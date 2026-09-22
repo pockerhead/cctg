@@ -38,7 +38,7 @@
 
 **Транскрипты сессий:**
 - Путь: `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Encoded cwd: путь с заменой `:`, `\`, `/`, пробелов и `_` на `-` (пример: `C:\Users\user\dev` → `C--Users-user-dev`). Файла может не быть вовсе: при унаследованной `CLAUDE_CODE_CHILD_SESSION=1` сохранение транскрипта выключено.
-- Записи `type: "user"` и `type: "assistant"`, поле `message.content` это массив блоков `text | tool_use | tool_result | thinking`. У каждой записи `uuid`, `parentUuid`, `timestamp`, `cwd`, `sessionId`, `gitBranch`, `isSidechain` (субагенты), `isMeta` (служебные).
+- Записи `type: "user"` и `type: "assistant"`, поле `message.content` это строка (набранные промпты, многие `isMeta`) или массив блоков `text | tool_use | tool_result | thinking | image` (TASK-005). Один ответ API разбит на несколько записей `assistant` с общим `message.id`, по одному блоку в каждой. Id субагента от вызова `Agent` лежит в `toolUseResult.agentId` записи с результатом. Входящие из канала сообщения лежат как `user` с `isMeta: true`. У каждой записи `uuid`, `parentUuid`, `timestamp`, `cwd`, `sessionId`, `gitBranch`, `isSidechain` (субагенты), `isMeta` (служебные).
 - Прочие типы, которые надо игнорировать при рендере: `mode`, `permission-mode`, `file-history-snapshot`, `ai-title`, `last-prompt`, `system`, `summary`.
 - `ai-title` даёт автоназвание сессии, пригодится для заголовка в теме.
 
