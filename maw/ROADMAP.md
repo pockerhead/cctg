@@ -1,25 +1,21 @@
 # Roadmap graph (derived from task.md Dependencies — task.md is source of truth)
 
-TASK-006
-  ├── TASK-009   (blocked by TASK-006, TASK-008)
-  └── TASK-016   (blocked by TASK-006, TASK-011, TASK-012)
-      └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
-          └── TASK-019   (blocked by TASK-017, TASK-018)
-
 TASK-007
   └── TASK-015   (blocked by TASK-007, TASK-011, TASK-012, TASK-013)
       └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
+          └── TASK-019   (blocked by TASK-017, TASK-018)
 
 TASK-008
-  ├── TASK-009   (blocked by TASK-006, TASK-008)
+  ├── TASK-009   (blocked by TASK-006, TASK-008) [waits on TASK-006 (in_progress)]
   └── TASK-011   (blocked by TASK-008, TASK-010)
       ├── TASK-012   (blocked by TASK-010, TASK-011)
       │   ├── TASK-015   (blocked by TASK-007, TASK-011, TASK-012, TASK-013)
-      │   └── TASK-016   (blocked by TASK-006, TASK-011, TASK-012)
+      │   └── TASK-016   (blocked by TASK-006, TASK-011, TASK-012) [waits on TASK-006 (in_progress)]
+      │       └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
       ├── TASK-014   (blocked by TASK-011, TASK-013)
       │   └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
       ├── TASK-015   (blocked by TASK-007, TASK-011, TASK-012, TASK-013)
-      ├── TASK-016   (blocked by TASK-006, TASK-011, TASK-012)
+      ├── TASK-016   (blocked by TASK-006, TASK-011, TASK-012) [waits on TASK-006 (in_progress)]
       └── TASK-017   (blocked by TASK-011)
           ├── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
           └── TASK-019   (blocked by TASK-017, TASK-018)
