@@ -1,0 +1,34 @@
+013fae31-ee3 lines=32    turns=4     text=2    use=1    result=1    agent_ids=0 meta=0 side=0 title=false leak=false
+1f2c01a2-63e lines=1578  turns=465   text=117  use=174  result=174  agent_ids=11 meta=14 side=0 title=true leak=false
+2591280b-a0f lines=42    turns=10    text=4    use=3    result=3    agent_ids=0 meta=0 side=0 title=false leak=false
+2f007a97-ce4 lines=28    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+4abcca41-a86 lines=27    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+58a03120-2c5 lines=77    turns=18    text=8    use=5    result=5    agent_ids=0 meta=3 side=0 title=true leak=false
+682bba42-8b2 lines=35    turns=8     text=2    use=3    result=3    agent_ids=0 meta=0 side=0 title=false leak=false
+6ee03417-2cc lines=27    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+745465f7-0b4 lines=28    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+8b45992a-fba lines=26    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+944c0017-e4b lines=32    turns=4     text=2    use=1    result=1    agent_ids=0 meta=0 side=0 title=false leak=false
+b66d1d86-8c1 lines=27    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+d8c72910-ea1 lines=44    turns=11    text=5    use=3    result=3    agent_ids=1 meta=1 side=0 title=false leak=false
+agent-a002fa lines=131   turns=68    text=4    use=32   result=32   agent_ids=0 meta=1 side=68 title=false leak=false
+agent-a24812 lines=152   turns=93    text=5    use=44   result=44   agent_ids=0 meta=1 side=93 title=false leak=false
+agent-a29844 lines=96    turns=49    text=9    use=20   result=20   agent_ids=0 meta=2 side=49 title=false leak=false
+agent-a45979 lines=133   turns=69    text=5    use=32   result=32   agent_ids=0 meta=1 side=69 title=false leak=false
+agent-a4b423 lines=88    turns=46    text=6    use=20   result=20   agent_ids=0 meta=1 side=46 title=false leak=false
+agent-a78444 lines=77    turns=41    text=9    use=16   result=16   agent_ids=0 meta=1 side=41 title=false leak=false
+agent-a8d88e lines=144   turns=78    text=8    use=35   result=35   agent_ids=1 meta=1 side=78 title=false leak=false
+agent-a8f6f6 lines=89    turns=46    text=3    use=22   result=21   agent_ids=0 meta=1 side=46 title=false leak=true
+agent-aa4e1b lines=217   turns=118   text=18   use=50   result=50   agent_ids=1 meta=1 side=118 title=false leak=false
+agent-aa6693 lines=348   turns=199   text=21   use=89   result=89   agent_ids=0 meta=1 side=199 title=false leak=false
+agent-aaf259 lines=120   turns=62    text=10   use=26   result=26   agent_ids=0 meta=1 side=62 title=false leak=false
+agent-aca63e lines=250   turns=137   text=7    use=65   result=65   agent_ids=0 meta=1 side=137 title=false leak=false
+agent-ae1e99 lines=17    turns=5     text=3    use=1    result=1    agent_ids=0 meta=1 side=5 title=false leak=false
+agent-a8c1bf lines=19    turns=4     text=2    use=1    result=1    agent_ids=0 meta=0 side=4 title=false leak=false
+plain_text.j lines=10    turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=false leak=false
+sidechain.js lines=3     turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=2 title=false leak=false
+string_conte lines=3     turns=3     text=3    use=0    result=0    agent_ids=0 meta=2 side=0 title=false leak=false
+thinking_ai_ lines=5     turns=2     text=2    use=0    result=0    agent_ids=0 meta=0 side=0 title=true leak=false
+tool_use_res lines=8     turns=8     text=0    use=4    result=4    agent_ids=1 meta=0 side=0 title=false leak=false
+garbage ok; last-line truncation keeps first: 1
+total turns 1564

@@ -1,0 +1,30 @@
+fixtures\plain_text.jsonl 1 permission-mode   -
+fixtures\plain_text.jsonl 2 mode   -
+fixtures\plain_text.jsonl 3 file-history-snapshot   -
+fixtures\plain_text.jsonl 4 attachment   -
+fixtures\plain_text.jsonl 5 user   str
+fixtures\plain_text.jsonl 6 queue-operation   -
+fixtures\plain_text.jsonl 7 assistant   list
+fixtures\plain_text.jsonl 8 system   -
+fixtures\plain_text.jsonl 9 last-prompt   -
+fixtures\plain_text.jsonl 10 atis-latch   -
+fixtures\sidechain.jsonl 1 user  side str
+fixtures\sidechain.jsonl 2 attachment  side -
+fixtures\sidechain.jsonl 3 assistant  side list
+fixtures\string_content.jsonl 1 user meta  str
+fixtures\string_content.jsonl 2 user   str
+fixtures\string_content.jsonl 3 user meta  list
+fixtures\thinking_ai_title.jsonl 1 ai-title   -
+fixtures\thinking_ai_title.jsonl 2 user   str
+fixtures\thinking_ai_title.jsonl 3 assistant   list
+fixtures\thinking_ai_title.jsonl 4 ai-title   -
+fixtures\thinking_ai_title.jsonl 5 assistant   list
+fixtures\tool_use_result.jsonl 1 assistant   list
+fixtures\tool_use_result.jsonl 2 user   list
+fixtures\tool_use_result.jsonl 3 assistant   list
+fixtures\tool_use_result.jsonl 4 user   list
+fixtures\tool_use_result.jsonl 5 assistant   list
+fixtures\tool_use_result.jsonl 6 user   list
+fixtures\tool_use_result.jsonl 7 assistant   list
+fixtures\tool_use_result.jsonl 8 user   list
+hits 0

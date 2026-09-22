@@ -1,0 +1,2 @@
+- 2026-09-22: premise SUSPECT resolved by amending task.md/TASK_FINAL.md (user approved in chat); planner runs on the amended spec.
+- 2026-09-22: planner open questions resolved by orchestrator with the planner defaults (not blocking, all reversible): (1) no `uuid` on Turn until TASK-016 needs it; (2) `ai_title` returns the first title per spec; (3) keep `ToolResult.agent_id` (cheap, needed by TASK-006 brief rule). Alternative: relay to user. Would flip: a reviewer showing one of them breaks a consumer.

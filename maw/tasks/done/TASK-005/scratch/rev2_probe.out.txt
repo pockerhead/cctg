@@ -1,0 +1,42 @@
+{"type":"text","text":"keep me","id":5}
+  -> Text { text: "keep me" }
+{"type":"text","text":5}
+  -> ERR invalid type: integer `5`, expected a string
+{"type":"thinking","thinking":"SECRET","signature":"S"}
+  -> Ignored
+{"type":"redacted_thinking","data":"x"}
+  -> Ignored
+{"text":"no tag"}
+  -> ERR missing field `type`
+{"type":7}
+  -> ERR invalid type: integer `7`, expected variant identifier
+{"type":null}
+  -> ERR invalid type: null, expected variant identifier
+{"type":"text"}
+  -> Text { text: "" }
+{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":"a"},{"type":"tool_reference","tool_name":"x"},{"type":"text","text":"b"}],"is_error":"yes"}
+  -> ToolResult { tool_use_id: "t", content: Array [Object {"text": String("a"), "type": String("text")}, Object {"tool_name": String("x"), "type": String("tool_reference")}, Object {"text": String("b"), "type": String("text")}], is_error: String("yes") }
+{"type":"tool_use","id":"t","name":"Bash","input":{"a":[1,2.5,-3,18446744073709551615,null,true]}}
+  -> ToolUse { id: "t", name: "Bash", input: Object {"a": Array [Number(1), Number(2.5), Number(-3), Number(18446744073709551615), Null, Bool(true)]} }
+["text","positional"]
+  -> Text { text: "positional" }
+{"text":"x","type":"text"}
+  -> Text { text: "x" }
+depth 100: Some(Some(3))
+depth 120: Some(Some(3))
+depth 125: Some(Some(2))
+depth 126: Some(Some(2))
+depth 127: Some(Some(2))
+depth 128: Some(Some(2))
+depth 200: Some(Some(2))
+depth 100000: Some(Some(2))
+main depth 126: 0
+array record: 1
+message null: 0
+message 5: 0
+bom: 0
+isMeta str: 1
+type 5: 0
+dup key: 0
+value eq: serde_json::value::Value
+clippy with deny(unwrap_used,expect_used,panic) on probe: exit 0

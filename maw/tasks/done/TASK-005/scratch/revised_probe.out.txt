@@ -1,0 +1,7 @@
+plain_text.jsonl 2
+sidechain.jsonl 2
+string_content.jsonl 3
+thinking_ai_title.jsonl 2
+tool_use_result.jsonl 8
+counterexamples 1 1
+cargo clippy -- -D warnings: exit 0

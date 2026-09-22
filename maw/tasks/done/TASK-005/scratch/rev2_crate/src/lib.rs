@@ -1,5 +1,4 @@
 //! Pure transcript parsing and rendering primitives.
-#![forbid(unsafe_code)]
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
@@ -82,21 +81,21 @@ struct RawTitleRecord {
 enum RawBlock {
     #[serde(rename = "text")]
     Text {
-        #[serde(default, deserialize_with = "string_or_default")]
+        #[serde(default)]
         text: String,
     },
     #[serde(rename = "tool_use")]
     ToolUse {
-        #[serde(default, deserialize_with = "string_or_default")]
+        #[serde(default)]
         id: String,
-        #[serde(default, deserialize_with = "string_or_default")]
+        #[serde(default)]
         name: String,
         #[serde(default)]
         input: Value,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
-        #[serde(default, deserialize_with = "string_or_default")]
+        #[serde(default)]
         tool_use_id: String,
         #[serde(default)]
         content: Value,
@@ -105,13 +104,6 @@ enum RawBlock {
     },
     #[serde(other)]
     Ignored,
-}
-
-fn string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Parses jsonl text into turns. Bad lines, other record types and unknown blocks are skipped.

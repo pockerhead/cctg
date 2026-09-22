@@ -1,0 +1,10 @@
+agent_input_keys:description,model,prompt,run_in_background,subagent_type 2
+agent_input_keys:description,model,prompt,subagent_type 9
+agent_input_keys:description,prompt,subagent_type 1
+agent_result_text_mentions_agentId:True 12
+agent_toolUseResult_keys:agentId,canReadOutputFile,description,isAsync,outputFile,prompt,resolvedModel,status 12
+agent_toolUseResult_type:dict 12
+agent_tool_use:Agent 12
+titles_per_file:0 distinct:0 11
+titles_per_file:3 distinct:1 1
+titles_per_file:87 distinct:1 1

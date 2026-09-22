@@ -1,0 +1,124 @@
+files 27 bad lines 0
+('aititle_keys', ('aiTitle', 'sessionId', 'type')) 90
+('assistant', 'block', 'text') 171
+('assistant', 'block', 'thinking') 426
+('assistant', 'block', 'tool_use') 628
+('assistant', 'content', 'list', 'nometa', 'main') 429
+('assistant', 'content', 'list', 'nometa', 'side') 796
+('assistant', 'nblocks', 1) 1225
+('sub', 'type', 'assistant') 796
+('sub', 'type', 'attachment') 568
+('sub', 'type', 'user') 465
+('tool_result.content', 'list') 36
+('tool_result.content', 'str') 591
+('tool_result.inner', 'text') 29
+('tool_result.inner', 'tool_reference') 10
+('tool_result.is_error', 'False') 414
+('tool_result.is_error', 'None') 182
+('tool_result.is_error', 'True') 31
+('tool_use.input', 'dict') 628
+('top', 'type', 'ai-title') 90
+('top', 'type', 'assistant') 429
+('top', 'type', 'atis-latch') 125
+('top', 'type', 'attachment') 596
+('top', 'type', 'cost-state') 13
+('top', 'type', 'file-history-delta') 20
+('top', 'type', 'file-history-snapshot') 21
+('top', 'type', 'last-prompt') 121
+('top', 'type', 'mode') 92
+('top', 'type', 'permission-mode') 92
+('top', 'type', 'queue-operation') 96
+('top', 'type', 'system') 56
+('top', 'type', 'user') 252
+('user', 'block', 'text') 3
+('user', 'block', 'tool_result') 627
+('user', 'content', 'list', 'meta', 'main') 2
+('user', 'content', 'list', 'nometa', 'main') 191
+('user', 'content', 'list', 'nometa', 'side') 437
+('user', 'content', 'str', 'meta', 'main') 16
+('user', 'content', 'str', 'meta', 'side') 14
+('user', 'content', 'str', 'nometa', 'main') 43
+('user', 'content', 'str', 'nometa', 'side') 14
+('user', 'nblocks', 1) 630
+--- record keys
+('assistant', 'advisorModel') 1113
+('assistant', 'agentId') 796
+('assistant', 'apiBlockIndex') 1225
+('assistant', 'attributionAgent') 796
+('assistant', 'attributionMcpServer') 6
+('assistant', 'attributionMcpTool') 6
+('assistant', 'attributionSkill') 28
+('assistant', 'cwd') 1225
+('assistant', 'effort') 1113
+('assistant', 'entrypoint') 1225
+('assistant', 'gitBranch') 1225
+('assistant', 'isSidechain') 1225
+('assistant', 'message') 1225
+('assistant', 'parentUuid') 1225
+('assistant', 'perTurnEffort') 1225
+('assistant', 'requestId') 1225
+('assistant', 'serverClassifierRequest') 1159
+('assistant', 'sessionId') 1225
+('assistant', 'session_id') 385
+('assistant', 'slug') 278
+('assistant', 'timestamp') 1225
+('assistant', 'type') 1225
+('assistant', 'userType') 1225
+('assistant', 'uuid') 1225
+('assistant', 'version') 1225
+('assistant', 'wireIngestContext') 170
+('assistant', 'wireToolInputs') 628
+('user', 'agentId') 465
+('user', 'cwd') 717
+('user', 'entrypoint') 717
+('user', 'gitBranch') 717
+('user', 'interruptedMessageId') 1
+('user', 'isCompactSummary') 1
+('user', 'isMeta') 32
+('user', 'isSidechain') 717
+('user', 'isVisibleInTranscriptOnly') 1
+('user', 'message') 717
+('user', 'origin') 39
+('user', 'parentUuid') 717
+('user', 'permissionMode') 50
+('user', 'promptId') 717
+('user', 'promptSource') 50
+('user', 'queueSkipAttachments') 20
+('user', 'serverClassifierContext') 414
+('user', 'sessionId') 717
+('user', 'session_id') 186
+('user', 'slug') 167
+('user', 'sourceToolAssistantUUID') 627
+('user', 'sourceToolUseID') 2
+('user', 'timestamp') 717
+('user', 'toolDenialKind') 2
+('user', 'toolUseResult') 626
+('user', 'turnCompanion') 4
+('user', 'turnOrigin') 50
+('user', 'type') 717
+('user', 'userType') 717
+('user', 'uuid') 717
+('user', 'version') 717
+--- message keys
+('assistant', 'container') 1225
+('assistant', 'content') 1225
+('assistant', 'context_management') 1225
+('assistant', 'diagnostics') 1225
+('assistant', 'id') 1225
+('assistant', 'input_transformations') 1225
+('assistant', 'model') 1225
+('assistant', 'role') 1225
+('assistant', 'stop_details') 1225
+('assistant', 'stop_reason') 1225
+('assistant', 'stop_sequence') 1225
+('assistant', 'type') 1225
+('assistant', 'usage') 1225
+('user', 'content') 717
+('user', 'role') 717
+--- block keys
+('assistant', 'text') {'type': 171, 'text': 171}
+('assistant', 'thinking') {'type': 426, 'thinking': 426, 'signature': 426}
+('assistant', 'tool_use') {'type': 628, 'id': 628, 'name': 628, 'input': 628, 'caller': 628}
+('user', 'text') {'type': 3, 'text': 3}
+('user', 'tool_result') {'tool_use_id': 627, 'type': 627, 'content': 627, 'is_error': 445}
+assistant message.id total 602 split across >1 record 432
