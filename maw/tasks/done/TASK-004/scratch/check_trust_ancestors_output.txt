@@ -1,0 +1,5 @@
+C:/                        absent  hasTrustDialogAccepted=None
+~                          present hasTrustDialogAccepted=False
+~/AppData                  absent  hasTrustDialogAccepted=None
+~/AppData/Local            absent  hasTrustDialogAccepted=None
+~/AppData/Local/Temp       absent  hasTrustDialogAccepted=None

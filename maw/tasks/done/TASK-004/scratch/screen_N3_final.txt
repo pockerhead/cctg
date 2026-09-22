@@ -1,0 +1,82 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg_probe_dir
+
+▎ Channels (experimental) messages from server:probe inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+
+> Say the word READY and nothing else
+
+● READY
+
+✻ Brewed for 1s · done 20:47
+
+← probe: PROBE-INBOUND-N1HHHH-T45
+
+● Зонд получен и обработан.
+
+✻ Cooked for 6s · done 20:47
+
+← probe: PROBE-INBOUND-N1HHHH-T80
+
+● Зонд T80 получен и обработан.
+
+✻ Sautéed for 2s · done 20:48
+
+> Run the Bash command: echo perm-test > perm_test.txt
+
+✻ Sautéed for 2s · done 20:48
+
+> Run the Bash command: echo perm-test > perm_test.txt
+
+● Bash(echo perm-test > perm_test.txt)
+  ⎿  (No output)
+
+● Файл perm_test.txt успешно создан. Проверим содержимое:
+
+  Read 1 file (ctrl+o to expand)
+
+● Команда выполнена успешно. Файл создан с содержимым perm-test.
+
+✻ Brewed for 6s · done 20:50
+
+← probe: PROBE-INBOUND-N2IIII-T50
+
+  Called probe (ctrl+o to expand)
+
+● Зонд T50 получен и обработан.
+
+✻ Baked for 2s · done 20:50
+
+← probe: PROBE-INBOUND-N2IIII-T95
+
+  Called probe (ctrl+o to expand)
+
+● Зонд T95 получен и обработан.
+
+✻ Cooked for 2s · done 20:51
+
+← probe: PROBE-INBOUND-N3JJJJ-T30
+
+  Called probe (ctrl+o to expand)
+
+● Зонд T30 получен и обработан.
+
+✻ Baked for 2s · done 20:54
+
+← probe: PROBE-INBOUND-N3JJJJ-T100
+
+  Called probe (ctrl+o to expand)
+
+● Зонд T100 получен и обработан.
+
+✻ Worked for 2s · done 20:55
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Run this Bash command exactly and show its output: claude -p --model haiku --max-turns 1
+  --dangerously-load-development-channels server:probe hello
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:cctg_probe_dir sh:bash ctx:26%
+  acc:<redacted-account> 5h:30% 7d:33%
+  ⏸ manual mode on

@@ -1,0 +1,16 @@
+*.bin
+*.dump
+*.core
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.sqlite
+*.db
+node_modules/
+__pycache__/

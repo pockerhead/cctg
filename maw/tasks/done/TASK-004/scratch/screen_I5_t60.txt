@@ -1,0 +1,46 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\dev\cctg
+
+▎ Channels (experimental) messages from server:probe inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+
+> Run the Bash command: netstat -an
+
+● Bash(netstat -an)
+  ⎿  ��⨢�� ������祭��
+
+       ���    ������� ����        ���譨� ����          ����ﭨ�
+     … +451 lines (ctrl+o to expand)
+
+● Полный вывод netstat -an сохранён в файл (46 KB). В превью видны основные прослушиваемые порты:
+
+  Системные сервисы:
+  - 135 (RPC), 445 (SMB), 5040, 5357 — стандартные Windows
+
+  Локальные приложения:
+  - 5939 (TeamViewer)
+  - 6463 (Discord)
+  - 6505 (VS Code / IDE)
+  - 16140, 19500, 39807 — активные соединения на локалхосте
+
+  Эфемерные порты: 47xxx–58xxx (динамические, для исходящих соединений)
+
+  Полный список сохранён в файл для детального анализа.
+
+✻ Cooked for 11s · done 20:43
+
+← probe: PROBE-INBOUND-I5GGGG-T40
+
+  Called probe (ctrl+o to expand)
+
+● Проба получена и подтверждена.
+
+✻ Baked for 5s · done 20:44
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 br:chore/spike-channel-lifecycle* dir:cctg sh:bash ctx:31%
+  acc:<redacted-account> 5h:27% 7d:32%
+  ⏸ manual mode on · ← 1 agent

@@ -1,0 +1,13 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\dev\cctg
+
+▎ Channels (experimental) messages from server:probe inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Try "how do I log an error?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 br:chore/spike-channel-lifecycle* dir:cctg sh:bash                    auto mode unavailable for this model
+  acc:<redacted-account>
+  ⏸ manual mode on · ← 1 agent

@@ -1,0 +1,19 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg_probe_dir
+
+▎ Channels (experimental) messages from server:probe inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+
+> Say the word READY and nothing else
+
+● READY
+
+✻ Brewed for 1s · done 20:47
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:cctg_probe_dir sh:bash ctx:25%
+  acc:<redacted-account> 5h:28% 7d:33%
+  ⏸ manual mode on · ← 1 agent

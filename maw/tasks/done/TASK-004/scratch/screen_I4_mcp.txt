@@ -1,0 +1,31 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\dev\cctg
+
+▎ Debug mode enabled · logging to ~\dev\cctg\maw\tasks\in_progress\TASK-004\scratch\debug_I4.log
+  1 more notice hidden
+
+> /mcp
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Manage MCP servers
+  10 servers
+
+    User MCPs (~\.claude.json)
+  > probe · √ connected · 1 tool
+    web-reader · √ connected · 1 tool
+    web-search-prime · √ connected · 1 tool
+    zai-mcp-server · √ connected · 8 tools
+    zread · √ connected · 3 tools
+
+    claude.ai
+    claude.ai Claude Docs · √ connected · 8 tools
+    claude.ai Gmail · ‼ needs authentication
+    claude.ai Google Calendar · ‼ needs authentication
+    claude.ai Google Drive · ‼ needs authentication
+
+    Built-in MCPs (always available)
+    claude-in-chrome · √ connected · 22 tools
+
+  https://code.claude.com/docs/en/mcp for help
+ ↑/↓ to navigate · Enter to confirm · Esc to cancel

@@ -1,0 +1,25 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\dev\cctg
+
+▎ Debug mode enabled · logging to ~\dev\cctg\maw\tasks\in_progress\TASK-004\scratch\debug_I4.log
+  1 more notice hidden
+
+> /mcp
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Probe MCP Server
+
+  Status:           √ connected
+  Command:          python ~/dev/cctg/maw/tasks/in_progress/TASK-004/scratch/probe_channel_server.py
+  Config location:  ~\.claude.json
+  Capabilities: tools
+  Tools: 1 tool
+
+  > 1. View tools
+    2. Reconnect
+    3. Disable
+
+  ↑/↓ to navigate · Enter to select · Esc to back

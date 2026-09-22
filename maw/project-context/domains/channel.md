@@ -9,6 +9,12 @@
 - Outbound from Claude: our tool (e.g. `reply(chat_id, text)`) is called via `tools/call`; the text is not shown in the terminal.
 - Permission relay: incoming `{ request_id, tool_name, description, input_preview }`; `request_id` is 5 lowercase letters without the letter l. Reply `{ request_id, behavior: "allow" | "deny" }`. Terminal dialog stays open in parallel, first answer wins. Trust dialogs and MCP consent are never relayed.
 - Launch: `claude --dangerously-load-development-channels server:cctg`. Register the server at user scope (`claude mcp add --scope user cctg -- cctg agent`, lands in top-level `mcpServers` of `~/.claude.json`): no per-project consent dialog, works in every folder. Project `.mcp.json` is not used. The `--channels` flag rejects our server (Anthropic allowlist). A session started without the flag gets hooks and a topic but no channel; the hub shows that state.
+- VERIFIED 2026-09-22 (TASK-004): the channel subsystem is initialized ONLY in interactive sessions. In `claude -p` (including `-p --resume`) the server is spawned as a plain MCP server and its tools work, but inbound `notifications/claude/channel` is dropped and `permission_request` never arrives. Headless resume of a dead session (TASK-019) is therefore one-shot (prompt in, stream-json out), never a two-way channel. Interactive `--resume <id>` and `--continue` keep the same session id and bring the channel up fully.
+- Without the flag the server is still spawned (user scope), inbound is silently dropped (`Channel notifications skipped` in the debug log only) and `/mcp` looks the same as with the flag. The server cannot detect this by itself; "no channel" is known to the hub only as a state reported by the agent.
+- A user-scope server is spawned in EVERY claude session on the machine, including sessions started without the flag and sessions in unrelated folders. `cctg agent` must run quietly in "no channel" mode (register, never crash or spam). `claude mcp remove` does not stop already-running instances.
+- A nested `claude -p` spawns its own second agent with its own session id (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`). `sdk-cli` means "headless", not "nested": hub-started headless resumes are `sdk-cli` too. Nesting is decided only by the hooks-domain contract (process tree + pid registry); the hub attaches such an agent to the parent or rejects it, never gives it a slot.
+- Env `CLAUDE_PID` in the server is inherited, not set by its own claude: `null` in a clean top-level session, the PARENT claude pid in a nested one. Do not use it as the server's own claude pid.
+- A freshly started session that has not had a single user turn may accept channel notifications without starting a turn (one observation, TASK-004 I3). Buffer on the hub side until the agent confirms delivery.
 - Messages reach Claude only while the session is alive; the hub buffers everything addressed to a dead session.
 - The channel server does not know its own session id; it reads env `CLAUDE_CODE_SESSION_ID` (inherited from the claude process) and the hub matches it to the hook's `session_id`.
 - stdout is reserved for JSON-RPC only. All logging goes to stderr or a file; one stray print on stdout breaks the transport.
@@ -16,8 +22,11 @@
 ## Risk lessons
 - 2026-09-22 (TASK-002 QA): `tracing_subscriber::fmt()` writes to stdout by default; `.with_writer(std::io::stderr)` is load-bearing. A stdout-purity test is vacuous unless the code path actually emits a `tracing` event: the test must trigger at least one log line (e.g. `RUST_LOG=trace` plus a real `tracing::info!` in the path) and assert stdout stays empty.
 
+- 2026-09-22 (TASK-004): spikes that register a user-scope MCP server leak it into the user's other live sessions; cleanup must also find and stop running instances by command line, not only `claude mcp remove`. Writes to `~/.claude.json` from a subagent are blocked by the auto-mode classifier: plan such cleanup as a user step.
+
 ## Pointers
-- `CLAUDE.md` (repo root), section "Channels": verified facts, Claude Code 2.1.278.
+- `CLAUDE.md` (repo root), section "Channels": verified facts, Claude Code 2.1.278; TASK-004 observed on 2.1.280.
+- `maw/tasks/done/TASK-004/scratch/FINDINGS.md`: 4-mode table, exact MVP launch command and aliases, probe server (`probe_channel_server.py`) and redacted probe logs.
 - https://code.claude.com/docs/en/channels-reference : official reference.
 - `anthropics/claude-plugins-official/external_plugins/fakechat` : minimal reference implementation.
 - https://github.com/gohyperdev/hdcd-telegram : Rust hand-rolled channel plus permission relay (read for decisions, do not copy).

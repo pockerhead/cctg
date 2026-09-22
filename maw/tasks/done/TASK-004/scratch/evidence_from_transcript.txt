@@ -1,0 +1,69 @@
+# Extracted from transcripts/6-implementer.jsonl (raw tool_use / tool_result), redacted.
+
+## 1. Interactive launcher runs: label, argv after `--`, spawned pid, probe start ppid
+- I4 (transcript line 167, tool_use ts 2026-09-22T17:39:38.379Z)
+    argv after --      : --dangerously-load-development-channels server:probe --model haiku --debug-file "~/dev/cctg/$S/debug_I4.log"
+    launcher printed   : ~\.local\bin\claude.EXE --dangerously-load-development-channels server:probe --model haiku --debug-file ~/dev/cctg/maw/tasks/in_progress/TASK-004/scratch/debug_I4.log
+    spawned pid        : 26692
+    probe_log start    : ppid=26692 t=2026-09-22T17:39:49Z sid=cdce686a-0215-4996-a104-9b306ac714d7
+- I5 (transcript line 187, tool_use ts 2026-09-22T17:43:18.217Z)
+    argv after --      : --dangerously-load-development-channels server:probe --model haiku
+    launcher printed   : ~\.local\bin\claude.EXE --dangerously-load-development-channels server:probe --model haiku
+    spawned pid        : 27708
+    probe_log start    : ppid=27708 t=2026-09-22T17:43:22Z sid=58a03120-2c52-4bbe-aa82-db522cf4b5a0
+- N1 (transcript line 205, tool_use ts 2026-09-22T17:46:56.306Z)
+    argv after --      : --dangerously-load-development-channels server:probe --model haiku
+    launcher printed   : ~\.local\bin\claude.EXE --dangerously-load-development-channels server:probe --model haiku
+    spawned pid        : 10724
+    probe_log start    : ppid=10724 t=2026-09-22T17:47:03Z sid=684d8e75-12f4-49a0-83cd-f706b8686468
+- N2 (transcript line 220, tool_use ts 2026-09-22T17:49:39.981Z)
+    argv after --      : --continue --dangerously-load-development-channels server:probe --model haiku
+    launcher printed   : ~\.local\bin\claude.EXE --continue --dangerously-load-development-channels server:probe --model haiku
+    spawned pid        : 7732
+    probe_log start    : ppid=7732 t=2026-09-22T17:49:49Z sid=684d8e75-12f4-49a0-83cd-f706b8686468
+- N3 (transcript line 232, tool_use ts 2026-09-22T17:53:39.120Z)
+    argv after --      : --resume 684d8e75-12f4-49a0-83cd-f706b8686468 --dangerously-load-development-channels server:probe --model haiku
+    launcher printed   : ~\.local\bin\claude.EXE --resume 684d8e75-12f4-49a0-83cd-f706b8686468 --dangerously-load-development-channels server:probe --model haiku
+    spawned pid        : 25092
+    probe_log start    : ppid=25092 t=2026-09-22T17:53:45Z sid=684d8e75-12f4-49a0-83cd-f706b8686468
+- N4 (transcript line 243, tool_use ts 2026-09-22T17:56:59.909Z)
+    argv after --      : --continue --dangerously-load-development-channels server:probe --model haiku
+    launcher printed   : <not in captured tail>
+    spawned pid        : <not in captured tail>
+    probe_log start    : ppid=17440 t=2026-09-22T17:57:05Z sid=684d8e75-12f4-49a0-83cd-f706b8686468
+- N5 (transcript line 252, tool_use ts 2026-09-22T18:00:14.381Z)
+    argv after --      : --continue --model haiku --debug-file "~/dev/cctg/$S/debug_N5.log"
+    launcher printed   : <not in captured tail>
+    spawned pid        : <not in captured tail>
+    probe_log start    : ppid=27012 t=2026-09-22T18:00:19Z sid=684d8e75-12f4-49a0-83cd-f706b8686468
+
+## 2. Pre-launch check: consent folder known to claude?
+- tool_use line 202 ts 2026-09-22T17:46:50.000Z
+    command: D="~/AppData/Local/Temp/cctg_probe_dir" && mkdir -p "$D" && echo "probe scratch folder for TASK-004" > "$D/README.txt" && python -c "
+             import json,os
+             d=json.load(open(os.path.expanduser('~/.claude.json'),encoding='utf-8'))
+             print('folder already known to claude:', any('cctg_probe_dir' in k for k in (d.get('projects') or {})))
+             " && ls -la "$D"
+    result (line 203, first 1500 chars):
+      folder already known to claude: False
+      total 1905
+      drwxr-xr-x 1 user 197121  0 Sep 22 20:46 .
+      drwxr-xr-x 1 user 197121  0 Sep 22 20:46 ..
+      -rw-r--r-- 1 user 197121 34 Sep 22 20:46 README.txt
+
+## 3. `claude --help` grep for the channel flag
+- tool_use line 64 ts 2026-09-22T17:28:24.769Z
+    command: claude --help 2>&1 | grep -i -A3 "channel"
+    result (line 65, first 1500 chars):
+      (Bash completed with no output)
+
+## 4. AppActivate/SendKeys attempts
+- tool_use line 124 ts 2026-09-22T17:32:15.145Z
+    command: S=maw/tasks/in_progress/TASK-004/scratch && rm -f $S/probe_log_I2.jsonl $S/debug_I2.log && CCTG_PROBE_LOG="~/dev/cctg/$S/probe_log_I2.jsonl" CCTG_PROBE_NONCE=I2DDDD CCTG_PROBE_AT="3,15,30,45" python $S/launch_interactive_probe.py I2_interactive_flag 80 --keys "Say the word READY and nothing else{ENTER}" -- --dangerously-load-development-channels server:probe --model haiku --debug-file "~/dev/cctg/$S/debug_I2.log" 2>&1
+    result (line 125, first 1500 chars):
+      cmd: ~\.local\bin\claude.EXE --dangerously-load-development-channels server:probe --model haiku --debug-file ~/dev/cctg/maw/tasks/in_progress/TASK-004/scratch/debug_I2.log
+      spawned pid 34236
+      ACTIVATE_FAILED
+      send_keys rc: 1
+      new transcript files: []
+

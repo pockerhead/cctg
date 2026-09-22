@@ -23,6 +23,7 @@
 - Permission relay: Claude Code шлёт `notifications/claude/channel/permission_request` с `{ request_id, tool_name, description, input_preview }`. `request_id` это 5 строчных букв без `l`. Ответ: `notifications/claude/channel/permission` с `{ request_id, behavior: 'allow' | 'deny' }`. Терминальный диалог остаётся открытым параллельно, побеждает первый ответ. Trust-диалоги и MCP consent не релеятся.
 - Запуск нашего канала: `claude --dangerously-load-development-channels server:cctg` при записи `cctg` в `.mcp.json` или `~/.claude.json`. Флаг `--channels` наш сервер не примет (allowlist Anthropic).
 - Сообщения доходят только пока сессия жива. Всё, что пришло в мёртвую сессию, надо буферить на нашей стороне.
+- Проверено 2026-09-22 (TASK-004, Claude Code 2.1.280): подсистема каналов поднимается только в интерактивной сессии. В `claude -p` (и `-p --resume`) сервер спавнится как обычный MCP, но inbound выкидывается и `permission_request` не приходит, поэтому headless resume бывает только одноразовым. Интерактивные `--resume <id>` и `--continue` сохраняют session id, канал поднимается полностью. Без флага сервер тоже спавнится, inbound молча дропается, `/mcp` выглядит так же, как с флагом: состояние "нет канала" hub узнаёт только от агента. User-scope сервер не требует consent в новой папке и спавнится в каждой сессии машины, включая сессии без флага; `claude mcp remove` уже запущенные экземпляры не гасит. Вложенный `claude -p` поднимает второй сервер со своим session id (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`, но это признак headless, не вложенности). `CLAUDE_PID` в env сервера наследуется (у вложенного это pid родителя, у чистого top-level его нет). Команда запуска и alias: `maw/tasks/done/TASK-004/scratch/FINDINGS.md` раздел 9, обёртки `cctg run` нет (решение).
 - Референс: https://code.claude.com/docs/en/channels-reference, пример fakechat в `anthropics/claude-plugins-official/external_plugins/fakechat`.
 
 **Telegram Bot API (проверено 2026-09-22 на реальной группе):**
@@ -36,7 +37,7 @@
 - curl на Windows ломает UTF-8 в аргументах (`·` в имени темы даёт `strings must be encoded in UTF-8`), это не ограничение API.
 
 **Транскрипты сессий:**
-- Путь: `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Encoded cwd: путь с заменой `:`, `\`, `/`, пробелов на `-` (пример: `C:\Users\user\dev` → `C--Users-user-dev`).
+- Путь: `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Encoded cwd: путь с заменой `:`, `\`, `/`, пробелов и `_` на `-` (пример: `C:\Users\user\dev` → `C--Users-user-dev`). Файла может не быть вовсе: при унаследованной `CLAUDE_CODE_CHILD_SESSION=1` сохранение транскрипта выключено.
 - Записи `type: "user"` и `type: "assistant"`, поле `message.content` это массив блоков `text | tool_use | tool_result | thinking`. У каждой записи `uuid`, `parentUuid`, `timestamp`, `cwd`, `sessionId`, `gitBranch`, `isSidechain` (субагенты), `isMeta` (служебные).
 - Прочие типы, которые надо игнорировать при рендере: `mode`, `permission-mode`, `file-history-snapshot`, `ai-title`, `last-prompt`, `system`, `summary`.
 - `ai-title` даёт автоназвание сессии, пригодится для заголовка в теме.
@@ -73,7 +74,7 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
 - Владеет токеном бота. Бот админ в закрытом супергруппе-форуме.
 - TCP-сервер для агентов (newline-JSON). Аутентификация shared secret первым сообщением. Другие устройства ходят через Tailscale/LAN.
 - Реестр слотов: `slot -> (device, folder, ordinal, topic_id, current_session_id?, state)` плюс `session_id -> (slot, transcript_path, parent_session_id?)` для роутинга permission-кнопок и субагентов.
-- Правило тем (решение 2026-09-22): **тема это слот `(device, folder, ordinal)`, не сессия.** Новая сессия в папке занимает первый слот папки без живой сессии, то есть обычно вчерашнюю тему. Второй параллельный claude в той же папке получает слот `#2`. Число тем равно максимальной параллельности по папке, а не числу сессий за всю жизнь. Заголовок `[host] folder · ai-title` (`#N` для ordinal > 1), иконка через `icon_custom_emoji_id` по состоянию: живая / мёртвая / ждёт разрешения / без канала. Смена сессии внутри слота рисуется разделителем `── session <id> · new | resumed ──`. Тема мёртвой сессии не закрывается (пользователь не сможет писать), сообщения буферятся (до 50, старые дропаются с одним предупреждением), кнопка Resume запускает `claude -p --resume <id>` через агента устройства. Раздутый контекст лечится handoff-ом: старой сессии заказывается summary, новая сессия стартует в том же слоте с этим summary; inline `/compact` в headless нет. Топик `General` это дашборд и команды.
+- Правило тем (решение 2026-09-22): **тема это слот `(device, folder, ordinal)`, не сессия.** Новая сессия в папке занимает первый слот папки без живой сессии, то есть обычно вчерашнюю тему. Второй параллельный claude в той же папке получает слот `#2`. Число тем равно максимальной параллельности по папке, а не числу сессий за всю жизнь. Заголовок `[host] folder · ai-title` (`#N` для ordinal > 1), иконка через `icon_custom_emoji_id` по состоянию: живая / мёртвая / ждёт разрешения / без канала. Смена сессии внутри слота рисуется разделителем `── session <id> · new | resumed ──`. Тема мёртвой сессии не закрывается (пользователь не сможет писать), сообщения буферятся (до 50, старые дропаются с одним предупреждением), кнопка Resume запускает `claude -p --resume <id>` через агента устройства (одноразовый прогон: в `-p` канала нет, TASK-004). Раздутый контекст лечится handoff-ом: старой сессии заказывается summary, новая сессия стартует в том же слоте с этим summary; inline `/compact` в headless нет. Топик `General` это дашборд и команды.
 - **Субагенты и вложенные запуски не получают свою тему.** Они живут внутри темы родителя:
   - Субагент отображается как свёрнутый блок в теме родителя: `↳ Explore a13bc9…` с кратким транскриптом из `subagents/agent-<id>.jsonl` по `SubagentStop`, промежуточный прогресс по запросу.
   - Вложенный `claude -p` (maw runner и т.п.) регистрируется через свой `SessionStart`, но hub по признаку вложенности привязывает его к теме родителя как `⇣ nested <id>` и не создаёт новую. Свой channel у него не поднимается.
@@ -122,8 +123,8 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
 
 - ~~Затирает ли вложенный `claude -p` переменную `CLAUDE_CODE_SESSION_ID`~~ Да, всегда (TASK-003). Детект только через ppid и реестр pid.
 - ~~Хватает ли `SubagentStop.last_assistant_message`~~ Зависит от того, вызвал ли субагент `SubagentHandback`: если был `PreToolUse SubagentHandback` для этого `agent_id`, отчёт в `tool_input.message`, иначе в `last_assistant_message` (TASK-003).
-- Как ведёт себя `--dangerously-load-development-channels` при `claude --resume`.
-- Нужен ли consent-диалог для `.mcp.json` каждый раз в новой папке (скорее да, значит регистрировать сервер глобально в `~/.claude.json`).
+- ~~Как ведёт себя `--dangerously-load-development-channels` при `claude --resume`~~ Канал поднимается, session id тот же; в `-p` канала нет вообще (TASK-004).
+- ~~Нужен ли consent-диалог для `.mcp.json` каждый раз в новой папке~~ User-scope регистрация в `~/.claude.json` consent не требует (TASK-004).
 - Лимиты Telegram на создание тем (rate limit при массовом старте).
 
 ## MAW (установлен, https://github.com/pockerhead/maw)
