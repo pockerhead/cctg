@@ -1,0 +1,21 @@
+{
+  "worktree_mode": "never",
+  "default_provider": "host",
+  "spawn_timeout_min": 30,
+  "allow_unverified_profile": false,
+  "providers": {
+    "claude": { "default_model": "opus",        "default_effort": "medium" },
+    "codex":  { "default_model": "gpt-5.6-sol", "default_effort": "medium" }
+  },
+  "agents": {
+    "clarifier":         { "provider": "claude", "model": "opus",        "effort": "medium" },
+    "premise-challenge": { "provider": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
+    "planner":           { "provider": "claude", "model": "opus",        "effort": "medium" },
+    "plan-reviewer-1":   { "provider": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
+    "plan-reviewer-2":   { "provider": "claude", "model": "opus",        "effort": "medium" },
+    "implementer":       { "provider": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
+    "code-reviewer":     { "provider": "claude", "model": "opus",        "effort": "medium" },
+    "fixer":             { "provider": "codex",  "model": "gpt-5.6-sol", "effort": "medium" },
+    "qa":                { "provider": "claude", "model": "opus",        "effort": "medium" }
+  }
+}
