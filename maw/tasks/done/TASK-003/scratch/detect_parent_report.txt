@@ -1,0 +1,64 @@
+###### capture_A_toplevel.jsonl
+  session 745465f7-0b40-42e9-a499-ec0af37607ad  claude_pid=24824
+    verdict=top_level          parent=None  via=rule3_no_claude_ancestor
+    chain: 25732:python.exe <- 22884:bash.exe <- 34764:bash.exe <- 24824:claude.exe <- 33312:env.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+
+###### capture_B_nested.jsonl
+  session 944c0017-e4be-44b9-8743-6773008d981f  claude_pid=776
+    verdict=top_level          parent=None  via=rule3_no_claude_ancestor
+    chain: 35960:python.exe <- 32724:bash.exe <- 29164:bash.exe <- 776:claude.exe <- 34164:env.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+  session 4abcca41-a869-41e8-a7a3-3760d0ebfbb4  claude_pid=25388
+    verdict=nested             parent=944c0017-e4be-44b9-8743-6773008d981f  via=rule2_ppid_chain
+    chain: 14588:python.exe <- 17412:bash.exe <- 27048:bash.exe <- 25388:claude.exe <- 20976:bash.exe <- 31964:bash.exe <- 2168:bash.exe <- 776:claude.exe <- 34164:env.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+
+###### capture_C_mixed.jsonl
+  session d8c72910-ea17-4d68-9c75-57e097fafeea  claude_pid=4580
+    verdict=top_level          parent=None  via=rule3_no_claude_ancestor
+    chain: 27760:python.exe <- 23960:bash.exe <- 17412:bash.exe <- 4580:claude.exe <- 27744:env.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+  session 6ee03417-2cc4-4ea5-b1a7-b72c974a4633  claude_pid=15928
+    verdict=nested             parent=d8c72910-ea17-4d68-9c75-57e097fafeea  via=rule2_ppid_chain
+    chain: 24340:python.exe <- 3060:bash.exe <- 32228:bash.exe <- 15928:claude.exe <- 31740:bash.exe <- 18008:bash.exe <- 6564:bash.exe <- 4580:claude.exe <- 27744:env.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+  session b66d1d86-8c1f-4e94-92d4-a557674970b9  claude_pid=13396
+    verdict=top_level          parent=None  via=rule3_no_claude_ancestor
+    chain: 6932:python.exe <- 15052:bash.exe <- 14360:bash.exe <- 13396:claude.exe <- 35512:env.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+
+###### capture_D_nested_env_stripped.jsonl
+  session 013fae31-ee35-41c1-9c4e-8671c2027341  claude_pid=7100
+    verdict=top_level          parent=None  via=rule3_no_claude_ancestor
+    chain: 35908:python.exe <- 27888:bash.exe <- 1116:bash.exe <- 7100:claude.exe <- 32968:env.exe
+    chain_truncated_at=35316
+  session 2f007a97-ce4b-4957-8b53-b84725bc20f7  claude_pid=16024
+    verdict=nested             parent=013fae31-ee35-41c1-9c4e-8671c2027341  via=rule2_ppid_chain
+    chain: 32380:python.exe <- 10064:bash.exe <- 28028:bash.exe <- 16024:claude.exe <- 29360:bash.exe <- 29560:bash.exe <- 28544:bash.exe <- 7100:claude.exe <- 32968:env.exe
+    chain_truncated_at=35316
+
+###### capture_E_interactive.jsonl
+  session 1e087ca8-58b5-4c0b-9f03-b7926645b744  claude_pid=28764
+    verdict=nested_unknown_parent parent=None  via=rule2_ppid_chain_unregistered
+    chain: 33220:python.exe <- 35944:bash.exe <- 15248:bash.exe <- 28764:claude.exe <- 31852:python.exe <- 13672:bash.exe <- 35000:bash.exe <- 30500:bash.exe <- 15320:claude.exe <- 34616:bash.exe <- 15580:bash.exe
+    chain_truncated_at=25528
+
+###### capture_unknown.jsonl
+  session test-sess-0001  claude_pid=15320
+    verdict=nested             parent=1f2c01a2-63e9-464d-a70f-4a4283d3cd8b  via=rule1_env_session_id
+    chain: 33476:python.exe <- 3408:bash.exe <- 3344:bash.exe <- 33068:bash.exe <- 15320:claude.exe <- 34616:bash.exe <- 15580:bash.exe
+    chain_truncated_at=n/a (captured before the probe recorded truncation)
+
+###### synthetic replay (branches the captures never produced)
+  missing CLAUDE_PID, nested chain
+    verdict=nested                 parent=sess-parent  via=rule2_ppid_chain
+  claude ancestor present but unregistered
+    verdict=nested_unknown_parent  parent=None         via=rule2_ppid_chain_unregistered
+  stale/reused CLAUDE_PID (matches no chain node)
+    verdict=nested                 parent=sess-child   via=rule2_ppid_chain
+  chain truncated below the parent claude
+    verdict=top_level              parent=None         via=rule3_no_claude_ancestor
+  env rule 1 fires (env session != stdin session)
+    verdict=nested                 parent=sess-parent  via=rule1_env_session_id
+
