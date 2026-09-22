@@ -12,7 +12,7 @@
 - Security gate is by `from.id` allowlist, never by chat. Permission Allow/Deny buttons carry `request_id` in callback data and are honoured only from allowlisted users.
 - Inbound routing: message in topic goes to the current session of that slot. Dead session: never close the topic; buffer up to 50 messages (drop oldest, warn once), offer a Resume button.
 - Local transcripts are read directly from `transcript_path` (works for dead sessions); remote devices serve the file through their agent on request.
-- Messages longer than 4096 chars are split or sent as a file (see transcript domain).
+- Messages longer than 4096 are split or sent as a file; measure with `transcript::telegram_len` and split with `transcript::split_for_telegram` (see transcript domain).
 
 ## Risk lessons
 - 2026-09-22: bot needs admin right `can_manage_topics` for createForumTopic; check via `getChatMember` at hub start. Bot API chat id is `-100` + web-client id. Bot-admin CAN post into a closed topic, users cannot: never close a dead session's topic. Service messages `forum_topic_*` arrive as `message` updates and must be ignored. Text limit is exactly 4096. `icon_custom_emoji_id` is editable, `icon_color` is not. Service messages for rename/icon change are deleted by the hub via `deleteMessage` (message_id from getUpdates); the `forum_topic_created` one cannot be deleted (it is the topic root). See CLAUDE.md "Telegram Bot API".

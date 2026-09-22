@@ -1,0 +1,8 @@
+[package]
+name = "crev_probe"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+transcript = { path = "../../../../../../../crates/transcript" }
+serde_json = "1"

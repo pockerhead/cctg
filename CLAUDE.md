@@ -60,7 +60,7 @@ Rust, один cargo workspace, один бинарник `cctg` с подком
 - Telegram: `teloxide` (long polling, `create_forum_topic`/`edit_forum_topic`, inline keyboards, `message_thread_id`). Если окажется тяжёлым, запасной путь как у hdcd-telegram: голый `reqwest` к Bot API.
 - MCP stdio: без крейта, свой JSON-RPC на `serde_json` поверх stdin/stdout. `rmcp` не брать: experimental capabilities и кастомные нотификации там проходят через generic-слой, проще и прозрачнее написать 200 строк самим.
 - hub <-> agent: `tokio-tungstenite` (ws) или простой newline-JSON по TCP. Начать с TCP newline-JSON, ws добавить только если понадобится браузер.
-- Транскрипт: `serde_json` построчно, без своих типов на весь jsonl, только нужные поля через `#[serde(default)]`.
+- Транскрипт: `serde_json` построчно, без своих типов на весь jsonl, только нужные поля через `#[serde(default)]`; `unicode-segmentation` для безопасной разбивки (TASK-006).
 
 ```
 Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) -->  agent (per session)
@@ -101,7 +101,7 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
 - `renderBrief(turns)`: промпты пользователя, финальный текст ассистента, вызовы инструментов в одну строку (`Bash: описание`, `Edit: file`). Вызов `Agent` показывается как `↳ <type> <agent_id>` с кратким итогом субагента.
 - `renderFull(turns)`: плюс входы инструментов и результаты с обрезкой, без thinking. Субагенты разворачиваются в своём кратком виде, не в полном.
 - Тот же парсер читает `subagents/agent-*.jsonl`, формат записей одинаковый.
-- Разбивка под лимит Telegram 4096 символов, длинное уходит файлом.
+- Разбивка под лимит Telegram 4096, считается в UTF-16 (`transcript::telegram_len`, консервативно при любом правиле сервера), без разреза графем-кластеров; больше 4 кусков уходит файлом. Brief показывает ответом текст с `stop_reason: end_turn` (у субагентов `null` на финальном тексте, там структурный fallback), незавершённый ход помечается «в работе…» (TASK-006).
 - Тесты: фикстуры это обезличенные куски реальных jsonl из `~/.claude/projects`, лежат в `crates/transcript/tests/fixtures/`.
 
 ## Безопасность

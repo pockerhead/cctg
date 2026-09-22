@@ -1,0 +1,9 @@
+diff --git a/C:/Users/user/dev/cctg/Cargo.toml "b/C:\\Users\\user\\AppData\\Local\\Temp/cctg-rev2-ws/Cargo.toml"
+index b8f75b9..9a755d8 100644
+--- a/C:/Users/user/dev/cctg/Cargo.toml
++++ "b/C:\\Users\\user\\AppData\\Local\\Temp/cctg-rev2-ws/Cargo.toml"
+@@ -13,3 +13,4 @@ serde_json = "1"
+ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+ tracing = "0.1"
+ tracing-subscriber = "0.3"
++unicode-segmentation = "1.13.3"

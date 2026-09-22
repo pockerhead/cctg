@@ -1,0 +1,1131 @@
+diff --git a/crates/transcript/src/lib.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/lib.rs
+index 2f896c7..058f0ae 100644
+--- a/crates/transcript/src/lib.rs
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/lib.rs
+@@ -8,6 +8,12 @@
+ use serde::Deserialize;
+ use serde_json::Value;
+ 
++mod render;
++mod split;
++
++pub use render::{IN_PROGRESS_MARKER, render_brief, render_full};
++pub use split::{Chunks, SplitLimits, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
++
+ /// Author of a turn, taken from the record's top-level `type`.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum Role {
+@@ -46,6 +52,9 @@ pub struct Turn {
+     pub blocks: Vec<Block>,
+     pub is_meta: bool,
+     pub is_sidechain: bool,
++    /// `message.stop_reason` when it is a string (`end_turn`, `tool_use`, ...); `None` when absent or null.
++    /// Subagent transcripts set it only on the last record of a response.
++    pub stop_reason: Option<String>,
+ }
+ 
+ #[derive(Default, Deserialize)]
+@@ -66,6 +75,7 @@ struct RawTurnRecord {
+ #[serde(default)]
+ struct RawMessage {
+     content: Value,
++    stop_reason: Value,
+ }
+ 
+ #[derive(Default, Deserialize)]
+@@ -149,7 +159,12 @@ fn to_turn(record: RawTurnRecord) -> Option<Turn> {
+         .tool_use_result
+         .get("agentId")
+         .and_then(Value::as_str);
+-    let blocks: Vec<Block> = match record.message?.content {
++    let message = record.message?;
++    let stop_reason = match message.stop_reason {
++        Value::String(reason) => Some(reason),
++        _ => None,
++    };
++    let blocks: Vec<Block> = match message.content {
+         Value::String(text) => vec![Block::Text(text)],
+         Value::Array(items) => items
+             .into_iter()
+@@ -165,6 +180,7 @@ fn to_turn(record: RawTurnRecord) -> Option<Turn> {
+         blocks,
+         is_meta: record.is_meta.as_bool().unwrap_or(false),
+         is_sidechain: record.is_sidechain.as_bool().unwrap_or(false),
++        stop_reason,
+     })
+ }
+ 
+diff --git a/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/render.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/render.rs
+new file mode 100644
+index 0000000..088b26e
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/render.rs
+@@ -0,0 +1,237 @@
++//! Plain-text brief and full views of a slice of turns.
++
++use std::collections::HashMap;
++
++use serde_json::Value;
++
++use crate::{Block, Role, Turn};
++
++/// Last line of a rendering whose slice ends while the assistant is still working.
++pub const IN_PROGRESS_MARKER: &str = "в работе…";
++
++const SUMMARY_KEYS: [&str; 8] = [
++    "description",
++    "file_path",
++    "notebook_path",
++    "pattern",
++    "url",
++    "query",
++    "command",
++    "skill",
++];
++const SUMMARY_CHARS: usize = 120;
++const INPUT_CHARS: usize = 500;
++const RESULT_CHARS: usize = 1500;
++const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
++
++/// Prompts, final assistant answers and one line per tool call.
++pub fn render_brief(turns: &[Turn]) -> String {
++    render(turns, false)
++}
++
++/// Brief plus intermediate assistant text, tool inputs and truncated tool results.
++pub fn render_full(turns: &[Turn]) -> String {
++    render(turns, true)
++}
++
++fn render(turns: &[Turn], full: bool) -> String {
++    let calls = tool_calls(turns);
++    let agents = agent_ids(turns);
++    let tool_after = tool_after(turns);
++    let mut out = String::new();
++    let mut finished = true;
++    let mut any = false;
++    for (turn, &tool_after) in turns.iter().zip(&tool_after) {
++        for block in &turn.blocks {
++            match (turn.role, block) {
++                (Role::User, Block::Text(text)) => {
++                    let Some(prompt) = prompt_text(turn, text) else {
++                        continue;
++                    };
++                    if !out.is_empty() {
++                        out.push('\n');
++                    }
++                    push_line(&mut out, &format!("> {prompt}"));
++                    finished = prompt.starts_with(INTERRUPT_PREFIX);
++                    any = true;
++                }
++                (Role::Assistant, Block::Text(text)) => {
++                    let text = text.trim();
++                    if text.is_empty() {
++                        continue;
++                    }
++                    let is_final = is_final(turn, tool_after);
++                    if full || is_final {
++                        push_line(&mut out, text);
++                    }
++                    finished = is_final;
++                    any = true;
++                }
++                (_, Block::ToolUse { id, name, input }) => {
++                    push_line(&mut out, &tool_line(name, input, agents.get(id.as_str())));
++                    if full {
++                        push_line(
++                            &mut out,
++                            &indent(&truncate(&input.to_string(), INPUT_CHARS)),
++                        );
++                    }
++                    finished = false;
++                    any = true;
++                }
++                (
++                    _,
++                    Block::ToolResult {
++                        tool_use_id,
++                        content,
++                        is_error,
++                        ..
++                    },
++                ) => {
++                    if full {
++                        let name = calls.get(tool_use_id.as_str()).copied().unwrap_or("tool");
++                        let label = if *is_error { "error" } else { name };
++                        let body = truncate(content.trim(), RESULT_CHARS);
++                        push_line(&mut out, &indent(&format!("← {label}: {body}")));
++                    }
++                    finished = false;
++                    any = true;
++                }
++            }
++        }
++    }
++    if any && !finished {
++        push_line(&mut out, IN_PROGRESS_MARKER);
++    }
++    out
++}
++
++/// Text of a user turn shown as a prompt; `None` for hidden meta records.
++fn prompt_text<'a>(turn: &Turn, text: &'a str) -> Option<&'a str> {
++    let text = text.trim();
++    if text.is_empty() {
++        return None;
++    }
++    if !turn.is_meta {
++        return Some(text);
++    }
++    let inner = text.strip_prefix("<channel")?.strip_suffix("</channel>")?;
++    inner.split_once('>').map(|(_, body)| body.trim())
++}
++
++/// `end_turn` text is the answer, `tool_use` text is not; any other stop reason (null in
++/// subagent transcripts, `stop_sequence`, `refusal`, ...) is the answer unless a tool call follows.
++fn is_final(turn: &Turn, tool_after: bool) -> bool {
++    match turn.stop_reason.as_deref() {
++        Some("end_turn") => true,
++        Some("tool_use") => false,
++        _ => !tool_after,
++    }
++}
++
++/// For each turn: does a tool call appear in it or later, before the next prompt?
++fn tool_after(turns: &[Turn]) -> Vec<bool> {
++    let mut flags = vec![false; turns.len()];
++    let mut seen = false;
++    for (i, turn) in turns.iter().enumerate().rev() {
++        if turn.role == Role::User
++            && turn.blocks.iter().any(|block| match block {
++                Block::Text(text) => prompt_text(turn, text).is_some(),
++                _ => false,
++            })
++        {
++            seen = false;
++        }
++        seen |= turn
++            .blocks
++            .iter()
++            .any(|block| matches!(block, Block::ToolUse { .. }));
++        flags[i] = seen;
++    }
++    flags
++}
++
++fn tool_calls(turns: &[Turn]) -> HashMap<&str, &str> {
++    turns
++        .iter()
++        .flat_map(|turn| &turn.blocks)
++        .filter_map(|block| match block {
++            Block::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
++            _ => None,
++        })
++        .collect()
++}
++
++fn agent_ids(turns: &[Turn]) -> HashMap<&str, &str> {
++    turns
++        .iter()
++        .flat_map(|turn| &turn.blocks)
++        .filter_map(|block| match block {
++            Block::ToolResult {
++                tool_use_id,
++                agent_id: Some(agent_id),
++                ..
++            } => Some((tool_use_id.as_str(), agent_id.as_str())),
++            _ => None,
++        })
++        .collect()
++}
++
++fn tool_line(name: &str, input: &Value, agent_id: Option<&&str>) -> String {
++    let field = |key: &str| {
++        input
++            .get(key)
++            .and_then(Value::as_str)
++            .map(one_line)
++            .filter(|value| !value.is_empty())
++    };
++    if name == "Agent" {
++        let kind = field("subagent_type").unwrap_or_else(|| "agent".to_owned());
++        let mut line = format!("↳ {kind}");
++        if let Some(agent_id) = agent_id {
++            line.push(' ');
++            line.push_str(agent_id);
++        }
++        if let Some(description) = field("description") {
++            line.push_str(": ");
++            line.push_str(&description);
++        }
++        return line;
++    }
++    match SUMMARY_KEYS.iter().find_map(|key| field(key)) {
++        Some(summary) => format!("• {name}: {summary}"),
++        None => format!("• {name}"),
++    }
++}
++
++/// Collapses whitespace runs to one space and cuts to `SUMMARY_CHARS`.
++fn one_line(text: &str) -> String {
++    truncate(
++        &text.split_whitespace().collect::<Vec<_>>().join(" "),
++        SUMMARY_CHARS,
++    )
++}
++
++/// Keeps the first `max` chars and says how many were dropped.
++fn truncate(text: &str, max: usize) -> String {
++    match text.char_indices().nth(max) {
++        None => text.to_owned(),
++        Some((cut, _)) => {
++            let dropped = text[cut..].chars().count();
++            format!("{}… [+{dropped} chars]", &text[..cut])
++        }
++    }
++}
++
++fn indent(text: &str) -> String {
++    text.lines()
++        .map(|line| format!("  {line}"))
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++fn push_line(out: &mut String, line: &str) {
++    if !out.is_empty() {
++        out.push('\n');
++    }
++    out.push_str(line);
++}
+diff --git a/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/split.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/split.rs
+new file mode 100644
+index 0000000..7a138d2
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/src/split.rs
+@@ -0,0 +1,154 @@
++//! Splitting rendered text into Telegram-sized plain-text messages.
++
++/// Bot API `sendMessage` text limit.
++pub const TELEGRAM_TEXT_LIMIT: usize = 4096;
++
++/// Length in UTF-16 code units. It never undercounts Unicode code points, so a chunk that fits by this
++/// measure also fits a code-point limit.
++pub fn telegram_len(text: &str) -> usize {
++    text.chars().map(char::len_utf16).sum()
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SplitLimits {
++    /// Maximum `telegram_len` of one chunk; values below 2 are treated as 2.
++    pub chunk_len: usize,
++    /// More chunks than this sets `Chunks::prefer_file`.
++    pub max_chunks: usize,
++}
++
++impl Default for SplitLimits {
++    fn default() -> Self {
++        Self {
++            chunk_len: TELEGRAM_TEXT_LIMIT,
++            max_chunks: 4,
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Chunks {
++    /// Non-blank pieces in order, each within `chunk_len`.
++    pub chunks: Vec<String>,
++    /// True when `chunks.len() > max_chunks`: send the whole text as a document instead.
++    pub prefer_file: bool,
++}
++
++/// Splits at blank lines first, then at line breaks, then inside a line.
++pub fn split_for_telegram(text: &str, limits: SplitLimits) -> Chunks {
++    let limit = limits.chunk_len.max(2);
++    let mut packer = Packer {
++        limit,
++        chunks: Vec::new(),
++        current: String::new(),
++        current_len: 0,
++    };
++    for paragraph in text.split("\n\n") {
++        let len = telegram_len(paragraph);
++        if len <= limit {
++            packer.add(paragraph, len, "\n\n");
++            continue;
++        }
++        for line in paragraph.split('\n') {
++            let len = telegram_len(line);
++            if len <= limit {
++                packer.add(line, len, "\n");
++                continue;
++            }
++            let mut rest = line;
++            while !rest.is_empty() {
++                let (piece, tail) = rest.split_at(hard_cut(rest, limit));
++                packer.add(piece, telegram_len(piece), "");
++                rest = tail;
++            }
++        }
++    }
++    packer.flush();
++    let prefer_file = packer.chunks.len() > limits.max_chunks;
++    Chunks {
++        chunks: packer.chunks,
++        prefer_file,
++    }
++}
++
++struct Packer {
++    limit: usize,
++    chunks: Vec<String>,
++    current: String,
++    current_len: usize,
++}
++
++impl Packer {
++    fn add(&mut self, piece: &str, len: usize, separator: &str) {
++        if piece.trim().is_empty() {
++            return;
++        }
++        if self.current.is_empty() {
++            self.start(piece, len);
++        } else if self.current_len + separator.len() + len <= self.limit {
++            self.current.push_str(separator);
++            self.current.push_str(piece);
++            self.current_len += separator.len() + len;
++        } else {
++            self.flush();
++            self.start(piece, len);
++        }
++    }
++
++    fn start(&mut self, piece: &str, len: usize) {
++        self.current.push_str(piece);
++        self.current_len = len;
++    }
++
++    fn flush(&mut self) {
++        if !self.current.trim().is_empty() {
++            self.chunks.push(std::mem::take(&mut self.current));
++        }
++        self.current.clear();
++        self.current_len = 0;
++    }
++}
++
++/// Byte index (> 0, a char boundary) where a line longer than `limit` is cut.
++/// Prefers just after the last whitespace in the second half of the window, and never cuts next to
++/// an emoji joiner or modifier when a safe point exists nearby.
++fn hard_cut(line: &str, limit: usize) -> usize {
++    let mut units = 0;
++    let mut end = 0;
++    for (index, c) in line.char_indices() {
++        if units + c.len_utf16() > limit {
++            break;
++        }
++        units += c.len_utf16();
++        end = index + c.len_utf8();
++    }
++    if end >= line.len() {
++        return line.len();
++    }
++    let window = &line[..end];
++    if let Some((index, c)) = window.char_indices().rev().find(|(_, c)| c.is_whitespace())
++        && index >= end / 2
++    {
++        return index + c.len_utf8();
++    }
++    let mut cut = end;
++    for _ in 0..16 {
++        let before = line[..cut].chars().next_back();
++        let at = line[cut..].chars().next();
++        if !(before.is_some_and(is_joiner) || at.is_some_and(is_joiner)) {
++            return cut;
++        }
++        match before {
++            Some(c) if cut > c.len_utf8() => cut -= c.len_utf8(),
++            _ => break,
++        }
++    }
++    end
++}
++
++/// Characters that glue to a neighbour: ZWJ, variation selectors, keycap, skin tones, tags, combining marks.
++fn is_joiner(c: char) -> bool {
++    matches!(c,
++        '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}'
++        | '\u{E0020}'..='\u{E007F}' | '\u{0300}'..='\u{036F}')
++}
+diff --git a/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/fixtures/final_answer.jsonl b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/fixtures/final_answer.jsonl
+new file mode 100644
+index 0000000..47dfdf9
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/fixtures/final_answer.jsonl
+@@ -0,0 +1,12 @@
++{"parentUuid":null,"isSidechain":false,"promptId":"redacted","type":"user","message":{"role":"user","content":"Check the build 🚀 and explain."},"uuid":"00000000-0000-4000-8000-000000000001","timestamp":"2026-01-01T00:00:01.000Z","permissionMode":"redacted","promptSource":"redacted","turnOrigin":"redacted","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000001","isSidechain":false,"message":{"model":"claude-opus-5-5","id":"msg_demoA","type":"message","role":"assistant","content":[{"type":"text","text":"Let me run the tests first."}],"container":null,"stop_reason":"tool_use","stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":37150,"cache_read_input_tokens":29951,"output_tokens":320,"output_tokens_details":{"thinking_tokens":66},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"redacted","cache_creation":{"ephemeral_1h_input_tokens":37150,"ephemeral_5m_input_tokens":0},"inference_geo":"redacted","iterations":[{"input_tokens":2,"output_tokens":320,"cache_read_input_tokens":29951,"cache_creation_input_tokens":37150,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":37150},"type":"redacted"}],"speed":"redacted"},"input_transformations":[],"diagnostics":null,"context_management":null},"serverClassifierRequest":"redacted","apiBlockIndex":1,"requestId":"redacted","type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","timestamp":"2026-01-01T00:00:02.000Z","advisorModel":"redacted","effort":"redacted","perTurnEffort":"redacted","session_id":"00000000-0000-4000-8000-000000000000","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000002","isSidechain":false,"message":{"model":"claude-opus-5-5","id":"msg_demoA","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_demo31","name":"Bash","input":{"command":"cargo test --workspace","description":"Run workspace tests"},"caller":{"type":"redacted"}}],"container":null,"stop_reason":"tool_use","stop_sequence":null,"stop_details":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":24532,"cache_read_input_tokens":21687,"output_tokens":326,"output_tokens_details":{"thinking_tokens":182},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"redacted","cache_creation":{"ephemeral_1h_input_tokens":24532,"ephemeral_5m_input_tokens":0},"inference_geo":"redacted","iterations":[{"input_tokens":10,"output_tokens":326,"cache_read_input_tokens":21687,"cache_creation_input_tokens":24532,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":24532},"type":"redacted"}],"speed":"redacted"},"input_transformations":[],"diagnostics":null,"context_management":null},"wireToolInputs":{"key0":{"command":"redacted","description":"redacted"}},"apiBlockIndex":1,"requestId":"redacted","type":"assistant","uuid":"00000000-0000-4000-8000-000000000003","timestamp":"2026-01-01T00:00:03.000Z","perTurnEffort":null,"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000003","isSidechain":false,"promptId":"redacted","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_demo31","type":"tool_result","content":"test result: ok. 27 passed","is_error":false}]},"uuid":"00000000-0000-4000-8000-000000000004","timestamp":"2026-01-01T00:00:04.000Z","toolUseResult":{"stdout":"redacted","stderr":"redacted","interrupted":false,"isImage":false,"noOutputExpected":false},"sourceToolAssistantUUID":"00000000-0000-4000-8000-000000000003","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000004","isSidechain":false,"message":{"model":"claude-opus-5-5","id":"msg_demoB","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"SECRET-THINKING-MARKER final","signature":"SECRET-SIGNATURE-MARKER"}],"container":null,"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":378,"cache_read_input_tokens":46219,"output_tokens":59,"output_tokens_details":{"thinking_tokens":53},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"redacted","cache_creation":{"ephemeral_1h_input_tokens":378,"ephemeral_5m_input_tokens":0},"inference_geo":"redacted","iterations":[{"input_tokens":8,"output_tokens":59,"cache_read_input_tokens":46219,"cache_creation_input_tokens":378,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":378},"type":"redacted"}],"speed":"redacted"},"input_transformations":[],"diagnostics":null,"context_management":null},"apiBlockIndex":0,"requestId":"redacted","type":"assistant","uuid":"00000000-0000-4000-8000-000000000005","timestamp":"2026-01-01T00:00:05.000Z","perTurnEffort":null,"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000005","isSidechain":false,"message":{"model":"claude-opus-5-5","id":"msg_demoB","type":"message","role":"assistant","content":[{"type":"text","text":"All 27 tests pass. Готово."}],"container":null,"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":378,"cache_read_input_tokens":46219,"output_tokens":59,"output_tokens_details":{"thinking_tokens":53},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"redacted","cache_creation":{"ephemeral_1h_input_tokens":378,"ephemeral_5m_input_tokens":0},"inference_geo":"redacted","iterations":[{"input_tokens":8,"output_tokens":59,"cache_read_input_tokens":46219,"cache_creation_input_tokens":378,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":378},"type":"redacted"}],"speed":"redacted"},"input_transformations":[],"diagnostics":null,"context_management":null},"apiBlockIndex":1,"requestId":"redacted","type":"assistant","uuid":"00000000-0000-4000-8000-000000000006","timestamp":"2026-01-01T00:00:06.000Z","perTurnEffort":null,"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000006","isSidechain":false,"promptId":"redacted","type":"user","message":{"role":"user","content":"<local-command-caveat>Caveat: demo meta record.</local-command-caveat>"},"isMeta":true,"uuid":"00000000-0000-4000-8000-000000000007","timestamp":"2026-01-01T00:00:07.000Z","session_id":"00000000-0000-4000-8000-000000000000","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main","slug":"redacted"}
++{"parentUuid":"00000000-0000-4000-8000-000000000007","isSidechain":false,"promptId":"redacted","type":"user","message":{"role":"user","content":"<channel source=\"cctg\" chat_id=\"demo\" message_id=\"7\">Explore the crate</channel>"},"isMeta":true,"uuid":"00000000-0000-4000-8000-000000000008","timestamp":"2026-01-01T00:00:08.000Z","permissionMode":"redacted","origin":{"kind":"redacted","server":"redacted"},"promptSource":"redacted","turnOrigin":"redacted","queueSkipAttachments":true,"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000008","isSidechain":false,"message":{"model":"claude-opus-5-5","id":"msg_demoC","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_demo32","name":"Agent","input":{"description":"Explore crate","prompt":"List the modules.","subagent_type":"Explore"},"caller":{"type":"redacted"}}],"container":null,"stop_reason":"tool_use","stop_sequence":null,"stop_details":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":24532,"cache_read_input_tokens":21687,"output_tokens":326,"output_tokens_details":{"thinking_tokens":182},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"redacted","cache_creation":{"ephemeral_1h_input_tokens":24532,"ephemeral_5m_input_tokens":0},"inference_geo":"redacted","iterations":[{"input_tokens":10,"output_tokens":326,"cache_read_input_tokens":21687,"cache_creation_input_tokens":24532,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":24532},"type":"redacted"}],"speed":"redacted"},"input_transformations":[],"diagnostics":null,"context_management":null},"wireToolInputs":{"key0":{"command":"redacted","description":"redacted"}},"apiBlockIndex":1,"requestId":"redacted","type":"assistant","uuid":"00000000-0000-4000-8000-000000000009","timestamp":"2026-01-01T00:00:09.000Z","perTurnEffort":null,"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000009","isSidechain":false,"promptId":"redacted","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_demo32","type":"tool_result","content":[{"type":"text","text":"Modules: lib, render, split."},{"type":"text","text":"agentId: a0000000000000002"}]}]},"uuid":"00000000-0000-4000-8000-000000000010","timestamp":"2026-01-01T00:00:10.000Z","toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a0000000000000002","description":"redacted","resolvedModel":"redacted","prompt":"redacted","outputFile":"redacted","canReadOutputFile":true},"serverClassifierContext":{"request":"redacted","context":{"git_state":{"cwd":"redacted","root":"redacted","branch":"redacted","default_branch":null,"status":{"clean":false,"counts":{"staged":0,"modified":0,"untracked":null,"untracked_normal":3},"porcelain":null,"truncated":false},"visibility":{"origin":null,"push_remote":"redacted","remotes":[],"visibility_cache":[]}},"live_cwd":"redacted","platform":"redacted"}},"sourceToolAssistantUUID":"00000000-0000-4000-8000-000000000009","session_id":"00000000-0000-4000-8000-000000000000","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000010","isSidechain":false,"message":{"model":"claude-opus-5-5","id":"msg_demoD","type":"message","role":"assistant","content":[{"type":"text","text":"The crate has three modules."}],"container":null,"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":378,"cache_read_input_tokens":46219,"output_tokens":59,"output_tokens_details":{"thinking_tokens":53},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"redacted","cache_creation":{"ephemeral_1h_input_tokens":378,"ephemeral_5m_input_tokens":0},"inference_geo":"redacted","iterations":[{"input_tokens":8,"output_tokens":59,"cache_read_input_tokens":46219,"cache_creation_input_tokens":378,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":378},"type":"redacted"}],"speed":"redacted"},"input_transformations":[],"diagnostics":null,"context_management":null},"apiBlockIndex":1,"requestId":"redacted","type":"assistant","uuid":"00000000-0000-4000-8000-000000000011","timestamp":"2026-01-01T00:00:11.000Z","perTurnEffort":null,"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
++{"parentUuid":"00000000-0000-4000-8000-000000000011","isSidechain":false,"attachment":{"type":"redacted","snapshot":{"workingDirectory":"redacted","isWorktree":false,"isGitRepo":true,"additionalWorkingDirectories":["redacted"],"platform":"redacted","shell":"redacted","osVersion":"redacted"}},"type":"attachment","uuid":"00000000-0000-4000-8000-000000000012","timestamp":"2026-01-01T00:00:12.000Z","rendered":[{"content":"redacted"}],"userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.278","gitBranch":"main"}
+diff --git a/crates/transcript/tests/parse_fixtures.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/parse_fixtures.rs
+index e5d411a..2a97cd2 100644
+--- a/crates/transcript/tests/parse_fixtures.rs
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/parse_fixtures.rs
+@@ -7,13 +7,15 @@ const THINKING_AI_TITLE: &str = include_str!("fixtures/thinking_ai_title.jsonl")
+ const SIDECHAIN: &str = include_str!("fixtures/sidechain.jsonl");
+ const STRING_CONTENT: &str = include_str!("fixtures/string_content.jsonl");
+ const NULL_FIELDS: &str = include_str!("fixtures/null_fields.jsonl");
+-const ALL: [&str; 6] = [
++const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
++const ALL: [&str; 7] = [
+     PLAIN_TEXT,
+     TOOL_USE_RESULT,
+     THINKING_AI_TITLE,
+     SIDECHAIN,
+     STRING_CONTENT,
+     NULL_FIELDS,
++    FINAL_ANSWER,
+ ];
+ 
+ fn turn(role: Role, block: Block) -> Turn {
+@@ -22,6 +24,14 @@ fn turn(role: Role, block: Block) -> Turn {
+         blocks: vec![block],
+         is_meta: false,
+         is_sidechain: false,
++        stop_reason: None,
++    }
++}
++
++fn stopped(reason: &str, turn: Turn) -> Turn {
++    Turn {
++        stop_reason: Some(reason.to_owned()),
++        ..turn
+     }
+ }
+ 
+@@ -52,7 +62,10 @@ fn plain_text_fixture() {
+         parse(PLAIN_TEXT),
+         vec![
+             turn(Role::User, text("Summarize the build status.")),
+-            turn(Role::Assistant, text("The build is green.")),
++            stopped(
++                "tool_use",
++                turn(Role::Assistant, text("The build is green."))
++            ),
+         ]
+     );
+     assert_eq!(ai_title(PLAIN_TEXT), None);
+@@ -63,49 +76,61 @@ fn tool_use_result_fixture() {
+     assert_eq!(
+         parse(TOOL_USE_RESULT),
+         vec![
+-            turn(
+-                Role::Assistant,
+-                tool_use(
+-                    "toolu_demo01",
+-                    "Bash",
+-                    json!({"command": "cargo test", "description": "Run tests"})
+-                )
++            stopped(
++                "tool_use",
++                turn(
++                    Role::Assistant,
++                    tool_use(
++                        "toolu_demo01",
++                        "Bash",
++                        json!({"command": "cargo test", "description": "Run tests"})
++                    )
++                ),
+             ),
+             turn(
+                 Role::User,
+                 tool_result("toolu_demo01", "test result: ok", false, None)
+             ),
+-            turn(
+-                Role::Assistant,
+-                tool_use(
+-                    "toolu_demo02",
+-                    "Read",
+-                    json!({"file_path": r"C:\work\demo\src\lib.rs"})
+-                )
++            stopped(
++                "tool_use",
++                turn(
++                    Role::Assistant,
++                    tool_use(
++                        "toolu_demo02",
++                        "Read",
++                        json!({"file_path": r"C:\work\demo\src\lib.rs"})
++                    )
++                ),
+             ),
+             turn(
+                 Role::User,
+                 tool_result("toolu_demo02", "fn main() {}", false, None)
+             ),
+-            turn(
+-                Role::Assistant,
+-                tool_use(
+-                    "toolu_demo10",
+-                    "Bash",
+-                    json!({"command": "false", "description": "Fail on purpose"})
+-                )
++            stopped(
++                "tool_use",
++                turn(
++                    Role::Assistant,
++                    tool_use(
++                        "toolu_demo10",
++                        "Bash",
++                        json!({"command": "false", "description": "Fail on purpose"})
++                    )
++                ),
+             ),
+             turn(
+                 Role::User,
+                 tool_result("toolu_demo10", "Exit code 1", true, None)
+             ),
+-            turn(
+-                Role::Assistant,
+-                tool_use(
+-                    "toolu_demo20",
+-                    "Agent",
+-                    json!({"description": "Explore crate", "prompt": "List the modules.", "subagent_type": "Explore"})
+-                )
++            stopped(
++                "tool_use",
++                turn(
++                    Role::Assistant,
++                    tool_use(
++                        "toolu_demo20",
++                        "Agent",
++                        json!({"description": "Explore crate", "prompt": "List the modules.", "subagent_type": "Explore"})
++                    )
++                ),
+             ),
+             turn(
+                 Role::User,
+@@ -126,7 +151,10 @@ fn thinking_ai_title_fixture() {
+         parse(THINKING_AI_TITLE),
+         vec![
+             turn(Role::User, text("Why does the parser test flake?")),
+-            turn(Role::Assistant, text("The test depends on HashMap order.")),
++            stopped(
++                "tool_use",
++                turn(Role::Assistant, text("The test depends on HashMap order."))
++            ),
+         ]
+     );
+     assert_eq!(
+@@ -192,6 +220,7 @@ fn null_string_fields_fixture() {
+             ],
+             is_meta: false,
+             is_sidechain: false,
++            stop_reason: None,
+         }]
+     );
+ }
+@@ -247,3 +276,27 @@ fn privacy_detectors_fire() {
+     assert!(has_supergroup_id("chat -1001234567890"));
+     assert!(has_private_path("c:\\users\\someone"));
+ }
++
++#[test]
++fn final_answer_fixture_stop_reasons() {
++    let stops: Vec<(Role, Option<String>)> = parse(FINAL_ANSWER)
++        .into_iter()
++        .map(|turn| (turn.role, turn.stop_reason))
++        .collect();
++    let s = |reason: &str| Some(reason.to_owned());
++    assert_eq!(
++        stops,
++        [
++            (Role::User, None),
++            (Role::Assistant, s("tool_use")),
++            (Role::Assistant, s("tool_use")),
++            (Role::User, None),
++            (Role::Assistant, s("end_turn")),
++            (Role::User, None),
++            (Role::User, None),
++            (Role::Assistant, s("tool_use")),
++            (Role::User, None),
++            (Role::Assistant, s("end_turn")),
++        ]
++    );
++}
+diff --git a/crates/transcript/tests/parse_tolerance.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/parse_tolerance.rs
+index cd2c60c..98692a8 100644
+--- a/crates/transcript/tests/parse_tolerance.rs
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/parse_tolerance.rs
+@@ -243,3 +243,25 @@ fn garbage_never_panics() {
+     let _ = parse(&all);
+     let _ = ai_title(&all);
+ }
++
++#[test]
++fn stop_reason_is_tolerant() {
++    let stop = |message: &str| {
++        let line = format!(r#"{{"type":"assistant","message":{{"content":"x"{message}}}}}"#);
++        let turns = parse(&line);
++        assert_eq!(turns.len(), 1, "{line}");
++        turns[0].stop_reason.clone()
++    };
++    assert_eq!(
++        stop(r#","stop_reason":"end_turn""#).as_deref(),
++        Some("end_turn")
++    );
++    assert_eq!(
++        stop(r#","stop_reason":"tool_use""#).as_deref(),
++        Some("tool_use")
++    );
++    assert_eq!(stop(""), None);
++    assert_eq!(stop(r#","stop_reason":null"#), None);
++    assert_eq!(stop(r#","stop_reason":7"#), None);
++    assert_eq!(stop(r#","stop_reason":{"a":1}"#), None);
++}
+diff --git a/crates/transcript/tests/purity.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/purity.rs
+index 4b8062e..fbb93b4 100644
+--- a/crates/transcript/tests/purity.rs
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/purity.rs
+@@ -1,4 +1,8 @@
+-const LIB: &str = include_str!("../src/lib.rs");
++const SOURCES: [(&str, &str); 3] = [
++    ("lib.rs", include_str!("../src/lib.rs")),
++    ("render.rs", include_str!("../src/render.rs")),
++    ("split.rs", include_str!("../src/split.rs")),
++];
+ const MANIFEST: &str = include_str!("../Cargo.toml");
+ 
+ fn code_without_line_comments(source: &str) -> String {
+@@ -15,8 +19,27 @@ fn contains_identifier(source: &str, identifier: &str) -> bool {
+         .any(|token| token == identifier)
+ }
+ 
++#[test]
++fn every_source_file_is_scanned() {
++    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
++    let mut found: Vec<String> = std::fs::read_dir(dir)
++        .unwrap()
++        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
++        .collect();
++    found.sort();
++    let mut scanned: Vec<&str> = SOURCES.iter().map(|(name, _)| *name).collect();
++    scanned.sort();
++    assert_eq!(found, scanned);
++}
++
+ #[test]
+ fn library_source_has_no_io_or_panicking_calls() {
++    for (name, source) in SOURCES {
++        assert_no_forbidden(name, source);
++    }
++}
++
++fn assert_no_forbidden(name: &str, source: &str) {
+     for forbidden in [
+         "std::fs",
+         "std::io",
+@@ -38,10 +61,13 @@ fn library_source_has_no_io_or_panicking_calls() {
+         "unimplemented!",
+         "#[cfg(test)]",
+     ] {
+-        assert!(!LIB.contains(forbidden), "src/lib.rs contains {forbidden}");
++        assert!(
++            !source.contains(forbidden),
++            "src/{name} contains {forbidden}"
++        );
+     }
+     assert!(!contains_identifier(
+-        &code_without_line_comments(LIB),
++        &code_without_line_comments(source),
+         "unsafe"
+     ));
+ }
+diff --git a/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/render.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/render.rs
+new file mode 100644
+index 0000000..f3c1048
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/render.rs
+@@ -0,0 +1,233 @@
++use std::time::{Duration, Instant};
++
++use serde_json::json;
++use transcript::{
++    Block, IN_PROGRESS_MARKER, Role, SplitLimits, Turn, parse, render_brief, render_full,
++    split_for_telegram,
++};
++
++const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
++const THINKING_AI_TITLE: &str = include_str!("fixtures/thinking_ai_title.jsonl");
++const TOOL_USE_RESULT: &str = include_str!("fixtures/tool_use_result.jsonl");
++const SIDECHAIN: &str = include_str!("fixtures/sidechain.jsonl");
++const ALL: [&str; 7] = [
++    FINAL_ANSWER,
++    THINKING_AI_TITLE,
++    TOOL_USE_RESULT,
++    SIDECHAIN,
++    include_str!("fixtures/plain_text.jsonl"),
++    include_str!("fixtures/string_content.jsonl"),
++    include_str!("fixtures/null_fields.jsonl"),
++];
++
++const FINAL_ANSWER_BRIEF: &str = "\
++> Check the build \u{1F680} and explain.
++• Bash: Run workspace tests
++All 27 tests pass. Готово.
++
++> Explore the crate
++↳ Explore a0000000000000002: Explore crate
++The crate has three modules.";
++
++const FINAL_ANSWER_FULL: &str = r#"> Check the build 🚀 and explain.
++Let me run the tests first.
++• Bash: Run workspace tests
++  {"command":"cargo test --workspace","description":"Run workspace tests"}
++  ← Bash: test result: ok. 27 passed
++All 27 tests pass. Готово.
++
++> Explore the crate
++↳ Explore a0000000000000002: Explore crate
++  {"description":"Explore crate","prompt":"List the modules.","subagent_type":"Explore"}
++  ← Agent: Modules: lib, render, split.
++  agentId: a0000000000000002
++The crate has three modules."#;
++
++fn turn(role: Role, stop: Option<&str>, blocks: Vec<Block>) -> Turn {
++    Turn {
++        role,
++        blocks,
++        is_meta: false,
++        is_sidechain: false,
++        stop_reason: stop.map(str::to_owned),
++    }
++}
++
++fn prompt(text: &str) -> Turn {
++    turn(Role::User, None, vec![Block::Text(text.to_owned())])
++}
++
++fn say(stop: Option<&str>, text: &str) -> Turn {
++    turn(Role::Assistant, stop, vec![Block::Text(text.to_owned())])
++}
++
++fn bash(id: &str, command: &str) -> Turn {
++    turn(
++        Role::Assistant,
++        Some("tool_use"),
++        vec![Block::ToolUse {
++            id: id.to_owned(),
++            name: "Bash".to_owned(),
++            input: json!({ "command": command }),
++        }],
++    )
++}
++
++fn result(id: &str, content: &str) -> Turn {
++    turn(
++        Role::User,
++        None,
++        vec![Block::ToolResult {
++            tool_use_id: id.to_owned(),
++            content: content.to_owned(),
++            is_error: false,
++            agent_id: None,
++        }],
++    )
++}
++
++#[test]
++fn final_answer_fixture_brief_and_full() {
++    let turns = parse(FINAL_ANSWER);
++    assert_eq!(render_brief(&turns), FINAL_ANSWER_BRIEF);
++    assert_eq!(render_full(&turns), FINAL_ANSWER_FULL);
++}
++
++#[test]
++fn brief_has_one_line_per_tool_call_and_no_io() {
++    let turns = parse(TOOL_USE_RESULT);
++    let brief = render_brief(&turns);
++    assert_eq!(
++        brief,
++        "• Bash: Run tests\n• Read: C:\\work\\demo\\src\\lib.rs\n• Bash: Fail on purpose\n\
++         ↳ Explore a0000000000000001: Explore crate\n{IN_PROGRESS_MARKER}"
++            .replace("{IN_PROGRESS_MARKER}", IN_PROGRESS_MARKER)
++    );
++    assert!(!brief.contains("test result: ok"));
++    assert!(!brief.contains("cargo test"));
++    let full = render_full(&turns);
++    assert!(full.contains("  ← Bash: test result: ok"));
++    assert!(full.contains("  ← error: Exit code 1"));
++    assert!(full.contains(r#"  {"command":"cargo test","description":"Run tests"}"#));
++}
++
++#[test]
++fn thinking_never_rendered() {
++    for src in ALL {
++        let turns = parse(src);
++        for shown in [render_brief(&turns), render_full(&turns)] {
++            assert!(!shown.contains("SECRET-THINKING-MARKER"));
++            assert!(!shown.contains("SECRET-SIGNATURE-MARKER"));
++        }
++    }
++}
++
++#[test]
++fn unfinished_tail_is_marked_in_progress() {
++    // real fixture: the last record is a text block with stop_reason "tool_use"
++    let turns = parse(THINKING_AI_TITLE);
++    let expected = format!("> Why does the parser test flake?\n{IN_PROGRESS_MARKER}");
++    assert_eq!(render_brief(&turns), expected);
++    assert!(render_full(&turns).contains("The test depends on HashMap order."));
++    // a prompt with no answer yet, and a pending tool call
++    assert_eq!(
++        render_brief(&[prompt("go")]),
++        format!("> go\n{IN_PROGRESS_MARKER}")
++    );
++    assert!(render_brief(&[prompt("go"), bash("t1", "ls")]).ends_with(IN_PROGRESS_MARKER));
++    assert!(
++        render_brief(&[prompt("go"), bash("t1", "ls"), result("t1", "ok")])
++            .ends_with(IN_PROGRESS_MARKER)
++    );
++}
++
++#[test]
++fn finished_exchanges_have_no_marker() {
++    let done = [
++        prompt("go"),
++        say(Some("tool_use"), "checking"),
++        bash("t1", "ls"),
++        result("t1", "ok"),
++        say(Some("end_turn"), "done"),
++    ];
++    assert_eq!(render_brief(&done), "> go\n• Bash: ls\ndone");
++    assert_eq!(render_brief(&[]), "");
++    assert_eq!(
++        render_brief(&[prompt("go"), prompt("[Request interrupted by user]")]),
++        "> go\n\n> [Request interrupted by user]"
++    );
++}
++
++#[test]
++fn null_stop_reason_falls_back_to_structure() {
++    // subagent transcripts: stop_reason is null on every record except the last of a response
++    let turns = parse(SIDECHAIN);
++    assert_eq!(
++        render_brief(&turns),
++        "> List the modules of the crate.\nModules: lib, parse."
++    );
++    let intermediate = [prompt("go"), say(None, "looking"), bash("t1", "ls")];
++    assert_eq!(
++        render_brief(&intermediate),
++        format!("> go\n• Bash: ls\n{IN_PROGRESS_MARKER}")
++    );
++}
++
++#[test]
++fn full_truncates_long_results_safely() {
++    let long = "я".repeat(5000);
++    let full = render_full(&[prompt("go"), bash("t1", "ls"), result("t1", &long)]);
++    assert!(full.contains("… [+3500 chars]"));
++    assert!(full.chars().count() < 2000);
++}
++
++#[test]
++fn slices_render_independently() {
++    let turns = parse(FINAL_ANSWER);
++    let head = render_brief(&turns[..6]);
++    let tail = render_brief(&turns[6..]);
++    assert_eq!(format!("{head}\n\n{tail}"), FINAL_ANSWER_BRIEF);
++}
++
++fn synthetic(exchanges: usize) -> Vec<Turn> {
++    let mut turns = Vec::with_capacity(exchanges * 4);
++    for i in 0..exchanges {
++        let id = format!("t{i}");
++        turns.push(prompt(&format!("prompt {i} with some words 🚀")));
++        turns.push(bash(&id, &format!("cargo test -p crate{i}")));
++        turns.push(result(&id, &"line of output\n".repeat(20)));
++        turns.push(say(Some("end_turn"), &format!("answer {i} ").repeat(10)));
++    }
++    turns
++}
++
++fn best_of_three(turns: &[Turn]) -> Duration {
++    (0..3)
++        .map(|_| {
++            let start = Instant::now();
++            let brief = render_brief(turns);
++            let full = render_full(turns);
++            let chunks = split_for_telegram(&full, SplitLimits::default());
++            assert!(!brief.is_empty() && !chunks.chunks.is_empty());
++            start.elapsed()
++        })
++        .min()
++        .unwrap_or_default()
++}
++
++#[test]
++fn five_thousand_turns_render_in_linear_time() {
++    let small = synthetic(1250); // 5000 turns
++    let large = synthetic(5000); // 20000 turns
++    let t_small = best_of_three(&small);
++    let t_large = best_of_three(&large);
++    assert!(
++        t_small < Duration::from_secs(2),
++        "5000 turns took {t_small:?}"
++    );
++    // 4x input: measured ~4.2x linear; an injected O(n) scan per line gave ~12x
++    assert!(
++        t_large < t_small * 8 + Duration::from_millis(50),
++        "{t_small:?} -> {t_large:?}"
++    );
++}
+diff --git a/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/split.rs b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/split.rs
+new file mode 100644
+index 0000000..5c791e9
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-006/scratch/planner/proto/transcript/tests/split.rs
+@@ -0,0 +1,134 @@
++use transcript::{Chunks, SplitLimits, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
++
++fn split(text: &str) -> Chunks {
++    split_for_telegram(text, SplitLimits::default())
++}
++
++fn assert_valid(text: &str, chunks: &Chunks) {
++    for chunk in &chunks.chunks {
++        assert!(telegram_len(chunk) <= TELEGRAM_TEXT_LIMIT);
++        assert!(chunk.chars().count() <= TELEGRAM_TEXT_LIMIT);
++        assert!(!chunk.trim().is_empty());
++    }
++    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
++    assert_eq!(strip(&chunks.chunks.concat()), strip(text));
++    assert_eq!(&split(text), chunks, "not deterministic");
++}
++
++#[test]
++fn telegram_len_counts_utf16_units() {
++    assert_eq!(telegram_len("abc"), 3);
++    assert_eq!(telegram_len("я"), 1);
++    assert_eq!(telegram_len("\u{1F680}"), 2);
++    assert_eq!(
++        telegram_len("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"),
++        8
++    );
++}
++
++#[test]
++fn short_text_is_one_chunk() {
++    let chunks = split("hello\n\nworld");
++    assert_eq!(chunks.chunks, ["hello\n\nworld"]);
++    assert!(!chunks.prefer_file);
++    assert_eq!(split("").chunks, Vec::<String>::new());
++    assert_eq!(split("\n\n  \n").chunks, Vec::<String>::new());
++}
++
++#[test]
++fn exact_limit_fits_and_one_more_splits() {
++    let exact = "a".repeat(TELEGRAM_TEXT_LIMIT);
++    assert_eq!(split(&exact).chunks, vec![exact]);
++    let over = "a".repeat(TELEGRAM_TEXT_LIMIT + 1);
++    let chunks = split(&over);
++    assert_eq!(chunks.chunks.len(), 2);
++    assert_valid(&over, &chunks);
++}
++
++#[test]
++fn prefers_paragraph_then_line_boundaries() {
++    let para = "x".repeat(3000);
++    let text = format!("{para}\n\n{para}\n\n{para}");
++    let chunks = split(&text);
++    assert_eq!(chunks.chunks, [para.clone(), para.clone(), para.clone()]);
++    let lines = format!("{}\n{}", "y".repeat(3000), "z".repeat(3000));
++    assert_eq!(split(&lines).chunks, ["y".repeat(3000), "z".repeat(3000)]);
++}
++
++#[test]
++fn fifty_kb_block_is_deterministic_and_prefers_file() {
++    let block = "0123456789".repeat(5_000);
++    let chunks = split(&block);
++    assert_eq!(chunks.chunks.len(), 13);
++    assert!(chunks.prefer_file);
++    assert_valid(&block, &chunks);
++    let cyrillic = "ж".repeat(25_000); // 50 KB of UTF-8
++    let chunks = split(&cyrillic);
++    assert_eq!(chunks.chunks.len(), 7);
++    assert!(chunks.prefer_file);
++    assert_valid(&cyrillic, &chunks);
++}
++
++#[test]
++fn emoji_on_the_boundary_is_never_cut() {
++    let rocket = "\u{1F680}";
++    let text = format!("{}{rocket}b", "a".repeat(TELEGRAM_TEXT_LIMIT - 1));
++    let chunks = split(&text);
++    assert_eq!(
++        chunks.chunks,
++        ["a".repeat(TELEGRAM_TEXT_LIMIT - 1), format!("{rocket}b")]
++    );
++    assert_valid(&text, &chunks);
++}
++
++#[test]
++fn zwj_sequence_on_the_boundary_stays_whole() {
++    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
++    for pad in TELEGRAM_TEXT_LIMIT - 8..TELEGRAM_TEXT_LIMIT {
++        let text = format!("{}{family}{}", "a".repeat(pad), "b".repeat(10));
++        let chunks = split(&text);
++        assert_valid(&text, &chunks);
++        assert!(
++            chunks.chunks.iter().any(|chunk| chunk.contains(family)),
++            "pad {pad}"
++        );
++    }
++}
++
++#[test]
++fn only_emoji_line_splits_on_char_boundaries() {
++    let text = "\u{1F600}".repeat(5_000);
++    let chunks = split(&text);
++    assert_valid(&text, &chunks);
++    assert_eq!(chunks.chunks.len(), 3);
++    assert_eq!(telegram_len(&chunks.chunks[0]), TELEGRAM_TEXT_LIMIT);
++}
++
++#[test]
++fn tiny_limits_still_make_progress() {
++    for chunk_len in [0, 1, 2, 3] {
++        let limits = SplitLimits {
++            chunk_len,
++            max_chunks: 1,
++        };
++        let chunks = split_for_telegram("a\u{1F680}b c", limits);
++        assert!(
++            chunks
++                .chunks
++                .iter()
++                .all(|chunk| telegram_len(chunk) <= chunk_len.max(2))
++        );
++        assert!(chunks.prefer_file);
++    }
++}
++
++#[test]
++fn threshold_is_configurable() {
++    let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
++    let limits = |max_chunks| SplitLimits {
++        chunk_len: TELEGRAM_TEXT_LIMIT,
++        max_chunks,
++    };
++    assert!(split_for_telegram(&text, limits(1)).prefer_file);
++    assert!(!split_for_telegram(&text, limits(2)).prefer_file);
++}

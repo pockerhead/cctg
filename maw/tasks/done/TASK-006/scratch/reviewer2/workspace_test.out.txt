@@ -1,0 +1,17 @@
+     Running unittests src\main.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\cctg-2b05eae979b99eec.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\stdout.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\stdout-6b568c1b396b3649.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\transcript-ff01b63386760ead.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\parse_fixtures-4cd18e47549126da.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\parse_tolerance-dabebd66b8ba0e18.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\purity-68385d7b703b2db5.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\render-f011d29e783a947f.exe)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-rev2-target-ws\debug\deps\split-627eef4eaa419950.exe)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,25 @@
+diff --git a/C:/Users/user/dev/cctg/Cargo.lock "b/C:\\Users\\user\\AppData\\Local\\Temp/cctg-rev2-ws/Cargo.lock"
+index 984b079..4ee6a91 100644
+--- a/C:/Users/user/dev/cctg/Cargo.lock
++++ "b/C:\\Users\\user\\AppData\\Local\\Temp/cctg-rev2-ws/Cargo.lock"
+@@ -381,6 +381,7 @@ version = "0.1.0"
+ dependencies = [
+  "serde",
+  "serde_json",
++ "unicode-segmentation",
+ ]
+ 
+ [[package]]
+@@ -389,6 +390,12 @@ version = "1.0.26"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+ 
++[[package]]
++name = "unicode-segmentation"
++version = "1.13.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
++
+ [[package]]
+ name = "utf8parse"
+ version = "0.2.2"

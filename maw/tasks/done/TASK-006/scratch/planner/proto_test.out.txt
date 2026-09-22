@@ -1,0 +1,13 @@
+     Running unittests src\lib.rs (C:/Users/user/AppData/Local/Temp/cctg-task006-planner-target\debug\deps\transcript-f154ea74cc2c065c.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_fixtures.rs (C:/Users/user/AppData/Local/Temp/cctg-task006-planner-target\debug\deps\parse_fixtures-0004bcf239de5444.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (C:/Users/user/AppData/Local/Temp/cctg-task006-planner-target\debug\deps\parse_tolerance-7b57b06ff232939d.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (C:/Users/user/AppData/Local/Temp/cctg-task006-planner-target\debug\deps\purity-ce0c896af06c312e.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (C:/Users/user/AppData/Local/Temp/cctg-task006-planner-target\debug\deps\render-9a7c5fa8a0e8938a.exe)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+     Running tests\split.rs (C:/Users/user/AppData/Local/Temp/cctg-task006-planner-target\debug\deps\split-db1e17098b8f38a4.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

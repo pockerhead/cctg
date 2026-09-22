@@ -1,0 +1,9 @@
+[package]
+name = "reviewer2-probe-time"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+transcript = { path = "../proto/transcript" }
+
+[workspace]

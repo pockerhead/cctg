@@ -1,0 +1,9 @@
+[package]
+name = "reviewer2-probe-old"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+transcript = { path = "../../planner/proto/transcript" }
+
+[workspace]

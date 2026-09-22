@@ -1,0 +1,13 @@
+fixtures\final_answer.jsonl 1 user   str
+fixtures\final_answer.jsonl 2 assistant   list
+fixtures\final_answer.jsonl 3 assistant   list
+fixtures\final_answer.jsonl 4 user   list
+fixtures\final_answer.jsonl 5 assistant   list
+fixtures\final_answer.jsonl 6 assistant   list
+fixtures\final_answer.jsonl 7 user meta  str
+fixtures\final_answer.jsonl 8 user meta  str
+fixtures\final_answer.jsonl 9 assistant   list
+fixtures\final_answer.jsonl 10 user   list
+fixtures\final_answer.jsonl 11 assistant   list
+fixtures\final_answer.jsonl 12 attachment   -
+hits 0
