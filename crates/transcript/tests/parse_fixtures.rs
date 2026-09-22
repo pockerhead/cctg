@@ -7,13 +7,17 @@ const THINKING_AI_TITLE: &str = include_str!("fixtures/thinking_ai_title.jsonl")
 const SIDECHAIN: &str = include_str!("fixtures/sidechain.jsonl");
 const STRING_CONTENT: &str = include_str!("fixtures/string_content.jsonl");
 const NULL_FIELDS: &str = include_str!("fixtures/null_fields.jsonl");
-const ALL: [&str; 6] = [
+const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
+const COMPACT_SUMMARY: &str = include_str!("fixtures/compact_summary.jsonl");
+const ALL: [&str; 8] = [
     PLAIN_TEXT,
     TOOL_USE_RESULT,
     THINKING_AI_TITLE,
     SIDECHAIN,
     STRING_CONTENT,
     NULL_FIELDS,
+    FINAL_ANSWER,
+    COMPACT_SUMMARY,
 ];
 
 fn turn(role: Role, block: Block) -> Turn {
@@ -22,6 +26,14 @@ fn turn(role: Role, block: Block) -> Turn {
         blocks: vec![block],
         is_meta: false,
         is_sidechain: false,
+        stop_reason: None,
+    }
+}
+
+fn stopped(reason: &str, turn: Turn) -> Turn {
+    Turn {
+        stop_reason: Some(reason.to_owned()),
+        ..turn
     }
 }
 
@@ -52,7 +64,10 @@ fn plain_text_fixture() {
         parse(PLAIN_TEXT),
         vec![
             turn(Role::User, text("Summarize the build status.")),
-            turn(Role::Assistant, text("The build is green.")),
+            stopped(
+                "tool_use",
+                turn(Role::Assistant, text("The build is green."))
+            ),
         ]
     );
     assert_eq!(ai_title(PLAIN_TEXT), None);
@@ -63,49 +78,61 @@ fn tool_use_result_fixture() {
     assert_eq!(
         parse(TOOL_USE_RESULT),
         vec![
-            turn(
-                Role::Assistant,
-                tool_use(
-                    "toolu_demo01",
-                    "Bash",
-                    json!({"command": "cargo test", "description": "Run tests"})
-                )
+            stopped(
+                "tool_use",
+                turn(
+                    Role::Assistant,
+                    tool_use(
+                        "toolu_demo01",
+                        "Bash",
+                        json!({"command": "cargo test", "description": "Run tests"})
+                    )
+                ),
             ),
             turn(
                 Role::User,
                 tool_result("toolu_demo01", "test result: ok", false, None)
             ),
-            turn(
-                Role::Assistant,
-                tool_use(
-                    "toolu_demo02",
-                    "Read",
-                    json!({"file_path": r"C:\work\demo\src\lib.rs"})
-                )
+            stopped(
+                "tool_use",
+                turn(
+                    Role::Assistant,
+                    tool_use(
+                        "toolu_demo02",
+                        "Read",
+                        json!({"file_path": r"C:\work\demo\src\lib.rs"})
+                    )
+                ),
             ),
             turn(
                 Role::User,
                 tool_result("toolu_demo02", "fn main() {}", false, None)
             ),
-            turn(
-                Role::Assistant,
-                tool_use(
-                    "toolu_demo10",
-                    "Bash",
-                    json!({"command": "false", "description": "Fail on purpose"})
-                )
+            stopped(
+                "tool_use",
+                turn(
+                    Role::Assistant,
+                    tool_use(
+                        "toolu_demo10",
+                        "Bash",
+                        json!({"command": "false", "description": "Fail on purpose"})
+                    )
+                ),
             ),
             turn(
                 Role::User,
                 tool_result("toolu_demo10", "Exit code 1", true, None)
             ),
-            turn(
-                Role::Assistant,
-                tool_use(
-                    "toolu_demo20",
-                    "Agent",
-                    json!({"description": "Explore crate", "prompt": "List the modules.", "subagent_type": "Explore"})
-                )
+            stopped(
+                "tool_use",
+                turn(
+                    Role::Assistant,
+                    tool_use(
+                        "toolu_demo20",
+                        "Agent",
+                        json!({"description": "Explore crate", "prompt": "List the modules.", "subagent_type": "Explore"})
+                    )
+                ),
             ),
             turn(
                 Role::User,
@@ -126,7 +153,10 @@ fn thinking_ai_title_fixture() {
         parse(THINKING_AI_TITLE),
         vec![
             turn(Role::User, text("Why does the parser test flake?")),
-            turn(Role::Assistant, text("The test depends on HashMap order.")),
+            stopped(
+                "tool_use",
+                turn(Role::Assistant, text("The test depends on HashMap order."))
+            ),
         ]
     );
     assert_eq!(
@@ -192,6 +222,7 @@ fn null_string_fields_fixture() {
             ],
             is_meta: false,
             is_sidechain: false,
+            stop_reason: None,
         }]
     );
 }
@@ -246,4 +277,28 @@ fn privacy_detectors_fire() {
     ));
     assert!(has_supergroup_id("chat -1001234567890"));
     assert!(has_private_path("c:\\users\\someone"));
+}
+
+#[test]
+fn final_answer_fixture_stop_reasons() {
+    let stops: Vec<(Role, Option<String>)> = parse(FINAL_ANSWER)
+        .into_iter()
+        .map(|turn| (turn.role, turn.stop_reason))
+        .collect();
+    let s = |reason: &str| Some(reason.to_owned());
+    assert_eq!(
+        stops,
+        [
+            (Role::User, None),
+            (Role::Assistant, s("tool_use")),
+            (Role::Assistant, s("tool_use")),
+            (Role::User, None),
+            (Role::Assistant, s("end_turn")),
+            (Role::User, None),
+            (Role::User, None),
+            (Role::Assistant, s("tool_use")),
+            (Role::User, None),
+            (Role::Assistant, s("end_turn")),
+        ]
+    );
 }

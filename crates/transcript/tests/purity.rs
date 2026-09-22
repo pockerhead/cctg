@@ -1,4 +1,8 @@
-const LIB: &str = include_str!("../src/lib.rs");
+const SOURCES: [(&str, &str); 3] = [
+    ("lib.rs", include_str!("../src/lib.rs")),
+    ("render.rs", include_str!("../src/render.rs")),
+    ("split.rs", include_str!("../src/split.rs")),
+];
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
 fn code_without_line_comments(source: &str) -> String {
@@ -16,7 +20,26 @@ fn contains_identifier(source: &str, identifier: &str) -> bool {
 }
 
 #[test]
+fn every_source_file_is_scanned() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    let mut scanned: Vec<&str> = SOURCES.iter().map(|(name, _)| *name).collect();
+    scanned.sort();
+    assert_eq!(found, scanned);
+}
+
+#[test]
 fn library_source_has_no_io_or_panicking_calls() {
+    for (name, source) in SOURCES {
+        assert_no_forbidden(name, source);
+    }
+}
+
+fn assert_no_forbidden(name: &str, source: &str) {
     for forbidden in [
         "std::fs",
         "std::io",
@@ -38,16 +61,19 @@ fn library_source_has_no_io_or_panicking_calls() {
         "unimplemented!",
         "#[cfg(test)]",
     ] {
-        assert!(!LIB.contains(forbidden), "src/lib.rs contains {forbidden}");
+        assert!(
+            !source.contains(forbidden),
+            "src/{name} contains {forbidden}"
+        );
     }
     assert!(!contains_identifier(
-        &code_without_line_comments(LIB),
+        &code_without_line_comments(source),
         "unsafe"
     ));
 }
 
 #[test]
-fn library_has_only_serde_dependencies() {
+fn library_has_only_pure_dependencies() {
     let deps = MANIFEST.split("[dependencies]").nth(1).unwrap_or_default();
     let names: Vec<&str> = deps
         .lines()
@@ -56,5 +82,5 @@ fn library_has_only_serde_dependencies() {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.split(['.', '=', ' ']).next())
         .collect();
-    assert_eq!(names, ["serde", "serde_json"]);
+    assert_eq!(names, ["serde", "serde_json", "unicode-segmentation"]);
 }

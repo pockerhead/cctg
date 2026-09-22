@@ -243,3 +243,25 @@ fn garbage_never_panics() {
     let _ = parse(&all);
     let _ = ai_title(&all);
 }
+
+#[test]
+fn stop_reason_is_tolerant() {
+    let stop = |message: &str| {
+        let line = format!(r#"{{"type":"assistant","message":{{"content":"x"{message}}}}}"#);
+        let turns = parse(&line);
+        assert_eq!(turns.len(), 1, "{line}");
+        turns[0].stop_reason.clone()
+    };
+    assert_eq!(
+        stop(r#","stop_reason":"end_turn""#).as_deref(),
+        Some("end_turn")
+    );
+    assert_eq!(
+        stop(r#","stop_reason":"tool_use""#).as_deref(),
+        Some("tool_use")
+    );
+    assert_eq!(stop(""), None);
+    assert_eq!(stop(r#","stop_reason":null"#), None);
+    assert_eq!(stop(r#","stop_reason":7"#), None);
+    assert_eq!(stop(r#","stop_reason":{"a":1}"#), None);
+}

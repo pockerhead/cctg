@@ -8,6 +8,12 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+mod render;
+mod split;
+
+pub use render::{render_brief, render_full};
+pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
+
 /// Author of a turn, taken from the record's top-level `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -46,6 +52,9 @@ pub struct Turn {
     pub blocks: Vec<Block>,
     pub is_meta: bool,
     pub is_sidechain: bool,
+    /// `message.stop_reason` when it is a string (`end_turn`, `tool_use`, ...); `None` when absent or null.
+    /// Subagent transcripts set it only on the last record of a response.
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -66,6 +75,7 @@ struct RawTurnRecord {
 #[serde(default)]
 struct RawMessage {
     content: Value,
+    stop_reason: Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -149,7 +159,12 @@ fn to_turn(record: RawTurnRecord) -> Option<Turn> {
         .tool_use_result
         .get("agentId")
         .and_then(Value::as_str);
-    let blocks: Vec<Block> = match record.message?.content {
+    let message = record.message?;
+    let stop_reason = match message.stop_reason {
+        Value::String(reason) => Some(reason),
+        _ => None,
+    };
+    let blocks: Vec<Block> = match message.content {
         Value::String(text) => vec![Block::Text(text)],
         Value::Array(items) => items
             .into_iter()
@@ -165,6 +180,7 @@ fn to_turn(record: RawTurnRecord) -> Option<Turn> {
         blocks,
         is_meta: record.is_meta.as_bool().unwrap_or(false),
         is_sidechain: record.is_sidechain.as_bool().unwrap_or(false),
+        stop_reason,
     })
 }
 

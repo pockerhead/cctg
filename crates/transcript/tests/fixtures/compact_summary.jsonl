@@ -1,0 +1,4 @@
+{"type":"user","isMeta":false,"message":{"role":"user","content":"Continue the work"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Intermediate text before the compact summary."}],"stop_reason":null}}
+{"type":"user","isMeta":false,"isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The earlier work is summarized here."}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_compact01","name":"Bash","input":{"command":"cargo test"}}],"stop_reason":"tool_use"}}
