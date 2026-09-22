@@ -1,0 +1,5 @@
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-007\scratch\reviewer2\ws\crates\transcript)
+test last_message_must_match_a_complete_rendered_line ... ok
+test embedded_header_uses_meta_values ... ok
+test sidechain_turns_do_not_leak_when_parent_input_is_contaminated ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

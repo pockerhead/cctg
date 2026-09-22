@@ -1,0 +1,11 @@
+fixtures\subagent_handback.jsonl 1 user  side str
+fixtures\subagent_handback.jsonl 2 user meta side str
+fixtures\subagent_handback.jsonl 3 attachment  side -
+fixtures\subagent_handback.jsonl 4 assistant  side list
+fixtures\subagent_handback.jsonl 5 assistant  side list
+fixtures\subagent_handback.jsonl 6 user  side list
+fixtures\subagent_handback.jsonl 7 assistant  side list
+fixtures\subagent_handback.jsonl 8 user  side list
+fixtures\subagent_handback.jsonl 9 assistant  side list
+fixtures\subagent_handback.meta.json 1 None   -
+files 2 real ids checked 1152 hits 0

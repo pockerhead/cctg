@@ -1,0 +1,12 @@
+[package]
+name = "qa007"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+transcript = { path = "C:/Users/user/dev/cctg/crates/transcript" }
+transcript_main = { path = "C:/Users/user/AppData/Local/Temp/cctg-qa007-main/crates/transcript" }
+serde_json = "1"

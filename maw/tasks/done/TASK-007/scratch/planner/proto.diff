@@ -1,0 +1,164 @@
+--- /tmp/base/lib.rs	2026-09-23 00:50:02.692486000 +0300
++++ maw/tasks/in_progress/TASK-007/scratch/planner/ws/crates/transcript/src/lib.rs	2026-09-23 00:48:29.566703000 +0300
+@@ -10,9 +10,13 @@
+ 
+ mod render;
+ mod split;
++mod subagent;
+ 
+-pub use render::{render_brief, render_full};
++pub use render::{
++    render_brief, render_brief_with_subagents, render_full, render_full_with_subagents,
++};
+ pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
++pub use subagent::{Subagent, SubagentBody, SubagentInput, SubagentMeta, parse_subagent_meta};
+ 
+ /// Author of a turn, taken from the record's top-level `type`.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+--- /tmp/base/render.rs	2026-09-23 00:50:02.728353400 +0300
++++ maw/tasks/in_progress/TASK-007/scratch/planner/ws/crates/transcript/src/render.rs	2026-09-23 00:49:06.057594800 +0300
+@@ -4,10 +4,10 @@
+ 
+ use serde_json::Value;
+ 
+-use crate::{Block, Role, Turn};
++use crate::{Block, Role, Subagent, Turn};
+ 
+ /// Last line of a rendering whose slice ends while the assistant is still working.
+-const IN_PROGRESS_MARKER: &str = "в работе…";
++pub(crate) const IN_PROGRESS_MARKER: &str = "в работе…";
+ 
+ const SUMMARY_KEYS: [&str; 8] = [
+     "description",
+@@ -42,17 +42,33 @@
+ 
+ /// Prompts, final assistant answers and one line per tool call.
+ pub fn render_brief(turns: &[Turn]) -> String {
+-    render(turns, false)
++    render(turns, false, &[]).0
+ }
+ 
+ /// Brief plus intermediate assistant text, tool inputs and truncated tool results.
+ pub fn render_full(turns: &[Turn]) -> String {
+-    render(turns, true)
++    render(turns, true, &[]).0
+ }
+ 
+-fn render(turns: &[Turn], full: bool) -> String {
++/// `render_brief`, with each known subagent's body indented under its `Agent` call line.
++pub fn render_brief_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
++    render(turns, false, subagents).0
++}
++
++/// `render_full`, with each known subagent's body indented under its `Agent` call line. The body
++/// stays brief.
++pub fn render_full_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
++    render(turns, true, subagents).0
++}
++
++/// The rendering and whether it ends with the in-progress marker.
++pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (String, bool) {
+     let calls = tool_calls(turns);
+     let agents = agent_ids(turns);
++    let bodies: HashMap<&str, &str> = subagents
++        .iter()
++        .map(|subagent| (subagent.agent_id(), subagent.body().text()))
++        .collect();
+     let tool_after = tool_after(turns);
+     let mut out = String::new();
+     let mut finished = true;
+@@ -88,7 +104,12 @@
+                     any = true;
+                 }
+                 (_, Block::ToolUse { id, name, input }) => {
+-                    push_line(&mut out, &tool_line(name, input, agents.get(id.as_str())));
++                    let agent_id = agents.get(id.as_str()).copied();
++                    push_line(&mut out, &tool_line(name, input, agent_id));
++                    match agent_id.and_then(|agent_id| bodies.get(agent_id)) {
++                        Some(body) if !body.is_empty() => push_line(&mut out, &indent(body)),
++                        _ => {}
++                    }
+                     if full {
+                         push_line(
+                             &mut out,
+@@ -119,10 +140,11 @@
+             }
+         }
+     }
+-    if any && !finished {
++    let in_progress = any && !finished;
++    if in_progress {
+         push_line(&mut out, IN_PROGRESS_MARKER);
+     }
+-    out
++    (out, in_progress)
+ }
+ 
+ /// Classifies a user text; `None` for blank text and hidden meta records. A meta `<channel>` record is
+@@ -221,7 +243,7 @@
+         .collect()
+ }
+ 
+-fn tool_line(name: &str, input: &Value, agent_id: Option<&&str>) -> String {
++fn tool_line(name: &str, input: &Value, agent_id: Option<&str>) -> String {
+     let field = |key: &str| {
+         input
+             .get(key)
+@@ -231,16 +253,7 @@
+     };
+     if name == "Agent" {
+         let kind = field("subagent_type").unwrap_or_else(|| "agent".to_owned());
+-        let mut line = format!("↳ {kind}");
+-        if let Some(agent_id) = agent_id {
+-            line.push(' ');
+-            line.push_str(agent_id);
+-        }
+-        if let Some(description) = field("description") {
+-            line.push_str(": ");
+-            line.push_str(&description);
+-        }
+-        return line;
++        return agent_header(&kind, agent_id, field("description").as_deref());
+     }
+     match SUMMARY_KEYS.iter().find_map(|key| field(key)) {
+         Some(summary) => format!("• {name}: {summary}"),
+@@ -248,8 +261,26 @@
+     }
+ }
+ 
++/// `↳ <kind>[ <agent_id>][: <description>]`, the first line of a subagent block.
++pub(crate) fn agent_header(
++    kind: &str,
++    agent_id: Option<&str>,
++    description: Option<&str>,
++) -> String {
++    let mut line = format!("↳ {kind}");
++    if let Some(agent_id) = agent_id {
++        line.push(' ');
++        line.push_str(agent_id);
++    }
++    if let Some(description) = description {
++        line.push_str(": ");
++        line.push_str(description);
++    }
++    line
++}
++
+ /// Collapses whitespace runs to one space and cuts to `SUMMARY_CHARS`.
+-fn one_line(text: &str) -> String {
++pub(crate) fn one_line(text: &str) -> String {
+     truncate(
+         &text.split_whitespace().collect::<Vec<_>>().join(" "),
+         SUMMARY_CHARS,
+--- /tmp/base/purity.rs	2026-09-23 00:50:02.773432600 +0300
++++ maw/tasks/in_progress/TASK-007/scratch/planner/ws/crates/transcript/tests/purity.rs	2026-09-23 00:48:29.566703000 +0300
+@@ -1,7 +1,8 @@
+-const SOURCES: [(&str, &str); 3] = [
++const SOURCES: [(&str, &str); 4] = [
+     ("lib.rs", include_str!("../src/lib.rs")),
+     ("render.rs", include_str!("../src/render.rs")),
+     ("split.rs", include_str!("../src/split.rs")),
++    ("subagent.rs", include_str!("../src/subagent.rs")),
+ ];
+ const MANIFEST: &str = include_str!("../Cargo.toml");
+ 

@@ -301,9 +301,8 @@ pub(crate) fn agent_header(
 ) -> String {
     let mut line = format!("↳ {kind}");
     if let Some(agent_id) = agent_id {
-        let agent_id = one_line(agent_id);
         line.push(' ');
-        line.push_str(&agent_id);
+        line.push_str(agent_id);
     }
     if let Some(description) = description {
         line.push_str(": ");

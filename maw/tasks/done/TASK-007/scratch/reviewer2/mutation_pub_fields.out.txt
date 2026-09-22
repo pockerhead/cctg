@@ -1,0 +1,4 @@
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 83) - compile fail ... FAILED
+Test compiled successfully, but it's marked `compile_fail`.
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+error: doctest failed, to rerun pass `-p transcript --doc`

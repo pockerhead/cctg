@@ -1,0 +1,30 @@
+meta files 538 subagent jsonl 538
+meta bad 0 empty description 0 no agentType 0
+  key agentType 538
+  key description 538
+  key toolUseId 538
+  key spawnDepth 538
+  key model 430
+  key requestShape 229
+  key requestNonInteractive 229
+  key parentAgentId 119
+  key stoppedByUser 8
+  type ('agentType', 'str') 538
+  type ('description', 'str') 538
+  type ('model', 'str') 430
+  type ('parentAgentId', 'str') 119
+  type ('requestNonInteractive', 'bool') 229
+  type ('requestShape', 'str') 229
+  type ('spawnDepth', 'int') 538
+  type ('stoppedByUser', 'bool') 8
+  type ('toolUseId', 'str') 538
+jsonl without meta 0
+empty files 0 files with non-sidechain u/a 0 agentId mismatch 0
+files with SubagentHandback tool_use 222
+  last ('assistant', ('text',), 'end_turn') 283
+  last ('assistant', ('text',), None) 238
+  last ('user', ('text',), None) 10
+  last ('assistant', ('text',), 'stop_sequence') 4
+  last ('assistant', ('tool_use',), None) 1
+  last ('assistant', ('thinking', 'text'), 'end_turn') 1
+  last ('assistant', ('text',), 'refusal') 1

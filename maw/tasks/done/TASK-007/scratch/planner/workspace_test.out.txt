@@ -1,0 +1,129 @@
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-007\scratch\planner\ws\crates\transcript)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.51s
+     Running unittests src\main.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\cctg-2b05eae979b99eec.exe)
+
+running 1 test
+test tests::parses_all_subcommands ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\stdout.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\stdout-6b568c1b396b3649.exe)
+
+running 1 test
+test subcommands_do_not_write_to_stdout ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\transcript-ff01b63386760ead.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\parse_fixtures-4cd18e47549126da.exe)
+
+running 10 tests
+test privacy_detectors_fire ... ok
+test null_string_fields_fixture ... ok
+test thinking_ai_title_fixture ... ok
+test sidechain_fixture ... ok
+test plain_text_fixture ... ok
+test string_content_fixture ... ok
+test final_answer_fixture_stop_reasons ... ok
+test tool_use_result_fixture ... ok
+test thinking_never_escapes ... ok
+test fixtures_have_no_private_data ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\parse_tolerance-dabebd66b8ba0e18.exe)
+
+running 15 tests
+test ai_title_rules ... ok
+test both_content_shapes_for_both_roles ... ok
+test unknown_and_malformed_blocks_drop_only_themselves ... ok
+test unusable_message_shapes_are_skipped ... ok
+test empty_and_ignored_only_inputs_give_nothing ... ok
+test irrelevant_wrong_typed_fields_do_not_drop_a_turn ... ok
+test crlf_matches_lf ... ok
+test stop_reason_is_tolerant ... ok
+test flags_are_tolerant ... ok
+test unknown_record_and_bad_lines_keep_neighbours ... ok
+test tool_result_shapes ... ok
+test known_block_with_missing_fields_keeps_defaults ... ok
+test truncated_last_line_keeps_earlier_turns ... ok
+test deep_nesting_is_skipped_without_panic ... ok
+test garbage_never_panics ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\purity.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\purity-68385d7b703b2db5.exe)
+
+running 3 tests
+test library_has_only_pure_dependencies ... ok
+test every_source_file_is_scanned ... ok
+test library_source_has_no_io_or_panicking_calls ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\render.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\render-f011d29e783a947f.exe)
+
+running 14 tests
+test channel_attribute_may_contain_a_greater_than_sign ... ok
+test null_stop_reason_falls_back_to_structure ... ok
+test full_truncates_long_results_safely ... ok
+test service_records_are_hidden_in_brief_and_keep_the_state ... ok
+test multiline_prompt_keeps_its_text_verbatim ... ok
+test finished_exchanges_have_no_marker ... ok
+test compact_summary_is_hidden_in_brief_and_keeps_the_state ... ok
+test only_channel_meta_is_shown_and_user_tags_stay_visible ... ok
+test unfinished_tail_is_marked_in_progress ... ok
+test slices_render_independently ... ok
+test brief_has_one_line_per_tool_call_and_no_io ... ok
+test final_answer_fixture_brief_and_full ... ok
+test thinking_never_rendered ... ok
+test five_thousand_turns_render_in_linear_time ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\split-627eef4eaa419950.exe)
+
+running 14 tests
+test crlf_is_not_split_at_the_limit ... ok
+test threshold_is_configurable ... ok
+test emoji_on_the_boundary_is_never_cut ... ok
+test exact_limit_fits_and_one_more_splits ... ok
+test short_text_is_one_chunk ... ok
+test telegram_len_counts_utf16_units ... ok
+test paragraph_separator_is_kept_exactly ... ok
+test flags_after_an_odd_prefix_are_not_split ... ok
+test only_emoji_line_splits_on_char_boundaries ... ok
+test prefers_paragraph_then_line_then_space ... ok
+test blank_run_longer_than_the_limit_drops_only_whitespace ... ok
+test oversized_grapheme_falls_back_to_char_boundaries ... ok
+test fifty_kb_block_is_deterministic_and_prefers_file ... ok
+test grapheme_clusters_on_the_boundary_stay_whole ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-planner-target\debug\deps\subagent-951e42826a051b33.exe)
+
+running 8 tests
+test meta_fixture_is_parsed ... ok
+test missing_or_broken_meta_falls_back_without_error ... ok
+test meta_description_and_type_win ... ok
+test report_replaces_the_transcript_final_text ... ok
+test only_known_agents_get_a_body ... ok
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test body_source_order_is_fixed ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests transcript
+
+running 1 test
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 83) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+

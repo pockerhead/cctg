@@ -1,0 +1,12 @@
+handback input keys {('message',): 223}
+message types {'str': 223}
+handback calls per file {1: 221, 2: 1}
+  after last handback ('u:tool_result', 'a:text') 215
+  after last handback ('u:tool_result', 'a:text', 'u:str', 'a:text') 2
+  after last handback ('u:tool_result', 'a:thinking', 'u:str', 'a:thinking', 'a:text') 1
+  after last handback ('u:tool_result', 'a:text', 'u:str', 'a:thinking', 'a:text', 'a:tool_use', 'u:tool_result', 'a:thinking', 'a:text', 'a:tool_use', 'u:tool_result', 'a:thinking', 'a:text', 'a:tool_use', 'u:tool_result', 'a:thinking', 'a:text', 'a:tool_use', 'u:tool_result/err', 'a:thinking', 'a:tool_use', 'u:tool_result/err', 'a:thinking', 'a:text', 'a:tool_use', 'u:tool_result', 'a:thinking', 'a:text', 'a:tool_use', 'u:tool_result', 'a:tool_use', 'u:tool_result', 'a:text') 1
+  after last handback ('u:tool_result', 'a:text', 'u:str', 'a:thinking', 'a:tool_use', 'u:tool_result', 'a:thinking', 'a:text') 1
+  after last handback ('u:tool_result', 'a:text', 'u:str', 'a:thinking', 'a:text') 1
+  after last handback ('u:tool_result', 'u:text') 1
+farewell text len: n 232 median 200 max 3712
+non-handback files ending in user record: ['text', 'text', 'text', 'text', 'text', 'text', 'text', 'text', 'text']

@@ -1,0 +1,27 @@
+FMT_OK
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.82s
+     Running unittests src\main.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\cctg-2b05eae979b99eec.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\stdout.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\stdout-6b568c1b396b3649.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\transcript-ff01b63386760ead.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\parse_fixtures-4cd18e47549126da.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\parse_tolerance-dabebd66b8ba0e18.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\purity-68385d7b703b2db5.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\render-f011d29e783a947f.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\split-627eef4eaa419950.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-task007-rev2-final-target\debug\deps\subagent-951e42826a051b33.exe)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests transcript
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 83) - compile fail ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+transcript v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-007\scratch\reviewer2\ws\crates\transcript)
+├── serde v1.0.229
+├── serde_json v1.0.151
+└── unicode-segmentation v1.13.3

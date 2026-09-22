@@ -1,6 +1,5 @@
 //! Plain-text brief and full views of a slice of turns.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde_json::Value;
@@ -51,40 +50,24 @@ pub fn render_full(turns: &[Turn]) -> String {
     render(turns, true, &[]).0
 }
 
-/// `render_brief` of a parent transcript: sidechain turns are dropped, and each known subagent's
-/// `Agent` line takes the subagent's header with its body indented below.
+/// `render_brief`, with each known subagent's body indented under its `Agent` call line.
 pub fn render_brief_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
-    render(&top_level(turns), false, subagents).0
+    render(turns, false, subagents).0
 }
 
-/// `render_full` of a parent transcript, with subagents as in `render_brief_with_subagents`. The
-/// body stays brief.
+/// `render_full`, with each known subagent's body indented under its `Agent` call line. The body
+/// stays brief.
 pub fn render_full_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
-    render(&top_level(turns), true, subagents).0
-}
-
-/// A subagent's turns belong to its block, never to the parent's top level.
-fn top_level(turns: &[Turn]) -> Cow<'_, [Turn]> {
-    if turns.iter().any(|turn| turn.is_sidechain) {
-        Cow::Owned(
-            turns
-                .iter()
-                .filter(|turn| !turn.is_sidechain)
-                .cloned()
-                .collect(),
-        )
-    } else {
-        Cow::Borrowed(turns)
-    }
+    render(turns, true, subagents).0
 }
 
 /// The rendering and whether it ends with the in-progress marker.
 pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (String, bool) {
     let calls = tool_calls(turns);
     let agents = agent_ids(turns);
-    let known: HashMap<&str, &Subagent> = subagents
+    let bodies: HashMap<&str, &str> = subagents
         .iter()
-        .map(|subagent| (subagent.agent_id(), subagent))
+        .map(|subagent| (subagent.agent_id(), subagent.body().text()))
         .collect();
     let tool_after = tool_after(turns);
     let mut out = String::new();
@@ -122,9 +105,8 @@ pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (Str
                 }
                 (_, Block::ToolUse { id, name, input }) => {
                     let agent_id = agents.get(id.as_str()).copied();
-                    let subagent = agent_id.and_then(|agent_id| known.get(agent_id)).copied();
-                    push_line(&mut out, &tool_line(name, input, agent_id, subagent));
-                    match subagent.map(|subagent| subagent.body().text()) {
+                    push_line(&mut out, &tool_line(name, input, agent_id));
+                    match agent_id.and_then(|agent_id| bodies.get(agent_id)) {
                         Some(body) if !body.is_empty() => push_line(&mut out, &indent(body)),
                         _ => {}
                     }
@@ -261,13 +243,7 @@ fn agent_ids(turns: &[Turn]) -> HashMap<&str, &str> {
         .collect()
 }
 
-/// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
-fn tool_line(
-    name: &str,
-    input: &Value,
-    agent_id: Option<&str>,
-    subagent: Option<&Subagent>,
-) -> String {
+fn tool_line(name: &str, input: &Value, agent_id: Option<&str>) -> String {
     let field = |key: &str| {
         input
             .get(key)
@@ -276,16 +252,8 @@ fn tool_line(
             .filter(|value| !value.is_empty())
     };
     if name == "Agent" {
-        let kind = subagent
-            .and_then(Subagent::agent_type)
-            .map(str::to_owned)
-            .or_else(|| field("subagent_type"))
-            .unwrap_or_else(|| "agent".to_owned());
-        let description = subagent
-            .and_then(Subagent::description)
-            .map(str::to_owned)
-            .or_else(|| field("description"));
-        return agent_header(&kind, agent_id, description.as_deref());
+        let kind = field("subagent_type").unwrap_or_else(|| "agent".to_owned());
+        return agent_header(&kind, agent_id, field("description").as_deref());
     }
     match SUMMARY_KEYS.iter().find_map(|key| field(key)) {
         Some(summary) => format!("• {name}: {summary}"),
@@ -301,9 +269,8 @@ pub(crate) fn agent_header(
 ) -> String {
     let mut line = format!("↳ {kind}");
     if let Some(agent_id) = agent_id {
-        let agent_id = one_line(agent_id);
         line.push(' ');
-        line.push_str(&agent_id);
+        line.push_str(agent_id);
     }
     if let Some(description) = description {
         line.push_str(": ");

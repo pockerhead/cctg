@@ -1,0 +1,9 @@
+main files 76 with sidechain u/a records 0 records 0
+Agent/Task calls 421
+  input keys ('description', 'model', 'prompt', 'subagent_type') 401
+  input keys ('description', 'model', 'prompt', 'run_in_background', 'subagent_type') 10
+  input keys ('description', 'prompt', 'subagent_type') 10
+toolUseResult types on Agent results {'dict': 419, 'str': 2}
+status {'async_launched': 419}
+results with agentId 419 with subagent file 419 meta toolUseId == tool_use_id 419 / 419
+meta vs Agent input: n 419 agentType==subagent_type 419 description equal 419 type diffs []

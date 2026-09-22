@@ -1,0 +1,40 @@
+
+---- last_message_must_match_a_complete_rendered_line stdout ----
+
+thread 'last_message_must_match_a_complete_rendered_line' (41760) panicked at crates\transcript\tests\reviewer1_adversarial.rs:27:5:
+assertion `left == right` failed
+  left: Transcript("not done")
+ right: LastMessage("done")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- embedded_header_uses_meta_values stdout ----
+
+thread 'embedded_header_uses_meta_values' (38376) panicked at crates\transcript\tests\reviewer1_adversarial.rs:66:5:
+• Bash: Run tests
+• Read: C:\work\demo\src\lib.rs
+• Bash: Fail on purpose
+↳ Explore a0000000000000001: Explore crate
+  body
+в работе…
+
+---- sidechain_turns_do_not_leak_when_parent_input_is_contaminated stdout ----
+
+thread 'sidechain_turns_do_not_leak_when_parent_input_is_contaminated' (24140) panicked at crates\transcript\tests\reviewer1_adversarial.rs:44:5:
+• Bash: Run tests
+• Read: C:\work\demo\src\lib.rs
+• Bash: Fail on purpose
+↳ Explore a0000000000000001: Explore crate
+  Modules: lib, parse.
+
+> List the modules of the crate.
+Modules: lib, parse.
+
+
+failures:
+    embedded_header_uses_meta_values
+    last_message_must_match_a_complete_rendered_line
+    sidechain_turns_do_not_leak_when_parent_input_is_contaminated
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p transcript --test reviewer1_adversarial`

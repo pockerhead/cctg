@@ -1,0 +1,366 @@
+--- ../planner/ws/crates/transcript/src/subagent.rs	2026-09-23 00:49:38.533315100 +0300
++++ ws/crates/transcript/src/subagent.rs	2026-09-23 01:30:06.593797600 +0300
+@@ -83,7 +83,7 @@
+ /// ```compile_fail
+ /// let block = transcript::Subagent {
+ ///     agent_id: "a1".to_owned(),
+-///     agent_type: "Explore".to_owned(),
++///     agent_type: Some("Explore".to_owned()),
+ ///     description: None,
+ ///     body: transcript::SubagentBody::Empty,
+ /// };
+@@ -91,15 +91,16 @@
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Subagent {
+     agent_id: String,
+-    agent_type: String,
++    agent_type: Option<String>,
+     description: Option<String>,
+     body: SubagentBody,
+ }
+ 
+ impl Subagent {
+     /// Header: type from the meta, else `input.agent_type`, else `agent`; description from the meta only.
+-    /// Body: the report, else the finished transcript brief (when it ends with `last_assistant_message`,
+-    /// if given), else `last_assistant_message`, else the unfinished transcript brief, else empty.
++    /// Body: the report, else the finished transcript brief (when its final answer equals
++    /// `last_assistant_message`, if given), else `last_assistant_message`, else the unfinished
++    /// transcript brief, else empty.
+     pub fn new(input: SubagentInput<'_>) -> Self {
+         let meta = input.meta.map(parse_subagent_meta).unwrap_or_default();
+         let agent_type = meta
+@@ -107,8 +108,7 @@
+             .as_deref()
+             .or(input.agent_type)
+             .map(one_line)
+-            .filter(|kind| !kind.is_empty())
+-            .unwrap_or_else(|| "agent".to_owned());
++            .filter(|kind| !kind.is_empty());
+         Self {
+             agent_id: input.agent_id.to_owned(),
+             agent_type,
+@@ -125,10 +125,20 @@
+         &self.body
+     }
+ 
++    /// Type from the meta or the input; `None` when neither had one.
++    pub(crate) fn agent_type(&self) -> Option<&str> {
++        self.agent_type.as_deref()
++    }
++
++    /// Description from the meta.
++    pub(crate) fn description(&self) -> Option<&str> {
++        self.description.as_deref()
++    }
++
+     /// `↳ <type> <id>[: <description>]`, then the body lines. The body is always brief.
+     pub fn render(&self) -> String {
+         let header = agent_header(
+-            &self.agent_type,
++            self.agent_type().unwrap_or("agent"),
+             Some(&self.agent_id),
+             self.description.as_deref(),
+         );
+@@ -143,33 +153,65 @@
+     if let Some(report) = non_blank(input.report) {
+         return SubagentBody::Report(report.to_owned());
+     }
+-    let (brief, finished) = input.transcript.map(transcript_brief).unwrap_or_default();
++    let brief = input.transcript.map(transcript_brief).unwrap_or_default();
+     let last = non_blank(input.last_assistant_message);
+-    if finished && last.is_none_or(|last| brief.ends_with(last)) {
+-        return SubagentBody::Transcript(brief);
++    if brief.finished && last.is_none_or(|last| brief.answer.as_deref() == Some(last)) {
++        return SubagentBody::Transcript(brief.text);
+     }
+     if let Some(last) = last {
+         return SubagentBody::LastMessage(last.to_owned());
+     }
+-    if brief.is_empty() {
++    if brief.text.is_empty() {
+         SubagentBody::Empty
+     } else {
+-        SubagentBody::InProgress(brief)
++        SubagentBody::InProgress(brief.text)
+     }
+ }
+ 
+-/// Brief of the turns after the spawn prompt and whether it ends with a final answer. A transcript
+-/// that holds only the prompt so far gives the in-progress marker alone.
+-fn transcript_brief(jsonl: &str) -> (String, bool) {
++#[derive(Default)]
++struct TranscriptBrief {
++    text: String,
++    /// The slice does not end while the subagent is still working.
++    finished: bool,
++    /// The last assistant text, trimmed, when it is the last line(s) of `text`.
++    answer: Option<String>,
++}
++
++/// Brief of the turns after the spawn prompt. A transcript that holds only the prompt so far gives the
++/// in-progress marker alone.
++fn transcript_brief(jsonl: &str) -> TranscriptBrief {
+     let turns = parse(jsonl);
+     if turns.is_empty() {
+-        return (String::new(), false);
++        return TranscriptBrief::default();
+     }
+-    let (brief, in_progress) = render(after_spawn_prompt(&turns), false, &[]);
+-    if brief.is_empty() {
+-        return (IN_PROGRESS_MARKER.to_owned(), false);
++    let turns = after_spawn_prompt(&turns);
++    let (text, in_progress) = render(turns, false, &[]);
++    if text.is_empty() {
++        return TranscriptBrief {
++            text: IN_PROGRESS_MARKER.to_owned(),
++            ..TranscriptBrief::default()
++        };
++    }
++    let answer = last_assistant_text(turns)
++        .filter(|answer| text == *answer || text.ends_with(&format!("\n{answer}")))
++        .map(str::to_owned);
++    TranscriptBrief {
++        text,
++        finished: !in_progress,
++        answer,
+     }
+-    (brief, !in_progress)
++}
++
++fn last_assistant_text(turns: &[Turn]) -> Option<&str> {
++    turns
++        .iter()
++        .rev()
++        .filter(|turn| turn.role == Role::Assistant)
++        .flat_map(|turn| turn.blocks.iter().rev())
++        .find_map(|block| match block {
++            Block::Text(text) => non_blank(Some(text)),
++            _ => None,
++        })
+ }
+ 
+ /// The spawn prompt is the first user text: the parent's `Agent` prompt, often longer than a message.
+--- ../planner/ws/crates/transcript/src/render.rs	2026-09-23 00:49:06.057594800 +0300
++++ ws/crates/transcript/src/render.rs	2026-09-23 01:30:06.593527300 +0300
+@@ -1,5 +1,6 @@
+ //! Plain-text brief and full views of a slice of turns.
+ 
++use std::borrow::Cow;
+ use std::collections::HashMap;
+ 
+ use serde_json::Value;
+@@ -50,24 +51,40 @@
+     render(turns, true, &[]).0
+ }
+ 
+-/// `render_brief`, with each known subagent's body indented under its `Agent` call line.
++/// `render_brief` of a parent transcript: sidechain turns are dropped, and each known subagent's
++/// `Agent` line takes the subagent's header with its body indented below.
+ pub fn render_brief_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
+-    render(turns, false, subagents).0
++    render(&top_level(turns), false, subagents).0
+ }
+ 
+-/// `render_full`, with each known subagent's body indented under its `Agent` call line. The body
+-/// stays brief.
++/// `render_full` of a parent transcript, with subagents as in `render_brief_with_subagents`. The
++/// body stays brief.
+ pub fn render_full_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
+-    render(turns, true, subagents).0
++    render(&top_level(turns), true, subagents).0
++}
++
++/// A subagent's turns belong to its block, never to the parent's top level.
++fn top_level(turns: &[Turn]) -> Cow<'_, [Turn]> {
++    if turns.iter().any(|turn| turn.is_sidechain) {
++        Cow::Owned(
++            turns
++                .iter()
++                .filter(|turn| !turn.is_sidechain)
++                .cloned()
++                .collect(),
++        )
++    } else {
++        Cow::Borrowed(turns)
++    }
+ }
+ 
+ /// The rendering and whether it ends with the in-progress marker.
+ pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (String, bool) {
+     let calls = tool_calls(turns);
+     let agents = agent_ids(turns);
+-    let bodies: HashMap<&str, &str> = subagents
++    let known: HashMap<&str, &Subagent> = subagents
+         .iter()
+-        .map(|subagent| (subagent.agent_id(), subagent.body().text()))
++        .map(|subagent| (subagent.agent_id(), subagent))
+         .collect();
+     let tool_after = tool_after(turns);
+     let mut out = String::new();
+@@ -105,8 +122,9 @@
+                 }
+                 (_, Block::ToolUse { id, name, input }) => {
+                     let agent_id = agents.get(id.as_str()).copied();
+-                    push_line(&mut out, &tool_line(name, input, agent_id));
+-                    match agent_id.and_then(|agent_id| bodies.get(agent_id)) {
++                    let subagent = agent_id.and_then(|agent_id| known.get(agent_id)).copied();
++                    push_line(&mut out, &tool_line(name, input, agent_id, subagent));
++                    match subagent.map(|subagent| subagent.body().text()) {
+                         Some(body) if !body.is_empty() => push_line(&mut out, &indent(body)),
+                         _ => {}
+                     }
+@@ -243,7 +261,13 @@
+         .collect()
+ }
+ 
+-fn tool_line(name: &str, input: &Value, agent_id: Option<&str>) -> String {
++/// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
++fn tool_line(
++    name: &str,
++    input: &Value,
++    agent_id: Option<&str>,
++    subagent: Option<&Subagent>,
++) -> String {
+     let field = |key: &str| {
+         input
+             .get(key)
+@@ -252,8 +276,16 @@
+             .filter(|value| !value.is_empty())
+     };
+     if name == "Agent" {
+-        let kind = field("subagent_type").unwrap_or_else(|| "agent".to_owned());
+-        return agent_header(&kind, agent_id, field("description").as_deref());
++        let kind = subagent
++            .and_then(Subagent::agent_type)
++            .map(str::to_owned)
++            .or_else(|| field("subagent_type"))
++            .unwrap_or_else(|| "agent".to_owned());
++        let description = subagent
++            .and_then(Subagent::description)
++            .map(str::to_owned)
++            .or_else(|| field("description"));
++        return agent_header(&kind, agent_id, description.as_deref());
+     }
+     match SUMMARY_KEYS.iter().find_map(|key| field(key)) {
+         Some(summary) => format!("• {name}: {summary}"),
+--- ../planner/ws/crates/transcript/tests/subagent.rs	2026-09-23 00:49:21.858272200 +0300
++++ ws/crates/transcript/tests/subagent.rs	2026-09-23 01:30:06.594708800 +0300
+@@ -332,3 +332,118 @@
+         render_full(&parent)
+     );
+ }
++
++/// A subagent transcript: the spawn prompt, then one `end_turn` assistant text per item.
++fn finished_with(answers: &[&str]) -> String {
++    let mut jsonl = String::from(r#"{"type":"user","message":{"content":"spawn"}}"#);
++    jsonl.push('\n');
++    for answer in answers {
++        let text = serde_json::to_string(answer).unwrap_or_default();
++        jsonl.push_str(&format!(
++            r#"{{"type":"assistant","message":{{"stop_reason":"end_turn","content":[{{"type":"text","text":{text}}}]}}}}"#
++        ));
++        jsonl.push('\n');
++    }
++    jsonl
++}
++
++#[test]
++fn last_message_must_equal_the_final_answer() {
++    // a suffix is not a match: "not done" ends with "done"
++    let not_done = finished_with(&["not done"]);
++    assert_eq!(
++        body(None, Some(&not_done), Some("done")),
++        SubagentBody::LastMessage("done".to_owned())
++    );
++    // nor is the last line of a longer answer
++    let longer = finished_with(&["Result:\ndone"]);
++    assert_eq!(
++        body(None, Some(&longer), Some("done")),
++        SubagentBody::LastMessage("done".to_owned())
++    );
++    // the hook text is compared trimmed, and so is the transcript text
++    let padded = finished_with(&["  done \n"]);
++    assert_eq!(
++        body(None, Some(&padded), Some("\ndone ")),
++        SubagentBody::Transcript("done".to_owned())
++    );
++    // an interrupted subagent ends on the interrupt line, not on the answer the hook reports
++    let interrupted = format!(
++        "{}{}\n",
++        finished_with(&["done"]),
++        r#"{"type":"user","message":{"content":"[Request interrupted by user]"}}"#
++    );
++    assert_eq!(
++        body(None, Some(&interrupted), Some("done")),
++        SubagentBody::LastMessage("done".to_owned())
++    );
++    assert_eq!(
++        body(None, Some(&interrupted), None),
++        SubagentBody::Transcript("done\n\n> [Request interrupted by user]".to_owned())
++    );
++}
++
++#[test]
++fn sidechain_turns_never_reach_the_parent_top_level() {
++    let mut turns = parse(TOOL_USE_RESULT);
++    let parent_only = render_brief_with_subagents(&turns, &[side(SIDECHAIN)]);
++    turns.extend(parse(SIDECHAIN));
++    for full in [false, true] {
++        let render = if full {
++            render_full_with_subagents
++        } else {
++            render_brief_with_subagents
++        };
++        let rendered = render(&turns, &[side(SIDECHAIN)]);
++        assert!(
++            !rendered.contains("List the modules of the crate."),
++            "{rendered}"
++        );
++        assert_eq!(
++            rendered.matches("Modules: lib, parse.").count(),
++            1,
++            "{rendered}"
++        );
++        // with no block, sidechain turns are still dropped from the parent view
++        assert!(!render(&turns, &[]).contains("Modules: lib, parse."));
++    }
++    assert_eq!(
++        render_brief_with_subagents(&turns, &[side(SIDECHAIN)]),
++        parent_only
++    );
++}
++
++#[test]
++fn embedded_header_is_the_block_header() {
++    let parent = parse(TOOL_USE_RESULT);
++    let from_meta = Subagent::new(SubagentInput {
++        agent_id: "a0000000000000001",
++        agent_type: Some("Explore"),
++        meta: Some(r#"{"agentType":"Plan","description":"From meta"}"#),
++        report: Some("body"),
++        ..SubagentInput::default()
++    });
++    let rendered = render_brief_with_subagents(&parent, std::slice::from_ref(&from_meta));
++    assert!(
++        rendered.contains(&format!(
++            "{}\n  body",
++            from_meta.render().replace("\nbody", "")
++        )),
++        "{rendered}"
++    );
++    assert!(
++        rendered.contains("↳ Plan a0000000000000001: From meta\n  body"),
++        "{rendered}"
++    );
++    assert!(!rendered.contains("Explore crate"), "{rendered}");
++    // no meta and no type: the call's own type and description stay
++    let bare = Subagent::new(SubagentInput {
++        agent_id: "a0000000000000001",
++        report: Some("body"),
++        ..SubagentInput::default()
++    });
++    assert!(
++        render_brief_with_subagents(&parent, &[bare])
++            .contains("↳ Explore a0000000000000001: Explore crate\n  body")
++    );
++}

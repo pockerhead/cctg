@@ -1,0 +1,12 @@
+test meta_fixture_is_parsed ... ok
+test last_message_must_equal_the_final_answer ... FAILED
+test missing_or_broken_meta_falls_back_without_error ... ok
+test meta_description_and_type_win ... ok
+test report_replaces_the_transcript_final_text ... ok
+test only_known_agents_get_a_body ... ok
+test embedded_header_is_the_block_header ... FAILED
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test sidechain_turns_never_reach_the_parent_top_level ... FAILED
+test body_source_order_is_fixed ... ok
+test result: FAILED. 8 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

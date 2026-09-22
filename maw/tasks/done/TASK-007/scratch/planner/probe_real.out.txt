@@ -1,0 +1,6 @@
+tool lines p50 49 p90 126 max 417
+tool-line utf16 p50 3320 p90 8882 max 36019
+non-tool utf16 (header+texts+prompts) p50 2194 p90 13588 max 89904 over4096 77
+files 539 in 1.4591602s
+body kinds {"in_progress": 2, "transcript": 537}
+block utf16 len p50 6075 p90 19812 max 90598 over4096 367
