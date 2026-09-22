@@ -5,6 +5,8 @@ Mode: small-fix
 Priority: high
 Branch: chore/spike-channel-lifecycle
 Domains: channel
+Providers: implementer=claude, fixer=claude, code-reviewer=codex
+Models: implementer=opus, fixer=opus
 
 ## Description
 На минимальном временном stdio JSON-RPC probe (Rust или любой не-Node процесс) проверить четыре режима запуска: fresh с `--dangerously-load-development-channels server:probe`, `--resume`, `--continue`, и запуск без флага. Отдельно проверить user-scope запись сервера в `~/.claude.json` из новой папки — требуется ли consent. Зафиксировать наблюдением: баннер, вывод `/mcp`, факт спавна сервера, доставку inbound `notifications/claude/channel`, приход `permission_request`. Решение пользователя: обёртки `cctg run` не будет — фиксируется точная команда запуска и пример shell alias. Probe и временный конфиг удалить.
