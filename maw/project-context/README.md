@@ -1,6 +1,6 @@
 ## Orientation
 cctg is a Rust bridge between local Claude Code sessions (several devices, several folders) and one private Telegram forum. One cargo workspace, one binary `cctg` with subcommands `hub` (Telegram bot + TCP server + session registry), `agent` (Channel MCP server over stdio, spawned by Claude Code) and `hook` (SessionStart/SessionEnd/Stop/SubagentStart/SubagentStop hooks that POST to hub), plus a pure library crate `transcript` (jsonl parser + brief/full renderers). No Node on any machine.
-Architectural law: one Telegram topic per Claude Code session. Subagents and nested `claude -p` runs never get their own topic; they live inside the parent's topic.
+Architectural law: a Telegram topic is a slot `(device, folder, ordinal)`, not a session. A new session takes the first free slot of its folder; concurrent sessions in one folder get `#2`, `#3`. Sessions succeed each other inside a slot. Subagents and nested `claude -p` runs never get a topic or a slot; they live inside the parent's topic.
 The repository's `CLAUDE.md` is the source of truth for platform facts (channel protocol, jsonl format, hooks). Read it before planning; do not re-research what it marks as verified.
 
 ## Universal invariants

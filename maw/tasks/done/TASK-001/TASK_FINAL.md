@@ -1,0 +1,25 @@
+# TASK-001: Decompose cctg MVP into pipeline tasks
+
+Type: chore
+Mode: deep-research
+Priority: high
+Branch: chore/decompose-mvp
+Domains: transcript, channel, hub, hooks
+
+## Description
+Produce a research report that breaks the cctg MVP (steps 1-4 of the development order in the repo root `CLAUDE.md`: `transcript` crate, `hub`, `agent` + `hook`, multi-session routing with subagents and nested runs) into concrete tasks for the MAW pipeline. Each proposed task must be small enough for one `full` or `small-fix` run, name its mode, its dependencies on other proposed tasks, and testable acceptance criteria. The report must treat the "Открытые вопросы" section of `CLAUDE.md` as first-class: for every open question, either answer it from primary sources (official Claude Code docs, channels reference, fakechat example, hdcd-telegram source, teloxide docs) with a link, or turn it into an explicit spike task with a described experiment. Verified facts in `CLAUDE.md` are not to be re-researched; contradicting them requires a cited source.
+
+## Acceptance criteria
+- [ ] Report contains an ordered list of proposed tasks covering steps 1-4 of the plan, each with: title, suggested mode (`full`/`small-fix`/`brainstorm`), one-paragraph scope, dependencies (`blocked by` / `prefer after`), and 3-6 testable acceptance criteria
+- [ ] Every open question from `CLAUDE.md` "Открытые вопросы" is either answered with a cited primary source or mapped to a spike task with a concrete experiment and expected observable outcome
+- [ ] Cargo workspace layout (crates, binary, subcommands) and the crate set are confirmed or amended with reasons; `teloxide` vs bare `reqwest` gets a recommendation backed by current crate state (version, maintenance, forum-topic API coverage)
+- [ ] Telegram Bot API constraints relevant to the design are verified with links: forum topic creation limits, message length, callback data size, edit rate limits
+- [ ] Report names which proposed tasks can run in parallel and which form the critical path
+- [ ] Report is written to PLAN_FINAL.md in a form that `/maw-tasks` batch mode can consume directly (one block per task)
+- [ ] Existing tests pass (not applicable until a Cargo workspace exists in the repo; while there is no `Cargo.toml`, this criterion is satisfied vacuously and `cargo test` is not required to run)
+
+### Resolved questions
+- 2026-09-22, premise-challenge: "Existing tests pass" was unverifiable because the repo has no Cargo workspace yet. Resolution (user): the criterion is conditioned on a workspace being present; vacuously satisfied for this research task.
+- 2026-09-22, user decision (ARCHITECTURE CHANGE, overrides "one topic per session" in CLAUDE.md and the hub domain): a Telegram topic is a **slot** `(device, folder, ordinal)`, not a session. A new session in a folder takes the first slot of that folder with no live session attached (normally the same topic as yesterday). A second concurrent session in the same folder takes slot #2 (`[host] folder #2`). Topic count equals max concurrency per folder, not total sessions ever. Sessions are rendered inside the slot with a separator line on change (`── session <short-id> · new | resumed ──`), not with a per-message prefix. Slot registry replaces the session registry: `slot -> (device, folder, ordinal, topic_id, current_session_id?, state)` plus `session_id -> slot` for permission callbacks. Dead session: topic stays open (never closeForumTopic), state icon changes, inbound is buffered, a Resume button runs `claude -p --resume <id>` through the agent on that device; the resumed session reuses the slot. Bloated context: no inline /compact in headless mode (verified: not among -p supported slash commands), so the hub does a handoff instead: `claude -p --resume <old> "summarize state for a fresh session"` and starts a new session in the same slot with that summary as first prompt. `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is set for headless-resumed sessions. Nested `claude -p` runs and subagents still get no slot.
+- 2026-09-22, user decisions on PLAN.md section 8: (1) no `cctg run` wrapper, document the flag and a shell alias; hub shows "no channel" state for a session without one. (2) state indicator via `icon_custom_emoji_id` (verified editable). (3) push every turn through the outbound queue (token bucket 20/min per group, FIFO per topic, coalesce edits, permission requests have priority); latency grows with concurrency, accepted. (4) dead session: buffer up to 50 messages, drop oldest with one warning in the topic; Resume as above. (5) Telegram client: the reviewer may deviate from "teloxide first" in CLAUDE.md; bare reqwest with frankenstein as fallback is acceptable if the report argues it; user has no preference.
+- 2026-09-22, verified on the real group (see CLAUDE.md "Telegram Bot API"): bot needs `can_manage_topics`; chat id is `-100`+web id; bot-admin can post into closed topics but users cannot; service messages `forum_topic_edited/closed/reopened` are deletable via deleteMessage, `forum_topic_created` is not; text limit exactly 4096; 5 topics in 5 s without 429.

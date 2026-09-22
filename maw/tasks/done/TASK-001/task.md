@@ -16,4 +16,4 @@ Produce a research report that breaks the cctg MVP (steps 1-4 of the development
 - [ ] Telegram Bot API constraints relevant to the design are verified with links: forum topic creation limits, message length, callback data size, edit rate limits
 - [ ] Report names which proposed tasks can run in parallel and which form the critical path
 - [ ] Report is written to PLAN_FINAL.md in a form that `/maw-tasks` batch mode can consume directly (one block per task)
-- [ ] Existing tests pass
+- [ ] Existing tests pass (not applicable until a Cargo workspace exists in the repo; while there is no `Cargo.toml`, this criterion is satisfied vacuously and `cargo test` is not required to run)

@@ -8,7 +8,7 @@
 - Inbound to Claude: `notifications/claude/channel` with `{ content: string, meta: Record<string,string> }`. Meta keys must match `[A-Za-z0-9_]+`, otherwise they are silently dropped. Meta becomes attributes of the `<channel source=... key=...>` tag.
 - Outbound from Claude: our tool (e.g. `reply(chat_id, text)`) is called via `tools/call`; the text is not shown in the terminal.
 - Permission relay: incoming `{ request_id, tool_name, description, input_preview }`; `request_id` is 5 lowercase letters without the letter l. Reply `{ request_id, behavior: "allow" | "deny" }`. Terminal dialog stays open in parallel, first answer wins. Trust dialogs and MCP consent are never relayed.
-- Launch: `claude --dangerously-load-development-channels server:cctg` with a `cctg` entry in `.mcp.json` or `~/.claude.json`. The `--channels` flag rejects our server (Anthropic allowlist).
+- Launch: `claude --dangerously-load-development-channels server:cctg`. Register the server at user scope (`claude mcp add --scope user cctg -- cctg agent`, lands in top-level `mcpServers` of `~/.claude.json`): no per-project consent dialog, works in every folder. Project `.mcp.json` is not used. The `--channels` flag rejects our server (Anthropic allowlist). A session started without the flag gets hooks and a topic but no channel; the hub shows that state.
 - Messages reach Claude only while the session is alive; the hub buffers everything addressed to a dead session.
 - The channel server does not know its own session id; it reads env `CLAUDE_CODE_SESSION_ID` (inherited from the claude process) and the hub matches it to the hook's `session_id`.
 - stdout is reserved for JSON-RPC only. All logging goes to stderr or a file; one stray print on stdout breaks the transport.
