@@ -10,9 +10,13 @@ use serde_json::Value;
 
 mod render;
 mod split;
+mod subagent;
 
-pub use render::{render_brief, render_full};
+pub use render::{
+    render_brief, render_brief_with_subagents, render_full, render_full_with_subagents,
+};
 pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
+pub use subagent::{Subagent, SubagentBody, SubagentInput, SubagentMeta, parse_subagent_meta};
 
 /// Author of a turn, taken from the record's top-level `type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

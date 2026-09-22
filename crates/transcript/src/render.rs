@@ -1,13 +1,14 @@
 //! Plain-text brief and full views of a slice of turns.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::{Block, Role, Turn};
+use crate::{Block, Role, Subagent, Turn};
 
 /// Last line of a rendering whose slice ends while the assistant is still working.
-const IN_PROGRESS_MARKER: &str = "в работе…";
+pub(crate) const IN_PROGRESS_MARKER: &str = "в работе…";
 
 const SUMMARY_KEYS: [&str; 8] = [
     "description",
@@ -42,17 +43,49 @@ enum UserText<'a> {
 
 /// Prompts, final assistant answers and one line per tool call.
 pub fn render_brief(turns: &[Turn]) -> String {
-    render(turns, false)
+    render(turns, false, &[]).0
 }
 
 /// Brief plus intermediate assistant text, tool inputs and truncated tool results.
 pub fn render_full(turns: &[Turn]) -> String {
-    render(turns, true)
+    render(turns, true, &[]).0
 }
 
-fn render(turns: &[Turn], full: bool) -> String {
+/// `render_brief` of a parent transcript: sidechain turns are dropped, and each known subagent's
+/// `Agent` line takes the subagent's header with its body indented below.
+pub fn render_brief_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
+    render(&top_level(turns), false, subagents).0
+}
+
+/// `render_full` of a parent transcript, with subagents as in `render_brief_with_subagents`. The
+/// body stays brief.
+pub fn render_full_with_subagents(turns: &[Turn], subagents: &[Subagent]) -> String {
+    render(&top_level(turns), true, subagents).0
+}
+
+/// A subagent's turns belong to its block, never to the parent's top level.
+fn top_level(turns: &[Turn]) -> Cow<'_, [Turn]> {
+    if turns.iter().any(|turn| turn.is_sidechain) {
+        Cow::Owned(
+            turns
+                .iter()
+                .filter(|turn| !turn.is_sidechain)
+                .cloned()
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(turns)
+    }
+}
+
+/// The rendering and whether it ends with the in-progress marker.
+pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (String, bool) {
     let calls = tool_calls(turns);
     let agents = agent_ids(turns);
+    let known: HashMap<&str, &Subagent> = subagents
+        .iter()
+        .map(|subagent| (subagent.agent_id(), subagent))
+        .collect();
     let tool_after = tool_after(turns);
     let mut out = String::new();
     let mut finished = true;
@@ -88,7 +121,13 @@ fn render(turns: &[Turn], full: bool) -> String {
                     any = true;
                 }
                 (_, Block::ToolUse { id, name, input }) => {
-                    push_line(&mut out, &tool_line(name, input, agents.get(id.as_str())));
+                    let agent_id = agents.get(id.as_str()).copied();
+                    let subagent = agent_id.and_then(|agent_id| known.get(agent_id)).copied();
+                    push_line(&mut out, &tool_line(name, input, agent_id, subagent));
+                    match subagent.map(|subagent| subagent.body().text()) {
+                        Some(body) if !body.is_empty() => push_line(&mut out, &indent(body)),
+                        _ => {}
+                    }
                     if full {
                         push_line(
                             &mut out,
@@ -119,10 +158,11 @@ fn render(turns: &[Turn], full: bool) -> String {
             }
         }
     }
-    if any && !finished {
+    let in_progress = any && !finished;
+    if in_progress {
         push_line(&mut out, IN_PROGRESS_MARKER);
     }
-    out
+    (out, in_progress)
 }
 
 /// Classifies a user text; `None` for blank text and hidden meta records. A meta `<channel>` record is
@@ -221,7 +261,13 @@ fn agent_ids(turns: &[Turn]) -> HashMap<&str, &str> {
         .collect()
 }
 
-fn tool_line(name: &str, input: &Value, agent_id: Option<&&str>) -> String {
+/// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
+fn tool_line(
+    name: &str,
+    input: &Value,
+    agent_id: Option<&str>,
+    subagent: Option<&Subagent>,
+) -> String {
     let field = |key: &str| {
         input
             .get(key)
@@ -230,17 +276,16 @@ fn tool_line(name: &str, input: &Value, agent_id: Option<&&str>) -> String {
             .filter(|value| !value.is_empty())
     };
     if name == "Agent" {
-        let kind = field("subagent_type").unwrap_or_else(|| "agent".to_owned());
-        let mut line = format!("↳ {kind}");
-        if let Some(agent_id) = agent_id {
-            line.push(' ');
-            line.push_str(agent_id);
-        }
-        if let Some(description) = field("description") {
-            line.push_str(": ");
-            line.push_str(&description);
-        }
-        return line;
+        let kind = subagent
+            .and_then(Subagent::agent_type)
+            .map(str::to_owned)
+            .or_else(|| field("subagent_type"))
+            .unwrap_or_else(|| "agent".to_owned());
+        let description = subagent
+            .and_then(Subagent::description)
+            .map(str::to_owned)
+            .or_else(|| field("description"));
+        return agent_header(&kind, agent_id, description.as_deref());
     }
     match SUMMARY_KEYS.iter().find_map(|key| field(key)) {
         Some(summary) => format!("• {name}: {summary}"),
@@ -248,8 +293,27 @@ fn tool_line(name: &str, input: &Value, agent_id: Option<&&str>) -> String {
     }
 }
 
+/// `↳ <kind>[ <agent_id>][: <description>]`, the first line of a subagent block.
+pub(crate) fn agent_header(
+    kind: &str,
+    agent_id: Option<&str>,
+    description: Option<&str>,
+) -> String {
+    let mut line = format!("↳ {kind}");
+    if let Some(agent_id) = agent_id {
+        let agent_id = one_line(agent_id);
+        line.push(' ');
+        line.push_str(&agent_id);
+    }
+    if let Some(description) = description {
+        line.push_str(": ");
+        line.push_str(description);
+    }
+    line
+}
+
 /// Collapses whitespace runs to one space and cuts to `SUMMARY_CHARS`.
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     truncate(
         &text.split_whitespace().collect::<Vec<_>>().join(" "),
         SUMMARY_CHARS,

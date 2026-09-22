@@ -1,7 +1,8 @@
-const SOURCES: [(&str, &str); 3] = [
+const SOURCES: [(&str, &str); 4] = [
     ("lib.rs", include_str!("../src/lib.rs")),
     ("render.rs", include_str!("../src/render.rs")),
     ("split.rs", include_str!("../src/split.rs")),
+    ("subagent.rs", include_str!("../src/subagent.rs")),
 ];
 const MANIFEST: &str = include_str!("../Cargo.toml");
 
