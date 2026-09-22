@@ -48,7 +48,7 @@
 - Транскрипт субагента лежит отдельно: `~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<agent_id>.jsonl` плюс `.meta.json`. В записях `isSidechain: true`, `agentId`. В основной jsonl сессии записи субагента не дублируются (проверено grep).
 - Дочерние процессы сессии (tool Bash, hooks, MCP-серверы) наследуют env: `CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID=<id>`, `CLAUDE_PID`, `CLAUDE_CODE_CHILD_SESSION=1`. Значит вложенный `claude -p`, запущенный из Bash-тула (maw runner, любой внешний шелл), тоже их видит.
 
-**Вложенные запуски (`claude -p` из сессии):** `SessionStart` для них стреляет как для обычной сессии. Отличать по env в hook: если в окружении hook-а есть `CLAUDECODE=1` и `CLAUDE_CODE_SESSION_ID` не равен `session_id` из stdin, это вложенный запуск, родитель известен. Если env затирается дочерним claude, запасной вариант: hook пишет свой `session_id` в `.cctg/<CLAUDE_PID>` и сверяем цепочку по ppid. Проверить кодом на шаге 3.
+**Вложенные запуски (`claude -p` из сессии), проверено кодом 2026-09-22 (TASK-003):** `SessionStart` для них стреляет как для обычной сессии. Признак через env НЕ работает: любой claude (вложенный, headless, интерактивный) перезаписывает `CLAUDE_CODE_SESSION_ID` и `CLAUDE_PID` своими значениями, а `CLAUDECODE=1` и `CLAUDE_CODE_CHILD_SESSION=1` стоят и у настоящего top-level. В хуке env id всегда равен stdin id. Работает только обход дерева процессов: пропустить claude.exe с pid == `CLAUDE_PID` (это мы), следующий claude.exe-предок это родитель, его session id берётся из реестра hub `claude_pid -> session_id` (заполняется на SessionStart, чистится на SessionEnd). Три исхода: TopLevel / Nested(parent) / NestedUnknownParent, последний тоже не создаёт тему. Дыра: если промежуточный процесс-обёртка умер до хука, цепочка обрывается и вложенный запуск выглядит как top-level. Детали и фикстуры: `maw/tasks/done/TASK-003/scratch/FINDINGS.md`.
 
 ## Архитектура
 
@@ -120,8 +120,8 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
 
 ## Открытые вопросы (проверить кодом, не гадать)
 
-- Затирает ли вложенный `claude -p` переменную `CLAUDE_CODE_SESSION_ID` для своих hooks и MCP-серверов. От этого зависит детект вложенности.
-- Хватает ли `SubagentStop.last_assistant_message` для краткого блока или всегда читать `subagents/*.jsonl`.
+- ~~Затирает ли вложенный `claude -p` переменную `CLAUDE_CODE_SESSION_ID`~~ Да, всегда (TASK-003). Детект только через ppid и реестр pid.
+- ~~Хватает ли `SubagentStop.last_assistant_message`~~ Зависит от того, вызвал ли субагент `SubagentHandback`: если был `PreToolUse SubagentHandback` для этого `agent_id`, отчёт в `tool_input.message`, иначе в `last_assistant_message` (TASK-003).
 - Как ведёт себя `--dangerously-load-development-channels` при `claude --resume`.
 - Нужен ли consent-диалог для `.mcp.json` каждый раз в новой папке (скорее да, значит регистрировать сервер глобально в `~/.claude.json`).
 - Лимиты Telegram на создание тем (rate limit при массовом старте).
