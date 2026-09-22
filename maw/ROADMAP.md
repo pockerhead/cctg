@@ -1,7 +1,5 @@
 # Roadmap graph (derived from task.md Dependencies — task.md is source of truth)
 
-TASK-003
-
 TASK-004
 
 TASK-005
@@ -36,8 +34,6 @@ TASK-010
       └── TASK-015   (blocked by TASK-007, TASK-011, TASK-012, TASK-013)
 
 Soft / unblocks:
-- TASK-003 unblocks TASK-012
-- TASK-003 unblocks TASK-015
 - TASK-004 unblocks TASK-011
 - TASK-004 unblocks TASK-013
 - TASK-007 prefer after TASK-006

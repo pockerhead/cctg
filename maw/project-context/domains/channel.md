@@ -14,7 +14,7 @@
 - stdout is reserved for JSON-RPC only. All logging goes to stderr or a file; one stray print on stdout breaks the transport.
 
 ## Risk lessons
-<!-- dated, one line each -->
+- 2026-09-22 (TASK-002 QA): `tracing_subscriber::fmt()` writes to stdout by default; `.with_writer(std::io::stderr)` is load-bearing. A stdout-purity test is vacuous unless the code path actually emits a `tracing` event: the test must trigger at least one log line (e.g. `RUST_LOG=trace` plus a real `tracing::info!` in the path) and assert stdout stays empty.
 
 ## Pointers
 - `CLAUDE.md` (repo root), section "Channels": verified facts, Claude Code 2.1.278.

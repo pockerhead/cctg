@@ -5,6 +5,8 @@ Mode: small-fix
 Priority: high
 Branch: chore/spike-nested-session-detection
 Domains: hooks
+Providers: implementer=claude, fixer=claude, code-reviewer=codex
+Models: implementer=opus, fixer=opus
 
 ## Description
 Временным локальным probe-хуком снять для двух сценариев (интерактивный старт и вложенный `claude -p` из Bash-тула) содержимое stdin хука и окружение: `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `CLAUDE_CODE_CHILD_SESSION`, плюс цепочку ppid. Сравнить env-id со stdin `session_id`, определить, работает ли основной признак вложенности и нужен ли fallback через `.cctg/<CLAUDE_PID>` и ppid. Заодно снять полный набор полей `SubagentStart`/`SubagentStop` и проверить, чем именно наполнено тело отчёта субагента. В репозитории нет `.claude/settings.json`, так что probe регистрируется во временном project-scope файле и удаляется после спайка. Production-код не писать.
