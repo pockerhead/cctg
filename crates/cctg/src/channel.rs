@@ -51,8 +51,10 @@ pub const MAX_REPLY: usize = 128 << 10;
 pub const MAX_PERMISSION_FIELD: usize = 32 << 10;
 
 pub const INSTRUCTIONS: &str = "Messages from the user's Telegram topic for this session arrive as \
-<channel source=\"cctg\" ...>. The user reads Telegram, not this terminal: answer each such \
-message with this server's `reply` tool, in plain text. Its full name is `mcp__<server>__reply`, \
+<channel source=\"cctg\" ...>. The user reads Telegram, not this terminal. The final answer \
+of each turn goes to the Telegram topic automatically: just answer normally and do not repeat \
+it through `reply`. Use this server's `reply` tool only for extra messages while you work \
+(for example progress on a long task), in plain text. Its full name is `mcp__<server>__reply`, \
 where <server> is the name this MCP server is registered under (normally `mcp__cctg__reply`). \
 It may be a deferred tool: if it is not in your tool list, find and load it with ToolSearch. \
 If the tag has a `target_agent` attribute, the message is for that running subagent: \
@@ -378,7 +380,8 @@ fn reply_tool() -> Value {
     json!({
         "name": REPLY_TOOL,
         "description": "Send a message to the Telegram topic of this Claude Code session. \
-            Use it to answer messages that arrived through the cctg channel.",
+            The final answer of each turn is sent there automatically; use this only for \
+            extra messages while you work.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -503,6 +506,11 @@ mod tests {
         assert!(instructions.contains("`mcp__cctg__reply`"));
         assert!(instructions.contains("deferred tool"));
         assert!(instructions.contains("ToolSearch"));
+        assert!(instructions.contains("goes to the Telegram topic automatically"));
+        assert!(instructions.contains("only for extra messages"));
+        assert!(!instructions.contains("answer each such message with"));
+        assert!(instructions.contains("SendMessage"));
+        assert!(instructions.contains("never ask for permissions through `reply`"));
     }
 
     #[test]
