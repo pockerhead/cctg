@@ -1,7 +1,5 @@
 # Roadmap graph (derived from task.md Dependencies — task.md is source of truth)
 
-TASK-009
-
 TASK-010
   ├── TASK-011   (blocked by TASK-010)
   │   ├── TASK-012   (blocked by TASK-010, TASK-011)
