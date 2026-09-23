@@ -3,6 +3,7 @@
 pub mod api;
 pub mod commands;
 pub mod config;
+pub mod ingress;
 pub mod offset;
 pub mod scheduler;
 pub mod sessions;
@@ -17,8 +18,10 @@ use anyhow::Context;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::wire::HookPost;
 use api::{BotApi, ChatMember};
-use config::{Config, PROJECTS_VAR, STATE_VAR};
+use config::{AGENT_LISTEN_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR};
+use ingress::AgentEvent;
 use offset::OffsetStore;
 use scheduler::{BucketConfig, Scheduler};
 use sessions::ProjectsDir;
@@ -63,6 +66,25 @@ fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed
     }
 }
 
+/// Until the slot registry exists, ingress only logs what arrives (short
+/// session ids and event types, never paths or text).
+async fn drain_ingress(
+    mut agents: mpsc::Receiver<AgentEvent>,
+    mut hooks: mpsc::Receiver<HookPost>,
+) {
+    loop {
+        tokio::select! {
+            Some(event) = agents.recv() => {
+                if let AgentEvent::Message { conn, .. } = event {
+                    info!(conn, "agent message not routed yet");
+                }
+            }
+            Some(_) = hooks.recv() => {}
+            else => return,
+        }
+    }
+}
+
 pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     let config = Config::load(env_file)?;
     let projects_dir = config.projects_dir.clone().with_context(|| {
@@ -70,6 +92,15 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     })?;
     let offsets = OffsetStore::open(&config.state_dir)
         .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
+    let secret = config.hub_secret.clone().with_context(|| {
+        format!("{SECRET_VAR} is not set; agents and hooks authenticate with it (16+ visible ASCII characters)")
+    })?;
+    let agent_listener = ingress::bind(config.agent_listen)
+        .await
+        .with_context(|| format!("cannot listen for agents; check {AGENT_LISTEN_VAR}"))?;
+    let hook_listener = ingress::bind(config.hook_listen)
+        .await
+        .with_context(|| format!("cannot listen for hooks; check {HOOK_LISTEN_VAR}"))?;
     let api = Arc::new(BotApi::new(&config.token, config.chat_id)?);
 
     let me = api
@@ -97,6 +128,15 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
         Arc::new(ProjectsDir::new(projects_dir)),
         me.username.clone(),
     ));
+    let (agents_tx, agents_rx) = mpsc::channel(256);
+    let (hooks_tx, hooks_rx) = mpsc::channel(256);
+    tokio::spawn(ingress::serve_agents(
+        agent_listener,
+        secret.clone(),
+        agents_tx,
+    ));
+    tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx));
+    tokio::spawn(drain_ingress(agents_rx, hooks_rx));
 
     updates::poll(
         api.as_ref(),

@@ -4,7 +4,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+
+use crate::wire::{Secret, SecretError};
 
 pub const TOKEN_VAR: &str = "CCTG_BOT_TOKEN";
 pub const CHAT_VAR: &str = "CCTG_CHAT_ID";
@@ -14,6 +17,16 @@ pub const PROJECTS_VAR: &str = "CCTG_PROJECTS_DIR";
 /// Optional: hub state directory (the saved `getUpdates` offset); defaults to `.cctg`.
 pub const STATE_VAR: &str = "CCTG_STATE_DIR";
 pub const DEFAULT_STATE_DIR: &str = ".cctg";
+/// Shared secret of agents and hooks; required by `cctg hub`.
+pub const SECRET_VAR: &str = "CCTG_HUB_SECRET";
+/// Optional: agent TCP listener `ip:port`; defaults to loopback.
+pub const AGENT_LISTEN_VAR: &str = "CCTG_AGENT_LISTEN";
+/// Optional: hook HTTP listener `ip:port`; defaults to loopback.
+pub const HOOK_LISTEN_VAR: &str = "CCTG_HOOK_LISTEN";
+pub const DEFAULT_AGENT_LISTEN: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47291));
+pub const DEFAULT_HOOK_LISTEN: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47292));
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -33,6 +46,10 @@ pub enum ConfigError {
     /// Carries no `dotenvy::Error`: its parse error quotes the file contents.
     #[error("cannot load env file {path}: {reason} (contents are not shown)")]
     EnvFile { path: String, reason: &'static str },
+    #[error("{SECRET_VAR} is invalid: {0}")]
+    Secret(SecretError),
+    #[error("{0} must be an ip:port address such as 127.0.0.1:47291 (host names are not resolved)")]
+    ListenAddr(&'static str),
 }
 
 /// Bot token. `Debug` never prints it.
@@ -83,6 +100,11 @@ pub struct Config {
     /// `CCTG_PROJECTS_DIR` is unset and no home directory is known.
     pub projects_dir: Option<PathBuf>,
     pub state_dir: PathBuf,
+    /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start then.
+    pub hub_secret: Option<Secret>,
+    /// Loopback unless configured; any other address is an explicit choice.
+    pub agent_listen: SocketAddr,
+    pub hook_listen: SocketAddr,
 }
 
 impl Config {
@@ -155,6 +177,16 @@ impl Config {
             .map(PathBuf::from)
             .or_else(|| home.map(|home| PathBuf::from(home).join(".claude").join("projects")));
         let state_dir = PathBuf::from(optional(STATE_VAR).as_deref().unwrap_or(DEFAULT_STATE_DIR));
+        let hub_secret = optional(SECRET_VAR)
+            .map(|value| Secret::parse(&value).map_err(ConfigError::Secret))
+            .transpose()?;
+        let listen = |name: &'static str, default: SocketAddr| {
+            optional(name).map_or(Ok(default), |value| {
+                value.parse().map_err(|_| ConfigError::ListenAddr(name))
+            })
+        };
+        let agent_listen = listen(AGENT_LISTEN_VAR, DEFAULT_AGENT_LISTEN)?;
+        let hook_listen = listen(HOOK_LISTEN_VAR, DEFAULT_HOOK_LISTEN)?;
 
         Ok(Self {
             token: BotToken(token),
@@ -162,6 +194,9 @@ impl Config {
             allowlist,
             projects_dir,
             state_dir,
+            hub_secret,
+            agent_listen,
+            hook_listen,
         })
     }
 }
@@ -361,15 +396,81 @@ mod tests {
     }
 
     #[test]
-    fn debug_hides_token_and_user_ids() {
+    fn debug_hides_token_user_ids_and_hub_secret() {
         let config = Config::from_vars(vars(&[
             (TOKEN_VAR, TOKEN),
             (CHAT_VAR, "-1001"),
             (ALLOWLIST_VAR, "987654"),
+            (SECRET_VAR, HUB_SECRET),
         ]))
         .unwrap();
+        assert!(config.hub_secret.is_some());
         let debug = format!("{config:?}");
         assert!(!debug.contains("test-secret"));
         assert!(!debug.contains("987654"));
+        assert!(!debug.contains(HUB_SECRET));
+    }
+
+    const HUB_SECRET: &str = "hub-secret-marker-0123456789";
+
+    #[test]
+    fn listeners_default_to_loopback() {
+        let config = Config::from_vars(vars(&[
+            (TOKEN_VAR, TOKEN),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+        ]))
+        .unwrap();
+        assert!(config.hub_secret.is_none());
+        assert_eq!(config.agent_listen, DEFAULT_AGENT_LISTEN);
+        assert_eq!(config.hook_listen, DEFAULT_HOOK_LISTEN);
+        assert!(config.agent_listen.ip().is_loopback());
+        assert!(config.hook_listen.ip().is_loopback());
+        assert_ne!(config.agent_listen.port(), config.hook_listen.port());
+    }
+
+    #[test]
+    fn non_loopback_listeners_need_an_explicit_address() {
+        let config = Config::from_vars(vars(&[
+            (TOKEN_VAR, TOKEN),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+            (AGENT_LISTEN_VAR, " 100.64.0.7:5000 "),
+            (HOOK_LISTEN_VAR, "[::]:5001"),
+        ]))
+        .unwrap();
+        assert_eq!(config.agent_listen, "100.64.0.7:5000".parse().unwrap());
+        assert!(!config.agent_listen.ip().is_loopback());
+        assert_eq!(config.hook_listen, "[::]:5001".parse().unwrap());
+
+        for bad in ["localhost:5000", "0.0.0.0", "5000", "10.0.0.1:99999"] {
+            let error = Config::from_vars(vars(&[
+                (TOKEN_VAR, TOKEN),
+                (CHAT_VAR, "-1001"),
+                (ALLOWLIST_VAR, "1"),
+                (AGENT_LISTEN_VAR, bad),
+            ]))
+            .unwrap_err();
+            assert_eq!(error, ConfigError::ListenAddr(AGENT_LISTEN_VAR), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bad_hub_secret_is_named_but_not_echoed() {
+        for (value, reason) in [
+            ("short-sec", SecretError::TooShort),
+            ("with space inside the secret", SecretError::Charset),
+        ] {
+            let error = Config::from_vars(vars(&[
+                (TOKEN_VAR, TOKEN),
+                (CHAT_VAR, "-1001"),
+                (ALLOWLIST_VAR, "1"),
+                (SECRET_VAR, value),
+            ]))
+            .unwrap_err();
+            assert_eq!(error, ConfigError::Secret(reason));
+            assert!(error.to_string().contains(SECRET_VAR));
+            assert!(!error.to_string().contains(value));
+        }
     }
 }
