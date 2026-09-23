@@ -1,0 +1,12 @@
+124	3	crates/cctg/src/agent.rs
+5	0	crates/cctg/src/channel.rs
+7	2	crates/cctg/src/hub/ingress.rs
+14	2	crates/cctg/src/hub/mod.rs
+666	0	crates/cctg/src/hub/permissions.rs
+1	1	crates/cctg/src/hub/registry.rs
+1309	13	crates/cctg/src/hub/slots.rs
+74	4	crates/cctg/src/wire.rs
+1	0	crates/cctg/tests/ingress_logs.rs
+1	0	crates/cctg/tests/message_logs.rs
+330	0	crates/cctg/tests/permission_logs.rs
+1	0	crates/cctg/tests/slots_logs.rs

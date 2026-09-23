@@ -187,7 +187,7 @@ fn one_line(text: &str) -> String {
 }
 
 /// At most `limit` UTF-16 units; a cut text ends with `…`.
-fn cut(text: &str, limit: usize) -> String {
+pub(crate) fn cut(text: &str, limit: usize) -> String {
     if telegram_len(text) <= limit {
         return text.to_owned();
     }
@@ -338,6 +338,9 @@ pub enum TopicJob {
 pub struct Followup {
     /// Read the ai-title from this transcript for this session.
     pub read_title: Option<(String, String)>,
+    /// Sessions ended or pruned by this transition. The slots actor uses the
+    /// ids to close prompts even when pruning removed the registry entries.
+    pub ended_sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -671,8 +674,24 @@ impl Registry {
                 claude_pid,
                 parent_claude_pid,
             } => {
+                let before: Vec<(String, bool)> = self
+                    .sessions
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), entry.ended))
+                    .collect();
                 self.session_started(post, source.as_deref(), *claude_pid, *parent_claude_pid);
-                Followup::default()
+                let ended_sessions = before
+                    .into_iter()
+                    .filter_map(|(id, was_ended)| match self.sessions.get(&id) {
+                        None => Some(id),
+                        Some(entry) if !was_ended && entry.ended => Some(id),
+                        Some(_) => None,
+                    })
+                    .collect();
+                Followup {
+                    ended_sessions,
+                    ..Followup::default()
+                }
             }
             HookEvent::SessionEnd { reason, claude_pid } => {
                 let Some(entry) = self.sessions.get_mut(session) else {
@@ -710,7 +729,10 @@ impl Registry {
                     }
                 }
                 self.touch();
-                Followup::default()
+                Followup {
+                    ended_sessions: vec![session.to_owned()],
+                    ..Followup::default()
+                }
             }
             HookEvent::UserPromptSubmit { .. } | HookEvent::Stop { .. } => {
                 // Only a SessionStart tells top-level from nested: a session
@@ -729,6 +751,7 @@ impl Registry {
                 Followup {
                     read_title: wants_title
                         .then(|| (session.to_owned(), entry.transcript_path.clone())),
+                    ..Followup::default()
                 }
             }
             HookEvent::SubagentStart {

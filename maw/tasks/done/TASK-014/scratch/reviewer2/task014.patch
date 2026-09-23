@@ -1,0 +1,3076 @@
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -11,11 +11,17 @@
+ //! accepts. Messages queued while the link is down wait in the outbox and go
+ //! out after the next registration. A message whose write failed is lost.
+ //!
++//! A permission verdict with a `verdict_id` is acknowledged once it is queued
++//! for the channel loop. The hub sends the same verdict again until the ack
++//! arrives, so the agent remembers recent ids across reconnects and passes
++//! each on only once.
++//!
+ //! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
+ //! channel from Claude Code (TASK-004), so its agent answers MCP but never
+ //! connects: a nested `claude -p` cannot show up as a routable channel even
+ //! when the process tree hides its parent.
+ 
++use std::collections::VecDeque;
+ use std::io::{BufRead, Read, Write};
+ use std::time::Duration;
+ 
+@@ -33,6 +39,8 @@
+ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+ const QUEUE: usize = 256;
++/// Verdict ids remembered for dropping a verdict the hub sent again.
++const RECENT_VERDICTS: usize = 256;
+ 
+ /// Exponential backoff with "equal jitter": the delay for attempt `n` is
+ /// uniform in `[d/2, d]` where `d = min(max, initial * 2^n)`.
+@@ -107,6 +115,7 @@
+ ) {
+     let mut attempt = 0u32;
+     let mut last_error = String::new();
++    let mut verdicts = VecDeque::with_capacity(RECENT_VERDICTS);
+     loop {
+         if outbox.is_closed() || events.is_closed() {
+             return;
+@@ -119,7 +128,7 @@
+                 if events.send(LinkEvent::Up).await.is_err() {
+                     return;
+                 }
+-                let stopped = serve(reader, write, &mut outbox, &events).await;
++                let stopped = serve(reader, write, &mut outbox, &events, &mut verdicts).await;
+                 if stopped || events.send(LinkEvent::Down).await.is_err() {
+                     return;
+                 }
+@@ -179,12 +188,14 @@
+ }
+ 
+ /// Runs one registered link. Returns `true` when the owner is gone (stop),
+-/// `false` when the link dropped (reconnect).
++/// `false` when the link dropped (reconnect). `verdicts`: ids of verdicts
++/// already passed on, newest last.
+ async fn serve(
+     reader: BufReader<OwnedReadHalf>,
+     mut write: OwnedWriteHalf,
+     outbox: &mut mpsc::Receiver<AgentMsg>,
+     events: &mpsc::Sender<LinkEvent>,
++    verdicts: &mut VecDeque<u64>,
+ ) -> bool {
+     let (frames_tx, mut frames) = mpsc::channel(QUEUE);
+     let reader_task = tokio::spawn(read_hub_frames(reader, frames_tx));
+@@ -193,8 +204,27 @@
+             frame = frames.recv() => {
+                 match frame {
+                     Some(Ok(msg)) => {
+-                        if events.send(LinkEvent::Message(msg)).await.is_err() {
++                        let ack = match &msg {
++                            HubMsg::PermissionVerdict { verdict_id, .. } => *verdict_id,
++                            _ => None,
++                        };
++                        let repeated = ack.is_some_and(|id| verdicts.contains(&id));
++                        if !repeated && events.send(LinkEvent::Message(msg)).await.is_err() {
+                             break true;
++                        }
++                        let Some(verdict_id) = ack else {
++                            continue;
++                        };
++                        if !repeated {
++                            if verdicts.len() == RECENT_VERDICTS {
++                                verdicts.pop_front();
++                            }
++                            verdicts.push_back(verdict_id);
++                        }
++                        let ack = AgentMsg::PermissionAck { verdict_id };
++                        if let Err(error) = write_agent_msg(&mut write, &ack).await {
++                            debug!(%error, "write to hub failed");
++                            break false;
+                         }
+                     }
+                     Some(Err(WireError::Version)) => {
+@@ -279,6 +309,7 @@
+                 // Not env `CLAUDE_PID`: in an MCP server it is inherited
+                 // from an outer claude, or unset (TASK-004).
+                 claude_pid: proctree::current_lineage(None, None, "").claude_pid,
++                verdict_ack: true,
+             };
+             let (outbox, events) = spawn(LinkConfig {
+                 addr: config.agent_addr.clone(),
+@@ -460,6 +491,7 @@
+             host: "box".into(),
+             cwd: "/w".into(),
+             claude_pid: None,
++            verdict_ack: true,
+         }
+     }
+ 
+@@ -916,6 +948,7 @@
+             .send(HubMsg::PermissionVerdict {
+                 request_id: "fdqmc".into(),
+                 behavior: wire::Behavior::Allow,
++                verdict_id: None,
+             })
+             .await
+             .unwrap();
+@@ -958,6 +991,94 @@
+         );
+     }
+ 
++    /// Accepts one agent on `listener` and answers its handshake.
++    async fn raw_hub(listener: &TcpListener) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
++        let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
++            .await
++            .expect("agent connects")
++            .unwrap();
++        let (read, mut write) = stream.into_split();
++        let mut reader = BufReader::new(read);
++        let mut line = Vec::new();
++        for _ in 0..2 {
++            wire::read_line(&mut reader, &mut line).await.unwrap();
++            line.clear();
++        }
++        wire::write_msg(&mut write, &HubMsg::Registered)
++            .await
++            .unwrap();
++        (reader, write)
++    }
++
++    async fn agent_line(reader: &mut BufReader<OwnedReadHalf>) -> AgentMsg {
++        let mut line = Vec::new();
++        tokio::time::timeout(WAIT, wire::read_line(reader, &mut line))
++            .await
++            .expect("a line in time")
++            .unwrap();
++        wire::decode(&line).unwrap()
++    }
++
++    #[tokio::test]
++    async fn a_verdict_sent_again_after_a_reconnect_is_passed_on_once_and_acked_again() {
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let backoff = Backoff {
++            initial: Duration::from_millis(10),
++            max: Duration::from_millis(20),
++        };
++        let (_outbox, mut events) = spawn(config(addr, backoff));
++        let verdict = |verdict_id| HubMsg::PermissionVerdict {
++            request_id: "fdqmc".into(),
++            behavior: wire::Behavior::Allow,
++            verdict_id,
++        };
++
++        let (mut reader, mut write) = raw_hub(&listener).await;
++        assert_eq!(next(&mut events).await, LinkEvent::Up);
++        wire::write_msg(&mut write, &verdict(Some(7)))
++            .await
++            .unwrap();
++        assert_eq!(
++            next(&mut events).await,
++            LinkEvent::Message(verdict(Some(7)))
++        );
++        assert_eq!(
++            agent_line(&mut reader).await,
++            AgentMsg::PermissionAck { verdict_id: 7 }
++        );
++        // The ack is lost with the link; the hub sends the same verdict again.
++        drop((reader, write));
++        assert_eq!(next(&mut events).await, LinkEvent::Down);
++        let (mut reader, mut write) = raw_hub(&listener).await;
++        assert_eq!(next(&mut events).await, LinkEvent::Up);
++        wire::write_msg(&mut write, &verdict(Some(7)))
++            .await
++            .unwrap();
++        assert_eq!(
++            agent_line(&mut reader).await,
++            AgentMsg::PermissionAck { verdict_id: 7 }
++        );
++        // A verdict without an id (a hub before TASK-014) gets no ack; a new
++        // id is passed on.
++        wire::write_msg(&mut write, &verdict(None)).await.unwrap();
++        wire::write_msg(&mut write, &verdict(Some(8)))
++            .await
++            .unwrap();
++        assert_eq!(next(&mut events).await, LinkEvent::Message(verdict(None)));
++        assert_eq!(
++            next(&mut events).await,
++            LinkEvent::Message(verdict(Some(8)))
++        );
++        assert_eq!(
++            agent_line(&mut reader).await,
++            AgentMsg::PermissionAck { verdict_id: 8 }
++        );
++        assert!(events.try_recv().is_err(), "verdict 7 was passed on once");
++    }
++
+     #[tokio::test]
+     async fn closing_stdin_ends_the_loop_and_the_link() {
+         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+diff --git a/crates/cctg/src/channel.rs b/crates/cctg/src/channel.rs
+--- a/crates/cctg/src/channel.rs
++++ b/crates/cctg/src/channel.rs
+@@ -181,6 +181,7 @@
+             LinkEvent::Message(HubMsg::PermissionVerdict {
+                 request_id,
+                 behavior,
++                ..
+             }) => {
+                 // Claude Code applies a verdict only to its own pending id,
+                 // so every well-formed one is passed on.
+@@ -633,6 +634,7 @@
+         let verdict = LinkEvent::Message(HubMsg::PermissionVerdict {
+             request_id: "abcde".into(),
+             behavior: Behavior::Allow,
++            verdict_id: None,
+         });
+         assert_eq!(server.on_link(verdict).len(), 1);
+         // After its verdict, the same id may be asked again.
+@@ -674,6 +676,7 @@
+         LinkEvent::Message(HubMsg::PermissionVerdict {
+             request_id: id.into(),
+             behavior: Behavior::Deny,
++            verdict_id: None,
+         })
+     }
+ 
+@@ -940,11 +943,13 @@
+         let stray = server.on_link(LinkEvent::Message(HubMsg::PermissionVerdict {
+             request_id: "zzzzl".into(),
+             behavior: Behavior::Allow,
++            verdict_id: None,
+         }));
+         assert!(stray.is_empty());
+         let verdict = LinkEvent::Message(HubMsg::PermissionVerdict {
+             request_id: "tcmbm".into(),
+             behavior: Behavior::Deny,
++            verdict_id: None,
+         });
+         let out = parse(&server.on_link(verdict));
+         assert_eq!(out.len(), 1);
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -58,7 +58,7 @@
+         /// Dropping it stops outbound traffic, not the connection.
+         to_agent: mpsc::Sender<HubMsg>,
+     },
+-    /// A `reply` or `permission_request` after registration.
++    /// A `reply`, `permission_request` or `permission_ack` after registration.
+     Message {
+         conn: u64,
+         msg: AgentMsg,
+@@ -206,7 +206,11 @@
+         tokio::select! {
+             frame = frames.recv() => {
+                 match frame {
+-                    Some(Ok(msg @ (AgentMsg::Reply { .. } | AgentMsg::PermissionRequest(_)))) => {
++                    Some(Ok(
++                        msg @ (AgentMsg::Reply { .. }
++                        | AgentMsg::PermissionRequest(_)
++                        | AgentMsg::PermissionAck { .. }),
++                    )) => {
+                         if events.send(AgentEvent::Message { conn, msg }).await.is_err() {
+                             break;
+                         }
+@@ -625,6 +629,7 @@
+             host: "box".into(),
+             cwd: "/w".into(),
+             claude_pid: None,
++            verdict_ack: false,
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/mod.rs b/crates/cctg/src/hub/mod.rs
+--- a/crates/cctg/src/hub/mod.rs
++++ b/crates/cctg/src/hub/mod.rs
+@@ -5,6 +5,7 @@
+ pub mod config;
+ pub mod ingress;
+ pub mod offset;
++pub mod permissions;
+ pub mod registry;
+ pub mod scheduler;
+ pub mod sessions;
+@@ -54,7 +55,7 @@
+ }
+ 
+ /// The poll callback: commands go to the command worker's queue; other
+-/// messages and topic edit notices go to the slot actor. Nothing here waits,
++/// messages, button presses and topic edit notices go to the slot actor. Nothing here waits,
+ /// so a slow command or a slow Telegram never holds up polling.
+ fn route_inbound<'a>(
+     commands: &'a mpsc::UnboundedSender<Inbound>,
+@@ -71,7 +72,11 @@
+                 warn!("slot actor stopped; message dropped");
+             }
+         }
+-        Routed::Callback(_) => info!("inbound button press"),
++        Routed::Callback(input) => {
++            if control.send(Control::Callback(input)).is_err() {
++                warn!("slot actor stopped; button press dropped");
++            }
++        }
+         Routed::Service(service) if service.kind == ServiceKind::TopicEdited => {
+             let edited = Control::TopicEdited {
+                 thread_id: service.thread_id,
+@@ -345,6 +350,12 @@
+             text: None,
+             ..input("")
+         }));
++        let press = updates::CallbackInput {
++            query_id: "q".to_owned(),
++            data: Some("allow:abcde".to_owned()),
++            message_id: Some(9),
++        };
++        route(Routed::Callback(press.clone()));
+         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {
+             route(Routed::Service(updates::ServiceMessage {
+                 kind,
+@@ -366,6 +377,7 @@
+             control_rx.try_recv().unwrap(),
+             Control::Message(Inbound { text: None, .. })
+         ));
++        assert_eq!(control_rx.try_recv().unwrap(), Control::Callback(press));
+         assert!(
+             control_rx.try_recv().is_err(),
+             "service messages are not input"
+diff --git a/crates/cctg/src/hub/permissions.rs b/crates/cctg/src/hub/permissions.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/hub/permissions.rs
+@@ -0,0 +1,666 @@
++//! Permission prompts: the topic message for a relayed `permission_request`,
++//! its Allow/Deny buttons and the book of prompts the hub has shown.
++//!
++//! Pure: the slots actor owns a [`Prompts`] and does all IO. A button carries
++//! only the action and the five-letter request id; the prompt is found by the
++//! Telegram message the button belongs to, because two sessions can issue the
++//! same request id and one message never belongs to two prompts.
++//!
++//! A prompt is [`State::Open`] until the first press fixes the answer
++//! ([`State::Selected`]); it is [`State::Decided`] once the agent took the
++//! verdict and [`State::Closed`] when its session ended first. An ended prompt
++//! owes Telegram one final edit that removes the buttons; a failed edit is
++//! tried again on the retry tick.
++//!
++//! Claude Code never says that a prompt was answered in the terminal, so an
++//! open prompt is not proof that the request is still pending. A verdict for
++//! a request that is no longer pending is ignored by Claude Code.
++
++use std::collections::{HashMap, VecDeque};
++
++use serde_json::{Value, json};
++use transcript::{TELEGRAM_TEXT_LIMIT, telegram_len};
++
++use super::registry::cut;
++use crate::channel::is_request_id;
++use crate::wire::{Behavior, PermissionRequest};
++
++/// Prompts remembered at a time. A full book forgets the oldest finished
++/// prompt, else expires the oldest open one, else takes no new prompt.
++pub const MAX_PROMPTS: usize = 256;
++/// A final edit that failed this many times is given up.
++pub const MAX_EDIT_ATTEMPTS: u32 = 5;
++/// Bot API limit for `callback_data`.
++pub const MAX_CALLBACK_DATA: usize = 64;
++const ALLOW: &str = "allow";
++const DENY: &str = "deny";
++pub const ALLOWED_MARK: &str = "\n\n✅ Разрешено из Telegram";
++pub const DENIED_MARK: &str = "\n\n⛔ Отклонено из Telegram";
++/// The whole text of a prompt whose session ended before an answer.
++pub const CLOSED_TEXT: &str = "Сессия завершилась";
++pub const ANSWER_ALLOWED: &str = "Разрешено";
++pub const ANSWER_DENIED: &str = "Отклонено";
++pub const ANSWER_DECIDED: &str = "Уже решено";
++/// Also the whole text of a prompt the full book expired.
++pub const ANSWER_EXPIRED: &str = "Запрос устарел";
++pub const ANSWER_OFFLINE: &str = "Сессия не на связи, ответьте в терминале";
++
++pub fn callback_data(behavior: Behavior, request_id: &str) -> String {
++    let action = match behavior {
++        Behavior::Allow => ALLOW,
++        Behavior::Deny => DENY,
++    };
++    format!("{action}:{request_id}")
++}
++
++/// `allow:<id>` or `deny:<id>` with a valid request id; anything else is not
++/// a permission button.
++pub fn parse_callback(data: &str) -> Option<(Behavior, &str)> {
++    let (action, request_id) = data.split_once(':')?;
++    let behavior = match action {
++        ALLOW => Behavior::Allow,
++        DENY => Behavior::Deny,
++        _ => return None,
++    };
++    is_request_id(request_id).then_some((behavior, request_id))
++}
++
++pub fn keyboard(request_id: &str) -> Value {
++    json!({ "inline_keyboard": [[
++        { "text": "Разрешить", "callback_data": callback_data(Behavior::Allow, request_id) },
++        { "text": "Запретить", "callback_data": callback_data(Behavior::Deny, request_id) },
++    ]] })
++}
++
++/// Sent with every final edit: an explicit empty keyboard removes the buttons
++/// whatever the default of `editMessageText` without `reply_markup` is.
++pub fn no_keyboard() -> Value {
++    json!({ "inline_keyboard": [] })
++}
++
++fn mark(behavior: Behavior) -> &'static str {
++    match behavior {
++        Behavior::Allow => ALLOWED_MARK,
++        Behavior::Deny => DENIED_MARK,
++    }
++}
++
++/// The prompt as plain text (no parse mode, so nothing Claude sent is markup),
++/// cut so that the decision mark still fits the Telegram limit.
++pub fn prompt_text(request: &PermissionRequest) -> String {
++    let mut text = format!("Запрос разрешения: {}", request.tool_name.trim());
++    if !request.description.trim().is_empty() {
++        text.push('\n');
++        text.push_str(request.description.trim());
++    }
++    if !request.input_preview.trim().is_empty() {
++        text.push_str("\n\n");
++        text.push_str(request.input_preview.trim());
++    }
++    let room = telegram_len(ALLOWED_MARK).max(telegram_len(DENIED_MARK));
++    cut(&text, TELEGRAM_TEXT_LIMIT - room)
++}
++
++/// The prompt after a decision; within the limit because [`prompt_text`]
++/// left room for the mark.
++pub fn decided_text(prompt: &str, behavior: Behavior) -> String {
++    format!("{prompt}{}", mark(behavior))
++}
++
++pub fn answer(behavior: Behavior) -> &'static str {
++    match behavior {
++        Behavior::Allow => ANSWER_ALLOWED,
++        Behavior::Deny => ANSWER_DENIED,
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum State {
++    /// Buttons live, no answer yet.
++    Open,
++    /// The first press fixed the answer; the verdict waits for an agent of
++    /// the session to take it. Later presses cannot change it.
++    Selected { behavior: Behavior, verdict_id: u64 },
++    /// An agent of the session took the verdict.
++    Decided(Behavior),
++    /// The session ended before an agent took an answer.
++    Closed,
++}
++
++impl State {
++    pub fn is_active(self) -> bool {
++        matches!(self, Self::Open | Self::Selected { .. })
++    }
++}
++
++/// The final edit of an ended prompt.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Edit {
++    /// Not owed (yet): the prompt is active or its message id is unknown.
++    None,
++    Due,
++    InFlight,
++    /// Failed; due again on the next retry tick.
++    Failed,
++    /// Applied or given up.
++    Done,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Prompt {
++    /// The agent connection that relayed the request.
++    pub conn: u64,
++    /// Device and claude process of that agent: after a link drop the same
++    /// process comes back on another connection.
++    pub host: String,
++    pub claude_pid: Option<u32>,
++    /// The session the agent was bound to when the request came in. Only an
++    /// agent bound to this session gets the verdict.
++    pub session: String,
++    pub request_id: String,
++    pub text: String,
++    /// Handed to Telegram (the send may still be in flight).
++    pub sent: bool,
++    /// Set once Telegram accepted the message.
++    pub message_id: Option<i64>,
++    pub state: State,
++    /// Counts for the session's waiting icon. Stop and UserPromptSubmit
++    /// clear it: a prompt answered in the terminal is never reported.
++    pub waits: bool,
++    pub edit: Edit,
++    /// Final edits that failed so far.
++    pub edit_failures: u32,
++}
++
++impl Prompt {
++    pub fn new(
++        conn: u64,
++        host: String,
++        claude_pid: Option<u32>,
++        session: String,
++        request: &PermissionRequest,
++    ) -> Self {
++        Self {
++            conn,
++            host,
++            claude_pid,
++            session,
++            request_id: request.request_id.clone(),
++            text: prompt_text(request),
++            sent: false,
++            message_id: None,
++            state: State::Open,
++            waits: true,
++            edit: Edit::None,
++            edit_failures: 0,
++        }
++    }
++
++    /// What Telegram should show once the prompt ended; `None` while active.
++    pub fn final_text(&self) -> Option<String> {
++        match self.state {
++            State::Decided(behavior) => Some(decided_text(&self.text, behavior)),
++            State::Closed => Some(CLOSED_TEXT.to_owned()),
++            State::Open | State::Selected { .. } => None,
++        }
++    }
++
++    /// Ended with nothing left to tell Telegram: safe to forget.
++    fn finished(&self) -> bool {
++        !self.state.is_active() && self.edit == Edit::Done
++    }
++
++    /// Open, and not waiting for a sendMessage answer.
++    fn expirable(&self) -> bool {
++        self.state == State::Open && (self.message_id.is_some() || !self.sent)
++    }
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum Opened {
++    /// `expired`: an open prompt that made room; its message (if any) should
++    /// lose its buttons.
++    Added { key: u64, expired: Option<Prompt> },
++    /// An active prompt of the same session and request id is there.
++    Duplicate,
++    /// Every prompt is still in use; this one is not shown.
++    Full,
++}
++
++/// Prompt book, bounded by [`MAX_PROMPTS`].
++#[derive(Debug, Default)]
++pub struct Prompts {
++    next: u64,
++    order: VecDeque<u64>,
++    prompts: HashMap<u64, Prompt>,
++    by_message: HashMap<i64, u64>,
++}
++
++impl Prompts {
++    pub fn open(&mut self, prompt: Prompt) -> Opened {
++        let duplicate = self.prompts.values().any(|known| {
++            known.state.is_active()
++                && known.session == prompt.session
++                && known.request_id == prompt.request_id
++        });
++        if duplicate {
++            return Opened::Duplicate;
++        }
++        let mut expired = None;
++        if self.order.len() >= MAX_PROMPTS {
++            let at = |ok: fn(&Prompt) -> bool| {
++                self.order
++                    .iter()
++                    .position(|key| self.prompts.get(key).is_some_and(ok))
++            };
++            let Some(victim) = at(Prompt::finished).or_else(|| at(Prompt::expirable)) else {
++                return Opened::Full;
++            };
++            if let Some(key) = self.order.get(victim).copied() {
++                expired = self.remove(key).filter(|gone| gone.state.is_active());
++            }
++        }
++        let key = self.next;
++        self.next += 1;
++        self.order.push_back(key);
++        self.prompts.insert(key, prompt);
++        Opened::Added { key, expired }
++    }
++
++    pub fn remove(&mut self, key: u64) -> Option<Prompt> {
++        self.order.retain(|known| *known != key);
++        let gone = self.prompts.remove(&key)?;
++        if let Some(message_id) = gone.message_id
++            && self.by_message.get(&message_id) == Some(&key)
++        {
++            self.by_message.remove(&message_id);
++        }
++        Some(gone)
++    }
++
++    pub fn get(&self, key: u64) -> Option<&Prompt> {
++        self.prompts.get(&key)
++    }
++
++    pub fn get_mut(&mut self, key: u64) -> Option<&mut Prompt> {
++        self.prompts.get_mut(&key)
++    }
++
++    /// Telegram accepted the prompt as `message_id`. A prompt that ended
++    /// while the send was in flight owes its final edit now.
++    pub fn delivered(&mut self, key: u64, message_id: i64) {
++        if let Some(prompt) = self.prompts.get_mut(&key) {
++            prompt.message_id = Some(message_id);
++            if !prompt.state.is_active() {
++                prompt.edit = Edit::Due;
++            }
++            self.by_message.insert(message_id, key);
++        }
++    }
++
++    /// Ends an active prompt with `state` (`Decided` or `Closed`). One that
++    /// never went to Telegram is forgotten. `false`: it was not active.
++    pub fn finish(&mut self, key: u64, state: State) -> bool {
++        let Some(prompt) = self.prompts.get_mut(&key) else {
++            return false;
++        };
++        if !prompt.state.is_active() {
++            return false;
++        }
++        prompt.state = state;
++        if prompt.message_id.is_some() {
++            prompt.edit = Edit::Due;
++        } else if !prompt.sent {
++            self.remove(key);
++        }
++        true
++    }
++
++    pub fn by_message(&self, message_id: i64) -> Option<u64> {
++        self.by_message.get(&message_id).copied()
++    }
++
++    /// The selected prompt waiting for the ack of `verdict_id`.
++    pub fn by_verdict(&self, verdict_id: u64) -> Option<u64> {
++        self.prompts.iter().find_map(|(key, prompt)| {
++            matches!(prompt.state, State::Selected { verdict_id: id, .. } if id == verdict_id)
++                .then_some(*key)
++        })
++    }
++
++    fn keys(&self, wanted: impl Fn(&Prompt) -> bool) -> Vec<u64> {
++        self.order
++            .iter()
++            .copied()
++            .filter(|key| self.prompts.get(key).is_some_and(&wanted))
++            .collect()
++    }
++
++    /// Active prompts not handed to Telegram yet, oldest first.
++    pub fn unsent(&self) -> Vec<u64> {
++        self.keys(|prompt| prompt.state.is_active() && !prompt.sent)
++    }
++
++    /// Prompts whose answer is fixed but not taken yet, oldest first.
++    pub fn selected(&self) -> Vec<u64> {
++        self.keys(|prompt| matches!(prompt.state, State::Selected { .. }))
++    }
++
++    /// Active prompts, oldest first.
++    pub fn active(&self) -> Vec<u64> {
++        self.keys(|prompt| prompt.state.is_active())
++    }
++
++    /// Prompts whose final edit should go out now.
++    pub fn due_edits(&self) -> Vec<u64> {
++        self.keys(|prompt| prompt.edit == Edit::Due && prompt.message_id.is_some())
++    }
++
++    /// Whether `session` has an active prompt that counts for the icon.
++    pub fn waiting(&self, session: &str) -> bool {
++        self.prompts
++            .values()
++            .any(|prompt| prompt.session == session && prompt.waits && prompt.state.is_active())
++    }
++
++    /// A turn of `session` ended or began: its prompts stop counting for the
++    /// icon. Their buttons stay.
++    pub fn quiet(&mut self, session: &str) {
++        for prompt in self.prompts.values_mut() {
++            if prompt.session == session {
++                prompt.waits = false;
++            }
++        }
++    }
++
++    pub fn edit_done(&mut self, key: u64) {
++        if let Some(prompt) = self.prompts.get_mut(&key) {
++            prompt.edit = Edit::Done;
++        }
++    }
++
++    /// Counts a failed final edit; returns the attempts so far. After
++    /// [`MAX_EDIT_ATTEMPTS`] the edit is given up.
++    pub fn edit_failed(&mut self, key: u64) -> u32 {
++        let Some(prompt) = self.prompts.get_mut(&key) else {
++            return 0;
++        };
++        prompt.edit_failures += 1;
++        prompt.edit = if prompt.edit_failures >= MAX_EDIT_ATTEMPTS {
++            Edit::Done
++        } else {
++            Edit::Failed
++        };
++        prompt.edit_failures
++    }
++
++    /// The retry tick: failed final edits are due again.
++    pub fn retry_failed_edits(&mut self) {
++        for prompt in self.prompts.values_mut() {
++            if prompt.edit == Edit::Failed {
++                prompt.edit = Edit::Due;
++            }
++        }
++    }
++
++    pub fn len(&self) -> usize {
++        self.prompts.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.prompts.is_empty()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn request(preview: &str) -> PermissionRequest {
++        PermissionRequest {
++            request_id: "abcde".into(),
++            tool_name: "Bash".into(),
++            description: "run the tests".into(),
++            input_preview: preview.into(),
++        }
++    }
++
++    fn prompt(session: &str, request_id: &str) -> Prompt {
++        let mut request = request("p");
++        request.request_id = request_id.into();
++        Prompt::new(1, "box".into(), Some(10), session.into(), &request)
++    }
++
++    fn added(opened: Opened) -> u64 {
++        match opened {
++            Opened::Added { key, .. } => key,
++            other => panic!("{other:?}"),
++        }
++    }
++
++    /// Shown in Telegram as `message_id`.
++    fn shown(book: &mut Prompts, key: u64, message_id: i64) {
++        book.get_mut(key).unwrap().sent = true;
++        book.delivered(key, message_id);
++    }
++
++    #[test]
++    fn callback_data_fits_and_round_trips() {
++        // The longest valid id and the longer action.
++        for behavior in [Behavior::Allow, Behavior::Deny] {
++            let data = callback_data(behavior, "zzzzz");
++            assert!((1..=MAX_CALLBACK_DATA).contains(&data.len()), "{data}");
++            assert_eq!(parse_callback(&data), Some((behavior, "zzzzz")));
++        }
++        let buttons = keyboard("abcde");
++        let data: Vec<&str> = buttons["inline_keyboard"][0]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|button| button["callback_data"].as_str().unwrap())
++            .collect();
++        assert_eq!(data, ["allow:abcde", "deny:abcde"]);
++    }
++
++    #[test]
++    fn foreign_callback_data_is_not_a_verdict() {
++        for data in [
++            "",
++            "allow",
++            "allow:",
++            "allow:abcdl",
++            "allow:ABCDE",
++            "allow:abcdef",
++            "maybe:abcde",
++            "resume:abcde",
++            "allow:abcde:x",
++        ] {
++            assert_eq!(parse_callback(data), None, "{data}");
++        }
++    }
++
++    #[test]
++    fn a_huge_prompt_and_its_final_texts_stay_within_the_limit() {
++        // Astral characters count two UTF-16 units each.
++        let huge = "😀".repeat(16 * 1024);
++        let text = prompt_text(&request(&huge));
++        assert!(text.starts_with("Запрос разрешения: Bash\nrun the tests\n\n"));
++        assert!(text.ends_with('…'));
++        for behavior in [Behavior::Allow, Behavior::Deny] {
++            let decided = decided_text(&text, behavior);
++            assert!(
++                telegram_len(&decided) <= TELEGRAM_TEXT_LIMIT,
++                "{}",
++                telegram_len(&decided)
++            );
++        }
++        assert!(telegram_len(CLOSED_TEXT) <= TELEGRAM_TEXT_LIMIT);
++        let short = prompt_text(&request("{\"command\":\"cargo test\"}"));
++        assert_eq!(
++            short,
++            "Запрос разрешения: Bash\nrun the tests\n\n{\"command\":\"cargo test\"}"
++        );
++    }
++
++    #[test]
++    fn duplicates_are_refused_per_session_and_the_same_id_lives_in_two() {
++        let mut book = Prompts::default();
++        let first = added(book.open(prompt("A", "abcde")));
++        assert_eq!(book.open(prompt("A", "abcde")), Opened::Duplicate);
++        let other = added(book.open(prompt("B", "abcde")));
++        shown(&mut book, first, 10);
++        shown(&mut book, other, 11);
++        assert_eq!(book.by_message(10), Some(first));
++        assert_eq!(book.by_message(11), Some(other));
++        // Once A's prompt ended, the same id may ask again.
++        assert!(book.finish(first, State::Closed));
++        added(book.open(prompt("A", "abcde")));
++    }
++
++    #[test]
++    fn the_answer_is_fixed_once_and_ends_in_one_final_edit() {
++        let mut book = Prompts::default();
++        let key = added(book.open(prompt("A", "abcde")));
++        shown(&mut book, key, 10);
++        assert_eq!(book.get(key).unwrap().final_text(), None);
++        book.get_mut(key).unwrap().state = State::Selected {
++            behavior: Behavior::Deny,
++            verdict_id: 7,
++        };
++        assert_eq!(book.by_verdict(7), Some(key));
++        assert_eq!(book.selected(), [key]);
++        assert!(
++            book.due_edits().is_empty(),
++            "no edit before the agent took it"
++        );
++        assert!(book.finish(key, State::Decided(Behavior::Deny)));
++        assert!(
++            !book.finish(key, State::Closed),
++            "a decided prompt stays decided"
++        );
++        assert_eq!(book.by_verdict(7), None);
++        let prompt = book.get(key).unwrap();
++        assert_eq!(
++            prompt.final_text(),
++            Some(decided_text(&prompt.text, Behavior::Deny))
++        );
++        assert_eq!(book.due_edits(), [key]);
++    }
++
++    #[test]
++    fn a_prompt_that_ends_before_its_message_id_is_edited_once_the_id_comes() {
++        let mut book = Prompts::default();
++        let in_flight = added(book.open(prompt("A", "abcde")));
++        book.get_mut(in_flight).unwrap().sent = true;
++        let unsent = added(book.open(prompt("A", "bcdef")));
++        assert!(book.finish(in_flight, State::Closed));
++        assert!(book.finish(unsent, State::Closed));
++        assert!(book.get(unsent).is_none(), "never shown: forgotten");
++        assert!(book.due_edits().is_empty());
++        book.delivered(in_flight, 10);
++        assert_eq!(book.due_edits(), [in_flight]);
++        assert_eq!(
++            book.get(in_flight).unwrap().final_text().as_deref(),
++            Some(CLOSED_TEXT)
++        );
++    }
++
++    #[test]
++    fn a_failed_final_edit_is_due_again_until_it_is_given_up() {
++        let mut book = Prompts::default();
++        let key = added(book.open(prompt("A", "abcde")));
++        shown(&mut book, key, 10);
++        book.finish(key, State::Closed);
++        for attempt in 1..MAX_EDIT_ATTEMPTS {
++            book.get_mut(key).unwrap().edit = Edit::InFlight;
++            assert_eq!(book.edit_failed(key), attempt);
++            assert!(book.due_edits().is_empty(), "not before the tick");
++            book.retry_failed_edits();
++            assert_eq!(book.due_edits(), [key]);
++        }
++        assert_eq!(book.edit_failed(key), MAX_EDIT_ATTEMPTS);
++        book.retry_failed_edits();
++        assert!(book.due_edits().is_empty(), "given up");
++        assert!(book.get(key).unwrap().finished());
++    }
++
++    #[test]
++    fn waiting_counts_active_prompts_until_the_turn_ends() {
++        let mut book = Prompts::default();
++        let first = added(book.open(prompt("A", "abcde")));
++        let second = added(book.open(prompt("A", "bcdef")));
++        shown(&mut book, first, 10);
++        shown(&mut book, second, 11);
++        assert!(book.waiting("A") && !book.waiting("B"));
++        book.finish(first, State::Decided(Behavior::Allow));
++        assert!(book.waiting("A"), "the second one is still open");
++        book.quiet("A");
++        assert!(!book.waiting("A"), "Stop: answered in the terminal, maybe");
++        let third = added(book.open(prompt("A", "cdefg")));
++        assert!(book.waiting("A"));
++        book.finish(third, State::Closed);
++        assert!(!book.waiting("A"));
++        assert_eq!(book.active(), [second]);
++    }
++
++    #[test]
++    fn a_full_book_forgets_finished_then_expires_open_never_selected() {
++        let mut book = Prompts::default();
++        let id = |n: usize| {
++            const LETTERS: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
++            (0..5)
++                .map(|place| LETTERS[(n / LETTERS.len().pow(place)) % LETTERS.len()] as char)
++                .collect::<String>()
++        };
++        let keys: Vec<u64> = (0..MAX_PROMPTS)
++            .map(|n| added(book.open(prompt("A", &id(n)))))
++            .collect();
++        for (n, key) in keys.iter().enumerate() {
++            shown(&mut book, *key, 100 + n as i64);
++        }
++        // The first one is finished: it goes silently.
++        book.finish(keys[0], State::Decided(Behavior::Allow));
++        book.edit_done(keys[0]);
++        let Opened::Added { expired: None, .. } = book.open(prompt("B", "abcde")) else {
++            panic!("a finished prompt makes room");
++        };
++        assert_eq!(book.by_message(100), None);
++        // Then the oldest open one expires; a selected one never does.
++        book.get_mut(keys[1]).unwrap().state = State::Selected {
++            behavior: Behavior::Deny,
++            verdict_id: 1,
++        };
++        let Opened::Added {
++            expired: Some(gone),
++            ..
++        } = book.open(prompt("B", "bcdef"))
++        else {
++            panic!("an open prompt makes room");
++        };
++        assert_eq!(gone.message_id, Some(102));
++        assert_eq!(book.by_message(102), None);
++        assert_eq!(book.by_message(101), Some(keys[1]));
++        assert_eq!(book.len(), MAX_PROMPTS);
++        // Nothing expirable left: every other prompt is selected.
++        for key in book.active() {
++            book.get_mut(key).unwrap().state = State::Selected {
++                behavior: Behavior::Allow,
++                verdict_id: key,
++            };
++        }
++        assert_eq!(book.open(prompt("C", "abcde")), Opened::Full);
++        assert_eq!(book.len(), MAX_PROMPTS);
++    }
++
++    #[test]
++    fn unsent_lists_only_active_prompts_not_handed_out() {
++        let mut book = Prompts::default();
++        let a = added(book.open(prompt("A", "abcde")));
++        let b = added(book.open(prompt("B", "abcde")));
++        book.get_mut(a).unwrap().sent = true;
++        assert_eq!(book.unsent(), [b]);
++        book.remove(b);
++        assert!(book.unsent().is_empty());
++        assert_eq!(book.len(), 1);
++    }
++}
+diff --git a/crates/cctg/src/hub/registry.rs b/crates/cctg/src/hub/registry.rs
+--- a/crates/cctg/src/hub/registry.rs
++++ b/crates/cctg/src/hub/registry.rs
+@@ -187,7 +187,7 @@
+ }
+ 
+ /// At most `limit` UTF-16 units; a cut text ends with `…`.
+-fn cut(text: &str, limit: usize) -> String {
++pub(crate) fn cut(text: &str, limit: usize) -> String {
+     if telegram_len(text) <= limit {
+         return text.to_owned();
+     }
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -16,6 +16,15 @@
+ //! [`MAX_QUEUED_MESSAGES`] such messages wait for Telegram at a time, and a
+ //! slot gets each kind of notice at most once per `Options::notice_every`.
+ //!
++//! Permission requests become prompts with Allow/Deny buttons in the topic of
++//! the requesting session's own slot (see [`permissions`]). They bypass the
++//! message cap and ride the scheduler's permission lane. The first press
++//! fixes the answer; the verdict goes only to an agent of the requesting
++//! session, and again after a link drop until that agent acknowledges it.
++//! Later presses only get "already decided". The end of the session closes
++//! its open prompts; every ended prompt loses its buttons, retried on the
++//! tick.
++//!
+ //! Logs carry short session ids, slot ordinals and fixed text; never a path,
+ //! a folder, a title or message text.
+ 
+@@ -31,10 +40,12 @@
+ 
+ use super::api::{ApiError, Document};
+ use super::ingress::AgentEvent;
++use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
+ use super::registry::{Icons, Registry, RegistryStore, SlotId, TopicJob, TopicView};
+ use super::scheduler::{Delivery, Op, Outbox, Outcome};
+-use super::updates::Inbound;
+-use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg};
++use super::updates::{CallbackInput, Inbound};
++use crate::channel::is_request_id;
++use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest};
+ 
+ /// A transcript is scanned line by line for its first ai-title up to this
+ /// many bytes (the same cap as `/brief`).
+@@ -87,6 +98,8 @@
+     },
+     /// A message from an allowlisted user that is not a command.
+     Message(Inbound),
++    /// A button press from an allowlisted user.
++    Callback(CallbackInput),
+ }
+ 
+ #[derive(Debug)]
+@@ -99,6 +112,18 @@
+     Delete(Option<Delivery>),
+     /// A reply chunk or a notice.
+     Message(Option<Delivery>),
++    /// A permission prompt, by its key in [`Prompts`].
++    Permission {
++        key: u64,
++        delivery: Option<Delivery>,
++    },
++    /// The final edit of a prompt, by its key.
++    PromptEdit {
++        key: u64,
++        delivery: Option<Delivery>,
++    },
++    /// A button answer or the edit of an expired prompt.
++    Callback(Option<Delivery>),
+     Title {
+         session: String,
+         path: String,
+@@ -114,6 +139,9 @@
+     Topic(TopicJob),
+     Delete,
+     Message,
++    Permission(u64),
++    PromptEdit(u64),
++    Callback,
+ }
+ 
+ fn short(session_id: &str) -> &str {
+@@ -196,6 +224,8 @@
+     host: String,
+     claude_pid: Option<u32>,
+     to_agent: mpsc::Sender<HubMsg>,
++    /// It acknowledges permission verdicts ([`crate::wire::Register::verdict_ack`]).
++    acks: bool,
+ }
+ 
+ pub struct Slots {
+@@ -216,6 +246,7 @@
+     overflow_warned: bool,
+     /// When a slot last got a notice of a kind.
+     notices: HashMap<(SlotId, &'static str), Instant>,
++    prompts: Prompts,
+     grace_until: Instant,
+     next_retry: Instant,
+     done_tx: mpsc::UnboundedSender<Done>,
+@@ -251,6 +282,7 @@
+             queued_messages: 0,
+             overflow_warned: false,
+             notices: HashMap::new(),
++            prompts: Prompts::default(),
+             grace_until: now + options.grace,
+             next_retry: now + options.retry_every,
+             done_tx,
+@@ -316,21 +348,26 @@
+                 self.conns.insert(
+                     conn,
+                     Conn {
+-                        session,
++                        session: session.clone(),
+                         host: register.host,
+                         claude_pid: register.claude_pid,
+                         to_agent,
++                        acks: register.verdict_ack,
+                     },
+                 );
++                // A link that came back takes the answers that wait for it.
++                self.push_selected(Some(&session));
++                self.sync_waiting(&session);
+             }
+             AgentEvent::Message { conn, msg } => {
+-                let Some(bound) = self.conns.get(&conn) else {
++                if !self.conns.contains_key(&conn) {
+                     return;
+-                };
++                }
+                 match msg {
+-                    AgentMsg::PermissionRequest(_) => {
+-                        self.registry.set_waiting(&bound.session, true);
++                    AgentMsg::PermissionRequest(request) => {
++                        self.on_permission_request(conn, request);
+                     }
++                    AgentMsg::PermissionAck { verdict_id } => self.on_verdict_ack(conn, verdict_id),
+                     AgentMsg::Reply { text } => self.on_reply(conn, &text),
+                     _ => debug!(conn, "agent message not routed yet"),
+                 }
+@@ -420,6 +457,13 @@
+         {
+             self.follow_pid(&post.host, pid);
+         }
++        if matches!(
++            post.event,
++            HookEvent::Stop { .. } | HookEvent::UserPromptSubmit { .. }
++        ) {
++            self.prompts.quiet(session);
++        }
++        self.close_ended_prompts();
+         if let Some((session, path)) = followup.read_title {
+             self.read_title(session, path);
+         }
+@@ -457,6 +501,7 @@
+                 message_id,
+             } => (thread_id, message_id),
+             Control::Message(input) => return self.on_topic_message(input),
++            Control::Callback(input) => return self.on_callback(input),
+         };
+         if !self.options.can_delete
+             || thread_id
+@@ -596,6 +641,344 @@
+         }
+     }
+ 
++    /// Remembers a relayed permission request; [`Self::send_prompts`] puts it
++    /// into the topic of the session's own slot. Unlike a reply it needs no
++    /// "current session of the slot" check: a session that ended has its
++    /// prompts closed (see [`Self::close_ended_prompts`]).
++    fn on_permission_request(&mut self, conn: u64, request: PermissionRequest) {
++        let Some(bound) = self.conns.get(&conn) else {
++            return;
++        };
++        if !is_request_id(&request.request_id) {
++            debug!(
++                conn,
++                "permission request without a valid request id; dropped"
++            );
++            return;
++        }
++        let session = bound.session.clone();
++        let prompt = Prompt::new(
++            conn,
++            bound.host.clone(),
++            bound.claude_pid,
++            session.clone(),
++            &request,
++        );
++        match self.prompts.open(prompt) {
++            Opened::Added { expired, .. } => {
++                info!(
++                    conn,
++                    session = short(&session),
++                    "permission request queued for the topic"
++                );
++                if let Some(gone) = expired {
++                    self.expire(gone);
++                }
++            }
++            Opened::Duplicate => debug!(conn, "permission request already shown; not repeated"),
++            Opened::Full => warn!(
++                conn,
++                session = short(&session),
++                "too many permission prompts wait for an answer; this one only in the terminal"
++            ),
++        }
++        self.sync_waiting(&session);
++    }
++
++    /// An open prompt the full book let go: its buttons go away. One try: a
++    /// press on buttons that stayed only answers "expired".
++    fn expire(&mut self, gone: Prompt) {
++        info!(
++            session = short(&gone.session),
++            "oldest open permission prompt expired to make room"
++        );
++        if let Some(message_id) = gone.message_id {
++            self.hand_off(
++                Work::Callback,
++                Op::Edit {
++                    message_id,
++                    text: permissions::ANSWER_EXPIRED.to_owned(),
++                    reply_markup: Some(permissions::no_keyboard()),
++                },
++            );
++        }
++        self.sync_waiting(&gone.session);
++    }
++
++    /// The waiting icon of `session` shows whether it has a prompt that
++    /// still counts (see [`Prompt::waits`]).
++    fn sync_waiting(&mut self, session: &str) {
++        let waiting = self.prompts.waiting(session);
++        self.registry.set_waiting(session, waiting);
++    }
++
++    /// Ends an active prompt: its final edit goes out on the next pump.
++    fn finish(&mut self, key: u64, state: State) {
++        let Some(session) = self.prompts.get(key).map(|prompt| prompt.session.clone()) else {
++            return;
++        };
++        if self.prompts.finish(key, state) {
++            self.sync_waiting(&session);
++        }
++    }
++
++    /// Closes the active prompts of every session the registry marks ended:
++    /// by its SessionEnd, by `/clear` or by a new session on a reused pid.
++    /// A SessionEnd the registry ignored (a nested resume) closes nothing.
++    fn close_ended_prompts(&mut self) {
++        for key in self.prompts.active() {
++            let Some(session) = self.prompts.get(key).map(|prompt| prompt.session.clone()) else {
++                continue;
++            };
++            if self
++                .registry
++                .sessions
++                .get(&session)
++                .is_some_and(|entry| entry.ended)
++            {
++                info!(
++                    session = short(&session),
++                    "permission prompt closed: its session ended"
++                );
++                self.finish(key, State::Closed);
++            }
++        }
++    }
++
++    /// Hands every active prompt whose session's slot has a topic to
++    /// Telegram, on the permission lane. Prompts are never counted against
++    /// [`MAX_QUEUED_MESSAGES`]; [`permissions::MAX_PROMPTS`] bounds them.
++    fn send_prompts(&mut self) {
++        for key in self.prompts.unsent() {
++            let Some(prompt) = self.prompts.get(key) else {
++                continue;
++            };
++            let thread_id = self
++                .registry
++                .sessions
++                .get(&prompt.session)
++                .and_then(|entry| entry.slot)
++                .and_then(|slot| self.registry.slot(slot))
++                .and_then(|slot| slot.topic_id);
++            let Some(thread_id) = thread_id else {
++                continue;
++            };
++            let op = Op::Send {
++                thread_id: Some(thread_id),
++                text: prompt.text.clone(),
++                reply_markup: Some(permissions::keyboard(&prompt.request_id)),
++                permission: true,
++            };
++            if let Some(prompt) = self.prompts.get_mut(key) {
++                prompt.sent = true;
++            }
++            self.hand_off(Work::Permission(key), op);
++        }
++    }
++
++    /// Hands out the final edits that are due: the decision or the end of
++    /// the session, always without buttons.
++    fn send_prompt_edits(&mut self) {
++        for key in self.prompts.due_edits() {
++            let Some(prompt) = self.prompts.get_mut(key) else {
++                continue;
++            };
++            let (Some(message_id), Some(text)) = (prompt.message_id, prompt.final_text()) else {
++                continue;
++            };
++            prompt.edit = Edit::InFlight;
++            self.hand_off(
++                Work::PromptEdit(key),
++                Op::Edit {
++                    message_id,
++                    text,
++                    reply_markup: Some(permissions::no_keyboard()),
++                },
++            );
++        }
++    }
++
++    /// Answers every button press at once; the final edit follows when the
++    /// prompt ends.
++    fn on_callback(&mut self, input: CallbackInput) {
++        let answer = self.press(&input);
++        self.hand_off(
++            Work::Callback,
++            Op::AnswerCallback {
++                query_id: input.query_id,
++                text: answer.map(str::to_owned),
++            },
++        );
++    }
++
++    /// The first press on an open prompt fixes the answer for good; later
++    /// presses only push the same verdict again. Buttons that are not
++    /// permission buttons get an empty answer.
++    fn press(&mut self, input: &CallbackInput) -> Option<&'static str> {
++        let Some((behavior, request_id)) =
++            input.data.as_deref().and_then(permissions::parse_callback)
++        else {
++            debug!("button press that is not a permission answer");
++            return None;
++        };
++        let expired = Some(permissions::ANSWER_EXPIRED);
++        let Some(message_id) = input.message_id else {
++            return expired;
++        };
++        let Some(key) = self.prompts.by_message(message_id) else {
++            debug!("button of a prompt this hub does not know");
++            return expired;
++        };
++        let Some(prompt) = self
++            .prompts
++            .get_mut(key)
++            .filter(|prompt| prompt.request_id == request_id)
++        else {
++            return expired;
++        };
++        match prompt.state {
++            State::Closed => expired,
++            State::Selected { .. } | State::Decided(_) => {
++                debug!(
++                    session = short(&prompt.session),
++                    "prompt already answered; no second verdict"
++                );
++                self.push_verdict(key);
++                Some(permissions::ANSWER_DECIDED)
++            }
++            State::Open => {
++                prompt.state = State::Selected {
++                    behavior,
++                    verdict_id: crate::wire::random_u64(),
++                };
++                info!(
++                    session = short(&prompt.session),
++                    ?behavior,
++                    "permission answer chosen in Telegram"
++                );
++                if self.push_verdict(key) {
++                    Some(permissions::answer(behavior))
++                } else {
++                    Some(permissions::ANSWER_OFFLINE)
++                }
++            }
++        }
++    }
++
++    /// Hands the fixed answer of a selected prompt to an agent of its
++    /// session. An agent that acknowledges verdicts decides the prompt with
++    /// its ack; for an older agent the hand-off is all there is to know.
++    /// `false`: no agent of the session could take it now.
++    fn push_verdict(&mut self, key: u64) -> bool {
++        let Some(prompt) = self.prompts.get(key) else {
++            return false;
++        };
++        let State::Selected {
++            behavior,
++            verdict_id,
++        } = prompt.state
++        else {
++            return false;
++        };
++        let Some((conn, bound)) = self
++            .verdict_conn(prompt)
++            .and_then(|conn| self.conns.get(&conn).map(|bound| (conn, bound)))
++        else {
++            info!(
++                session = short(&prompt.session),
++                "permission answer for an agent that is not on line; it waits"
++            );
++            return false;
++        };
++        let verdict = HubMsg::PermissionVerdict {
++            request_id: prompt.request_id.clone(),
++            behavior,
++            verdict_id: bound.acks.then_some(verdict_id),
++        };
++        if bound.to_agent.try_send(verdict).is_err() {
++            warn!(
++                conn,
++                "agent queue full or closed; the permission answer waits"
++            );
++            return false;
++        }
++        info!(
++            conn,
++            session = short(&prompt.session),
++            ?behavior,
++            "permission verdict forwarded to the session agent"
++        );
++        if !bound.acks {
++            self.finish(key, State::Decided(behavior));
++        }
++        true
++    }
++
++    /// Selected prompts go again to their session's agents: after a link
++    /// came back (`session`) or on the retry tick (all). The agent drops a
++    /// verdict id it already passed on and acks it again.
++    fn push_selected(&mut self, session: Option<&str>) {
++        for key in self.prompts.selected() {
++            let wanted = self
++                .prompts
++                .get(key)
++                .is_some_and(|prompt| session.is_none_or(|session| prompt.session == session));
++            if wanted {
++                self.push_verdict(key);
++            }
++        }
++    }
++
++    /// The agent took the verdict: the prompt is decided.
++    fn on_verdict_ack(&mut self, conn: u64, verdict_id: u64) {
++        let Some(key) = self.prompts.by_verdict(verdict_id) else {
++            debug!(conn, "ack of a verdict nothing waits for");
++            return;
++        };
++        let Some(prompt) = self.prompts.get(key) else {
++            return;
++        };
++        let State::Selected { behavior, .. } = prompt.state else {
++            return;
++        };
++        if self
++            .conns
++            .get(&conn)
++            .is_none_or(|bound| bound.session != prompt.session)
++        {
++            debug!(
++                conn,
++                "verdict ack from an agent of another session; ignored"
++            );
++            return;
++        }
++        info!(
++            conn,
++            session = short(&prompt.session),
++            "permission verdict taken by the session agent"
++        );
++        self.finish(key, State::Decided(behavior));
++    }
++
++    /// An agent bound to the prompt's session: the one that relayed it, or
++    /// after a link drop the newest connection of the same claude process.
++    /// A connection that follows another session (after `/clear`) or another
++    /// process on a reused pid never qualifies.
++    fn verdict_conn(&self, prompt: &Prompt) -> Option<u64> {
++        let serves = |bound: &Conn| bound.session == prompt.session;
++        if self.conns.get(&prompt.conn).is_some_and(serves) {
++            return Some(prompt.conn);
++        }
++        let pid = prompt.claude_pid?;
++        self.conns
++            .iter()
++            .filter(|(_, bound)| {
++                serves(bound) && bound.host == prompt.host && bound.claude_pid == Some(pid)
++            })
++            .map(|(conn, _)| *conn)
++            .max()
++    }
++
+     /// Sends `notice` to the slot's topic unless the slot got it within
+     /// `notice_every`.
+     fn notify(&mut self, slot: SlotId, thread_id: i64, notice: &'static str) {
+@@ -644,6 +1027,8 @@
+         let now = Instant::now();
+         if now >= self.next_retry {
+             self.registry.retry_failed();
++            self.prompts.retry_failed_edits();
++            self.push_selected(None);
+             self.next_retry = now + self.options.retry_every;
+         }
+     }
+@@ -672,6 +1057,32 @@
+                     Some(Ok(_)) => {}
+                     Some(Err(error)) => warn!(%error, "message to a topic not delivered"),
+                     None => warn!("message to a topic got no answer"),
++                }
++            }
++            Done::Permission { key, delivery } => {
++                match delivery {
++                    Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
++                        self.prompts.delivered(key, message.message_id);
++                        return;
++                    }
++                    Some(Ok(_)) => {
++                        warn!(
++                            "permission prompt sent without a message id; its buttons cannot work"
++                        );
++                    }
++                    Some(Err(error)) => {
++                        warn!(%error, "permission prompt not delivered; it can be answered in the terminal");
++                    }
++                    None => warn!("permission prompt got no answer"),
++                }
++                if let Some(gone) = self.prompts.remove(key) {
++                    self.sync_waiting(&gone.session);
++                }
++            }
++            Done::PromptEdit { key, delivery } => self.on_prompt_edit_done(key, delivery),
++            Done::Callback(delivery) => {
++                if let Some(Err(error)) = delivery {
++                    debug!(%error, "button answer or expired prompt edit failed");
+                 }
+             }
+             Done::Title {
+@@ -698,6 +1109,34 @@
+                     None => {}
+                 }
+             }
++        }
++    }
++
++    fn on_prompt_edit_done(&mut self, key: u64, delivery: Option<Delivery>) {
++        let applied = match &delivery {
++            Some(Ok(_)) => true,
++            // Shown already, or the message is gone: nothing left to fix.
++            Some(delivery) => telegram_error(
++                delivery,
++                &[
++                    "message is not modified",
++                    "message to edit not found",
++                    "message can't be edited",
++                ],
++            ),
++            None => false,
++        };
++        if applied {
++            self.prompts.edit_done(key);
++            return;
++        }
++        let attempts = self.prompts.edit_failed(key);
++        if attempts == 1 {
++            warn!("permission prompt edit failed; its buttons stay until a retry works");
++        } else if attempts >= permissions::MAX_EDIT_ATTEMPTS {
++            warn!("permission prompt edit keeps failing; given up");
++        } else {
++            debug!(attempts, "permission prompt edit failed again");
+         }
+     }
+ 
+@@ -788,8 +1227,8 @@
+         }
+     }
+ 
+-    /// Hands pending topic work to the dispatch task, publishes the view and
+-    /// the snapshot to save.
++    /// Hands pending topic work and prompts to the dispatch task, publishes
++    /// the view and the snapshot to save.
+     fn pump(&mut self) {
+         let edits = Instant::now() >= self.grace_until;
+         for job in self.registry.topic_work(&self.options.icons, edits) {
+@@ -819,6 +1258,8 @@
+             };
+             self.hand_off(Work::Topic(job), op);
+         }
++        self.send_prompts();
++        self.send_prompt_edits();
+         let view = self.registry.topic_view();
+         self.view.send_if_modified(|current| {
+             let changed = **current != view;
+@@ -860,6 +1301,9 @@
+                 Work::Topic(job) => Done::Topic { job, delivery },
+                 Work::Delete => Done::Delete(delivery),
+                 Work::Message => Done::Message(delivery),
++                Work::Permission(key) => Done::Permission { key, delivery },
++                Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
++                Work::Callback => Done::Callback(delivery),
+             });
+         });
+     }
+@@ -894,6 +1338,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::collections::HashSet;
+     use std::sync::Mutex;
+ 
+     use super::*;
+@@ -901,7 +1346,7 @@
+     use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL};
+     use crate::hub::scheduler::{BucketConfig, Scheduler, Transport};
+     use crate::hub::testdir::TempDir;
+-    use crate::wire::{HookEvent, PermissionRequest, Register};
++    use crate::wire::{Behavior, HookEvent, PermissionRequest, Register};
+ 
+     const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+     const B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+@@ -910,15 +1355,19 @@
+     // generous bound only protects against a loaded host, it hides nothing.
+     const WAIT: Duration = Duration::from_secs(60);
+ 
+-    /// Records every op. Topics are numbered from 100. `edit_errors` and
++    /// Records every op. Topics are numbered from 100, sent messages from
++    /// 1000. `edit_errors` and
+     /// `send_errors` answer the next edits or sends with these Telegram
+     /// errors (last first). `stall`: no call ever returns.
+     #[derive(Default)]
+     struct Fake {
+         ops: Mutex<Vec<Op>>,
+         next_topic: Mutex<i64>,
++        next_message: Mutex<i64>,
+         edit_errors: Mutex<Vec<&'static str>>,
+         send_errors: Mutex<Vec<&'static str>>,
++        /// Answers the next `editMessageText` calls (last first).
++        message_edit_errors: Mutex<Vec<(i64, &'static str)>>,
+         delete_error: Option<&'static str>,
+         stall: bool,
+         /// Only sends never return; topic calls still answer.
+@@ -954,13 +1403,29 @@
+                     Some(description) => error(description),
+                     None => Ok(Outcome::Done),
+                 },
++                Op::Edit { .. } => match self.message_edit_errors.lock().unwrap().pop() {
++                    Some((code, description)) => Err(ApiError::Telegram {
++                        code,
++                        description: description.to_owned(),
++                    }),
++                    None => Ok(Outcome::Done),
++                },
+                 Op::Delete { .. } => match self.delete_error {
+                     Some(description) => error(description),
+                     None => Ok(Outcome::Done),
+                 },
+                 Op::Send { .. } => match self.send_errors.lock().unwrap().pop() {
+                     Some(description) => error(description),
+-                    None => Ok(Outcome::Sent(Message::default())),
++                    None => {
++                        let mut next = self.next_message.lock().unwrap();
++                        *next = (*next).max(1000);
++                        let message_id = *next;
++                        *next += 1;
++                        Ok(Outcome::Sent(Message {
++                            message_id,
++                            ..Message::default()
++                        }))
++                    }
+                 },
+                 _ => Ok(Outcome::Sent(Message::default())),
+             }
+@@ -1047,8 +1512,19 @@
+             self.agent_of(conn, session, None).await;
+         }
+ 
+-        /// An agent that reports the pid of its claude process.
++        /// An agent that reports the pid of its claude process and does not
++        /// acknowledge verdicts (built before TASK-014).
+         async fn agent_of(&mut self, conn: u64, session: &str, claude_pid: Option<u32>) {
++            self.agent_with(conn, session, claude_pid, false).await;
++        }
++
++        async fn agent_with(
++            &mut self,
++            conn: u64,
++            session: &str,
++            claude_pid: Option<u32>,
++            verdict_ack: bool,
++        ) {
+             let (to_agent, rx) = mpsc::channel(4);
+             self._to_agent.push(rx);
+             let register = Register {
+@@ -1056,6 +1532,7 @@
+                 host: "box".into(),
+                 cwd: CWD.into(),
+                 claude_pid,
++                verdict_ack,
+             };
+             self.agents
+                 .send(AgentEvent::Registered {
+@@ -1418,6 +1895,823 @@
+         assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+     }
+ 
++    fn permission(conn: u64, request_id: &str, preview: &str) -> AgentEvent {
++        AgentEvent::Message {
++            conn,
++            msg: AgentMsg::PermissionRequest(PermissionRequest {
++                request_id: request_id.into(),
++                tool_name: "Bash".into(),
++                description: "run the tests".into(),
++                input_preview: preview.into(),
++            }),
++        }
++    }
++
++    fn press(query: &str, message_id: Option<i64>, data: &str) -> Control {
++        Control::Callback(CallbackInput {
++            query_id: query.into(),
++            data: Some(data.into()),
++            message_id,
++        })
++    }
++
++    /// Permission prompts sent so far: (thread, text, message id Telegram gave).
++    fn prompts(ops: &[Op]) -> Vec<(i64, String, i64)> {
++        let mut message_id = 1000;
++        let mut found = Vec::new();
++        for op in ops {
++            if let Op::Send {
++                thread_id: Some(thread),
++                text,
++                permission,
++                ..
++            } = op
++            {
++                if *permission {
++                    found.push((*thread, text.clone(), message_id));
++                }
++                message_id += 1;
++            }
++        }
++        found
++    }
++
++    fn answers(ops: &[Op]) -> Vec<Option<&str>> {
++        ops.iter()
++            .filter_map(|op| match op {
++                Op::AnswerCallback { text, .. } => Some(text.as_deref()),
++                _ => None,
++            })
++            .collect()
++    }
++
++    fn verdicts(got: &[HubMsg]) -> Vec<(String, Behavior)> {
++        got.iter()
++            .filter_map(|msg| match msg {
++                HubMsg::PermissionVerdict {
++                    request_id,
++                    behavior,
++                    ..
++                } => Some((request_id.clone(), *behavior)),
++                _ => None,
++            })
++            .collect()
++    }
++
++    #[tokio::test]
++    async fn a_prompt_reaches_its_topic_with_two_bounded_buttons() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        let huge = "😀".repeat(16 * 1024);
++        rig.agents
++            .send(permission(2, "abcde", &huge))
++            .await
++            .unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let sent = ops
++            .iter()
++            .find(|op| {
++                matches!(
++                    op,
++                    Op::Send {
++                        permission: true,
++                        ..
++                    }
++                )
++            })
++            .unwrap();
++        let Op::Send {
++            thread_id,
++            text,
++            reply_markup: Some(markup),
++            ..
++        } = sent
++        else {
++            panic!("{sent:?}");
++        };
++        assert_eq!(*thread_id, Some(101), "B's topic");
++        assert!(transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT);
++        let data: Vec<&str> = markup["inline_keyboard"][0]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|button| button["callback_data"].as_str().unwrap())
++            .collect();
++        assert_eq!(data, ["allow:abcde", "deny:abcde"]);
++        assert!(
++            data.iter()
++                .all(|d| d.len() <= permissions::MAX_CALLBACK_DATA)
++        );
++        settled(&rig, |ops| {
++            last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
++        })
++        .await;
++    }
++
++    #[tokio::test]
++    async fn the_first_press_sends_one_verdict_and_later_presses_do_not() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, text, message_id) = prompts(&ops).remove(0);
++        // Let Done::Permission record the message id.
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.control
++            .send(press("q1", Some(message_id), "allow:abcde"))
++            .unwrap();
++        rig.control
++            .send(press("q2", Some(message_id), "allow:abcde"))
++            .unwrap();
++        rig.control
++            .send(press("q3", Some(message_id), "deny:abcde"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 3).await;
++        assert_eq!(
++            answers(&ops),
++            [
++                Some(permissions::ANSWER_ALLOWED),
++                Some(permissions::ANSWER_DECIDED),
++                Some(permissions::ANSWER_DECIDED),
++            ]
++        );
++        let got = received(&mut rig, 1).await;
++        assert_eq!(verdicts(&got), [("abcde".to_owned(), Behavior::Allow)]);
++        assert!(
++            matches!(
++                got.as_slice(),
++                [HubMsg::PermissionVerdict {
++                    verdict_id: None,
++                    ..
++                }]
++            ),
++            "an agent without acks gets the v1 verdict: {got:?}"
++        );
++        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
++        let edits: Vec<&Op> = ops
++            .iter()
++            .filter(|op| matches!(op, Op::Edit { .. }))
++            .collect();
++        assert_eq!(edits.len(), 1, "{edits:?}");
++        assert!(
++            matches!(edits[0], Op::Edit { message_id: id, text: edited, reply_markup: Some(markup) }
++            if *id == message_id
++                && *edited == format!("{text}{}", permissions::ALLOWED_MARK)
++                && *markup == permissions::no_keyboard())
++        );
++        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
++    }
++
++    #[tokio::test]
++    async fn one_request_id_in_two_sessions_is_told_apart_by_its_message() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        rig.agents.send(permission(1, "abcde", "a")).await.unwrap();
++        rig.agents.send(permission(2, "abcde", "b")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        let of_b = prompts(&ops)
++            .into_iter()
++            .find(|(thread, _, _)| *thread == 101)
++            .unwrap();
++        rig.control
++            .send(press("q", Some(of_b.2), "deny:abcde"))
++            .unwrap();
++        settled(&rig, |ops| answers(ops).len() == 1).await;
++        assert_eq!(
++            verdicts(&received(&mut rig, 1).await),
++            [("abcde".to_owned(), Behavior::Deny)]
++        );
++        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
++    }
++
++    #[tokio::test]
++    async fn stale_or_foreign_presses_send_no_verdict() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        for control in [
++            press("q1", Some(message_id + 50), "allow:abcde"), // unknown message
++            press("q2", Some(message_id), "allow:bcdef"),      // another id
++            press("q3", None, "allow:abcde"),                  // inaccessible message
++            press("q4", Some(message_id), "allow:abcdl"),      // not a request id
++            press("q5", Some(message_id), "resume:x"),         // another button
++        ] {
++            rig.control.send(control).unwrap();
++        }
++        let ops = settled(&rig, |ops| answers(ops).len() == 5).await;
++        let expired = Some(permissions::ANSWER_EXPIRED);
++        assert_eq!(answers(&ops), [expired, expired, expired, None, None]);
++        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
++        assert!(!ops.iter().any(|op| matches!(op, Op::Edit { .. })));
++    }
++
++    // ---- TASK-014 review 2: lifecycle defects of the planner reference ----
++
++    const CLOSED: &str = "Сессия завершилась";
++
++    #[test]
++    fn the_closing_text_is_the_decided_wording() {
++        assert_eq!(permissions::CLOSED_TEXT, CLOSED);
++    }
++
++    impl Rig {
++        /// An agent that acknowledges verdicts (`Register::verdict_ack`).
++        async fn agent_acking(&mut self, conn: u64, session: &str, claude_pid: Option<u32>) {
++            self.agent_with(conn, session, claude_pid, true).await;
++        }
++    }
++
++    /// The actor driven by direct calls over a Telegram that answers at once
++    /// (answers are not fed back: there is no run loop).
++    fn live_slots(dir: &TempDir, options: Options) -> (Arc<Fake>, Slots) {
++        let store = RegistryStore::open(dir.path()).unwrap();
++        let fake = Arc::new(Fake::default());
++        let fast = BucketConfig {
++            capacity: 1000,
++            refill_every: Duration::from_millis(1),
++            min_gap: Duration::ZERO,
++        };
++        let (scheduler, outbox) = Scheduler::new(fake.clone(), fast);
++        tokio::spawn(scheduler.run());
++        let slots = Slots::new(Registry::default(), store, outbox, options).0;
++        (fake, slots)
++    }
++
++    fn edits_of(ops: &[Op], message: i64) -> Vec<(String, Option<serde_json::Value>)> {
++        ops.iter()
++            .filter_map(|op| match op {
++                Op::Edit {
++                    message_id,
++                    text,
++                    reply_markup,
++                } if *message_id == message => Some((text.clone(), reply_markup.clone())),
++                _ => None,
++            })
++            .collect()
++    }
++
++    /// Five letters without `l`, distinct for every `n` below 25^5.
++    fn request_id(mut n: usize) -> String {
++        const LETTERS: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
++        let mut id = String::new();
++        for _ in 0..5 {
++            id.push(LETTERS[n % LETTERS.len()] as char);
++            n /= LETTERS.len();
++        }
++        id
++    }
++
++    #[tokio::test]
++    async fn session_end_closes_its_open_prompt_and_a_late_press_does_nothing() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.hook(hook(
++            B,
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: Some(11),
++            },
++        ))
++        .await;
++        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_DEAD)).await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        rig.control
++            .send(press("late", Some(message_id), "allow:abcde"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
++        assert!(
++            verdicts(&received(&mut rig, 1).await).is_empty(),
++            "no verdict after the end"
++        );
++        assert_eq!(answers(&ops), [Some(permissions::ANSWER_EXPIRED)]);
++        assert_eq!(
++            edits_of(&ops, message_id),
++            [(CLOSED.to_owned(), Some(permissions::no_keyboard()))]
++        );
++    }
++
++    #[tokio::test]
++    async fn a_prompt_stays_in_its_slot_topic_when_clear_moves_the_slot_on() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        rig.agents.send(permission(1, "abcde", "a")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (thread, _, old) = prompts(&ops).remove(0);
++        assert_eq!(thread, 100);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.hook(hook(
++            A,
++            HookEvent::SessionEnd {
++                reason: Some("clear".into()),
++                claude_pid: Some(10),
++            },
++        ))
++        .await;
++        rig.hook(hook(
++            B,
++            HookEvent::SessionStart {
++                source: Some("clear".into()),
++                claude_pid: Some(10),
++                parent_claude_pid: None,
++            },
++        ))
++        .await;
++        settled(&rig, |ops| {
++            sent_to(ops, 100).contains(&"── session bbbbbbbb · new ──")
++        })
++        .await;
++        // B, on the same agent (it follows its claude process), asks with the
++        // same five letters.
++        rig.agents.send(permission(1, "abcde", "b")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
++        let (thread, _, new) = prompts(&ops)[1].clone();
++        assert_eq!(thread, 100, "the slot's topic");
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.control
++            .send(press("old", Some(old), "allow:abcde"))
++            .unwrap();
++        rig.control
++            .send(press("new", Some(new), "deny:abcde"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 2).await;
++        assert_eq!(
++            verdicts(&received(&mut rig, 0).await),
++            [("abcde".to_owned(), Behavior::Deny)]
++        );
++        assert_eq!(
++            answers(&ops),
++            [
++                Some(permissions::ANSWER_EXPIRED),
++                Some(permissions::ANSWER_DENIED)
++            ]
++        );
++        assert_eq!(
++            edits_of(&ops, old),
++            [(CLOSED.to_owned(), Some(permissions::no_keyboard()))]
++        );
++    }
++
++    #[tokio::test]
++    async fn an_ended_sessions_prompt_never_reaches_the_topic_its_slot_moved_on_to() {
++        let dir = TempDir::new("slots-prompt-moved");
++        let (fake, mut slots) = live_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        connect(&mut slots, 1, A, Some(10));
++        // A asks while its slot has no topic yet.
++        slots.on_agent(permission(1, "abcde", "p"));
++        slots.pump();
++        slots.on_hook(&hook(
++            A,
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: Some(10),
++            },
++        ));
++        slots.on_hook(&start(B, 11));
++        slots.registry.topic_created(SlotId(0), 100, "t", None);
++        slots.pump();
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        assert!(
++            !fake.ops().iter().any(|op| matches!(
++                op,
++                Op::Send {
++                    permission: true,
++                    ..
++                }
++            )),
++            "{:?}",
++            fake.ops()
++        );
++    }
++
++    #[tokio::test]
++    async fn a_verdict_lost_with_the_link_goes_again_to_the_reconnected_agent() {
++        let mut rig = rig(Fake::default(), message_options());
++        rig.hook(start(A, 10)).await;
++        rig.ops_after(1).await;
++        rig.agent_acking(1, A, Some(10)).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.control
++            .send(press("q1", Some(message_id), "allow:abcde"))
++            .unwrap();
++        assert_eq!(
++            verdicts(&received(&mut rig, 0).await),
++            [("abcde".to_owned(), Behavior::Allow)]
++        );
++        // The link drops before the agent read the verdict: no ack came back.
++        rig.agents
++            .send(AgentEvent::Disconnected { conn: 1 })
++            .await
++            .unwrap();
++        rig.agent_acking(2, A, Some(10)).await;
++        let again = received(&mut rig, 1).await;
++        assert_eq!(
++            verdicts(&again),
++            [("abcde".to_owned(), Behavior::Allow)],
++            "the same verdict again"
++        );
++        let [
++            HubMsg::PermissionVerdict {
++                verdict_id: Some(verdict_id),
++                ..
++            },
++        ] = again.as_slice()
++        else {
++            panic!("{again:?}");
++        };
++        assert!(
++            edits_of(&rig.fake.ops(), message_id).is_empty(),
++            "not decided before the ack"
++        );
++        rig.agents
++            .send(AgentEvent::Message {
++                conn: 2,
++                msg: AgentMsg::PermissionAck {
++                    verdict_id: *verdict_id,
++                },
++            })
++            .await
++            .unwrap();
++        settled(&rig, |ops| edits_of(ops, message_id).len() == 1).await;
++    }
++
++    #[tokio::test]
++    async fn an_acking_agent_decides_a_prompt_only_with_its_own_ack() {
++        let options = Options {
++            retry_every: Duration::from_millis(100),
++            ..message_options()
++        };
++        let mut rig = rig(Fake::default(), options);
++        rig.hook(start(A, 10)).await;
++        rig.ops_after(1).await;
++        rig.agent_of(1, A, Some(10)).await;
++        rig.hook(start(B, 11)).await;
++        settled(&rig, |ops| count(ops, is_create) == 2).await;
++        rig.agent_acking(2, B, Some(11)).await;
++        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| {
++            prompts(ops).len() == 1
++                && last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
++        })
++        .await;
++        let (_, text, message_id) = prompts(&ops).remove(0);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.control
++            .send(press("q1", Some(message_id), "deny:abcde"))
++            .unwrap();
++        // Unacked, it goes again on every tick with the same id.
++        tokio::time::sleep(Duration::from_millis(350)).await;
++        let got = received(&mut rig, 1).await;
++        let ids: HashSet<Option<u64>> = got
++            .iter()
++            .map(|msg| match msg {
++                HubMsg::PermissionVerdict { verdict_id, .. } => *verdict_id,
++                other => panic!("{other:?}"),
++            })
++            .collect();
++        assert!(got.len() >= 2, "{got:?}");
++        assert_eq!(ids.len(), 1, "{got:?}");
++        let Some(Some(verdict_id)) = ids.into_iter().next() else {
++            panic!("an acking agent gets an id");
++        };
++        assert!(edits_of(&rig.fake.ops(), message_id).is_empty());
++        assert_eq!(
++            last_icon(&rig.fake.ops(), 101),
++            Some(crate::hub::registry::ICON_WAITING)
++        );
++        // An ack from an agent of another session decides nothing.
++        rig.agents
++            .send(AgentEvent::Message {
++                conn: 1,
++                msg: AgentMsg::PermissionAck { verdict_id },
++            })
++            .await
++            .unwrap();
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        assert!(edits_of(&rig.fake.ops(), message_id).is_empty());
++        rig.agents
++            .send(AgentEvent::Message {
++                conn: 2,
++                msg: AgentMsg::PermissionAck { verdict_id },
++            })
++            .await
++            .unwrap();
++        let ops = settled(&rig, |ops| {
++            edits_of(ops, message_id).len() == 1 && last_icon(ops, 101) == Some(ICON_ALIVE)
++        })
++        .await;
++        assert_eq!(
++            edits_of(&ops, message_id),
++            [(
++                format!("{text}{}", permissions::DENIED_MARK),
++                Some(permissions::no_keyboard())
++            )]
++        );
++        // Decided: nothing goes again, a press only hears "already decided".
++        let _ = received(&mut rig, 1).await;
++        rig.control
++            .send(press("q2", Some(message_id), "allow:abcde"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 2).await;
++        assert_eq!(
++            answers(&ops),
++            [
++                Some(permissions::ANSWER_DENIED),
++                Some(permissions::ANSWER_DECIDED)
++            ]
++        );
++        assert!(received(&mut rig, 1).await.is_empty());
++        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
++    }
++
++    #[tokio::test]
++    async fn a_nested_resume_ending_leaves_the_prompt_open() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        // The end of a nested `claude -p --resume` of B: another pid.
++        rig.hook(hook(
++            B,
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: Some(99),
++            },
++        ))
++        .await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        rig.control
++            .send(press("q", Some(message_id), "allow:abcde"))
++            .unwrap();
++        settled(&rig, |ops| answers(ops).len() == 1).await;
++        assert_eq!(
++            verdicts(&received(&mut rig, 1).await),
++            [("abcde".to_owned(), Behavior::Allow)]
++        );
++    }
++
++    #[tokio::test]
++    async fn a_turn_boundary_stops_an_unanswered_prompt_from_holding_the_icon() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        // Answered in the terminal: the hub only sees the turn end.
++        rig.agents.send(permission(2, "abcde", "1")).await.unwrap();
++        settled(&rig, |ops| {
++            last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
++        })
++        .await;
++        rig.hook(hook(
++            B,
++            HookEvent::Stop {
++                prompt_id: None,
++                last_assistant_message: None,
++            },
++        ))
++        .await;
++        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
++        rig.agents.send(permission(2, "bcdef", "2")).await.unwrap();
++        let ops = settled(&rig, |ops| {
++            prompts(ops).len() == 2
++                && last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
++        })
++        .await;
++        let second = prompts(&ops)[1].2;
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.control
++            .send(press("q", Some(second), "allow:bcdef"))
++            .unwrap();
++        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
++    }
++
++    #[tokio::test]
++    async fn a_verdict_never_reaches_another_session_on_the_same_pid() {
++        let mut rig = rig(Fake::default(), message_options());
++        // A hook without a pid: the registry cannot tie pid 10 to A.
++        rig.hook(hook(
++            A,
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: None,
++                parent_claude_pid: None,
++            },
++        ))
++        .await;
++        rig.ops_after(1).await;
++        rig.agent_of(1, A, Some(10)).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        rig.agents
++            .send(AgentEvent::Disconnected { conn: 1 })
++            .await
++            .unwrap();
++        // An agent of another session reports the same claude pid (a reused
++        // pid); its SessionStart has not arrived yet, so it waits unbound.
++        rig.agent_of(7, "cccccccc-0000-4000-8000-000000000003", Some(10))
++            .await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        rig.control
++            .send(press("q", Some(message_id), "allow:abcde"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
++        assert!(verdicts(&received(&mut rig, 1).await).is_empty());
++        assert_eq!(answers(&ops), [Some(permissions::ANSWER_OFFLINE)]);
++    }
++
++    #[tokio::test]
++    async fn the_waiting_icon_stays_while_another_prompt_of_the_session_is_open() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        rig.agents.send(permission(2, "abcde", "1")).await.unwrap();
++        rig.agents.send(permission(2, "bcdef", "2")).await.unwrap();
++        let ops = settled(&rig, |ops| {
++            prompts(ops).len() == 2
++                && last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
++        })
++        .await;
++        let shown = prompts(&ops);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.control
++            .send(press("q1", Some(shown[0].2), "allow:abcde"))
++            .unwrap();
++        settled(&rig, |ops| edits_of(ops, shown[0].2).len() == 1).await;
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        assert_eq!(
++            last_icon(&rig.fake.ops(), 101),
++            Some(crate::hub::registry::ICON_WAITING),
++            "the second prompt is still open"
++        );
++        rig.control
++            .send(press("q2", Some(shown[1].2), "allow:bcdef"))
++            .unwrap();
++        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
++    }
++
++    #[tokio::test]
++    async fn a_prompt_telegram_refused_leaves_no_waiting_icon() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        rig.fake
++            .send_errors
++            .lock()
++            .unwrap()
++            .push("Bad Request: message text is empty");
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        settled(&rig, |ops| {
++            ops.iter().any(|op| {
++                matches!(
++                    op,
++                    Op::Send {
++                        permission: true,
++                        ..
++                    }
++                )
++            })
++        })
++        .await;
++        tokio::time::sleep(Duration::from_millis(500)).await;
++        assert_eq!(last_icon(&rig.fake.ops(), 101), Some(ICON_ALIVE));
++    }
++
++    #[tokio::test]
++    async fn a_failed_decision_edit_is_tried_again_on_the_tick() {
++        let options = Options {
++            retry_every: Duration::from_millis(100),
++            ..message_options()
++        };
++        let mut rig = rig(Fake::default(), options);
++        two_live_slots(&mut rig, true).await;
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, text, message_id) = prompts(&ops).remove(0);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        rig.fake
++            .message_edit_errors
++            .lock()
++            .unwrap()
++            .push((500, "Internal Server Error"));
++        rig.control
++            .send(press("q1", Some(message_id), "allow:abcde"))
++            .unwrap();
++        settled(&rig, |ops| !edits_of(ops, message_id).is_empty()).await;
++        tokio::time::sleep(Duration::from_millis(800)).await;
++        let decided = (
++            format!("{text}{}", permissions::ALLOWED_MARK),
++            Some(permissions::no_keyboard()),
++        );
++        assert_eq!(
++            edits_of(&rig.fake.ops(), message_id),
++            [decided.clone(), decided],
++            "one failure, one retry, then done"
++        );
++        assert_eq!(verdicts(&received(&mut rig, 1).await).len(), 1);
++    }
++
++    #[tokio::test]
++    async fn a_full_prompt_book_expires_its_oldest_prompt_visibly() {
++        let dir = TempDir::new("slots-prompt-book");
++        let (fake, mut slots) = live_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        connect(&mut slots, 1, A, Some(10));
++        for n in 0..permissions::MAX_PROMPTS {
++            slots.on_agent(permission(1, &request_id(n), "p"));
++        }
++        // All shown (no pump: nothing else goes out).
++        for key in 0..permissions::MAX_PROMPTS as u64 {
++            slots.prompts.get_mut(key).unwrap().sent = true;
++            slots.prompts.delivered(key, 5000 + key as i64);
++        }
++        slots.on_agent(permission(1, "zzzzz", "p"));
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        let ops = fake.ops();
++        let old = edits_of(&ops, 5000);
++        assert!(
++            old.len() == 1 && old[0].1 == Some(permissions::no_keyboard()),
++            "{ops:?}"
++        );
++        assert_eq!(ops.len(), 1, "{ops:?}");
++    }
++
++    #[tokio::test]
++    async fn the_first_press_stays_the_answer_while_the_agent_is_away() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        rig.agents
++            .send(AgentEvent::Disconnected { conn: 1 })
++            .await
++            .unwrap();
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_NO_CHANNEL)).await;
++        rig.control
++            .send(press("q1", Some(message_id), "deny:abcde"))
++            .unwrap();
++        settled(&rig, |ops| answers(ops).len() == 1).await;
++        // A second thought while the agent is still away changes nothing.
++        rig.control
++            .send(press("q2", Some(message_id), "allow:abcde"))
++            .unwrap();
++        settled(&rig, |ops| answers(ops).len() == 2).await;
++        rig.agent_of(2, A, Some(10)).await;
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        rig.control
++            .send(press("q3", Some(message_id), "allow:abcde"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 3).await;
++        assert_eq!(
++            verdicts(&received(&mut rig, 1).await),
++            [("abcde".to_owned(), Behavior::Deny)],
++            "the first choice, once"
++        );
++        assert_eq!(
++            answers(&ops),
++            [
++                Some(permissions::ANSWER_OFFLINE),
++                Some(permissions::ANSWER_DECIDED),
++                Some(permissions::ANSWER_DECIDED)
++            ]
++        );
++    }
++
++    #[tokio::test]
++    async fn a_prompt_overtakes_a_full_reply_backlog() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, true).await;
++        // Fill the reply cap for topic 100, then ask for a permission in 101.
++        for i in 0..MAX_QUEUED_MESSAGES + 10 {
++            rig.agents.send(reply(1, &format!("r{i}"))).await.unwrap();
++        }
++        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
++        // Identified by its text, not by the lane flag under test.
++        let is_prompt = |text: &&str| text.starts_with("Запрос разрешения");
++        let ops = settled(&rig, |ops| {
++            sends(ops).iter().any(is_prompt) || sends(ops).len() >= 3
++        })
++        .await;
++        let sends: Vec<&str> = sends(&ops);
++        // The first reply may already be on its way; nothing else is ahead.
++        let at = sends.iter().position(is_prompt);
++        assert!(at.is_some_and(|at| at <= 1), "prompt at {at:?}: {sends:?}");
++    }
++
+     #[tokio::test]
+     async fn a_multi_chunk_reply_is_rejected_atomically_at_the_cap() {
+         let dir = TempDir::new("slots-atomic-reply");
+@@ -1503,6 +2797,7 @@
+                 host: "box".into(),
+                 cwd: CWD.into(),
+                 claude_pid,
++                verdict_ack: false,
+             },
+             to_agent,
+         });
+@@ -1560,6 +2855,7 @@
+                 host: "box".into(),
+                 cwd: CWD.into(),
+                 claude_pid: Some(10),
++                verdict_ack: false,
+             },
+             to_agent,
+         });
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -10,9 +10,11 @@
+ //! [`EventId`] once and sends the same one again only when it re-sends the
+ //! same POST; the hub drops repeats by it.
+ //!
+-//! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; a new message
+-//! type or a changed meaning bumps it. Errors never carry the offending input:
+-//! a line can contain the secret.
++//! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; so does a new
++//! message type that a peer sends only after the other side announced it in
++//! such a field (`permission_ack`, see [`Register::verdict_ack`]). Any other
++//! new message type or a changed meaning bumps it. Errors never carry the
++//! offending input: a line can contain the secret.
+ 
+ use std::collections::BTreeMap;
+ use std::collections::hash_map::RandomState;
+@@ -120,6 +122,11 @@
+     /// hub follows the process through its `pids` map instead.
+     #[serde(default)]
+     pub claude_pid: Option<u32>,
++    /// The agent answers a `permission_verdict` that carries a `verdict_id`
++    /// with `permission_ack`. Agents built before TASK-014 leave it out: the
++    /// hub then takes a verdict handed to their link as delivered.
++    #[serde(default)]
++    pub verdict_ack: bool,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -143,10 +150,21 @@
+         text: String,
+     },
+     PermissionRequest(PermissionRequest),
++    /// The agent queued the verdict `verdict_id` for Claude Code. Sent only
++    /// to a hub that put the id into the verdict.
++    PermissionAck {
++        verdict_id: u64,
++    },
+ }
+ 
+ impl Kinds for AgentMsg {
+-    const KINDS: &'static [&'static str] = &["hello", "register", "reply", "permission_request"];
++    const KINDS: &'static [&'static str] = &[
++        "hello",
++        "register",
++        "reply",
++        "permission_request",
++        "permission_ack",
++    ];
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+@@ -181,6 +199,10 @@
+     PermissionVerdict {
+         request_id: String,
+         behavior: Behavior,
++        /// Set only for an agent that registered with `verdict_ack`; the same
++        /// id comes again when the hub re-sends the same answer.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        verdict_id: Option<u64>,
+     },
+ }
+ 
+@@ -464,6 +486,7 @@
+                 host: "box".into(),
+                 cwd: "C:\\work\\app".into(),
+                 claude_pid: Some(4242),
++                verdict_ack: true,
+             }),
+             AgentMsg::Reply {
+                 text: "multi\nline \u{2014} text".into(),
+@@ -474,6 +497,9 @@
+                 description: "run tests".into(),
+                 input_preview: "{\"command\":\"cargo test\"}".into(),
+             }),
++            AgentMsg::PermissionAck {
++                verdict_id: u64::MAX,
++            },
+         ]
+     }
+ 
+@@ -496,10 +522,12 @@
+             HubMsg::PermissionVerdict {
+                 request_id: "abcde".into(),
+                 behavior: Behavior::Allow,
++                verdict_id: None,
+             },
+             HubMsg::PermissionVerdict {
+                 request_id: "abcde".into(),
+                 behavior: Behavior::Deny,
++                verdict_id: Some(u64::MAX),
+             },
+         ]
+     }
+@@ -620,7 +648,49 @@
+                 host: "h".into(),
+                 cwd: "/w".into(),
+                 claude_pid: None,
++                verdict_ack: false,
+             }))
++        );
++    }
++
++    #[test]
++    fn verdict_acks_stay_compatible_with_version_one_peers() {
++        // A hub before TASK-014 sends no id; an agent before it reads past one.
++        let legacy =
++            br#"{"v":1,"type":"permission_verdict","request_id":"abcde","behavior":"allow"}"#;
++        assert_eq!(
++            decode::<HubMsg>(legacy),
++            Ok(HubMsg::PermissionVerdict {
++                request_id: "abcde".into(),
++                behavior: Behavior::Allow,
++                verdict_id: None,
++            })
++        );
++        let without_id = encode(&HubMsg::PermissionVerdict {
++            request_id: "abcde".into(),
++            behavior: Behavior::Allow,
++            verdict_id: None,
++        });
++        assert_eq!(without_id, [&legacy[..], b"\n"].concat());
++        let with_id = encode(&HubMsg::PermissionVerdict {
++            request_id: "abcde".into(),
++            behavior: Behavior::Deny,
++            verdict_id: Some(7),
++        });
++        let value: Value = serde_json::from_slice(&with_id).unwrap();
++        assert_eq!(value["v"], 1);
++        assert_eq!(value["verdict_id"], 7);
++        let line = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w","verdict_ack":true}"#;
++        assert!(matches!(
++            decode::<AgentMsg>(line),
++            Ok(AgentMsg::Register(Register {
++                verdict_ack: true,
++                ..
++            }))
++        ));
++        assert_eq!(
++            decode::<AgentMsg>(br#"{"v":1,"type":"permission_ack"}"#),
++            Err(WireError::Malformed)
+         );
+     }
+ 
+diff --git a/crates/cctg/tests/ingress_logs.rs b/crates/cctg/tests/ingress_logs.rs
+--- a/crates/cctg/tests/ingress_logs.rs
++++ b/crates/cctg/tests/ingress_logs.rs
+@@ -103,6 +103,7 @@
+         host: format!("host-{content}"),
+         cwd: format!("/home/{content}"),
+         claude_pid: None,
++        verdict_ack: false,
+     };
+     let mut lines = wire::encode(&AgentMsg::Hello {
+         secret: secret.clone(),
+diff --git a/crates/cctg/tests/message_logs.rs b/crates/cctg/tests/message_logs.rs
+--- a/crates/cctg/tests/message_logs.rs
++++ b/crates/cctg/tests/message_logs.rs
+@@ -164,6 +164,7 @@
+                 host: "box".into(),
+                 cwd: r"C:\w\p".into(),
+                 claude_pid: Some(10),
++                verdict_ack: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/permission_logs.rs b/crates/cctg/tests/permission_logs.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/permission_logs.rs
+@@ -0,0 +1,330 @@
++//! Permission relay through the real poll classification, the slot actor and
++//! the scheduler, with log capture: a stranger's press sends nothing, an
++//! allowlisted press sends one verdict that the agent acknowledges, the end
++//! of the session closes the next prompt, and neither the request fields,
++//! the request or verdict id nor the user id reach the logs. Its own test
++//! binary with a global subscriber (see `message_logs.rs`).
++
++use std::io;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use cctg::hub::api::{ForumTopic, Message};
++use cctg::hub::config::Allowlist;
++use cctg::hub::ingress::AgentEvent;
++use cctg::hub::permissions;
++use cctg::hub::registry::RegistryStore;
++use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
++use cctg::hub::slots::{Control, Options, Slots};
++use cctg::hub::updates::{Ignored, Routed, route_batch};
++use cctg::wire::{AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionRequest, Register};
++use serde_json::{Value, json};
++use tokio::sync::mpsc;
++
++const CHAT: i64 = -1000000000001;
++/// Distinctive enough not to appear by chance (logs run `.without_time()`).
++const USER: i64 = 7_318_046_259;
++const STRANGER: i64 = 6_402_917_385;
++const REQUEST: &str = "qzxwv";
++const SECOND_REQUEST: &str = "wvxzq";
++const PROMPT_MESSAGE: i64 = 4242;
++
++#[derive(Clone, Default)]
++struct Captured(Arc<Mutex<Vec<u8>>>);
++
++impl io::Write for Captured {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        if let Ok(mut out) = self.0.lock() {
++            out.extend_from_slice(buf);
++        }
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++/// Topic 100; every sent message gets id [`PROMPT_MESSAGE`].
++#[derive(Default)]
++struct Accepting(Mutex<Vec<Op>>);
++
++impl Accepting {
++    fn ops(&self) -> Vec<Op> {
++        self.0.lock().expect("ops").clone()
++    }
++}
++
++impl Transport for Accepting {
++    async fn execute(&self, op: &Op) -> Delivery {
++        self.0.lock().expect("ops").push(op.clone());
++        match op {
++            Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
++                message_thread_id: 100,
++                name: name.clone(),
++                icon_custom_emoji_id: None,
++            })),
++            Op::Send { .. } | Op::SendDocument { .. } => Ok(Outcome::Sent(Message {
++                message_id: PROMPT_MESSAGE,
++                ..Message::default()
++            })),
++            _ => Ok(Outcome::Done),
++        }
++    }
++}
++
++fn press(update_id: i64, from: i64) -> Value {
++    json!({ "update_id": update_id, "callback_query": {
++        "id": format!("q{update_id}"),
++        "from": { "id": from, "is_bot": false, "first_name": "x" },
++        "chat_instance": "c",
++        "data": permissions::callback_data(Behavior::Allow, REQUEST),
++        "message": {
++            "message_id": PROMPT_MESSAGE, "message_thread_id": 100, "is_topic_message": true,
++            "date": 1, "text": "prompt",
++            "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
++        },
++    }})
++}
++
++async fn until(what: &str, mut ready: impl FnMut() -> bool) {
++    let wait = async {
++        while !ready() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    };
++    tokio::time::timeout(Duration::from_secs(30), wait)
++        .await
++        .unwrap_or_else(|_| panic!("{what} in time"));
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn permission_relay_logs_carry_no_request_and_no_user_id() {
++    let captured = Captured::default();
++    let writer = captured.clone();
++    let subscriber = tracing_subscriber::fmt()
++        .without_time()
++        .with_max_level(tracing::Level::TRACE)
++        .with_writer(move || writer.clone())
++        .finish();
++    tracing::subscriber::set_global_default(subscriber).expect("first subscriber");
++
++    let pid = std::process::id();
++    let tool = format!("PrivateTool{pid}");
++    let description = format!("private description {pid}");
++    let preview = format!("private preview {pid}");
++    let state = std::env::temp_dir().join(format!("cctg-permission-logs-{pid}"));
++    let _ = std::fs::remove_dir_all(&state);
++    std::fs::create_dir_all(&state).expect("state dir");
++
++    let fake = Arc::new(Accepting::default());
++    let (scheduler, outbox) = Scheduler::new(
++        fake.clone(),
++        BucketConfig {
++            capacity: 100,
++            refill_every: Duration::from_millis(10),
++            min_gap: Duration::ZERO,
++        },
++    );
++    tokio::spawn(scheduler.run());
++    let store = RegistryStore::open(&state).expect("store");
++    let options = Options {
++        grace: Duration::ZERO,
++        chat_id: CHAT,
++        ..Options::default()
++    };
++    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
++    let (agents, agents_rx) = mpsc::channel(16);
++    let (hooks, hooks_rx) = mpsc::channel(16);
++    let (control, control_rx) = mpsc::unbounded_channel();
++    tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
++
++    let session = "5e551017-0000-4000-8000-000000000001";
++    hooks
++        .send(HookPost::new(
++            "box".into(),
++            session.into(),
++            r"C:\w\p".into(),
++            String::new(),
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(10),
++                parent_claude_pid: None,
++            },
++        ))
++        .await
++        .expect("hook");
++    until("topic", || {
++        fake.ops()
++            .iter()
++            .any(|op| matches!(op, Op::CreateTopic { .. }))
++    })
++    .await;
++    let (to_agent, mut to_agent_rx) = mpsc::channel(4);
++    agents
++        .send(AgentEvent::Registered {
++            conn: 1,
++            register: Register {
++                session_id: session.into(),
++                host: "box".into(),
++                cwd: r"C:\w\p".into(),
++                claude_pid: Some(10),
++                verdict_ack: true,
++            },
++            to_agent,
++        })
++        .await
++        .expect("agent");
++    agents
++        .send(AgentEvent::Message {
++            conn: 1,
++            msg: AgentMsg::PermissionRequest(PermissionRequest {
++                request_id: REQUEST.into(),
++                tool_name: tool.clone(),
++                description: description.clone(),
++                input_preview: preview.clone(),
++            }),
++        })
++        .await
++        .expect("request");
++    until("prompt", || {
++        fake.ops().iter().any(|op| {
++            matches!(
++                op,
++                Op::Send {
++                    permission: true,
++                    ..
++                }
++            )
++        })
++    })
++    .await;
++    tokio::time::sleep(Duration::from_millis(200)).await;
++
++    let allowlist: Allowlist = [USER].into_iter().collect();
++    let (_, routed) = route_batch(
++        vec![press(1, STRANGER), press(2, USER)],
++        None,
++        CHAT,
++        &allowlist,
++    );
++    assert_eq!(routed[0], Routed::Ignored(Ignored::NotAllowed));
++    for item in routed {
++        if let Routed::Callback(input) = item {
++            control.send(Control::Callback(input)).expect("control");
++        }
++    }
++    let got = tokio::time::timeout(Duration::from_secs(30), to_agent_rx.recv())
++        .await
++        .expect("verdict in time");
++    let Some(HubMsg::PermissionVerdict {
++        request_id,
++        behavior: Behavior::Allow,
++        verdict_id: Some(verdict_id),
++    }) = got
++    else {
++        panic!("one allow verdict with an id: {got:?}");
++    };
++    assert_eq!(request_id, REQUEST);
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    assert!(
++        !fake.ops().iter().any(|op| matches!(op, Op::Edit { .. })),
++        "decided only by the ack"
++    );
++    agents
++        .send(AgentEvent::Message {
++            conn: 1,
++            msg: AgentMsg::PermissionAck { verdict_id },
++        })
++        .await
++        .expect("ack");
++    until("answer and edit", || {
++        fake.ops().iter().any(|op| matches!(op, Op::Edit { .. }))
++    })
++    .await;
++    let answered: Vec<Op> = fake
++        .ops()
++        .into_iter()
++        .filter(|op| matches!(op, Op::AnswerCallback { .. }))
++        .collect();
++    assert_eq!(
++        answered.len(),
++        1,
++        "the stranger's press is not answered: {answered:?}"
++    );
++    assert!(to_agent_rx.try_recv().is_err(), "one verdict only");
++
++    // A second prompt is still open when the session ends: it is closed.
++    agents
++        .send(AgentEvent::Message {
++            conn: 1,
++            msg: AgentMsg::PermissionRequest(PermissionRequest {
++                request_id: SECOND_REQUEST.into(),
++                tool_name: tool.clone(),
++                description: description.clone(),
++                input_preview: preview.clone(),
++            }),
++        })
++        .await
++        .expect("second request");
++    let permission_sends = || {
++        fake.ops()
++            .iter()
++            .filter(|op| {
++                matches!(
++                    op,
++                    Op::Send {
++                        permission: true,
++                        ..
++                    }
++                )
++            })
++            .count()
++    };
++    until("second prompt", || permission_sends() == 2).await;
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    hooks
++        .send(HookPost::new(
++            "box".into(),
++            session.into(),
++            r"C:\w\p".into(),
++            String::new(),
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: Some(10),
++            },
++        ))
++        .await
++        .expect("hook");
++    until("closing edit", || {
++        fake.ops()
++            .iter()
++            .any(|op| matches!(op, Op::Edit { text, .. } if text == permissions::CLOSED_TEXT))
++    })
++    .await;
++    let _ = std::fs::remove_dir_all(&state);
++
++    let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
++        .unwrap_or_default();
++    for expected in [
++        "permission request queued for the topic",
++        "permission answer chosen in Telegram",
++        "permission verdict forwarded to the session agent",
++        "permission verdict taken by the session agent",
++        "permission prompt closed: its session ended",
++    ] {
++        assert!(logs.contains(expected), "{expected}: {logs}");
++    }
++    for private in [
++        tool.as_str(),
++        description.as_str(),
++        preview.as_str(),
++        "private",
++        REQUEST,
++        SECOND_REQUEST,
++        &verdict_id.to_string(),
++        &USER.to_string(),
++        &STRANGER.to_string(),
++    ] {
++        assert!(!logs.contains(private), "{private} in logs: {logs}");
++    }
++}
+diff --git a/crates/cctg/tests/slots_logs.rs b/crates/cctg/tests/slots_logs.rs
+--- a/crates/cctg/tests/slots_logs.rs
++++ b/crates/cctg/tests/slots_logs.rs
+@@ -130,6 +130,7 @@
+                 host: "box".into(),
+                 cwd: cwd.clone(),
+                 claude_pid: None,
++                verdict_ack: false,
+             },
+             to_agent,
+         })

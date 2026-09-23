@@ -1,0 +1,12 @@
+OK crates/cctg/src/agent.rs
+OK crates/cctg/src/channel.rs
+OK crates/cctg/src/hub/ingress.rs
+OK crates/cctg/src/hub/mod.rs
+OK crates/cctg/src/hub/permissions.rs
+OK crates/cctg/src/hub/registry.rs
+OK crates/cctg/src/hub/slots.rs
+OK crates/cctg/src/wire.rs
+OK crates/cctg/tests/ingress_logs.rs
+OK crates/cctg/tests/message_logs.rs
+OK crates/cctg/tests/permission_logs.rs
+OK crates/cctg/tests/slots_logs.rs

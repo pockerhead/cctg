@@ -164,6 +164,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 host: "box".into(),
                 cwd: r"C:\w\p".into(),
                 claude_pid: Some(10),
+                verdict_ack: false,
             },
             to_agent,
         })
@@ -183,6 +184,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     agents
         .send(AgentEvent::Message {
             conn: 1,
+            received_at: std::time::Instant::now(),
             msg: AgentMsg::Reply {
                 text: reply_text.clone(),
             },

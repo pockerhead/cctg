@@ -1,0 +1,5 @@
+f1e6ae8b105155a97889a323af9984f01115235442fc5ac20e289fefd53400cb  crates/cctg/src/hub/mod.rs
+671aa23c09d6a503af2f6c0ce9d22f1c092c1611928cf92cac243dc9a8656ec5  crates/cctg/src/hub/permissions.rs
+02997b219aa49e3925c7ecb85e71b3adc9ce320d22f6250a776faf0e8a6bf57f  crates/cctg/src/hub/registry.rs
+683ebddf035280db964eccd0b0e725ea24232d28370ef704722a141d4e46a41f  crates/cctg/src/hub/slots.rs
+20df0f6570dd03bc95ee3a2c70e7d367ff071d649a3cddf4753b2c42f6921350  crates/cctg/tests/permission_logs.rs

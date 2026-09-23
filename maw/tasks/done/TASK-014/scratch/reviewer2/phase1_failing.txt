@@ -1,0 +1,41 @@
+# planner reference + review-2 tests, `cargo test -p cctg --lib hub::slots`, exit 101
+test hub::slots::tests::a_full_prompt_book_expires_its_oldest_prompt_visibly ... FAILED
+test hub::slots::tests::a_prompt_telegram_refused_leaves_no_waiting_icon ... FAILED
+test hub::slots::tests::a_verdict_never_reaches_another_session_on_the_same_pid ... FAILED
+test hub::slots::tests::an_ended_sessions_prompt_never_reaches_the_topic_its_slot_moved_on_to ... FAILED
+test hub::slots::tests::a_verdict_lost_with_the_link_goes_again_to_the_reconnected_agent ... FAILED
+test hub::slots::tests::a_failed_decision_edit_is_tried_again_on_the_tick ... FAILED
+test hub::slots::tests::session_end_closes_its_open_prompt_and_a_late_press_does_nothing ... FAILED
+test hub::slots::tests::the_first_press_stays_the_answer_while_the_agent_is_away ... FAILED
+test hub::slots::tests::a_prompt_stays_in_its_slot_topic_when_clear_moves_the_slot_on ... FAILED
+test hub::slots::tests::the_waiting_icon_stays_while_another_prompt_of_the_session_is_open ... FAILED
+thread 'hub::slots::tests::a_full_prompt_book_expires_its_oldest_prompt_visibly' (25552) panicked at crates\cctg\src\hub\slots.rs:2319:9:
+thread 'hub::slots::tests::a_prompt_telegram_refused_leaves_no_waiting_icon' (25980) panicked at crates\cctg\src\hub\slots.rs:2263:9:
+assertion `left == right` failed
+  left: Some("5377316857231450742")
+ right: Some("5312016608254762256")
+thread 'hub::slots::tests::a_verdict_never_reaches_another_session_on_the_same_pid' (21536) panicked at crates\cctg\src\hub\slots.rs:2208:9:
+assertion failed: verdicts(&received(&mut rig, 1).await).is_empty()
+thread 'hub::slots::tests::an_ended_sessions_prompt_never_reaches_the_topic_its_slot_moved_on_to' (37560) panicked at crates\cctg\src\hub\slots.rs:2132:9:
+thread 'hub::slots::tests::a_verdict_lost_with_the_link_goes_again_to_the_reconnected_agent' (28048) panicked at crates\cctg\src\hub\slots.rs:2169:9:
+assertion `left == right` failed: the same verdict again
+  left: []
+ right: [("abcde", Allow)]
+thread 'hub::slots::tests::a_failed_decision_edit_is_tried_again_on_the_tick' (29404) panicked at crates\cctg\src\hub\slots.rs:2292:9:
+assertion `left == right` failed: one failure, one retry, then done
+  left: [("Запрос разрешения: Bash\nrun the tests\n\np\n\n✅ Разрешено из Telegram", Some(Object {"inline_keyboard": Array []}))]
+ right: [("Запрос разрешения: Bash\nrun the tests\n\np\n\n✅ Разрешено из Telegram", Some(Object {"inline_keyboard": Array []})), ("Запрос разрешения: Bash\nrun the tests\n\np\n\n✅ Разрешено из Telegram", Some(Object {"inline_keyboard": Array []}))]
+thread 'hub::slots::tests::session_end_closes_its_open_prompt_and_a_late_press_does_nothing' (23852) panicked at crates\cctg\src\hub\slots.rs:2040:9:
+thread 'hub::slots::tests::the_first_press_stays_the_answer_while_the_agent_is_away' (23424) panicked at crates\cctg\src\hub\slots.rs:2353:9:
+assertion `left == right` failed: the first choice, once
+  left: [("abcde", Allow)]
+ right: [("abcde", Deny)]
+thread 'hub::slots::tests::a_prompt_stays_in_its_slot_topic_when_clear_moves_the_slot_on' (41900) panicked at crates\cctg\src\hub\slots.rs:2095:9:
+assertion `left == right` failed
+  left: [("abcde", Allow), ("abcde", Deny)]
+ right: [("abcde", Deny)]
+thread 'hub::slots::tests::the_waiting_icon_stays_while_another_prompt_of_the_session_is_open' (40248) panicked at crates\cctg\src\hub\slots.rs:2229:9:
+assertion `left == right` failed: the second prompt is still open
+  left: Some("5312016608254762256")
+ right: Some("5377316857231450742")
+test result: FAILED. 40 passed; 10 failed; 0 ignored; 0 measured; 211 filtered out; finished in 7.17s
