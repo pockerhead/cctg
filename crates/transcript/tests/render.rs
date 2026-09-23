@@ -12,7 +12,8 @@ const COMPACT_SUMMARY: &str = include_str!("fixtures/compact_summary.jsonl");
 const THINKING_AI_TITLE: &str = include_str!("fixtures/thinking_ai_title.jsonl");
 const TOOL_USE_RESULT: &str = include_str!("fixtures/tool_use_result.jsonl");
 const SIDECHAIN: &str = include_str!("fixtures/sidechain.jsonl");
-const ALL: [&str; 8] = [
+const SLASH_COMMAND: &str = include_str!("fixtures/slash_command.jsonl");
+const ALL: [&str; 9] = [
     FINAL_ANSWER,
     COMPACT_SUMMARY,
     THINKING_AI_TITLE,
@@ -21,6 +22,7 @@ const ALL: [&str; 8] = [
     include_str!("fixtures/plain_text.jsonl"),
     include_str!("fixtures/string_content.jsonl"),
     include_str!("fixtures/null_fields.jsonl"),
+    SLASH_COMMAND,
 ];
 
 const FINAL_ANSWER_BRIEF: &str = "\
@@ -187,7 +189,6 @@ fn meta(text: &str) -> Turn {
 fn service_records_are_hidden_in_brief_and_keep_the_state() {
     for service in [
         "<task-notification>\n<task-id>x</task-id>\n</task-notification>",
-        "<command-name>/clear</command-name>\n<command-message>clear</command-message>",
         "<command-message>clear</command-message>",
         "<local-command-stdout>ok</local-command-stdout>",
         "<bash-input>ls</bash-input>",
@@ -214,6 +215,39 @@ fn service_records_are_hidden_in_brief_and_keep_the_state() {
             "{service}"
         );
     }
+}
+
+#[test]
+fn slash_commands_are_one_line_prompts() {
+    let turns = parse(SLASH_COMMAND);
+    assert_eq!(
+        render_brief(&turns),
+        "> /model opus\n\n> Summarize the build status.\nThe build is green.\n\n> /compact\n\n> /review check a<b and c>d second line\n\n> /maw-tasks add a task\nв работе…"
+    );
+    assert_eq!(
+        render_full(&turns),
+        "> /model opus\n\n> <local-command-stdout>Set model to opus</local-command-stdout>\n\n> Summarize the build status.\nThe build is green.\n\n> /compact\n\n> /review check a<b and c>d second line\n\n> /maw-tasks add a task\nв работе…"
+    );
+}
+
+#[test]
+fn slash_command_without_args_is_still_a_prompt() {
+    let turns = [prompt(
+        "<command-message>model</command-message>\n<command-name>/model</command-name>",
+    )];
+    let expected = format!("> /model\n{IN_PROGRESS_MARKER}");
+    assert_eq!(render_brief(&turns), expected);
+    assert_eq!(render_full(&turns), expected);
+}
+
+#[test]
+fn slash_command_args_use_the_last_closing_tag() {
+    let turns = [prompt(
+        "<command-name>/x</command-name><command-message>x</command-message><command-args>a </command-args> b</command-args>",
+    )];
+    let expected = format!("> /x a </command-args> b\n{IN_PROGRESS_MARKER}");
+    assert_eq!(render_brief(&turns), expected);
+    assert_eq!(render_full(&turns), expected);
 }
 
 #[test]

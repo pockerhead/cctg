@@ -9,7 +9,8 @@ const STRING_CONTENT: &str = include_str!("fixtures/string_content.jsonl");
 const NULL_FIELDS: &str = include_str!("fixtures/null_fields.jsonl");
 const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
 const COMPACT_SUMMARY: &str = include_str!("fixtures/compact_summary.jsonl");
-const ALL: [&str; 8] = [
+const SLASH_COMMAND: &str = include_str!("fixtures/slash_command.jsonl");
+const ALL: [&str; 9] = [
     PLAIN_TEXT,
     TOOL_USE_RESULT,
     THINKING_AI_TITLE,
@@ -18,6 +19,7 @@ const ALL: [&str; 8] = [
     NULL_FIELDS,
     FINAL_ANSWER,
     COMPACT_SUMMARY,
+    SLASH_COMMAND,
 ];
 
 fn turn(role: Role, block: Block) -> Turn {
