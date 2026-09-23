@@ -1,0 +1,714 @@
+--- planner/ws/crates/cctg/src/hub/commands.rs	2026-09-23 05:04:39.627212800 +0300
++++ reviewer2/ws/crates/cctg/src/hub/commands.rs	2026-09-23 05:45:53.625161000 +0300
+@@ -5,6 +5,8 @@
+ //! Logs carry the view, the prompt count and the short session id; never a
+ //! path or a project directory name.
+ 
++use std::io::{self, Read};
++use std::path::Path;
+ use std::sync::Arc;
+ 
+ use tokio::sync::mpsc;
+@@ -13,7 +15,7 @@
+ 
+ use super::api::{ApiError, Document};
+ use super::scheduler::{Op, Outbox, Outcome};
+-use super::sessions::{LocateError, Located, TranscriptLocator};
++use super::sessions::{LocateError, TranscriptLocator};
+ use super::updates::Inbound;
+ 
+ pub const DEFAULT_BRIEF_PROMPTS: usize = 3;
+@@ -22,6 +24,9 @@
+ /// Candidates listed for an ambiguous prefix.
+ const MAX_CANDIDATES: usize = 10;
+ const SHORT_ID_LEN: usize = 8;
++/// Largest transcript `/brief` and `/full` read. Parsing needs about as much
++/// memory again; the largest real session seen was 92 MiB.
++pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
+ 
+ pub const USAGE: &str = "Использование: /brief [n] [начало id сессии] или /full [n] [начало id сессии]. \
+ n: сколько последних промптов показать, от 1 до 100 (по умолчанию brief 3, full 1). \
+@@ -122,10 +127,10 @@
+ /// A rendered transcript ready for delivery.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Reply {
+-    /// Header line, a blank line, then the library rendering.
+-    pub text: String,
++    /// Exactly the library rendering, nothing added.
++    pub body: String,
+     pub file_name: String,
+-    /// The header line; the document caption.
++    /// `brief · <short id> · последние N`, used only as the document caption.
+     pub caption: String,
+     /// First `SHORT_ID_LEN` chars of the session id, for logs.
+     pub short_id: String,
+@@ -142,17 +147,27 @@
+     session_id.get(..SHORT_ID_LEN).unwrap_or(session_id)
+ }
+ 
+-/// First line of every reply: `brief · <project> · <short id> · последние N`.
+-pub fn header(command: &TranscriptCommand, located: &Located) -> String {
++/// Document caption: `brief · <short id> · последние N`. No project name.
++fn caption(command: &TranscriptCommand, short: &str) -> String {
+     format!(
+-        "{} · {} · {} · последние {}",
++        "{} · {short} · последние {}",
+         command.view.name(),
+-        located.project,
+-        short_id(&located.session_id),
+         command.prompts
+     )
+ }
+ 
++/// Reads at most `limit` bytes; `None` when the file is larger. The length is
++/// checked before reading and again after, for a file that grows meanwhile.
++fn read_limited(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
++    let file = std::fs::File::open(path)?;
++    if file.metadata()?.len() > limit {
++        return Ok(None);
++    }
++    let mut bytes = Vec::new();
++    file.take(limit + 1).read_to_end(&mut bytes)?;
++    Ok((bytes.len() as u64 <= limit).then_some(bytes))
++}
++
+ fn locate_notice(error: &LocateError) -> String {
+     match error {
+         LocateError::RootMissing => {
+@@ -188,13 +203,29 @@
+     thread_id: Option<i64>,
+     command: &TranscriptCommand,
+ ) -> Prepared {
++    prepare_limited(locator, thread_id, command, MAX_TRANSCRIPT_BYTES)
++}
++
++fn prepare_limited<L: TranscriptLocator + ?Sized>(
++    locator: &L,
++    thread_id: Option<i64>,
++    command: &TranscriptCommand,
++    limit: u64,
++) -> Prepared {
+     let located = match locator.locate(thread_id, command.session_prefix.as_deref()) {
+         Ok(located) => located,
+         Err(error) => return Prepared::Notice(locate_notice(&error)),
+     };
+     let short = short_id(&located.session_id).to_owned();
+-    let bytes = match std::fs::read(&located.path) {
+-        Ok(bytes) => bytes,
++    let bytes = match read_limited(&located.path, limit) {
++        Ok(Some(bytes)) => bytes,
++        Ok(None) => {
++            warn!(session = %short, "transcript too large to read");
++            return Prepared::Notice(format!(
++                "Транскрипт сессии {short} больше {} МБ, такие пока не показываются.",
++                limit / (1024 * 1024)
++            ));
++        }
+         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+             return Prepared::Notice(format!(
+                 "Транскрипт сессии {short} не найден: файла нет или он ещё не записан."
+@@ -219,11 +250,10 @@
+     if body.trim().is_empty() {
+         return Prepared::Notice(format!("В сессии {short} пока нечего показывать."));
+     }
+-    let caption = header(command, &located);
+     Prepared::Transcript(Reply {
+-        text: format!("{caption}\n\n{body}"),
++        body,
+         file_name: format!("{}-{short}.txt", command.view.name()),
+-        caption,
++        caption: caption(command, &short),
+         short_id: short,
+     })
+ }
+@@ -299,9 +329,9 @@
+     thread_id: Option<i64>,
+     reply: &Reply,
+ ) -> Result<(), DeliveryError> {
+-    let split = split_for_telegram(&reply.text, SplitOptions::default());
++    let split = split_for_telegram(&reply.body, SplitOptions::default());
+     if split.prefer_file {
+-        return send_document(outbox, thread_id, reply, reply.text.clone()).await;
++        return send_document(outbox, thread_id, reply, reply.body.clone()).await;
+     }
+     for (index, chunk) in split.chunks.iter().enumerate() {
+         match send_text(outbox, thread_id, chunk.clone()).await {
+@@ -393,7 +423,7 @@
+     use super::*;
+     use crate::hub::api::Message;
+     use crate::hub::scheduler::{BucketConfig, Delivery, Scheduler, Transport};
+-    use crate::hub::sessions::ProjectsDir;
++    use crate::hub::sessions::{Located, ProjectsDir};
+     use crate::hub::testdir::TempDir;
+ 
+     const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
+@@ -502,24 +532,14 @@
+         scheduler.await.unwrap();
+     }
+ 
++    /// The library output for the command, with nothing added.
+     fn expected(jsonl: &str, view: View, prompts: usize) -> String {
+         let turns = parse_jsonl(jsonl);
+         let slice = last_prompts(&turns, prompts);
+-        let body = match view {
++        match view {
+             View::Brief => render_brief(slice),
+             View::Full => render_full(slice),
+-        };
+-        let command = TranscriptCommand {
+-            view,
+-            prompts,
+-            session_prefix: None,
+-        };
+-        let located = Located {
+-            session_id: SESSION.to_owned(),
+-            project: PROJECT.to_owned(),
+-            path: Default::default(),
+-        };
+-        format!("{}\n\n{body}", header(&command, &located))
++        }
+     }
+ 
+     #[tokio::test(start_paused = true)]
+@@ -611,7 +631,10 @@
+                 assert_eq!(*thread_id, THREAD);
+                 assert_eq!(document.bytes, want.as_bytes());
+                 assert_eq!(document.file_name, "full-5e551017.txt");
+-                assert_eq!(document.caption.as_deref(), want.lines().next());
++                assert_eq!(
++                    document.caption.as_deref(),
++                    Some("full · 5e551017 · последние 8")
++                );
+             }
+             other => panic!("expected a document, got {other:?}"),
+         }
+@@ -635,6 +658,10 @@
+         match &ops[2] {
+             Op::SendDocument { document, .. } => {
+                 assert_eq!(document.bytes, chunks[1..].concat().as_bytes());
++                // What the user got: the accepted chunk plus the document is
++                // the library output, nothing lost or repeated.
++                let document = String::from_utf8(document.bytes.clone()).unwrap();
++                assert_eq!(format!("{}{document}", chunks[0]), want);
+             }
+             other => panic!("expected a document, got {other:?}"),
+         }
+@@ -680,7 +707,7 @@
+         run(&fake, dir.path(), &["/brief 1 ffff", "/brief", "/brief x!"]).await;
+         let sent = fake.texts();
+         assert_eq!(sent[0], "Нет сессии с таким началом id.");
+-        assert!(sent[1].starts_with("brief · C--proj-demo · 5e551017 · последние 3"));
++        assert_eq!(sent[1], expected(jsonl, View::Brief, DEFAULT_BRIEF_PROMPTS));
+         assert_eq!(sent[2], USAGE);
+ 
+         std::fs::remove_file(&session).unwrap();
+@@ -757,6 +784,40 @@
+     }
+ 
+     #[test]
++    fn oversized_transcripts_become_a_notice() {
++        let dir = projects("");
++        let session = dir.path().join(PROJECT).join(format!("{SESSION}.jsonl"));
++        let root = ProjectsDir::new(dir.path().to_owned());
++        let command = TranscriptCommand {
++            view: View::Full,
++            prompts: 1,
++            session_prefix: None,
++        };
++        let with_len = |len: u64| {
++            std::fs::File::options()
++                .write(true)
++                .open(&session)
++                .unwrap()
++                .set_len(len)
++                .unwrap();
++            prepare_limited(&root, None, &command, 16)
++        };
++        assert_eq!(
++            with_len(17),
++            Prepared::Notice(
++                "Транскрипт сессии 5e551017 больше 0 МБ, такие пока не показываются.".to_owned()
++            )
++        );
++        // At the limit the file is read; zero bytes render nothing.
++        assert_eq!(
++            with_len(16),
++            Prepared::Notice("В сессии 5e551017 пока нечего показывать.".to_owned())
++        );
++        assert_eq!(read_limited(&session, 15).unwrap(), None);
++        assert_eq!(read_limited(&session, 16).unwrap(), Some(vec![0; 16]));
++    }
++
++    #[test]
+     fn ambiguous_prefix_lists_candidates() {
+         let candidates: Vec<Located> = (0..12)
+             .map(|i| Located {
+--- planner/ws/crates/cctg/src/hub/mod.rs	2026-09-23 05:02:16.849750100 +0300
++++ reviewer2/ws/crates/cctg/src/hub/mod.rs	2026-09-23 05:46:42.510752300 +0300
+@@ -22,7 +22,7 @@
+ use offset::OffsetStore;
+ use scheduler::{BucketConfig, Scheduler};
+ use sessions::ProjectsDir;
+-use updates::Routed;
++use updates::{Inbound, Routed};
+ 
+ #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+ pub enum RightsError {
+@@ -48,6 +48,21 @@
+     }
+ }
+ 
++/// The poll callback: commands go to the command worker's queue, nothing here
++/// waits, so a slow command never holds up polling.
++fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed) + '_ {
++    move |routed| match routed {
++        Routed::Input(input) if commands::is_command(&input) => {
++            if commands.send(input).is_err() {
++                warn!("command worker stopped; command dropped");
++            }
++        }
++        Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
++        Routed::Callback(_) => info!("inbound button press"),
++        Routed::Service(_) | Routed::Ignored(_) => {}
++    }
++}
++
+ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+     let config = Config::load(env_file)?;
+     let projects_dir = config.projects_dir.clone().with_context(|| {
+@@ -87,16 +102,7 @@
+         api.as_ref(),
+         &config.allowlist,
+         &offsets,
+-        |routed| match routed {
+-            Routed::Input(input) if commands::is_command(&input) => {
+-                if commands_tx.send(input).is_err() {
+-                    warn!("command worker stopped; command dropped");
+-                }
+-            }
+-            Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
+-            Routed::Callback(_) => info!("inbound button press"),
+-            Routed::Service(_) | Routed::Ignored(_) => {}
+-        },
++        route_inbound(&commands_tx),
+     )
+     .await;
+     Ok(())
+@@ -104,7 +110,147 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::sync::Mutex;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::time::Duration;
++
++    use serde_json::{Value, json};
++    use tokio::sync::Notify;
++
+     use super::*;
++    use api::{ApiError, Message};
++    use scheduler::{Delivery, Op, Outcome, Transport};
++    use sessions::{LocateError, Located, TranscriptLocator};
++    use testdir::TempDir;
++    use updates::UpdateSource;
++
++    const CHAT: i64 = -1000000000001;
++    const ALLOWED: i64 = 1001;
++    const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
++
++    /// One command per call, then an idle long poll; counts calls.
++    struct Batches {
++        calls: AtomicUsize,
++        polled_twice: Notify,
++    }
++
++    impl UpdateSource for Batches {
++        fn chat_id(&self) -> i64 {
++            CHAT
++        }
++
++        async fn get_updates(&self, _: Option<i64>, _: Duration) -> Result<Vec<Value>, ApiError> {
++            let call = self.calls.fetch_add(1, Ordering::SeqCst);
++            let text = match call {
++                0 => "/brief",
++                1 => "/full",
++                _ => {
++                    self.polled_twice.notify_one();
++                    return std::future::pending().await;
++                }
++            };
++            Ok(vec![json!({ "update_id": call + 1, "message": {
++                "message_id": call + 10, "date": 1, "text": text,
++                "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
++                "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
++            }})])
++        }
++    }
++
++    /// Blocks each `locate` until the test lets it through.
++    struct Gated {
++        gate: Mutex<std::sync::mpsc::Receiver<()>>,
++        file: std::path::PathBuf,
++    }
++
++    impl TranscriptLocator for Gated {
++        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
++            let _ = self.gate.lock().unwrap().recv();
++            Ok(Located {
++                session_id: SESSION.to_owned(),
++                project: "C--proj".to_owned(),
++                path: self.file.clone(),
++            })
++        }
++    }
++
++    #[derive(Default)]
++    struct Sent(Mutex<Vec<String>>);
++
++    impl Transport for Sent {
++        async fn execute(&self, op: &Op) -> Delivery {
++            if let Op::Send { text, .. } = op {
++                self.0.lock().unwrap().push(text.clone());
++            }
++            Ok(Outcome::Sent(Message::default()))
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn a_slow_command_does_not_hold_up_polling() {
++        let dir = TempDir::new("hub-slow-command");
++        let file = dir.path().join(format!("{SESSION}.jsonl"));
++        std::fs::write(
++            &file,
++            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
++        )
++        .unwrap();
++        let (open_gate, gate) = std::sync::mpsc::channel();
++        let sent = Arc::new(Sent::default());
++        let (scheduler, outbox) = Scheduler::new(sent.clone(), BucketConfig::default());
++        tokio::spawn(scheduler.run());
++        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
++        let locator = Arc::new(Gated {
++            gate: Mutex::new(gate),
++            file: file.clone(),
++        });
++        tokio::spawn(commands::serve(commands_rx, outbox, locator, None));
++
++        let source = Arc::new(Batches {
++            calls: AtomicUsize::new(0),
++            polled_twice: Notify::new(),
++        });
++        let store = Arc::new(OffsetStore::open(dir.path()).unwrap());
++        let polling = {
++            let (source, store) = (source.clone(), store.clone());
++            tokio::spawn(async move {
++                let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
++                updates::poll(
++                    source.as_ref(),
++                    &allowlist,
++                    &store,
++                    route_inbound(&commands_tx),
++                )
++                .await;
++            })
++        };
++
++        // The first command is stuck in `locate`, yet both batches were
++        // fetched and the offset saved past them.
++        tokio::time::timeout(Duration::from_secs(10), source.polled_twice.notified())
++            .await
++            .expect("poll kept going while a command was stuck");
++        assert_eq!(store.load(), Some(3));
++        assert!(sent.0.lock().unwrap().is_empty());
++
++        open_gate.send(()).unwrap();
++        open_gate.send(()).unwrap();
++        let answered = async {
++            while sent.0.lock().unwrap().len() < 2 {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::time::timeout(Duration::from_secs(10), answered)
++            .await
++            .expect("both commands answered");
++        let turns = transcript::parse(&std::fs::read_to_string(&file).unwrap());
++        let want = [
++            transcript::render_brief(&turns),
++            transcript::render_full(&turns),
++        ];
++        assert_eq!(*sent.0.lock().unwrap(), want);
++        polling.abort();
++    }
+ 
+     fn member(status: &str, topics: bool) -> ChatMember {
+         ChatMember {
+--- planner/ws/crates/cctg/src/hub/offset.rs	2026-09-23 04:58:25.223953600 +0300
++++ reviewer2/ws/crates/cctg/src/hub/offset.rs	2026-09-23 05:46:10.093763800 +0300
+@@ -7,11 +7,16 @@
+ 
+ use std::io::{self, Write};
+ use std::path::{Path, PathBuf};
++use std::time::{Duration, SystemTime};
+ 
+ use tracing::warn;
+ 
+ const FILE_NAME: &str = "offset";
+ const TEMP_NAME: &str = "offset.tmp";
++/// Telegram keeps an update at most 24 hours, so an offset saved earlier
++/// guards nothing. It can hurt: after a week without updates Telegram restarts
++/// ids at random, possibly below it.
++const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+ 
+ #[derive(Debug)]
+ pub struct OffsetStore {
+@@ -28,9 +33,19 @@
+     }
+ 
+     /// The saved offset. A missing file is `None`; an unreadable or garbled one
+-    /// is logged and also `None`, so the hub still starts.
++    /// is logged and also `None`, so the hub still starts. So is one saved
++    /// more than `MAX_AGE` ago.
+     pub fn load(&self) -> Option<i64> {
+-        match std::fs::read_to_string(self.dir.join(FILE_NAME)) {
++        let path = self.dir.join(FILE_NAME);
++        let age = std::fs::metadata(&path)
++            .and_then(|metadata| metadata.modified())
++            .ok()
++            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
++        if age.is_some_and(|age| age > MAX_AGE) {
++            warn!("saved getUpdates offset is older than a day; starting without it");
++            return None;
++        }
++        match std::fs::read_to_string(&path) {
+             Ok(text) => {
+                 let offset = text.trim().parse().ok();
+                 if offset.is_none() {
+@@ -89,4 +104,21 @@
+         store.save(8).unwrap();
+         assert_eq!(store.load(), Some(8));
+     }
++
++    #[test]
++    fn an_offset_older_than_a_day_is_ignored() {
++        let dir = TempDir::new("offset-stale");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        store.save(9).unwrap();
++        let file = std::fs::File::options()
++            .write(true)
++            .open(dir.path().join(FILE_NAME))
++            .unwrap();
++        file.set_modified(SystemTime::now() - MAX_AGE + Duration::from_secs(60))
++            .unwrap();
++        assert_eq!(store.load(), Some(9));
++        file.set_modified(SystemTime::now() - MAX_AGE - Duration::from_secs(60))
++            .unwrap();
++        assert_eq!(store.load(), None);
++    }
+ }
+--- planner/ws/crates/cctg/src/hub/updates.rs	2026-09-23 05:04:11.001184500 +0300
++++ reviewer2/ws/crates/cctg/src/hub/updates.rs	2026-09-23 05:46:07.544929900 +0300
+@@ -15,6 +15,9 @@
+ const POLL_TIMEOUT: Duration = Duration::from_secs(50);
+ const MAX_BACKOFF: Duration = Duration::from_secs(30);
+ const STALLED_BATCH_BACKOFF: Duration = Duration::from_secs(1);
++/// Waits before the second and third attempt to save the offset (a file held
++/// open by a scanner or indexer on Windows makes the rename fail for a moment).
++const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Routed {
+@@ -141,18 +144,22 @@
+ /// Routes a raw `getUpdates` batch. Returns the next offset and the routed
+ /// updates. A malformed update is skipped, not fatal, and still advances the
+ /// offset so it is not fetched again.
++///
++/// The next offset is one past the highest `update_id` of this batch, even
++/// when that is below `offset`: after a week without updates Telegram picks
++/// the next id at random, and keeping the old, higher offset would fetch and
++/// handle the same update again on every call.
+ pub fn route_batch(
+     raw: Vec<Value>,
+     offset: Option<i64>,
+     chat_id: i64,
+     allowlist: &Allowlist,
+ ) -> (Option<i64>, Vec<Routed>) {
+-    let mut next = offset;
++    let mut highest: Option<i64> = None;
+     let mut routed = Vec::with_capacity(raw.len());
+     for value in raw {
+         if let Some(id) = value.get("update_id").and_then(Value::as_i64) {
+-            let following = id.saturating_add(1);
+-            next = Some(next.map_or(following, |current| current.max(following)));
++            highest = Some(highest.map_or(id, |current| current.max(id)));
+         }
+         let item = match serde_json::from_value::<Update>(value) {
+             Ok(update) => classify(update, chat_id, allowlist),
+@@ -165,6 +172,7 @@
+         }
+         routed.push(item);
+     }
++    let next = highest.map(|id| id.saturating_add(1)).or(offset);
+     (next, routed)
+ }
+ 
+@@ -200,6 +208,23 @@
+     (batch_len > 0 && next == previous).then_some(STALLED_BATCH_BACKOFF)
+ }
+ 
++/// Saves `offset`, retrying twice. A save that still fails is logged and the
++/// poll goes on: an unwritable state directory must not stop the hub; the
++/// cost is that a restart before the next successful save repeats the batch.
++async fn save_offset(store: &OffsetStore, offset: i64) {
++    let mut result = store.save(offset);
++    for wait in SAVE_RETRY_WAITS {
++        if result.is_ok() {
++            return;
++        }
++        tokio::time::sleep(wait).await;
++        result = store.save(offset);
++    }
++    if let Err(error) = result {
++        warn!(kind = ?error.kind(), "cannot save the getUpdates offset; a restart may repeat this batch");
++    }
++}
++
+ /// Long-polls forever and hands every routed update to `handle`. Errors never
+ /// stop the loop: 429 waits `retry_after`, other errors back off up to 30 s.
+ ///
+@@ -224,9 +249,8 @@
+                 offset = next;
+                 if next != previous
+                     && let Some(next) = next
+-                    && let Err(error) = store.save(next)
+                 {
+-                    warn!(kind = ?error.kind(), "cannot save the getUpdates offset; a restart may repeat this batch");
++                    save_offset(store, next).await;
+                 }
+                 routed.into_iter().for_each(&mut handle);
+                 if let Some(wait) = stalled_batch_backoff(batch_len, previous, next) {
+@@ -405,6 +429,16 @@
+         assert_eq!((next, routed.len()), (Some(3), 0));
+     }
+ 
++    #[test]
++    fn next_offset_follows_the_batch_even_below_the_old_one() {
++        // Telegram restarts ids at random after a week without updates.
++        let batch = vec![json!({ "update_id": 40 }), json!({ "update_id": 42 })];
++        let (next, _) = route_batch(batch, Some(9000), CHAT, &allowlist());
++        assert_eq!(next, Some(43));
++        let (next, _) = route_batch(vec![json!({ "x": 1 })], Some(9000), CHAT, &allowlist());
++        assert_eq!(next, Some(9000));
++    }
++
+     /// Answers like Telegram: every update at or above `offset`, or waits out
+     /// the long poll when there is none. It never forgets an update, which is
+     /// what Telegram does for an update that was not yet confirmed.
+@@ -476,6 +510,108 @@
+         assert_eq!(handled(pending, &fresh).await, ["/brief", "/full"]);
+     }
+ 
++    /// Keeps returning its updates until `getUpdates` is called with an offset
++    /// above them, whatever offset it was called with before: what a bot saw
++    /// after a week-long pause, when Telegram restarted ids below the offset.
++    struct RestartedIds(Vec<Value>, std::sync::Mutex<i64>);
++
++    impl UpdateSource for RestartedIds {
++        fn chat_id(&self) -> i64 {
++            CHAT
++        }
++
++        async fn get_updates(
++            &self,
++            offset: Option<i64>,
++            timeout: Duration,
++        ) -> Result<Vec<Value>, ApiError> {
++            // Only an offset just above the update confirms it; the stale
++            // 5000 does not (the observed behaviour this models).
++            let confirmed = {
++                let mut confirmed = self.1.lock().unwrap();
++                if let Some(offset) = offset.filter(|offset| *offset < 1000) {
++                    *confirmed = (*confirmed).max(offset);
++                }
++                *confirmed
++            };
++            let batch: Vec<Value> = self
++                .0
++                .iter()
++                .filter(|update| update["update_id"].as_i64().unwrap_or_default() >= confirmed)
++                .cloned()
++                .collect();
++            if batch.is_empty() {
++                tokio::time::sleep(timeout).await;
++            }
++            Ok(batch)
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn ids_restarted_below_the_saved_offset_are_handled_once() {
++        let dir = crate::hub::testdir::TempDir::new("poll-restarted-ids");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        store.save(5000).unwrap();
++        let mut texts = Vec::new();
++        let source = RestartedIds(vec![text_update(7, "/brief")], std::sync::Mutex::new(0));
++        let allowlist = allowlist();
++        let polling = poll(&source, &allowlist, &store, |routed| {
++            if let Routed::Input(input) = routed {
++                texts.push(input.text.unwrap_or_default());
++            }
++        });
++        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
++        assert_eq!(texts, ["/brief"]);
++        assert_eq!(store.load(), Some(8));
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn offset_is_saved_before_the_batch_is_handled() {
++        let dir = crate::hub::testdir::TempDir::new("poll-save-first");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        let mut seen = Vec::new();
++        let source = FakeTelegram(vec![text_update(5, "/brief")]);
++        let allowlist = allowlist();
++        let polling = poll(&source, &allowlist, &store, |_| seen.push(store.load()));
++        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
++        assert_eq!(seen, [Some(6)]);
++    }
++
++    /// Makes `offset` a non-empty directory, so every save fails.
++    fn block_saves(dir: &std::path::Path) -> std::path::PathBuf {
++        let blocker = dir.join("offset");
++        std::fs::create_dir_all(blocker.join("inside")).unwrap();
++        blocker
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn failing_offset_saves_do_not_stop_polling() {
++        let dir = crate::hub::testdir::TempDir::new("poll-save-fails");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        block_saves(dir.path());
++        let updates = vec![text_update(5, "/brief"), text_update(6, "/full")];
++        // Both handled once: the in-memory offset still moves on.
++        assert_eq!(handled(updates, &store).await, ["/brief", "/full"]);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_briefly_failing_offset_save_is_retried() {
++        let dir = crate::hub::testdir::TempDir::new("poll-save-retry");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        let blocker = block_saves(dir.path());
++        // Unblocked after the first attempt, before the retry 100 ms later.
++        let unblock = tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_millis(50)).await;
++            std::fs::remove_dir_all(blocker).unwrap();
++        });
++        assert_eq!(
++            handled(vec![text_update(5, "/brief")], &store).await,
++            ["/brief"]
++        );
++        unblock.await.unwrap();
++        assert_eq!(store.load(), Some(6));
++    }
++
+     #[test]
+     fn nonempty_batch_without_update_ids_gets_a_short_backoff() {
+         assert_eq!(

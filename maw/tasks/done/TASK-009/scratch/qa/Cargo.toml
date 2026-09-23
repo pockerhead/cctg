@@ -1,0 +1,18 @@
+[package]
+name = "qa-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cctg = { path = "../../../../../../crates/cctg" }
+transcript = { path = "../../../../../../crates/transcript" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.dev]
+debug = "line-tables-only"

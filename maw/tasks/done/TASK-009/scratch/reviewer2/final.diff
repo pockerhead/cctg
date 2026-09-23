@@ -1,0 +1,2268 @@
+--- Cargo.lock	2026-09-23 04:13:31.920467300 +0300
++++ Cargo.lock	2026-09-23 05:38:05.024819800 +0300
+@@ -143,6 +143,7 @@
+  "tokio",
+  "tracing",
+  "tracing-subscriber",
++ "transcript",
+ ]
+ 
+ [[package]]
+--- crates/cctg/Cargo.toml	2026-09-23 04:13:31.922021000 +0300
++++ crates/cctg/Cargo.toml	2026-09-23 05:38:04.993359900 +0300
+@@ -14,6 +14,7 @@
+ tokio = { workspace = true, features = ["sync", "time"] }
+ tracing.workspace = true
+ tracing-subscriber.workspace = true
++transcript = { path = "../transcript" }
+ 
+ [dev-dependencies]
+ tokio = { workspace = true, features = ["test-util"] }
+--- /dev/null	2026-09-23 05:49:55.000000000 +0300
++++ crates/cctg/src/hub/commands.rs	2026-09-23 05:45:53.625161000 +0300
+@@ -0,0 +1,885 @@
++//! `/brief [n] [session-id-prefix]` and `/full [n] [session-id-prefix]`.
++//!
++//! One worker answers commands in arrival order, so the chunks of two replies
++//! never interleave. File reading and rendering run on the blocking pool.
++//! Logs carry the view, the prompt count and the short session id; never a
++//! path or a project directory name.
++
++use std::io::{self, Read};
++use std::path::Path;
++use std::sync::Arc;
++
++use tokio::sync::mpsc;
++use tracing::{info, warn};
++use transcript::{SplitOptions, split_for_telegram};
++
++use super::api::{ApiError, Document};
++use super::scheduler::{Op, Outbox, Outcome};
++use super::sessions::{LocateError, TranscriptLocator};
++use super::updates::Inbound;
++
++pub const DEFAULT_BRIEF_PROMPTS: usize = 3;
++pub const DEFAULT_FULL_PROMPTS: usize = 1;
++pub const MAX_PROMPTS: usize = 100;
++/// Candidates listed for an ambiguous prefix.
++const MAX_CANDIDATES: usize = 10;
++const SHORT_ID_LEN: usize = 8;
++/// Largest transcript `/brief` and `/full` read. Parsing needs about as much
++/// memory again; the largest real session seen was 92 MiB.
++pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
++
++pub const USAGE: &str = "Использование: /brief [n] [начало id сессии] или /full [n] [начало id сессии]. \
++n: сколько последних промптов показать, от 1 до 100 (по умолчанию brief 3, full 1). \
++Без id берётся самая свежая сессия.";
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum View {
++    Brief,
++    Full,
++}
++
++impl View {
++    fn name(self) -> &'static str {
++        match self {
++            View::Brief => "brief",
++            View::Full => "full",
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TranscriptCommand {
++    pub view: View,
++    /// How many of the last prompts to show, `1..=MAX_PROMPTS`.
++    pub prompts: usize,
++    /// Lowercase hex digits and dashes.
++    pub session_prefix: Option<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Parsed {
++    Command(TranscriptCommand),
++    /// `/brief` or `/full` with arguments that do not parse.
++    Usage,
++    /// Not one of these commands, or addressed to another bot.
++    NotOurs,
++}
++
++/// True for texts the command worker should see.
++pub fn is_command(input: &Inbound) -> bool {
++    input
++        .text
++        .as_deref()
++        .is_some_and(|text| text.trim_start().starts_with('/'))
++}
++
++/// Parses `/brief`, `/full`, optionally `@<bot_username>`, then `[n] [prefix]`.
++/// A single numeric argument is `n`; a digits-only prefix needs an explicit `n`.
++pub fn parse(text: &str, bot_username: Option<&str>) -> Parsed {
++    let mut words = text.split_whitespace();
++    let Some(head) = words.next().and_then(|word| word.strip_prefix('/')) else {
++        return Parsed::NotOurs;
++    };
++    let (name, target) = match head.split_once('@') {
++        Some((name, target)) => (name, Some(target)),
++        None => (head, None),
++    };
++    if let (Some(target), Some(bot)) = (target, bot_username)
++        && !target.eq_ignore_ascii_case(bot)
++    {
++        return Parsed::NotOurs;
++    }
++    let (view, default_prompts) = if name.eq_ignore_ascii_case("brief") {
++        (View::Brief, DEFAULT_BRIEF_PROMPTS)
++    } else if name.eq_ignore_ascii_case("full") {
++        (View::Full, DEFAULT_FULL_PROMPTS)
++    } else {
++        return Parsed::NotOurs;
++    };
++
++    let args: Vec<&str> = words.collect();
++    let count = |word: &str| {
++        word.parse::<usize>()
++            .ok()
++            .filter(|n| (1..=MAX_PROMPTS).contains(n))
++    };
++    let prefix = |word: &str| {
++        let word = word.to_ascii_lowercase();
++        (word.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then_some(word)
++    };
++    let parsed = match args.as_slice() {
++        [] => Some((default_prompts, None)),
++        [one] if one.bytes().all(|b| b.is_ascii_digit()) => count(one).map(|n| (n, None)),
++        [one] => prefix(one).map(|p| (default_prompts, Some(p))),
++        [n, p] => count(n).zip(prefix(p)).map(|(n, p)| (n, Some(p))),
++        _ => None,
++    };
++    match parsed {
++        Some((prompts, session_prefix)) => Parsed::Command(TranscriptCommand {
++            view,
++            prompts,
++            session_prefix,
++        }),
++        None => Parsed::Usage,
++    }
++}
++
++/// A rendered transcript ready for delivery.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Reply {
++    /// Exactly the library rendering, nothing added.
++    pub body: String,
++    pub file_name: String,
++    /// `brief · <short id> · последние N`, used only as the document caption.
++    pub caption: String,
++    /// First `SHORT_ID_LEN` chars of the session id, for logs.
++    pub short_id: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Prepared {
++    Transcript(Reply),
++    /// A single message for the user: not found, ambiguous, nothing to show.
++    Notice(String),
++}
++
++fn short_id(session_id: &str) -> &str {
++    session_id.get(..SHORT_ID_LEN).unwrap_or(session_id)
++}
++
++/// Document caption: `brief · <short id> · последние N`. No project name.
++fn caption(command: &TranscriptCommand, short: &str) -> String {
++    format!(
++        "{} · {short} · последние {}",
++        command.view.name(),
++        command.prompts
++    )
++}
++
++/// Reads at most `limit` bytes; `None` when the file is larger. The length is
++/// checked before reading and again after, for a file that grows meanwhile.
++fn read_limited(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
++    let file = std::fs::File::open(path)?;
++    if file.metadata()?.len() > limit {
++        return Ok(None);
++    }
++    let mut bytes = Vec::new();
++    file.take(limit + 1).read_to_end(&mut bytes)?;
++    Ok((bytes.len() as u64 <= limit).then_some(bytes))
++}
++
++fn locate_notice(error: &LocateError) -> String {
++    match error {
++        LocateError::RootMissing => {
++            "Каталог проектов Claude Code не найден. Проверьте CCTG_PROJECTS_DIR.".to_owned()
++        }
++        LocateError::RootUnreadable(kind) => {
++            format!("Каталог проектов Claude Code не читается ({kind:?}).")
++        }
++        LocateError::NoSessions => "Сессий Claude Code пока нет.".to_owned(),
++        LocateError::NoMatch => "Нет сессии с таким началом id.".to_owned(),
++        LocateError::Ambiguous(candidates) => {
++            let mut text = format!(
++                "Под это начало id подходят {} сессий, уточните:",
++                candidates.len()
++            );
++            for candidate in candidates.iter().take(MAX_CANDIDATES) {
++                text.push_str(&format!(
++                    "\n{} · {}",
++                    candidate.session_id, candidate.project
++                ));
++            }
++            if candidates.len() > MAX_CANDIDATES {
++                text.push_str(&format!("\n… и ещё {}", candidates.len() - MAX_CANDIDATES));
++            }
++            text
++        }
++    }
++}
++
++/// Locates, reads, parses and renders. Blocking: file IO and CPU-bound parsing.
++pub fn prepare<L: TranscriptLocator + ?Sized>(
++    locator: &L,
++    thread_id: Option<i64>,
++    command: &TranscriptCommand,
++) -> Prepared {
++    prepare_limited(locator, thread_id, command, MAX_TRANSCRIPT_BYTES)
++}
++
++fn prepare_limited<L: TranscriptLocator + ?Sized>(
++    locator: &L,
++    thread_id: Option<i64>,
++    command: &TranscriptCommand,
++    limit: u64,
++) -> Prepared {
++    let located = match locator.locate(thread_id, command.session_prefix.as_deref()) {
++        Ok(located) => located,
++        Err(error) => return Prepared::Notice(locate_notice(&error)),
++    };
++    let short = short_id(&located.session_id).to_owned();
++    let bytes = match read_limited(&located.path, limit) {
++        Ok(Some(bytes)) => bytes,
++        Ok(None) => {
++            warn!(session = %short, "transcript too large to read");
++            return Prepared::Notice(format!(
++                "Транскрипт сессии {short} больше {} МБ, такие пока не показываются.",
++                limit / (1024 * 1024)
++            ));
++        }
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            return Prepared::Notice(format!(
++                "Транскрипт сессии {short} не найден: файла нет или он ещё не записан."
++            ));
++        }
++        Err(error) => {
++            warn!(session = %short, kind = ?error.kind(), "transcript cannot be read");
++            return Prepared::Notice(format!(
++                "Транскрипт сессии {short} не читается ({:?}).",
++                error.kind()
++            ));
++        }
++    };
++    // A half-written last line or stray bytes must not fail the whole command.
++    let jsonl = String::from_utf8_lossy(&bytes);
++    let turns = transcript::parse(&jsonl);
++    let slice = transcript::last_prompts(&turns, command.prompts);
++    let body = match command.view {
++        View::Brief => transcript::render_brief(slice),
++        View::Full => transcript::render_full(slice),
++    };
++    if body.trim().is_empty() {
++        return Prepared::Notice(format!("В сессии {short} пока нечего показывать."));
++    }
++    Prepared::Transcript(Reply {
++        body,
++        file_name: format!("{}-{short}.txt", command.view.name()),
++        caption: caption(command, &short),
++        short_id: short,
++    })
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum DeliveryError {
++    #[error(transparent)]
++    Api(#[from] ApiError),
++    #[error("the outbound scheduler has stopped")]
++    Stopped,
++}
++
++async fn submit(outbox: &Outbox, op: Op) -> Result<Outcome, DeliveryError> {
++    outbox
++        .submit(op)
++        .await
++        .await
++        .map_err(|_| DeliveryError::Stopped)?
++        .map_err(DeliveryError::from)
++}
++
++pub async fn send_text(
++    outbox: &Outbox,
++    thread_id: Option<i64>,
++    text: String,
++) -> Result<(), DeliveryError> {
++    let op = Op::Send {
++        thread_id,
++        text,
++        reply_markup: None,
++        permission: false,
++    };
++    submit(outbox, op).await.map(drop)
++}
++
++async fn send_document(
++    outbox: &Outbox,
++    thread_id: Option<i64>,
++    reply: &Reply,
++    text: String,
++) -> Result<(), DeliveryError> {
++    let document = Document {
++        file_name: reply.file_name.clone(),
++        bytes: text.into_bytes(),
++        caption: Some(reply.caption.clone()),
++    };
++    submit(
++        outbox,
++        Op::SendDocument {
++            thread_id,
++            document,
++        },
++    )
++    .await
++    .map(drop)
++}
++
++/// Telegram's answer to a text over its limit: `400 Bad Request: message is too long`.
++fn is_too_long(error: &DeliveryError) -> bool {
++    matches!(
++        error,
++        DeliveryError::Api(ApiError::Telegram { code: 400, description })
++            if description.to_ascii_lowercase().contains("too long")
++    )
++}
++
++/// Sends `reply` as ordered messages, or as one document when the split asks
++/// for it. When Telegram rejects a chunk as too long, the rest (that chunk and
++/// everything after it) goes as one document; that switch happens once and the
++/// document is never retried as text.
++pub async fn deliver(
++    outbox: &Outbox,
++    thread_id: Option<i64>,
++    reply: &Reply,
++) -> Result<(), DeliveryError> {
++    let split = split_for_telegram(&reply.body, SplitOptions::default());
++    if split.prefer_file {
++        return send_document(outbox, thread_id, reply, reply.body.clone()).await;
++    }
++    for (index, chunk) in split.chunks.iter().enumerate() {
++        match send_text(outbox, thread_id, chunk.clone()).await {
++            Ok(()) => {}
++            Err(error) if is_too_long(&error) => {
++                warn!(
++                    chunk = index,
++                    "telegram rejected a chunk as too long; sending the rest as a document"
++                );
++                let rest = split.chunks[index..].concat();
++                return send_document(outbox, thread_id, reply, rest).await;
++            }
++            Err(error) => return Err(error),
++        }
++    }
++    Ok(())
++}
++
++/// Answers one inbound message if it is a transcript command. Never panics and
++/// never stops the caller: every failure becomes a notice or a log line.
++pub async fn handle<L: TranscriptLocator>(
++    input: &Inbound,
++    outbox: &Outbox,
++    locator: &Arc<L>,
++    bot_username: Option<&str>,
++) {
++    let Some(text) = input.text.as_deref() else {
++        return;
++    };
++    let thread_id = input.thread_id;
++    let command = match parse(text, bot_username) {
++        Parsed::NotOurs => return,
++        Parsed::Usage => {
++            if let Err(error) = send_text(outbox, thread_id, USAGE.to_owned()).await {
++                warn!(%error, "usage reply failed");
++            }
++            return;
++        }
++        Parsed::Command(command) => command,
++    };
++    let view = command.view;
++    let prompts = command.prompts;
++    let locator = Arc::clone(locator);
++    let prepared =
++        tokio::task::spawn_blocking(move || prepare(locator.as_ref(), thread_id, &command))
++            .await
++            .unwrap_or_else(|_| {
++                warn!(?view, "transcript preparation panicked");
++                Prepared::Notice("Не удалось подготовить транскрипт.".to_owned())
++            });
++    let (result, session) = match &prepared {
++        Prepared::Transcript(reply) => (
++            deliver(outbox, thread_id, reply).await,
++            Some(reply.short_id.as_str()),
++        ),
++        Prepared::Notice(notice) => (send_text(outbox, thread_id, notice.clone()).await, None),
++    };
++    match result {
++        Ok(()) => info!(
++            ?view,
++            prompts,
++            session = session.unwrap_or("-"),
++            "transcript command answered"
++        ),
++        Err(error) => warn!(?view, %error, "transcript command reply failed"),
++    }
++}
++
++/// Handles commands one at a time until the sender side is dropped.
++pub async fn serve<L: TranscriptLocator>(
++    mut inbox: mpsc::UnboundedReceiver<Inbound>,
++    outbox: Outbox,
++    locator: Arc<L>,
++    bot_username: Option<String>,
++) {
++    while let Some(input) = inbox.recv().await {
++        handle(&input, &outbox, &locator, bot_username.as_deref()).await;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::VecDeque;
++    use std::path::Path;
++    use std::sync::Mutex;
++
++    use transcript::{last_prompts, parse as parse_jsonl, render_brief, render_full};
++
++    use super::*;
++    use crate::hub::api::Message;
++    use crate::hub::scheduler::{BucketConfig, Delivery, Scheduler, Transport};
++    use crate::hub::sessions::{Located, ProjectsDir};
++    use crate::hub::testdir::TempDir;
++
++    const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
++    const PROJECT: &str = "C--proj-demo";
++    const THREAD: Option<i64> = Some(7);
++
++    macro_rules! fixture {
++        ($name:literal) => {
++            include_str!(concat!(
++                env!("CARGO_MANIFEST_DIR"),
++                "/../transcript/tests/fixtures/",
++                $name
++            ))
++        };
++    }
++
++    const FIXTURES: [&str; 7] = [
++        fixture!("final_answer.jsonl"),
++        fixture!("tool_use_result.jsonl"),
++        fixture!("slash_command.jsonl"),
++        fixture!("compact_summary.jsonl"),
++        fixture!("string_content.jsonl"),
++        fixture!("plain_text.jsonl"),
++        fixture!("thinking_ai_title.jsonl"),
++    ];
++
++    /// Records every op; answers from a script, then `Sent`/`Done`.
++    #[derive(Default)]
++    struct Fake {
++        ops: Mutex<Vec<Op>>,
++        script: Mutex<VecDeque<Option<ApiError>>>,
++        /// Answer every op with this error once the script is empty.
++        always: Option<(i64, &'static str)>,
++    }
++
++    impl Fake {
++        fn scripted(script: Vec<Option<ApiError>>) -> Arc<Self> {
++            Arc::new(Self {
++                script: Mutex::new(script.into()),
++                ..Self::default()
++            })
++        }
++
++        fn ops(&self) -> Vec<Op> {
++            self.ops.lock().unwrap().clone()
++        }
++
++        fn texts(&self) -> Vec<String> {
++            self.ops()
++                .into_iter()
++                .filter_map(|op| match op {
++                    Op::Send { text, .. } => Some(text),
++                    _ => None,
++                })
++                .collect()
++        }
++    }
++
++    fn too_long() -> ApiError {
++        ApiError::Telegram {
++            code: 400,
++            description: "Bad Request: message is too long".to_owned(),
++        }
++    }
++
++    impl Transport for Fake {
++        async fn execute(&self, op: &Op) -> Delivery {
++            self.ops.lock().unwrap().push(op.clone());
++            if let Some(Some(error)) = self.script.lock().unwrap().pop_front() {
++                return Err(error);
++            }
++            if let Some((code, description)) = self.always {
++                return Err(ApiError::Telegram {
++                    code,
++                    description: description.to_owned(),
++                });
++            }
++            Ok(Outcome::Sent(Message::default()))
++        }
++    }
++
++    fn projects(jsonl: &str) -> TempDir {
++        let dir = TempDir::new("commands");
++        let project = dir.path().join(PROJECT);
++        std::fs::create_dir_all(&project).unwrap();
++        std::fs::write(project.join(format!("{SESSION}.jsonl")), jsonl).unwrap();
++        dir
++    }
++
++    /// Runs `texts` through `serve` against `root` and a fresh scheduler.
++    async fn run(fake: &Arc<Fake>, root: &Path, texts: &[&str]) {
++        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
++        let scheduler = tokio::spawn(scheduler.run());
++        let (tx, rx) = mpsc::unbounded_channel();
++        for text in texts {
++            tx.send(Inbound {
++                message_id: 1,
++                thread_id: THREAD,
++                text: Some((*text).to_owned()),
++            })
++            .unwrap();
++        }
++        drop(tx);
++        let locator = Arc::new(ProjectsDir::new(root.to_owned()));
++        serve(rx, outbox, locator, Some("cctg_bot".to_owned())).await;
++        scheduler.await.unwrap();
++    }
++
++    /// The library output for the command, with nothing added.
++    fn expected(jsonl: &str, view: View, prompts: usize) -> String {
++        let turns = parse_jsonl(jsonl);
++        let slice = last_prompts(&turns, prompts);
++        match view {
++            View::Brief => render_brief(slice),
++            View::Full => render_full(slice),
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn replies_match_the_library_on_fixtures() {
++        for jsonl in FIXTURES {
++            let dir = projects(jsonl);
++            let fake = Arc::new(Fake::default());
++            run(
++                &fake,
++                dir.path(),
++                &["/brief", "/full 2", "/brief@cctg_bot 100 5e55"],
++            )
++            .await;
++            let want = [
++                expected(jsonl, View::Brief, DEFAULT_BRIEF_PROMPTS),
++                expected(jsonl, View::Full, 2),
++                expected(jsonl, View::Brief, 100),
++            ];
++            let mut sent = Vec::new();
++            for op in fake.ops() {
++                match op {
++                    Op::Send {
++                        thread_id, text, ..
++                    } => {
++                        assert_eq!(thread_id, THREAD);
++                        sent.push(text);
++                    }
++                    other => panic!("fixtures fit in messages, got {other:?}"),
++                }
++            }
++            let want_chunks: Vec<String> = want
++                .iter()
++                .flat_map(|text| split_for_telegram(text, SplitOptions::default()).chunks)
++                .collect();
++            assert_eq!(sent, want_chunks);
++        }
++    }
++
++    /// `exchanges` prompts, each answered with `answer_len` chars that name the exchange.
++    fn long_session(exchanges: usize, answer_len: usize) -> String {
++        let mut lines = Vec::new();
++        for i in 0..exchanges {
++            lines.push(serde_json::json!({
++                "type": "user", "message": { "role": "user", "content": format!("prompt {i}") }
++            }));
++            let answer = format!("answer-{i} ").repeat(answer_len / 10);
++            lines.push(serde_json::json!({
++                "type": "assistant",
++                "message": { "role": "assistant", "stop_reason": "end_turn",
++                    "content": [{ "type": "text", "text": answer }] }
++            }));
++        }
++        lines
++            .iter()
++            .map(|line| format!("{line}\n"))
++            .collect::<String>()
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn multi_chunk_reply_keeps_order() {
++        let jsonl = long_session(3, 3000);
++        let dir = projects(&jsonl);
++        let fake = Arc::new(Fake::default());
++        run(&fake, dir.path(), &["/brief 3"]).await;
++        let sent = fake.texts();
++        let want = expected(&jsonl, View::Brief, 3);
++        assert!(sent.len() > 1 && sent.len() <= 4, "{} chunks", sent.len());
++        assert_eq!(
++            sent,
++            split_for_telegram(&want, SplitOptions::default()).chunks
++        );
++        assert_eq!(sent.concat(), want);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn large_reply_goes_as_one_document() {
++        let jsonl = long_session(8, 4000);
++        let dir = projects(&jsonl);
++        let fake = Arc::new(Fake::default());
++        run(&fake, dir.path(), &["/full 8"]).await;
++        let want = expected(&jsonl, View::Full, 8);
++        let ops = fake.ops();
++        assert_eq!(ops.len(), 1);
++        match &ops[0] {
++            Op::SendDocument {
++                thread_id,
++                document,
++            } => {
++                assert_eq!(*thread_id, THREAD);
++                assert_eq!(document.bytes, want.as_bytes());
++                assert_eq!(document.file_name, "full-5e551017.txt");
++                assert_eq!(
++                    document.caption.as_deref(),
++                    Some("full · 5e551017 · последние 8")
++                );
++            }
++            other => panic!("expected a document, got {other:?}"),
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn too_long_switches_to_a_document_once() {
++        let jsonl = long_session(3, 3000);
++        let dir = projects(&jsonl);
++        let want = expected(&jsonl, View::Brief, 3);
++        let chunks = split_for_telegram(&want, SplitOptions::default()).chunks;
++        assert!(chunks.len() >= 2);
++
++        // The second chunk is rejected: the rest goes as a document.
++        let fake = Fake::scripted(vec![None, Some(too_long())]);
++        run(&fake, dir.path(), &["/brief 3"]).await;
++        let ops = fake.ops();
++        assert_eq!(ops.len(), 3, "{ops:?}");
++        assert!(matches!(&ops[0], Op::Send { text, .. } if *text == chunks[0]));
++        assert!(matches!(&ops[1], Op::Send { text, .. } if *text == chunks[1]));
++        match &ops[2] {
++            Op::SendDocument { document, .. } => {
++                assert_eq!(document.bytes, chunks[1..].concat().as_bytes());
++                // What the user got: the accepted chunk plus the document is
++                // the library output, nothing lost or repeated.
++                let document = String::from_utf8(document.bytes.clone()).unwrap();
++                assert_eq!(format!("{}{document}", chunks[0]), want);
++            }
++            other => panic!("expected a document, got {other:?}"),
++        }
++
++        // Everything is rejected: one text attempt, one document, nothing more.
++        let fake = Arc::new(Fake {
++            always: Some((400, "Bad Request: message is too long")),
++            ..Fake::default()
++        });
++        run(&fake, dir.path(), &["/brief 3"]).await;
++        let ops = fake.ops();
++        assert_eq!(ops.len(), 2, "{ops:?}");
++        assert!(matches!(ops[0], Op::Send { .. }));
++        assert!(matches!(ops[1], Op::SendDocument { .. }));
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn other_errors_do_not_switch_to_a_document() {
++        let jsonl = long_session(3, 3000);
++        let dir = projects(&jsonl);
++        let fake = Fake::scripted(vec![Some(ApiError::Telegram {
++            code: 400,
++            description: "Bad Request: message thread not found".to_owned(),
++        })]);
++        run(&fake, dir.path(), &["/brief 3"]).await;
++        let ops = fake.ops();
++        assert_eq!(ops.len(), 1, "{ops:?}");
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn bad_paths_get_a_notice_and_the_worker_keeps_going() {
++        let jsonl = fixture!("final_answer.jsonl");
++        let dir = projects(jsonl);
++        let session = dir.path().join(PROJECT).join(format!("{SESSION}.jsonl"));
++        // A directory named like a session is not a session.
++        let fake_dir = dir
++            .path()
++            .join(PROJECT)
++            .join("5e551017-0000-4000-8000-000000000002.jsonl");
++        std::fs::create_dir_all(&fake_dir).unwrap();
++
++        let fake = Arc::new(Fake::default());
++        run(&fake, dir.path(), &["/brief 1 ffff", "/brief", "/brief x!"]).await;
++        let sent = fake.texts();
++        assert_eq!(sent[0], "Нет сессии с таким началом id.");
++        assert_eq!(sent[1], expected(jsonl, View::Brief, DEFAULT_BRIEF_PROMPTS));
++        assert_eq!(sent[2], USAGE);
++
++        std::fs::remove_file(&session).unwrap();
++        let fake = Arc::new(Fake::default());
++        run(&fake, dir.path(), &["/brief", "/full"]).await;
++        assert_eq!(
++            fake.texts(),
++            [
++                "Сессий Claude Code пока нет.",
++                "Сессий Claude Code пока нет."
++            ]
++        );
++
++        // Only records the renderers skip: nothing to show.
++        std::fs::write(
++            &session,
++            "{\"type\":\"ai-title\",\"aiTitle\":\"t\"}
++not json
++",
++        )
++        .unwrap();
++        let fake = Arc::new(Fake::default());
++        run(&fake, dir.path(), &["/full"]).await;
++        assert_eq!(fake.texts(), ["В сессии 5e551017 пока нечего показывать."]);
++        std::fs::remove_file(&session).unwrap();
++
++        let missing = dir.path().join("absent");
++        let fake = Arc::new(Fake::default());
++        run(&fake, &missing, &["/brief"]).await;
++        assert!(fake.texts()[0].starts_with("Каталог проектов Claude Code не найден"));
++    }
++
++    /// A locator that points at a path it does not check.
++    struct Fixed(Located);
++
++    impl TranscriptLocator for Fixed {
++        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
++            Ok(self.0.clone())
++        }
++    }
++
++    #[test]
++    fn missing_and_unreadable_files_become_notices() {
++        let dir = TempDir::new("commands-unreadable");
++        let command = TranscriptCommand {
++            view: View::Brief,
++            prompts: 1,
++            session_prefix: None,
++        };
++        let at = |path: std::path::PathBuf| {
++            Fixed(Located {
++                session_id: SESSION.to_owned(),
++                project: PROJECT.to_owned(),
++                path,
++            })
++        };
++        let gone = prepare(&at(dir.path().join("gone.jsonl")), None, &command);
++        assert_eq!(
++            gone,
++            Prepared::Notice(
++                "Транскрипт сессии 5e551017 не найден: файла нет или он ещё не записан.".to_owned()
++            )
++        );
++        let unreadable = prepare(&at(dir.path().to_owned()), None, &command);
++        assert!(
++            matches!(&unreadable, Prepared::Notice(text) if text.starts_with("Транскрипт сессии 5e551017 не читается")),
++            "{unreadable:?}"
++        );
++        for prepared in [gone, unreadable] {
++            if let Prepared::Notice(text) = prepared {
++                assert!(!text.contains(&dir.path().display().to_string()));
++            }
++        }
++    }
++
++    #[test]
++    fn oversized_transcripts_become_a_notice() {
++        let dir = projects("");
++        let session = dir.path().join(PROJECT).join(format!("{SESSION}.jsonl"));
++        let root = ProjectsDir::new(dir.path().to_owned());
++        let command = TranscriptCommand {
++            view: View::Full,
++            prompts: 1,
++            session_prefix: None,
++        };
++        let with_len = |len: u64| {
++            std::fs::File::options()
++                .write(true)
++                .open(&session)
++                .unwrap()
++                .set_len(len)
++                .unwrap();
++            prepare_limited(&root, None, &command, 16)
++        };
++        assert_eq!(
++            with_len(17),
++            Prepared::Notice(
++                "Транскрипт сессии 5e551017 больше 0 МБ, такие пока не показываются.".to_owned()
++            )
++        );
++        // At the limit the file is read; zero bytes render nothing.
++        assert_eq!(
++            with_len(16),
++            Prepared::Notice("В сессии 5e551017 пока нечего показывать.".to_owned())
++        );
++        assert_eq!(read_limited(&session, 15).unwrap(), None);
++        assert_eq!(read_limited(&session, 16).unwrap(), Some(vec![0; 16]));
++    }
++
++    #[test]
++    fn ambiguous_prefix_lists_candidates() {
++        let candidates: Vec<Located> = (0..12)
++            .map(|i| Located {
++                session_id: format!("aaaa{i:04}-0000-4000-8000-000000000000"),
++                project: "C--proj".to_owned(),
++                path: Default::default(),
++            })
++            .collect();
++        let text = locate_notice(&LocateError::Ambiguous(candidates));
++        assert!(text.starts_with("Под это начало id подходят 12 сессий"));
++        assert!(text.contains("\naaaa0000-0000-4000-8000-000000000000 · C--proj"));
++        assert!(text.contains("\naaaa0009-"));
++        assert!(!text.contains("aaaa0010-"));
++        assert!(text.ends_with("… и ещё 2"));
++    }
++
++    #[test]
++    fn parses_arguments() {
++        let command = |view, prompts, prefix: Option<&str>| {
++            Parsed::Command(TranscriptCommand {
++                view,
++                prompts,
++                session_prefix: prefix.map(str::to_owned),
++            })
++        };
++        let bot = Some("cctg_bot");
++        assert_eq!(parse("/brief", bot), command(View::Brief, 3, None));
++        assert_eq!(parse("/full", bot), command(View::Full, 1, None));
++        assert_eq!(parse(" /brief  5 ", bot), command(View::Brief, 5, None));
++        assert_eq!(
++            parse("/brief 1F2C", bot),
++            command(View::Brief, 3, Some("1f2c"))
++        );
++        assert_eq!(
++            parse("/full 2 1f2c-01", bot),
++            command(View::Full, 2, Some("1f2c-01"))
++        );
++        assert_eq!(
++            parse("/brief 1 0133", bot),
++            command(View::Brief, 1, Some("0133"))
++        );
++        assert_eq!(
++            parse("/brief@CCTG_bot 4", bot),
++            command(View::Brief, 4, None)
++        );
++        assert_eq!(parse("/brief@other_bot", bot), Parsed::NotOurs);
++        assert_eq!(
++            parse("/brief@other_bot", None),
++            command(View::Brief, 3, None)
++        );
++        for bad in [
++            "/brief 0",
++            "/brief 101",
++            "/brief x!",
++            "/brief 1 2 3",
++            "/full ../x",
++            "/brief 2 zz",
++        ] {
++            assert_eq!(parse(bad, bot), Parsed::Usage, "{bad}");
++        }
++        for other in ["/sessions", "brief", "hello", "", "/", "/briefly"] {
++            assert_eq!(parse(other, bot), Parsed::NotOurs, "{other}");
++        }
++    }
++}
+--- crates/cctg/src/hub/config.rs	2026-09-23 04:13:31.923026200 +0300
++++ crates/cctg/src/hub/config.rs	2026-09-23 05:38:04.996875200 +0300
+@@ -4,11 +4,16 @@
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::fmt;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ 
+ pub const TOKEN_VAR: &str = "CCTG_BOT_TOKEN";
+ pub const CHAT_VAR: &str = "CCTG_CHAT_ID";
+ pub const ALLOWLIST_VAR: &str = "CCTG_ALLOWED_USER_IDS";
++/// Optional: Claude Code projects directory; defaults to `<home>/.claude/projects`.
++pub const PROJECTS_VAR: &str = "CCTG_PROJECTS_DIR";
++/// Optional: hub state directory (the saved `getUpdates` offset); defaults to `.cctg`.
++pub const STATE_VAR: &str = "CCTG_STATE_DIR";
++pub const DEFAULT_STATE_DIR: &str = ".cctg";
+ 
+ #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+ pub enum ConfigError {
+@@ -74,6 +79,10 @@
+     /// Supergroup id in the Bot API `-100...` form.
+     pub chat_id: i64,
+     pub allowlist: Allowlist,
++    /// Where Claude Code keeps `<encoded-cwd>/<session-id>.jsonl`. `None` when
++    /// `CCTG_PROJECTS_DIR` is unset and no home directory is known.
++    pub projects_dir: Option<PathBuf>,
++    pub state_dir: PathBuf,
+ }
+ 
+ impl Config {
+@@ -99,12 +108,12 @@
+     }
+ 
+     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+-        let required = |name: &'static str| {
++        let optional = |name: &str| {
+             var(name)
+                 .map(|value| value.trim().to_owned())
+                 .filter(|value| !value.is_empty())
+-                .ok_or(ConfigError::Missing(name))
+         };
++        let required = |name: &'static str| optional(name).ok_or(ConfigError::Missing(name));
+ 
+         let token = required(TOKEN_VAR)?;
+         let valid_token = token
+@@ -137,10 +146,22 @@
+             return Err(ConfigError::AllowlistEmpty);
+         }
+ 
++        let home = if cfg!(windows) {
++            optional("USERPROFILE").or_else(|| optional("HOME"))
++        } else {
++            optional("HOME")
++        };
++        let projects_dir = optional(PROJECTS_VAR)
++            .map(PathBuf::from)
++            .or_else(|| home.map(|home| PathBuf::from(home).join(".claude").join("projects")));
++        let state_dir = PathBuf::from(optional(STATE_VAR).as_deref().unwrap_or(DEFAULT_STATE_DIR));
++
+         Ok(Self {
+             token: BotToken(token),
+             chat_id,
+             allowlist,
++            projects_dir,
++            state_dir,
+         })
+     }
+ }
+@@ -193,6 +214,35 @@
+     }
+ 
+     #[test]
++    fn paths_have_defaults_and_overrides() {
++        let base = [
++            (TOKEN_VAR, TOKEN),
++            (CHAT_VAR, "-1001"),
++            (ALLOWLIST_VAR, "1"),
++        ];
++        let config = Config::from_vars(vars(&base)).unwrap();
++        assert_eq!(config.projects_dir, None);
++        assert_eq!(config.state_dir, Path::new(DEFAULT_STATE_DIR));
++
++        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
++        let with_home = [base.as_slice(), &[(home_var, "home-dir")]].concat();
++        let config = Config::from_vars(vars(&with_home)).unwrap();
++        assert_eq!(
++            config.projects_dir,
++            Some(Path::new("home-dir").join(".claude").join("projects"))
++        );
++
++        let overridden = [
++            with_home.as_slice(),
++            &[(PROJECTS_VAR, " other-projects "), (STATE_VAR, "state")],
++        ]
++        .concat();
++        let config = Config::from_vars(vars(&overridden)).unwrap();
++        assert_eq!(config.projects_dir, Some(PathBuf::from("other-projects")));
++        assert_eq!(config.state_dir, Path::new("state"));
++    }
++
++    #[test]
+     fn chat_id_must_use_the_bot_api_form() {
+         for chat in ["-4401", "4401", "-100", "-100abc", "abc"] {
+             let result = Config::from_vars(vars(&[
+--- crates/cctg/src/hub/mod.rs	2026-09-23 04:13:31.924029600 +0300
++++ crates/cctg/src/hub/mod.rs	2026-09-23 05:46:42.510752300 +0300
+@@ -1,20 +1,28 @@
+ //! `cctg hub`: Telegram side of the bridge.
+ 
+ pub mod api;
++pub mod commands;
+ pub mod config;
++pub mod offset;
+ pub mod scheduler;
++pub mod sessions;
++#[cfg(test)]
++pub(crate) mod testdir;
+ pub mod updates;
+ 
+ use std::path::Path;
+ use std::sync::Arc;
+ 
+ use anyhow::Context;
++use tokio::sync::mpsc;
+ use tracing::{info, warn};
+ 
+ use api::{BotApi, ChatMember};
+-use config::Config;
++use config::{Config, PROJECTS_VAR, STATE_VAR};
++use offset::OffsetStore;
+ use scheduler::{BucketConfig, Scheduler};
+-use updates::Routed;
++use sessions::ProjectsDir;
++use updates::{Inbound, Routed};
+ 
+ #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+ pub enum RightsError {
+@@ -40,8 +48,28 @@
+     }
+ }
+ 
++/// The poll callback: commands go to the command worker's queue, nothing here
++/// waits, so a slow command never holds up polling.
++fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed) + '_ {
++    move |routed| match routed {
++        Routed::Input(input) if commands::is_command(&input) => {
++            if commands.send(input).is_err() {
++                warn!("command worker stopped; command dropped");
++            }
++        }
++        Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
++        Routed::Callback(_) => info!("inbound button press"),
++        Routed::Service(_) | Routed::Ignored(_) => {}
++    }
++}
++
+ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+     let config = Config::load(env_file)?;
++    let projects_dir = config.projects_dir.clone().with_context(|| {
++        format!("no home directory found; set {PROJECTS_VAR} to the Claude Code projects directory")
++    })?;
++    let offsets = OffsetStore::open(&config.state_dir)
++        .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
+     let api = Arc::new(BotApi::new(&config.token, config.chat_id)?);
+ 
+     let me = api
+@@ -62,23 +90,167 @@
+ 
+     let (scheduler, outbox) = Scheduler::new(api.clone(), BucketConfig::default());
+     tokio::spawn(scheduler.run());
+-
+-    updates::poll(&api, &config.allowlist, |routed| {
+-        // Handlers arrive with TASK-009/011; the outbox is kept alive for them.
+-        let _ = &outbox;
+-        match routed {
+-            Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
+-            Routed::Callback(_) => info!("inbound button press"),
+-            Routed::Service(_) | Routed::Ignored(_) => {}
+-        }
+-    })
++    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
++    tokio::spawn(commands::serve(
++        commands_rx,
++        outbox,
++        Arc::new(ProjectsDir::new(projects_dir)),
++        me.username.clone(),
++    ));
++
++    updates::poll(
++        api.as_ref(),
++        &config.allowlist,
++        &offsets,
++        route_inbound(&commands_tx),
++    )
+     .await;
+     Ok(())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::sync::Mutex;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::time::Duration;
++
++    use serde_json::{Value, json};
++    use tokio::sync::Notify;
++
+     use super::*;
++    use api::{ApiError, Message};
++    use scheduler::{Delivery, Op, Outcome, Transport};
++    use sessions::{LocateError, Located, TranscriptLocator};
++    use testdir::TempDir;
++    use updates::UpdateSource;
++
++    const CHAT: i64 = -1000000000001;
++    const ALLOWED: i64 = 1001;
++    const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
++
++    /// One command per call, then an idle long poll; counts calls.
++    struct Batches {
++        calls: AtomicUsize,
++        polled_twice: Notify,
++    }
++
++    impl UpdateSource for Batches {
++        fn chat_id(&self) -> i64 {
++            CHAT
++        }
++
++        async fn get_updates(&self, _: Option<i64>, _: Duration) -> Result<Vec<Value>, ApiError> {
++            let call = self.calls.fetch_add(1, Ordering::SeqCst);
++            let text = match call {
++                0 => "/brief",
++                1 => "/full",
++                _ => {
++                    self.polled_twice.notify_one();
++                    return std::future::pending().await;
++                }
++            };
++            Ok(vec![json!({ "update_id": call + 1, "message": {
++                "message_id": call + 10, "date": 1, "text": text,
++                "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
++                "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
++            }})])
++        }
++    }
++
++    /// Blocks each `locate` until the test lets it through.
++    struct Gated {
++        gate: Mutex<std::sync::mpsc::Receiver<()>>,
++        file: std::path::PathBuf,
++    }
++
++    impl TranscriptLocator for Gated {
++        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
++            let _ = self.gate.lock().unwrap().recv();
++            Ok(Located {
++                session_id: SESSION.to_owned(),
++                project: "C--proj".to_owned(),
++                path: self.file.clone(),
++            })
++        }
++    }
++
++    #[derive(Default)]
++    struct Sent(Mutex<Vec<String>>);
++
++    impl Transport for Sent {
++        async fn execute(&self, op: &Op) -> Delivery {
++            if let Op::Send { text, .. } = op {
++                self.0.lock().unwrap().push(text.clone());
++            }
++            Ok(Outcome::Sent(Message::default()))
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn a_slow_command_does_not_hold_up_polling() {
++        let dir = TempDir::new("hub-slow-command");
++        let file = dir.path().join(format!("{SESSION}.jsonl"));
++        std::fs::write(
++            &file,
++            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
++        )
++        .unwrap();
++        let (open_gate, gate) = std::sync::mpsc::channel();
++        let sent = Arc::new(Sent::default());
++        let (scheduler, outbox) = Scheduler::new(sent.clone(), BucketConfig::default());
++        tokio::spawn(scheduler.run());
++        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
++        let locator = Arc::new(Gated {
++            gate: Mutex::new(gate),
++            file: file.clone(),
++        });
++        tokio::spawn(commands::serve(commands_rx, outbox, locator, None));
++
++        let source = Arc::new(Batches {
++            calls: AtomicUsize::new(0),
++            polled_twice: Notify::new(),
++        });
++        let store = Arc::new(OffsetStore::open(dir.path()).unwrap());
++        let polling = {
++            let (source, store) = (source.clone(), store.clone());
++            tokio::spawn(async move {
++                let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
++                updates::poll(
++                    source.as_ref(),
++                    &allowlist,
++                    &store,
++                    route_inbound(&commands_tx),
++                )
++                .await;
++            })
++        };
++
++        // The first command is stuck in `locate`, yet both batches were
++        // fetched and the offset saved past them.
++        tokio::time::timeout(Duration::from_secs(10), source.polled_twice.notified())
++            .await
++            .expect("poll kept going while a command was stuck");
++        assert_eq!(store.load(), Some(3));
++        assert!(sent.0.lock().unwrap().is_empty());
++
++        open_gate.send(()).unwrap();
++        open_gate.send(()).unwrap();
++        let answered = async {
++            while sent.0.lock().unwrap().len() < 2 {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::time::timeout(Duration::from_secs(10), answered)
++            .await
++            .expect("both commands answered");
++        let turns = transcript::parse(&std::fs::read_to_string(&file).unwrap());
++        let want = [
++            transcript::render_brief(&turns),
++            transcript::render_full(&turns),
++        ];
++        assert_eq!(*sent.0.lock().unwrap(), want);
++        polling.abort();
++    }
+ 
+     fn member(status: &str, topics: bool) -> ChatMember {
+         ChatMember {
+--- /dev/null	2026-09-23 05:49:55.000000000 +0300
++++ crates/cctg/src/hub/offset.rs	2026-09-23 05:46:10.093763800 +0300
+@@ -0,0 +1,124 @@
++//! The `getUpdates` offset on disk, so a restarted hub does not handle an
++//! update again.
++//!
++//! Telegram confirms an update only when `getUpdates` is next called with a
++//! higher offset. Without this file, updates handled just before a crash or
++//! restart come back on the first call after it.
++
++use std::io::{self, Write};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, SystemTime};
++
++use tracing::warn;
++
++const FILE_NAME: &str = "offset";
++const TEMP_NAME: &str = "offset.tmp";
++/// Telegram keeps an update at most 24 hours, so an offset saved earlier
++/// guards nothing. It can hurt: after a week without updates Telegram restarts
++/// ids at random, possibly below it.
++const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
++
++#[derive(Debug)]
++pub struct OffsetStore {
++    dir: PathBuf,
++}
++
++impl OffsetStore {
++    /// Uses `dir`, creating it when missing.
++    pub fn open(dir: &Path) -> io::Result<Self> {
++        std::fs::create_dir_all(dir)?;
++        Ok(Self {
++            dir: dir.to_owned(),
++        })
++    }
++
++    /// The saved offset. A missing file is `None`; an unreadable or garbled one
++    /// is logged and also `None`, so the hub still starts. So is one saved
++    /// more than `MAX_AGE` ago.
++    pub fn load(&self) -> Option<i64> {
++        let path = self.dir.join(FILE_NAME);
++        let age = std::fs::metadata(&path)
++            .and_then(|metadata| metadata.modified())
++            .ok()
++            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
++        if age.is_some_and(|age| age > MAX_AGE) {
++            warn!("saved getUpdates offset is older than a day; starting without it");
++            return None;
++        }
++        match std::fs::read_to_string(&path) {
++            Ok(text) => {
++                let offset = text.trim().parse().ok();
++                if offset.is_none() {
++                    warn!("saved getUpdates offset is not a number; starting without it");
++                }
++                offset
++            }
++            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
++            Err(error) => {
++                warn!(kind = ?error.kind(), "cannot read the saved getUpdates offset; starting without it");
++                None
++            }
++        }
++    }
++
++    /// Writes a temp file, flushes it to disk and renames it over the old one,
++    /// so an interrupted save leaves the previous value.
++    pub fn save(&self, offset: i64) -> io::Result<()> {
++        let temp = self.dir.join(TEMP_NAME);
++        let mut file = std::fs::File::create(&temp)?;
++        writeln!(file, "{offset}")?;
++        file.sync_all()?;
++        drop(file);
++        std::fs::rename(&temp, self.dir.join(FILE_NAME))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::hub::testdir::TempDir;
++
++    #[test]
++    fn saves_and_reloads_across_instances() {
++        let dir = TempDir::new("offset-roundtrip");
++        let state = dir.path().join("state");
++        let store = OffsetStore::open(&state).unwrap();
++        assert_eq!(store.load(), None);
++        store.save(41).unwrap();
++        store.save(42).unwrap();
++        assert_eq!(OffsetStore::open(&state).unwrap().load(), Some(42));
++        assert!(!state.join(TEMP_NAME).exists());
++    }
++
++    #[test]
++    fn garbage_or_leftover_temp_file_does_not_break_start() {
++        let dir = TempDir::new("offset-garbage");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        std::fs::write(dir.path().join(FILE_NAME), "not a number").unwrap();
++        assert_eq!(store.load(), None);
++
++        // A crash between write and rename leaves only the temp file behind.
++        store.save(7).unwrap();
++        std::fs::write(dir.path().join(TEMP_NAME), "99").unwrap();
++        assert_eq!(store.load(), Some(7));
++        store.save(8).unwrap();
++        assert_eq!(store.load(), Some(8));
++    }
++
++    #[test]
++    fn an_offset_older_than_a_day_is_ignored() {
++        let dir = TempDir::new("offset-stale");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        store.save(9).unwrap();
++        let file = std::fs::File::options()
++            .write(true)
++            .open(dir.path().join(FILE_NAME))
++            .unwrap();
++        file.set_modified(SystemTime::now() - MAX_AGE + Duration::from_secs(60))
++            .unwrap();
++        assert_eq!(store.load(), Some(9));
++        file.set_modified(SystemTime::now() - MAX_AGE - Duration::from_secs(60))
++            .unwrap();
++        assert_eq!(store.load(), None);
++    }
++}
+--- /dev/null	2026-09-23 05:49:55.000000000 +0300
++++ crates/cctg/src/hub/sessions.rs	2026-09-23 05:45:28.957774200 +0300
+@@ -0,0 +1,252 @@
++//! Which transcript `/brief` and `/full` read.
++//!
++//! `TranscriptLocator` is the seam: today `ProjectsDir` scans the Claude Code
++//! projects directory; the slot registry (TASK-011) replaces it with
++//! "current session of the slot behind this topic".
++
++use std::io;
++use std::path::PathBuf;
++use std::time::{SystemTime, UNIX_EPOCH};
++
++/// A top-level session transcript.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Located {
++    pub session_id: String,
++    /// Encoded-cwd directory name, e.g. `C--Users-me-dev-app`. Shown to the
++    /// user, never logged.
++    pub project: String,
++    pub path: PathBuf,
++}
++
++#[derive(Debug, PartialEq, Eq, thiserror::Error)]
++pub enum LocateError {
++    #[error("the projects directory does not exist")]
++    RootMissing,
++    #[error("the projects directory cannot be read ({0:?})")]
++    RootUnreadable(io::ErrorKind),
++    #[error("no sessions")]
++    NoSessions,
++    #[error("no session id starts with the given prefix")]
++    NoMatch,
++    /// Every match, newest first.
++    #[error("the prefix matches {} sessions", .0.len())]
++    Ambiguous(Vec<Located>),
++}
++
++pub trait TranscriptLocator: Send + Sync + 'static {
++    /// The transcript for a command sent in `thread_id` (`None` is General),
++    /// narrowed to sessions whose id starts with `session_prefix` when given.
++    fn locate(
++        &self,
++        thread_id: Option<i64>,
++        session_prefix: Option<&str>,
++    ) -> Result<Located, LocateError>;
++}
++
++/// Finds `<root>/<project>/<session-id>.jsonl`. Only direct children of a
++/// project directory count, so `<session-id>/subagents/*.jsonl` never does.
++#[derive(Debug)]
++pub struct ProjectsDir {
++    root: PathBuf,
++}
++
++impl ProjectsDir {
++    pub fn new(root: PathBuf) -> Self {
++        Self { root }
++    }
++
++    /// All top-level sessions, newest first; ties by id.
++    fn sessions(&self) -> Result<Vec<Located>, LocateError> {
++        let projects = match std::fs::read_dir(&self.root) {
++            Ok(projects) => projects,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                return Err(LocateError::RootMissing);
++            }
++            Err(error) => return Err(LocateError::RootUnreadable(error.kind())),
++        };
++        let mut sessions: Vec<(SystemTime, Located)> = Vec::new();
++        for project in projects.flatten() {
++            if !project.file_type().is_ok_and(|kind| kind.is_dir()) {
++                continue;
++            }
++            let Ok(files) = std::fs::read_dir(project.path()) else {
++                continue;
++            };
++            let project_name = project.file_name().to_string_lossy().into_owned();
++            for file in files.flatten() {
++                let name = file.file_name();
++                let Some(session_id) = name
++                    .to_str()
++                    .and_then(|name| name.strip_suffix(".jsonl"))
++                    .filter(|id| is_session_id(id))
++                else {
++                    continue;
++                };
++                let Ok(metadata) = file.metadata() else {
++                    continue;
++                };
++                if !metadata.is_file() {
++                    continue;
++                }
++                let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
++                sessions.push((
++                    modified,
++                    Located {
++                        session_id: session_id.to_owned(),
++                        project: project_name.clone(),
++                        path: file.path(),
++                    },
++                ));
++            }
++        }
++        sessions.sort_by(|(a_time, a), (b_time, b)| {
++            b_time
++                .cmp(a_time)
++                .then_with(|| a.session_id.cmp(&b.session_id))
++        });
++        Ok(sessions.into_iter().map(|(_, session)| session).collect())
++    }
++}
++
++impl TranscriptLocator for ProjectsDir {
++    fn locate(
++        &self,
++        _thread_id: Option<i64>,
++        session_prefix: Option<&str>,
++    ) -> Result<Located, LocateError> {
++        let mut sessions = self.sessions()?;
++        let Some(prefix) = session_prefix else {
++            return sessions.into_iter().next().ok_or(LocateError::NoSessions);
++        };
++        sessions.retain(|session| session.session_id.starts_with(prefix));
++        match sessions.len() {
++            0 => Err(LocateError::NoMatch),
++            1 => Ok(sessions.remove(0)),
++            _ => Err(LocateError::Ambiguous(sessions)),
++        }
++    }
++}
++
++/// Claude Code names top-level transcripts by a lowercase UUID.
++fn is_session_id(id: &str) -> bool {
++    id.len() == 36
++        && id.char_indices().all(|(index, c)| match index {
++            8 | 13 | 18 | 23 => c == '-',
++            _ => c.is_ascii_digit() || ('a'..='f').contains(&c),
++        })
++}
++
++#[cfg(test)]
++mod tests {
++    use std::path::Path;
++    use std::time::Duration;
++
++    use super::*;
++    use crate::hub::testdir::TempDir;
++
++    const OLD: &str = "0a1b2c3d-0000-4000-8000-000000000001";
++    const NEW: &str = "0a1b9999-0000-4000-8000-000000000002";
++    const OTHER: &str = "f0000000-0000-4000-8000-000000000003";
++
++    fn write(path: &Path, age_secs: u64) {
++        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++        std::fs::write(path, "{}\n").unwrap();
++        let modified = SystemTime::now() - Duration::from_secs(age_secs);
++        std::fs::File::options()
++            .write(true)
++            .open(path)
++            .unwrap()
++            .set_modified(modified)
++            .unwrap();
++    }
++
++    fn root() -> TempDir {
++        let dir = TempDir::new("sessions");
++        write(
++            &dir.path().join("C--proj-a").join(format!("{OLD}.jsonl")),
++            300,
++        );
++        write(
++            &dir.path().join("C--proj-b").join(format!("{NEW}.jsonl")),
++            200,
++        );
++        write(
++            &dir.path().join("C--proj-b").join(format!("{OTHER}.jsonl")),
++            100,
++        );
++        dir
++    }
++
++    fn locate(dir: &TempDir, prefix: Option<&str>) -> Result<Located, LocateError> {
++        ProjectsDir::new(dir.path().to_owned()).locate(None, prefix)
++    }
++
++    #[test]
++    fn newest_session_wins_without_a_prefix() {
++        let dir = root();
++        let found = locate(&dir, None).unwrap();
++        assert_eq!(found.session_id, OTHER);
++        assert_eq!(found.project, "C--proj-b");
++        assert_eq!(
++            found.path,
++            dir.path().join("C--proj-b").join(format!("{OTHER}.jsonl"))
++        );
++    }
++
++    #[test]
++    fn prefix_selects_one_or_lists_candidates() {
++        let dir = root();
++        assert_eq!(locate(&dir, Some("0a1b2")).unwrap().session_id, OLD);
++        assert_eq!(locate(&dir, Some(OLD)).unwrap().session_id, OLD);
++        match locate(&dir, Some("0a1b")) {
++            Err(LocateError::Ambiguous(candidates)) => {
++                let ids: Vec<&str> = candidates.iter().map(|c| c.session_id.as_str()).collect();
++                assert_eq!(ids, [NEW, OLD], "newest first");
++            }
++            other => panic!("expected candidates, got {other:?}"),
++        }
++        assert_eq!(locate(&dir, Some("dead")), Err(LocateError::NoMatch));
++    }
++
++    #[test]
++    fn subagent_transcripts_are_never_sessions() {
++        let dir = root();
++        let nested = dir.path().join("C--proj-b").join(OTHER).join("subagents");
++        // Newer than every top-level file, and one of them named like a session.
++        write(&nested.join("agent-a0123.jsonl"), 0);
++        write(
++            &nested.join("ffffffff-0000-4000-8000-000000000009.jsonl"),
++            0,
++        );
++        assert_eq!(locate(&dir, None).unwrap().session_id, OTHER);
++        assert_eq!(locate(&dir, Some("ffffffff")), Err(LocateError::NoMatch));
++    }
++
++    #[test]
++    fn non_session_entries_are_skipped() {
++        let dir = TempDir::new("sessions-junk");
++        let project = dir.path().join("C--proj");
++        write(&project.join("notes.jsonl"), 0);
++        write(&project.join("sessions-index.json"), 0);
++        write(&dir.path().join(format!("{NEW}.jsonl")), 0);
++        std::fs::create_dir_all(project.join(format!("{OTHER}.jsonl"))).unwrap();
++        assert_eq!(locate(&dir, None), Err(LocateError::NoSessions));
++        write(&project.join(format!("{OLD}.jsonl")), 50);
++        assert_eq!(locate(&dir, None).unwrap().session_id, OLD);
++    }
++
++    #[test]
++    fn missing_root_is_reported() {
++        let dir = TempDir::new("sessions-missing");
++        let missing = ProjectsDir::new(dir.path().join("absent"));
++        assert_eq!(missing.locate(None, None), Err(LocateError::RootMissing));
++    }
++
++    #[test]
++    fn session_id_shape() {
++        assert!(is_session_id(OLD));
++        assert!(!is_session_id("0A1B2C3D-0000-4000-8000-000000000001"));
++        assert!(!is_session_id("agent-a0123"));
++        assert!(!is_session_id("0a1b2c3d00000-4000-8000-000000000001"));
++    }
++}
+--- /dev/null	2026-09-23 05:49:55.000000000 +0300
++++ crates/cctg/src/hub/testdir.rs	2026-09-23 05:38:04.998877800 +0300
+@@ -0,0 +1,30 @@
++//! Self-removing temporary directory for unit tests.
++
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++pub struct TempDir(PathBuf);
++
++impl TempDir {
++    pub fn new(name: &str) -> Self {
++        static NEXT: AtomicUsize = AtomicUsize::new(0);
++        let path = std::env::temp_dir().join(format!(
++            "cctg-test-{}-{}-{name}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path).expect("create temp dir");
++        Self(path)
++    }
++
++    pub fn path(&self) -> &Path {
++        &self.0
++    }
++}
++
++impl Drop for TempDir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
+--- crates/cctg/src/hub/updates.rs	2026-09-23 04:13:31.925027800 +0300
++++ crates/cctg/src/hub/updates.rs	2026-09-23 05:46:07.544929900 +0300
+@@ -2,6 +2,7 @@
+ //!
+ //! `Routed` values carry no Telegram user id, so nothing downstream can log one.
+ 
++use std::future::Future;
+ use std::time::Duration;
+ 
+ use serde_json::Value;
+@@ -9,10 +10,14 @@
+ 
+ use super::api::{ApiError, BotApi, Message, Update};
+ use super::config::Allowlist;
++use super::offset::OffsetStore;
+ 
+ const POLL_TIMEOUT: Duration = Duration::from_secs(50);
+ const MAX_BACKOFF: Duration = Duration::from_secs(30);
+ const STALLED_BATCH_BACKOFF: Duration = Duration::from_secs(1);
++/// Waits before the second and third attempt to save the offset (a file held
++/// open by a scanner or indexer on Windows makes the rename fail for a moment).
++const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Routed {
+@@ -139,18 +144,22 @@
+ /// Routes a raw `getUpdates` batch. Returns the next offset and the routed
+ /// updates. A malformed update is skipped, not fatal, and still advances the
+ /// offset so it is not fetched again.
++///
++/// The next offset is one past the highest `update_id` of this batch, even
++/// when that is below `offset`: after a week without updates Telegram picks
++/// the next id at random, and keeping the old, higher offset would fetch and
++/// handle the same update again on every call.
+ pub fn route_batch(
+     raw: Vec<Value>,
+     offset: Option<i64>,
+     chat_id: i64,
+     allowlist: &Allowlist,
+ ) -> (Option<i64>, Vec<Routed>) {
+-    let mut next = offset;
++    let mut highest: Option<i64> = None;
+     let mut routed = Vec::with_capacity(raw.len());
+     for value in raw {
+         if let Some(id) = value.get("update_id").and_then(Value::as_i64) {
+-            let following = id.saturating_add(1);
+-            next = Some(next.map_or(following, |current| current.max(following)));
++            highest = Some(highest.map_or(id, |current| current.max(id)));
+         }
+         let item = match serde_json::from_value::<Update>(value) {
+             Ok(update) => classify(update, chat_id, allowlist),
+@@ -163,9 +172,34 @@
+         }
+         routed.push(item);
+     }
++    let next = highest.map(|id| id.saturating_add(1)).or(offset);
+     (next, routed)
+ }
+ 
++/// Where updates come from: `BotApi` in production, a fake in tests.
++pub trait UpdateSource {
++    fn chat_id(&self) -> i64;
++    fn get_updates(
++        &self,
++        offset: Option<i64>,
++        timeout: Duration,
++    ) -> impl Future<Output = Result<Vec<Value>, ApiError>> + Send;
++}
++
++impl UpdateSource for BotApi {
++    fn chat_id(&self) -> i64 {
++        BotApi::chat_id(self)
++    }
++
++    async fn get_updates(
++        &self,
++        offset: Option<i64>,
++        timeout: Duration,
++    ) -> Result<Vec<Value>, ApiError> {
++        BotApi::get_updates(self, offset, timeout).await
++    }
++}
++
+ fn stalled_batch_backoff(
+     batch_len: usize,
+     previous: Option<i64>,
+@@ -174,19 +208,50 @@
+     (batch_len > 0 && next == previous).then_some(STALLED_BATCH_BACKOFF)
+ }
+ 
++/// Saves `offset`, retrying twice. A save that still fails is logged and the
++/// poll goes on: an unwritable state directory must not stop the hub; the
++/// cost is that a restart before the next successful save repeats the batch.
++async fn save_offset(store: &OffsetStore, offset: i64) {
++    let mut result = store.save(offset);
++    for wait in SAVE_RETRY_WAITS {
++        if result.is_ok() {
++            return;
++        }
++        tokio::time::sleep(wait).await;
++        result = store.save(offset);
++    }
++    if let Err(error) = result {
++        warn!(kind = ?error.kind(), "cannot save the getUpdates offset; a restart may repeat this batch");
++    }
++}
++
+ /// Long-polls forever and hands every routed update to `handle`. Errors never
+ /// stop the loop: 429 waits `retry_after`, other errors back off up to 30 s.
+-pub async fn poll(api: &BotApi, allowlist: &Allowlist, mut handle: impl FnMut(Routed)) {
+-    let mut offset = None;
++///
++/// Starts from the offset in `store` and saves each new offset before the
++/// batch is handled: a crash in between skips those updates instead of
++/// handling them twice (at most once, so a command is never answered twice).
++pub async fn poll<S: UpdateSource>(
++    source: &S,
++    allowlist: &Allowlist,
++    store: &OffsetStore,
++    mut handle: impl FnMut(Routed),
++) {
++    let mut offset = store.load();
+     let mut backoff = Duration::from_secs(1);
+     loop {
+-        match api.get_updates(offset, POLL_TIMEOUT).await {
++        match source.get_updates(offset, POLL_TIMEOUT).await {
+             Ok(raw) => {
+                 backoff = Duration::from_secs(1);
+                 let batch_len = raw.len();
+                 let previous = offset;
+-                let (next, routed) = route_batch(raw, offset, api.chat_id(), allowlist);
++                let (next, routed) = route_batch(raw, offset, source.chat_id(), allowlist);
+                 offset = next;
++                if next != previous
++                    && let Some(next) = next
++                {
++                    save_offset(store, next).await;
++                }
+                 routed.into_iter().for_each(&mut handle);
+                 if let Some(wait) = stalled_batch_backoff(batch_len, previous, next) {
+                     warn!(?wait, "getUpdates batch did not contain an update_id");
+@@ -365,6 +430,189 @@
+     }
+ 
+     #[test]
++    fn next_offset_follows_the_batch_even_below_the_old_one() {
++        // Telegram restarts ids at random after a week without updates.
++        let batch = vec![json!({ "update_id": 40 }), json!({ "update_id": 42 })];
++        let (next, _) = route_batch(batch, Some(9000), CHAT, &allowlist());
++        assert_eq!(next, Some(43));
++        let (next, _) = route_batch(vec![json!({ "x": 1 })], Some(9000), CHAT, &allowlist());
++        assert_eq!(next, Some(9000));
++    }
++
++    /// Answers like Telegram: every update at or above `offset`, or waits out
++    /// the long poll when there is none. It never forgets an update, which is
++    /// what Telegram does for an update that was not yet confirmed.
++    struct FakeTelegram(Vec<Value>);
++
++    impl UpdateSource for FakeTelegram {
++        fn chat_id(&self) -> i64 {
++            CHAT
++        }
++
++        async fn get_updates(
++            &self,
++            offset: Option<i64>,
++            timeout: Duration,
++        ) -> Result<Vec<Value>, ApiError> {
++            let batch: Vec<Value> = self
++                .0
++                .iter()
++                .filter(|update| {
++                    let id = update["update_id"].as_i64().unwrap_or_default();
++                    offset.is_none_or(|offset| id >= offset)
++                })
++                .cloned()
++                .collect();
++            if batch.is_empty() {
++                tokio::time::sleep(timeout).await;
++            }
++            Ok(batch)
++        }
++    }
++
++    fn text_update(id: i64, text: &str) -> Value {
++        json!({ "update_id": id, "message": message(ALLOWED, json!({ "text": text })) })
++    }
++
++    /// Polls `updates` for a few simulated minutes; returns the handled texts.
++    async fn handled(updates: Vec<Value>, store: &OffsetStore) -> Vec<String> {
++        let mut texts = Vec::new();
++        let source = FakeTelegram(updates);
++        let allowlist = allowlist();
++        let polling = poll(&source, &allowlist, store, |routed| {
++            if let Routed::Input(input) = routed {
++                texts.push(input.text.unwrap_or_default());
++            }
++        });
++        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
++        texts
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn saved_offset_prevents_handling_an_update_twice_after_restart() {
++        let dir = crate::hub::testdir::TempDir::new("poll-restart");
++        let first_run = OffsetStore::open(dir.path()).unwrap();
++        assert_eq!(
++            handled(vec![text_update(5, "/brief")], &first_run).await,
++            ["/brief"]
++        );
++
++        // Restart: a new store over the same directory, and Telegram still
++        // holds update 5 because no later getUpdates confirmed it.
++        let restarted = OffsetStore::open(dir.path()).unwrap();
++        assert_eq!(restarted.load(), Some(6));
++        let pending = vec![text_update(5, "/brief"), text_update(6, "/full")];
++        assert_eq!(handled(pending.clone(), &restarted).await, ["/full"]);
++
++        // Control: without the saved offset the old command runs again.
++        let empty = crate::hub::testdir::TempDir::new("poll-no-offset");
++        let fresh = OffsetStore::open(empty.path()).unwrap();
++        assert_eq!(handled(pending, &fresh).await, ["/brief", "/full"]);
++    }
++
++    /// Keeps returning its updates until `getUpdates` is called with an offset
++    /// above them, whatever offset it was called with before: what a bot saw
++    /// after a week-long pause, when Telegram restarted ids below the offset.
++    struct RestartedIds(Vec<Value>, std::sync::Mutex<i64>);
++
++    impl UpdateSource for RestartedIds {
++        fn chat_id(&self) -> i64 {
++            CHAT
++        }
++
++        async fn get_updates(
++            &self,
++            offset: Option<i64>,
++            timeout: Duration,
++        ) -> Result<Vec<Value>, ApiError> {
++            // Only an offset just above the update confirms it; the stale
++            // 5000 does not (the observed behaviour this models).
++            let confirmed = {
++                let mut confirmed = self.1.lock().unwrap();
++                if let Some(offset) = offset.filter(|offset| *offset < 1000) {
++                    *confirmed = (*confirmed).max(offset);
++                }
++                *confirmed
++            };
++            let batch: Vec<Value> = self
++                .0
++                .iter()
++                .filter(|update| update["update_id"].as_i64().unwrap_or_default() >= confirmed)
++                .cloned()
++                .collect();
++            if batch.is_empty() {
++                tokio::time::sleep(timeout).await;
++            }
++            Ok(batch)
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn ids_restarted_below_the_saved_offset_are_handled_once() {
++        let dir = crate::hub::testdir::TempDir::new("poll-restarted-ids");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        store.save(5000).unwrap();
++        let mut texts = Vec::new();
++        let source = RestartedIds(vec![text_update(7, "/brief")], std::sync::Mutex::new(0));
++        let allowlist = allowlist();
++        let polling = poll(&source, &allowlist, &store, |routed| {
++            if let Routed::Input(input) = routed {
++                texts.push(input.text.unwrap_or_default());
++            }
++        });
++        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
++        assert_eq!(texts, ["/brief"]);
++        assert_eq!(store.load(), Some(8));
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn offset_is_saved_before_the_batch_is_handled() {
++        let dir = crate::hub::testdir::TempDir::new("poll-save-first");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        let mut seen = Vec::new();
++        let source = FakeTelegram(vec![text_update(5, "/brief")]);
++        let allowlist = allowlist();
++        let polling = poll(&source, &allowlist, &store, |_| seen.push(store.load()));
++        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
++        assert_eq!(seen, [Some(6)]);
++    }
++
++    /// Makes `offset` a non-empty directory, so every save fails.
++    fn block_saves(dir: &std::path::Path) -> std::path::PathBuf {
++        let blocker = dir.join("offset");
++        std::fs::create_dir_all(blocker.join("inside")).unwrap();
++        blocker
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn failing_offset_saves_do_not_stop_polling() {
++        let dir = crate::hub::testdir::TempDir::new("poll-save-fails");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        block_saves(dir.path());
++        let updates = vec![text_update(5, "/brief"), text_update(6, "/full")];
++        // Both handled once: the in-memory offset still moves on.
++        assert_eq!(handled(updates, &store).await, ["/brief", "/full"]);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_briefly_failing_offset_save_is_retried() {
++        let dir = crate::hub::testdir::TempDir::new("poll-save-retry");
++        let store = OffsetStore::open(dir.path()).unwrap();
++        let blocker = block_saves(dir.path());
++        // Unblocked after the first attempt, before the retry 100 ms later.
++        let unblock = tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_millis(50)).await;
++            std::fs::remove_dir_all(blocker).unwrap();
++        });
++        assert_eq!(
++            handled(vec![text_update(5, "/brief")], &store).await,
++            ["/brief"]
++        );
++        unblock.await.unwrap();
++        assert_eq!(store.load(), Some(6));
++    }
++
++    #[test]
+     fn nonempty_batch_without_update_ids_gets_a_short_backoff() {
+         assert_eq!(
+             stalled_batch_backoff(2, Some(3), Some(3)),
+--- /dev/null	2026-09-23 05:49:55.000000000 +0300
++++ crates/cctg/tests/command_logs.rs	2026-09-23 05:38:05.012410200 +0300
+@@ -0,0 +1,136 @@
++//! Log capture for `/brief` and `/full`. Its own test binary with a global
++//! subscriber: file work runs on the blocking pool, where a scoped
++//! (`with_default`) subscriber would not see it, and parallel tests would race
++//! on tracing callsite registration.
++
++use std::io;
++use std::path::PathBuf;
++use std::sync::{Arc, Mutex};
++
++use cctg::hub::api::Message;
++use cctg::hub::commands::handle;
++use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
++use cctg::hub::sessions::{LocateError, Located, ProjectsDir, TranscriptLocator};
++use cctg::hub::updates::Inbound;
++
++const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
++const FIXTURE: &str = include_str!(concat!(
++    env!("CARGO_MANIFEST_DIR"),
++    "/../transcript/tests/fixtures/final_answer.jsonl"
++));
++
++#[derive(Clone, Default)]
++struct Captured(Arc<Mutex<Vec<u8>>>);
++
++impl io::Write for Captured {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        if let Ok(mut out) = self.0.lock() {
++            out.extend_from_slice(buf);
++        }
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++#[derive(Default)]
++struct Fake(Mutex<Vec<Op>>);
++
++impl Transport for Fake {
++    async fn execute(&self, op: &Op) -> Delivery {
++        if let Ok(mut ops) = self.0.lock() {
++            ops.push(op.clone());
++        }
++        Ok(Outcome::Sent(Message::default()))
++    }
++}
++
++/// Points at a path without checking it, like a stale registry entry would.
++struct Fixed(Located);
++
++impl TranscriptLocator for Fixed {
++    fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
++        Ok(self.0.clone())
++    }
++}
++
++fn input(text: &str) -> Inbound {
++    Inbound {
++        message_id: 1,
++        thread_id: None,
++        text: Some(text.to_owned()),
++    }
++}
++
++#[tokio::test]
++async fn command_logs_carry_no_paths() {
++    let captured = Captured::default();
++    let writer = captured.clone();
++    let subscriber = tracing_subscriber::fmt()
++        .without_time()
++        .with_max_level(tracing::Level::TRACE)
++        .with_writer(move || writer.clone())
++        .finish();
++    tracing::subscriber::set_global_default(subscriber).expect("first subscriber");
++
++    let marker = format!("private-marker-{}", std::process::id());
++    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(&marker);
++    let project = format!("C--Users-{marker}-dev");
++    let _ = std::fs::remove_dir_all(&root);
++    std::fs::create_dir_all(root.join(&project)).expect("project dir");
++    std::fs::write(
++        root.join(&project).join(format!("{SESSION}.jsonl")),
++        FIXTURE,
++    )
++    .expect("session file");
++
++    let fake = Arc::new(Fake::default());
++    let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
++    let scheduler = tokio::spawn(scheduler.run());
++
++    let projects = Arc::new(ProjectsDir::new(root.clone()));
++    handle(&input("/brief"), &outbox, &projects, None).await;
++    handle(&input("/full 1 5e55"), &outbox, &projects, None).await;
++    let located = |path: PathBuf| {
++        Arc::new(Fixed(Located {
++            session_id: SESSION.to_owned(),
++            project: project.clone(),
++            path,
++        }))
++    };
++    // Missing file, then a directory instead of a file (read error).
++    handle(
++        &input("/brief"),
++        &outbox,
++        &located(root.join("gone.jsonl")),
++        None,
++    )
++    .await;
++    handle(&input("/brief"), &outbox, &located(root.clone()), None).await;
++    drop(outbox);
++    scheduler.await.expect("scheduler");
++    let _ = std::fs::remove_dir_all(&root);
++
++    let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
++        .unwrap_or_default();
++    assert!(
++        logs.contains("transcript command answered") && logs.contains("transcript cannot be read"),
++        "expected command logs: {logs}"
++    );
++    assert!(
++        logs.contains("5e551017"),
++        "short session id expected: {logs}"
++    );
++    assert!(!logs.contains(&marker), "path or project in logs: {logs}");
++
++    let ops = fake.0.lock().map(|ops| ops.clone()).unwrap_or_default();
++    assert_eq!(ops.len(), 4);
++    // Notices name the session, never the path.
++    for op in &ops[2..] {
++        match op {
++            Op::Send { text, .. } => assert!(!text.contains(&marker), "{text}"),
++            other => panic!("expected a notice, got {other:?}"),
++        }
++    }
++}
+--- crates/transcript/src/lib.rs	2026-09-23 01:58:36.606509500 +0300
++++ crates/transcript/src/lib.rs	2026-09-23 05:38:04.976808600 +0300
+@@ -13,7 +13,8 @@
+ mod subagent;
+ 
+ pub use render::{
+-    render_brief, render_brief_with_subagents, render_full, render_full_with_subagents,
++    last_prompts, render_brief, render_brief_with_subagents, render_full,
++    render_full_with_subagents,
+ };
+ pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
+ pub use subagent::{Subagent, SubagentBody, SubagentInput, SubagentMeta, parse_subagent_meta};
+--- crates/transcript/src/render.rs	2026-09-23 04:39:39.963060800 +0300
++++ crates/transcript/src/render.rs	2026-09-23 05:45:43.925453300 +0300
+@@ -237,18 +237,40 @@
+     }
+ }
+ 
++/// The tail of `turns` that starts at the `n`-th prompt from the end, so the renderers show the last
++/// `n` exchanges. All of `turns` when there are fewer prompts; empty for `n == 0`. A prompt is what
++/// the renderers show as `> ...` and count as a boundary: typed text, a slash command, a Telegram
++/// message; service records and tool results are not prompts.
++pub fn last_prompts(turns: &[Turn], n: usize) -> &[Turn] {
++    if n == 0 {
++        return &[];
++    }
++    let start = turns
++        .iter()
++        .enumerate()
++        .rev()
++        .filter(|(_, turn)| is_prompt(turn))
++        .nth(n - 1)
++        .map_or(0, |(index, _)| index);
++    &turns[start..]
++}
++
++/// A user turn with at least one prompt text.
++fn is_prompt(turn: &Turn) -> bool {
++    turn.role == Role::User
++        && turn.blocks.iter().any(|block| match block {
++            Block::Text(text) => matches!(user_text(turn, text), Some(UserText::Prompt(_))),
++            _ => false,
++        })
++}
++
+ /// For each turn: does a tool call appear in it or later, before the next prompt? Service records
+ /// are not prompts.
+ fn tool_after(turns: &[Turn]) -> Vec<bool> {
+     let mut flags = vec![false; turns.len()];
+     let mut seen = false;
+     for (i, turn) in turns.iter().enumerate().rev() {
+-        if turn.role == Role::User
+-            && turn.blocks.iter().any(|block| match block {
+-                Block::Text(text) => matches!(user_text(turn, text), Some(UserText::Prompt(_))),
+-                _ => false,
+-            })
+-        {
++        if is_prompt(turn) {
+             seen = false;
+         }
+         seen |= turn
+--- crates/transcript/tests/render.rs	2026-09-23 04:39:39.965564100 +0300
++++ crates/transcript/tests/render.rs	2026-09-23 05:38:04.893427000 +0300
+@@ -2,7 +2,8 @@
+ 
+ use serde_json::json;
+ use transcript::{
+-    Block, Role, SplitOptions, Turn, parse, render_brief, render_full, split_for_telegram,
++    Block, Role, SplitOptions, Turn, last_prompts, parse, render_brief, render_full,
++    split_for_telegram,
+ };
+ 
+ const IN_PROGRESS_MARKER: &str = "в работе…";
+@@ -355,3 +356,56 @@
+         "{t_small:?} -> {t_large:?}"
+     );
+ }
++
++#[test]
++fn last_prompts_keeps_the_last_n_exchanges() {
++    let turns = parse(FINAL_ANSWER);
++    assert_eq!(
++        render_brief(last_prompts(&turns, 1)),
++        "> Explore the crate
++↳ Explore a0000000000000002: Explore crate
++The crate has three modules."
++    );
++    assert_eq!(render_brief(last_prompts(&turns, 2)), FINAL_ANSWER_BRIEF);
++    assert_eq!(render_full(last_prompts(&turns, 99)), FINAL_ANSWER_FULL);
++    assert!(last_prompts(&turns, 0).is_empty());
++    assert!(last_prompts(&[], 3).is_empty());
++}
++
++#[test]
++fn last_prompts_counts_only_what_renders_as_a_prompt() {
++    let turns = [
++        prompt("first"),
++        say(Some("end_turn"), "one"),
++        prompt("second"),
++        bash("t1", "ls"),
++        result("t1", "a.txt"),
++        prompt(
++            "<task-notification>
++<task-id>x</task-id>
++</task-notification>",
++        ),
++        meta("<system-reminder>hidden</system-reminder>"),
++        say(Some("end_turn"), "two"),
++    ];
++    // Tool results, service records and hidden meta turns are not boundaries.
++    assert_eq!(
++        render_brief(last_prompts(&turns, 1)),
++        "> second
++• Bash: ls
++two"
++    );
++    assert_eq!(last_prompts(&turns, 2).len(), turns.len());
++
++    let channel = [
++        prompt("typed"),
++        say(Some("end_turn"), "a"),
++        meta("<channel source=\"cctg\" chat_id=\"1\">from telegram</channel>"),
++        say(Some("end_turn"), "b"),
++    ];
++    assert_eq!(
++        render_brief(last_prompts(&channel, 1)),
++        "> from telegram
++b"
++    );
++}

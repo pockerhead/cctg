@@ -1,0 +1,1 @@
+﻿bytes=96315756 turns=5170 brief_len=43703 full100_len=1604505 peakWS_MB>=112.2 wall_ms=162

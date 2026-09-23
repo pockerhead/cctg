@@ -17,3 +17,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 unicode-segmentation = "1.13.3"
+
+# Keep line-level backtraces but drop full debug info: linking test binaries
+# with full debuginfo peaked at 5-6 GB in rust-lld on this host.
+[profile.dev]
+debug = "line-tables-only"

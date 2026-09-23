@@ -1,0 +1,7 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+transcript = { path = "../ws/crates/transcript" }
