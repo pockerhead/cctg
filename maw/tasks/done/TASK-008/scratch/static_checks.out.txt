@@ -1,0 +1,10 @@
+warning: in the working copy of 'Cargo.lock', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cctg/Cargo.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cctg/src/main.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'crates/cctg/tests/stdout.rs', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'maw/tasks/in_progress/TASK-008/log.jsonl', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'maw/tasks/in_progress/TASK-008/metrics.md', LF will be replaced by CRLF the next time Git touches it
+git diff --check: PASS
+reference hashes after verification: PASS (12/12)
+numeric edit/topic mutation limit grep: no matches

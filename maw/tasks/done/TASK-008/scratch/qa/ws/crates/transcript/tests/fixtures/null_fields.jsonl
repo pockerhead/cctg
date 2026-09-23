@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"content":[{"type":"text","text":null},{"type":"tool_use","id":null,"name":null,"input":{"ok":true}},{"type":"tool_result","tool_use_id":null,"content":"done"}]}}

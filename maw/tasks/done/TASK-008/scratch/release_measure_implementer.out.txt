@@ -1,0 +1,7 @@
+command=cargo build --release -p cctg --offline
+elapsed_seconds=48.35
+binary=C:\Users\user\dev\cctg\target\release\cctg.exe
+binary_size_bytes=5490688
+rustc=rustc 1.95.0 (59807616e 2026-04-14)
+logical_processors=16
+os=Microsoft Windows NT 10.0.26200.0

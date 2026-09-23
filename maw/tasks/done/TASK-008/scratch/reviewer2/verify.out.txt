@@ -1,0 +1,129 @@
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\cctg-791c4f290b7e5b80.exe)
+test hub::api::tests::decodes_ok_result_and_ignores_unknown_fields ... ok
+test hub::api::tests::maps_429_to_retry_after ... ok
+test hub::config::tests::chat_id_must_use_the_bot_api_form ... ok
+test hub::scheduler::tests::default_bucket_fits_twenty_per_minute ... ok
+test hub::config::tests::reads_a_complete_config ... ok
+test hub::config::tests::debug_hides_token_and_user_ids ... ok
+test hub::api::tests::maps_other_errors_with_description ... ok
+test hub::config::tests::missing_and_bad_values_are_named_but_not_echoed ... ok
+test hub::config::tests::missing_env_file_is_named ... ok
+test hub::scheduler::tests::permission_never_overtakes_its_own_topic ... ok
+test hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order ... ok
+test hub::scheduler::tests::repeated_edits_of_one_message_coalesce ... ok
+test hub::scheduler::tests::permission_overtakes_other_topics_only ... ok
+test hub::tests::missing_manage_topics_is_a_startup_error ... ok
+test hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after ... ok
+test hub::scheduler::tests::retry_after_pauses_everything_and_retries_once ... ok
+test hub::scheduler::tests::retried_permission_keeps_topic_order ... ok
+test hub::scheduler::tests::stops_after_outbox_is_dropped_and_queue_drained ... ok
+test hub::updates::tests::other_chats_and_senderless_messages_are_ignored ... ok
+test hub::scheduler::tests::permission_prompt_jumps_the_queue ... ok
+test hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped ... ok
+test hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch ... ok
+test hub::updates::tests::forum_service_messages_are_never_input ... ok
+test hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens ... ok
+test hub::scheduler::tests::failed_attempts_spend_tokens ... ok
+test hub::scheduler::tests::group_limit_and_topic_order_hold ... ok
+test hub::api::tests::transport_errors_never_contain_the_token ... ok
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+     Running unittests src\main.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\cctg-331dd2fb31aa8a77.exe)
+test tests::parses_all_subcommands ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\routing_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\routing_logs-18b16d3357ea0983.exe)
+test routing_logs_never_contain_user_ids ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\stdout.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\stdout-45cb367217f38e8a.exe)
+test hub_without_config_fails_on_stderr_only ... ok
+test malformed_env_file_does_not_echo_its_contents ... ok
+test subcommands_do_not_write_to_stdout ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\transcript-d3207e2e48f8ea6a.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\parse_fixtures-7e3f74ddf546d0be.exe)
+test null_string_fields_fixture ... ok
+test plain_text_fixture ... ok
+test sidechain_fixture ... ok
+test string_content_fixture ... ok
+test privacy_detectors_fire ... ok
+test thinking_ai_title_fixture ... ok
+test tool_use_result_fixture ... ok
+test final_answer_fixture_stop_reasons ... ok
+test thinking_never_escapes ... ok
+test fixtures_have_no_private_data ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\parse_tolerance-a90174b8afa68a1a.exe)
+test irrelevant_wrong_typed_fields_do_not_drop_a_turn ... ok
+test both_content_shapes_for_both_roles ... ok
+test unknown_record_and_bad_lines_keep_neighbours ... ok
+test ai_title_rules ... ok
+test stop_reason_is_tolerant ... ok
+test crlf_matches_lf ... ok
+test empty_and_ignored_only_inputs_give_nothing ... ok
+test flags_are_tolerant ... ok
+test unknown_and_malformed_blocks_drop_only_themselves ... ok
+test tool_result_shapes ... ok
+test unusable_message_shapes_are_skipped ... ok
+test known_block_with_missing_fields_keeps_defaults ... ok
+test truncated_last_line_keeps_earlier_turns ... ok
+test deep_nesting_is_skipped_without_panic ... ok
+test garbage_never_panics ... ok
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\purity-521b738d889d825a.exe)
+test library_has_only_pure_dependencies ... ok
+test every_source_file_is_scanned ... ok
+test library_source_has_no_io_or_panicking_calls ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\render-30abc1d0aae875a2.exe)
+test channel_attribute_may_contain_a_greater_than_sign ... ok
+test finished_exchanges_have_no_marker ... ok
+test compact_summary_is_hidden_in_brief_and_keeps_the_state ... ok
+test only_channel_meta_is_shown_and_user_tags_stay_visible ... ok
+test full_truncates_long_results_safely ... ok
+test null_stop_reason_falls_back_to_structure ... ok
+test multiline_prompt_keeps_its_text_verbatim ... ok
+test service_records_are_hidden_in_brief_and_keep_the_state ... ok
+test unfinished_tail_is_marked_in_progress ... ok
+test brief_has_one_line_per_tool_call_and_no_io ... ok
+test final_answer_fixture_brief_and_full ... ok
+test slices_render_independently ... ok
+test thinking_never_rendered ... ok
+test five_thousand_turns_render_in_linear_time ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\split-39175c50312fb527.exe)
+test crlf_is_not_split_at_the_limit ... ok
+test emoji_on_the_boundary_is_never_cut ... ok
+test short_text_is_one_chunk ... ok
+test exact_limit_fits_and_one_more_splits ... ok
+test telegram_len_counts_utf16_units ... ok
+test flags_after_an_odd_prefix_are_not_split ... ok
+test paragraph_separator_is_kept_exactly ... ok
+test threshold_is_configurable ... ok
+test only_emoji_line_splits_on_char_boundaries ... ok
+test prefers_paragraph_then_line_then_space ... ok
+test blank_run_longer_than_the_limit_drops_only_whitespace ... ok
+test oversized_grapheme_falls_back_to_char_boundaries ... ok
+test fifty_kb_block_is_deterministic_and_prefers_file ... ok
+test grapheme_clusters_on_the_boundary_stay_whole ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\debug\deps\subagent-0296bc774049886e.exe)
+test meta_fixture_is_parsed ... ok
+test last_message_must_equal_the_final_answer ... ok
+test missing_or_broken_meta_falls_back_without_error ... ok
+test background_agent_embeds_an_in_progress_body ... ok
+test agent_id_is_one_line_without_breaking_parent_lookup ... ok
+test meta_description_and_type_win ... ok
+test embedded_header_is_the_block_header ... ok
+test report_replaces_the_transcript_final_text ... ok
+test only_known_agents_get_a_body ... ok
+test duplicate_agent_ids_use_the_last_slice_entry ... ok
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test sidechain_turns_never_reach_the_parent_top_level ... ok
+test body_source_order_is_fixed ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests cctg
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests transcript
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 83) - compile fail ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s

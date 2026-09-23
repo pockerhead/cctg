@@ -1,0 +1,12 @@
+Malformed `.env` probe: FAILED confidentiality expectation.
+
+`Config::load` adds context with `anyhow::Context` but retains the underlying
+`dotenvy` parse error. The CLI's stderr therefore included the malformed input
+line and all following lines, exposing both the synthetic bot-token marker and
+the synthetic allowlist-id marker. Exact probe input remains in `bad.env`;
+no real `.env` was read.
+
+Required correction: convert dotenv parse/read failures to an error whose
+Display and Debug contain only the variable-free file path and a generic
+message, without retaining the dotenvy source text; cover the actual CLI
+stderr path with an integration test.

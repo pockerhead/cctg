@@ -1,0 +1,134 @@
+
+    // ---------------- QA leak tests (TASK-008 QA) ----------------
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Loopback server answering every connection with `responses[i % len]`
+    /// (raw HTTP), recording nothing. Returns base url.
+    async fn qa_server(responses: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut i = 0usize;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let resp = responses[i % responses.len()].clone();
+                i += 1;
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn http(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn qa_token(secret: &str) -> BotToken {
+        super::super::config::Config::from_vars(|name| match name {
+            "CCTG_BOT_TOKEN" => Some(format!("778899:{secret}")),
+            "CCTG_CHAT_ID" => Some("-1001".to_owned()),
+            "CCTG_ALLOWED_USER_IDS" => Some("1".to_owned()),
+            _ => None,
+        })
+        .unwrap()
+        .token
+    }
+
+    fn assert_clean(label: &str, error: ApiError, secret: &str) {
+        let anyhow_err = anyhow::Error::from(error).context("getMe failed; check CCTG_BOT_TOKEN");
+        let rendered = [
+            format!("{anyhow_err}"),
+            format!("{anyhow_err:#}"),
+            format!("{anyhow_err:?}"),
+            format!("{anyhow_err:#?}"),
+        ];
+        for text in rendered {
+            assert!(!text.contains(secret), "{label}: token leaked: {text}");
+            assert!(!text.contains("778899"), "{label}: bot id leaked: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn qa_error_paths_never_render_the_token() {
+        let secret = format!("qa-leak-{}", std::process::id());
+        let token = qa_token(&secret);
+
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("401", vec![http("401 Unauthorized", r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#)]),
+            ("html502", vec![http("502 Bad Gateway", "<html>bad</html>")]),
+            ("wrong type 200", vec![http("200 OK", r#"{"ok":true,"result":{"id":"not-a-number"}}"#)]),
+            ("truncated", vec![
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"ok\":tr".to_owned(),
+            ]),
+            ("garbage status", vec!["NOT HTTP AT ALL\r\n\r\n".to_owned()]),
+            ("redirect to closed port", vec![
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/bot778899:x/getMe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            ]),
+        ];
+        for (label, responses) in cases {
+            let base = qa_server(responses).await;
+            let api = BotApi::with_api_url(&base, &token, -1001).unwrap();
+            let error = api.get_me().await.unwrap_err();
+            eprintln!("QA {label}: {error:?}");
+            assert_clean(label, error, &secret);
+        }
+
+        // Redirect loop: server redirects to itself (relative Location keeps the token path).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {path}?again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let api = BotApi::with_api_url(&format!("http://{addr}"), &token, -1001).unwrap();
+        let error = api.get_me().await.unwrap_err();
+        eprintln!("QA redirect loop: {error:?}");
+        assert_clean("redirect loop", error, &secret);
+
+        // Invalid URL built from a strange token.
+        let weird = super::super::config::Config::from_vars(|name| match name {
+            "CCTG_BOT_TOKEN" => Some(format!("778899:{secret} with spaces/%%zz#frag")),
+            "CCTG_CHAT_ID" => Some("-1001".to_owned()),
+            "CCTG_ALLOWED_USER_IDS" => Some("1".to_owned()),
+            _ => None,
+        })
+        .unwrap()
+        .token;
+        let api = BotApi::with_api_url("http://[::1", &weird, -1001).unwrap();
+        let error = api.get_me().await.unwrap_err();
+        eprintln!("QA invalid url: {error:?}");
+        assert_clean("invalid url", error, &secret);
+    }
+
+    #[tokio::test]
+    async fn qa_retry_after_zero_over_the_wire_is_one_second() {
+        let base = qa_server(vec![http(
+            "429 Too Many Requests",
+            r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 0","parameters":{"retry_after":0}}"#,
+        )])
+        .await;
+        let api = BotApi::with_api_url(&base, &qa_token("x"), -1001).unwrap();
+        let error = api.get_me().await.unwrap_err();
+        assert!(matches!(error, ApiError::RetryAfter(d) if d == Duration::from_secs(1)), "{error:?}");
+    }

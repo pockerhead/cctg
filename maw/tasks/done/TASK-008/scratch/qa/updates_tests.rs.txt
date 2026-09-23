@@ -1,0 +1,63 @@
+
+    // ---------------- QA edge tests (TASK-008 QA) ----------------
+    #[test]
+    fn qa_callback_without_message_is_gated_by_allowlist() {
+        let cb = |from: i64| {
+            json!({ "update_id": 1, "callback_query": {
+                "id": "q", "from": { "id": from, "is_bot": false, "first_name": "x" },
+                "chat_instance": "c", "inline_message_id": "abc", "data": "allow:abcde"
+            }})
+        };
+        assert_eq!(route_one(cb(STRANGER)), Routed::Ignored(Ignored::NotAllowed));
+        assert!(matches!(route_one(cb(ALLOWED)), Routed::Callback(_)));
+    }
+
+    #[test]
+    fn qa_inaccessible_callback_message_does_not_break_parsing() {
+        let update = json!({ "update_id": 1, "callback_query": {
+            "id": "q", "from": { "id": STRANGER, "is_bot": false, "first_name": "x" },
+            "chat_instance": "c", "data": "d",
+            "message": { "chat": { "id": CHAT, "type": "supergroup" }, "message_id": 5, "date": 0 }
+        }});
+        assert_eq!(route_one(update), Routed::Ignored(Ignored::NotAllowed));
+    }
+
+    #[test]
+    fn qa_service_message_in_other_chat_is_other_chat() {
+        let mut m = message(ALLOWED, json!({ "forum_topic_created": { "name": "t" } }));
+        m["chat"]["id"] = json!(-100555);
+        assert_eq!(
+            route_one(json!({ "update_id": 1, "message": m })),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+    }
+
+    #[test]
+    fn qa_general_topic_reply_has_no_thread() {
+        let m = message(ALLOWED, json!({ "text": "x", "is_topic_message": false }));
+        assert!(matches!(
+            route_one(json!({ "update_id": 1, "message": m })),
+            Routed::Input(Inbound { thread_id: None, .. })
+        ));
+    }
+
+    #[test]
+    fn qa_null_and_huge_fields() {
+        // update_id near i64::MAX: offset arithmetic must not panic.
+        let r = std::panic::catch_unwind(|| {
+            route_batch(
+                vec![json!({ "update_id": i64::MAX, "message": message(ALLOWED, json!({ "text": "x" })) })],
+                None,
+                CHAT,
+                &allowlist(),
+            )
+        });
+        assert!(r.is_ok(), "update_id = i64::MAX panics in route_batch");
+    }
+
+    #[test]
+    fn qa_null_fields_are_tolerated() {
+        let m = message(ALLOWED, json!({ "text": null, "message_thread_id": null, "from": { "id": ALLOWED, "username": null } }));
+        let r = route_one(json!({ "update_id": 1, "message": m }));
+        eprintln!("QA null fields -> {r:?}");
+    }

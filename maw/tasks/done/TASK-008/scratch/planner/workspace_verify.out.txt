@@ -1,0 +1,37 @@
+fmt: clean
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.80s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\cctg-791c4f290b7e5b80.exe)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
+     Running unittests src\main.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\cctg-331dd2fb31aa8a77.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\stdout.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\stdout-45cb367217f38e8a.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\transcript-d3207e2e48f8ea6a.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\parse_fixtures-7e3f74ddf546d0be.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\parse_tolerance-a90174b8afa68a1a.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\purity-521b738d889d825a.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\render-30abc1d0aae875a2.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\split-39175c50312fb527.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-task008-target\debug\deps\subagent-0296bc774049886e.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests cctg
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests transcript
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+cctg v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-008\scratch\planner\ws\crates\cctg)
+├── anyhow v1.0.104
+├── clap v4.6.6
+├── dotenvy v0.15.7
+├── reqwest v0.13.5
+├── serde v1.0.229
+├── serde_json v1.0.151
+├── thiserror v2.0.20
+├── tokio v1.53.1
+├── tracing v0.1.44
+└── tracing-subscriber v0.3.23

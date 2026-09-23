@@ -3,3 +3,5 @@ target/
 *.log
 .cctg/
 registry.json
+.claude/
+.agent/

@@ -1,0 +1,4 @@
+host: 16 threads, rustc 1.95.0 (59807616e 2026-04-14)
+clean release build of the reviewer-2 reference (empty target dir, --offline, cargo build --release -p cctg): exit 0, cargo "Finished ... in 1m 31s", 127 crates compiled
+note: machine was not idle (other cargo target dirs and agents); planner measured 45.6 s on the planner reference
+release cctg.exe: 5490688 bytes

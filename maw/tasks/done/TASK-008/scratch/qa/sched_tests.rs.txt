@@ -1,0 +1,301 @@
+
+    // ---------------- QA adversarial tests (TASK-008 QA) ----------------
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct QaCall {
+        at: Duration,
+        op: Op,
+        ok: bool,
+    }
+
+    struct QaFake {
+        start: Instant,
+        calls: Mutex<Vec<QaCall>>,
+        delay: Duration,
+        flood_every: usize,
+        flood_secs: u64,
+    }
+
+    impl Transport for QaFake {
+        async fn execute(&self, op: &Op) -> Delivery {
+            let n = self.calls.lock().map(|c| c.len()).unwrap_or(0);
+            let flood = self.flood_every > 0 && n % self.flood_every == self.flood_every - 1;
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(QaCall {
+                    at: Instant::now() - self.start,
+                    op: op.clone(),
+                    ok: !flood,
+                });
+            }
+            tokio::time::sleep(self.delay).await;
+            if flood {
+                return Err(ApiError::RetryAfter(Duration::from_secs(
+                    self.flood_secs * (n as u64 % 3),
+                )));
+            }
+            Ok(match op {
+                Op::CreateTopic { .. } => Outcome::Topic(ForumTopic::default()),
+                Op::Send { .. } | Op::SendDocument { .. } => Outcome::Sent(Message::default()),
+                _ => Outcome::Done,
+            })
+        }
+    }
+
+    fn qa_thread(op: &Op) -> Option<Option<i64>> {
+        match op {
+            Op::Send { thread_id, .. } | Op::SendDocument { thread_id, .. } => Some(*thread_id),
+            _ => None,
+        }
+    }
+
+    async fn qa_run(mut s: Scheduler<QaFake>, violations: Arc<Mutex<Vec<String>>>) {
+        let v = |m: String| {
+            if let Ok(mut g) = violations.lock() {
+                g.push(m);
+            }
+        };
+        loop {
+            while let Ok(job) = s.rx.try_recv() {
+                s.enqueue(job);
+            }
+            let now = Instant::now();
+            // Snapshot BEFORE pick (pick may clear the pause and refill the bucket).
+            let paused = s.paused_until.is_some_and(|u| now < u);
+            match s.pick(now) {
+                Pick::Now(lane) => {
+                    if paused {
+                        v(format!("dispatch during 429 pause at {now:?}"));
+                    }
+                    let eligible = s.next_permission();
+                    let bucket_ready = !s.message.is_empty() && s.bucket.ready_at(now) <= now;
+                    match lane {
+                        Lane::Message(i) => {
+                            let op = &s.message[i].op;
+                            let is_perm = matches!(op, Op::Send { permission: true, .. });
+                            if !is_perm && eligible.is_some() {
+                                v(format!("ordinary message overtook eligible permission at {now:?}"));
+                            }
+                            if is_perm && eligible != Some(i) {
+                                v(format!("permission picked is not the oldest eligible at {now:?}"));
+                            }
+                            let tid = qa_thread(op);
+                            if s.message.iter().take(i).any(|j| qa_thread(&j.op) == tid) {
+                                v(format!("FIFO broken in topic {tid:?} at {now:?}"));
+                            }
+                            if !bucket_ready {
+                                v(format!("metered pick while bucket not ready at {now:?}"));
+                            }
+                        }
+                        Lane::Edit | Lane::Topic => {
+                            if bucket_ready && eligible.is_some() {
+                                v(format!(
+                                    "unmetered op went before a ready eligible permission at {now:?}"
+                                ));
+                            }
+                            if bucket_ready && s.consecutive_unmetered >= MAX_CONSECUTIVE_UNMETERED {
+                                v(format!(
+                                    "unmetered streak {} while message ready at {now:?}",
+                                    s.consecutive_unmetered
+                                ));
+                            }
+                        }
+                    }
+                    s.dispatch(lane).await;
+                }
+                Pick::At(when) if s.open => {
+                    tokio::select! {
+                        job = s.rx.recv() => s.receive(job),
+                        () = sleep_until(when) => {}
+                    }
+                }
+                Pick::At(when) => sleep_until(when).await,
+                Pick::Idle if s.open => {
+                    let job = s.rx.recv().await;
+                    s.receive(job);
+                }
+                Pick::Idle => return,
+            }
+        }
+    }
+
+    async fn qa_scenario(seed: u64, delay_ms: u64, flood_every: usize, flood_secs: u64, steps: usize) {
+        let fake = Arc::new(QaFake {
+            start: Instant::now(),
+            calls: Mutex::new(Vec::new()),
+            delay: Duration::from_millis(delay_ms),
+            flood_every,
+            flood_secs,
+        });
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let violations = Arc::new(Mutex::new(Vec::new()));
+        let runner = tokio::spawn(qa_run(scheduler, violations.clone()));
+        let mut rng = Lcg(seed);
+        let mut receivers = Vec::new();
+        let mut enqueue_order: Vec<(Option<i64>, String)> = Vec::new();
+        for step in 0..steps {
+            tokio::time::sleep(Duration::from_millis(rng.below(2500))).await;
+            let roll = rng.below(100);
+            let topic = if rng.below(5) == 0 {
+                None
+            } else {
+                Some(rng.below(4) as i64)
+            };
+            let tag = format!("s{step}");
+            let op = if roll < 30 {
+                enqueue_order.push((topic, tag.clone()));
+                Op::Send {
+                    thread_id: topic,
+                    text: tag,
+                    reply_markup: None,
+                    permission: false,
+                }
+            } else if roll < 42 {
+                enqueue_order.push((topic, tag.clone()));
+                Op::Send {
+                    thread_id: topic,
+                    text: tag,
+                    reply_markup: None,
+                    permission: true,
+                }
+            } else if roll < 50 {
+                enqueue_order.push((topic, tag.clone()));
+                Op::SendDocument {
+                    thread_id: topic,
+                    document: Document {
+                        file_name: tag,
+                        bytes: Vec::new(),
+                        caption: None,
+                    },
+                }
+            } else if roll < 85 {
+                edit(rng.below(30) as i64, &tag)
+            } else if roll < 92 {
+                Op::EditTopic {
+                    thread_id: 1,
+                    name: Some(tag),
+                    icon_custom_emoji_id: None,
+                }
+            } else {
+                Op::Delete {
+                    message_id: step as i64,
+                }
+            };
+            receivers.push(outbox.submit(op).await);
+        }
+        drop(outbox);
+        assert!(runner.await.is_ok());
+        let mut lost = 0;
+        for r in receivers {
+            if r.await.is_err() {
+                lost += 1;
+            }
+        }
+        let violations = violations.lock().map(|v| v.clone()).unwrap_or_default();
+        assert!(violations.is_empty(), "seed {seed}: {violations:?}");
+        assert_eq!(lost, 0, "seed {seed}: lost replies");
+
+        let calls = fake.calls.lock().map(|c| c.clone()).unwrap_or_default();
+        let metered: Vec<&QaCall> = calls.iter().filter(|c| c.op.metered()).collect();
+        let mut max_window = 0;
+        for (i, c) in metered.iter().enumerate() {
+            let n = metered[i..]
+                .iter()
+                .take_while(|l| l.at <= c.at + Duration::from_secs(60))
+                .count();
+            max_window = max_window.max(n);
+        }
+        assert!(
+            max_window <= 20,
+            "seed {seed}: {max_window} metered attempts in a closed 60 s window"
+        );
+        for pair in metered.windows(2) {
+            assert!(
+                pair[1].at - pair[0].at >= Duration::from_secs(1),
+                "seed {seed}: gap < 1 s"
+            );
+        }
+        let mut topics: Vec<Option<i64>> = enqueue_order.iter().map(|(t, _)| *t).collect();
+        topics.sort();
+        topics.dedup();
+        for t in topics {
+            let want: Vec<&str> = enqueue_order
+                .iter()
+                .filter(|(tt, _)| *tt == t)
+                .map(|(_, s)| s.as_str())
+                .collect();
+            let got: Vec<&str> = calls
+                .iter()
+                .filter(|c| c.ok && qa_thread(&c.op) == Some(t))
+                .map(|c| text_of(&c.op))
+                .collect();
+            assert_eq!(got, want, "seed {seed}: topic {t:?} order");
+        }
+        eprintln!(
+            "QA seed {seed} delay {delay_ms}: calls {} metered {} max_window {max_window}",
+            calls.len(),
+            metered.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn qa_random_mixed_traffic_many_seeds() {
+        for seed in 1..=40u64 {
+            qa_scenario(seed, 0, 0, 0, 300).await;
+            qa_scenario(seed + 1000, 200, 13, 2, 300).await;
+            qa_scenario(seed + 2000, 900, 7, 3, 200).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn qa_edit_flood_with_permissions_and_messages() {
+        let fake = Arc::new(QaFake {
+            start: Instant::now(),
+            calls: Mutex::new(Vec::new()),
+            delay: Duration::from_millis(300),
+            flood_every: 0,
+            flood_secs: 0,
+        });
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let violations = Arc::new(Mutex::new(Vec::new()));
+        let runner = tokio::spawn(qa_run(scheduler, violations.clone()));
+        let producer_outbox = outbox.clone();
+        let producer = tokio::spawn(async move {
+            for id in 0..1200i64 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(producer_outbox.submit(edit(id, "flood")).await);
+            }
+        });
+        let mut rx = Vec::new();
+        for i in 0..30 {
+            rx.push(outbox.submit(send(1, &format!("m{i}"))).await);
+            if i % 5 == 0 {
+                rx.push(outbox.submit(permission(2, &format!("p{i}"))).await);
+            }
+        }
+        drop(outbox);
+        assert!(producer.await.is_ok());
+        assert!(runner.await.is_ok());
+        for r in rx {
+            assert!(matches!(r.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        let v = violations.lock().map(|v| v.clone()).unwrap_or_default();
+        assert!(v.is_empty(), "{v:?}");
+        let calls = fake.calls.lock().map(|c| c.clone()).unwrap_or_default();
+        let metered: Vec<Duration> = calls.iter().filter(|c| c.op.metered()).map(|c| c.at).collect();
+        eprintln!("QA flood: metered times {metered:?}");
+        let last = metered.iter().max().copied();
+        assert!(last.is_some_and(|t| t <= Duration::from_secs(140)), "{last:?}");
+    }

@@ -1,0 +1,2 @@
+status=administrator can_manage_topics=true can_delete_messages=true stickers=112 with_custom_emoji_id=112
+idle

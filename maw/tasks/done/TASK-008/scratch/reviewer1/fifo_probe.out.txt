@@ -1,0 +1,10 @@
+Command: cargo test -p cctg fifo_is_preserved_when_permission_is_in_the_same_topic --offline
+Result: FAILED (exit code 1)
+
+assertion `left == right` failed
+  left: "permission-second"
+ right: "ordinary-first"
+
+The reference scheduler sent a later permission message before an earlier
+ordinary message in the same topic. The probe test is preserved in
+scratch/reviewer1/ws/crates/cctg/src/hub/scheduler.rs.

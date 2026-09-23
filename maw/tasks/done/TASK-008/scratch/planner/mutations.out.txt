@@ -1,0 +1,30 @@
+== mutation: crates/cctg/src/hub/api.rs :: Self::Http(error.without_url()) -> Self::Http(error)
+test hub::api::tests::transport_errors_never_contain_the_token ... FAILED
+thread 'hub::api::tests::transport_errors_never_contain_the_token' (13452) panicked at crates\cctg\src\hub\api.rs:448:13:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 2.04s
+== mutation: crates/cctg/src/hub/scheduler.rs :: capacity: 5, -> capacity: 20,
+test hub::scheduler::tests::group_limit_and_topic_order_hold ... FAILED
+thread 'hub::scheduler::tests::group_limit_and_topic_order_hold' (39036) panicked at crates\cctg\src\hub\scheduler.rs:522:13:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+== mutation: crates/cctg/src/hub/scheduler.rs :: matches!(self, Op::Send { .. } | Op::SendDocument { .. }) -> !matches!(self, Op::Edit { .. })
+test hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens ... FAILED
+thread 'hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens' (30244) panicked at crates\cctg\src\hub\scheduler.rs:598:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+== mutation: crates/cctg/src/hub/scheduler.rs :: self.paused_until = Some(Instant::now() + wait); -> let _ = wait;
+test hub::api::tests::maps_429_to_retry_after ... ok
+test hub::scheduler::tests::retry_after_pauses_everything_and_retries_once ... FAILED
+test hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after ... FAILED
+thread 'hub::scheduler::tests::retry_after_pauses_everything_and_retries_once' (37668) panicked at crates\cctg\src\hub\scheduler.rs:622:9:
+thread 'hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after' (31712) panicked at crates\cctg\src\hub\scheduler.rs:639:9:
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 19 filtered out; finished in 0.00s
+== mutation: crates/cctg/src/hub/updates.rs :: if !allowlist.contains(from.id) {
+            return Routed::Ignored(Ignored::NotAllowed);
+        }
+        return Routed::Input -> return Routed::Input
+test hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped ... FAILED
+thread 'hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped' (37600) panicked at crates\cctg\src\hub\updates.rs:245:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s
+== mutation: crates/cctg/src/hub/updates.rs :: Err(_) => Routed::Ignored(Ignored::Malformed), -> Err(_) => return (next, routed),
+test hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch ... FAILED
+thread 'hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch' (25452) panicked at crates\cctg\src\hub\updates.rs:339:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.00s

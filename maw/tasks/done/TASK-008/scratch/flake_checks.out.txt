@@ -1,0 +1,2 @@
+cctg lib: 50/50 passed (C:\Users\user\dev\cctg\target\debug\deps\cctg-791c4f290b7e5b80.exe)
+routing_logs: 50/50 passed (C:\Users\user\dev\cctg\target\debug\deps\routing_logs-18b16d3357ea0983.exe)

@@ -1,0 +1,4 @@
+Error: getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group
+
+Caused by:
+    telegram error 400: Bad Request: chat not found

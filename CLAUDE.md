@@ -4,6 +4,8 @@
 
 Язык общения в репозитории: русский. Код, идентификаторы, коммиты: английский.
 
+Локальные приватные факты (не секреты): @.claude/secrets.md. Секреты (токен бота, user id из allowlist, секрет hub) только в `.env`, в контекст агентов их не подгружать.
+
 ## Зачем своё, а не готовое
 
 Проверено 2026-09-22:
@@ -27,7 +29,7 @@
 - Референс: https://code.claude.com/docs/en/channels-reference, пример fakechat в `anthropics/claude-plugins-official/external_plugins/fakechat`.
 
 **Telegram Bot API (проверено 2026-09-22 на реальной группе):**
-- Id supergroup в Bot API это `-100<id из веб-клиента>`. Веб-клиент показывает `<group-id>`, Bot API принимает только `-100<group-id>`.
+- Id supergroup в Bot API это `-100<id из веб-клиента>`: веб-клиент показывает `-<N>`, Bot API принимает только `-100<N>`. Реальные id нашей группы в `.claude/secrets.md`.
 - Боту нужно админ-право `can_manage_topics`, без него `createForumTopic` не работает. `getChatMember` показывает право, проверять на старте hub.
 - `createForumTopic` ~0.36 с, 5 тем подряд за 5 с без 429. `editForumTopic` меняет `name` и `icon_custom_emoji_id` по отдельности, `icon_color` после создания не меняется. Список иконок: `getForumTopicIconStickers`, 112 штук.
 - Бот-админ может писать в закрытую тему (`closeForumTopic` не блокирует бота). Пользователя закрытие блокирует, поэтому темы мёртвых сессий не закрывать: в них должны приниматься сообщения для буфера.

@@ -1,0 +1,85 @@
+test hub::scheduler::tests::default_bucket_fits_twenty_per_minute ... ok
+test hub::api::tests::decodes_ok_result_and_ignores_unknown_fields ... ok
+test hub::api::tests::maps_429_to_retry_after ... ok
+test hub::config::tests::chat_id_must_use_the_bot_api_form ... ok
+test hub::api::tests::maps_other_errors_with_description ... ok
+test hub::config::tests::reads_a_complete_config ... ok
+test hub::config::tests::debug_hides_token_and_user_ids ... ok
+test hub::config::tests::missing_and_bad_values_are_named_but_not_echoed ... ok
+test hub::tests::missing_manage_topics_is_a_startup_error ... ok
+test hub::updates::tests::other_chats_and_senderless_messages_are_ignored ... ok
+test hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped ... ok
+test hub::scheduler::tests::repeated_edits_of_one_message_coalesce ... ok
+test hub::scheduler::tests::retry_after_pauses_everything_and_retries_once ... ok
+test hub::scheduler::tests::stops_after_outbox_is_dropped_and_queue_drained ... ok
+test hub::updates::tests::forum_service_messages_are_never_input ... ok
+test hub::scheduler::tests::retried_permission_keeps_topic_order ... ok
+test hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens ... ok
+test hub::scheduler::tests::permission_never_overtakes_its_own_topic ... FAILED
+test hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order ... FAILED
+test hub::scheduler::tests::permission_prompt_jumps_the_queue ... ok
+test hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after ... ok
+test hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch ... ok
+test hub::scheduler::tests::permission_overtakes_other_topics_only ... FAILED
+test hub::updates::tests::routing_logs_never_contain_user_ids ... ok
+test hub::scheduler::tests::group_limit_and_topic_order_hold ... ok
+test hub::api::tests::transport_errors_never_contain_the_token ... ok
+
+failures:
+
+---- hub::scheduler::tests::permission_never_overtakes_its_own_topic stdout ----
+
+thread 'hub::scheduler::tests::permission_never_overtakes_its_own_topic' (32284) panicked at crates\cctg\src\hub\scheduler.rs:679:9:
+assertion `left == right` failed
+  left: ["prompt", "ordinary", "doc"]
+ right: ["ordinary", "doc", "prompt"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order stdout ----
+
+thread 'hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order' (27640) panicked at crates\cctg\src\hub\scheduler.rs:708:9:
+assertion `left == right` failed
+  left: ["p1", "p2", "o", "z"]
+ right: ["p1", "o", "p2", "z"]
+
+---- hub::scheduler::tests::permission_overtakes_other_topics_only stdout ----
+
+thread 'hub::scheduler::tests::permission_overtakes_other_topics_only' (16476) panicked at crates\cctg\src\hub\scheduler.rs:695:9:
+assertion `left == right` failed
+  left: ["p2", "p3", "m0", "x", "m1", "m2"]
+ right: ["p3", "m0", "x", "p2", "m1", "m2"]
+
+
+failures:
+    hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order
+    hub::scheduler::tests::permission_never_overtakes_its_own_topic
+    hub::scheduler::tests::permission_overtakes_other_topics_only
+
+test result: FAILED. 23 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+
+error: test failed, to rerun pass `-p cctg --lib`
+test hub_without_config_fails_on_stderr_only ... ok
+test subcommands_do_not_write_to_stdout ... ok
+test malformed_env_file_does_not_echo_its_contents ... FAILED
+
+failures:
+
+---- malformed_env_file_does_not_echo_its_contents stdout ----
+
+thread 'malformed_env_file_does_not_echo_its_contents' (456) panicked at crates\cctg\tests\stdout.rs:77:9:
+env-secret-marker-<pid> leaked: Error: cannot read env file C:\Users\user\AppData\Local\Temp/cctg-task008-reviewer2-target\tmp\hub-bad-env\bad.env
+
+Caused by:
+    Error parsing line: 'CCTG_BOT_TOKEN='777:env-secret-marker-<pid>
+    CCTG_ALLOWED_USER_IDS=9876533148
+    ', error at line index: 77
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    malformed_env_file_does_not_echo_its_contents
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+error: test failed, to rerun pass `-p cctg --test stdout`

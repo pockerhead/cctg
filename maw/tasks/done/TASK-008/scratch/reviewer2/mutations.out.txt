@@ -1,0 +1,24 @@
+== no without_url (crates/cctg/src/hub/api.rs)
+   KILLED: hub::api::tests::transport_errors_never_contain_the_token
+== capacity 20 (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::default_bucket_fits_twenty_per_minute, hub::scheduler::tests::failed_attempts_spend_tokens, hub::scheduler::tests::group_limit_and_topic_order_hold
+== everything but edits metered (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::retry_after_pauses_everything_and_retries_once, hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens
+== no 429 pause (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after, hub::scheduler::tests::retried_permission_keeps_topic_order, hub::scheduler::tests::retry_after_pauses_everything_and_retries_once
+== no allowlist on messages (crates/cctg/src/hub/updates.rs)
+   KILLED: hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped
+== stop batch on bad update (crates/cctg/src/hub/updates.rs)
+   KILLED: hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch
+== permission ignores its topic (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order, hub::scheduler::tests::permission_never_overtakes_its_own_topic, hub::scheduler::tests::permission_overtakes_other_topics_only
+== no permission priority (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::permission_overtakes_other_topics_only, hub::scheduler::tests::permission_prompt_jumps_the_queue, hub::scheduler::tests::retried_permission_keeps_topic_order
+== 429 job to the back (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::retried_permission_keeps_topic_order
+== token only on success (crates/cctg/src/hub/scheduler.rs)
+   KILLED: hub::scheduler::tests::failed_attempts_spend_tokens
+== dotenvy error text in EnvFile (crates/cctg/src/hub/config.rs)
+   KILLED: hub::config::tests::missing_env_file_is_named, malformed_env_file_does_not_echo_its_contents
+== log raw update (crates/cctg/src/hub/updates.rs)
+   KILLED: routing_logs_never_contain_user_ids

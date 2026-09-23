@@ -1,0 +1,14 @@
+Reference copy: scratch/reviewer1/ws
+External target: %TEMP%/cctg-task008-reviewer1-target
+Network mode: --offline
+
+cargo fmt --all -- --check: PASS
+cargo clippy --workspace --all-targets --offline -- -D warnings: PASS
+cargo test --workspace --offline: PASS
+
+Test suites passed, but the plan's total was arithmetically wrong: cctg lib 22,
+cctg main 1, stdout integration 2, transcript 70 unit/integration tests plus 1
+doc-test; 96 total, not 82.
+
+After this clean run, one reviewer-only adversarial FIFO test was added. Its
+separate failing result is recorded in fifo_probe.out.txt.

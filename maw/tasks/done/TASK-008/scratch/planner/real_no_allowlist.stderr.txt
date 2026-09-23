@@ -1,0 +1,1 @@
+Error: CCTG_ALLOWED_USER_IDS is empty; list the Telegram user ids allowed to talk to the hub

@@ -1,0 +1,123 @@
+{
+ "getMe": {
+  "http": 200,
+  "body": {
+   "ok": "bool:True",
+   "result": {
+    "id": "int",
+    "is_bot": "bool:True",
+    "first_name": "str",
+    "username": "str",
+    "can_join_groups": "bool:True",
+    "can_read_all_group_messages": "bool:False",
+    "supports_inline_queries": "bool:False",
+    "supports_guest_queries": "bool:False",
+    "can_connect_to_business": "bool:False",
+    "has_main_web_app": "bool:False",
+    "has_topics_enabled": "bool:False",
+    "allows_users_to_create_topics": "bool:False",
+    "can_manage_bots": "bool:False",
+    "supports_join_request_queries": "bool:False"
+   }
+  }
+ },
+ "getChatMember(bot)": {
+  "http": 200,
+  "body": {
+   "ok": "bool:True",
+   "result": {
+    "user": {
+     "id": "int",
+     "is_bot": "bool:True",
+     "first_name": "str",
+     "username": "str"
+    },
+    "status": "str",
+    "can_be_edited": "bool:False",
+    "can_manage_chat": "bool:True",
+    "can_change_info": "bool:True",
+    "can_delete_messages": "bool:True",
+    "can_invite_users": "bool:True",
+    "can_restrict_members": "bool:True",
+    "can_pin_messages": "bool:True",
+    "can_manage_topics": "bool:True",
+    "can_promote_members": "bool:True",
+    "can_manage_video_chats": "bool:True",
+    "can_post_stories": "bool:False",
+    "can_edit_stories": "bool:False",
+    "can_delete_stories": "bool:False",
+    "can_manage_tags": "bool:False",
+    "can_send_welcome_messages": "bool:True",
+    "is_anonymous": "bool:True",
+    "can_manage_voice_chats": "bool:True"
+   }
+  }
+ },
+ "getForumTopicIconStickers": {
+  "http": 200,
+  "count": 112,
+  "body": {
+   "ok": "bool:True",
+   "result": [
+    {
+     "width": "int",
+     "height": "int",
+     "emoji": "str",
+     "set_name": "str",
+     "is_animated": "bool:True",
+     "is_video": "bool:False",
+     "type": "str",
+     "custom_emoji_id": "str",
+     "thumbnail": {
+      "file_id": "str",
+      "file_unique_id": "str",
+      "file_size": "int",
+      "width": "int",
+      "height": "int"
+     },
+     "thumb": {
+      "file_id": "str",
+      "file_unique_id": "str",
+      "file_size": "int",
+      "width": "int",
+      "height": "int"
+     },
+     "file_id": "str",
+     "file_unique_id": "str",
+     "file_size": "int"
+    }
+   ]
+  }
+ },
+ "getWebhookInfo": {
+  "http": 200,
+  "body": {
+   "ok": "bool:True",
+   "result": {
+    "url": "str",
+    "has_custom_certificate": "bool:False",
+    "pending_update_count": "int"
+   }
+  },
+  "pending_update_count": 2,
+  "url_set": false
+ },
+ "getChatMember(bad user)": {
+  "http": 400,
+  "body": {
+   "ok": "bool:False",
+   "error_code": "int",
+   "description": "str"
+  },
+  "description": "Bad Request: PARTICIPANT_ID_INVALID"
+ },
+ "noSuchMethod": {
+  "http": 404,
+  "body": {
+   "ok": "bool:False",
+   "error_code": "int",
+   "description": "str"
+  },
+  "description": "Not Found"
+ }
+}
