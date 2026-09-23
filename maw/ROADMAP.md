@@ -22,8 +22,6 @@ TASK-010
       ├── TASK-014   (blocked by TASK-011, TASK-013)
       └── TASK-015   (blocked by TASK-011, TASK-012, TASK-013)
 
-TASK-020
-
 Soft / unblocks:
 - TASK-011 prefer after TASK-004
 - TASK-012 prefer after TASK-003
