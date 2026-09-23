@@ -1,17 +1,14 @@
 # Roadmap graph (derived from task.md Dependencies — task.md is source of truth)
 
-TASK-014
-  └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
+TASK-015
+  └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017) [waits on TASK-014 (in_progress)]
       └── TASK-019   (blocked by TASK-017, TASK-018)
 
-TASK-015
-  └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
-
 TASK-016
-  └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
+  └── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017) [waits on TASK-014 (in_progress)]
 
 TASK-017
-  ├── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017)
+  ├── TASK-018   (blocked by TASK-014, TASK-015, TASK-016, TASK-017) [waits on TASK-014 (in_progress)]
   └── TASK-019   (blocked by TASK-017, TASK-018)
 
 Soft / unblocks:
