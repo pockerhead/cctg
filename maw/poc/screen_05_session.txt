@@ -1,0 +1,14 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-poc\work
+
+▎ Channels (experimental) messages from server:cctg inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+▎ server:cctg · no MCP server configured with that name
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:work sh:bash
+  acc:<email>
+  ⏸ manual mode on · ← 1 agent

@@ -1,0 +1,30 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-poc\work
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-poc\work
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-poc\work
+
+▎ Channels (experimental) messages from server:cctg inject directly in this session · restart without
+▎ --dangerously-load-development-channels to stop
+▎ server:cctg · no MCP server configured with that name
+
+> Use the MCP tool mcp__cctg__reply (it may be a deferred tool; load it with ToolSearch) to send exactly the text: cctg
+  PoC reply ok
+
+● Загружаю инструмент для отправки сообщения в Telegram.
+
+  Called cctg (ctrl+o to expand)
+
+● Готово. Сообщение отправлено в Telegram.
+
+✻ Sautéed for 6s · done 19:51
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:work sh:bash ctx:25%
+  acc:<email> 5h:23% 7d:64%
+  ⏸ manual mode on · ← 1 agent
