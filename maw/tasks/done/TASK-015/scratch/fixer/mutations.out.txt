@@ -1,0 +1,9 @@
+== M1: no index removal at end
+thread 'hub::slots::tests::the_agent_calls_of_an_ended_session_are_forgotten' (37252) panicked at crates\cctg\src\hub\slots.rs:4867:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 315 filtered out; finished in 0.42s
+== M2: nested block only when running
+thread 'hub::slots::tests::a_nested_answer_after_its_parent_ended_still_shows' (2656) panicked at crates\cctg\src\hub\slots.rs:3898:23:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 315 filtered out; finished in 60.24s
+== M3: no saved header
+thread 'hub::slots::tests::the_agent_calls_of_an_ended_session_are_forgotten' (33984) panicked at crates\cctg\src\hub\slots.rs:4872:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 315 filtered out; finished in 0.84s

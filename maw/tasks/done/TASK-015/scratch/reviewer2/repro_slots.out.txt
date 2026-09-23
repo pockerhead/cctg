@@ -1,0 +1,12 @@
+test hub::slots::tests::a_late_body_read_never_overwrites_a_newer_one ... FAILED
+test hub::slots::tests::a_nested_answer_survives_a_restart_before_its_end ... FAILED
+test hub::slots::tests::a_legacy_subagent_record_never_becomes_a_block ... FAILED
+test hub::slots::tests::a_block_confirmed_after_its_session_ended_is_marked_lost ... FAILED
+test hub::slots::tests::block_messages_in_flight_are_capped ... FAILED
+thread 'hub::slots::tests::a_late_body_read_never_overwrites_a_newer_one' (29956) panicked at crates\cctg\src\hub\slots.rs:4812:9:
+thread 'hub::slots::tests::a_nested_answer_survives_a_restart_before_its_end' (13872) panicked at crates\cctg\src\hub\slots.rs:4685:9:
+thread 'hub::slots::tests::a_legacy_subagent_record_never_becomes_a_block' (38400) panicked at crates\cctg\src\hub\slots.rs:4553:9:
+thread 'hub::slots::tests::a_block_confirmed_after_its_session_ended_is_marked_lost' (27952) panicked at crates\cctg\src\hub\slots.rs:4756:9:
+thread 'hub::slots::tests::block_messages_in_flight_are_capped' (28304) panicked at crates\cctg\src\hub\slots.rs:4783:9:
+test result: FAILED. 69 passed; 5 failed; 0 ignored; 0 measured; 232 filtered out; finished in 7.50s
+error: test failed, to rerun pass `-p cctg --lib`

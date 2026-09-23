@@ -1,0 +1,6 @@
+OK crates/cctg/src/hub/mod.rs
+OK crates/cctg/src/hub/registry.rs
+OK crates/cctg/src/hub/slots.rs
+OK crates/cctg/src/hub/subagents.rs
+OK crates/transcript/src/subagent.rs
+OK crates/transcript/tests/subagent.rs

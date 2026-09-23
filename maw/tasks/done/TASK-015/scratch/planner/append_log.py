@@ -1,0 +1,20 @@
+import datetime, io, json, os
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'log.jsonl')
+ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+base = dict(stage='planner', provider='claude', model='opus', effort='medium')
+S, R, A = 'crates/cctg/src/hub/slots.rs', 'crates/cctg/src/hub/registry.rs', 'crates/cctg/src/hub/subagents.rs'
+T = 'crates/transcript/src/subagent.rs'
+entries = [
+ ('decision', "A typed SubagentStart/Stop is only an in-memory candidate in the slots actor; it becomes a persisted registry.subagents entry with a block only when the parent transcript has an Agent tool_use whose tool_result carries toolUseResult.agentId == agent_id. Alternative: keep recording every typed hook in registry.subagents (TASK-011 behaviour) and filter at render time (leaves ghost entries of --agent sessions in registry.json).", [S, R, A]),
+ ('decision', "Correlation timing: the parent transcript is read incrementally (per-session offset, complete lines only, one read in flight per session, spawn_blocking) right away and again after 1,2,4,8,16,16.. s up to correlate_for=60 s; a SubagentStop re-opens the 60 s window and asks for a lookup now; after the window the candidate is dropped with a debug line. Alternative: correlate only via agent-<id>.meta.json toolUseId (needs the subagent file, still has to find the parent call to prove it is explicit).", [S, A]),
+ ('decision', "Blocks are posted when the subagent is matched (header + 'в работе…') and edited on SubagentStop to Subagent::render (report > finished transcript brief > last_assistant_message), so a reply to a running subagent works. Alternative: one message at SubagentStop only (no in-progress block, nothing to reply to while the subagent runs).", [S, R]),
+ ('decision', "Block text lives in registry.json as pending text (like pending_separator) until Telegram accepted it; a first send out without an answer is persisted as sending=true and never repeated after a restart (at most once, a rare lost block instead of a duplicate). Running blocks of ended sessions (at SessionEnd, clear, pid reuse, prune, and at hub start for sessions already ended) become 'итог не получен'; a later result still replaces it. Alternative: keep final text only in memory (restart loses unsent edits) or re-send unanswered sends (duplicates).", [R, S]),
+ ('decision', "Subagents of nested runs get no block of their own; a nested run is one '⇣ nested <id>' block (running, then its last Stop answer or '· завершён' at its SessionEnd). Alternative: blocks for nested runs' subagents in the parent topic (maw runners spawn many; SendMessage from the top-level parent cannot reach them, so target_agent would be wrong).", [R, S]),
+ ('decision', "target_agent is added to Inbound meta only for an explicit reply (reply_to) to a subagent block whose parent_session is the slot's live current session and whose thread matches; agent ids are accepted only as [A-Za-z0-9_-]{1,64}. Finished subagents still get target_agent (SendMessage continues a previously spawned agent). Alternative: only while the block is running.", [S, R, A]),
+ ('decision', "SubagentInput gets an optional description (the parent Agent call's) used when the meta has none, and Subagent::header() is public, so the running block header equals the final render's first line without duplicating agent_header in the hub. Alternative: format the header in the hub (second copy of the transcript crate's header format).", [T, 'crates/transcript/tests/subagent.rs']),
+ ('decision', "Final block text over 4096 UTF-16 units is cut with registry::cut plus a note and the whole text goes once as a document subagent-<short>.txt / nested-<short>.txt (counted against MAX_QUEUED_MESSAGES). Alternative: cut only (long SubagentHandback reports would be lost in Telegram).", [A, S]),
+]
+with io.open(LOG, 'a', encoding='utf-8', newline='\n') as f:
+    for kind, body, refs in entries:
+        f.write(json.dumps(dict(ts=ts, **base, kind=kind, body=body, refs=refs), ensure_ascii=False) + '\n')
+print('appended', len(entries))

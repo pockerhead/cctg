@@ -1,0 +1,982 @@
+diff --git a/crates/cctg/src/hub/slots.rs b/maw/tasks/in_progress/TASK-015/scratch/planner/ws/crates/cctg/src/hub/slots.rs
+index 85cf54a..fc8f07f 100644
+--- a/crates/cctg/src/hub/slots.rs
++++ b/maw/tasks/in_progress/TASK-015/scratch/planner/ws/crates/cctg/src/hub/slots.rs
+@@ -26,6 +26,13 @@
+ //! its open prompts; every ended prompt loses its buttons, retried on the
+ //! tick.
+ //!
++//! Subagents and nested runs get no topic: each gets one collapsed block
++//! message in the topic of its parent's slot (see [`subagents`]). A typed
++//! subagent hook opens a block only once the parent's transcript shows the
++//! `Agent` call that launched it; the block is edited to its result on
++//! `SubagentStop`. A nested `claude -p` gets one `⇣ nested` block. A reply to
++//! a subagent block reaches the parent's agent with meta `target_agent`.
++//!
+ //! Logs carry short session ids, slot ordinals and fixed text; never a path,
+ //! a folder, a title or message text.
+ 
+@@ -42,8 +49,13 @@ use transcript::{SplitOptions, split_for_telegram};
+ use super::api::{ApiError, Document};
+ use super::ingress::AgentEvent;
+ use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
+-use super::registry::{Icons, Registry, RegistryStore, SlotId, TopicJob, TopicView};
++use super::registry::{
++    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, TopicJob, TopicView,
++};
+ use super::scheduler::{Delivery, Op, Outbox, Outcome};
++use super::subagents::{
++    self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
++};
+ use super::updates::{CallbackInput, Inbound};
+ use crate::channel::is_request_id;
+ use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest};
+@@ -73,6 +85,11 @@ pub struct Options {
+     pub grace: Duration,
+     /// Failed topic calls are tried again this often.
+     pub retry_every: Duration,
++    /// How long a subagent hook waits for its `Agent` call to appear in the
++    /// parent transcript; its stop starts the wait again.
++    pub correlate_for: Duration,
++    /// First pause before the parent transcript is looked at again; it doubles.
++    pub recheck_after: Duration,
+ }
+ 
+ impl Default for Options {
+@@ -85,6 +102,8 @@ impl Default for Options {
+             // Longer than the agent's 30 s maximum reconnect backoff.
+             grace: Duration::from_secs(45),
+             retry_every: Duration::from_secs(60),
++            correlate_for: Duration::from_secs(60),
++            recheck_after: Duration::from_secs(1),
+         }
+     }
+ }
+@@ -132,6 +151,20 @@ enum Done {
+         /// Bytes of `path` scanned so far.
+         scanned: u64,
+     },
++    /// `Agent` calls found in a session's transcript.
++    Index {
++        session: String,
++        scan: Scan,
++    },
++    /// The finished text of a subagent block.
++    Body {
++        key: BlockKey,
++        text: String,
++    },
++    Block {
++        job: BlockJob,
++        delivery: Option<Delivery>,
++    },
+ }
+ 
+ /// A job for the dispatch task.
+@@ -143,6 +176,7 @@ enum Work {
+     Permission(u64),
+     PromptEdit(u64),
+     Callback,
++    Block(BlockJob),
+ }
+ 
+ fn short(session_id: &str) -> &str {
+@@ -251,6 +285,15 @@ pub struct Slots {
+     /// When a slot last got a notice of a kind.
+     notices: HashMap<(SlotId, &'static str), Instant>,
+     prompts: Prompts,
++    /// Typed subagents not yet matched to an `Agent` call of their parent.
++    candidates: Candidates,
++    /// `Agent` calls per session transcript, read incrementally.
++    indexes: HashMap<String, AgentIndex>,
++    /// Sessions whose transcript is being read for `Agent` calls.
++    indexing: HashSet<String>,
++    reports: Reports,
++    /// Last turn answer of each nested run with a block, for its end.
++    nested_answers: HashMap<String, String>,
+     grace_until: Instant,
+     next_retry: Instant,
+     done_tx: mpsc::UnboundedSender<Done>,
+@@ -261,11 +304,20 @@ impl Slots {
+     /// Starts the save and dispatch tasks. Returns the actor and the view
+     /// for `/brief`.
+     pub fn new(
+-        registry: Registry,
++        mut registry: Registry,
+         store: RegistryStore,
+         outbox: Outbox,
+         options: Options,
+     ) -> (Self, watch::Receiver<Arc<TopicView>>) {
++        // Blocks left running by sessions that ended meanwhile end now; a
++        // result that still comes replaces the mark.
++        let ended: Vec<String> = registry
++            .sessions
++            .iter()
++            .filter(|(_, entry)| entry.ended)
++            .map(|(id, _)| id.clone())
++            .collect();
++        registry.lose_blocks(&ended);
+         let (saver, saves) = watch::channel(None);
+         tokio::spawn(save_loop(store, saves));
+         let (view, view_rx) = watch::channel(Arc::new(registry.topic_view()));
+@@ -287,6 +339,11 @@ impl Slots {
+             overflow_warned: false,
+             notices: HashMap::new(),
+             prompts: Prompts::default(),
++            candidates: Candidates::default(),
++            indexes: HashMap::new(),
++            indexing: HashSet::new(),
++            reports: Reports::default(),
++            nested_answers: HashMap::new(),
+             grace_until: now + options.grace,
+             next_retry: now + options.retry_every,
+             done_tx,
+@@ -320,11 +377,15 @@ impl Slots {
+     }
+ 
+     fn next_deadline(&self) -> Instant {
+-        if self.grace_until > Instant::now() {
++        let deadline = if self.grace_until > Instant::now() {
+             self.next_retry.min(self.grace_until)
+         } else {
+             self.next_retry
+-        }
++        };
++        // A session whose transcript is being read wakes the actor anyway.
++        self.candidates
++            .next_due(|session| self.indexing.contains(session))
++            .map_or(deadline, |due| deadline.min(due))
+     }
+ 
+     fn on_agent(&mut self, event: AgentEvent) {
+@@ -499,14 +560,259 @@ impl Slots {
+             ..
+         } = &post.event
+         {
++            if self.has_nested_block(session) {
++                self.nested_answers
++                    .insert(session.to_owned(), answer.clone());
++            }
+             self.on_turn_answer(session, answer);
+         }
++        match &post.event {
++            HookEvent::SubagentStart {
++                agent_id,
++                agent_type,
++            } => self.on_subagent(session, agent_id, agent_type, None),
++            HookEvent::SubagentStop {
++                agent_id,
++                agent_type,
++                agent_transcript_path,
++                last_assistant_message,
++            } => {
++                let stop = Stopped {
++                    agent_type: agent_type.clone(),
++                    agent_path: agent_transcript_path.clone().unwrap_or_default(),
++                    last: last_assistant_message.clone(),
++                };
++                self.on_subagent(session, agent_id, agent_type, Some(stop));
++            }
++            HookEvent::SubagentHandback { agent_id, message }
++                if subagents::is_agent_id(agent_id) =>
++            {
++                self.reports.insert(agent_id.clone(), message.clone());
++            }
++            _ => {}
++        }
+         self.close_prompts(&followup.ended_sessions);
++        self.end_blocks(&followup.ended_sessions);
+         if let Some((session, path)) = followup.read_title {
+             self.read_title(session, path);
+         }
+     }
+ 
++    fn has_nested_block(&self, session: &str) -> bool {
++        self.registry.sessions.get(session).is_some_and(|entry| {
++            matches!(entry.kind, SessionKind::Nested { .. }) && entry.block.is_some()
++        })
++    }
++
++    /// Ended nested runs show their last answer; every other block still
++    /// running in those sessions ends as lost.
++    fn end_blocks(&mut self, ended: &[String]) {
++        for session in ended {
++            let answer = self.nested_answers.remove(session);
++            let key = BlockKey::Nested(session.clone());
++            let Some(header) = self
++                .registry
++                .block(&key)
++                .filter(|block| block.running)
++                .map(|block| block.header.clone())
++            else {
++                continue;
++            };
++            info!(session = short(session), "nested run block finished");
++            self.finish_block(key, subagents::nested_text(&header, answer.as_deref()));
++        }
++        self.registry.lose_blocks(ended);
++    }
++
++    /// A typed subagent hook. A known subagent's stop finishes its block;
++    /// an unknown one waits as a candidate until the parent's transcript
++    /// shows its `Agent` call. Subagents of nested runs get no block.
++    fn on_subagent(
++        &mut self,
++        session: &str,
++        agent_id: &str,
++        agent_type: &str,
++        stop: Option<Stopped>,
++    ) {
++        if agent_type.trim().is_empty() || !subagents::is_agent_id(agent_id) {
++            return;
++        }
++        if let Some(entry) = self.registry.subagents.get(agent_id) {
++            if entry.parent_session == session
++                && let Some(stop) = stop
++            {
++                self.read_body(agent_id, stop);
++            }
++            return;
++        }
++        let own_slot = self
++            .registry
++            .sessions
++            .get(session)
++            .is_some_and(|entry| entry.kind == SessionKind::TopLevel && entry.slot.is_some());
++        if !own_slot {
++            debug!(
++                agent = short(agent_id),
++                "subagent of a session without a slot of its own; no block"
++            );
++            return;
++        }
++        self.candidates.seen(
++            agent_id,
++            session,
++            agent_type,
++            stop,
++            Instant::now(),
++            self.options.correlate_for,
++        );
++        self.check_candidates();
++    }
++
++    /// Reads the transcripts of sessions with a candidate due, from where
++    /// the last read stopped, one read per session at a time.
++    fn check_candidates(&mut self) {
++        for session in self.candidates.due_sessions(Instant::now()) {
++            if self.indexing.contains(&session) {
++                continue;
++            }
++            let path = self
++                .registry
++                .sessions
++                .get(&session)
++                .map(|entry| entry.transcript_path.clone())
++                .unwrap_or_default();
++            if path.is_empty() {
++                self.match_candidates(&session);
++                continue;
++            }
++            let from = self
++                .indexes
++                .get(&session)
++                .map_or(0, |index| index.resume_at(&path));
++            self.indexing.insert(session.clone());
++            let done = self.done_tx.clone();
++            tokio::spawn(async move {
++                let read_path = path.clone();
++                let scan = tokio::task::spawn_blocking(move || subagents::scan(&read_path, from))
++                    .await
++                    .unwrap_or_else(|_| Scan::nothing(path, from));
++                let _ = done.send(Done::Index { session, scan });
++            });
++        }
++    }
++
++    /// Opens the block of each candidate of `session` whose `Agent` call is
++    /// known now; the others wait longer or are dropped at their window's end.
++    fn match_candidates(&mut self, session: &str) {
++        let now = Instant::now();
++        for agent_id in self.candidates.of_session(session) {
++            let call = self
++                .indexes
++                .get(session)
++                .and_then(|index| index.call(&agent_id))
++                .cloned();
++            match call {
++                Some(call) => self.confirm(&agent_id, call),
++                None => {
++                    if self
++                        .candidates
++                        .missed(&agent_id, now, self.options.recheck_after)
++                    {
++                        debug!(
++                            agent = short(&agent_id),
++                            "subagent never matched an Agent call of its parent; no block"
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    fn confirm(&mut self, agent_id: &str, call: AgentCall) {
++        let Some(candidate) = self.candidates.take(agent_id) else {
++            return;
++        };
++        let header = subagents::header(
++            agent_id,
++            call.subagent_type
++                .as_deref()
++                .or(Some(candidate.agent_type.as_str())),
++            call.description.as_deref(),
++        );
++        if !self
++            .registry
++            .confirm_subagent(agent_id, &candidate.session, header)
++        {
++            return;
++        }
++        info!(
++            agent = short(agent_id),
++            session = short(&candidate.session),
++            "subagent block opened"
++        );
++        if let Some(stop) = candidate.stop {
++            self.read_body(agent_id, stop);
++        }
++    }
++
++    /// Reads the finished subagent's files off the actor; the text comes
++    /// back as [`Done::Body`].
++    fn read_body(&mut self, agent_id: &str, stop: Stopped) {
++        let Some(entry) = self.registry.subagents.get(agent_id) else {
++            return;
++        };
++        let call = self
++            .indexes
++            .get(&entry.parent_session)
++            .and_then(|index| index.call(agent_id))
++            .cloned()
++            .unwrap_or_default();
++        let input = BodyInput {
++            agent_id: agent_id.to_owned(),
++            agent_type: call.subagent_type.or(Some(stop.agent_type)),
++            description: call.description,
++            agent_path: stop.agent_path,
++            report: self.reports.take(agent_id),
++            last: stop.last,
++        };
++        let key = BlockKey::Agent(agent_id.to_owned());
++        let done = self.done_tx.clone();
++        tokio::spawn(async move {
++            let text = tokio::task::spawn_blocking(move || subagents::read_body(&input))
++                .await
++                .unwrap_or_default();
++            let _ = done.send(Done::Body { key, text });
++        });
++    }
++
++    /// Shows the final `text` in the block; a text too long for one
++    /// message is cut there and sent whole as a file after it.
++    fn finish_block(&mut self, key: BlockKey, text: String) {
++        let (shown, whole) = subagents::fit(text);
++        if let Some(whole) = whole {
++            let thread_id = self
++                .registry
++                .block_slot(&key)
++                .and_then(|slot| self.registry.slot(slot))
++                .and_then(|slot| slot.topic_id);
++            if let Some(thread_id) = thread_id {
++                let (kind, id) = match &key {
++                    BlockKey::Agent(id) => ("subagent", id),
++                    BlockKey::Nested(id) => ("nested", id),
++                };
++                self.send_messages(vec![Op::SendDocument {
++                    thread_id: Some(thread_id),
++                    document: Document {
++                        file_name: format!("{kind}-{}.txt", short(id)),
++                        bytes: whole.into_bytes(),
++                        caption: None,
++                    },
++                }]);
++            }
++        }
++        self.registry.show_block(&key, shown, false);
++    }
++
+     fn read_title(&mut self, session: String, path: String) {
+         if !self.reading.insert(session.clone()) {
+             return;
+@@ -583,6 +889,14 @@ impl Slots {
+         ]);
+         if let Some(reply_to) = input.reply_to {
+             meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
++            // A reply to a block of this session's subagent is for that
++            // subagent; Claude forwards it (channel instructions).
++            if let Some(agent_id) = self
++                .registry
++                .subagent_of_message(thread_id, reply_to, &session)
++            {
++                meta.insert("target_agent".to_owned(), agent_id.to_owned());
++            }
+         }
+         let inbound = HubMsg::Inbound { content, meta };
+         let sent = self
+@@ -1146,6 +1460,7 @@ impl Slots {
+             self.push_selected(None);
+             self.next_retry = now + self.options.retry_every;
+         }
++        self.check_candidates();
+     }
+ 
+     fn ordinal(&self, slot: SlotId) -> u32 {
+@@ -1224,9 +1539,58 @@ impl Slots {
+                     None => {}
+                 }
+             }
++            Done::Index { session, scan } => {
++                self.indexing.remove(&session);
++                self.indexes.entry(session.clone()).or_default().merge(scan);
++                self.match_candidates(&session);
++                // Forget what no candidate and no running block needs.
++                if self.candidates.of_session(&session).is_empty()
++                    && !self.registry.is_live_top_level(&session)
++                {
++                    self.indexes.remove(&session);
++                }
++            }
++            Done::Body { key, text } => {
++                if !text.is_empty() {
++                    self.finish_block(key, text);
++                }
++            }
++            Done::Block { job, delivery } => self.on_block_done(job, delivery),
+         }
+     }
+ 
++    fn on_block_done(&mut self, job: BlockJob, delivery: Option<Delivery>) {
++        let (key, text, message_id) = match (&job, &delivery) {
++            (BlockJob::Send { key, text, .. }, Some(Ok(Outcome::Sent(message))))
++                if message.message_id != 0 =>
++            {
++                (key, text, Some(message.message_id))
++            }
++            (BlockJob::Edit { key, text, .. }, Some(delivery))
++                if delivery.is_ok()
++                    || telegram_error(
++                        delivery,
++                        &[
++                            "message is not modified",
++                            "message to edit not found",
++                            "message can't be edited",
++                        ],
++                    ) =>
++            {
++                (key, text, None)
++            }
++            (BlockJob::Send { key, .. } | BlockJob::Edit { key, .. }, _) => {
++                if self.registry.block_failed(key) {
++                    warn!("block message keeps failing; given up");
++                } else {
++                    debug!("block message failed; retrying later");
++                }
++                return;
++            }
++        };
++        self.registry.block_done(key, text, message_id);
++    }
++
+     fn on_prompt_edit_done(&mut self, key: u64, delivery: Option<Delivery>) {
+         let applied = match &delivery {
+             Some(Ok(_)) => true,
+@@ -1373,6 +1737,21 @@ impl Slots {
+             };
+             self.hand_off(Work::Topic(job), op);
+         }
++        for job in self.registry.block_work() {
++            let op = match &job {
++                BlockJob::Send {
++                    thread_id, text, ..
++                } => message_op(*thread_id, text.clone()),
++                BlockJob::Edit {
++                    message_id, text, ..
++                } => Op::Edit {
++                    message_id: *message_id,
++                    text: text.clone(),
++                    reply_markup: None,
++                },
++            };
++            self.hand_off(Work::Block(job), op);
++        }
+         self.send_prompts();
+         self.send_prompt_edits();
+         let view = self.registry.topic_view();
+@@ -1419,6 +1798,7 @@ async fn dispatch_loop(
+                 Work::Permission(key) => Done::Permission { key, delivery },
+                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
+                 Work::Callback => Done::Callback(delivery),
++                Work::Block(job) => Done::Block { job, delivery },
+             });
+         });
+     }
+@@ -3652,6 +4032,8 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn nested_and_subagent_events_make_no_topics() {
++        // Only the nested run's one block goes into the parent's topic; an
++        // unmatched subagent makes nothing.
+         let rig = rig(Fake::default(), options());
+         rig.hook(start(A, 10)).await;
+         rig.ops_after(1).await;
+@@ -3682,8 +4064,447 @@ mod tests {
+             },
+         ))
+         .await;
+-        let ops = rig.ops_after(1).await;
+-        assert_eq!(ops.len(), 1, "{ops:?}");
++        let ops = rig.ops_after(2).await;
++        assert_eq!(ops.len(), 2, "{ops:?}");
++        assert_eq!(count(&ops, is_create), 1);
++        assert_eq!(
++            sent_to(&ops, 100),
++            [format!(
++                "⇣ nested bbbbbbbb\n{}",
++                crate::hub::registry::BLOCK_RUNNING
++            )]
++        );
++    }
++
++    const SUBAGENT_JSONL: &str =
++        include_str!("../../../transcript/tests/fixtures/subagent_handback.jsonl");
++    const SUBAGENT_META: &str =
++        include_str!("../../../transcript/tests/fixtures/subagent_handback.meta.json");
++    const REPORT: &str = "Modules: lib, render, split.";
++
++    fn subagent_options() -> Options {
++        Options {
++            correlate_for: Duration::from_millis(400),
++            recheck_after: Duration::from_millis(20),
++            ..message_options()
++        }
++    }
++
++    fn start_in(session: &str, pid: u32, transcript: &std::path::Path) -> HookPost {
++        let mut post = start(session, pid);
++        post.transcript_path = transcript.to_string_lossy().into_owned();
++        post
++    }
++
++    /// An `Agent` call of the parent, as Claude Code writes it.
++    fn call_line(tool: &str, description: &str) -> String {
++        let record = serde_json::json!({
++            "type": "assistant",
++            "message": { "role": "assistant", "stop_reason": "tool_use", "content": [{
++                "type": "tool_use", "id": tool, "name": "Agent",
++                "input": { "description": description, "prompt": "p", "subagent_type": "Explore" },
++            }]},
++        });
++        format!("{record}\n")
++    }
++
++    /// The result of that call: `async_launched` with the agent id.
++    fn result_line(tool: &str, agent: &str) -> String {
++        let record = serde_json::json!({
++            "type": "user",
++            "message": { "role": "user", "content": [{
++                "type": "tool_result", "tool_use_id": tool,
++                "content": [{ "type": "text", "text": "Async agent launched." }],
++            }]},
++            "toolUseResult": { "isAsync": true, "status": "async_launched", "agentId": agent },
++        });
++        format!("{record}\n")
++    }
++
++    fn sub_start(session: &str, agent: &str, kind: &str) -> HookPost {
++        hook(
++            session,
++            HookEvent::SubagentStart {
++                agent_id: agent.into(),
++                agent_type: kind.into(),
++            },
++        )
++    }
++
++    fn sub_stop(
++        session: &str,
++        agent: &str,
++        kind: &str,
++        path: &std::path::Path,
++        last: &str,
++    ) -> HookPost {
++        hook(
++            session,
++            HookEvent::SubagentStop {
++                agent_id: agent.into(),
++                agent_type: kind.into(),
++                agent_transcript_path: Some(path.to_string_lossy().into_owned()),
++                last_assistant_message: Some(last.into()),
++            },
++        )
++    }
++
++    /// What each message shows in the end: sends are numbered like the
++    /// fake numbers them, edits replace the text.
++    fn shown(ops: &[Op]) -> BTreeMap<i64, String> {
++        let mut next = 1000;
++        let mut texts = BTreeMap::new();
++        for op in ops {
++            match op {
++                Op::Send { text, .. } => {
++                    texts.insert(next, text.clone());
++                    next += 1;
++                }
++                Op::Edit {
++                    message_id, text, ..
++                } => {
++                    texts.insert(*message_id, text.clone());
++                }
++                _ => {}
++            }
++        }
++        texts
++    }
++
++    fn block_of<'a>(texts: &'a BTreeMap<i64, String>, agent: &str) -> Vec<(&'a i64, &'a String)> {
++        texts
++            .iter()
++            .filter(|(_, text)| {
++                text.starts_with("↳ ") && text.lines().next().unwrap().contains(agent)
++            })
++            .collect()
++    }
++
++    const S1: &str = "a0000000000000011";
++    const S2: &str = "a0000000000000012";
++    const S3: &str = "a0000000000000013";
++    const INTERNAL: &str = "a0000000000000019";
++
++    #[tokio::test]
++    async fn three_explicit_subagents_make_three_blocks_and_internal_agents_none() {
++        let dir = TempDir::new("slots-subagents");
++        let parent = dir.path().join("parent.jsonl");
++        let mut lines = String::new();
++        for (tool, agent, what) in [("t1", S1, "one"), ("t2", S2, "two"), ("t3", S3, "three")] {
++            lines.push_str(&call_line(tool, what));
++            lines.push_str(&result_line(tool, agent));
++        }
++        std::fs::write(&parent, lines).unwrap();
++        let file = |agent: &str| dir.path().join(format!("agent-{agent}.jsonl"));
++        std::fs::write(file(S1), SUBAGENT_JSONL).unwrap();
++        std::fs::write(
++            dir.path().join(format!("agent-{S1}.meta.json")),
++            SUBAGENT_META,
++        )
++        .unwrap();
++        std::fs::write(file(S2), SUBAGENT_JSONL).unwrap();
++        // S3's file lags: it stops on the Bash tool result.
++        let lagging: String = SUBAGENT_JSONL
++            .lines()
++            .take(6)
++            .map(|l| format!("{l}\n"))
++            .collect();
++        std::fs::write(file(S3), lagging).unwrap();
++        // The `--agent` session's own agent: typed, with files, never called.
++        std::fs::write(file(INTERNAL), SUBAGENT_JSONL).unwrap();
++
++        let rig = rig(Fake::default(), subagent_options());
++        rig.hook(start_in(A, 10, &parent)).await;
++        rig.ops_after(1).await;
++        for agent in [S1, S2, S3] {
++            rig.hook(sub_start(A, agent, "Explore")).await;
++        }
++        rig.hook(sub_start(A, INTERNAL, "my-agent")).await;
++        settled(&rig, |ops| {
++            count(ops, |op| matches!(op, Op::Send { .. })) == 3
++        })
++        .await;
++        rig.hook(hook(
++            A,
++            HookEvent::SubagentHandback {
++                agent_id: S1.into(),
++                message: REPORT.into(),
++            },
++        ))
++        .await;
++        rig.hook(sub_stop(A, S1, "Explore", &file(S1), "Report handed back."))
++            .await;
++        rig.hook(sub_stop(A, S2, "Explore", &file(S2), "Report handed back."))
++            .await;
++        rig.hook(sub_stop(A, S3, "Explore", &file(S3), "The final answer."))
++            .await;
++        rig.hook(sub_stop(
++            A,
++            INTERNAL,
++            "my-agent",
++            &file(INTERNAL),
++            "Internal text.",
++        ))
++        .await;
++        let ops = settled(&rig, |ops| {
++            count(ops, |op| matches!(op, Op::Edit { .. })) == 3
++        })
++        .await;
++        // Well past every window: nothing more comes.
++        tokio::time::sleep(Duration::from_millis(900)).await;
++        let ops_later = rig.fake.ops();
++        assert_eq!(ops_later.len(), ops.len(), "{ops_later:?}");
++
++        assert_eq!(count(&ops, is_create), 1);
++        let texts = shown(&ops);
++        assert_eq!(texts.len(), 3, "{texts:?}");
++        let one = block_of(&texts, S1);
++        assert_eq!(one.len(), 1);
++        assert_eq!(
++            one[0].1,
++            &format!("↳ Explore {S1}: Explore crate\n{REPORT}")
++        );
++        let two = block_of(&texts, S2);
++        assert_eq!(
++            two[0].1,
++            &format!(
++                "↳ Explore {S2}: two\n• Bash: List source files\n• SubagentHandback\nReport handed back."
++            )
++        );
++        let three = block_of(&texts, S3);
++        assert_eq!(
++            three[0].1,
++            &format!("↳ Explore {S3}: three\nThe final answer.")
++        );
++        // No ghost block, and a subagent's stop is never a turn answer.
++        for op in &ops {
++            if let Op::Send { text, .. } | Op::Edit { text, .. } = op {
++                assert!(
++                    !text.contains(INTERNAL) && !text.contains("Internal text."),
++                    "{text}"
++                );
++                assert!(text.starts_with("↳ "), "{text}");
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn a_stop_before_its_call_is_visible_still_gets_its_block() {
++        let dir = TempDir::new("slots-subagent-lag");
++        let parent = dir.path().join("parent.jsonl");
++        std::fs::write(&parent, call_line("t1", "late")).unwrap();
++        let rig = rig(Fake::default(), subagent_options());
++        rig.hook(start_in(A, 10, &parent)).await;
++        rig.ops_after(1).await;
++        // No start seen (hooks installed mid-session); the stop comes first.
++        let gone = dir.path().join("agent-missing.jsonl");
++        rig.hook(sub_stop(A, S1, "Explore", &gone, "Done.")).await;
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        assert_eq!(rig.fake.ops().len(), 1, "no block before the match");
++        // The parent transcript catches up.
++        let mut file = std::fs::OpenOptions::new()
++            .append(true)
++            .open(&parent)
++            .unwrap();
++        std::io::Write::write_all(&mut file, result_line("t1", S1).as_bytes()).unwrap();
++        drop(file);
++        let ops = settled(&rig, |ops| {
++            shown(ops).values().any(|text| text.ends_with("\nDone."))
++        })
++        .await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        let ops_later = rig.fake.ops();
++        assert_eq!(ops_later.len(), ops.len());
++        assert_eq!(count(&ops, |op| matches!(op, Op::Send { .. })), 1);
++        assert_eq!(
++            shown(&ops).values().collect::<Vec<_>>(),
++            [&format!("↳ Explore {S1}: late\nDone.")]
++        );
++    }
++
++    #[tokio::test]
++    async fn a_reply_to_a_subagent_block_goes_to_the_parent_with_its_agent_id() {
++        let dir = TempDir::new("slots-subagent-reply");
++        let parent = dir.path().join("parent.jsonl");
++        std::fs::write(&parent, call_line("t1", "one") + &result_line("t1", S1)).unwrap();
++        let mut rig = rig(Fake::default(), subagent_options());
++        rig.hook(start_in(A, 10, &parent)).await;
++        rig.ops_after(1).await;
++        rig.agent_of(1, A, Some(10)).await;
++        rig.hook(sub_start(A, S1, "Explore")).await;
++        // A nested run of A, with an agent of its own.
++        rig.hook(hook(
++            B,
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(20),
++                parent_claude_pid: Some(10),
++            },
++        ))
++        .await;
++        rig.agent_of(2, B, Some(20)).await;
++        let ops = settled(&rig, |ops| {
++            count(ops, |op| matches!(op, Op::Send { .. })) == 2
++        })
++        .await;
++        let texts = shown(&ops);
++        let block = *block_of(&texts, S1)[0].0;
++        let nested = *texts
++            .iter()
++            .find(|(_, text)| text.starts_with("⇣ nested"))
++            .unwrap()
++            .0;
++        for (message_id, reply_to) in [(50, block), (51, nested), (52, 999)] {
++            rig.control
++                .send(Control::Message(Inbound {
++                    message_id,
++                    thread_id: Some(100),
++                    text: Some("hi".into()),
++                    reply_to: Some(reply_to),
++                }))
++                .unwrap();
++        }
++        let got = received(&mut rig, 0).await;
++        let metas: Vec<Option<String>> = got
++            .iter()
++            .map(|msg| match msg {
++                HubMsg::Inbound { meta, .. } => meta.get("target_agent").cloned(),
++                other => panic!("{other:?}"),
++            })
++            .collect();
++        assert_eq!(metas, [Some(S1.to_owned()), None, None]);
++        assert!(crate::channel::is_meta_key("target_agent"));
++        // The nested run's agent is no channel: it got nothing.
++        assert!(received(&mut rig, 1).await.is_empty());
++    }
++
++    #[tokio::test]
++    async fn a_nested_run_shows_one_block_and_its_answer_only_there() {
++        let rig = rig(Fake::default(), options());
++        rig.hook(start(A, 10)).await;
++        rig.ops_after(1).await;
++        let nested_start = hook(
++            B,
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(20),
++                parent_claude_pid: Some(10),
++            },
++        );
++        rig.hook(nested_start.clone()).await;
++        rig.ops_after(2).await;
++        let mut again = nested_start;
++        again.event_id = crate::wire::EventId::new();
++        rig.hook(again).await;
++        rig.hook(stop(B, Some("nested answer"))).await;
++        rig.hook(hook(
++            B,
++            HookEvent::SessionEnd {
++                reason: Some("other".into()),
++                claude_pid: Some(20),
++            },
++        ))
++        .await;
++        let ops = settled(&rig, |ops| {
++            count(ops, |op| matches!(op, Op::Edit { .. })) == 1
++        })
++        .await;
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        assert_eq!(rig.fake.ops().len(), ops.len());
++        assert_eq!(count(&ops, is_create), 1);
++        assert_eq!(
++            sent_to(&ops, 100),
++            [format!(
++                "⇣ nested bbbbbbbb\n{}",
++                crate::hub::registry::BLOCK_RUNNING
++            )]
++        );
++        assert_eq!(
++            shown(&ops).values().collect::<Vec<_>>(),
++            [&"⇣ nested bbbbbbbb\nnested answer".to_owned()]
++        );
++    }
++
++    #[tokio::test]
++    async fn after_a_restart_blocks_are_edited_never_sent_again() {
++        let dir = TempDir::new("slots-block-restart");
++        let store = RegistryStore::open(dir.path()).unwrap();
++        let mut registry = Registry::default();
++        registry.apply_hook(&start(A, 10));
++        registry.apply_hook(&start(B, 11));
++        let jobs = registry.topic_work(&Icons::default(), true);
++        for (job, topic) in jobs.into_iter().zip([100, 101]) {
++            if let TopicJob::Create { slot, name, icon } = job {
++                registry.topic_created(slot, topic, &name, icon.as_deref());
++            }
++        }
++        registry.confirm_subagent(S1, A, format!("↳ Explore {S1}"));
++        registry.confirm_subagent(S2, B, format!("↳ Explore {S2}"));
++        for (job, message) in registry.block_work().into_iter().zip([700, 701]) {
++            if let BlockJob::Send { key, text, .. } = job {
++                registry.block_done(&key, &text, Some(message));
++            }
++        }
++        // B ends while the hub is down.
++        registry.apply_hook(&hook(
++            B,
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: None,
++            },
++        ));
++        store.save(&RegistryStore::encode(&registry)).unwrap();
++
++        let rig = rig_in(Fake::default(), subagent_options(), dir);
++        let ops = settled(&rig, |ops| {
++            ops.iter().any(|op| {
++                matches!(
++                    op,
++                    Op::Edit {
++                        message_id: 701,
++                        ..
++                    }
++                )
++            })
++        })
++        .await;
++        let edits: Vec<(i64, &str)> = ops
++            .iter()
++            .filter_map(|op| match op {
++                Op::Edit {
++                    message_id, text, ..
++                } => Some((*message_id, text.as_str())),
++                _ => None,
++            })
++            .collect();
++        let lost = format!("↳ Explore {S2}\n{}", crate::hub::registry::BLOCK_LOST);
++        assert!(edits.contains(&(701, lost.as_str())), "{ops:?}");
++        // The live session's subagent hooks come again: same message.
++        rig.hook(sub_start(A, S1, "Explore")).await;
++        let gone = rig.dir.path().join("agent-missing.jsonl");
++        rig.hook(sub_stop(A, S1, "Explore", &gone, "Late.")).await;
++        settled(&rig, |ops| {
++            ops.iter().any(|op| {
++                matches!(
++                    op,
++                    Op::Edit {
++                        message_id: 700,
++                        ..
++                    }
++                )
++            })
++        })
++        .await;
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        let all = rig.fake.ops();
++        assert_eq!(
++            count(&all, |op| matches!(
++                op,
++                Op::Send { .. } | Op::CreateTopic { .. }
++            )),
++            0
++        );
++        assert_eq!(shown(&all)[&700], format!("↳ Explore {S1}\nLate."));
+     }
+ 
+     #[tokio::test]

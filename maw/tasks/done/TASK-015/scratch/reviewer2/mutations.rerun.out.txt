@@ -1,0 +1,2 @@
+M11 a stale body read is applied: KILLED ['test hub::slots::tests::a_late_body_read_never_overwrites_a_newer_one ... FAILED']
+M12 an unclear first send is retried: KILLED ['test hub::slots::tests::a_first_send_with_an_unclear_answer_is_not_sent_again ... FAILED']

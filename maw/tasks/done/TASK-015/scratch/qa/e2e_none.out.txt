@@ -1,0 +1,27 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 3.20s
+     Running tests\qa_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-t015-qa-target\debug\deps\qa_e2e-34aaf1d94ee0ea77.exe)
+
+running 1 test
+A1 block:
+↳ Explore a1000000000000001: desc one
+REPORT-A1 delivered
+---
+A2 block:
+↳ Explore a2000000000000002: desc two
+• Bash: List files for a2000000000000002
+FINAL-A2
+---
+A3 block:
+↳ Explore a3000000000000003: desc three
+LAST-A3
+P inbound: [("to A2", {"chat_id": "-1000000000001", "message_id": "7001", "reply_to_message_id": "1002", "target_agent": "a2000000000000002", "thread_id": "101"}), ("to nested", {"chat_id": "-1000000000001", "message_id": "7002", "reply_to_message_id": "1004", "thread_id": "101"}), ("plain", {"chat_id": "-1000000000001", "message_id": "7003", "thread_id": "101"})]
+Q inbound: [("other topic, same message id", {"chat_id": "-1000000000001", "message_id": "7004", "reply_to_message_id": "1002", "thread_id": "102"})]
+N inbound: []
+block sends after the window: [(Some(101), "↳ Explore a1000000000000001: desc one\nв работе…"), (Some(101), "↳ Explore a2000000000000002: desc two\nв работе…"), (Some(101), "↳ Explore a3000000000000003: desc three\nв работе…"), (Some(101), "⇣ nested 5e551017\nв работе…")]
+run 2 ops: [EditTopic { thread_id: 101, name: None, icon_custom_emoji_id: Some("5357121491508928442") }, EditTopic { thread_id: 102, name: None, icon_custom_emoji_id: Some("5357121491508928442") }, EditTopic { thread_id: 101, name: None, icon_custom_emoji_id: Some("5312016608254762256") }, Edit { message_id: 1001, text: "↳ Explore a1000000000000001: desc one\nLAST-A1", reply_markup: None }, Edit { message_id: 1005, text: "↳ Explore a4000000000000004: desc four\nитог не получен", reply_markup: None }, EditTopic { thread_id: 101, name: None, icon_custom_emoji_id: Some("5408906741125490282") }]
+test qa_subagents_nested_reply_and_restart_end_to_end ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.82s
+
+exit 0

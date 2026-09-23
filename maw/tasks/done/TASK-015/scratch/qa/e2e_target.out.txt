@@ -1,0 +1,37 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 4.15s
+     Running tests\qa_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-t015-qa-target\debug\deps\qa_e2e-34aaf1d94ee0ea77.exe)
+
+running 1 test
+A1 block:
+↳ Explore a1000000000000001: desc one
+REPORT-A1 delivered
+---
+A2 block:
+↳ Explore a2000000000000002: desc two
+• Bash: List files for a2000000000000002
+FINAL-A2
+---
+A3 block:
+↳ Explore a3000000000000003: desc three
+LAST-A3
+P inbound: [("to A2", {"chat_id": "-1000000000001", "message_id": "7001", "reply_to_message_id": "1002", "thread_id": "101"}), ("to nested", {"chat_id": "-1000000000001", "message_id": "7002", "reply_to_message_id": "1004", "thread_id": "101"}), ("plain", {"chat_id": "-1000000000001", "message_id": "7003", "thread_id": "101"})]
+Q inbound: [("other topic, same message id", {"chat_id": "-1000000000001", "message_id": "7004", "reply_to_message_id": "1002", "thread_id": "102"})]
+N inbound: []
+
+thread 'qa_subagents_nested_reply_and_restart_end_to_end' (38048) panicked at crates\cctg\tests\qa_e2e.rs:704:5:
+assertion `left == right` failed
+  left: None
+ right: Some("a2000000000000002")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test qa_subagents_nested_reply_and_restart_end_to_end ... FAILED
+
+failures:
+
+failures:
+    qa_subagents_nested_reply_and_restart_end_to_end
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.17s
+
+error: test failed, to rerun pass `-p cctg --test qa_e2e`
+exit 101

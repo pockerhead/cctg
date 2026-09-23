@@ -1,0 +1,19 @@
+{
+  "session_id": "1f2c01a2-63e9-464d-a70f-4a4283d3cd8b",
+  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b.jsonl",
+  "cwd": "~\\dev\\cctg",
+  "scratchpad_dir": "~\\AppData\\Local\\Temp\\claude\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b\\scratchpad",
+  "prompt_id": "7d0affaf-0ef2-40db-bdd0-a34fbe9228af",
+  "permission_mode": "auto",
+  "agent_id": "acc9ca60c285ff315",
+  "agent_type": "",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b\\subagents\\agent-acc9ca60c285ff315.jsonl",
+  "last_assistant_message": "Running a command",
+  "background_tasks": [],
+  "session_crons": []
+}

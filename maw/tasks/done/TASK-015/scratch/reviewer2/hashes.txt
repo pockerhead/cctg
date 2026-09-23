@@ -1,0 +1,6 @@
+b4c7f66ab83a3e8517b2dbf4b39578b468df0c21dd87aa6646bb42631cfc638a  crates/cctg/src/hub/mod.rs
+1889ab553e4d4227d0d5e4a4f006eae48adbc511f750228512251107881efb88  crates/cctg/src/hub/registry.rs
+1713d9ce6346de884cc125fc61f02646950c01b88c591ad50619cd63caf64e1a  crates/cctg/src/hub/slots.rs
+d189da2165a85c6f3bebb70eb9d816132f27087f570ac5891ce22fca9401cb6e  crates/cctg/src/hub/subagents.rs
+db477600f37e472814ac37428dde45f85c3630d23eec6bfcb030342e0ed57ac9  crates/transcript/src/subagent.rs
+a32e60ad384911498bb985ca2204feb595d39da551b074a8a8a27c8a86b4e2d1  crates/transcript/tests/subagent.rs

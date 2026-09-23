@@ -1,0 +1,20 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 3.94s
+     Running tests\qa_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-t015-qa-target\debug\deps\qa_e2e-34aaf1d94ee0ea77.exe)
+
+running 1 test
+
+thread 'qa_subagents_nested_reply_and_restart_end_to_end' (12256) panicked at crates\cctg\tests\qa_e2e.rs:527:5:
+no block before the transcript shows the calls: [(Some(101), "↳ Explore a1000000000000001\nв работе…"), (Some(101), "↳ Explore a2000000000000002\nв работе…"), (Some(101), "↳ Explore a3000000000000003\nв работе…"), (Some(101), "↳ my-agent a9000000000000009\nв работе…")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test qa_subagents_nested_reply_and_restart_end_to_end ... FAILED
+
+failures:
+
+failures:
+    qa_subagents_nested_reply_and_restart_end_to_end
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+error: test failed, to rerun pass `-p cctg --test qa_e2e`
+exit 101

@@ -57,7 +57,7 @@ it through `reply`. Use this server's `reply` tool only for extra messages while
 (for example progress on a long task), in plain text. Its full name is `mcp__<server>__reply`, \
 where <server> is the name this MCP server is registered under (normally `mcp__cctg__reply`). \
 It may be a deferred tool: if it is not in your tool list, find and load it with ToolSearch. \
-If the tag has a `target_agent` attribute, the message is for that running subagent: \
+If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
 never ask for permissions through `reply`.";
 
@@ -510,6 +510,7 @@ mod tests {
         assert!(instructions.contains("only for extra messages"));
         assert!(!instructions.contains("answer each such message with"));
         assert!(instructions.contains("SendMessage"));
+        assert!(instructions.contains("that subagent, running or finished"));
         assert!(instructions.contains("never ask for permissions through `reply`"));
     }
 

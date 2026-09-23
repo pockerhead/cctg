@@ -1,0 +1,36 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling syn v3.0.6
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling unicode-segmentation v1.13.3
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+    Finished `test` profile [unoptimized] target(s) in 12.07s
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-t015-impl-target\debug\deps\subagent-0e3bd8d44281104f.exe)
+
+running 15 tests
+test meta_fixture_is_parsed ... ok
+test missing_or_broken_meta_falls_back_without_error ... ok
+test the_call_description_stands_in_for_a_missing_meta ... ok
+test meta_description_and_type_win ... ok
+test report_replaces_the_transcript_final_text ... ok
+test last_message_must_equal_the_final_answer ... ok
+test agent_id_is_one_line_without_breaking_parent_lookup ... ok
+test duplicate_agent_ids_use_the_last_slice_entry ... ok
+test embedded_header_is_the_block_header ... ok
+test background_agent_embeds_an_in_progress_body ... ok
+test only_known_agents_get_a_body ... ok
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test sidechain_turns_never_reach_the_parent_top_level ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test body_source_order_is_fixed ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+exit=0
