@@ -1,0 +1,18 @@
+﻿cargo :    Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+At line:1 char:531
++ ... _DEBUG="0"; cargo test -j 1 -p cctg --test qa_turn_answer_e2e -- --no ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling cc...tg\crates\cctg):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `test` profile [unoptimized] target(s) in 1.01s
+     Running tests\qa_turn_answer_e2e.rs (C:\Users\user\AppData\Local\Temp\cctg-qa022-target\debug\deps\qa_turn_answer_
+e2e-ad7c1ec621b6050c.exe)
+
+running 2 tests
+test stop_answer_reaches_topic_in_order_via_real_hook_binary ... ok
+topic 100: ["progress reply", "final A", "── session bbbbbbbb · new ──", "answer B"]
+test nested_ended_unknown_and_late_clear_stop_send_nothing ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+

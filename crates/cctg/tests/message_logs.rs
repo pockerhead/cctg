@@ -1,5 +1,5 @@
-//! Log capture for topic messages and agent replies: the text of either and
-//! the sender's user id never reach the logs. Its own test binary with a
+//! Log capture for topic messages, agent replies and turn answers: their
+//! text and the sender's user id never reach the logs. Its own test binary with a
 //! global subscriber, like `slots_logs.rs`: the actor runs on runtime
 //! workers and parallel tests would race on tracing callsite registration.
 
@@ -86,6 +86,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     let inbound_text = format!("private inbound {pid}");
     let reply_text = format!("private reply {pid}");
     let offline_text = format!("private offline {pid}");
+    let answer_text = format!("private answer {pid}");
     let state = std::env::temp_dir().join(format!("cctg-message-logs-{pid}"));
     let _ = std::fs::remove_dir_all(&state);
     std::fs::create_dir_all(&state).expect("state dir");
@@ -191,6 +192,13 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         })
         .await
         .expect("reply");
+    hooks
+        .send(post(HookEvent::Stop {
+            prompt_id: None,
+            last_assistant_message: Some(answer_text.clone()),
+        }))
+        .await
+        .expect("hook");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let _ = std::fs::remove_dir_all(&state);
 
@@ -200,18 +208,25 @@ async fn message_logs_carry_no_text_and_no_user_id() {
             .any(|op| matches!(op, Op::Send { text, .. } if *text == reply_text)),
         "{ops:?}"
     );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, Op::Send { text, .. } if *text == answer_text)),
+        "{ops:?}"
+    );
     let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
         .unwrap_or_default();
     for expected in [
         "message for a session that is not on line",
         "message forwarded to the session agent",
         "agent reply queued",
+        "turn answer queued",
     ] {
         assert!(logs.contains(expected), "{expected}: {logs}");
     }
     for private in [
         inbound_text.as_str(),
         reply_text.as_str(),
+        answer_text.as_str(),
         offline_text.as_str(),
         "private",
         &USER.to_string(),

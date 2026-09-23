@@ -11,8 +11,9 @@
 //! Saving goes to a separate task that writes the latest snapshot.
 //!
 //! Topic messages from allowlisted users go to the agent of the slot's
-//! current session with a non-blocking `try_send`; agent replies go back to
-//! the session's topic through the same dispatch task. At most
+//! current session with a non-blocking `try_send`; agent replies and the
+//! final answer of each turn (from the `Stop` hook) go back to the session's
+//! topic through the same dispatch task. At most
 //! [`MAX_QUEUED_MESSAGES`] such messages wait for Telegram at a time, and a
 //! slot gets each kind of notice at most once per `Options::notice_every`.
 //!
@@ -52,8 +53,8 @@ use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest};
 const TITLE_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 const SHORT_ID: usize = 8;
-/// Reply chunks and notices waiting for Telegram; beyond this a new reply or
-/// notice is dropped whole (the group allows ~20 messages a minute anyway).
+/// Reply and turn-answer chunks and notices waiting for Telegram; beyond this
+/// a new reply, answer or notice is dropped whole (the group allows ~20 messages a minute anyway).
 pub const MAX_QUEUED_MESSAGES: usize = 256;
 pub const OFFLINE_NOTICE: &str = "Сессия этой темы не на связи, сообщение не доставлено.";
 pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
@@ -493,6 +494,13 @@ impl Slots {
         ) {
             self.prompts.quiet(session);
         }
+        if let HookEvent::Stop {
+            last_assistant_message: Some(answer),
+            ..
+        } = &post.event
+        {
+            self.on_turn_answer(session, answer);
+        }
         self.close_prompts(&followup.ended_sessions);
         if let Some((session, path)) = followup.read_title {
             self.read_title(session, path);
@@ -615,17 +623,54 @@ impl Slots {
     /// its slot. This is the reply-side counterpart of [`Self::live_agent`].
     fn live_reply_slot(&self, conn: u64, session: &str) -> Option<(String, SlotId)> {
         self.conns.get(&conn)?;
-        if !self.registry.is_live_top_level(session) {
-            return None;
-        }
-        let entry = self
-            .registry
+        self.registry
             .sessions
             .get(session)
             .filter(|entry| entry.agent == Some(conn))?;
-        let slot = entry.slot?;
-        (self.registry.slot(slot)?.current_session.as_deref() == Some(session))
-            .then(|| (session.to_owned(), slot))
+        let slot = self.current_slot(session)?;
+        Some((session.to_owned(), slot))
+    }
+
+    /// The slot of `session` when it is a running top-level session and
+    /// still the current session of that slot.
+    fn current_slot(&self, session: &str) -> Option<SlotId> {
+        if !self.registry.is_live_top_level(session) {
+            return None;
+        }
+        let slot = self.registry.sessions.get(session)?.slot?;
+        (self.registry.slot(slot)?.current_session.as_deref() == Some(session)).then_some(slot)
+    }
+
+    /// Sends the final answer of a turn (from the `Stop` hook) to the topic
+    /// of its session, like an agent reply, so the answer reaches Telegram
+    /// whether or not the model called `reply`.
+    fn on_turn_answer(&mut self, session: &str, answer: &str) {
+        if answer.trim().is_empty() {
+            return;
+        }
+        let Some(slot) = self.current_slot(session) else {
+            debug!(
+                session = short(session),
+                "turn answer of a session that is not the live one of its slot; not sent"
+            );
+            return;
+        };
+        let ordinal = self.ordinal(slot);
+        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+            info!(
+                ordinal,
+                "turn answer for a slot without a topic yet; not sent"
+            );
+            return;
+        };
+        if let Some(parts) = self.send_text(thread_id, session, answer, "answer") {
+            info!(
+                ordinal,
+                session = short(session),
+                parts,
+                "turn answer queued"
+            );
+        }
     }
 
     /// Sends an agent's reply to the topic of its session: the chunks of
@@ -651,12 +696,32 @@ impl Slots {
             warn!(ordinal, "reply for a slot without a topic yet; dropped");
             return;
         };
+        if let Some(parts) = self.send_text(thread_id, &session, text, "reply") {
+            info!(
+                ordinal,
+                session = short(&session),
+                parts,
+                "agent reply queued"
+            );
+        }
+    }
+
+    /// Queues `text` for the topic: the chunks of `split_for_telegram` in
+    /// order, or one document `<kind>-<short id>.txt` when it prefers a file.
+    /// The number of parts, or `None` when the message cap refused them.
+    fn send_text(
+        &mut self,
+        thread_id: i64,
+        session: &str,
+        text: &str,
+        kind: &str,
+    ) -> Option<usize> {
         let split = split_for_telegram(text, SplitOptions::default());
         let ops: Vec<Op> = if split.prefer_file {
             vec![Op::SendDocument {
                 thread_id: Some(thread_id),
                 document: Document {
-                    file_name: format!("reply-{}.txt", short(&session)),
+                    file_name: format!("{kind}-{}.txt", short(session)),
                     bytes: text.as_bytes().to_vec(),
                     caption: None,
                 },
@@ -669,14 +734,7 @@ impl Slots {
                 .collect()
         };
         let parts = ops.len();
-        if self.send_messages(ops) {
-            info!(
-                ordinal,
-                session = short(&session),
-                parts,
-                "agent reply queued"
-            );
-        }
+        self.send_messages(ops).then_some(parts)
     }
 
     /// Remembers a relayed permission request; [`Self::send_prompts`] puts it
@@ -1060,7 +1118,9 @@ impl Slots {
         if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
-                warn!("too many messages wait for Telegram; new replies and notices are dropped");
+                warn!(
+                    "too many messages wait for Telegram; new replies, turn answers and notices are dropped"
+                );
             }
             return false;
         }
@@ -1949,6 +2009,163 @@ mod tests {
         slots.on_reply(1, "stale after clear");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+    }
+
+    fn stop(session: &str, answer: Option<&str>) -> HookPost {
+        hook(
+            session,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: answer.map(str::to_owned),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_turn_answer_goes_to_its_session_topic_in_split_order() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        let paragraph = |c: char| format!("{}\n\n", c.to_string().repeat(3000));
+        let long: String = ['a', 'b', 'c'].into_iter().map(paragraph).collect();
+        let want = split_for_telegram(&long, SplitOptions::default());
+        assert!(want.chunks.len() > 1 && !want.prefer_file);
+        rig.hook(stop(B, Some(&long))).await;
+        rig.hook(stop(B, Some("short"))).await;
+        let expected: Vec<&str> = want
+            .chunks
+            .iter()
+            .map(String::as_str)
+            .chain(["short"])
+            .collect();
+        let ops = settled(&rig, |ops| sent_to(ops, 101).len() == expected.len()).await;
+        assert_eq!(sent_to(&ops, 101), expected);
+        assert!(sent_to(&ops, 100).is_empty());
+
+        // More chunks than `max_chunks`: one document with the whole text.
+        let huge = "x".repeat(5 * 4096);
+        rig.hook(stop(A, Some(&huge))).await;
+        let ops = settled(&rig, |ops| {
+            ops.iter().any(|op| matches!(op, Op::SendDocument { .. }))
+        })
+        .await;
+        assert!(ops.iter().any(|op| matches!(op,
+            Op::SendDocument { thread_id: Some(100), document }
+                if document.bytes == huge.as_bytes() && document.file_name == "answer-aaaaaaaa.txt")));
+    }
+
+    #[tokio::test]
+    async fn only_a_live_top_level_current_session_with_a_topic_sends_its_answer() {
+        let dir = TempDir::new("slots-turn-answer");
+        let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        // No topic yet.
+        slots.on_hook(&stop(A, Some("before the topic")));
+        assert_eq!(slots.queued_messages, 0);
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        // Absent, empty and blank answers.
+        for answer in [None, Some(""), Some(" \n\t ")] {
+            slots.on_hook(&stop(A, answer));
+        }
+        assert_eq!(slots.queued_messages, 0);
+        // A nested run inside A and a session no SessionStart announced.
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(20),
+                parent_claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&stop(B, Some("nested answer")));
+        slots.on_hook(&stop(
+            "cccccccc-0000-4000-8000-000000000003",
+            Some("unknown answer"),
+        ));
+        assert_eq!(slots.queued_messages, 0);
+        // The live session, with no agent linked: the hook alone is enough.
+        slots.on_hook(&stop(A, Some("current answer")));
+        assert_eq!(slots.queued_messages, 1);
+        // An ended session, also after its slot went to the next session.
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&stop(A, Some("after the end")));
+        slots.on_hook(&start("dddddddd-0000-4000-8000-000000000004", 11));
+        slots.on_hook(&stop(A, Some("after the slot moved on")));
+        assert_eq!(slots.queued_messages, 1);
+
+        let ops = wait_for_ops(&fake, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fake.ops().len(), 1, "{:?}", fake.ops());
+        assert!(
+            matches!(&ops[0], Op::Send { thread_id: Some(100), text, .. } if text == "current answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_answers_and_replies_share_the_message_cap() {
+        let dir = TempDir::new("slots-answer-cap");
+        let mut slots = stalled_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
+        let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
+        assert!(
+            split_for_telegram(&text, SplitOptions::default())
+                .chunks
+                .len()
+                > 1
+        );
+
+        // Two chunks do not fit: the answer is dropped whole.
+        slots.on_hook(&stop(A, Some(&text)));
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES - 1);
+        assert!(slots.overflow_warned);
+        // One chunk fits and fills the cap; a reply then finds no room.
+        slots.on_hook(&stop(A, Some("one")));
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+        slots.on_reply(1, "reply");
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_telegram_never_stalls_turn_answers() {
+        let fake = Fake {
+            stall_sends: true,
+            ..Fake::default()
+        };
+        let mut rig = rig(fake, message_options());
+        two_live_slots(&mut rig, false).await;
+        // Far more answers than the scheduler queue (1024) and the cap, each
+        // through the bounded hook channel: a stalled actor would block here.
+        let flood = async {
+            for _ in 0..1500 {
+                rig.hook(stop(A, Some("stuck"))).await;
+            }
+        };
+        tokio::time::timeout(WAIT, flood)
+            .await
+            .expect("hook events kept draining");
+        rig.control
+            .send(say(Some(100), 5000, Some("still here")))
+            .unwrap();
+        let arrived = async {
+            loop {
+                if let Some(HubMsg::Inbound { content, .. }) = rig._to_agent[0].recv().await
+                    && content == "still here"
+                {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(WAIT, arrived)
+            .await
+            .expect("inbound reached the agent while Telegram stalled");
     }
 
     fn permission(conn: u64, request_id: &str, preview: &str) -> AgentEvent {

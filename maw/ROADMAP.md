@@ -4,7 +4,7 @@ TASK-015
   └── TASK-018   (blocked by TASK-015, TASK-016, TASK-017)
       └── TASK-019   (blocked by TASK-017, TASK-018)
 
-TASK-016   [waits on TASK-022 (in_progress)]
+TASK-016
   └── TASK-018   (blocked by TASK-015, TASK-016, TASK-017)
 
 TASK-017

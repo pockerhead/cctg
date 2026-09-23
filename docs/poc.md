@@ -78,12 +78,38 @@ claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>
 
 Без `CLAUDE_CONFIG_DIR` рецепт тоже работает, но Claude Code запишет в ваш `~/.claude.json` ключ `projects[<рабочая папка>]` (доверие папке) и сохранит транскрипт в `~/.claude/projects/`. Тогда берите одну и ту же рабочую папку на все прогоны, чтобы ключ был один.
 
+### Из Git Bash
+
+В Git Bash (MSYS) перед командой нужен `MSYS_NO_PATHCONV=1`. Без него MSYS переписывает аргументы, похожие на пути: `server:cctg` и пути к файлам доходят до Claude Code искажёнными, канал не регистрируется и диалог про development channels не появляется. С `MSYS_NO_PATHCONV=1` пути пишите в виде `C:/...`: `/tmp`, `/c/...` и `$TMP` в стиле MSYS дойдут до Claude Code как есть и не откроются.
+
+```
+cd <рабочая папка>
+export CLAUDE_CONFIG_DIR="<tmp>/cctg-poc/claude-config"
+MSYS_NO_PATHCONV=1 claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>/cctg-poc/settings.json --dangerously-load-development-channels server:cctg
+```
+
+Чтобы не набирать это каждый раз, положите в папку из `PATH` (например `~/bin`) скрипт `claude-cctg`:
+
+```bash
+#!/usr/bin/env bash
+# claude-cctg: Claude Code with the cctg channel for this run only.
+export CLAUDE_CONFIG_DIR="<tmp>/cctg-poc/claude-config"
+export MSYS_NO_PATHCONV=1
+exec claude \
+  --mcp-config "<tmp>/cctg-poc/mcp.json" --strict-mcp-config \
+  --settings "<tmp>/cctg-poc/settings.json" \
+  --dangerously-load-development-channels server:cctg \
+  "$@"
+```
+
+`chmod +x ~/bin/claude-cctg`, дальше `claude-cctg` в любой рабочей папке, остальные аргументы уходят в `claude` как есть (`claude-cctg --resume <id>`). Строку `CLAUDE_CONFIG_DIR` уберите, если запускаете без отдельного конфига.
+
 `--strict-mcp-config` берёт MCP-серверы только из `mcp.json`: если `cctg` уже зарегистрирован глобально, второго экземпляра не будет. Claude Code спросит про доверие к папке и про development channels, оба вопроса подтвердить.
 
 ## 4. Что проверить
 
 1. В группе появилась тема `[<host>] <папка> · <начало id сессии>`, иконка "живая".
-2. Текст в этой теме доходит в сессию как `<channel source="cctg" ...>`, Claude отвечает инструментом `reply`, ответ приходит в ту же тему. Длинный ответ приходит несколькими сообщениями по порядку или одним файлом.
+2. Текст в этой теме доходит в сессию как `<channel source="cctg" ...>`, финальный ответ хода приходит в ту же тему сам (из хука `Stop`), даже если Claude не вызвал `reply`. Инструкции канала просят вызывать `reply` только для дополнительных сообщений по ходу работы; если Claude всё же отправит финальный ответ и через `reply`, он придёт дважды. В тему уходит финальный ответ каждого хода живой top-level сессии слота, в том числе ходов, начатых из терминала. Длинный ответ приходит несколькими сообщениями по порядку или одним файлом.
 3. `/brief` в теме отвечает транскриптом и не попадает в сессию.
 4. `/clear` в терминале: в теме разделитель `── session <id> · new ──`, следующее сообщение из темы доходит в новую сессию.
 5. Выход из Claude Code: иконка "мёртвая"; сообщение в тему даёт ответ "Сессия этой темы не на связи, сообщение не доставлено." Несколько сообщений подряд дают один такой ответ в минуту.
