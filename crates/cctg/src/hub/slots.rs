@@ -10,10 +10,16 @@
 //! queue holds at most one topic job per slot plus service-message deletes.
 //! Saving goes to a separate task that writes the latest snapshot.
 //!
+//! Topic messages from allowlisted users go to the agent of the slot's
+//! current session with a non-blocking `try_send`; agent replies go back to
+//! the session's topic through the same dispatch task. At most
+//! [`MAX_QUEUED_MESSAGES`] such messages wait for Telegram at a time, and a
+//! slot gets each kind of notice at most once per `Options::notice_every`.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
-//! a folder or a title.
+//! a folder, a title or message text.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,11 +27,13 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
+use transcript::{SplitOptions, split_for_telegram};
 
-use super::api::ApiError;
+use super::api::{ApiError, Document};
 use super::ingress::AgentEvent;
 use super::registry::{Icons, Registry, RegistryStore, SlotId, TopicJob, TopicView};
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
+use super::updates::Inbound;
 use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg};
 
 /// A transcript is scanned line by line for its first ai-title up to this
@@ -33,12 +41,22 @@ use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg};
 const TITLE_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 const SHORT_ID: usize = 8;
+/// Reply chunks and notices waiting for Telegram; beyond this a new reply or
+/// notice is dropped whole (the group allows ~20 messages a minute anyway).
+pub const MAX_QUEUED_MESSAGES: usize = 256;
+pub const OFFLINE_NOTICE: &str = "Сессия этой темы не на связи, сообщение не доставлено.";
+pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub icons: Icons,
+    /// The forum supergroup, passed to Claude as `chat_id` meta.
+    pub chat_id: i64,
     /// The bot may delete service messages (`can_delete_messages`).
     pub can_delete: bool,
+    /// A slot gets the same notice at most once per this long; a burst of
+    /// messages to a dead session would eat the group's 20 messages a minute.
+    pub notice_every: Duration,
     /// After start, topic edits wait this long: agents are reconnecting.
     pub grace: Duration,
     /// Failed topic calls are tried again this often.
@@ -49,7 +67,9 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             icons: Icons::default(),
+            chat_id: 0,
             can_delete: true,
+            notice_every: Duration::from_secs(60),
             // Longer than the agent's 30 s maximum reconnect backoff.
             grace: Duration::from_secs(45),
             retry_every: Duration::from_secs(60),
@@ -58,13 +78,15 @@ impl Default for Options {
 }
 
 /// From the update poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
     /// A `forum_topic_edited` service message.
     TopicEdited {
         thread_id: Option<i64>,
         message_id: i64,
     },
+    /// A message from an allowlisted user that is not a command.
+    Message(Inbound),
 }
 
 #[derive(Debug)]
@@ -75,6 +97,8 @@ enum Done {
         delivery: Option<Delivery>,
     },
     Delete(Option<Delivery>),
+    /// A reply chunk or a notice.
+    Message(Option<Delivery>),
     Title {
         session: String,
         path: String,
@@ -89,6 +113,7 @@ enum Done {
 enum Work {
     Topic(TopicJob),
     Delete,
+    Message,
 }
 
 fn short(session_id: &str) -> &str {
@@ -170,7 +195,7 @@ struct Conn {
     session: String,
     host: String,
     claude_pid: Option<u32>,
-    _to_agent: mpsc::Sender<HubMsg>,
+    to_agent: mpsc::Sender<HubMsg>,
 }
 
 pub struct Slots {
@@ -186,6 +211,11 @@ pub struct Slots {
     /// Transcript bytes already scanned for an ai-title: session -> (path, offset).
     scanned: HashMap<String, (String, u64)>,
     delete_warned: bool,
+    /// Messages handed to the dispatch task and not answered yet.
+    queued_messages: usize,
+    overflow_warned: bool,
+    /// When a slot last got a notice of a kind.
+    notices: HashMap<(SlotId, &'static str), Instant>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -218,6 +248,9 @@ impl Slots {
             reading: HashSet::new(),
             scanned: HashMap::new(),
             delete_warned: false,
+            queued_messages: 0,
+            overflow_warned: false,
+            notices: HashMap::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -286,7 +319,7 @@ impl Slots {
                         session,
                         host: register.host,
                         claude_pid: register.claude_pid,
-                        _to_agent: to_agent,
+                        to_agent,
                     },
                 );
             }
@@ -298,6 +331,7 @@ impl Slots {
                     AgentMsg::PermissionRequest(_) => {
                         self.registry.set_waiting(&bound.session, true);
                     }
+                    AgentMsg::Reply { text } => self.on_reply(conn, &text),
                     _ => debug!(conn, "agent message not routed yet"),
                 }
             }
@@ -337,31 +371,34 @@ impl Slots {
         else {
             return;
         };
-        let movers: Vec<u64> = self
+        // Only the newest connection of the process moves: a stale duplicate
+        // (the agent reconnected) must not win the new session by map order.
+        let mover = self
             .conns
             .iter()
             .filter(|(_, bound)| {
                 bound.host == host && bound.claude_pid == Some(pid) && bound.session != session
             })
             .map(|(conn, _)| *conn)
-            .collect();
-        for conn in movers {
-            let Some(bound) = self.conns.get_mut(&conn) else {
-                continue;
-            };
-            let old = std::mem::replace(&mut bound.session, session.clone());
-            self.registry.agent_disconnected(&old, conn);
-            if self.pending.get(&old) == Some(&conn) {
-                self.pending.remove(&old);
-            }
-            if self.registry.agent_connected(&session, conn) {
-                info!(
-                    conn,
-                    from = short(&old),
-                    session = short(&session),
-                    "agent follows its claude process to a new session"
-                );
-            }
+            .max();
+        let Some(conn) = mover else {
+            return;
+        };
+        let Some(bound) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let old = std::mem::replace(&mut bound.session, session.clone());
+        self.registry.agent_disconnected(&old, conn);
+        if self.pending.get(&old) == Some(&conn) {
+            self.pending.remove(&old);
+        }
+        if self.registry.agent_connected(&session, conn) {
+            info!(
+                conn,
+                from = short(&old),
+                session = short(&session),
+                "agent follows its claude process to a new session"
+            );
         }
     }
 
@@ -414,10 +451,13 @@ impl Slots {
     }
 
     fn on_control(&mut self, control: Control) {
-        let Control::TopicEdited {
-            thread_id,
-            message_id,
-        } = control;
+        let (thread_id, message_id) = match control {
+            Control::TopicEdited {
+                thread_id,
+                message_id,
+            } => (thread_id, message_id),
+            Control::Message(input) => return self.on_topic_message(input),
+        };
         if !self.options.can_delete
             || thread_id
                 .and_then(|t| self.registry.slot_by_topic(t))
@@ -426,6 +466,171 @@ impl Slots {
             return;
         }
         self.hand_off(Work::Delete, Op::Delete { message_id });
+    }
+
+    /// Forwards a topic message to the agent of the slot's current session,
+    /// or tells the user it did not get there. General and topics that are
+    /// not slots reach no agent and get no answer.
+    fn on_topic_message(&mut self, input: Inbound) {
+        let Some(thread_id) = input.thread_id else {
+            debug!("message outside a topic; not forwarded");
+            return;
+        };
+        let Some(slot) = self.registry.slot_by_topic(thread_id) else {
+            debug!("message in a topic without a slot; not forwarded");
+            return;
+        };
+        let ordinal = self.ordinal(slot);
+        let Some(content) = input.text else {
+            self.notify(slot, thread_id, TEXT_ONLY_NOTICE);
+            return;
+        };
+        let Some((session, conn)) = self.live_agent(slot) else {
+            info!(
+                ordinal,
+                "message for a session that is not on line; not delivered"
+            );
+            self.notify(slot, thread_id, OFFLINE_NOTICE);
+            return;
+        };
+        let mut meta = BTreeMap::from([
+            ("chat_id".to_owned(), self.options.chat_id.to_string()),
+            ("message_id".to_owned(), input.message_id.to_string()),
+            ("thread_id".to_owned(), thread_id.to_string()),
+        ]);
+        if let Some(reply_to) = input.reply_to {
+            meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
+        }
+        let inbound = HubMsg::Inbound { content, meta };
+        let sent = self
+            .conns
+            .get(&conn)
+            .is_some_and(|bound| bound.to_agent.try_send(inbound).is_ok());
+        if sent {
+            // Delivered: the next failure starts a new episode and is told at once.
+            self.notices.remove(&(slot, OFFLINE_NOTICE));
+            info!(
+                ordinal,
+                session = short(&session),
+                "message forwarded to the session agent"
+            );
+        } else {
+            warn!(
+                ordinal,
+                session = short(&session),
+                "agent queue full or closed; not delivered"
+            );
+            self.notify(slot, thread_id, OFFLINE_NOTICE);
+        }
+    }
+
+    /// The running top-level session of `slot` and its agent connection.
+    fn live_agent(&self, slot: SlotId) -> Option<(String, u64)> {
+        let session = self.registry.slot(slot)?.current_session.as_deref()?;
+        if !self.registry.is_live_top_level(session) {
+            return None;
+        }
+        let conn = self.registry.sessions.get(session)?.agent?;
+        self.conns
+            .contains_key(&conn)
+            .then(|| (session.to_owned(), conn))
+    }
+
+    /// The running top-level session currently represented by `conn` and
+    /// its slot. This is the reply-side counterpart of [`Self::live_agent`].
+    fn live_reply_slot(&self, conn: u64) -> Option<(String, SlotId)> {
+        let session = self.conns.get(&conn)?.session.as_str();
+        if !self.registry.is_live_top_level(session) {
+            return None;
+        }
+        let entry = self
+            .registry
+            .sessions
+            .get(session)
+            .filter(|entry| entry.agent == Some(conn))?;
+        let slot = entry.slot?;
+        (self.registry.slot(slot)?.current_session.as_deref() == Some(session))
+            .then(|| (session.to_owned(), slot))
+    }
+
+    /// Sends an agent's reply to the topic of its session: the chunks of
+    /// `split_for_telegram` in order, or one document when it prefers a file.
+    fn on_reply(&mut self, conn: u64, text: &str) {
+        let Some((session, slot)) = self.live_reply_slot(conn) else {
+            debug!(
+                conn,
+                "reply from an agent without the current live session; dropped"
+            );
+            return;
+        };
+        let ordinal = self.ordinal(slot);
+        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+            warn!(ordinal, "reply for a slot without a topic yet; dropped");
+            return;
+        };
+        let split = split_for_telegram(text, SplitOptions::default());
+        let ops: Vec<Op> = if split.prefer_file {
+            vec![Op::SendDocument {
+                thread_id: Some(thread_id),
+                document: Document {
+                    file_name: format!("reply-{}.txt", short(&session)),
+                    bytes: text.as_bytes().to_vec(),
+                    caption: None,
+                },
+            }]
+        } else {
+            split
+                .chunks
+                .into_iter()
+                .map(|chunk| message_op(thread_id, chunk))
+                .collect()
+        };
+        let parts = ops.len();
+        if self.send_messages(ops) {
+            info!(
+                ordinal,
+                session = short(&session),
+                parts,
+                "agent reply queued"
+            );
+        }
+    }
+
+    /// Sends `notice` to the slot's topic unless the slot got it within
+    /// `notice_every`.
+    fn notify(&mut self, slot: SlotId, thread_id: i64, notice: &'static str) {
+        let now = Instant::now();
+        if self
+            .notices
+            .get(&(slot, notice))
+            .is_some_and(|&last| now < last + self.options.notice_every)
+        {
+            debug!(
+                ordinal = self.ordinal(slot),
+                "notice sent to this slot recently; not repeated"
+            );
+            return;
+        }
+        if self.send_messages(vec![message_op(thread_id, notice.to_owned())]) {
+            self.notices.insert((slot, notice), now);
+        }
+    }
+
+    /// Hands all `ops` to the dispatch task in order, or none of them when
+    /// that would pass [`MAX_QUEUED_MESSAGES`].
+    fn send_messages(&mut self, ops: Vec<Op>) -> bool {
+        if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
+            if !self.overflow_warned {
+                self.overflow_warned = true;
+                warn!("too many messages wait for Telegram; new replies and notices are dropped");
+            }
+            return false;
+        }
+        self.queued_messages += ops.len();
+        for op in ops {
+            self.hand_off(Work::Message, op);
+        }
+        true
     }
 
     /// Never waits: the dispatch task does.
@@ -458,6 +663,17 @@ impl Slots {
                 }
                 Some(Err(error)) => debug!(%error, "forum service message not deleted"),
             },
+            Done::Message(delivery) => {
+                self.queued_messages = self.queued_messages.saturating_sub(1);
+                if self.queued_messages == 0 {
+                    self.overflow_warned = false;
+                }
+                match delivery {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => warn!(%error, "message to a topic not delivered"),
+                    None => warn!("message to a topic got no answer"),
+                }
+            }
             Done::Title {
                 session,
                 path,
@@ -619,6 +835,15 @@ impl Slots {
     }
 }
 
+fn message_op(thread_id: i64, text: String) -> Op {
+    Op::Send {
+        thread_id: Some(thread_id),
+        text,
+        reply_markup: None,
+        permission: false,
+    }
+}
+
 /// Enqueues jobs in order, waiting for room in the scheduler queue so the
 /// actor never has to; each answer comes back as a [`Done`].
 async fn dispatch_loop(
@@ -634,6 +859,7 @@ async fn dispatch_loop(
             let _ = done.send(match work {
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
+                Work::Message => Done::Message(delivery),
             });
         });
     }
@@ -695,12 +921,15 @@ mod tests {
         send_errors: Mutex<Vec<&'static str>>,
         delete_error: Option<&'static str>,
         stall: bool,
+        /// Only sends never return; topic calls still answer.
+        stall_sends: bool,
     }
 
     impl Transport for Fake {
         async fn execute(&self, op: &Op) -> Delivery {
             self.ops.lock().unwrap().push(op.clone());
-            if self.stall {
+            let send = matches!(op, Op::Send { .. } | Op::SendDocument { .. });
+            if self.stall || (self.stall_sends && send) {
                 return std::future::pending().await;
             }
             let error = |description: &str| {
@@ -861,6 +1090,507 @@ mod tests {
             } => Some(icon),
             _ => None,
         }
+    }
+
+    const CHAT: i64 = -1000000000001;
+
+    fn say(thread_id: Option<i64>, message_id: i64, text: Option<&str>) -> Control {
+        Control::Message(Inbound {
+            message_id,
+            thread_id,
+            text: text.map(str::to_owned),
+            reply_to: None,
+        })
+    }
+
+    fn message_options() -> Options {
+        Options {
+            chat_id: CHAT,
+            ..options()
+        }
+    }
+
+    /// What agent `index` (in registration order) received, after a pause.
+    async fn received(rig: &mut Rig, index: usize) -> Vec<HubMsg> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut got = Vec::new();
+        while let Ok(msg) = rig._to_agent[index].try_recv() {
+            got.push(msg);
+        }
+        got
+    }
+
+    fn sent_to(ops: &[Op], thread: i64) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(t),
+                    text,
+                    ..
+                } if *t == thread => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Topic 100 for A (agent 0, conn 1) and, with `second`, topic 101 for B
+    /// (agent 1, conn 2); waits until both are alive.
+    async fn two_live_slots(rig: &mut Rig, second: bool) {
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        if second {
+            rig.hook(start(B, 11)).await;
+            settled(rig, |ops| count(ops, is_create) == 2).await;
+            rig.agent_of(2, B, Some(11)).await;
+            settled(rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
+        }
+        settled(rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+    }
+
+    #[tokio::test]
+    async fn a_topic_message_reaches_only_the_agent_of_its_slot() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        let before = rig.fake.ops().len();
+        rig.control.send(say(Some(101), 42, Some("hi B"))).unwrap();
+        rig.control
+            .send(Control::Message(Inbound {
+                message_id: 43,
+                thread_id: Some(101),
+                text: Some("again".into()),
+                reply_to: Some(40),
+            }))
+            .unwrap();
+        // General and a topic that is no slot reach nobody and say nothing.
+        rig.control.send(say(None, 44, Some("general"))).unwrap();
+        rig.control
+            .send(say(Some(999), 45, Some("foreign")))
+            .unwrap();
+
+        let got = received(&mut rig, 1).await;
+        let meta = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            got,
+            [
+                HubMsg::Inbound {
+                    content: "hi B".into(),
+                    meta: meta(&[
+                        ("chat_id", "-1000000000001"),
+                        ("message_id", "42"),
+                        ("thread_id", "101"),
+                    ]),
+                },
+                HubMsg::Inbound {
+                    content: "again".into(),
+                    meta: meta(&[
+                        ("chat_id", "-1000000000001"),
+                        ("message_id", "43"),
+                        ("reply_to_message_id", "40"),
+                        ("thread_id", "101"),
+                    ]),
+                },
+            ]
+        );
+        for msg in &got {
+            if let HubMsg::Inbound { meta, .. } = msg {
+                assert!(meta.keys().all(|key| crate::channel::is_meta_key(key)));
+            }
+        }
+        assert!(received(&mut rig, 0).await.is_empty(), "A got nothing");
+        assert_eq!(
+            rig.fake.ops().len(),
+            before,
+            "no notice: {:?}",
+            rig.fake.ops()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_nobody_can_take_gets_one_notice_each() {
+        // Every path once; the per-slot minute is its own test.
+        let options = Options {
+            notice_every: Duration::ZERO,
+            ..message_options()
+        };
+        let mut rig = rig(Fake::default(), options);
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        // A session without an agent.
+        rig.control.send(say(Some(100), 1, Some("one"))).unwrap();
+        settled(&rig, |ops| sent_to(ops, 100).len() == 1).await;
+        // An agent whose link queue is gone.
+        rig.agent_of(1, A, Some(10)).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        rig._to_agent.clear();
+        rig.control.send(say(Some(100), 2, Some("two"))).unwrap();
+        settled(&rig, |ops| sent_to(ops, 100).len() == 2).await;
+        // A photo: only text is forwarded.
+        rig.control.send(say(Some(100), 3, None)).unwrap();
+        settled(&rig, |ops| sent_to(ops, 100).len() == 3).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            sent_to(&rig.fake.ops(), 100),
+            [OFFLINE_NOTICE, OFFLINE_NOTICE, TEXT_ONLY_NOTICE]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ended_session_gets_no_inbound_even_with_its_agent_still_linked() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_DEAD)).await;
+        rig.control.send(say(Some(100), 4, Some("four"))).unwrap();
+        settled(&rig, |ops| sent_to(ops, 100) == [OFFLINE_NOTICE]).await;
+        assert!(received(&mut rig, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn after_clear_the_new_session_of_the_slot_gets_the_message() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        rig.hook(hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ))
+        .await;
+        settled(&rig, |ops| {
+            sent_to(ops, 100).contains(&"── session bbbbbbbb · new ──")
+        })
+        .await;
+        rig.control
+            .send(say(Some(100), 7, Some("after clear")))
+            .unwrap();
+        let got = received(&mut rig, 0).await;
+        assert!(
+            matches!(got.as_slice(), [HubMsg::Inbound { content, .. }] if content == "after clear"),
+            "{got:?}"
+        );
+        assert_eq!(count(&rig.fake.ops(), is_create), 1);
+    }
+
+    fn reply(conn: u64, text: &str) -> AgentEvent {
+        AgentEvent::Message {
+            conn,
+            msg: AgentMsg::Reply { text: text.into() },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_goes_to_its_session_topic_in_split_order() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        let paragraph = |c: char| format!("{}\n\n", c.to_string().repeat(3000));
+        let long: String = ['a', 'b', 'c'].into_iter().map(paragraph).collect();
+        let want = split_for_telegram(&long, SplitOptions::default());
+        assert!(want.chunks.len() > 1 && !want.prefer_file);
+        rig.agents.send(reply(2, &long)).await.unwrap();
+        rig.agents.send(reply(2, "short")).await.unwrap();
+        let expected: Vec<&str> = want
+            .chunks
+            .iter()
+            .map(String::as_str)
+            .chain(["short"])
+            .collect();
+        let ops = settled(&rig, |ops| sent_to(ops, 101).len() == expected.len()).await;
+        assert_eq!(sent_to(&ops, 101), expected);
+        assert!(sent_to(&ops, 100).is_empty());
+
+        // More chunks than `max_chunks`: one document with the whole text.
+        let huge = "x".repeat(5 * 4096);
+        rig.agents.send(reply(1, &huge)).await.unwrap();
+        let ops = settled(&rig, |ops| {
+            ops.iter().any(|op| matches!(op, Op::SendDocument { .. }))
+        })
+        .await;
+        assert!(ops.iter().any(|op| matches!(op,
+            Op::SendDocument { thread_id: Some(100), document } if document.bytes == huge.as_bytes())));
+    }
+
+    #[tokio::test]
+    async fn a_reply_from_an_agent_without_a_slot_is_dropped() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.agent(5, B).await; // no SessionStart for B: waits, unbound
+        let before = rig.fake.ops().len();
+        rig.agents.send(reply(5, "lost")).await.unwrap();
+        rig.agents.send(reply(99, "unknown conn")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(rig.fake.ops().len(), before, "{:?}", rig.fake.ops());
+    }
+
+    #[tokio::test]
+    async fn a_late_reply_cannot_cross_into_a_reused_slot() {
+        let dir = TempDir::new("slots-late-reply");
+        let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&start(B, 11));
+        connect(&mut slots, 2, B, Some(11));
+
+        slots.on_reply(1, "late A");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+        slots.on_reply(2, "current B");
+        let ops = wait_for_ops(&fake, 1).await;
+        assert!(
+            matches!(&ops[0], Op::Send { thread_id: Some(100), text, .. } if text == "current B")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_duplicate_connection_cannot_reply() {
+        let dir = TempDir::new("slots-duplicate-reply");
+        let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        connect(&mut slots, 2, A, Some(10));
+
+        slots.on_reply(1, "stale connection");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+        slots.on_reply(2, "current connection");
+        let ops = wait_for_ops(&fake, 1).await;
+        assert!(
+            matches!(&ops[0], Op::Send { thread_id: Some(100), text, .. } if text == "current connection")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrebound_connection_cannot_reply_after_clear() {
+        let dir = TempDir::new("slots-clear-reply");
+        let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, None);
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: None,
+            },
+        ));
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: None,
+                parent_claude_pid: None,
+            },
+        ));
+
+        slots.on_reply(1, "stale after clear");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+    }
+
+    #[tokio::test]
+    async fn a_multi_chunk_reply_is_rejected_atomically_at_the_cap() {
+        let dir = TempDir::new("slots-atomic-reply");
+        let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
+        let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
+        let split = split_for_telegram(&text, SplitOptions::default());
+        assert!(split.chunks.len() > 1 && !split.prefer_file);
+
+        slots.on_reply(1, &text);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES - 1);
+        assert!(slots.overflow_warned);
+        assert!(fake.ops().is_empty(), "{:?}", fake.ops());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_telegram_never_stalls_inbound() {
+        let fake = Fake {
+            stall_sends: true,
+            ..Fake::default()
+        };
+        let mut rig = rig(fake, message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.hook(start(B, 11)).await; // slot 101, no agent: notices
+        settled(&rig, |ops| count(ops, is_create) == 2).await;
+        // Far more replies than the scheduler queue (1024) and the cap, plus
+        // a burst to a slot without an agent (one notice): every send is
+        // stuck behind a send that never ends.
+        let flood = async {
+            for i in 0..1500 {
+                rig.agents.send(reply(1, "stuck")).await.unwrap();
+                rig.control.send(say(Some(101), i, Some("x"))).unwrap();
+            }
+        };
+        tokio::time::timeout(WAIT, flood)
+            .await
+            .expect("agent events kept draining");
+        rig.control
+            .send(say(Some(100), 5000, Some("still here")))
+            .unwrap();
+        let arrived = async {
+            loop {
+                if let Some(HubMsg::Inbound { content, .. }) = rig._to_agent[0].recv().await
+                    && content == "still here"
+                {
+                    return;
+                }
+            }
+        };
+        tokio::time::timeout(WAIT, arrived)
+            .await
+            .expect("inbound reached the agent while Telegram stalled");
+    }
+
+    /// The actor alone, driven by direct calls; Telegram never answers, so
+    /// `queued_messages` counts every message handed out.
+    fn stalled_slots(dir: &TempDir, options: Options) -> Slots {
+        stalled_slots_with_fake(dir, options).1
+    }
+
+    fn stalled_slots_with_fake(dir: &TempDir, options: Options) -> (Arc<Fake>, Slots) {
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled.clone(), BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let slots = Slots::new(Registry::default(), store, outbox, options).0;
+        (stalled, slots)
+    }
+
+    fn connect(slots: &mut Slots, conn: u64, session: &str, claude_pid: Option<u32>) {
+        let (to_agent, _from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                session_id: session.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid,
+            },
+            to_agent,
+        });
+    }
+
+    async fn wait_for_ops(fake: &Arc<Fake>, count: usize) -> Vec<Op> {
+        let reached = async {
+            loop {
+                let ops = fake.ops();
+                if ops.len() >= count {
+                    return ops;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, reached)
+            .await
+            .expect("ops in time")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_to_a_dead_slot_gets_one_notice_a_minute() {
+        let dir = TempDir::new("slots-notice");
+        let mut slots = stalled_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.on_hook(&start(B, 11));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        for i in 0..10 {
+            slots.on_control(say(Some(100), i, Some("x")));
+        }
+        assert_eq!(slots.queued_messages, 1, "one offline notice for the burst");
+        // Another kind of notice and another slot count on their own.
+        for i in 10..15 {
+            slots.on_control(say(Some(100), i, None));
+        }
+        assert_eq!(slots.queued_messages, 2, "one text-only notice");
+        for i in 15..20 {
+            slots.on_control(say(Some(101), i, Some("x")));
+        }
+        assert_eq!(slots.queued_messages, 3, "one notice for the other slot");
+        tokio::time::advance(Duration::from_secs(59)).await;
+        slots.on_control(say(Some(100), 20, Some("x")));
+        assert_eq!(slots.queued_messages, 3, "still inside the minute");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        slots.on_control(say(Some(100), 21, Some("x")));
+        assert_eq!(slots.queued_messages, 4, "a minute later: one more");
+        // A delivered message ends the offline episode: the next failure is
+        // reported at once, then the minute starts again.
+        let (to_agent, mut agent_rx) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+            },
+            to_agent,
+        });
+        slots.on_control(say(Some(100), 22, Some("delivered")));
+        assert!(matches!(agent_rx.try_recv(), Ok(HubMsg::Inbound { .. })));
+        assert_eq!(slots.queued_messages, 4);
+        drop(agent_rx);
+        slots.on_control(say(Some(100), 23, Some("x")));
+        slots.on_control(say(Some(100), 24, Some("x")));
+        assert_eq!(slots.queued_messages, 5, "one notice for the new episode");
+    }
+
+    #[tokio::test]
+    async fn the_backlog_of_messages_for_telegram_is_capped() {
+        let dir = TempDir::new("slots-cap");
+        let options = Options {
+            notice_every: Duration::ZERO,
+            ..message_options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "t", None);
+        for i in 0..MAX_QUEUED_MESSAGES as i64 + 50 {
+            slots.on_control(say(Some(100), i, Some("x")));
+        }
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+        assert!(slots.overflow_warned);
+        // An answer frees one place and the next notice takes it.
+        slots.on_done(Done::Message(None));
+        slots.on_control(say(Some(100), 1000, Some("x")));
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
     }
 
     fn count(ops: &[Op], pred: impl Fn(&Op) -> bool) -> usize {

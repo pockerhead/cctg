@@ -1,0 +1,25 @@
+   Compiling dotenvy v0.15.7
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-021\scratch\reviewer2\ws\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 3m 17s
+     Running unittests src\lib.rs (C:/Users/user/AppData/Local/Temp/cctg-t021-rev2-target\debug\deps\cctg-153a26ffdcdb83a3.exe)
+
+running 1 test
+test hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute ... FAILED
+
+failures:
+
+---- hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute stdout ----
+
+thread 'hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute' (37004) panicked at crates\cctg\src\hub\slots.rs:1368:9:
+assertion `left == right` failed: one offline notice for the burst
+  left: 10
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 233 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p cctg --lib`

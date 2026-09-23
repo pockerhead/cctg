@@ -1,0 +1,20 @@
+import datetime, io, json, os
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'log.jsonl')
+ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+base = dict(stage='planner', provider='claude', model='opus', effort='medium')
+S, M, U = 'crates/cctg/src/hub/slots.rs', 'crates/cctg/src/hub/mod.rs', 'crates/cctg/src/hub/updates.rs'
+entries = [
+ ('decision', "Topic messages reach the slot actor as a new Control::Message(Inbound) over the existing unbounded control channel; the actor resolves slot -> current live top-level session -> bound conn and does Conn.to_agent.try_send (never await). Alternative: a separate router task holding a copy of the bindings (two owners of slot/session/agent state, the thing TASK-011 forbade).", [S, M]),
+ ('decision', "Agent replies and 'not on line' notices go through the actor's existing dispatch task as Work::Message, fire-and-forget, FIFO with topic jobs; chunks from split_for_telegram, one document when prefer_file. Alternative: reuse commands::deliver in a spawned task per reply (awaits each chunk, two replies could interleave, extra task per reply).", [S, 'crates/cctg/src/hub/commands.rs']),
+ ('decision', "Outbound messages waiting for Telegram are capped at MAX_QUEUED_MESSAGES=256 (counter in the actor, decremented on Done::Message); a reply that does not fit is dropped whole with one warning. Alternative: unbounded (an agent looping on reply while Telegram is in retry_after grows hub memory without limit).", [S]),
+ ('decision', "reply_to meta is the id of reply_to_message only when it differs from message_thread_id: Telegram sets reply_to_message to the topic root on every message in a forum topic (hermes-agent issue #118678). Alternative: pass reply_to_message as is (every message would look like a reply to the topic-created service message).", [U, 'crates/cctg/src/hub/api.rs']),
+ ('decision', "General and topics that are not slots get no forwarding and no notice (debug log only); a slot topic whose session is ended, has no agent, or whose agent queue is full/closed gets OFFLINE_NOTICE; a non-text message gets TEXT_ONLY_NOTICE. Alternative: notice in General too (General is dashboard + commands; a notice there answers chatter the hub never promised to route).", [S]),
+ ('dead_end', "First message_logs test sent the offline-notice message on the control channel and then registered the agent: select! picked the agent event first, the 'offline' text was forwarded to the agent. Tests now wait for the notice op before the next input on another channel. Same lesson as TASK-011's hook/agent reorder.", ['crates/cctg/tests/message_logs.rs']),
+ ('dead_end', "The reply in message_logs did not arrive within 500 ms: the default BucketConfig keeps a 1 s min_gap after the notice. Integration tests through the real Scheduler use a fast bucket (TASK-011 QA lesson).", ['crates/cctg/tests/message_logs.rs']),
+ ('dead_end', "The 'sends <= MAX_QUEUED_MESSAGES' assertion in the stalled-Telegram test was vacuous: with a stalled transport the scheduler never gets past the first send. Replaced with a direct actor test of the counter (mutation M3 now killed).", [S, 'maw/tasks/in_progress/TASK-021/scratch/planner/mutations.out.txt']),
+ ('decision', "docs/poc.md uses a temporary --mcp-config plus --settings for hooks. The CLI reference says hooks are not loaded from --settings; a claude -p probe on 2.1.280 showed a SessionStart hook from --settings firing. The recipe keeps .claude/settings.local.json of the probe folder as the named fallback. Alternative: register the server and hooks globally (touches the user's global config, forbidden for the PoC).", ['maw/tasks/in_progress/TASK-021/scratch/planner/probe/cmd.txt', 'docs/poc.md']),
+]
+with io.open(LOG, 'a', encoding='utf-8', newline='\n') as f:
+    for kind, body, refs in entries:
+        f.write(json.dumps(dict(ts=ts, **base, kind=kind, body=body, refs=refs), ensure_ascii=False) + '\n')
+print('appended', len(entries))

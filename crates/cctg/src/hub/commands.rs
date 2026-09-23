@@ -69,12 +69,17 @@ pub enum Parsed {
     NotOurs,
 }
 
-/// True for texts the command worker should see.
+/// True for texts the command worker should see: only `/brief` and `/full`
+/// (optionally `@bot`). Any other text, including `/compact` or a path like
+/// `/tmp/x`, is a message for the session.
 pub fn is_command(input: &Inbound) -> bool {
-    input
-        .text
-        .as_deref()
-        .is_some_and(|text| text.trim_start().starts_with('/'))
+    input.text.as_deref().is_some_and(|text| {
+        text.split_whitespace()
+            .next()
+            .and_then(|word| word.strip_prefix('/'))
+            .map(|head| head.split_once('@').map_or(head, |(name, _)| name))
+            .is_some_and(|name| name == "brief" || name == "full")
+    })
 }
 
 /// Parses `/brief`, `/full`, optionally `@<bot_username>`, then `[n] [prefix]`.
@@ -421,12 +426,8 @@ pub async fn handle<L: TranscriptLocator>(
     let thread_id = input.thread_id;
     let command = match parse(text, bot_username) {
         Parsed::NotOurs => {
-            if let Some(command) = text
-                .split_whitespace()
-                .next()
-                .filter(|command| command.starts_with('/'))
-            {
-                debug!(command, "unknown slash command");
+            if text.trim_start().starts_with('/') {
+                debug!("unknown slash command");
             }
             return;
         }
@@ -484,6 +485,29 @@ pub async fn serve<L: TranscriptLocator>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_our_commands_are_commands() {
+        let input = |text: &str| crate::hub::updates::Inbound {
+            message_id: 1,
+            thread_id: Some(2),
+            text: Some(text.to_owned()),
+            reply_to: None,
+        };
+        for text in ["/brief", "/full 2", " /brief@cctg_bot 3", "/full@other_bot"] {
+            assert!(super::is_command(&input(text)), "{text}");
+        }
+        for text in [
+            "/compact",
+            "/tmp/app.log fails",
+            "/briefly",
+            "hello",
+            "",
+            "/",
+        ] {
+            assert!(!super::is_command(&input(text)), "{text}");
+        }
+    }
+
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
@@ -593,6 +617,7 @@ mod tests {
                 message_id: 1,
                 thread_id: THREAD,
                 text: Some((*text).to_owned()),
+                reply_to: None,
             })
             .unwrap();
         }

@@ -1,0 +1,8 @@
+5288952075d2af1e7476309fdc01e0ed97897b95c2a6ef9153f33f0ac8b19363  crates/cctg/src/hub/api.rs
+36b3df8b93593c475f3190676711b828647833ef9d13e075dfe3a61bee90b9c1  crates/cctg/src/hub/commands.rs
+c9e379f41ac9ffecf9b6bdb31200ee249b10e0cf94a84062b92ab1e978e2ccd1  crates/cctg/src/hub/mod.rs
+d91ec08d67ecef2b74cba05da740b4527cc32f8052c2fae675474aca96ced9f4  crates/cctg/src/hub/slots.rs
+7f4d3d3fa99c43585ab1f34e70c94f96ba94e0ece2a298a958aae23427147ff8  crates/cctg/src/hub/updates.rs
+de4a352af02d058b82fff29f37f451f38afd627dc6d5240f726e58a9bfc437d8  crates/cctg/tests/command_logs.rs
+c80cf1ed7f1060191b45e1a9cd58d2f72fd4fb7cc53183e4c550d99f75a8db6e  crates/cctg/tests/message_logs.rs
+314bdab44852ee246a8dc95fe4802c510845f8a89234284dc6c44d5197242927  docs/poc.md

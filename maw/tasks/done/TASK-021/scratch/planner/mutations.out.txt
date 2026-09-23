@@ -1,0 +1,13 @@
+M1 live filter removed:
+test hub::slots::tests::an_ended_session_gets_no_inbound_even_with_its_agent_still_linked ... FAILED
+test result: FAILED. 26 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 60.14s
+M2 topic-root reply kept:
+test hub::updates::tests::only_an_explicit_reply_is_a_reply ... FAILED
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 220 filtered out; finished in 0.05s
+M3 cap removed:
+test hub::slots::tests::the_backlog_of_messages_for_telegram_is_capped ... FAILED
+test result: FAILED. 27 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 6.82s
+M4 commands forwarded as messages:
+test hub::tests::messages_go_to_the_slot_actor_and_commands_do_not ... FAILED
+test hub::tests::a_slow_command_does_not_hold_up_polling ... FAILED
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 229 filtered out; finished in 10.03s

@@ -30,6 +30,8 @@
 - 2026-09-23 (TASK-013): live probes should define the server in a temporary `claude --mcp-config <file>` (accepted by `--dangerously-load-development-channels server:<name>`) instead of `claude mcp add --scope user`, which leaks into every live session; Claude Code still records a `projects[<dir>]` key in `~/.claude.json` for each new probe folder, so reuse one fixed folder.
 - 2026-09-23 (TASK-013): a relay set that only a hub verdict can close leaks forever (prompts answered in the terminal); a verdict filter by open id drops late verdicts. Forward verdicts, dedupe requests with a bounded FIFO.
 
+- 2026-09-23 (TASK-021, 2.1.280): hooks defined in a file passed with `claude --settings <file>` do fire (the CLI help text suggesting otherwise is outdated). `CLAUDE_CONFIG_DIR=<dir>` moves the whole config including `.claude.json`: a session run that way leaves the user's real `~/.claude.json` untouched but needs its own login. `docs/poc.md` uses both for the local end-to-end run.
+
 ## Pointers
 - `CLAUDE.md` (repo root), section "Channels": verified facts, Claude Code 2.1.278; TASK-004 observed on 2.1.280.
 - `maw/tasks/done/TASK-004/scratch/FINDINGS.md`: 4-mode table, exact MVP launch command and aliases, probe server (`probe_channel_server.py`) and redacted probe logs.

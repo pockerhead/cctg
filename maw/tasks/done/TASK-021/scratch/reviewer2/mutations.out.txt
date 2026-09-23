@@ -1,0 +1,38 @@
+M1 live filter removed: KILLED
+test hub::slots::tests::an_ended_session_gets_no_inbound_even_with_its_agent_still_linked ... FAILED
+thread 'hub::slots::tests::an_ended_session_gets_no_inbound_even_with_its_agent_still_linked' (39240) panicked at crates\cctg\src\hub\slots.rs:1531:23:
+test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 60.15s
+M2 topic-root reply kept: KILLED
+test hub::updates::tests::only_an_explicit_reply_is_a_reply ... FAILED
+thread 'hub::updates::tests::only_an_explicit_reply_is_a_reply' (25200) panicked at crates\cctg\src\hub\updates.rs:376:9:
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 222 filtered out; finished in 0.05s
+M3 cap removed: KILLED
+test hub::slots::tests::the_backlog_of_messages_for_telegram_is_capped ... FAILED
+thread 'hub::slots::tests::the_backlog_of_messages_for_telegram_is_capped' (35600) panicked at crates\cctg\src\hub\slots.rs:1451:9:
+test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 6.85s
+M4 commands forwarded as messages: KILLED
+test hub::tests::messages_go_to_the_slot_actor_and_commands_do_not ... FAILED
+test hub::tests::a_slow_command_does_not_hold_up_polling ... FAILED
+thread 'hub::tests::messages_go_to_the_slot_actor_and_commands_do_not' (36020) panicked at crates\cctg\src\hub\mod.rs:357:36:
+thread 'hub::tests::a_slow_command_does_not_hold_up_polling' (8472) panicked at crates\cctg\src\hub\mod.rs:321:14:
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 230 filtered out; finished in 10.02s
+MF1 notice cooldown removed: KILLED
+test hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute ... FAILED
+thread 'hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute' (30400) panicked at crates\cctg\src\hub\slots.rs:1400:9:
+test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 7.11s
+MF2 delivery does not re-arm the offline notice: KILLED
+test hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute ... FAILED
+thread 'hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute' (12464) panicked at crates\cctg\src\hub\slots.rs:1435:9:
+test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 8.16s
+MF3 one cooldown per slot for every kind: KILLED
+test hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute ... FAILED
+thread 'hub::slots::tests::a_burst_to_a_dead_slot_gets_one_notice_a_minute' (36028) panicked at crates\cctg\src\hub\slots.rs:1405:9:
+test result: FAILED. 28 passed; 1 failed; 0 ignored; 0 measured; 205 filtered out; finished in 8.33s
+MF4 overflow warns every time: KILLED
+test one_overflow_warning_per_episode ... FAILED
+thread 'one_overflow_warning_per_episode' (40968) panicked at crates\cctg\tests\overflow_logs.rs:163:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+MF5 overflow warning never re-armed: KILLED
+test one_overflow_warning_per_episode ... FAILED
+thread 'one_overflow_warning_per_episode' (25748) panicked at crates\cctg\tests\overflow_logs.rs:81:29:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 61.00s

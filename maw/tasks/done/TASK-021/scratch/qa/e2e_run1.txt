@@ -1,0 +1,27 @@
+[PASS] slot A agent got exactly its message, topic-root reply_to filtered: [("m1 QAMARK_ONE", [("chat_id", "-1000000000001"), ("message_id", "1001"), ("thread_id", "100")])]
+[PASS] slot B agent got its message with explicit reply id: [("m2 QAMARK_TWO", [("chat_id", "-1000000000001"), ("message_id", "1002"), ("reply_to_message_id", "55"), ("thread_id", "101")])]
+[PASS] meta keys only [A-Za-z0-9_]
+[PASS] commands (and any text starting with '/') go to the command worker, not to agents: ["/brief 2", "/QAMARK_SLASH do it", "  /tmp/QAMARK_PATH.log fails"]
+[PASS] General/foreign/stranger/service produced no notice
+[PASS] 4-chunk reply stays messages
+[PASS] reply chunks in order to topic 101 (got 5 parts)
+[PASS] chunks concatenate back to the reply
+[PASS] 5-chunk reply prefers file
+[PASS] >4 chunks -> exactly one document with the whole text, no message chunks
+[PASS] no document to the other topic
+[PASS] 10 messages to dead slot -> 1 offline notice (got 1)
+[PASS] ended session's still-linked agent got no inbound
+[PASS] 3 photos -> 1 text-only notice (got 1)
+[PASS] inside 60 s -> no second notice (got 1)
+[PASS] after 60 s -> exactly one more notice (got 2)
+[PASS] late reply of an ended session dropped
+[PASS] after /clear the moved connection receives the slot's message: [("after clear QAMARK_CLEAR", [("chat_id", "-1000000000001"), ("message_id", "1400"), ("thread_id", "100")])]
+[PASS] reply after /clear lands in the slot topic
+[PASS] /clear created no topic
+[PASS] re-registered stale-id agent gets inbound: [("after relink", [("chat_id", "-1000000000001"), ("message_id", "1500"), ("thread_id", "100")])]
+[PASS] gone conn dropped, relinked conn replies
+[PASS] resumed session in its old slot gets inbound: [("resumed B", [("chat_id", "-1000000000001"), ("message_id", "1600"), ("thread_id", "101")])]
+[PASS] per-topic FIFO under interleaving
+[PASS] inbound reaches agent while Telegram stalls: [("through the stall", [("chat_id", "-1000000000001"), ("message_id", "1001"), ("thread_id", "100")])]
+[PASS] no message text, user id or path in logs
+fails=0

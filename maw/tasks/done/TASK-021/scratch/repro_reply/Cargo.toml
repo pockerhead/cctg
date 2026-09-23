@@ -1,0 +1,10 @@
+[package]
+name = "task021-repro-reply"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+cctg = { path = "C:/Users/user/dev/cctg/crates/cctg" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
