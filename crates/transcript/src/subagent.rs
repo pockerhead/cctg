@@ -39,6 +39,8 @@ pub struct SubagentInput<'a> {
     pub agent_id: &'a str,
     /// Hook `agent_type` or the parent call's `subagent_type`; used when the meta has no `agentType`.
     pub agent_type: Option<&'a str>,
+    /// The parent `Agent` call's `description`; used when the meta has no `description`.
+    pub description: Option<&'a str>,
     /// Text of `agent-<id>.meta.json`; `None` when the file is missing.
     pub meta: Option<&'a str>,
     /// `tool_input.message` of the `SubagentHandback` hook.
@@ -97,7 +99,8 @@ pub struct Subagent {
 }
 
 impl Subagent {
-    /// Header: type from the meta, else `input.agent_type`, else `agent`; description from the meta only.
+    /// Header: type from the meta, else `input.agent_type`, else `agent`; description from the meta,
+    /// else `input.description`.
     /// Body: the report, else the finished transcript brief (when its final answer equals
     /// `last_assistant_message`, if given), else `last_assistant_message`, else the unfinished
     /// transcript brief, else empty.
@@ -112,7 +115,12 @@ impl Subagent {
         Self {
             agent_id: input.agent_id.to_owned(),
             agent_type,
-            description: meta.description.as_deref().map(one_line),
+            description: meta
+                .description
+                .as_deref()
+                .or(input.description)
+                .map(one_line)
+                .filter(|description| !description.is_empty()),
             body: body(&input),
         }
     }
@@ -135,13 +143,18 @@ impl Subagent {
         self.description.as_deref()
     }
 
-    /// `↳ <type> <id>[: <description>]`, then the body lines. The body is always brief.
-    pub fn render(&self) -> String {
-        let header = agent_header(
+    /// `↳ <type> <id>[: <description>]`, the first line of [`Subagent::render`].
+    pub fn header(&self) -> String {
+        agent_header(
             self.agent_type().unwrap_or("agent"),
             Some(&self.agent_id),
             self.description.as_deref(),
-        );
+        )
+    }
+
+    /// `↳ <type> <id>[: <description>]`, then the body lines. The body is always brief.
+    pub fn render(&self) -> String {
+        let header = self.header();
         match self.body.text() {
             "" => header,
             body => format!("{header}\n{body}"),

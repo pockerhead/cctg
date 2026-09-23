@@ -29,6 +29,7 @@ fn explore(report: Option<&str>) -> Subagent {
     Subagent::new(SubagentInput {
         agent_id: "a0000000000000002",
         agent_type: Some("general-purpose"),
+        description: Some("call description"),
         meta: Some(META),
         report,
         transcript: Some(SUBAGENT),
@@ -309,6 +310,34 @@ fn body_source_order_is_fixed() {
     });
     assert_eq!(empty.body().text(), "");
     assert_eq!(empty.render(), "↳ agent a1");
+}
+
+#[test]
+fn the_call_description_stands_in_for_a_missing_meta() {
+    let header = |meta: Option<&str>, description: Option<&str>| {
+        Subagent::new(SubagentInput {
+            agent_id: "a1",
+            agent_type: Some("Explore"),
+            description,
+            meta,
+            ..SubagentInput::default()
+        })
+        .header()
+    };
+    assert_eq!(
+        header(None, Some("List\n the modules")),
+        "↳ Explore a1: List the modules"
+    );
+    assert_eq!(header(None, Some("  ")), "↳ Explore a1");
+    assert_eq!(header(None, None), "↳ Explore a1");
+    // The meta wins over the call.
+    assert_eq!(
+        header(Some(META), Some("call description")),
+        "↳ Explore a1: Explore crate"
+    );
+    // The header is the first line of the rendering.
+    let block = explore(Some(REPORT));
+    assert_eq!(block.render(), format!("{}\n{REPORT}", block.header()));
 }
 
 #[test]

@@ -229,6 +229,21 @@ pub fn topic_title(host: &str, folder: &str, ordinal: u32, label: Option<&str>) 
     title
 }
 
+/// Last line of a block whose subagent or nested run is still working.
+pub const BLOCK_RUNNING: &str = "в работе…";
+/// Last line of a block whose session ended before its result arrived.
+pub const BLOCK_LOST: &str = "итог не получен";
+/// Tries of one block send or edit before it is given up.
+pub const MAX_BLOCK_ATTEMPTS: u32 = 5;
+/// Subagent records kept; beyond this the oldest settled one is forgotten
+/// (a reply to its block then carries no `target_agent`).
+pub const MAX_SUBAGENTS: usize = 1024;
+
+/// `⇣ nested <short id>`, the header of a nested run's block.
+pub fn nested_header(session_id: &str) -> String {
+    format!("⇣ nested {}", short(session_id))
+}
+
 pub fn separator(session_id: &str, resumed: bool) -> String {
     let how = if resumed { "resumed" } else { "new" };
     format!("── session {} · {how} ──", short(session_id))
@@ -301,13 +316,93 @@ pub struct SessionEntry {
     pub agent: Option<u64>,
     #[serde(skip)]
     pub waiting: bool,
+    /// The `⇣ nested` block of a nested run in its parent's topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<Block>,
 }
 
+/// A subagent matched to an `Agent` call of its parent: it has a block in
+/// the topic of the parent's slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentEntry {
     pub parent_session: String,
     #[serde(default)]
     pub slot: Option<SlotId>,
+    #[serde(default)]
+    pub block: Block,
+    /// Registry sequence number of the confirmation; orders eviction.
+    #[serde(default)]
+    pub seen: u64,
+}
+
+/// One collapsed message in a topic: a subagent or a nested run. The
+/// registry keeps the text Telegram should show until Telegram took it, so a
+/// restart neither loses nor repeats it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Block {
+    /// `↳ <type> <id>[: <description>]` or `⇣ nested <id>`.
+    #[serde(default)]
+    pub header: String,
+    /// The topic the message went to.
+    #[serde(default)]
+    pub thread_id: Option<i64>,
+    #[serde(default)]
+    pub message_id: Option<i64>,
+    /// Text to send or edit to; `None` once Telegram shows it.
+    #[serde(default)]
+    pub pending: Option<String>,
+    /// The block still ends with [`BLOCK_RUNNING`].
+    #[serde(default)]
+    pub running: bool,
+    /// The first send is out without an answer. Found so after a restart,
+    /// the block is never sent again: Telegram may have it already.
+    #[serde(default)]
+    pub sending: bool,
+    /// A nested run's last turn answer, shown when the run ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(skip)]
+    pub busy: bool,
+    /// Waits for the retry tick.
+    #[serde(skip)]
+    pub failed: bool,
+    #[serde(skip)]
+    pub attempts: u32,
+}
+
+impl Block {
+    fn running(header: String) -> Self {
+        Self {
+            pending: Some(format!("{header}\n{BLOCK_RUNNING}")),
+            header,
+            running: true,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BlockKey {
+    /// By agent id.
+    Agent(String),
+    /// By the nested run's session id.
+    Nested(String),
+}
+
+/// A block message the actor should send or edit. At most one per block is
+/// in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockJob {
+    Send {
+        key: BlockKey,
+        thread_id: i64,
+        text: String,
+    },
+    Edit {
+        key: BlockKey,
+        message_id: i64,
+        text: String,
+    },
 }
 
 /// A topic call the actor should make. At most one per slot is in flight: the
@@ -640,6 +735,7 @@ impl Registry {
                 seen,
                 agent: None,
                 waiting: false,
+                block: None,
             });
         entry.kind = kind.clone();
         entry.slot = slot;
@@ -651,6 +747,19 @@ impl Registry {
         }
         if claude_pid.is_some() {
             entry.claude_pid = claude_pid;
+        }
+        if let SessionKind::Nested { parent: Some(_) } = &kind
+            && slot.is_some()
+        {
+            // One block per nested run, however often it starts.
+            match &mut entry.block {
+                None => entry.block = Some(Block::running(nested_header(session))),
+                Some(block) if !block.running => {
+                    block.pending = Some(format!("{}\n{BLOCK_RUNNING}", block.header));
+                    block.running = true;
+                }
+                Some(_) => {}
+            }
         }
         if let Some(pid) = claude_pid {
             self.pids
@@ -754,30 +863,12 @@ impl Registry {
                     ..Followup::default()
                 }
             }
-            HookEvent::SubagentStart {
-                agent_id,
-                agent_type,
-            }
-            | HookEvent::SubagentStop {
-                agent_id,
-                agent_type,
-                ..
-            } => {
-                // Claude Code's own internal agents have no type.
-                if !agent_type.is_empty() {
-                    let slot = self.sessions.get(session).and_then(|entry| entry.slot);
-                    let entry = SubagentEntry {
-                        parent_session: session.to_owned(),
-                        slot,
-                    };
-                    if self.subagents.get(agent_id) != Some(&entry) {
-                        self.subagents.insert(agent_id.clone(), entry);
-                        self.dirty = true;
-                    }
-                }
-                Followup::default()
-            }
-            HookEvent::SubagentHandback { .. } => Followup::default(),
+            // A subagent is recorded only once the slots actor matched it to
+            // an `Agent` call of its parent ([`Registry::confirm_subagent`]):
+            // Claude Code's internal agents must leave no trace.
+            HookEvent::SubagentStart { .. }
+            | HookEvent::SubagentStop { .. }
+            | HookEvent::SubagentHandback { .. } => Followup::default(),
         }
     }
 
@@ -848,6 +939,298 @@ impl Registry {
             slot.busy = false;
             slot.failed = None;
         }
+        for block in self.blocks_mut() {
+            block.busy = false;
+            block.failed = false;
+            block.attempts = 0;
+        }
+    }
+
+    fn blocks_mut(&mut self) -> impl Iterator<Item = &mut Block> {
+        let agents = self.subagents.values_mut().map(|entry| &mut entry.block);
+        let nested = self
+            .sessions
+            .values_mut()
+            .filter_map(|entry| entry.block.as_mut());
+        agents.chain(nested)
+    }
+
+    pub fn block(&self, key: &BlockKey) -> Option<&Block> {
+        match key {
+            BlockKey::Agent(id) => self.subagents.get(id).map(|entry| &entry.block),
+            BlockKey::Nested(session) => self.sessions.get(session)?.block.as_ref(),
+        }
+    }
+
+    fn block_mut(&mut self, key: &BlockKey) -> Option<&mut Block> {
+        match key {
+            BlockKey::Agent(id) => self.subagents.get_mut(id).map(|entry| &mut entry.block),
+            BlockKey::Nested(session) => self.sessions.get_mut(session)?.block.as_mut(),
+        }
+    }
+
+    pub fn block_slot(&self, key: &BlockKey) -> Option<SlotId> {
+        match key {
+            BlockKey::Agent(id) => self.subagents.get(id)?.slot,
+            BlockKey::Nested(session) => self.sessions.get(session)?.slot,
+        }
+    }
+
+    /// Records a subagent matched to an `Agent` call of `parent`, with a
+    /// running block. `false`: it has a block already (a repeated hook, a
+    /// restart), or the parent is not a top-level session with a slot.
+    pub fn confirm_subagent(&mut self, agent_id: &str, parent: &str, header: String) -> bool {
+        if self.subagents.contains_key(agent_id) {
+            return false;
+        }
+        let Some(slot) = self
+            .sessions
+            .get(parent)
+            .filter(|entry| entry.kind == SessionKind::TopLevel)
+            .and_then(|entry| entry.slot)
+        else {
+            return false;
+        };
+        if self.subagents.len() >= MAX_SUBAGENTS {
+            // The oldest block with nothing left to show goes; when every
+            // block still works or waits for Telegram, the new one is refused.
+            let settled = self
+                .subagents
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.block.running && entry.block.pending.is_none() && !entry.block.busy
+                })
+                .min_by_key(|(_, entry)| entry.seen)
+                .map(|(id, _)| id.clone());
+            let Some(oldest) = settled else {
+                return false;
+            };
+            self.subagents.remove(&oldest);
+        }
+        let seen = self.touch();
+        self.subagents.insert(
+            agent_id.to_owned(),
+            SubagentEntry {
+                parent_session: parent.to_owned(),
+                slot: Some(slot),
+                block: Block::running(header),
+                seen,
+            },
+        );
+        true
+    }
+
+    /// Keeps a nested run's last answer for its end. `false`: not a nested
+    /// run with a block.
+    pub fn set_nested_answer(&mut self, session: &str, answer: &str) -> bool {
+        let Some(block) = self
+            .sessions
+            .get_mut(session)
+            .filter(|entry| matches!(entry.kind, SessionKind::Nested { .. }))
+            .and_then(|entry| entry.block.as_mut())
+        else {
+            return false;
+        };
+        block.answer = Some(answer.to_owned());
+        self.dirty = true;
+        true
+    }
+
+    /// Takes the answer kept by [`Registry::set_nested_answer`].
+    pub fn take_nested_answer(&mut self, session: &str) -> Option<String> {
+        let answer = self
+            .sessions
+            .get_mut(session)?
+            .block
+            .as_mut()?
+            .answer
+            .take();
+        if answer.is_some() {
+            self.dirty = true;
+        }
+        answer
+    }
+
+    /// The block shall show `text`; `running` says whether it still works.
+    pub fn show_block(&mut self, key: &BlockKey, text: String, running: bool) {
+        if let Some(block) = self.block_mut(key) {
+            block.pending = Some(text);
+            block.running = running;
+            block.failed = false;
+            block.attempts = 0;
+            self.dirty = true;
+        }
+    }
+
+    /// Running blocks that belong to `ended` sessions end as [`BLOCK_LOST`]:
+    /// the subagents of those sessions, the nested runs themselves and the
+    /// nested runs whose parent is among them. A later result still wins.
+    pub fn lose_blocks(&mut self, ended: &[String]) {
+        if ended.is_empty() {
+            return;
+        }
+        let ended: HashSet<&str> = ended.iter().map(String::as_str).collect();
+        let mut lost = Vec::new();
+        for (id, entry) in &self.subagents {
+            if entry.block.running && ended.contains(entry.parent_session.as_str()) {
+                lost.push(BlockKey::Agent(id.clone()));
+            }
+        }
+        for (id, entry) in &self.sessions {
+            let parent_ended = matches!(&entry.kind, SessionKind::Nested { parent: Some(parent) }
+                if ended.contains(parent.as_str()));
+            if entry.block.as_ref().is_some_and(|block| block.running)
+                && (ended.contains(id.as_str()) || parent_ended)
+            {
+                lost.push(BlockKey::Nested(id.clone()));
+            }
+        }
+        for key in lost {
+            if let Some(header) = self.block(&key).map(|block| block.header.clone()) {
+                self.show_block(&key, format!("{header}\n{BLOCK_LOST}"), false);
+            }
+            if let BlockKey::Nested(session) = &key {
+                self.take_nested_answer(session);
+            }
+        }
+    }
+
+    /// At most `limit` block sends and edits that are due; the rest wait in
+    /// the registry. A first send needs the slot's topic; a block whose first
+    /// send may have reached Telegram (`sending` without an answer, e.g. cut
+    /// off by a restart) is never sent again: its text is dropped.
+    pub fn block_work(&mut self, limit: usize) -> Vec<BlockJob> {
+        let keys: Vec<BlockKey> = self
+            .subagents
+            .iter()
+            .filter(|(_, entry)| entry.block.pending.is_some())
+            .map(|(id, _)| BlockKey::Agent(id.clone()))
+            .chain(
+                self.sessions
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry
+                            .block
+                            .as_ref()
+                            .is_some_and(|block| block.pending.is_some())
+                    })
+                    .map(|(id, _)| BlockKey::Nested(id.clone())),
+            )
+            .collect();
+        let mut jobs = Vec::new();
+        for key in keys {
+            if jobs.len() >= limit {
+                break;
+            }
+            let topic = self
+                .block_slot(&key)
+                .and_then(|slot| self.slot(slot))
+                .and_then(|slot| slot.topic_id);
+            let Some(block) = self.block_mut(&key) else {
+                continue;
+            };
+            if block.busy || block.failed {
+                continue;
+            }
+            let Some(text) = block.pending.clone() else {
+                continue;
+            };
+            match block.message_id {
+                Some(message_id) => {
+                    block.busy = true;
+                    jobs.push(BlockJob::Edit {
+                        key,
+                        message_id,
+                        text,
+                    });
+                }
+                None if block.sending => {
+                    block.pending = None;
+                    block.running = false;
+                    self.dirty = true;
+                }
+                None => {
+                    let Some(thread_id) = topic else {
+                        continue;
+                    };
+                    block.busy = true;
+                    block.sending = true;
+                    block.thread_id = Some(thread_id);
+                    self.dirty = true;
+                    jobs.push(BlockJob::Send {
+                        key,
+                        thread_id,
+                        text,
+                    });
+                }
+            }
+        }
+        jobs
+    }
+
+    /// Telegram shows `text`; `message_id` is set for a first send.
+    pub fn block_done(&mut self, key: &BlockKey, text: &str, message_id: Option<i64>) {
+        if let Some(block) = self.block_mut(key) {
+            block.busy = false;
+            block.sending = false;
+            block.attempts = 0;
+            if message_id.is_some() {
+                block.message_id = message_id;
+            }
+            if block.pending.as_deref() == Some(text) {
+                block.pending = None;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// A send or edit failed: tried again on the retry tick, given up after
+    /// [`MAX_BLOCK_ATTEMPTS`]. `true` when it was given up now.
+    pub fn block_failed(&mut self, key: &BlockKey) -> bool {
+        let Some(block) = self.block_mut(key) else {
+            return false;
+        };
+        block.busy = false;
+        block.sending = false;
+        block.attempts += 1;
+        let given_up = block.attempts >= MAX_BLOCK_ATTEMPTS;
+        if given_up {
+            block.pending = None;
+            block.attempts = 0;
+        } else {
+            block.failed = true;
+        }
+        self.dirty = true;
+        given_up
+    }
+
+    /// A first send got no clear answer: Telegram may show it, so it is
+    /// never sent again (at most once); the block keeps no text to show.
+    pub fn block_send_unclear(&mut self, key: &BlockKey) {
+        if let Some(block) = self.block_mut(key) {
+            block.busy = false;
+            block.pending = None;
+            block.running = false;
+            self.dirty = true;
+        }
+    }
+
+    /// The agent id of the subagent block `message_id` in `thread_id`, when
+    /// that subagent belongs to `session`.
+    pub fn subagent_of_message(
+        &self,
+        thread_id: i64,
+        message_id: i64,
+        session: &str,
+    ) -> Option<&str> {
+        self.subagents
+            .iter()
+            .find(|(_, entry)| {
+                entry.parent_session == session
+                    && entry.block.message_id == Some(message_id)
+                    && entry.block.thread_id == Some(thread_id)
+            })
+            .map(|(id, _)| id.as_str())
     }
 
     /// Forgets the oldest ended sessions that no slot shows, beyond
@@ -1021,6 +1404,9 @@ impl Registry {
         for slot in &mut self.slots {
             slot.failed = None;
         }
+        for block in self.blocks_mut() {
+            block.failed = false;
+        }
     }
 
     /// `thread_id -> (session id, transcript path)` of each slot's current session.
@@ -1108,6 +1494,11 @@ impl RegistryStore {
         {
             return Err(LoadError::Invalid);
         }
+        // Records written before subagents were matched to `Agent` calls have
+        // no block header; they may be Claude Code's internal agents.
+        registry
+            .subagents
+            .retain(|_, agent| !agent.block.header.is_empty());
         registry.after_restart();
         Ok(registry)
     }
@@ -1446,7 +1837,8 @@ mod tests {
             SessionKind::Nested { parent: None }
         );
         assert_eq!(slot_of(&registry, B), None);
-        // Subagents: typed ones are recorded against the parent's slot.
+        // Subagent hooks alone record nothing; a confirmed match records the
+        // subagent against the parent's slot, once.
         for (agent, kind) in [("a1", "Explore"), ("a2", "")] {
             registry.apply_hook(&post(
                 A,
@@ -1457,18 +1849,271 @@ mod tests {
                 },
             ));
         }
-        assert_eq!(
-            registry.subagents.get("a1"),
-            Some(&SubagentEntry {
-                parent_session: A.to_owned(),
-                slot: parent_slot
-            })
-        );
-        assert!(!registry.subagents.contains_key("a2"));
+        assert!(registry.subagents.is_empty());
+        assert!(registry.confirm_subagent("a1", A, "↳ Explore a1".into()));
+        assert!(!registry.confirm_subagent("a1", A, "↳ Explore a1".into()));
+        assert_eq!(registry.subagents["a1"].slot, parent_slot);
+        assert_eq!(registry.subagents["a1"].parent_session, A);
+        // A nested run's subagents get no block of their own.
+        assert!(!registry.confirm_subagent("a3", N, "↳ Explore a3".into()));
         assert_eq!(creates(&settle(&mut registry, &mut topic)), 0);
         assert_eq!(registry.slots.len(), 1);
         // The parent's slot is still free for nobody else: nested runs do not hold it.
         assert_eq!(registry.slots[0].current_session.as_deref(), Some(A));
+    }
+
+    /// Answers every block job as Telegram would, numbering messages from 500.
+    fn settle_blocks(registry: &mut Registry, next_message: &mut i64) -> Vec<BlockJob> {
+        let jobs = registry.block_work(usize::MAX);
+        for job in &jobs {
+            match job {
+                BlockJob::Send { key, text, .. } => {
+                    registry.block_done(key, text, Some(*next_message));
+                    *next_message += 1;
+                }
+                BlockJob::Edit { key, text, .. } => registry.block_done(key, text, None),
+            }
+        }
+        jobs
+    }
+
+    #[test]
+    fn a_nested_run_gets_one_block_in_its_parents_topic() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        let mut message = 500;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        // The parent's topic does not exist yet: the block waits for it.
+        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
+        assert!(registry.block_work(usize::MAX).is_empty());
+        settle(&mut registry, &mut topic);
+        let jobs = settle_blocks(&mut registry, &mut message);
+        assert_eq!(
+            jobs,
+            [BlockJob::Send {
+                key: BlockKey::Nested(N.to_owned()),
+                thread_id: 100,
+                text: format!("⇣ nested dddddddd\n{BLOCK_RUNNING}"),
+            }]
+        );
+        // Another start of the same run keeps its one block.
+        registry.apply_hook(&start_from(N, CWD, Some(21), Some(10), "resume"));
+        assert!(settle_blocks(&mut registry, &mut message).is_empty());
+        // Parent unknown: no block anywhere.
+        registry.apply_hook(&start(B, CWD, Some(40), Some(99)));
+        assert!(registry.sessions[B].block.is_none());
+        // Ending the parent ends the running block deterministically.
+        registry.lose_blocks(&[A.to_owned()]);
+        let jobs = settle_blocks(&mut registry, &mut message);
+        assert_eq!(
+            jobs,
+            [BlockJob::Edit {
+                key: BlockKey::Nested(N.to_owned()),
+                message_id: 500,
+                text: format!("⇣ nested dddddddd\n{BLOCK_LOST}"),
+            }]
+        );
+        assert_eq!(creates(&settle(&mut registry, &mut topic)), 0);
+        assert_eq!(registry.slots.len(), 1);
+    }
+
+    #[test]
+    fn blocks_survive_a_restart_without_a_second_send() {
+        let dir = TempDir::new("registry-blocks");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        let mut message = 500;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        for agent in ["a1", "a2", "a3"] {
+            registry.confirm_subagent(agent, A, format!("↳ Explore {agent}"));
+        }
+        // a1 and a2 were shown; a3's first send was out when the hub stopped.
+        let jobs = registry.block_work(usize::MAX);
+        assert_eq!(jobs.len(), 3);
+        for job in &jobs[..2] {
+            let BlockJob::Send { key, text, .. } = job else {
+                panic!("{job:?}");
+            };
+            registry.block_done(key, text, Some(message));
+            message += 1;
+        }
+        registry.show_block(
+            &BlockKey::Agent("a1".into()),
+            "↳ Explore a1\ndone".into(),
+            false,
+        );
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+
+        let mut registry = store.load().unwrap();
+        assert_eq!(registry.subagents.len(), 3);
+        assert!(!registry.confirm_subagent("a2", A, "↳ Explore a2".into()));
+        // Only a1's pending edit goes out; a3 is never sent again.
+        let jobs = settle_blocks(&mut registry, &mut message);
+        assert_eq!(
+            jobs,
+            [BlockJob::Edit {
+                key: BlockKey::Agent("a1".into()),
+                message_id: 500,
+                text: "↳ Explore a1\ndone".into(),
+            }]
+        );
+        assert!(settle_blocks(&mut registry, &mut message).is_empty());
+        assert_eq!(registry.subagents["a3"].block.message_id, None);
+        // The unfinished a2 ends as lost when its session is found ended.
+        registry.apply_hook(&end(A));
+        registry.lose_blocks(&[A.to_owned()]);
+        let jobs = settle_blocks(&mut registry, &mut message);
+        assert_eq!(
+            jobs,
+            [BlockJob::Edit {
+                key: BlockKey::Agent("a2".into()),
+                message_id: 501,
+                text: format!("↳ Explore a2\n{BLOCK_LOST}"),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_failed_block_waits_for_the_tick_and_is_given_up_in_the_end() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        registry.confirm_subagent("a1", A, "↳ Explore a1".into());
+        let key = BlockKey::Agent("a1".into());
+        for attempt in 1..=MAX_BLOCK_ATTEMPTS {
+            assert_eq!(
+                registry.block_work(usize::MAX).len(),
+                1,
+                "attempt {attempt}"
+            );
+            let given_up = registry.block_failed(&key);
+            assert_eq!(given_up, attempt == MAX_BLOCK_ATTEMPTS);
+            // Not again before the tick.
+            assert!(registry.block_work(usize::MAX).is_empty());
+            registry.retry_failed();
+        }
+        assert!(registry.block_work(usize::MAX).is_empty());
+        assert_eq!(registry.subagents["a1"].block.pending, None);
+    }
+
+    #[test]
+    fn a_legacy_subagent_record_is_dropped_on_load() {
+        let dir = TempDir::new("registry-legacy-subagent");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        registry.confirm_subagent("a1", A, "↳ Explore a1".into());
+        registry.confirm_subagent("a2", A, "↳ Explore a2".into());
+        // TASK-011 wrote `{ parent_session, slot }` for every typed hook.
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
+        json["subagents"]["a2"]
+            .as_object_mut()
+            .unwrap()
+            .remove("block");
+        store.save(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.subagents.keys().collect::<Vec<_>>(), ["a1"]);
+    }
+
+    #[test]
+    fn an_unclear_first_send_is_never_repeated() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        registry.confirm_subagent("a1", A, "↳ Explore a1".into());
+        let key = BlockKey::Agent("a1".into());
+        assert_eq!(registry.block_work(usize::MAX).len(), 1);
+        registry.block_send_unclear(&key);
+        // Neither its result nor its session's end sends it again.
+        registry.show_block(&key, "↳ Explore a1\ndone".into(), false);
+        assert!(registry.block_work(usize::MAX).is_empty());
+        registry.retry_failed();
+        registry.lose_blocks(&[A.to_owned()]);
+        assert!(registry.block_work(usize::MAX).is_empty());
+        let block = &registry.subagents["a1"].block;
+        assert!(block.sending && block.pending.is_none() && block.message_id.is_none());
+    }
+
+    #[test]
+    fn block_work_hands_out_at_most_its_limit() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        for agent in ["a1", "a2", "a3"] {
+            registry.confirm_subagent(agent, A, format!("↳ Explore {agent}"));
+        }
+        assert_eq!(registry.block_work(2).len(), 2);
+        assert_eq!(registry.block_work(2).len(), 1);
+        assert!(registry.block_work(2).is_empty());
+    }
+
+    #[test]
+    fn subagent_records_are_bounded_oldest_settled_first() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        let mut message = 500;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        let id = |i: usize| format!("a{i}");
+        for i in 0..MAX_SUBAGENTS {
+            assert!(registry.confirm_subagent(&id(i), A, format!("↳ Explore {}", id(i))));
+        }
+        settle_blocks(&mut registry, &mut message);
+        // Every block still works: a new one is refused, none is dropped.
+        assert!(!registry.confirm_subagent("new", A, "↳ Explore new".into()));
+        // a5 and a3 finished (in that order of confirmation: a3 is older).
+        for i in [5, 3] {
+            let key = BlockKey::Agent(id(i));
+            registry.show_block(&key, "done".into(), false);
+        }
+        settle_blocks(&mut registry, &mut message);
+        assert!(registry.confirm_subagent("new", A, "↳ Explore new".into()));
+        assert_eq!(registry.subagents.len(), MAX_SUBAGENTS);
+        assert!(!registry.subagents.contains_key("a3"));
+        assert!(registry.subagents.contains_key("a5"));
+    }
+
+    #[test]
+    fn a_nested_answer_is_kept_in_the_registry_until_the_run_ends() {
+        let dir = TempDir::new("registry-nested-answer");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
+        assert!(!registry.set_nested_answer(A, "top-level answers are turn answers"));
+        assert!(registry.set_nested_answer(N, "first"));
+        assert!(registry.set_nested_answer(N, "last"));
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let mut registry = store.load().unwrap();
+        assert_eq!(registry.take_nested_answer(N).as_deref(), Some("last"));
+        assert_eq!(registry.take_nested_answer(N), None);
+        // A run lost with its parent keeps no answer.
+        registry.set_nested_answer(N, "late");
+        registry.lose_blocks(&[A.to_owned()]);
+        assert_eq!(registry.take_nested_answer(N), None);
+    }
+
+    #[test]
+    fn a_reply_finds_only_its_own_sessions_subagent_block() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        let mut message = 500;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        registry.confirm_subagent("a1", A, "↳ Explore a1".into());
+        settle_blocks(&mut registry, &mut message);
+        assert_eq!(registry.subagent_of_message(100, 500, A), Some("a1"));
+        assert_eq!(registry.subagent_of_message(100, 500, B), None);
+        assert_eq!(registry.subagent_of_message(101, 500, A), None);
+        assert_eq!(registry.subagent_of_message(100, 501, A), None);
     }
 
     #[test]
