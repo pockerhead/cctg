@@ -1,0 +1,9 @@
+{
+  "session_id": "745465f7-0b40-42e9-a499-ec0af37607ad",
+  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\745465f7-0b40-42e9-a499-ec0af37607ad.jsonl",
+  "cwd": "~\\dev\\cctg",
+  "prompt_id": "0bb27012-0d04-43a9-9fa9-128e91ee7e34",
+  "permission_mode": "default",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "private prompt text that must not reach the hub"
+}

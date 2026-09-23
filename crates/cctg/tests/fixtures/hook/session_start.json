@@ -1,0 +1,9 @@
+{
+  "session_id": "1e087ca8-58b5-4c0b-9f03-b7926645b744",
+  "transcript_path": "~\\.claude\\projects\\~-dev-cctg\\1e087ca8-58b5-4c0b-9f03-b7926645b744.jsonl",
+  "cwd": "~\\dev\\cctg",
+  "scratchpad_dir": "~\\AppData\\Local\\Temp\\claude\\~-dev-cctg\\1e087ca8-58b5-4c0b-9f03-b7926645b744\\scratchpad",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-fable-5-1"
+}
