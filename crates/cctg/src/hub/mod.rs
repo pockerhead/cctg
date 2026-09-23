@@ -53,9 +53,9 @@ pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
     }
 }
 
-/// The poll callback: commands go to the command worker's queue and topic
-/// edit notices to the slot actor; nothing here waits, so a slow command
-/// never holds up polling.
+/// The poll callback: commands go to the command worker's queue; other
+/// messages and topic edit notices go to the slot actor. Nothing here waits,
+/// so a slow command or a slow Telegram never holds up polling.
 fn route_inbound<'a>(
     commands: &'a mpsc::UnboundedSender<Inbound>,
     control: &'a mpsc::UnboundedSender<Control>,
@@ -66,7 +66,11 @@ fn route_inbound<'a>(
                 warn!("command worker stopped; command dropped");
             }
         }
-        Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
+        Routed::Input(input) => {
+            if control.send(Control::Message(input)).is_err() {
+                warn!("slot actor stopped; message dropped");
+            }
+        }
         Routed::Callback(_) => info!("inbound button press"),
         Routed::Service(service) if service.kind == ServiceKind::TopicEdited => {
             let edited = Control::TopicEdited {
@@ -146,6 +150,7 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     tokio::spawn(scheduler.run());
     let options = slots::Options {
         icons,
+        chat_id: config.chat_id,
         can_delete,
         ..slots::Options::default()
     };
@@ -321,6 +326,50 @@ mod tests {
         ];
         assert_eq!(*sent.0.lock().unwrap(), want);
         polling.abort();
+    }
+
+    #[test]
+    fn messages_go_to_the_slot_actor_and_commands_do_not() {
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let input = |text: &str| Inbound {
+            message_id: 5,
+            thread_id: Some(100),
+            text: Some(text.to_owned()),
+            reply_to: None,
+        };
+        let mut route = route_inbound(&commands_tx, &control_tx);
+        route(Routed::Input(input("hello")));
+        route(Routed::Input(input("/brief 2")));
+        route(Routed::Input(Inbound {
+            text: None,
+            ..input("")
+        }));
+        for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {
+            route(Routed::Service(updates::ServiceMessage {
+                kind,
+                message_id: 9,
+                thread_id: Some(100),
+            }));
+        }
+        drop(route);
+        assert_eq!(
+            commands_rx.try_recv().unwrap().text.as_deref(),
+            Some("/brief 2")
+        );
+        assert!(commands_rx.try_recv().is_err());
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            Control::Message(input("hello"))
+        );
+        assert!(matches!(
+            control_rx.try_recv().unwrap(),
+            Control::Message(Inbound { text: None, .. })
+        ));
+        assert!(
+            control_rx.try_recv().is_err(),
+            "service messages are not input"
+        );
     }
 
     fn member(status: &str, topics: bool) -> ChatMember {

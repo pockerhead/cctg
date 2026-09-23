@@ -60,6 +60,7 @@ fn input(text: &str) -> Inbound {
         message_id: 1,
         thread_id: None,
         text: Some(text.to_owned()),
+        reply_to: None,
     }
 }
 
@@ -92,13 +93,7 @@ async fn command_logs_carry_no_paths() {
     let projects = Arc::new(ProjectsDir::new(root.clone()));
     handle(&input("/brief"), &outbox, &projects, None).await;
     handle(&input("/full 1 5e55"), &outbox, &projects, None).await;
-    handle(
-        &input(&format!("/sessions must-not-log-{marker}")),
-        &outbox,
-        &projects,
-        None,
-    )
-    .await;
+    handle(&input(&format!("/{marker}")), &outbox, &projects, None).await;
     let located = |path: PathBuf| {
         Arc::new(Fixed(Located {
             session_id: SESSION.to_owned(),
@@ -130,8 +125,8 @@ async fn command_logs_carry_no_paths() {
         "short session id expected: {logs}"
     );
     assert!(
-        logs.contains("unknown slash command") && logs.contains("/sessions"),
-        "unknown command word expected: {logs}"
+        logs.contains("unknown slash command"),
+        "fixed unknown-command log expected: {logs}"
     );
     assert!(!logs.contains(&marker), "path or project in logs: {logs}");
 

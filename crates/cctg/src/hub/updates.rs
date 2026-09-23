@@ -37,6 +37,9 @@ pub struct Inbound {
     /// `None` for the General topic.
     pub thread_id: Option<i64>,
     pub text: Option<String>,
+    /// The message this one explicitly answers. `None` for the implicit
+    /// reply to the topic root that Telegram sets on every topic message.
+    pub reply_to: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,12 +112,18 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         if !allowlist.contains(from.id) {
             return Routed::Ignored(Ignored::NotAllowed);
         }
+        let thread_id = message
+            .message_thread_id
+            .filter(|_| message.is_topic_message);
+        let reply_to = message
+            .reply_to_message
+            .map(|replied| replied.message_id)
+            .filter(|&id| id != 0 && Some(id) != thread_id);
         return Routed::Input(Inbound {
             message_id: message.message_id,
-            thread_id: message
-                .message_thread_id
-                .filter(|_| message.is_topic_message),
+            thread_id,
             text: message.text,
+            reply_to,
         });
     }
 
@@ -324,7 +333,8 @@ mod tests {
             Routed::Input(Inbound {
                 message_id: 10,
                 thread_id: Some(7),
-                text: Some("hi".to_owned())
+                text: Some("hi".to_owned()),
+                reply_to: None,
             })
         );
 
@@ -351,6 +361,36 @@ mod tests {
                 data: Some("allow:abcde".to_owned()),
                 message_id: Some(10),
             })
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_reply_is_a_reply() {
+        let reply_to = |extra: Value| match route_one(
+            json!({ "update_id": 1, "message": message(ALLOWED, extra) }),
+        ) {
+            Routed::Input(input) => input.reply_to,
+            other => panic!("not input: {other:?}"),
+        };
+        // Telegram points every topic message at the topic root (id 7 here).
+        assert_eq!(
+            reply_to(json!({ "text": "hi", "reply_to_message": { "message_id": 7 } })),
+            None
+        );
+        assert_eq!(
+            reply_to(
+                json!({ "text": "hi", "reply_to_message": { "message_id": 42, "text": "bot" } })
+            ),
+            Some(42)
+        );
+        assert_eq!(reply_to(json!({ "text": "hi" })), None);
+        // General: no thread, so any replied id is explicit.
+        assert_eq!(
+            reply_to(
+                json!({ "text": "hi", "is_topic_message": false, "message_thread_id": null,
+                "reply_to_message": { "message_id": 42 } })
+            ),
+            Some(42)
         );
     }
 

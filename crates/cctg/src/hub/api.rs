@@ -83,10 +83,20 @@ pub struct Message {
     pub from: Option<User>,
     pub chat: Chat,
     pub text: Option<String>,
+    /// In a forum topic every message that is not an explicit reply points
+    /// at the topic root (the `forum_topic_created` message).
+    pub reply_to_message: Option<MessageRef>,
     pub forum_topic_created: Option<IgnoredAny>,
     pub forum_topic_edited: Option<IgnoredAny>,
     pub forum_topic_closed: Option<IgnoredAny>,
     pub forum_topic_reopened: Option<IgnoredAny>,
+}
+
+/// Only the id of a message another message refers to.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub struct MessageRef {
+    pub message_id: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
