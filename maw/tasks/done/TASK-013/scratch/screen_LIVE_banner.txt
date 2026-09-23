@@ -1,0 +1,13 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg13_live
+
+▎ Debug mode enabled · logging to C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-013\scratch\debug_LIVE.log
+  1 more notice hidden
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Try "edit <filepath> to..."
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:cctg13_live sh:bash                                               auto mode unavailable for this model
+  acc:<email>
+  ⏸ manual mode on · ← 1 agent

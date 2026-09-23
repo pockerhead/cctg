@@ -1,0 +1,18 @@
+Exception in thread Thread-1 (hub):
+Traceback (most recent call last):
+  File "C:\Program Files\Python310\lib\threading.py", line 1016, in _bootstrap_inner
+    self.run()
+  File "C:\Program Files\Python310\lib\threading.py", line 953, in run
+    self._target(*self._args, **self._kwargs)
+  File "C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-013\scratch\qa\perm_leak.py", line 32, in hub
+    for raw in f:
+  File "C:\Program Files\Python310\lib\socket.py", line 705, in readinto
+    return self._sock.recv_into(b)
+ConnectionResetError: [WinError 10054] Удаленный хост принудительно разорвал существующее подключение
+sent 330 distinct permission requests (no verdicts: answered at the terminal)
+relayed to hub: 330
+not relayed: []
+exit code: 0
+stdout lines: 1 all json: True
+secret in stdout/stderr: False False
+stderr tail: ['INFO registered with the hub']

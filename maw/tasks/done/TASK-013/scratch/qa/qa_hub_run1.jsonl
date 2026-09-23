@@ -1,0 +1,5 @@
+{"t": "17:05:54", "kind": "listening", "port": 47491}
+{"t": "17:06:06", "kind": "hello", "ok": true}
+{"t": "17:06:06", "kind": "register", "register": {"v": 1, "type": "register", "session_id": "381104f0-8c16-4a21-af54-80b330e62cd8", "host": "qa13", "cwd": "C:\\Users\\user\\AppData\\Local\\Temp\\cctg13_qa", "claude_pid": 37240}}
+{"t": "17:06:36", "kind": "inbound_sent", "text": "QA13-A reply with the reply tool: pong-a", "agents": 1}
+{"t": "17:07:46", "kind": "inbound_sent", "text": "QA13-B reply with the reply tool: pong-b", "agents": 1}

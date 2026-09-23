@@ -1,0 +1,31 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg13_qa
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg13_qa
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg13_qa
+
+▎ Debug mode enabled · logging to C:\Users\user\AppData\Local\Temp\cctg13_qa\debug_QA2.log
+  1 more notice hidden
+
+> /clear
+
+← cctgqa: QA13-B. Load the tool mcp__cctgqa__reply with ToolSearch, t…
+
+● Теперь вызываю инструмент с текстом "pong-b":
+
+  Called cctgqa (ctrl+o to expand)
+
+● Готово. Сообщение "pong-b" отправлено в Telegram топик этой сессии.
+
+✻ Cooked for 5s · done 17:11
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:cctg13_qa sh:bash ctx:25%
+  acc:<email> 5h:8% 7d:60%
+  ⏸ manual mode on · ← 1 agent

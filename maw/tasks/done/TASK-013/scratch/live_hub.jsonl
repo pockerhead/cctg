@@ -1,0 +1,10 @@
+{"t": "14:28:07", "kind": "listening", "port": 47391}
+{"t": "14:28:13", "kind": "hello", "ok": true}
+{"t": "14:28:13", "kind": "register", "register": {"v": 1, "type": "register", "session_id": "c4c6aced-3145-4591-80a7-49156c77932f", "host": "live13", "cwd": "C:\\Users\\user\\AppData\\Local\\Temp\\cctg13_live", "claude_pid": 15620}}
+{"t": "14:28:38", "kind": "inbound_sent", "text": "LIVE13-A reply with the reply tool: pong-a", "agents": 1}
+{"t": "14:28:46", "kind": "permission_request", "msg": {"v": 1, "type": "permission_request", "request_id": "dxpca", "tool_name": "mcp__cctg__reply", "description": "Send a message to the Telegram topic of this Claude Code session. Use it to answer messages that arrived through the cctg channel.", "input_preview": "{ \"text\": \"pong-a\" }"}}
+{"t": "14:28:46", "kind": "verdict_sent", "request_id": "dxpca"}
+{"t": "14:28:46", "kind": "agent_msg", "msg": {"v": 1, "type": "reply", "text": "pong-a"}}
+{"t": "14:29:33", "kind": "inbound_sent", "text": "LIVE13-B reply with the reply tool: pong-b", "agents": 1}
+{"t": "14:30:01", "kind": "permission_request", "msg": {"v": 1, "type": "permission_request", "request_id": "hebcw", "tool_name": "Bash", "description": "Run bash nested.sh script", "input_preview": "{ \"command\": \"bash nested.sh\", \"description\": \"Run bash nested.sh script\" }"}}
+{"t": "14:30:01", "kind": "verdict_sent", "request_id": "hebcw"}

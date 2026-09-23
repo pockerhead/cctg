@@ -1,0 +1,1986 @@
+diff --git a/crates/cctg/Cargo.toml b/crates/cctg/Cargo.toml
+--- a/crates/cctg/Cargo.toml
++++ b/crates/cctg/Cargo.toml
+@@ -12,7 +12,7 @@
+ serde_json.workspace = true
+ subtle.workspace = true
+ thiserror.workspace = true
+-tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
++tokio = { workspace = true, features = ["io-std", "io-util", "net", "sync", "time"] }
+ tracing.workspace = true
+ tracing-subscriber.workspace = true
+ transcript = { path = "../transcript" }
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -1,18 +1,33 @@
+-//! Agent end of the hub link: connect, authenticate, register, and on any
+-//! loss reconnect with backoff and register again. Only the agent reconnects;
+-//! the hub just accepts.
++//! `cctg agent`: the channel MCP server Claude Code spawns over stdio, and
++//! its end of the hub link.
+ //!
+-//! Messages queued while the link is down wait in the outbox and go out after
+-//! the next registration. A message whose write failed is lost.
+-
++//! [`run_stdio`] reads JSON-RPC lines from stdin on a thread of its own, hands them
++//! to [`channel::Server`] and writes every answer and notification to stdout
++//! from one place, a line at a time. stdout carries JSON-RPC and nothing else;
++//! logs go to stderr. The process ends when stdin closes.
++//!
++//! Hub link: connect, authenticate, register, and on any loss reconnect with
++//! backoff and register again. Only the agent reconnects; the hub just
++//! accepts. Messages queued while the link is down wait in the outbox and go
++//! out after the next registration. A message whose write failed is lost.
++//!
++//! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
++//! channel from Claude Code (TASK-004), so its agent answers MCP but never
++//! connects: a nested `claude -p` cannot show up as a routable channel even
++//! when the process tree hides its parent.
++
++use std::io::{BufRead, Read};
+ use std::time::Duration;
+ 
+-use tokio::io::BufReader;
++use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
+ use tokio::net::TcpStream;
+ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+ use tokio::sync::mpsc;
+ use tracing::{debug, info, warn};
+ 
++use crate::channel::{self, Hub, NoHub};
++use crate::device::{self, DeviceConfig};
++use crate::proctree;
+ use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
+ 
+ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+@@ -230,6 +245,179 @@
+     }
+ }
+ 
++/// Longest JSON-RPC line read from Claude Code; a longer one is skipped and
++/// answered with a parse error.
++pub const MAX_RPC_LINE: usize = 8 << 20;
++const FRAMES: usize = 64;
++
++/// One line from stdin.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Frame {
++    Line(Vec<u8>),
++    TooLong,
++}
++
++/// Runs `cctg agent` until stdin closes.
++pub async fn run_stdio() {
++    let config = DeviceConfig::load();
++    let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
++    let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
++    let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
++        Ok((secret, session_id)) => {
++            let register = Register {
++                session_id,
++                host: config.host.clone(),
++                cwd: device::canonical_cwd(&current_dir()),
++                // Not env `CLAUDE_PID`: in an MCP server it is inherited
++                // from an outer claude, or unset (TASK-004).
++                claude_pid: proctree::current_lineage(None, None, "").claude_pid,
++            };
++            let (outbox, events) = spawn(LinkConfig {
++                addr: config.agent_addr.clone(),
++                secret,
++                register,
++                backoff: Backoff::default(),
++            });
++            (Hub::Link(outbox), Some(events))
++        }
++        Err(reason) => {
++            info!(reason = reason.text(), "no hub link");
++            (Hub::Off(reason), None)
++        }
++    };
++    let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
++    if let Err(error) = serve_channel(frames, tokio::io::stdout(), hub, events).await {
++        debug!(kind = ?error.kind(), "stdout closed");
++    }
++}
++
++/// Whether this agent talks to the hub, and as which session.
++pub fn link_plan(
++    session_id: Option<String>,
++    entrypoint: Option<&str>,
++    config: &DeviceConfig,
++) -> Result<(Secret, String), NoHub> {
++    if entrypoint == Some("sdk-cli") {
++        return Err(NoHub::Headless);
++    }
++    let session_id = session_id
++        .map(|id| id.trim().to_owned())
++        .filter(|id| !id.is_empty())
++        .ok_or(NoHub::NoSession)?;
++    let secret = config.secret.clone().map_err(|problem| {
++        warn!(%problem, "hub link off");
++        NoHub::NoConfig
++    })?;
++    Ok((secret, session_id))
++}
++
++fn current_dir() -> String {
++    std::env::current_dir()
++        .ok()
++        .and_then(|dir| dir.into_os_string().into_string().ok())
++        .unwrap_or_default()
++}
++
++/// Reads lines on a thread of its own: a blocking read cannot be cancelled,
++/// and nobody waits for the thread once stdin is closed. The receiver ends
++/// at end of input or on a read error.
++pub fn read_frames<R: BufRead + Send + 'static>(mut reader: R) -> mpsc::Receiver<Frame> {
++    let (tx, rx) = mpsc::channel(FRAMES);
++    std::thread::spawn(move || {
++        let mut line = Vec::new();
++        loop {
++            line.clear();
++            match reader
++                .by_ref()
++                .take(MAX_RPC_LINE as u64)
++                .read_until(b'\n', &mut line)
++            {
++                Ok(0) => return,
++                Ok(_) => {}
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++                Err(_) => return,
++            }
++            let frame = if line.last() != Some(&b'\n') && line.len() >= MAX_RPC_LINE {
++                if !skip_line(&mut reader) {
++                    let _ = tx.blocking_send(Frame::TooLong);
++                    return;
++                }
++                Frame::TooLong
++            } else {
++                Frame::Line(std::mem::take(&mut line))
++            };
++            if tx.blocking_send(frame).is_err() {
++                return;
++            }
++        }
++    });
++    rx
++}
++
++/// Discards input up to and including the next newline; `false` when the
++/// input ends first.
++fn skip_line(reader: &mut impl BufRead) -> bool {
++    loop {
++        let (found, used) = match reader.fill_buf() {
++            Ok([]) => return false,
++            Ok(buf) => match buf.iter().position(|&byte| byte == b'\n') {
++                Some(at) => (true, at + 1),
++                None => (false, buf.len()),
++            },
++            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++            Err(_) => return false,
++        };
++        reader.consume(used);
++        if found {
++            return true;
++        }
++    }
++}
++
++/// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
++/// when stdin ends (the hub link stops with it) or stdout fails.
++pub async fn serve_channel<W: AsyncWrite + Unpin>(
++    mut frames: mpsc::Receiver<Frame>,
++    mut output: W,
++    hub: Hub,
++    mut events: Option<mpsc::Receiver<LinkEvent>>,
++) -> std::io::Result<()> {
++    let mut server = channel::Server::new(hub);
++    loop {
++        let lines = tokio::select! {
++            frame = frames.recv() => match frame {
++                Some(Frame::Line(line)) => server.on_line(&line),
++                Some(Frame::TooLong) => server.on_oversized_line(),
++                None => break,
++            },
++            event = recv_event(&mut events), if events.is_some() => match event {
++                Some(event) => server.on_link(event),
++                None => {
++                    events = None;
++                    Vec::new()
++                }
++            },
++        };
++        for line in lines {
++            output.write_all(&line).await?;
++        }
++        output.flush().await?;
++    }
++    output.flush().await
++}
++
++async fn recv_event(events: &mut Option<mpsc::Receiver<LinkEvent>>) -> Option<LinkEvent> {
++    match events {
++        Some(events) => events.recv().await,
++        None => None,
++    }
++}
++
++/// The one-time registration command, with this executable's absolute path.
++pub fn install_command(exe: &str) -> String {
++    format!("claude mcp add --scope user cctg -- \"{exe}\" agent")
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::net::{Ipv4Addr, SocketAddr};
+@@ -248,6 +436,7 @@
+             session_id: "5e551017-0000-4000-8000-000000000001".into(),
+             host: "box".into(),
+             cwd: "/w".into(),
++            claude_pid: None,
+         }
+     }
+ 
+@@ -495,4 +684,253 @@
+             "the closed outbox must prevent another connection attempt"
+         );
+     }
+-}
++
++    fn device(secret: Option<&str>) -> DeviceConfig {
++        DeviceConfig::from_vars(|name| {
++            (name == crate::hub::config::SECRET_VAR)
++                .then(|| secret.map(str::to_owned))
++                .flatten()
++        })
++    }
++
++    #[test]
++    fn link_plan_rules() {
++        let session = || Some(" 5e551017-0000-4000-8000-000000000001 ".to_owned());
++        let (_, id) = link_plan(session(), Some("cli"), &device(Some(SECRET))).unwrap();
++        assert_eq!(id, "5e551017-0000-4000-8000-000000000001");
++        assert!(link_plan(session(), None, &device(Some(SECRET))).is_ok());
++        assert_eq!(
++            link_plan(session(), Some("sdk-cli"), &device(Some(SECRET))).unwrap_err(),
++            NoHub::Headless
++        );
++        for missing in [None, Some(String::new()), Some("  ".to_owned())] {
++            assert_eq!(
++                link_plan(missing, Some("cli"), &device(Some(SECRET))).unwrap_err(),
++                NoHub::NoSession
++            );
++        }
++        assert_eq!(
++            link_plan(session(), Some("cli"), &device(None)).unwrap_err(),
++            NoHub::NoConfig
++        );
++        assert_eq!(
++            link_plan(session(), Some("cli"), &device(Some("short"))).unwrap_err(),
++            NoHub::NoConfig
++        );
++    }
++
++    #[test]
++    fn install_command_quotes_the_absolute_path() {
++        assert_eq!(
++            install_command(r"C:\Program Files\cctg\cctg.exe"),
++            r#"claude mcp add --scope user cctg -- "C:\Program Files\cctg\cctg.exe" agent"#
++        );
++    }
++
++    #[tokio::test]
++    async fn frames_are_lines_and_an_oversized_line_is_skipped_whole() {
++        let mut input = b"{\"a\":1}\r\n".to_vec();
++        input.extend(vec![b'x'; MAX_RPC_LINE + 10]);
++        input.extend(b"\n{\"b\":2}\nlast without newline");
++        let mut frames = read_frames(std::io::Cursor::new(input));
++        let mut got = Vec::new();
++        while let Some(frame) = tokio::time::timeout(WAIT, frames.recv()).await.unwrap() {
++            got.push(frame);
++        }
++        assert_eq!(
++            got,
++            [
++                Frame::Line(b"{\"a\":1}\r\n".to_vec()),
++                Frame::TooLong,
++                Frame::Line(b"{\"b\":2}\n".to_vec()),
++                Frame::Line(b"last without newline".to_vec()),
++            ]
++        );
++        // An oversized line cut by the end of input.
++        let mut frames = read_frames(std::io::Cursor::new(vec![b'y'; MAX_RPC_LINE + 1]));
++        assert_eq!(frames.recv().await, Some(Frame::TooLong));
++        assert_eq!(frames.recv().await, None);
++    }
++
++    /// Claude Code's side of the stdio pipes.
++    struct Claude {
++        frames: mpsc::Sender<Frame>,
++        out: tokio::io::BufReader<tokio::io::DuplexStream>,
++    }
++
++    impl Claude {
++        async fn send(&self, line: &str) {
++            self.frames
++                .send(Frame::Line(format!("{line}\n").into_bytes()))
++                .await
++                .unwrap();
++        }
++
++        async fn recv(&mut self) -> serde_json::Value {
++            let mut line = Vec::new();
++            tokio::time::timeout(WAIT, wire::read_line(&mut self.out, &mut line))
++                .await
++                .expect("a line in time")
++                .expect("a whole line");
++            serde_json::from_slice(&line).expect("one JSON object per line")
++        }
++    }
++
++    fn claude(hub: Hub, events: Option<mpsc::Receiver<LinkEvent>>) -> Claude {
++        let (frames, frames_rx) = mpsc::channel(16);
++        let (ours, theirs) = tokio::io::duplex(1 << 16);
++        tokio::spawn(serve_channel(frames_rx, ours, hub, events));
++        Claude {
++            frames,
++            out: tokio::io::BufReader::new(theirs),
++        }
++    }
++
++    async fn hub_message(hub: &mut mpsc::Receiver<AgentEvent>) -> AgentMsg {
++        loop {
++            match tokio::time::timeout(WAIT, hub.recv())
++                .await
++                .expect("in time")
++            {
++                Some(AgentEvent::Message { msg, .. }) => return msg,
++                Some(_) => continue,
++                None => panic!("hub stopped"),
++            }
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn the_channel_relays_both_ways_and_survives_a_hub_restart() {
++        let secret = Secret::parse(SECRET).unwrap();
++        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (hub_tx, mut hub_rx) = mpsc::channel(16);
++        let hub = tokio::spawn(ingress::serve_agents(listener, secret.clone(), hub_tx));
++        let backoff = Backoff {
++            initial: Duration::from_millis(20),
++            max: Duration::from_millis(160),
++        };
++        let (outbox, events) = spawn(config(addr, backoff));
++        let mut claude = claude(Hub::Link(outbox), Some(events));
++
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
++            .await;
++        assert_eq!(claude.recv().await["id"], 0);
++        claude
++            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
++            .await;
++        let (got, to_agent) = registered(&mut hub_rx).await;
++        assert_eq!(got, register());
++
++        // Telegram -> Claude, invalid meta keys dropped.
++        to_agent
++            .send(HubMsg::Inbound {
++                content: "hello from Telegram".into(),
++                meta: [
++                    ("chat_id".to_owned(), "-1001".to_owned()),
++                    ("bad-key".to_owned(), "x".to_owned()),
++                ]
++                .into(),
++            })
++            .await
++            .unwrap();
++        let note = claude.recv().await;
++        assert_eq!(note["method"], "notifications/claude/channel");
++        assert_eq!(note["params"]["content"], "hello from Telegram");
++        assert_eq!(
++            note["params"]["meta"],
++            serde_json::json!({ "chat_id": "-1001" })
++        );
++
++        // Claude -> Telegram.
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reply","arguments":{"text":"on it"}}}"#)
++            .await;
++        assert_eq!(claude.recv().await["result"]["isError"], false);
++        assert_eq!(
++            hub_message(&mut hub_rx).await,
++            AgentMsg::Reply {
++                text: "on it".into()
++            }
++        );
++
++        // Permission relay.
++        claude
++            .send(r#"{"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":{"request_id":"fdqmc","tool_name":"Bash","description":"d","input_preview":"p"}}"#)
++            .await;
++        assert!(matches!(
++            hub_message(&mut hub_rx).await,
++            AgentMsg::PermissionRequest(request) if request.request_id == "fdqmc"
++        ));
++        to_agent
++            .send(HubMsg::PermissionVerdict {
++                request_id: "fdqmc".into(),
++                behavior: wire::Behavior::Allow,
++            })
++            .await
++            .unwrap();
++        let verdict = claude.recv().await;
++        assert_eq!(verdict["method"], "notifications/claude/channel/permission");
++        assert_eq!(verdict["params"]["behavior"], "allow");
++
++        // The hub goes away: MCP keeps answering, the reply waits.
++        hub.abort();
++        let _ = hub.await;
++        drop(to_agent);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
++            .await;
++        assert_eq!(claude.recv().await["id"], 2);
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"text":"while down"}}}"#)
++            .await;
++        let answer = claude.recv().await;
++        assert_eq!(answer["result"]["isError"], false);
++        assert!(
++            answer["result"]["content"][0]["text"]
++                .as_str()
++                .unwrap()
++                .contains("queued")
++        );
++
++        // Back again: the same session registers and the reply arrives.
++        let listener = rebind(addr).await;
++        let (hub_tx, mut hub_rx) = mpsc::channel(16);
++        let _hub = tokio::spawn(ingress::serve_agents(listener, secret, hub_tx));
++        let (again, _to_agent) = registered(&mut hub_rx).await;
++        assert_eq!(again, register());
++        assert_eq!(
++            hub_message(&mut hub_rx).await,
++            AgentMsg::Reply {
++                text: "while down".into()
++            }
++        );
++    }
++
++    #[tokio::test]
++    async fn closing_stdin_ends_the_loop_and_the_link() {
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (outbox, events) = spawn(config(addr, Backoff::default()));
++        let (frames, frames_rx) = mpsc::channel(4);
++        let (ours, _theirs) = tokio::io::duplex(1024);
++        let serving = tokio::spawn(serve_channel(
++            frames_rx,
++            ours,
++            Hub::Link(outbox),
++            Some(events),
++        ));
++        let (_first, _) = listener.accept().await.unwrap();
++        drop(frames);
++        let done = tokio::time::timeout(WAIT, serving)
++            .await
++            .expect("loop ends");
++        assert!(done.unwrap().is_ok());
++    }
++}
+diff --git a/crates/cctg/src/channel.rs b/crates/cctg/src/channel.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/channel.rs
+@@ -0,0 +1,781 @@
++//! The Claude Code channel surface of `cctg agent`: MCP over stdio, one
++//! JSON-RPC 2.0 object per line, hand-rolled on `serde_json`.
++//!
++//! Implemented: `initialize` (channel, permission relay and tools
++//! capabilities), `notifications/initialized`, `tools/list`, `tools/call`
++//! (`reply`), the incoming `notifications/claude/channel/permission_request`
++//! and the outgoing `notifications/claude/channel` and
++//! `notifications/claude/channel/permission`. Every other request answers
++//! method-not-found; other notifications are ignored.
++//!
++//! [`Server`] is pure state: it turns one input into the lines to write and
++//! the messages to queue for the hub. Nothing here touches stdout; the agent
++//! loop owns it. Error texts are fixed: input from either side is never
++//! echoed back or logged.
++
++use std::collections::{BTreeMap, VecDeque};
++
++use serde_json::{Map, Value, json};
++use tokio::sync::mpsc;
++use tracing::{debug, warn};
++
++use crate::agent::LinkEvent;
++use crate::wire::{AgentMsg, Behavior, HubMsg, PermissionRequest};
++
++pub const SERVER_NAME: &str = "cctg";
++/// Answered when the client names no version; any named one is echoed, since
++/// nothing here depends on a protocol revision.
++pub const FALLBACK_PROTOCOL: &str = "2025-06-18";
++pub const PARSE_ERROR: i64 = -32700;
++pub const INVALID_REQUEST: i64 = -32600;
++pub const METHOD_NOT_FOUND: i64 = -32601;
++pub const INVALID_PARAMS: i64 = -32602;
++/// Channel notifications held until Claude Code sends `initialized`.
++pub const MAX_HELD: usize = 64;
++/// Permission requests still waiting for a verdict from the hub.
++pub const MAX_OPEN_PERMISSIONS: usize = 64;
++pub const REPLY_TOOL: &str = "reply";
++/// Longest reply text sent to the hub, in bytes. Even with every character
++/// `\u`-escaped the link line stays under `wire::MAX_LINE`.
++pub const MAX_REPLY: usize = 128 << 10;
++/// Longest permission request field, in bytes; three of them, escaped, still
++/// fit one link line. Claude Code already cuts each field to 3,500 code points.
++pub const MAX_PERMISSION_FIELD: usize = 32 << 10;
++
++pub const INSTRUCTIONS: &str = "Messages from the user's Telegram topic for this session arrive as \
++<channel source=\"cctg\" ...>. The user reads Telegram, not this terminal: answer each such \
++message with the `reply` tool, in plain text. If the tag has a `target_agent` attribute, the \
++message is for that running subagent: forward it with SendMessage to that agent instead of \
++acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
++never ask for permissions through `reply`.";
++
++/// Why this agent has no hub link. Shown to Claude when it calls `reply`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum NoHub {
++    /// `claude -p`: Claude Code never starts channels in headless runs.
++    Headless,
++    /// `CLAUDE_CODE_SESSION_ID` is missing: not spawned by Claude Code.
++    NoSession,
++    /// The device config has no usable `CCTG_HUB_SECRET`.
++    NoConfig,
++}
++
++impl NoHub {
++    pub fn text(self) -> &'static str {
++        match self {
++            Self::Headless => {
++                "cctg: this is a headless (claude -p) run; it has no Telegram channel"
++            }
++            Self::NoSession => "cctg: no Claude Code session id; the Telegram channel is off",
++            Self::NoConfig => {
++                "cctg: the hub is not configured on this device (~/.cctg/device.env); nothing was sent"
++            }
++        }
++    }
++}
++
++/// Where hub-bound messages go.
++#[derive(Debug)]
++pub enum Hub {
++    Off(NoHub),
++    Link(mpsc::Sender<AgentMsg>),
++}
++
++pub struct Server {
++    hub: Hub,
++    hub_up: bool,
++    initialized: bool,
++    held: VecDeque<Vec<u8>>,
++    open_permissions: VecDeque<String>,
++}
++
++impl Server {
++    pub fn new(hub: Hub) -> Self {
++        Self {
++            hub,
++            hub_up: false,
++            initialized: false,
++            held: VecDeque::new(),
++            open_permissions: VecDeque::new(),
++        }
++    }
++
++    /// One line from Claude Code (newline optional). Returns the lines to
++    /// write, each a complete JSON object followed by `\n`.
++    pub fn on_line(&mut self, line: &[u8]) -> Vec<Vec<u8>> {
++        if line.iter().all(u8::is_ascii_whitespace) {
++            return Vec::new();
++        }
++        let Ok(value) = serde_json::from_slice::<Value>(line) else {
++            return vec![error(&Value::Null, PARSE_ERROR, "Parse error")];
++        };
++        let Value::Object(msg) = value else {
++            // Batches are not part of MCP since 2025-06-18.
++            return vec![error(&Value::Null, INVALID_REQUEST, "Invalid Request")];
++        };
++        let id = msg.get("id").filter(|id| id.is_string() || id.is_number());
++        match (msg.get("method"), msg.get("id")) {
++            (Some(Value::String(method)), None) => {
++                self.on_notification(method, msg.get("params"));
++                self.flush_if_ready(method)
++            }
++            (Some(Value::String(method)), Some(_)) => match id {
++                Some(id) => vec![self.on_request(id, method, msg.get("params"))],
++                None => vec![error(&Value::Null, INVALID_REQUEST, "Invalid Request")],
++            },
++            // A response to a request of ours: we send none, so drop it.
++            (None, Some(_)) if msg.contains_key("result") || msg.contains_key("error") => {
++                Vec::new()
++            }
++            _ => vec![error(
++                id.unwrap_or(&Value::Null),
++                INVALID_REQUEST,
++                "Invalid Request",
++            )],
++        }
++    }
++
++    /// A line longer than the reader accepts was skipped.
++    pub fn on_oversized_line(&mut self) -> Vec<Vec<u8>> {
++        warn!("oversized line from Claude Code skipped");
++        vec![error(&Value::Null, PARSE_ERROR, "Parse error")]
++    }
++
++    /// Link state and hub messages.
++    pub fn on_link(&mut self, event: LinkEvent) -> Vec<Vec<u8>> {
++        match event {
++            LinkEvent::Up => {
++                self.hub_up = true;
++                Vec::new()
++            }
++            LinkEvent::Down => {
++                self.hub_up = false;
++                Vec::new()
++            }
++            LinkEvent::Message(HubMsg::Inbound { content, meta }) => {
++                let line = notification(
++                    "notifications/claude/channel",
++                    json!({ "content": content, "meta": channel_meta(meta) }),
++                );
++                self.emit(line)
++            }
++            LinkEvent::Message(HubMsg::PermissionVerdict {
++                request_id,
++                behavior,
++            }) => {
++                let Some(at) = self
++                    .open_permissions
++                    .iter()
++                    .position(|id| *id == request_id)
++                else {
++                    debug!("verdict for a request that is not open; dropped");
++                    return Vec::new();
++                };
++                self.open_permissions.remove(at);
++                let behavior = match behavior {
++                    Behavior::Allow => "allow",
++                    Behavior::Deny => "deny",
++                };
++                let line = notification(
++                    "notifications/claude/channel/permission",
++                    json!({ "request_id": request_id, "behavior": behavior }),
++                );
++                self.emit(line)
++            }
++            LinkEvent::Message(HubMsg::Registered | HubMsg::Rejected { .. }) => Vec::new(),
++        }
++    }
++
++    fn emit(&mut self, line: Vec<u8>) -> Vec<Vec<u8>> {
++        if self.initialized {
++            return vec![line];
++        }
++        if self.held.len() == MAX_HELD {
++            self.held.pop_front();
++            warn!("channel notification dropped before initialization");
++        }
++        self.held.push_back(line);
++        Vec::new()
++    }
++
++    fn flush_if_ready(&mut self, method: &str) -> Vec<Vec<u8>> {
++        if method == "notifications/initialized" {
++            self.held.drain(..).collect()
++        } else {
++            Vec::new()
++        }
++    }
++
++    fn on_notification(&mut self, method: &str, params: Option<&Value>) {
++        match method {
++            "notifications/initialized" => self.initialized = true,
++            "notifications/claude/channel/permission_request" => {
++                self.on_permission_request(params);
++            }
++            _ => debug!("notification ignored"),
++        }
++    }
++
++    fn on_permission_request(&mut self, params: Option<&Value>) {
++        let field = |name: &str| {
++            params
++                .and_then(|params| params.get(name))
++                .and_then(Value::as_str)
++                .map(str::to_owned)
++        };
++        let Some(request_id) = field("request_id").filter(|id| is_request_id(id)) else {
++            warn!("permission request without a valid request id; ignored");
++            return;
++        };
++        let Hub::Link(outbox) = &self.hub else {
++            return;
++        };
++        let request = PermissionRequest {
++            request_id: request_id.clone(),
++            tool_name: cap(field("tool_name").unwrap_or_default(), MAX_PERMISSION_FIELD),
++            description: cap(
++                field("description").unwrap_or_default(),
++                MAX_PERMISSION_FIELD,
++            ),
++            input_preview: cap(
++                field("input_preview").unwrap_or_default(),
++                MAX_PERMISSION_FIELD,
++            ),
++        };
++        if outbox
++            .try_send(AgentMsg::PermissionRequest(request))
++            .is_err()
++        {
++            warn!("hub queue full; permission request not relayed");
++            return;
++        }
++        if self.open_permissions.len() == MAX_OPEN_PERMISSIONS {
++            self.open_permissions.pop_front();
++        }
++        self.open_permissions.push_back(request_id);
++    }
++
++    fn on_request(&mut self, id: &Value, method: &str, params: Option<&Value>) -> Vec<u8> {
++        match method {
++            "initialize" => {
++                let version = params
++                    .and_then(|params| params.get("protocolVersion"))
++                    .and_then(Value::as_str)
++                    .filter(|version| !version.is_empty())
++                    .unwrap_or(FALLBACK_PROTOCOL);
++                result(
++                    id,
++                    json!({
++                        "protocolVersion": version,
++                        "capabilities": {
++                            "tools": {},
++                            "experimental": {
++                                "claude/channel": {},
++                                "claude/channel/permission": {},
++                            },
++                        },
++                        "serverInfo": {
++                            "name": SERVER_NAME,
++                            "version": env!("CARGO_PKG_VERSION"),
++                        },
++                        "instructions": INSTRUCTIONS,
++                    }),
++                )
++            }
++            "tools/list" => result(id, json!({ "tools": [reply_tool()] })),
++            "tools/call" => {
++                let name = params
++                    .and_then(|params| params.get("name"))
++                    .and_then(Value::as_str);
++                match name {
++                    Some(REPLY_TOOL) => {
++                        let arguments = params.and_then(|params| params.get("arguments"));
++                        result(id, self.reply(arguments))
++                    }
++                    Some(_) => error(id, INVALID_PARAMS, "Unknown tool"),
++                    None => error(id, INVALID_PARAMS, "tools/call needs a tool name"),
++                }
++            }
++            _ => error(id, METHOD_NOT_FOUND, "Method not found"),
++        }
++    }
++
++    /// The `reply` tool. Input problems are tool errors (`isError`), so
++    /// Claude can correct them; only protocol problems are JSON-RPC errors.
++    fn reply(&mut self, arguments: Option<&Value>) -> Value {
++        let text = arguments
++            .and_then(|arguments| arguments.get("text"))
++            .and_then(Value::as_str)
++            .filter(|text| !text.trim().is_empty());
++        let Some(text) = text else {
++            return tool_result("reply needs a non-empty `text` string", true);
++        };
++        let outbox = match &self.hub {
++            Hub::Off(reason) => return tool_result(reason.text(), true),
++            Hub::Link(outbox) => outbox,
++        };
++        let reply = AgentMsg::Reply {
++            text: cap(text.to_owned(), MAX_REPLY),
++        };
++        match outbox.try_send(reply) {
++            Ok(()) if self.hub_up => {
++                tool_result("Sent to the Telegram topic of this session.", false)
++            }
++            Ok(()) => tool_result(
++                "The cctg hub is not reachable right now; the reply is queued and goes out when the link is back.",
++                false,
++            ),
++            Err(_) => tool_result("The cctg hub queue is full; the reply was not sent.", true),
++        }
++    }
++}
++
++/// Cuts on a char boundary and marks the cut with an ellipsis.
++fn cap(mut text: String, max: usize) -> String {
++    if text.len() > max {
++        let cut = text.floor_char_boundary(max - '\u{2026}'.len_utf8());
++        text.truncate(cut);
++        text.push('\u{2026}');
++    }
++    text
++}
++
++fn reply_tool() -> Value {
++    json!({
++        "name": REPLY_TOOL,
++        "description": "Send a message to the Telegram topic of this Claude Code session. \
++            Use it to answer messages that arrived through the cctg channel.",
++        "inputSchema": {
++            "type": "object",
++            "properties": {
++                "text": { "type": "string", "description": "Message text, plain text." },
++            },
++            "required": ["text"],
++            "additionalProperties": false,
++        },
++    })
++}
++
++/// Keeps only keys Claude Code accepts (`[A-Za-z0-9_]+`); other keys are
++/// dropped, never renamed. Values are passed through unchanged.
++pub fn channel_meta(meta: BTreeMap<String, String>) -> Map<String, Value> {
++    let total = meta.len();
++    let kept: Map<String, Value> = meta
++        .into_iter()
++        .filter(|(key, _)| is_meta_key(key))
++        .map(|(key, value)| (key, Value::String(value)))
++        .collect();
++    if kept.len() != total {
++        debug!(dropped = total - kept.len(), "invalid meta keys dropped");
++    }
++    kept
++}
++
++pub fn is_meta_key(key: &str) -> bool {
++    !key.is_empty()
++        && key
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
++}
++
++/// Five lowercase letters without `l`, as Claude Code issues them.
++pub fn is_request_id(id: &str) -> bool {
++    id.len() == 5
++        && id
++            .bytes()
++            .all(|byte| byte.is_ascii_lowercase() && byte != b'l')
++}
++
++fn line(value: &Value) -> Vec<u8> {
++    let mut line = serde_json::to_vec(value).expect("a JSON value always serializes");
++    line.push(b'\n');
++    line
++}
++
++fn result(id: &Value, result: Value) -> Vec<u8> {
++    line(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
++}
++
++fn error(id: &Value, code: i64, message: &str) -> Vec<u8> {
++    line(&json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }))
++}
++
++fn notification(method: &str, params: Value) -> Vec<u8> {
++    line(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
++}
++
++fn tool_result(text: &str, is_error: bool) -> Value {
++    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn parse(lines: &[Vec<u8>]) -> Vec<Value> {
++        lines
++            .iter()
++            .map(|line| {
++                assert!(line.ends_with(b"\n"));
++                assert_eq!(line.iter().filter(|&&b| b == b'\n').count(), 1);
++                let value: Value = serde_json::from_slice(line).expect("one JSON object");
++                assert!(value.is_object());
++                value
++            })
++            .collect()
++    }
++
++    fn one(server: &mut Server, input: &str) -> Value {
++        let out = parse(&server.on_line(input.as_bytes()));
++        assert_eq!(out.len(), 1, "{input}");
++        out.into_iter().next().unwrap()
++    }
++
++    fn linked() -> (Server, mpsc::Receiver<AgentMsg>) {
++        let (tx, rx) = mpsc::channel(4);
++        (Server::new(Hub::Link(tx)), rx)
++    }
++
++    fn init(server: &mut Server) {
++        one(
++            server,
++            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
++        );
++        assert!(
++            server
++                .on_line(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
++                .is_empty()
++        );
++    }
++
++    #[test]
++    fn initialize_declares_the_channel() {
++        let (mut server, _rx) = linked();
++        let answer = one(
++            &mut server,
++            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
++        );
++        assert_eq!(answer["id"], 0);
++        let result = &answer["result"];
++        assert_eq!(result["protocolVersion"], "2025-11-25");
++        assert_eq!(result["capabilities"]["tools"], json!({}));
++        assert_eq!(
++            result["capabilities"]["experimental"],
++            json!({ "claude/channel": {}, "claude/channel/permission": {} })
++        );
++        assert_eq!(result["serverInfo"]["name"], "cctg");
++        assert!(result["instructions"].as_str().unwrap().contains("reply"));
++        let answer = one(
++            &mut server,
++            r#"{"jsonrpc":"2.0","id":"x","method":"initialize"}"#,
++        );
++        assert_eq!(answer["id"], "x");
++        assert_eq!(answer["result"]["protocolVersion"], FALLBACK_PROTOCOL);
++    }
++
++    #[test]
++    fn tools_list_offers_reply_only() {
++        let (mut server, _rx) = linked();
++        init(&mut server);
++        let answer = one(
++            &mut server,
++            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
++        );
++        let tools = answer["result"]["tools"].as_array().unwrap();
++        assert_eq!(tools.len(), 1);
++        assert_eq!(tools[0]["name"], "reply");
++        assert_eq!(tools[0]["inputSchema"]["required"], json!(["text"]));
++    }
++
++    #[test]
++    fn reply_goes_to_the_hub() {
++        let (mut server, mut rx) = linked();
++        init(&mut server);
++        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reply","arguments":{"text":"done ✓"}}}"#;
++        let answer = one(&mut server, call);
++        assert_eq!(answer["result"]["isError"], false);
++        assert!(
++            answer["result"]["content"][0]["text"]
++                .as_str()
++                .unwrap()
++                .contains("queued")
++        );
++        assert_eq!(
++            rx.try_recv().unwrap(),
++            AgentMsg::Reply {
++                text: "done ✓".into()
++            }
++        );
++        server.on_link(LinkEvent::Up);
++        let answer = one(&mut server, call);
++        assert!(
++            answer["result"]["content"][0]["text"]
++                .as_str()
++                .unwrap()
++                .starts_with("Sent")
++        );
++    }
++
++    #[test]
++    fn bad_calls_are_answered_not_fatal() {
++        let (mut server, mut rx) = linked();
++        init(&mut server);
++        for (input, code) in [
++            (
++                r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
++                METHOD_NOT_FOUND,
++            ),
++            (
++                r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#,
++                METHOD_NOT_FOUND,
++            ),
++            (
++                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"other"}}"#,
++                INVALID_PARAMS,
++            ),
++            (
++                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#,
++                INVALID_PARAMS,
++            ),
++        ] {
++            let answer = one(&mut server, input);
++            assert_eq!(answer["id"], 3, "{input}");
++            assert_eq!(answer["error"]["code"], code, "{input}");
++        }
++        for input in [
++            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"reply"}}"#,
++            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"reply","arguments":{"text":"  "}}}"#,
++            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"reply","arguments":{"text":7}}}"#,
++        ] {
++            let answer = one(&mut server, input);
++            assert_eq!(answer["result"]["isError"], true, "{input}");
++        }
++        assert!(rx.try_recv().is_err(), "nothing reached the hub");
++    }
++
++    #[test]
++    fn broken_input_gets_controlled_answers() {
++        let (mut server, _rx) = linked();
++        for (input, id, code) in [
++            ("not json", Value::Null, PARSE_ERROR),
++            ("{\"jsonrpc\":\"2.0\",\"id\":1,", Value::Null, PARSE_ERROR),
++            ("[]", Value::Null, INVALID_REQUEST),
++            ("42", Value::Null, INVALID_REQUEST),
++            (
++                r#"{"jsonrpc":"2.0","id":{"a":1},"method":"tools/list"}"#,
++                Value::Null,
++                INVALID_REQUEST,
++            ),
++            (
++                r#"{"jsonrpc":"2.0","id":5,"method":7}"#,
++                json!(5),
++                INVALID_REQUEST,
++            ),
++            (r#"{"jsonrpc":"2.0","id":5}"#, json!(5), INVALID_REQUEST),
++        ] {
++            let answer = one(&mut server, input);
++            assert_eq!(answer["id"], id, "{input}");
++            assert_eq!(answer["error"]["code"], code, "{input}");
++        }
++        // Silence: blank lines, responses to us, unknown notifications.
++        for input in [
++            "",
++            "  \r\n",
++            r#"{"jsonrpc":"2.0","id":9,"result":{}}"#,
++            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
++        ] {
++            assert!(server.on_line(input.as_bytes()).is_empty(), "{input}");
++        }
++        // Non-UTF-8 bytes and every prefix of a real request.
++        let _ = parse(&server.on_line(b"\xff\xfe{"));
++        let real = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"reply","arguments":{"text":"x"}}}"#;
++        for cut in 0..real.len() {
++            let _ = parse(&server.on_line(&real[..cut]));
++        }
++        assert_eq!(
++            parse(&server.on_oversized_line())[0]["error"]["code"],
++            PARSE_ERROR
++        );
++    }
++
++    #[test]
++    fn inbound_waits_for_initialized_and_keeps_valid_meta_byte_for_byte() {
++        let (mut server, _rx) = linked();
++        let meta: BTreeMap<String, String> = [
++            ("chat_id", "-1001"),
++            ("target_agent", "a8c1bff86acd31609"),
++            ("From2", "Артём \"quoted\" <tag> \n\t😀 \\ ok"),
++            ("bad-key", "dropped"),
++            ("", "dropped"),
++            ("dotted.key", "dropped"),
++            ("ключ", "dropped"),
++            ("sp ace", "dropped"),
++        ]
++        .into_iter()
++        .map(|(k, v)| (k.to_owned(), v.to_owned()))
++        .collect();
++        let inbound = LinkEvent::Message(HubMsg::Inbound {
++            content: "line one\nline two".into(),
++            meta: meta.clone(),
++        });
++        assert!(server.on_link(inbound).is_empty(), "held before initialize");
++        one(
++            &mut server,
++            r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#,
++        );
++        let flushed =
++            parse(&server.on_line(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#));
++        assert_eq!(flushed.len(), 1);
++        let note = &flushed[0];
++        assert_eq!(note["method"], "notifications/claude/channel");
++        assert!(note.get("id").is_none());
++        assert_eq!(note["params"]["content"], "line one\nline two");
++        let got = note["params"]["meta"].as_object().unwrap();
++        let keys: Vec<&str> = got.keys().map(String::as_str).collect();
++        assert_eq!(keys, ["From2", "chat_id", "target_agent"]);
++        for key in keys {
++            assert_eq!(got[key].as_str().unwrap().as_bytes(), meta[key].as_bytes());
++        }
++        // After initialization, delivered at once.
++        let later = server.on_link(LinkEvent::Message(HubMsg::Inbound {
++            content: "now".into(),
++            meta: BTreeMap::new(),
++        }));
++        assert_eq!(parse(&later)[0]["params"]["meta"], json!({}));
++    }
++
++    #[test]
++    fn held_notifications_are_bounded() {
++        let (mut server, _rx) = linked();
++        for n in 0..MAX_HELD + 5 {
++            server.on_link(LinkEvent::Message(HubMsg::Inbound {
++                content: n.to_string(),
++                meta: BTreeMap::new(),
++            }));
++        }
++        let flushed =
++            parse(&server.on_line(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#));
++        assert_eq!(flushed.len(), MAX_HELD);
++        assert_eq!(flushed[0]["params"]["content"], "5");
++    }
++
++    #[test]
++    fn permission_relay_round_trip() {
++        let (mut server, mut rx) = linked();
++        init(&mut server);
++        let request = r#"{"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":{"request_id":"tcmbm","tool_name":"Bash","description":"Create a file","input_preview":"{ \"command\": \"echo x > y\" }"}}"#;
++        assert!(server.on_line(request.as_bytes()).is_empty());
++        assert_eq!(
++            rx.try_recv().unwrap(),
++            AgentMsg::PermissionRequest(PermissionRequest {
++                request_id: "tcmbm".into(),
++                tool_name: "Bash".into(),
++                description: "Create a file".into(),
++                input_preview: "{ \"command\": \"echo x > y\" }".into(),
++            })
++        );
++        // A verdict for an id that was never asked is dropped.
++        let stray = server.on_link(LinkEvent::Message(HubMsg::PermissionVerdict {
++            request_id: "zzzzz".into(),
++            behavior: Behavior::Allow,
++        }));
++        assert!(stray.is_empty());
++        let verdict = LinkEvent::Message(HubMsg::PermissionVerdict {
++            request_id: "tcmbm".into(),
++            behavior: Behavior::Deny,
++        });
++        let out = parse(&server.on_link(verdict.clone()));
++        assert_eq!(out[0]["method"], "notifications/claude/channel/permission");
++        assert_eq!(
++            out[0]["params"],
++            json!({ "request_id": "tcmbm", "behavior": "deny" })
++        );
++        // Second verdict for the same id: already decided.
++        assert!(server.on_link(verdict).is_empty());
++    }
++
++    #[test]
++    fn malformed_permission_requests_are_not_relayed() {
++        let (mut server, mut rx) = linked();
++        init(&mut server);
++        for params in [
++            r#"{}"#,
++            r#"{"request_id":"abcdl"}"#,
++            r#"{"request_id":"ABCDE"}"#,
++            r#"{"request_id":"abcdef"}"#,
++            r#"{"request_id":5}"#,
++        ] {
++            let line = format!(
++                r#"{{"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":{params}}}"#
++            );
++            assert!(server.on_line(line.as_bytes()).is_empty());
++        }
++        assert!(rx.try_recv().is_err());
++        assert!(is_request_id("abcde") && !is_request_id("abcle"));
++    }
++
++    #[test]
++    fn without_a_hub_reply_says_why() {
++        for reason in [NoHub::Headless, NoHub::NoSession, NoHub::NoConfig] {
++            let mut server = Server::new(Hub::Off(reason));
++            init(&mut server);
++            let answer = one(
++                &mut server,
++                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reply","arguments":{"text":"hi"}}}"#,
++            );
++            assert_eq!(answer["result"]["isError"], true);
++            assert_eq!(answer["result"]["content"][0]["text"], reason.text());
++            // Permission requests are accepted silently.
++            assert!(
++                server
++                    .on_line(br#"{"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":{"request_id":"abcde"}}"#)
++                    .is_empty()
++            );
++        }
++    }
++
++    #[test]
++    fn a_full_hub_queue_is_a_tool_error() {
++        let (tx, _rx) = mpsc::channel(1);
++        tx.try_send(AgentMsg::Reply { text: "x".into() }).unwrap();
++        let mut server = Server::new(Hub::Link(tx));
++        init(&mut server);
++        let answer = one(
++            &mut server,
++            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reply","arguments":{"text":"hi"}}}"#,
++        );
++        assert_eq!(answer["result"]["isError"], true);
++    }
++
++    #[test]
++    fn long_replies_are_capped() {
++        let (mut server, mut rx) = linked();
++        init(&mut server);
++        let text = "\u{1}".repeat(MAX_REPLY + 1);
++        let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reply","arguments":{"text":text}}});
++        one(&mut server, &call.to_string());
++        let AgentMsg::Reply { text } = rx.try_recv().unwrap() else {
++            panic!("reply expected");
++        };
++        assert!(text.len() <= MAX_REPLY && text.ends_with('\u{2026}'));
++        assert!(crate::wire::encode(&AgentMsg::Reply { text }).len() < crate::wire::MAX_LINE);
++        // Worst case for a permission request: three escaped fields.
++        let field = "\u{1}".repeat(MAX_PERMISSION_FIELD * 2);
++        let params = json!({"request_id":"abcde","tool_name":field,"description":field,"input_preview":field});
++        let note = json!({"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":params});
++        assert!(server.on_line(note.to_string().as_bytes()).is_empty());
++        let request = rx.try_recv().unwrap();
++        assert!(crate::wire::encode(&request).len() < crate::wire::MAX_LINE);
++        assert_eq!(cap("é".repeat(10), 5), "é\u{2026}");
++    }
++
++    #[test]
++    fn meta_keys() {
++        for good in ["a", "A_1", "_", "chat_id"] {
++            assert!(is_meta_key(good), "{good}");
++        }
++        for bad in ["", "a-b", "a.b", "a b", "ä", "a\n"] {
++            assert!(!is_meta_key(bad), "{bad:?}");
++        }
++    }
++}
+diff --git a/crates/cctg/src/device.rs b/crates/cctg/src/device.rs
+--- a/crates/cctg/src/device.rs
++++ b/crates/cctg/src/device.rs
+@@ -11,6 +11,7 @@
+ //! ```text
+ //! CCTG_HUB_SECRET=<same value as on the hub>
+ //! CCTG_HUB_HOOK_ADDR=127.0.0.1:47292   # optional, ip:port or host:port
++//! CCTG_HUB_AGENT_ADDR=127.0.0.1:47291  # optional, the hub agent listener
+ //! CCTG_HOST=laptop                     # optional, defaults to the machine name
+ //! ```
+ 
+@@ -18,11 +19,13 @@
+ use std::fmt;
+ use std::path::{Path, PathBuf};
+ 
+-use crate::hub::config::{DEFAULT_HOOK_LISTEN, SECRET_VAR};
++use crate::hub::config::{DEFAULT_AGENT_LISTEN, DEFAULT_HOOK_LISTEN, SECRET_VAR};
+ use crate::wire::Secret;
+ 
+ /// `host:port` of the hub hook endpoint.
+ pub const HOOK_ADDR_VAR: &str = "CCTG_HUB_HOOK_ADDR";
++/// `host:port` of the hub agent listener (`cctg agent`).
++pub const AGENT_ADDR_VAR: &str = "CCTG_HUB_AGENT_ADDR";
+ /// Optional override of the host name this device reports.
+ pub const HOST_VAR: &str = "CCTG_HOST";
+ /// Location of the device config file, relative to the home directory.
+@@ -53,6 +56,7 @@
+ pub struct DeviceConfig {
+     pub secret: Result<Secret, ConfigProblem>,
+     pub hook_addr: String,
++    pub agent_addr: String,
+     pub host: String,
+ }
+ 
+@@ -83,9 +87,11 @@
+             Some(raw) => Secret::parse(&raw).map_err(|_| ConfigProblem::BadSecret),
+         };
+         let hook_addr = value(HOOK_ADDR_VAR).unwrap_or_else(|| DEFAULT_HOOK_LISTEN.to_string());
++        let agent_addr = value(AGENT_ADDR_VAR).unwrap_or_else(|| DEFAULT_AGENT_LISTEN.to_string());
+         Self {
+             secret,
+             hook_addr,
++            agent_addr,
+             host: host_name(&value),
+         }
+     }
+@@ -189,9 +195,14 @@
+         let config = DeviceConfig::from_vars(vars(&[(SECRET_VAR, SECRET), (HOST_VAR, " laptop ")]));
+         assert_eq!(config.secret.as_ref().map(Secret::expose), Ok(SECRET));
+         assert_eq!(config.hook_addr, "127.0.0.1:47292");
++        assert_eq!(config.agent_addr, "127.0.0.1:47291");
+         assert_eq!(config.host, "laptop");
+ 
+-        let config = DeviceConfig::from_vars(vars(&[(HOOK_ADDR_VAR, "hub.tail:47292")]));
++        let config = DeviceConfig::from_vars(vars(&[
++            (HOOK_ADDR_VAR, "hub.tail:47292"),
++            (AGENT_ADDR_VAR, "hub.tail:47291"),
++        ]));
++        assert_eq!(config.agent_addr, "hub.tail:47291");
+         assert_eq!(config.secret.err(), Some(ConfigProblem::NoSecret));
+         assert_eq!(config.hook_addr, "hub.tail:47292");
+         assert!(!config.host.is_empty());
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -624,6 +624,7 @@
+             session_id: "5e551017-0000-4000-8000-000000000001".into(),
+             host: "box".into(),
+             cwd: "/w".into(),
++            claude_pid: None,
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/registry.rs b/crates/cctg/src/hub/registry.rs
+--- a/crates/cctg/src/hub/registry.rs
++++ b/crates/cctg/src/hub/registry.rs
+@@ -760,15 +760,33 @@
+ 
+     /// An agent registered. `false`: the session is unknown; the caller keeps
+     /// the agent waiting for its SessionStart and never adopts it (without a
+-    /// SessionStart a nested run cannot be told from a top-level one).
++    /// SessionStart a nested run cannot be told from a top-level one). The
++    /// agent of a nested run is never bound: it is not a channel of any slot.
+     pub fn agent_connected(&mut self, session: &str, conn: u64) -> bool {
+         match self.sessions.get_mut(session) {
+-            Some(entry) => {
++            Some(entry) if entry.kind == SessionKind::TopLevel => {
+                 entry.agent = Some(conn);
+                 true
+             }
+-            None => false,
+-        }
++            _ => false,
++        }
++    }
++
++    /// The running top-level session of a claude process, if the registry
++    /// knows one. After `/clear` this is the new session of the same process.
++    pub fn live_session_of_pid(&self, host: &str, pid: u32) -> Option<&str> {
++        let session = self.pids.get(&pid_key(host, pid))?;
++        self.sessions
++            .get(session)
++            .filter(|entry| !entry.ended && entry.kind == SessionKind::TopLevel)
++            .map(|_| session.as_str())
++    }
++
++    /// A known top-level session that has not ended.
++    pub fn is_live_top_level(&self, session: &str) -> bool {
++        self.sessions
++            .get(session)
++            .is_some_and(|entry| !entry.ended && entry.kind == SessionKind::TopLevel)
+     }
+ 
+     pub fn agent_disconnected(&mut self, session: &str, conn: u64) {
+@@ -1465,6 +1483,34 @@
+     }
+ 
+     #[test]
++    fn the_pid_of_a_cleared_process_names_the_new_session() {
++        let mut registry = Registry::default();
++        registry.apply_hook(&start(A, CWD, Some(10), None));
++        assert_eq!(registry.live_session_of_pid("box", 10), Some(A));
++        assert!(registry.is_live_top_level(A));
++        registry.apply_hook(&clear_end(A));
++        assert_eq!(registry.live_session_of_pid("box", 10), None);
++        assert!(!registry.is_live_top_level(A));
++        registry.apply_hook(&start_from(B, CWD, Some(10), None, "clear"));
++        assert_eq!(registry.live_session_of_pid("box", 10), Some(B));
++        assert_eq!(registry.live_session_of_pid("other", 10), None);
++        // A nested run's own pid never names a channel session.
++        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
++        assert_eq!(registry.live_session_of_pid("box", 20), None);
++        assert!(!registry.is_live_top_level(N));
++    }
++
++    #[test]
++    fn the_agent_of_a_nested_run_is_never_bound() {
++        let mut registry = Registry::default();
++        registry.apply_hook(&start(A, CWD, Some(10), None));
++        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
++        assert!(!registry.agent_connected(N, 5));
++        assert_eq!(registry.sessions[N].agent, None);
++        assert!(registry.agent_connected(A, 6));
++    }
++
++    #[test]
+     fn clear_in_one_process_stays_in_its_slot() {
+         let mut registry = Registry::default();
+         let mut topic = 100;
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -164,13 +164,22 @@
+     }
+ }
+ 
++/// One registered agent connection.
++struct Conn {
++    /// The session it is bound to or waits for.
++    session: String,
++    host: String,
++    claude_pid: Option<u32>,
++    _to_agent: mpsc::Sender<HubMsg>,
++}
++
+ pub struct Slots {
+     registry: Registry,
+     dispatch: mpsc::UnboundedSender<(Work, Op)>,
+     options: Options,
+     saver: watch::Sender<Option<Arc<Vec<u8>>>>,
+     view: watch::Sender<Arc<TopicView>>,
+-    conns: HashMap<u64, (String, mpsc::Sender<HubMsg>)>,
++    conns: HashMap<u64, Conn>,
+     /// Agents of sessions no SessionStart announced yet: session -> conn.
+     pending: HashMap<String, u64>,
+     reading: HashSet<String>,
+@@ -256,7 +265,7 @@
+                 register,
+                 to_agent,
+             } => {
+-                let session = register.session_id.clone();
++                let session = self.agent_session(&register);
+                 if self.registry.agent_connected(&session, conn) {
+                     info!(
+                         conn,
+@@ -271,24 +280,87 @@
+                     );
+                     self.pending.insert(session.clone(), conn);
+                 }
+-                self.conns.insert(conn, (session, to_agent));
++                self.conns.insert(
++                    conn,
++                    Conn {
++                        session,
++                        host: register.host,
++                        claude_pid: register.claude_pid,
++                        _to_agent: to_agent,
++                    },
++                );
+             }
+             AgentEvent::Message { conn, msg } => {
+-                let Some((session, _)) = self.conns.get(&conn) else {
++                let Some(bound) = self.conns.get(&conn) else {
+                     return;
+                 };
+                 match msg {
+-                    AgentMsg::PermissionRequest(_) => self.registry.set_waiting(session, true),
++                    AgentMsg::PermissionRequest(_) => {
++                        self.registry.set_waiting(&bound.session, true);
++                    }
+                     _ => debug!(conn, "agent message not routed yet"),
+                 }
+             }
+             AgentEvent::Disconnected { conn } => {
+-                if let Some((session, _)) = self.conns.remove(&conn) {
+-                    self.registry.agent_disconnected(&session, conn);
+-                    if self.pending.get(&session) == Some(&conn) {
+-                        self.pending.remove(&session);
++                if let Some(gone) = self.conns.remove(&conn) {
++                    self.registry.agent_disconnected(&gone.session, conn);
++                    if self.pending.get(&gone.session) == Some(&conn) {
++                        self.pending.remove(&gone.session);
+                     }
+                 }
++            }
++        }
++    }
++
++    /// The session a registering agent belongs to. Its env session id, unless
++    /// that session is over and the registry knows a newer session of the
++    /// same claude process: after `/clear` Claude Code keeps the channel
++    /// server running with the old id (TASK-013).
++    fn agent_session(&self, register: &crate::wire::Register) -> String {
++        if !self.registry.is_live_top_level(&register.session_id)
++            && let Some(current) = register
++                .claude_pid
++                .and_then(|pid| self.registry.live_session_of_pid(&register.host, pid))
++        {
++            return current.to_owned();
++        }
++        register.session_id.clone()
++    }
++
++    /// Moves the agents of a claude process to the session that process now
++    /// runs. Nothing moves when the pid names no running top-level session.
++    fn follow_pid(&mut self, host: &str, pid: u32) {
++        let Some(session) = self
++            .registry
++            .live_session_of_pid(host, pid)
++            .map(str::to_owned)
++        else {
++            return;
++        };
++        let movers: Vec<u64> = self
++            .conns
++            .iter()
++            .filter(|(_, bound)| {
++                bound.host == host && bound.claude_pid == Some(pid) && bound.session != session
++            })
++            .map(|(conn, _)| *conn)
++            .collect();
++        for conn in movers {
++            let Some(bound) = self.conns.get_mut(&conn) else {
++                continue;
++            };
++            let old = std::mem::replace(&mut bound.session, session.clone());
++            self.registry.agent_disconnected(&old, conn);
++            if self.pending.get(&old) == Some(&conn) {
++                self.pending.remove(&old);
++            }
++            if self.registry.agent_connected(&session, conn) {
++                info!(
++                    conn,
++                    from = short(&old),
++                    session = short(&session),
++                    "agent follows its claude process to a new session"
++                );
+             }
+         }
+     }
+@@ -303,6 +375,13 @@
+             && let Some(conn) = self.pending.remove(session)
+         {
+             self.registry.agent_connected(session, conn);
++        }
++        if let HookEvent::SessionStart {
++            claude_pid: Some(pid),
++            ..
++        } = post.event
++        {
++            self.follow_pid(&post.host, pid);
+         }
+         if let Some((session, path)) = followup.read_title {
+             self.read_title(session, path);
+@@ -736,12 +815,18 @@
+         }
+ 
+         async fn agent(&mut self, conn: u64, session: &str) {
++            self.agent_of(conn, session, None).await;
++        }
++
++        /// An agent that reports the pid of its claude process.
++        async fn agent_of(&mut self, conn: u64, session: &str, claude_pid: Option<u32>) {
+             let (to_agent, rx) = mpsc::channel(4);
+             self._to_agent.push(rx);
+             let register = Register {
+                 session_id: session.into(),
+                 host: "box".into(),
+                 cwd: CWD.into(),
++                claude_pid,
+             };
+             self.agents
+                 .send(AgentEvent::Registered {
+@@ -784,6 +869,57 @@
+ 
+     fn is_create(op: &Op) -> bool {
+         matches!(op, Op::CreateTopic { .. })
++    }
++
++    #[tokio::test]
++    async fn the_agent_follows_its_claude_process_through_clear() {
++        let mut rig = rig(Fake::default(), options());
++        rig.hook(start(A, 10)).await;
++        rig.ops_after(1).await;
++        rig.agent_of(1, A, Some(10)).await;
++        let ops = rig.ops_after(2).await;
++        assert_eq!(icon_edit(&ops[1]), Some(ICON_ALIVE), "{ops:?}");
++
++        // `/clear`: the channel server keeps running with the old id.
++        rig.hook(hook(
++            A,
++            HookEvent::SessionEnd {
++                reason: Some("clear".into()),
++                claude_pid: Some(10),
++            },
++        ))
++        .await;
++        rig.hook(hook(
++            B,
++            HookEvent::SessionStart {
++                source: Some("clear".into()),
++                claude_pid: Some(10),
++                parent_claude_pid: None,
++            },
++        ))
++        .await;
++        // The end may flash "dead" before the start arrives; what matters is
++        // that the new session ends up alive, never "no channel".
++        let ops = rig.ops_after(5).await;
++        assert_eq!(count(&ops, is_create), 1, "same slot: {ops:?}");
++        assert!(
++            ops[1..]
++                .iter()
++                .all(|op| icon_edit(op) != Some(ICON_NO_CHANNEL)),
++            "{ops:?}"
++        );
++        let last_icon = ops.iter().rev().find_map(icon_edit);
++        assert_eq!(last_icon, Some(ICON_ALIVE), "{ops:?}");
++
++        // The link drops and comes back with the stale env id: still B.
++        rig.agents
++            .send(AgentEvent::Disconnected { conn: 1 })
++            .await
++            .unwrap();
++        let before = rig.ops_after(ops.len() + 1).await.len();
++        rig.agent_of(2, A, Some(10)).await;
++        let ops = rig.ops_after(before + 1).await;
++        assert_eq!(icon_edit(ops.last().unwrap()), Some(ICON_ALIVE), "{ops:?}");
+     }
+ 
+     #[tokio::test]
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -2,6 +2,7 @@
+ //! subcommands can use the hub modules.
+ 
+ pub mod agent;
++pub mod channel;
+ pub mod device;
+ pub mod hook;
+ pub mod hub;
+diff --git a/crates/cctg/src/main.rs b/crates/cctg/src/main.rs
+--- a/crates/cctg/src/main.rs
++++ b/crates/cctg/src/main.rs
+@@ -17,8 +17,11 @@
+         #[arg(long)]
+         env_file: Option<PathBuf>,
+     },
+-    /// Run the Claude Code channel agent.
++    /// Run the Claude Code channel agent (spawned by Claude Code over stdio).
+     Agent,
++    /// Print the command that registers `cctg agent` with Claude Code at
++    /// user scope, with this executable's absolute path.
++    AgentInstall,
+     /// Handle a Claude Code hook event.
+     Hook {
+         /// Hook event name.
+@@ -37,7 +40,10 @@
+         }
+         Err(error) => error.exit(),
+     };
+-    init_tracing(matches!(&cli.command, Command::Hook { .. }));
++    init_tracing(matches!(
++        &cli.command,
++        Command::Hook { .. } | Command::Agent
++    ));
+     match cli.command {
+         Command::Hub { env_file } => cctg::hub::run(env_file.as_deref()).await?,
+         Command::Hook { event } => {
+@@ -49,14 +55,28 @@
+             let _ = tokio::spawn(async move { cctg::hook::run(&event).await }).await;
+             std::process::exit(0);
+         }
+-        Command::Agent => {}
++        Command::Agent => {
++            // stdout belongs to JSON-RPC; a panic message goes to stderr as a
++            // fixed line (it could quote channel content).
++            std::panic::set_hook(Box::new(|_| eprintln!("cctg agent: internal error")));
++            let _ = tokio::spawn(cctg::agent::run_stdio()).await;
++            // At once: the stdin reader thread may still be blocked.
++            std::process::exit(0);
++        }
++        Command::AgentInstall => {
++            let exe = std::env::current_exe()?;
++            let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
++            println!("{}", cctg::agent::install_command(&exe));
++        }
+     }
+ 
+     Ok(())
+ }
+ 
+-fn init_tracing(is_hook: bool) {
+-    if is_hook {
++/// `plain`: no colours and no time, for output Claude Code captures (hooks,
++/// the agent's stderr lands in its debug log).
++fn init_tracing(plain: bool) {
++    if plain {
+         let _ = tracing_subscriber::fmt()
+             .with_writer(std::io::stderr)
+             .with_target(false)
+@@ -93,6 +113,12 @@
+             Command::Agent
+         ));
+         assert!(matches!(
++            Cli::try_parse_from(["cctg", "agent-install"])
++                .unwrap()
++                .command,
++            Command::AgentInstall
++        ));
++        assert!(matches!(
+             Cli::try_parse_from(["cctg", "hook", "SessionStart"])
+                 .unwrap()
+                 .command,
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -115,6 +115,11 @@
+     pub session_id: String,
+     pub host: String,
+     pub cwd: String,
++    /// The Claude Code process that spawned the agent. `CLAUDE_CODE_SESSION_ID`
++    /// goes stale after `/clear` (the server is not restarted, TASK-013); the
++    /// hub follows the process through its `pids` map instead.
++    #[serde(default)]
++    pub claude_pid: Option<u32>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -458,6 +463,7 @@
+                 session_id: "5e551017-0000-4000-8000-000000000001".into(),
+                 host: "box".into(),
+                 cwd: "C:\\work\\app".into(),
++                claude_pid: Some(4242),
+             }),
+             AgentMsg::Reply {
+                 text: "multi\nline \u{2014} text".into(),
+@@ -605,6 +611,20 @@
+     }
+ 
+     #[test]
++    fn a_register_without_claude_pid_still_decodes() {
++        let line = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
++        assert_eq!(
++            decode::<AgentMsg>(line),
++            Ok(AgentMsg::Register(Register {
++                session_id: "s".into(),
++                host: "h".into(),
++                cwd: "/w".into(),
++                claude_pid: None,
++            }))
++        );
++    }
++
++    #[test]
+     fn unknown_fields_are_ignored() {
+         let line = br#"{"v":1,"type":"registered","extra":{"a":1}}"#;
+         assert_eq!(decode::<HubMsg>(line), Ok(HubMsg::Registered));
+diff --git a/crates/cctg/tests/agent_stdio.rs b/crates/cctg/tests/agent_stdio.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/agent_stdio.rs
+@@ -0,0 +1,175 @@
++//! `cctg agent` as Claude Code runs it: JSON-RPC over the real stdin and
++//! stdout of the binary. stdout must carry one JSON object per line and
++//! nothing else, also while the hub link fails and logs.
++
++use std::io::Write;
++use std::net::TcpListener;
++use std::process::{Command, Stdio};
++use std::time::{Duration, Instant};
++
++use serde_json::Value;
++
++const SECRET: &str = "agent-stdio-secret-0123456789";
++
++/// A hub address that accepts and hangs up at once: the agent's handshake
++/// fails fast and it logs a warning.
++fn slamming_hub() -> String {
++    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
++    let addr = listener.local_addr().expect("addr").to_string();
++    std::thread::spawn(move || {
++        for stream in listener.incoming() {
++            drop(stream);
++        }
++    });
++    addr
++}
++
++struct Run {
++    status_ok: bool,
++    stdout: Vec<Value>,
++    stdout_raw: String,
++    stderr: String,
++}
++
++fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
++    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("agent-stdio-home");
++    std::fs::create_dir_all(&home).expect("home");
++    let mut command = Command::new(env!("CARGO_BIN_EXE_cctg"));
++    command
++        .arg("agent")
++        .current_dir(&home)
++        // Never the developer's own device config or session.
++        .env("USERPROFILE", &home)
++        .env("HOME", &home)
++        .env_remove("CCTG_HUB_SECRET")
++        .env_remove("CCTG_HUB_AGENT_ADDR")
++        .env_remove("CLAUDE_CODE_SESSION_ID")
++        .env_remove("CLAUDE_CODE_ENTRYPOINT")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped());
++    for (key, value) in envs {
++        command.env(key, value);
++    }
++    let mut child = command.spawn().expect("cctg starts");
++    let mut stdin = child.stdin.take().expect("stdin");
++    for line in lines {
++        stdin.write_all(line.as_bytes()).expect("write");
++        stdin.write_all(b"\n").expect("write");
++    }
++    stdin.flush().expect("flush");
++    std::thread::sleep(linger);
++    drop(stdin);
++    let started = Instant::now();
++    let output = child.wait_with_output().expect("cctg ends");
++    assert!(
++        started.elapsed() < Duration::from_secs(5),
++        "closing stdin ends the agent"
++    );
++    let stdout_raw = String::from_utf8(output.stdout).expect("utf-8 stdout");
++    let stdout = stdout_raw
++        .lines()
++        .map(|line| {
++            let value: Value = serde_json::from_str(line)
++                .unwrap_or_else(|_| panic!("stdout line is not JSON: {line:?}"));
++            assert!(value.is_object(), "{line}");
++            assert_eq!(value["jsonrpc"], "2.0", "{line}");
++            value
++        })
++        .collect();
++    Run {
++        status_ok: output.status.success(),
++        stdout,
++        stdout_raw,
++        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
++    }
++}
++
++const SCRIPT: &[&str] = &[
++    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
++    r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
++    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
++    r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reply","arguments":{"text":"hi"}}}"#,
++    r#"{"jsonrpc":"2.0","id":4,"method":"prompts/list"}"#,
++    "this is not json {",
++    "",
++    r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#,
++];
++
++fn by_id(run: &Run, id: i64) -> &Value {
++    run.stdout
++        .iter()
++        .find(|value| value["id"] == id)
++        .unwrap_or_else(|| panic!("no answer for id {id}: {}", run.stdout_raw))
++}
++
++#[test]
++fn a_full_session_with_a_failing_hub_keeps_stdout_pure() {
++    let hub = slamming_hub();
++    let run = run_agent(
++        &[
++            ("CCTG_HUB_SECRET", SECRET),
++            ("CCTG_HUB_AGENT_ADDR", &hub),
++            (
++                "CLAUDE_CODE_SESSION_ID",
++                "5e551017-0000-4000-8000-00000000abcd",
++            ),
++            ("CLAUDE_CODE_ENTRYPOINT", "cli"),
++        ],
++        SCRIPT,
++        Duration::from_millis(800),
++    );
++    assert!(run.status_ok, "{}", run.stderr);
++    // Six answers (ids 1-5 and one parse error), no notification.
++    assert_eq!(run.stdout.len(), 6, "{}", run.stdout_raw);
++    assert_eq!(
++        by_id(&run, 1)["result"]["capabilities"]["experimental"]["claude/channel"],
++        serde_json::json!({})
++    );
++    assert_eq!(by_id(&run, 2)["result"]["tools"][0]["name"], "reply");
++    assert_eq!(by_id(&run, 3)["result"]["isError"], false);
++    assert_eq!(by_id(&run, 4)["error"]["code"], -32601);
++    assert_eq!(by_id(&run, 5)["result"]["tools"][0]["name"], "reply");
++    assert!(
++        run.stdout
++            .iter()
++            .any(|value| value["id"].is_null() && value["error"]["code"] == -32700)
++    );
++    // The failing link did log, and only to stderr.
++    assert!(run.stderr.contains("hub link"), "{}", run.stderr);
++    for leaked in ["hub link", "WARN", "INFO", SECRET] {
++        assert!(!run.stdout_raw.contains(leaked), "{leaked} on stdout");
++    }
++    assert!(!run.stderr.contains(SECRET));
++}
++
++#[test]
++fn headless_and_unconfigured_agents_answer_without_a_hub() {
++    let hub = slamming_hub();
++    for envs in [
++        vec![
++            ("CCTG_HUB_SECRET", SECRET),
++            ("CCTG_HUB_AGENT_ADDR", hub.as_str()),
++            (
++                "CLAUDE_CODE_SESSION_ID",
++                "5e551017-0000-4000-8000-00000000abcd",
++            ),
++            ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
++        ],
++        vec![(
++            "CLAUDE_CODE_SESSION_ID",
++            "5e551017-0000-4000-8000-00000000abcd",
++        )],
++        vec![("CCTG_HUB_SECRET", SECRET)],
++    ] {
++        let run = run_agent(&envs, SCRIPT, Duration::from_millis(200));
++        assert!(run.status_ok, "{}", run.stderr);
++        assert_eq!(run.stdout.len(), 6, "{}", run.stdout_raw);
++        assert_eq!(by_id(&run, 3)["result"]["isError"], true);
++        assert!(
++            !run.stderr.contains("hub link not established"),
++            "{}",
++            run.stderr
++        );
++    }
++}
+diff --git a/crates/cctg/tests/ingress_logs.rs b/crates/cctg/tests/ingress_logs.rs
+--- a/crates/cctg/tests/ingress_logs.rs
++++ b/crates/cctg/tests/ingress_logs.rs
+@@ -102,6 +102,7 @@
+         session_id: "5e551017-0000-4000-8000-000000000001".into(),
+         host: format!("host-{content}"),
+         cwd: format!("/home/{content}"),
++        claude_pid: None,
+     };
+     let mut lines = wire::encode(&AgentMsg::Hello {
+         secret: secret.clone(),
+diff --git a/crates/cctg/tests/slots_logs.rs b/crates/cctg/tests/slots_logs.rs
+--- a/crates/cctg/tests/slots_logs.rs
++++ b/crates/cctg/tests/slots_logs.rs
+@@ -129,6 +129,7 @@
+                 session_id: "0dd0dd0d-0000-4000-8000-000000000009".into(),
+                 host: "box".into(),
+                 cwd: cwd.clone(),
++                claude_pid: None,
+             },
+             to_agent,
+         })

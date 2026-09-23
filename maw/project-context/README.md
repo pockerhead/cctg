@@ -10,6 +10,7 @@ The repository's `CLAUDE.md` is the source of truth for platform facts (channel 
 - Deserialize only the fields you need with `#[serde(default)]`; never model the whole jsonl or Bot API.
 - Language: code, identifiers, commits in English; prose to the user in Russian.
 - Commit messages carry no "Generated with" / "Co-Authored-By" trailers.
+- Never put a window or a question on the user's screen. Prefer unit/integration tests and `claude -p` (no dialogs; no channel). A live interactive `claude` probe starts in a HIDDEN console (`Popen(..., creationflags=CREATE_NEW_CONSOLE, startupinfo=si)` with `si.dwFlags |= STARTF_USESHOWWINDOW; si.wShowWindow = 0`), answers the workspace-trust and development-channels dialogs itself via `AttachConsole` + `WriteConsoleInputW` (no flag or setting skips them), reads the screen the same way, reuses one fixed probe folder, and kills only its own process tree.
 
 ## Domain catalog
 - trigger: any file under `crates/transcript/**`, any `.jsonl` fixture, or literal tokens `parentUuid`, `isSidechain`, `tool_result` → {PCTX}/domains/transcript.md

@@ -1,0 +1,13 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg13_qa
+
+▎ Debug mode enabled · logging to C:\Users\user\AppData\Local\Temp\cctg13_qa\debug_QA2.log
+  1 more notice hidden
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Try "how do I log an error?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:cctg13_qa sh:bash
+  acc:<email>
+  ⏸ manual mode on · ← 1 agent

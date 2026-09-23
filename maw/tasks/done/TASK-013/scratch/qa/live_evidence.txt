@@ -1,0 +1,39 @@
+## debug_QA.log
+2026-09-23T14:06:06.760Z [DEBUG] MCP server "cctgqa": Starting connection with timeout of 30000ms
+2026-09-23T14:06:07.056Z [ERROR] MCP server "cctgqa" Server stderr:  INFO registered with the hub
+2026-09-23T14:06:07.057Z [DEBUG] MCP server "cctgqa": Successfully connected (transport: stdio) in 297ms
+2026-09-23T14:06:07.057Z [DEBUG] MCP server "cctgqa": Connection established with capabilities: {"hasTools":true,"hasPrompts":false,"hasResources":false,"hasResourceSubscribe":false,"serverVersion":{"name":"cctg","version":"0.1.0"},"protocolEra":"legacy","negotiatedProtocolVersion":"2025-11-25"}
+2026-09-23T14:06:07.057Z [DEBUG] [MCP] Server "cctgqa" connected with subscribe=false
+2026-09-23T14:06:07.186Z [DEBUG] MCP server "cctgqa": Channel notifications registered
+2026-09-23T14:06:36.826Z [DEBUG] MCP server "cctgqa": notifications/claude/channel: QA13-A reply with the reply tool: pong-a
+2026-09-23T14:07:10.909Z [DEBUG] Cleared all session hooks for session 381104f0-8c16-4a21-af54-80b330e62cd8
+2026-09-23T14:07:10.952Z [DEBUG] MCP server "cctgqa": Channel notifications registered
+2026-09-23T14:07:46.818Z [DEBUG] MCP server "cctgqa": notifications/claude/channel: QA13-B reply with the reply tool: pong-b
+## debug_QA2.log
+2026-09-23T14:09:12.369Z [DEBUG] MCP server "cctgqa": Starting connection with timeout of 30000ms
+2026-09-23T14:09:12.414Z [ERROR] MCP server "cctgqa" Server stderr:  INFO registered with the hub
+2026-09-23T14:09:12.414Z [DEBUG] MCP server "cctgqa": Successfully connected (transport: stdio) in 45ms
+2026-09-23T14:09:12.415Z [DEBUG] MCP server "cctgqa": Connection established with capabilities: {"hasTools":true,"hasPrompts":false,"hasResources":false,"hasResourceSubscribe":false,"serverVersion":{"name":"cctg","version":"0.1.0"},"protocolEra":"legacy","negotiatedProtocolVersion":"2025-11-25"}
+2026-09-23T14:09:12.415Z [DEBUG] [MCP] Server "cctgqa" connected with subscribe=false
+2026-09-23T14:09:12.696Z [DEBUG] MCP server "cctgqa": Channel notifications registered
+2026-09-23T14:09:42.419Z [DEBUG] MCP server "cctgqa": notifications/claude/channel: QA13-A. Load the tool mcp__cctgqa__reply with ToolSearch, then call it with text
+2026-09-23T14:09:44.688Z [DEBUG] ToolSearchTool: selected mcp__cctgqa__reply
+2026-09-23T14:09:47.226Z [DEBUG] "Permission suggestions for mcp__cctgqa__reply: [\n  {\n    \"type\": \"addRules\",\n    \"rules\": [\n      {\n        \"toolName\": \"mcp__cctgqa__reply\"\n      }\n    ],\n    \"behavior\": \"allow\",\n    \"destination\": \"localSettings\"\n  }\n]"
+2026-09-23T14:09:47.228Z [DEBUG] executePermissionRequestHooks called for tool: mcp__cctgqa__reply
+2026-09-23T14:09:47.256Z [DEBUG] MCP server "cctgqa": notifications/claude/channel/permission: yfsgn → allow (matched pending)
+2026-09-23T14:09:47.259Z [DEBUG] MCP server "cctgqa": Calling MCP tool: reply
+2026-09-23T14:09:47.292Z [DEBUG] MCP server "cctgqa": Tool 'reply' completed successfully in 33ms
+2026-09-23T14:10:20.420Z [DEBUG] Cleared all session hooks for session 9068257b-d637-461e-86da-6bc32eb91899
+2026-09-23T14:10:20.460Z [DEBUG] MCP server "cctgqa": Channel notifications registered
+2026-09-23T14:10:57.418Z [DEBUG] MCP server "cctgqa": notifications/claude/channel: QA13-B. Load the tool mcp__cctgqa__reply with ToolSearch, then call it with text
+2026-09-23T14:10:59.300Z [DEBUG] ToolSearchTool: selected mcp__cctgqa__reply
+2026-09-23T14:11:01.697Z [DEBUG] "Permission suggestions for mcp__cctgqa__reply: [\n  {\n    \"type\": \"addRules\",\n    \"rules\": [\n      {\n        \"toolName\": \"mcp__cctgqa__reply\"\n      }\n    ],\n    \"behavior\": \"allow\",\n    \"destination\": \"localSettings\"\n  }\n]"
+2026-09-23T14:11:01.698Z [DEBUG] executePermissionRequestHooks called for tool: mcp__cctgqa__reply
+2026-09-23T14:11:01.721Z [DEBUG] MCP server "cctgqa": notifications/claude/channel/permission: hbiot → allow (matched pending)
+2026-09-23T14:11:01.722Z [DEBUG] MCP server "cctgqa": Calling MCP tool: reply
+2026-09-23T14:11:01.757Z [DEBUG] MCP server "cctgqa": Tool 'reply' completed successfully in 35ms
+## transcripts (file: A/B inbound tag counts, sessionId)
+381104f0-8c16-4a21-af54-80b330e62cd8.jsonl: A=2 B=0
+4c630dd6-8978-411f-a534-6f52dec6cbea.jsonl: A=0 B=2
+9068257b-d637-461e-86da-6bc32eb91899.jsonl: A=2 B=0
+a2b73976-2be3-4605-b667-bfaea75c6e76.jsonl: A=0 B=2

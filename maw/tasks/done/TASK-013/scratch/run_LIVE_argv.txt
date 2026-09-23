@@ -1,0 +1,9 @@
+label: LIVE
+argv: ["C:\\Users\\user\\.local\\bin\\claude.EXE", "--mcp-config", "C:\\Users\\user\\AppData\\Local\\Temp\\cctg13_live\\mcp.json", "--dangerously-load-development-channels", "server:cctg", "--model", "haiku", "--debug-file", "C:\\Users\\user\\dev\\cctg\\maw\\tasks\\in_progress\\TASK-013\\scratch\\debug_LIVE.log"]
+cwd: C:\Users\user\AppData\Local\Temp\cctg13_live
+probe_nonce: NONONCE
+start_utc: 2026-09-23T11:28:08Z
+spawned_pid: 15620
+end_utc: 2026-09-23T11:30:58Z
+exit_status_before_kill: None
+exit_status: 1

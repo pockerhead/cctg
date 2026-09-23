@@ -1,0 +1,27 @@
+# /clear observation 2026-09-23, Claude Code 2.1.280, --mcp-config temp server probe13
+## transcripts created by the run (file: count of C13-T70 inbound tag)
+d10b35d3-c9da-4143-badf-7d8d7cda5854.jsonl: 0
+ec6e5724-7cb5-41ae-8a3f-6f472af6d006.jsonl: 2
+## channel tag inside post-clear transcript
+<channel source=\"probe13\" probe=\"1\" tag=\"T70\">\nPROBE-INBOUND-C13-T70\n</channel>
+<channel source=\"probe13\" probe=\"1\" tag=\"T70\">\nPROBE-INBOUND-C13-T70\n</channel>
+## sessionId values per transcript
+d10b35d3-c9da-4143-badf-7d8d7cda5854.jsonl: "sessionId":"d10b35d3-c9da-4143-badf-7d8d7cda5854" 
+ec6e5724-7cb5-41ae-8a3f-6f472af6d006.jsonl: "sessionId":"ec6e5724-7cb5-41ae-8a3f-6f472af6d006" 
+## debug log key lines
+175:2026-09-23T11:02:03.122Z [DEBUG] session.start: raised (surface terminal, interactive)
+193:2026-09-23T11:02:03.216Z [DEBUG] MCP server "claude-in-chrome": Successfully connected (transport: stdio) in 24ms
+244:2026-09-23T11:02:03.437Z [DEBUG] MCP server "probe13": Successfully connected (transport: stdio) in 273ms
+272:2026-09-23T11:02:03.573Z [DEBUG] MCP server "probe13": Channel notifications registered
+315:2026-09-23T11:02:04.234Z [DEBUG] MCP server "web-search-prime": Successfully connected (transport: http) in 965ms
+318:2026-09-23T11:02:04.237Z [DEBUG] MCP server "web-reader": Successfully connected (transport: http) in 974ms
+321:2026-09-23T11:02:04.243Z [DEBUG] MCP server "zread": Successfully connected (transport: http) in 976ms
+327:2026-09-23T11:02:05.449Z [DEBUG] MCP server "claude.ai Claude Docs": Successfully connected (transport: claudeai-proxy) in 1387ms
+355:2026-09-23T11:02:13.054Z [DEBUG] MCP server "zai-mcp-server": Successfully connected (transport: stdio) in 9921ms
+398:2026-09-23T11:02:43.484Z [DEBUG] Cleared all session hooks for session d10b35d3-c9da-4143-badf-7d8d7cda5854
+409:2026-09-23T11:02:43.548Z [DEBUG] MCP server "probe13": Channel notifications registered
+470:2026-09-23T11:03:13.453Z [DEBUG] MCP server "probe13": notifications/claude/channel: PROBE-INBOUND-C13-T70
+502:2026-09-23T11:03:17.534Z [DEBUG] MCP server "probe13": notifications/claude/channel/permission: dffmo → allow (matched pending)
+1b1d502d-5d6d-47dc-9c99-f2740962ca26.jsonl: entry="entrypoint":"sdk-cli"  LIVE13B=0 LIVE13A=0
+51b9f3b8-6acd-4eeb-8ee3-b26c832071ef.jsonl: entry="entrypoint":"cli"  LIVE13B=2 LIVE13A=0
+c4c6aced-3145-4591-80a7-49156c77932f.jsonl: entry="entrypoint":"cli"  LIVE13B=0 LIVE13A=2

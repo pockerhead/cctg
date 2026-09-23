@@ -1,0 +1,2 @@
+    Checking cctg v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-013\scratch\reviewer2\ws\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 3.42s

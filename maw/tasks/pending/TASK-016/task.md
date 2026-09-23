@@ -10,6 +10,7 @@ Domains: hub, transcript
 Закрыть решение пользователя «push every turn через outbound queue»: hub следит за локальным транскриптом сессии по `transcript_path` (tail по смещению, только целые строки), скармливает новые записи в `transcript` и отправляет каждый завершённый turn в brief-виде в тему слота через планировщик. Финальный текст ассистента на `Stop` берётся из полей хука, а jsonl используется как история и может отставать. Смещение хранится в реестре, чтобы рестарт hub не переотправлял уже отправленное. Удалённые устройства (агент отдаёт файл) — вне этой задачи, это шаг 5 плана.
 
 ## Dependencies
+- blocked by TASK-021 — hard prerequisite
 - blocked by TASK-006 — hard prerequisite
 - blocked by TASK-011 — hard prerequisite
 - blocked by TASK-012 — hard prerequisite

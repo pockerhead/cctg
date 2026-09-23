@@ -1,0 +1,12 @@
+M1_no_follow_pid: KILLED  test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out; finished in 6.75s
+M2_no_pid_fallback_on_register: KILLED  test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; 199 filtered out; finished in 60.47s
+M3_no_headless_skip: KILLED  test result: FAILED. 10 passed; 1 failed; 0 ignored; 0 measured; 207 filtered out; finished in 0.52s
+M4_meta_unfiltered: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+M5_nested_bound: KILLED  test result: FAILED. 35 passed; 1 failed; 0 ignored; 0 measured; 182 filtered out; finished in 0.02s
+N1_no_ping: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+N2_no_jsonrpc_check: KILLED  test result: FAILED. 16 passed; 2 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+N3_jsonrpc_error_echoes_id: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+N4_scalar_params_accepted: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+N5_unknown_version_echoed: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+N6_missing_version_falls_back: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+N7_duplicate_permission_relayed: KILLED  test result: FAILED. 17 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s

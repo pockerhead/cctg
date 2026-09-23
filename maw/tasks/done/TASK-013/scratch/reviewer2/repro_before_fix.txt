@@ -1,0 +1,60 @@
+test channel::tests::permission_relay_round_trip ... ok
+test channel::tests::reply_goes_to_the_hub ... ok
+test channel::tests::a_duplicate_permission_request_is_relayed_once_and_closed_once ... FAILED
+test channel::tests::a_notification_without_json_rpc_2_0_does_not_initialize ... FAILED
+test channel::tests::ping_answers_an_empty_result_at_any_time ... FAILED
+test channel::tests::only_json_rpc_2_0_with_structured_params_is_served ... FAILED
+test channel::tests::tools_list_offers_reply_only ... ok
+test channel::tests::initialize_negotiates_the_protocol_version ... FAILED
+test channel::tests::without_a_hub_reply_says_why ... ok
+test channel::tests::held_notifications_are_bounded ... ok
+test channel::tests::broken_input_gets_controlled_answers ... ok
+test channel::tests::long_replies_are_capped ... ok
+
+failures:
+
+---- channel::tests::a_duplicate_permission_request_is_relayed_once_and_closed_once stdout ----
+
+thread 'channel::tests::a_duplicate_permission_request_is_relayed_once_and_closed_once' (33744) panicked at crates\cctg\src\channel.rs:572:9:
+the duplicate is not relayed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- channel::tests::a_notification_without_json_rpc_2_0_does_not_initialize stdout ----
+
+thread 'channel::tests::a_notification_without_json_rpc_2_0_does_not_initialize' (34088) panicked at crates\cctg\src\channel.rs:431:9:
+assertion `left == right` failed: {"method":"notifications/initialized"}
+  left: 0
+ right: 1
+
+---- channel::tests::ping_answers_an_empty_result_at_any_time stdout ----
+
+thread 'channel::tests::ping_answers_an_empty_result_at_any_time' (35772) panicked at crates\cctg\src\channel.rs:506:9:
+assertion `left == right` failed
+  left: Null
+ right: Object {}
+
+---- channel::tests::only_json_rpc_2_0_with_structured_params_is_served stdout ----
+
+thread 'channel::tests::only_json_rpc_2_0_with_structured_params_is_served' (18176) panicked at crates\cctg\src\channel.rs:540:13:
+assertion `left == right` failed: {"id":1,"method":"tools/list"}
+  left: Number(1)
+ right: Null
+
+---- channel::tests::initialize_negotiates_the_protocol_version stdout ----
+
+thread 'channel::tests::initialize_negotiates_the_protocol_version' (24196) panicked at crates\cctg\src\channel.rs:485:13:
+assertion `left == right` failed: 9999-99-99
+  left: String("9999-99-99")
+ right: "2025-11-25"
+
+
+failures:
+    channel::tests::a_duplicate_permission_request_is_relayed_once_and_closed_once
+    channel::tests::a_notification_without_json_rpc_2_0_does_not_initialize
+    channel::tests::initialize_negotiates_the_protocol_version
+    channel::tests::only_json_rpc_2_0_with_structured_params_is_served
+    channel::tests::ping_answers_an_empty_result_at_any_time
+
+test result: FAILED. 13 passed; 5 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p cctg --lib`

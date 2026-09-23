@@ -10,6 +10,7 @@ Domains: channel, hub
 Транслировать `permission_request` в тему слота с кнопками Allow/Deny, приоритетом в планировщике и gate по allowlist. В `callback_data` только действие и пятибуквенный request id — гарантированно ≤64 байт. Побеждает первый ответ; поздний вердикт становится безвредным «уже решено». Итоговое сообщение hub ограничивает по 4096 символов независимо от того, что прислал Claude.
 
 ## Dependencies
+- blocked by TASK-021 — hard prerequisite
 - blocked by TASK-011 — hard prerequisite
 - blocked by TASK-013 — hard prerequisite
 

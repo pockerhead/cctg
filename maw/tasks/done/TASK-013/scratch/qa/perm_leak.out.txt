@@ -1,0 +1,10 @@
+Exception in thread Thread-1 (hub):
+Traceback (most recent call last):
+  File "C:\Program Files\Python310\lib\threading.py", line 1016, in _bootstrap_inner
+sent 70 distinct permission requests (no verdicts: answered at the terminal)
+relayed to hub: 64
+not relayed: ['aaacp', 'aaacq', 'aaacr', 'aaacs', 'aaact', 'aaacu']
+exit code: 0
+stdout lines: 1 all json: True
+secret in stdout/stderr: False False
+stderr tail: ['INFO registered with the hub', ' WARN too many open permission requests; new requests not relayed']

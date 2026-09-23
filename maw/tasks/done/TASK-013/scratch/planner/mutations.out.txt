@@ -1,0 +1,5 @@
+M1_no_follow_pid: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 212 filtered out; finished in 0.37s 
+M2_no_pid_fallback_on_register: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 212 filtered out; finished in 60.52s 
+M3_no_headless_skip: test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s 
+M4_meta_unfiltered: test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 200 filtered out; finished in 0.04s 
+M5_nested_bound: test result: FAILED. 35 passed; 1 failed; 0 ignored; 0 measured; 177 filtered out; finished in 0.02s 

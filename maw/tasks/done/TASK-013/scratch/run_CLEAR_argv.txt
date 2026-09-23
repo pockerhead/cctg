@@ -1,0 +1,9 @@
+label: CLEAR
+argv: ["C:\\Users\\user\\.local\\bin\\claude.EXE", "--mcp-config", "C:\\Users\\user\\AppData\\Local\\Temp\\cctg13_clear_probe\\mcp.json", "--dangerously-load-development-channels", "server:probe13", "--model", "haiku", "--debug-file", "C:\\Users\\user\\dev\\cctg\\maw\\tasks\\in_progress\\TASK-013\\scratch\\debug_CLEAR.log"]
+cwd: C:\Users\user\AppData\Local\Temp\cctg13_clear_probe
+probe_nonce: NONONCE
+start_utc: 2026-09-23T11:01:58Z
+spawned_pid: 15936
+end_utc: 2026-09-23T11:03:53Z
+exit_status_before_kill: None
+exit_status: 1

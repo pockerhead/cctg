@@ -1,0 +1,17 @@
+ ▐▛███▛█   Claude Code v2.1.280
+▝▜██████▀  Haiku 4.5 · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg13_clear_probe
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+  2 more notices hidden
+
+← probe13: PROBE-INBOUND-C13-T5
+
+✢ Beaming… (4s · thinking)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Haiku 4.5 dir:cctg13_clear_probe sh:bash
+  acc:<email>
+  ⏸ manual mode on · ← 1 agent
