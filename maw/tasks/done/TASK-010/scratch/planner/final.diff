@@ -1,0 +1,2789 @@
+diff --git a/crates/cctg/Cargo.toml b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/Cargo.toml
+index 056ae74..baec8f4 100644
+--- a/crates/cctg/Cargo.toml
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/Cargo.toml
+@@ -11,7 +11,7 @@ reqwest.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ thiserror.workspace = true
+-tokio = { workspace = true, features = ["sync", "time"] }
++tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+ tracing.workspace = true
+ tracing-subscriber.workspace = true
+ transcript = { path = "../transcript" }
+diff --git a/crates/cctg/src/lib.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/lib.rs
+index 8a0d87e..2375c2d 100644
+--- a/crates/cctg/src/lib.rs
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/lib.rs
+@@ -1,4 +1,7 @@
+ //! Library side of the `cctg` binary, so integration tests and later
+ //! subcommands can use the hub modules.
+ 
++pub mod agent;
++pub mod hook;
+ pub mod hub;
++pub mod wire;
+diff --git a/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/wire.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/wire.rs
+new file mode 100644
+index 0000000..dd87377
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/wire.rs
+@@ -0,0 +1,728 @@
++//! Transport contracts between the hub and its per-session companions.
++//!
++//! Agent link: a persistent TCP connection carrying one JSON object per line.
++//! Every line has `"v"` (the protocol version) and `"type"`. The agent sends
++//! `hello` with the shared secret, then `register`; the hub answers
++//! `registered` or `rejected` and closes. Only the agent reconnects.
++//!
++//! Hook ingress: one HTTP POST of a [`HookPost`] per hook invocation to
++//! [`HOOK_PATH`], secret in `Authorization: Bearer`. The hook mints the
++//! [`EventId`] once and sends the same one again only when it re-sends the
++//! same POST; the hub drops repeats by it.
++//!
++//! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; a new message
++//! type or a changed meaning bumps it. Errors never carry the offending input:
++//! a line can contain the secret.
++
++use std::collections::BTreeMap;
++use std::collections::hash_map::RandomState;
++use std::fmt;
++use std::hash::{BuildHasher, Hasher};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use serde::de::DeserializeOwned;
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
++
++pub const VERSION: u32 = 1;
++/// Longest accepted agent-link line, newline included.
++pub const MAX_LINE: usize = 1 << 20;
++/// Longest accepted hook POST body.
++pub const MAX_HOOK_BODY: usize = 1 << 20;
++pub const HOOK_PATH: &str = "/v1/hook";
++pub const MIN_SECRET_LEN: usize = 16;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
++pub enum WireError {
++    #[error("line longer than {MAX_LINE} bytes")]
++    TooLong,
++    #[error("message is not valid for its type")]
++    Malformed,
++    #[error("unsupported or missing protocol version")]
++    Version,
++    #[error("unknown message type")]
++    UnknownKind,
++    #[error("connection closed")]
++    Closed,
++    #[error("connection error: {0:?}")]
++    Io(std::io::ErrorKind),
++}
++
++#[derive(Debug, PartialEq, Eq, thiserror::Error)]
++pub enum SecretError {
++    #[error("the shared secret must be at least {MIN_SECRET_LEN} characters")]
++    TooShort,
++    #[error("the shared secret may contain only visible ASCII characters (no spaces)")]
++    Charset,
++}
++
++/// The hub shared secret. `Debug` never prints it; comparison is constant-time.
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(transparent)]
++pub struct Secret(String);
++
++impl Secret {
++    /// Trims surrounding whitespace. The value goes into an HTTP header, so it
++    /// is limited to visible ASCII.
++    pub fn parse(value: &str) -> Result<Self, SecretError> {
++        let value = value.trim();
++        if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
++            return Err(SecretError::Charset);
++        }
++        if value.len() < MIN_SECRET_LEN {
++            return Err(SecretError::TooShort);
++        }
++        Ok(Self(value.to_owned()))
++    }
++
++    pub fn expose(&self) -> &str {
++        &self.0
++    }
++
++    pub fn matches(&self, candidate: &[u8]) -> bool {
++        constant_time_eq(self.0.as_bytes(), candidate)
++    }
++}
++
++impl PartialEq for Secret {
++    fn eq(&self, other: &Self) -> bool {
++        self.matches(other.0.as_bytes())
++    }
++}
++
++impl fmt::Debug for Secret {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("Secret(<redacted>)")
++    }
++}
++
++/// Leaks only whether the lengths differ, never where the bytes differ.
++fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
++    if a.len() != b.len() {
++        return false;
++    }
++    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
++    std::hint::black_box(diff) == 0
++}
++
++/// Message types a decoder accepts; keeps unknown types apart from bad fields.
++pub trait Kinds {
++    const KINDS: &'static [&'static str];
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct Register {
++    /// `CLAUDE_CODE_SESSION_ID` of the Claude Code process that spawned the agent.
++    pub session_id: String,
++    pub host: String,
++    pub cwd: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct PermissionRequest {
++    pub request_id: String,
++    pub tool_name: String,
++    pub description: String,
++    pub input_preview: String,
++}
++
++/// Agent to hub.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum AgentMsg {
++    Hello {
++        secret: Secret,
++    },
++    Register(Register),
++    /// Text from the channel `reply` tool, for the session's topic.
++    Reply {
++        text: String,
++    },
++    PermissionRequest(PermissionRequest),
++}
++
++impl Kinds for AgentMsg {
++    const KINDS: &'static [&'static str] = &["hello", "register", "reply", "permission_request"];
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Rejection {
++    Auth,
++    Version,
++    Protocol,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Behavior {
++    Allow,
++    Deny,
++}
++
++/// Hub to agent.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum HubMsg {
++    Registered,
++    Rejected {
++        reason: Rejection,
++    },
++    /// A Telegram message for `notifications/claude/channel`.
++    Inbound {
++        content: String,
++        #[serde(default)]
++        meta: BTreeMap<String, String>,
++    },
++    PermissionVerdict {
++        request_id: String,
++        behavior: Behavior,
++    },
++}
++
++impl Kinds for HubMsg {
++    const KINDS: &'static [&'static str] =
++        &["registered", "rejected", "inbound", "permission_verdict"];
++}
++
++/// One agent-link line: the message plus `"v"`, newline-terminated.
++pub fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
++    #[derive(Serialize)]
++    struct Framed<'a, T> {
++        v: u32,
++        #[serde(flatten)]
++        msg: &'a T,
++    }
++    let mut line = serde_json::to_vec(&Framed { v: VERSION, msg })
++        .expect("wire messages have string keys and always serialize");
++    line.push(b'\n');
++    line
++}
++
++/// Checks the version, then the type, then the fields.
++pub fn decode<T: DeserializeOwned + Kinds>(line: &[u8]) -> Result<T, WireError> {
++    let value: Value = serde_json::from_slice(line).map_err(|_| WireError::Malformed)?;
++    check_version(&value)?;
++    check_kind::<T>(value.get("type"))?;
++    serde_json::from_value(value).map_err(|_| WireError::Malformed)
++}
++
++fn check_version(value: &Value) -> Result<(), WireError> {
++    match value.get("v").and_then(Value::as_u64) {
++        Some(v) if v == u64::from(VERSION) => Ok(()),
++        _ => Err(WireError::Version),
++    }
++}
++
++fn check_kind<T: Kinds>(kind: Option<&Value>) -> Result<(), WireError> {
++    match kind.and_then(Value::as_str) {
++        Some(kind) if T::KINDS.contains(&kind) => Ok(()),
++        Some(_) => Err(WireError::UnknownKind),
++        None => Err(WireError::Malformed),
++    }
++}
++
++/// Reads one line into `buf` (cleared first). Reads at most [`MAX_LINE`]
++/// bytes, so a peer that never sends a newline cannot grow `buf` further.
++pub async fn read_line<R: AsyncBufRead + Unpin>(
++    reader: &mut R,
++    buf: &mut Vec<u8>,
++) -> Result<(), WireError> {
++    buf.clear();
++    let read = (&mut *reader)
++        .take(MAX_LINE as u64)
++        .read_until(b'\n', buf)
++        .await
++        .map_err(|error| WireError::Io(error.kind()))?;
++    match buf.last() {
++        Some(b'\n') => Ok(()),
++        _ if read >= MAX_LINE => Err(WireError::TooLong),
++        _ => Err(WireError::Closed),
++    }
++}
++
++pub async fn write_msg<W: AsyncWrite + Unpin, T: Serialize>(
++    writer: &mut W,
++    msg: &T,
++) -> Result<(), WireError> {
++    let io = |error: std::io::Error| WireError::Io(error.kind());
++    writer.write_all(&encode(msg)).await.map_err(io)?;
++    writer.flush().await.map_err(io)
++}
++
++/// Per-invocation hook event key: 32 lowercase hex digits.
++#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
++#[serde(try_from = "String", into = "String")]
++pub struct EventId(String);
++
++impl EventId {
++    /// A fresh id. Unique, not secret: requests are authenticated separately.
++    pub fn new() -> Self {
++        Self(format!("{:016x}{:016x}", random_u64(), random_u64()))
++    }
++
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl Default for EventId {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl TryFrom<String> for EventId {
++    type Error = &'static str;
++
++    fn try_from(value: String) -> Result<Self, Self::Error> {
++        let valid = value.len() == 32
++            && value
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
++        if valid {
++            Ok(Self(value))
++        } else {
++            Err("event_id must be 32 lowercase hex digits")
++        }
++    }
++}
++
++impl From<EventId> for String {
++    fn from(id: EventId) -> Self {
++        id.0
++    }
++}
++
++/// 64 bits from a randomly keyed SipHash (the std `RandomState` keys come
++/// from the OS generator) over a counter, the clock and the pid. No `rand`
++/// crate: ids and jitter need uniqueness, not cryptographic strength.
++pub(crate) fn random_u64() -> u64 {
++    static COUNTER: AtomicU64 = AtomicU64::new(0);
++    let mut hasher = RandomState::new().build_hasher();
++    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
++    hasher.write_u128(
++        SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map(|elapsed| elapsed.as_nanos())
++            .unwrap_or_default(),
++    );
++    hasher.write_u32(std::process::id());
++    hasher.finish()
++}
++
++/// Body of one hook POST. Paths are strings: they may come from another OS.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct HookPost {
++    pub v: u32,
++    pub event_id: EventId,
++    pub host: String,
++    pub session_id: String,
++    #[serde(default)]
++    pub cwd: String,
++    #[serde(default)]
++    pub transcript_path: String,
++    pub event: HookEvent,
++}
++
++impl HookPost {
++    /// Mints the event id; keep the value to re-send the same POST.
++    pub fn new(
++        host: String,
++        session_id: String,
++        cwd: String,
++        transcript_path: String,
++        event: HookEvent,
++    ) -> Self {
++        Self {
++            v: VERSION,
++            event_id: EventId::new(),
++            host,
++            session_id,
++            cwd,
++            transcript_path,
++            event,
++        }
++    }
++}
++
++/// Event-specific fields; `TASK-012` fills them from the hook stdin.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum HookEvent {
++    SessionStart {
++        #[serde(default)]
++        source: Option<String>,
++        /// `CLAUDE_PID` of the hook: the session's own claude process.
++        #[serde(default)]
++        claude_pid: Option<u32>,
++        /// Next `claude` ancestor in the process tree, when there is one.
++        #[serde(default)]
++        parent_claude_pid: Option<u32>,
++    },
++    SessionEnd {
++        #[serde(default)]
++        reason: Option<String>,
++    },
++    UserPromptSubmit {
++        #[serde(default)]
++        prompt_id: Option<String>,
++    },
++    Stop {
++        #[serde(default)]
++        prompt_id: Option<String>,
++        #[serde(default)]
++        last_assistant_message: Option<String>,
++    },
++    SubagentStart {
++        agent_id: String,
++        #[serde(default)]
++        agent_type: String,
++    },
++    SubagentStop {
++        agent_id: String,
++        #[serde(default)]
++        agent_type: String,
++        #[serde(default)]
++        agent_transcript_path: Option<String>,
++        #[serde(default)]
++        last_assistant_message: Option<String>,
++    },
++    /// `SubagentHandback` report, taken from `PreToolUse`/`PostToolUse`.
++    SubagentHandback { agent_id: String, message: String },
++}
++
++impl HookEvent {
++    pub fn kind(&self) -> &'static str {
++        match self {
++            Self::SessionStart { .. } => "session_start",
++            Self::SessionEnd { .. } => "session_end",
++            Self::UserPromptSubmit { .. } => "user_prompt_submit",
++            Self::Stop { .. } => "stop",
++            Self::SubagentStart { .. } => "subagent_start",
++            Self::SubagentStop { .. } => "subagent_stop",
++            Self::SubagentHandback { .. } => "subagent_handback",
++        }
++    }
++}
++
++impl Kinds for HookEvent {
++    const KINDS: &'static [&'static str] = &[
++        "session_start",
++        "session_end",
++        "user_prompt_submit",
++        "stop",
++        "subagent_start",
++        "subagent_stop",
++        "subagent_handback",
++    ];
++}
++
++pub fn decode_hook(body: &[u8]) -> Result<HookPost, WireError> {
++    let value: Value = serde_json::from_slice(body).map_err(|_| WireError::Malformed)?;
++    check_version(&value)?;
++    check_kind::<HookEvent>(value.get("event").and_then(|event| event.get("type")))?;
++    serde_json::from_value(value).map_err(|_| WireError::Malformed)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::HashSet;
++
++    use serde_json::json;
++
++    use super::*;
++
++    const SECRET: &str = "0123456789abcdef-secret";
++
++    fn secret() -> Secret {
++        Secret::parse(SECRET).unwrap()
++    }
++
++    fn agent_samples() -> Vec<AgentMsg> {
++        vec![
++            AgentMsg::Hello { secret: secret() },
++            AgentMsg::Register(Register {
++                session_id: "5e551017-0000-4000-8000-000000000001".into(),
++                host: "box".into(),
++                cwd: "C:\\work\\app".into(),
++            }),
++            AgentMsg::Reply {
++                text: "multi\nline \u{2014} text".into(),
++            },
++            AgentMsg::PermissionRequest(PermissionRequest {
++                request_id: "abcde".into(),
++                tool_name: "Bash".into(),
++                description: "run tests".into(),
++                input_preview: "{\"command\":\"cargo test\"}".into(),
++            }),
++        ]
++    }
++
++    fn hub_samples() -> Vec<HubMsg> {
++        vec![
++            HubMsg::Registered,
++            HubMsg::Rejected {
++                reason: Rejection::Auth,
++            },
++            HubMsg::Rejected {
++                reason: Rejection::Version,
++            },
++            HubMsg::Rejected {
++                reason: Rejection::Protocol,
++            },
++            HubMsg::Inbound {
++                content: "hi".into(),
++                meta: [("target_agent".to_owned(), "a1".to_owned())].into(),
++            },
++            HubMsg::PermissionVerdict {
++                request_id: "abcde".into(),
++                behavior: Behavior::Allow,
++            },
++            HubMsg::PermissionVerdict {
++                request_id: "abcde".into(),
++                behavior: Behavior::Deny,
++            },
++        ]
++    }
++
++    fn hook_samples() -> Vec<HookEvent> {
++        vec![
++            HookEvent::SessionStart {
++                source: Some("resume".into()),
++                claude_pid: Some(10),
++                parent_claude_pid: None,
++            },
++            HookEvent::SessionEnd {
++                reason: Some("prompt_input_exit".into()),
++            },
++            HookEvent::UserPromptSubmit {
++                prompt_id: Some("p1".into()),
++            },
++            HookEvent::Stop {
++                prompt_id: Some("p1".into()),
++                last_assistant_message: Some("done".into()),
++            },
++            HookEvent::SubagentStart {
++                agent_id: "a1".into(),
++                agent_type: "Explore".into(),
++            },
++            HookEvent::SubagentStop {
++                agent_id: "a1".into(),
++                agent_type: "Explore".into(),
++                agent_transcript_path: Some("/x/agent-a1.jsonl".into()),
++                last_assistant_message: None,
++            },
++            HookEvent::SubagentHandback {
++                agent_id: "a1".into(),
++                message: "report".into(),
++            },
++        ]
++    }
++
++    fn kind_of(line: &[u8]) -> String {
++        let value: Value = serde_json::from_slice(line).unwrap();
++        value["type"].as_str().unwrap().to_owned()
++    }
++
++    #[test]
++    fn every_link_message_round_trips_as_one_versioned_line() {
++        for msg in agent_samples() {
++            let line = encode(&msg);
++            assert_eq!(line.iter().filter(|&&b| b == b'\n').count(), 1);
++            assert!(line.ends_with(b"\n"));
++            assert_eq!(serde_json::from_slice::<Value>(&line).unwrap()["v"], 1);
++            assert_eq!(decode::<AgentMsg>(&line), Ok(msg));
++        }
++        for msg in hub_samples() {
++            assert_eq!(decode::<HubMsg>(&encode(&msg)), Ok(msg));
++        }
++    }
++
++    #[test]
++    fn kind_lists_match_the_enums() {
++        let agent: HashSet<String> = agent_samples()
++            .iter()
++            .map(|m| kind_of(&encode(m)))
++            .collect();
++        assert_eq!(
++            agent,
++            AgentMsg::KINDS.iter().map(|k| k.to_string()).collect()
++        );
++        let hub: HashSet<String> = hub_samples().iter().map(|m| kind_of(&encode(m))).collect();
++        assert_eq!(hub, HubMsg::KINDS.iter().map(|k| k.to_string()).collect());
++        let hooks: Vec<&str> = hook_samples().iter().map(HookEvent::kind).collect();
++        assert_eq!(hooks, HookEvent::KINDS);
++        for event in hook_samples() {
++            let value = serde_json::to_value(&event).unwrap();
++            assert_eq!(value["type"], event.kind());
++        }
++    }
++
++    #[test]
++    fn bad_lines_are_typed_errors() {
++        let cases: [(&[u8], WireError); 8] = [
++            (br#"{"v":2,"type":"reply","text":"x"}"#, WireError::Version),
++            (br#"{"type":"reply","text":"x"}"#, WireError::Version),
++            (
++                br#"{"v":"1","type":"reply","text":"x"}"#,
++                WireError::Version,
++            ),
++            (
++                br#"{"v":1,"type":"teleport","text":"x"}"#,
++                WireError::UnknownKind,
++            ),
++            (br#"{"v":1,"text":"x"}"#, WireError::Malformed),
++            (br#"{"v":1,"type":"reply"}"#, WireError::Malformed),
++            (b"not json at all", WireError::Malformed),
++            (b"", WireError::Malformed),
++        ];
++        for (line, want) in cases {
++            assert_eq!(
++                decode::<AgentMsg>(line),
++                Err(want),
++                "{}",
++                String::from_utf8_lossy(line)
++            );
++        }
++        assert_eq!(
++            decode::<HubMsg>(br#"{"v":1,"type":"hello","secret":"x"}"#),
++            Err(WireError::UnknownKind)
++        );
++    }
++
++    #[test]
++    fn unknown_fields_are_ignored() {
++        let line = br#"{"v":1,"type":"registered","extra":{"a":1}}"#;
++        assert_eq!(decode::<HubMsg>(line), Ok(HubMsg::Registered));
++        let line = br#"{"v":1,"type":"reply","text":"t","later":true}"#;
++        assert_eq!(
++            decode::<AgentMsg>(line),
++            Ok(AgentMsg::Reply { text: "t".into() })
++        );
++    }
++
++    #[test]
++    fn errors_and_debug_never_show_the_secret() {
++        let line = format!(r#"{{"v":1,"type":"register","session_id":7,"host":"{SECRET}"}}"#);
++        let error = decode::<AgentMsg>(line.as_bytes()).unwrap_err();
++        assert_eq!(error, WireError::Malformed);
++        assert!(!format!("{error} {error:?}").contains(SECRET));
++        let hello = AgentMsg::Hello { secret: secret() };
++        assert!(!format!("{hello:?}").contains(SECRET));
++        assert!(!format!("{:?}", secret()).contains(SECRET));
++    }
++
++    #[test]
++    fn secret_rules_and_comparison() {
++        assert_eq!(Secret::parse("short"), Err(SecretError::TooShort));
++        assert_eq!(
++            Secret::parse("has a space in it!!"),
++            Err(SecretError::Charset)
++        );
++        assert_eq!(
++            Secret::parse("кириллица-кириллица"),
++            Err(SecretError::Charset)
++        );
++        let parsed = Secret::parse(&format!("  {SECRET}\n")).unwrap();
++        assert_eq!(parsed.expose(), SECRET);
++        assert!(parsed.matches(SECRET.as_bytes()));
++        assert!(!parsed.matches(&SECRET.as_bytes()[1..]));
++        assert!(!parsed.matches(b"0123456789abcdef-secreT"));
++        assert!(!parsed.matches(b""));
++    }
++
++    #[tokio::test]
++    async fn lines_are_read_one_at_a_time() {
++        let mut reader = tokio::io::BufReader::new(&b"{\"a\":1}\n{\"b\":2}\ntail"[..]);
++        let mut buf = Vec::new();
++        read_line(&mut reader, &mut buf).await.unwrap();
++        assert_eq!(buf, b"{\"a\":1}\n");
++        read_line(&mut reader, &mut buf).await.unwrap();
++        assert_eq!(buf, b"{\"b\":2}\n");
++        // A line cut by EOF is a closed connection, not a message.
++        assert_eq!(
++            read_line(&mut reader, &mut buf).await,
++            Err(WireError::Closed)
++        );
++        assert_eq!(
++            read_line(&mut reader, &mut buf).await,
++            Err(WireError::Closed)
++        );
++    }
++
++    #[tokio::test]
++    async fn an_endless_line_stops_at_the_limit() {
++        // `repeat` never ends and never sends a newline.
++        let mut reader = tokio::io::BufReader::new(tokio::io::repeat(b'a'));
++        let mut buf = Vec::new();
++        assert_eq!(
++            read_line(&mut reader, &mut buf).await,
++            Err(WireError::TooLong)
++        );
++        assert_eq!(buf.len(), MAX_LINE);
++        assert!(buf.capacity() <= 2 * MAX_LINE, "{}", buf.capacity());
++
++        let mut exact = vec![b'a'; MAX_LINE - 1];
++        exact.push(b'\n');
++        let mut reader = tokio::io::BufReader::new(&exact[..]);
++        read_line(&mut reader, &mut buf).await.unwrap();
++        assert_eq!(buf.len(), MAX_LINE);
++    }
++
++    #[test]
++    fn hook_posts_round_trip_and_keep_their_event_id() {
++        for event in hook_samples() {
++            let post = HookPost::new(
++                "box".into(),
++                "s1".into(),
++                "/w".into(),
++                "/w/s1.jsonl".into(),
++                event,
++            );
++            let body = serde_json::to_vec(&post).unwrap();
++            let decoded = decode_hook(&body).unwrap();
++            assert_eq!(decoded.event_id, post.event_id);
++            assert_eq!(decoded, post);
++        }
++    }
++
++    #[test]
++    fn bad_hook_bodies_are_typed_errors() {
++        let id = EventId::new();
++        let body = |v: Value| serde_json::to_vec(&v).unwrap();
++        let base = |event: Value| json!({ "v": 1, "event_id": id.as_str(), "host": "h", "session_id": "s", "event": event });
++        assert_eq!(
++            decode_hook(&body(base(json!({ "type": "session_end" })))).map(|p| p.event),
++            Ok(HookEvent::SessionEnd { reason: None })
++        );
++        let mut v2 = base(json!({ "type": "stop" }));
++        v2["v"] = json!(2);
++        assert_eq!(decode_hook(&body(v2)), Err(WireError::Version));
++        assert_eq!(
++            decode_hook(&body(base(json!({ "type": "pre_compact" })))),
++            Err(WireError::UnknownKind)
++        );
++        assert_eq!(
++            decode_hook(&body(base(json!({ "type": "subagent_start" })))),
++            Err(WireError::Malformed)
++        );
++        let mut bad_id = base(json!({ "type": "stop" }));
++        bad_id["event_id"] = json!("session-5e551017");
++        assert_eq!(decode_hook(&body(bad_id)), Err(WireError::Malformed));
++        assert_eq!(decode_hook(b"{"), Err(WireError::Malformed));
++    }
++
++    #[test]
++    fn event_ids_are_fresh_hex() {
++        let ids: HashSet<EventId> = (0..10_000).map(|_| EventId::new()).collect();
++        assert_eq!(ids.len(), 10_000);
++        for id in ids.iter().take(10) {
++            assert!(EventId::try_from(id.as_str().to_owned()).is_ok());
++        }
++        assert!(EventId::try_from("A".repeat(32)).is_err());
++        assert!(EventId::try_from("a".repeat(31)).is_err());
++    }
++}
+diff --git a/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/agent.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/agent.rs
+new file mode 100644
+index 0000000..46cae75
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/agent.rs
+@@ -0,0 +1,393 @@
++//! Agent end of the hub link: connect, authenticate, register, and on any
++//! loss reconnect with backoff and register again. Only the agent reconnects;
++//! the hub just accepts.
++//!
++//! Messages queued while the link is down wait in the outbox and go out after
++//! the next registration. A message whose write failed is lost.
++
++use std::time::Duration;
++
++use tokio::io::BufReader;
++use tokio::net::TcpStream;
++use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
++use tokio::sync::mpsc;
++use tracing::{debug, info, warn};
++
++use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
++
++const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
++const QUEUE: usize = 256;
++
++/// Exponential backoff with "equal jitter": the delay for attempt `n` is
++/// uniform in `[d/2, d]` where `d = min(max, initial * 2^n)`.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Backoff {
++    pub initial: Duration,
++    pub max: Duration,
++}
++
++impl Default for Backoff {
++    fn default() -> Self {
++        Self {
++            initial: Duration::from_millis(250),
++            max: Duration::from_secs(30),
++        }
++    }
++}
++
++impl Backoff {
++    pub fn delay(&self, attempt: u32) -> Duration {
++        let factor = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
++        let capped = self.initial.saturating_mul(factor).min(self.max);
++        let half = capped / 2;
++        let span = u64::try_from((capped - half).as_nanos()).unwrap_or(u64::MAX);
++        half + Duration::from_nanos(wire::random_u64() % span.saturating_add(1))
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct LinkConfig {
++    /// `host:port` of the hub agent listener.
++    pub addr: String,
++    pub secret: Secret,
++    pub register: Register,
++    pub backoff: Backoff,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum LinkEvent {
++    /// Registered with the hub (again, after a reconnect).
++    Up,
++    /// The link dropped; reconnecting.
++    Down,
++    Message(HubMsg),
++}
++
++#[derive(Debug, thiserror::Error)]
++enum ConnectError {
++    #[error("cannot reach the hub: {0:?}")]
++    Io(std::io::ErrorKind),
++    #[error("hub handshake timed out")]
++    Timeout,
++    #[error("hub rejected the agent: {0:?}")]
++    Rejected(Rejection),
++    #[error("hub handshake failed: {0}")]
++    Wire(#[from] WireError),
++}
++
++/// Starts the link task. Send to the returned sender; read link state and hub
++/// messages from the receiver. Dropping either one stops the task.
++pub fn spawn(config: LinkConfig) -> (mpsc::Sender<AgentMsg>, mpsc::Receiver<LinkEvent>) {
++    let (outbox_tx, outbox) = mpsc::channel(QUEUE);
++    let (events, events_rx) = mpsc::channel(QUEUE);
++    tokio::spawn(run(config, outbox, events));
++    (outbox_tx, events_rx)
++}
++
++async fn run(
++    config: LinkConfig,
++    mut outbox: mpsc::Receiver<AgentMsg>,
++    events: mpsc::Sender<LinkEvent>,
++) {
++    let mut attempt = 0u32;
++    let mut last_error = String::new();
++    loop {
++        match connect(&config).await {
++            Ok((reader, write)) => {
++                attempt = 0;
++                last_error.clear();
++                info!("registered with the hub");
++                if events.send(LinkEvent::Up).await.is_err() {
++                    return;
++                }
++                let stopped = serve(reader, write, &mut outbox, &events).await;
++                if stopped || events.send(LinkEvent::Down).await.is_err() {
++                    return;
++                }
++                info!("hub link lost; reconnecting");
++            }
++            Err(error) => {
++                // One warning per kind of failure, not one per attempt.
++                let text = error.to_string();
++                if text != last_error {
++                    warn!(%error, "hub link not established; retrying");
++                    last_error = text;
++                } else {
++                    debug!(%error, attempt, "hub link retry failed");
++                }
++            }
++        }
++        if events.is_closed() {
++            return;
++        }
++        tokio::time::sleep(config.backoff.delay(attempt)).await;
++        attempt = attempt.saturating_add(1);
++    }
++}
++
++async fn connect(
++    config: &LinkConfig,
++) -> Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf), ConnectError> {
++    let handshake = async {
++        let stream = TcpStream::connect(config.addr.as_str())
++            .await
++            .map_err(|error| ConnectError::Io(error.kind()))?;
++        let _ = stream.set_nodelay(true);
++        let (read, mut write) = stream.into_split();
++        let hello = AgentMsg::Hello {
++            secret: config.secret.clone(),
++        };
++        wire::write_msg(&mut write, &hello).await?;
++        wire::write_msg(&mut write, &AgentMsg::Register(config.register.clone())).await?;
++        let mut reader = BufReader::new(read);
++        let mut line = Vec::new();
++        wire::read_line(&mut reader, &mut line).await?;
++        match wire::decode::<HubMsg>(&line)? {
++            HubMsg::Registered => Ok((reader, write)),
++            HubMsg::Rejected { reason } => Err(ConnectError::Rejected(reason)),
++            _ => Err(ConnectError::Wire(WireError::Malformed)),
++        }
++    };
++    tokio::time::timeout(CONNECT_TIMEOUT, handshake)
++        .await
++        .unwrap_or(Err(ConnectError::Timeout))
++}
++
++/// Runs one registered link. Returns `true` when the owner is gone (stop),
++/// `false` when the link dropped (reconnect).
++async fn serve(
++    mut reader: BufReader<OwnedReadHalf>,
++    mut write: OwnedWriteHalf,
++    outbox: &mut mpsc::Receiver<AgentMsg>,
++    events: &mpsc::Sender<LinkEvent>,
++) -> bool {
++    let mut line = Vec::new();
++    loop {
++        tokio::select! {
++            read = wire::read_line(&mut reader, &mut line) => {
++                if let Err(error) = read {
++                    debug!(%error, "hub link ended");
++                    return false;
++                }
++                match wire::decode::<HubMsg>(&line) {
++                    Ok(msg) => {
++                        if events.send(LinkEvent::Message(msg)).await.is_err() {
++                            return true;
++                        }
++                    }
++                    Err(WireError::Version) => {
++                        warn!("hub changed protocol version; reconnecting");
++                        return false;
++                    }
++                    Err(error) => warn!(%error, "hub line ignored"),
++                }
++            }
++            msg = outbox.recv() => match msg {
++                Some(msg) => {
++                    if let Err(error) = wire::write_msg(&mut write, &msg).await {
++                        debug!(%error, "write to hub failed");
++                        return false;
++                    }
++                }
++                None => return true,
++            },
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::net::{Ipv4Addr, SocketAddr};
++
++    use tokio::net::TcpListener;
++
++    use super::*;
++    use crate::hub::ingress::{self, AgentEvent};
++
++    const SECRET: &str = "0123456789abcdef-secret";
++    const WAIT: Duration = Duration::from_secs(10);
++
++    fn register() -> Register {
++        Register {
++            session_id: "5e551017-0000-4000-8000-000000000001".into(),
++            host: "box".into(),
++            cwd: "/w".into(),
++        }
++    }
++
++    fn config(addr: SocketAddr, backoff: Backoff) -> LinkConfig {
++        LinkConfig {
++            addr: addr.to_string(),
++            secret: Secret::parse(SECRET).unwrap(),
++            register: register(),
++            backoff,
++        }
++    }
++
++    /// Rebinding the port of a just-closed listener can fail briefly.
++    async fn rebind(addr: SocketAddr) -> TcpListener {
++        for _ in 0..100 {
++            if let Ok(listener) = TcpListener::bind(addr).await {
++                return listener;
++            }
++            tokio::time::sleep(Duration::from_millis(50)).await;
++        }
++        panic!("cannot rebind {addr}");
++    }
++
++    async fn next(events: &mut mpsc::Receiver<LinkEvent>) -> LinkEvent {
++        tokio::time::timeout(WAIT, events.recv())
++            .await
++            .expect("link event in time")
++            .expect("link task alive")
++    }
++
++    async fn registered(hub: &mut mpsc::Receiver<AgentEvent>) -> (Register, mpsc::Sender<HubMsg>) {
++        loop {
++            match tokio::time::timeout(WAIT, hub.recv())
++                .await
++                .expect("hub event in time")
++            {
++                Some(AgentEvent::Registered {
++                    register, to_agent, ..
++                }) => return (register, to_agent),
++                Some(_) => continue,
++                None => panic!("hub stopped"),
++            }
++        }
++    }
++
++    #[test]
++    fn backoff_grows_to_the_cap_with_jitter() {
++        let backoff = Backoff {
++            initial: Duration::from_millis(100),
++            max: Duration::from_secs(2),
++        };
++        for attempt in 0..40 {
++            let capped = (backoff.initial * 2u32.saturating_pow(attempt.min(20))).min(backoff.max);
++            for _ in 0..50 {
++                let delay = backoff.delay(attempt);
++                assert!(
++                    delay >= capped / 2 && delay <= capped,
++                    "{attempt}: {delay:?}"
++                );
++            }
++        }
++        assert_eq!(backoff.delay(u32::MAX).max(backoff.max), backoff.max);
++        let spread: std::collections::HashSet<Duration> =
++            (0..20).map(|_| backoff.delay(5)).collect();
++        assert!(spread.len() > 1, "jitter expected");
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn the_agent_reconnects_and_registers_again_after_a_hub_restart() {
++        let secret = Secret::parse(SECRET).unwrap();
++        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (hub_tx, mut hub_rx) = mpsc::channel(16);
++        let hub = tokio::spawn(ingress::serve_agents(listener, secret.clone(), hub_tx));
++
++        let backoff = Backoff {
++            initial: Duration::from_millis(20),
++            max: Duration::from_millis(160),
++        };
++        let (outbox, mut events) = spawn(config(addr, backoff));
++        assert_eq!(next(&mut events).await, LinkEvent::Up);
++        let (got, to_agent) = registered(&mut hub_rx).await;
++        assert_eq!(got, register());
++        to_agent.send(HubMsg::Registered).await.unwrap();
++        assert_eq!(
++            next(&mut events).await,
++            LinkEvent::Message(HubMsg::Registered)
++        );
++
++        // Hub goes away: its listener and every connection close.
++        hub.abort();
++        let _ = hub.await;
++        drop(to_agent);
++        assert_eq!(next(&mut events).await, LinkEvent::Down);
++
++        // While it is down, the port accepts and hangs up at once: the agent
++        // must retry with growing pauses, not in a tight loop.
++        let refusing = rebind(addr).await;
++        let queued = AgentMsg::Reply {
++            text: "queued while down".into(),
++        };
++        outbox.send(queued.clone()).await.unwrap();
++        let mut attempts = Vec::new();
++        while attempts.len() < 5 {
++            let accepted = tokio::time::timeout(WAIT, refusing.accept()).await;
++            assert!(matches!(accepted, Ok(Ok(_))), "agent retried");
++            attempts.push(tokio::time::Instant::now());
++        }
++        drop(refusing);
++        let gaps: Vec<Duration> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
++        // Attempt n waits at least min(160, 20 * 2^n) / 2 ms; the fifth
++        // accept follows at least the fourth failure.
++        assert!(
++            gaps.iter().all(|gap| *gap >= Duration::from_millis(5)),
++            "{gaps:?}"
++        );
++        assert!(gaps[3] >= Duration::from_millis(60), "{gaps:?}");
++
++        let listener = rebind(addr).await;
++        let (hub_tx, mut hub_rx) = mpsc::channel(16);
++        let _hub = tokio::spawn(ingress::serve_agents(listener, secret, hub_tx));
++        loop {
++            match next(&mut events).await {
++                LinkEvent::Up => break,
++                LinkEvent::Down => continue,
++                other => panic!("unexpected {other:?}"),
++            }
++        }
++        let (again, _to_agent) = registered(&mut hub_rx).await;
++        assert_eq!(again, register());
++        match tokio::time::timeout(WAIT, hub_rx.recv()).await.unwrap() {
++            Some(AgentEvent::Message { msg, .. }) => assert_eq!(msg, queued),
++            other => panic!("expected the queued reply, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn a_rejected_secret_keeps_retrying_quietly() {
++        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (hub_tx, mut hub_rx) = mpsc::channel(16);
++        let other = Secret::parse("another-secret-0123456789").unwrap();
++        let _hub = tokio::spawn(ingress::serve_agents(listener, other, hub_tx));
++        let backoff = Backoff {
++            initial: Duration::from_millis(10),
++            max: Duration::from_millis(40),
++        };
++        let (_outbox, mut events) = spawn(config(addr, backoff));
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        assert!(events.try_recv().is_err(), "never up");
++        assert!(hub_rx.try_recv().is_err(), "never registered");
++    }
++
++    #[tokio::test]
++    async fn dropping_the_receiver_stops_the_link() {
++        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (hub_tx, mut hub_rx) = mpsc::channel(16);
++        let _hub = tokio::spawn(ingress::serve_agents(
++            listener,
++            Secret::parse(SECRET).unwrap(),
++            hub_tx,
++        ));
++        let (outbox, events) = spawn(config(addr, Backoff::default()));
++        let _ = registered(&mut hub_rx).await;
++        drop(events);
++        drop(outbox);
++        match tokio::time::timeout(WAIT, hub_rx.recv()).await.unwrap() {
++            Some(AgentEvent::Disconnected { .. }) => {}
++            other => panic!("expected disconnect, got {other:?}"),
++        }
++    }
++}
+diff --git a/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hook.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hook.rs
+new file mode 100644
+index 0000000..693743e
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hook.rs
+@@ -0,0 +1,198 @@
++//! Hook end of the hub ingress: one HTTP POST per call, one overall timeout,
++//! no retry loop. Plain TCP instead of `reqwest`: the body is tiny, the hub is
++//! local or on a private network, and a TLS-capable client costs start-up
++//! time the `SessionEnd` budget (1.5 s shared) cannot spare.
++//!
++//! [`HookPost::new`](crate::wire::HookPost::new) mints the event id; calling
++//! [`post`] again with the same value re-sends the same event, which the hub
++//! drops as a repeat.
++
++use std::time::Duration;
++
++use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
++use tokio::net::TcpStream;
++
++use crate::wire::{HOOK_PATH, HookPost, Secret};
++
++const MAX_STATUS_LINE: u64 = 256;
++
++#[derive(Debug, PartialEq, Eq, thiserror::Error)]
++pub enum PostError {
++    #[error("hub did not answer within {0:?}")]
++    Timeout(Duration),
++    #[error("cannot reach the hub: {0:?}")]
++    Io(std::io::ErrorKind),
++    #[error("hub answered HTTP {0}")]
++    Status(u16),
++    #[error("hub answer is not HTTP")]
++    BadResponse,
++}
++
++/// Sends `post` to the hub hook endpoint at `addr` (`host:port`). Everything,
++/// connect included, fits in `timeout`. `Ok` means the hub has the event.
++pub async fn post(
++    addr: &str,
++    secret: &Secret,
++    post: &HookPost,
++    timeout: Duration,
++) -> Result<(), PostError> {
++    let body = serde_json::to_vec(post).expect("hook posts always serialize");
++    let head = format!(
++        "POST {HOOK_PATH} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
++         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
++        secret.expose(),
++        body.len()
++    );
++    let exchange = async {
++        let io = |error: std::io::Error| PostError::Io(error.kind());
++        let mut stream = TcpStream::connect(addr).await.map_err(io)?;
++        let _ = stream.set_nodelay(true);
++        stream
++            .write_all(&[head.as_bytes(), &body].concat())
++            .await
++            .map_err(io)?;
++        let mut status_line = Vec::new();
++        BufReader::new(stream)
++            .take(MAX_STATUS_LINE)
++            .read_until(b'\n', &mut status_line)
++            .await
++            .map_err(io)?;
++        match parse_status(&status_line) {
++            Some(204) => Ok(()),
++            Some(code) => Err(PostError::Status(code)),
++            None => Err(PostError::BadResponse),
++        }
++    };
++    tokio::time::timeout(timeout, exchange)
++        .await
++        .unwrap_or(Err(PostError::Timeout(timeout)))
++}
++
++fn parse_status(line: &[u8]) -> Option<u16> {
++    let line = std::str::from_utf8(line).ok()?;
++    let mut parts = line.split(' ');
++    if !parts.next()?.starts_with("HTTP/1.") {
++        return None;
++    }
++    parts.next()?.trim().parse().ok()
++}
++
++#[cfg(test)]
++mod tests {
++    use std::net::{Ipv4Addr, SocketAddr};
++    use std::time::Instant;
++
++    use tokio::net::TcpListener;
++    use tokio::sync::mpsc;
++
++    use super::*;
++    use crate::hub::ingress;
++    use crate::wire::HookEvent;
++
++    const SECRET: &str = "0123456789abcdef-secret";
++
++    fn secret() -> Secret {
++        Secret::parse(SECRET).unwrap()
++    }
++
++    fn sample() -> HookPost {
++        HookPost::new(
++            "box".into(),
++            "5e551017-0000-4000-8000-000000000001".into(),
++            "/w".into(),
++            "/w/s.jsonl".into(),
++            HookEvent::SessionEnd {
++                reason: Some("other".into()),
++            },
++        )
++    }
++
++    async fn hub() -> (String, mpsc::Receiver<HookPost>) {
++        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap().to_string();
++        let (tx, rx) = mpsc::channel(8);
++        tokio::spawn(ingress::serve_hooks(listener, secret(), tx));
++        (addr, rx)
++    }
++
++    #[tokio::test]
++    async fn a_resent_post_reaches_the_hub_once() {
++        let (addr, mut events) = hub().await;
++        let sent = sample();
++        let timeout = Duration::from_secs(5);
++        let started = Instant::now();
++        post(&addr, &secret(), &sent, timeout).await.unwrap();
++        assert!(
++            started.elapsed() < Duration::from_millis(500),
++            "{:?}",
++            started.elapsed()
++        );
++        post(&addr, &secret(), &sent, timeout).await.unwrap();
++        assert_eq!(events.recv().await, Some(sent));
++        tokio::time::sleep(Duration::from_millis(50)).await;
++        assert!(events.try_recv().is_err());
++    }
++
++    #[tokio::test]
++    async fn a_wrong_secret_is_refused() {
++        let (addr, mut events) = hub().await;
++        let wrong = Secret::parse("0123456789abcdef-secreT").unwrap();
++        let result = post(&addr, &wrong, &sample(), Duration::from_secs(5)).await;
++        assert_eq!(result, Err(PostError::Status(401)));
++        assert!(events.try_recv().is_err());
++    }
++
++    #[tokio::test]
++    async fn a_silent_hub_costs_at_most_the_timeout() {
++        // Accepts and never answers.
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap().to_string();
++        let _held = tokio::spawn(async move {
++            let mut open = Vec::new();
++            while let Ok((stream, _)) = listener.accept().await {
++                open.push(stream);
++            }
++        });
++        let timeout = Duration::from_millis(300);
++        let started = Instant::now();
++        let result = post(&addr, &secret(), &sample(), timeout).await;
++        assert_eq!(result, Err(PostError::Timeout(timeout)));
++        assert!(
++            started.elapsed() < Duration::from_secs(1),
++            "{:?}",
++            started.elapsed()
++        );
++    }
++
++    #[tokio::test]
++    async fn no_hub_is_an_error_within_the_timeout() {
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap().to_string();
++        drop(listener);
++        let timeout = Duration::from_millis(800);
++        let started = Instant::now();
++        let error = post(&addr, &secret(), &sample(), timeout)
++            .await
++            .unwrap_err();
++        assert!(
++            matches!(error, PostError::Io(_) | PostError::Timeout(_)),
++            "{error:?}"
++        );
++        assert!(started.elapsed() < Duration::from_millis(1500));
++        assert!(!format!("{error} {error:?}").contains(SECRET));
++    }
++
++    #[test]
++    fn status_lines() {
++        assert_eq!(parse_status(b"HTTP/1.1 204 No Content\r\n"), Some(204));
++        assert_eq!(parse_status(b"HTTP/1.0 401 Unauthorized\r\n"), Some(401));
++        assert_eq!(parse_status(b"SSH-2.0-x\r\n"), None);
++        assert_eq!(parse_status(b""), None);
++    }
++}
+diff --git a/crates/cctg/src/hub/mod.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/mod.rs
+index 60a49a9..706df79 100644
+--- a/crates/cctg/src/hub/mod.rs
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/mod.rs
+@@ -3,6 +3,7 @@
+ pub mod api;
+ pub mod commands;
+ pub mod config;
++pub mod ingress;
+ pub mod offset;
+ pub mod scheduler;
+ pub mod sessions;
+@@ -17,8 +18,10 @@ use anyhow::Context;
+ use tokio::sync::mpsc;
+ use tracing::{info, warn};
+ 
++use crate::wire::HookPost;
+ use api::{BotApi, ChatMember};
+-use config::{Config, PROJECTS_VAR, STATE_VAR};
++use config::{AGENT_LISTEN_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR};
++use ingress::AgentEvent;
+ use offset::OffsetStore;
+ use scheduler::{BucketConfig, Scheduler};
+ use sessions::ProjectsDir;
+@@ -63,6 +66,25 @@ fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed
+     }
+ }
+ 
++/// Until the slot registry exists, ingress only logs what arrives (short
++/// session ids and event types, never paths or text).
++async fn drain_ingress(
++    mut agents: mpsc::Receiver<AgentEvent>,
++    mut hooks: mpsc::Receiver<HookPost>,
++) {
++    loop {
++        tokio::select! {
++            Some(event) = agents.recv() => {
++                if let AgentEvent::Message { conn, .. } = event {
++                    info!(conn, "agent message not routed yet");
++                }
++            }
++            Some(_) = hooks.recv() => {}
++            else => return,
++        }
++    }
++}
++
+ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+     let config = Config::load(env_file)?;
+     let projects_dir = config.projects_dir.clone().with_context(|| {
+@@ -70,6 +92,15 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+     })?;
+     let offsets = OffsetStore::open(&config.state_dir)
+         .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
++    let secret = config.hub_secret.clone().with_context(|| {
++        format!("{SECRET_VAR} is not set; agents and hooks authenticate with it (16+ visible ASCII characters)")
++    })?;
++    let agent_listener = ingress::bind(config.agent_listen)
++        .await
++        .with_context(|| format!("cannot listen for agents; check {AGENT_LISTEN_VAR}"))?;
++    let hook_listener = ingress::bind(config.hook_listen)
++        .await
++        .with_context(|| format!("cannot listen for hooks; check {HOOK_LISTEN_VAR}"))?;
+     let api = Arc::new(BotApi::new(&config.token, config.chat_id)?);
+ 
+     let me = api
+@@ -97,6 +128,15 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+         Arc::new(ProjectsDir::new(projects_dir)),
+         me.username.clone(),
+     ));
++    let (agents_tx, agents_rx) = mpsc::channel(256);
++    let (hooks_tx, hooks_rx) = mpsc::channel(256);
++    tokio::spawn(ingress::serve_agents(
++        agent_listener,
++        secret.clone(),
++        agents_tx,
++    ));
++    tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx));
++    tokio::spawn(drain_ingress(agents_rx, hooks_rx));
+ 
+     updates::poll(
+         api.as_ref(),
+diff --git a/crates/cctg/src/hub/config.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/config.rs
+index 419e6f5..3766fac 100644
+--- a/crates/cctg/src/hub/config.rs
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/config.rs
+@@ -4,8 +4,11 @@
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::fmt;
++use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+ use std::path::{Path, PathBuf};
+ 
++use crate::wire::{Secret, SecretError};
++
+ pub const TOKEN_VAR: &str = "CCTG_BOT_TOKEN";
+ pub const CHAT_VAR: &str = "CCTG_CHAT_ID";
+ pub const ALLOWLIST_VAR: &str = "CCTG_ALLOWED_USER_IDS";
+@@ -14,6 +17,16 @@ pub const PROJECTS_VAR: &str = "CCTG_PROJECTS_DIR";
+ /// Optional: hub state directory (the saved `getUpdates` offset); defaults to `.cctg`.
+ pub const STATE_VAR: &str = "CCTG_STATE_DIR";
+ pub const DEFAULT_STATE_DIR: &str = ".cctg";
++/// Shared secret of agents and hooks; required by `cctg hub`.
++pub const SECRET_VAR: &str = "CCTG_HUB_SECRET";
++/// Optional: agent TCP listener `ip:port`; defaults to loopback.
++pub const AGENT_LISTEN_VAR: &str = "CCTG_AGENT_LISTEN";
++/// Optional: hook HTTP listener `ip:port`; defaults to loopback.
++pub const HOOK_LISTEN_VAR: &str = "CCTG_HOOK_LISTEN";
++pub const DEFAULT_AGENT_LISTEN: SocketAddr =
++    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47291));
++pub const DEFAULT_HOOK_LISTEN: SocketAddr =
++    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47292));
+ 
+ #[derive(Debug, PartialEq, Eq, thiserror::Error)]
+ pub enum ConfigError {
+@@ -33,6 +46,10 @@ pub enum ConfigError {
+     /// Carries no `dotenvy::Error`: its parse error quotes the file contents.
+     #[error("cannot load env file {path}: {reason} (contents are not shown)")]
+     EnvFile { path: String, reason: &'static str },
++    #[error("{SECRET_VAR} is invalid: {0}")]
++    Secret(SecretError),
++    #[error("{0} must be an ip:port address such as 127.0.0.1:47291 (host names are not resolved)")]
++    ListenAddr(&'static str),
+ }
+ 
+ /// Bot token. `Debug` never prints it.
+@@ -83,6 +100,11 @@ pub struct Config {
+     /// `CCTG_PROJECTS_DIR` is unset and no home directory is known.
+     pub projects_dir: Option<PathBuf>,
+     pub state_dir: PathBuf,
++    /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start then.
++    pub hub_secret: Option<Secret>,
++    /// Loopback unless configured; any other address is an explicit choice.
++    pub agent_listen: SocketAddr,
++    pub hook_listen: SocketAddr,
+ }
+ 
+ impl Config {
+@@ -155,6 +177,16 @@ impl Config {
+             .map(PathBuf::from)
+             .or_else(|| home.map(|home| PathBuf::from(home).join(".claude").join("projects")));
+         let state_dir = PathBuf::from(optional(STATE_VAR).as_deref().unwrap_or(DEFAULT_STATE_DIR));
++        let hub_secret = optional(SECRET_VAR)
++            .map(|value| Secret::parse(&value).map_err(ConfigError::Secret))
++            .transpose()?;
++        let listen = |name: &'static str, default: SocketAddr| {
++            optional(name).map_or(Ok(default), |value| {
++                value.parse().map_err(|_| ConfigError::ListenAddr(name))
++            })
++        };
++        let agent_listen = listen(AGENT_LISTEN_VAR, DEFAULT_AGENT_LISTEN)?;
++        let hook_listen = listen(HOOK_LISTEN_VAR, DEFAULT_HOOK_LISTEN)?;
+ 
+         Ok(Self {
+             token: BotToken(token),
+@@ -162,6 +194,9 @@ impl Config {
+             allowlist,
+             projects_dir,
+             state_dir,
++            hub_secret,
++            agent_listen,
++            hook_listen,
+         })
+     }
+ }
+@@ -361,15 +396,81 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn debug_hides_token_and_user_ids() {
++    fn debug_hides_token_user_ids_and_hub_secret() {
+         let config = Config::from_vars(vars(&[
+             (TOKEN_VAR, TOKEN),
+             (CHAT_VAR, "-1001"),
+             (ALLOWLIST_VAR, "987654"),
++            (SECRET_VAR, HUB_SECRET),
+         ]))
+         .unwrap();
++        assert!(config.hub_secret.is_some());
+         let debug = format!("{config:?}");
+         assert!(!debug.contains("test-secret"));
+         assert!(!debug.contains("987654"));
++        assert!(!debug.contains(HUB_SECRET));
++    }
++
++    const HUB_SECRET: &str = "hub-secret-marker-0123456789";
++
++    #[test]
++    fn listeners_default_to_loopback() {
++        let config = Config::from_vars(vars(&[
++            (TOKEN_VAR, TOKEN),
++            (CHAT_VAR, "-1001"),
++            (ALLOWLIST_VAR, "1"),
++        ]))
++        .unwrap();
++        assert!(config.hub_secret.is_none());
++        assert_eq!(config.agent_listen, DEFAULT_AGENT_LISTEN);
++        assert_eq!(config.hook_listen, DEFAULT_HOOK_LISTEN);
++        assert!(config.agent_listen.ip().is_loopback());
++        assert!(config.hook_listen.ip().is_loopback());
++        assert_ne!(config.agent_listen.port(), config.hook_listen.port());
++    }
++
++    #[test]
++    fn non_loopback_listeners_need_an_explicit_address() {
++        let config = Config::from_vars(vars(&[
++            (TOKEN_VAR, TOKEN),
++            (CHAT_VAR, "-1001"),
++            (ALLOWLIST_VAR, "1"),
++            (AGENT_LISTEN_VAR, " 100.64.0.7:5000 "),
++            (HOOK_LISTEN_VAR, "[::]:5001"),
++        ]))
++        .unwrap();
++        assert_eq!(config.agent_listen, "100.64.0.7:5000".parse().unwrap());
++        assert!(!config.agent_listen.ip().is_loopback());
++        assert_eq!(config.hook_listen, "[::]:5001".parse().unwrap());
++
++        for bad in ["localhost:5000", "0.0.0.0", "5000", "10.0.0.1:99999"] {
++            let error = Config::from_vars(vars(&[
++                (TOKEN_VAR, TOKEN),
++                (CHAT_VAR, "-1001"),
++                (ALLOWLIST_VAR, "1"),
++                (AGENT_LISTEN_VAR, bad),
++            ]))
++            .unwrap_err();
++            assert_eq!(error, ConfigError::ListenAddr(AGENT_LISTEN_VAR), "{bad}");
++        }
++    }
++
++    #[test]
++    fn a_bad_hub_secret_is_named_but_not_echoed() {
++        for (value, reason) in [
++            ("short-sec", SecretError::TooShort),
++            ("with space inside the secret", SecretError::Charset),
++        ] {
++            let error = Config::from_vars(vars(&[
++                (TOKEN_VAR, TOKEN),
++                (CHAT_VAR, "-1001"),
++                (ALLOWLIST_VAR, "1"),
++                (SECRET_VAR, value),
++            ]))
++            .unwrap_err();
++            assert_eq!(error, ConfigError::Secret(reason));
++            assert!(error.to_string().contains(SECRET_VAR));
++            assert!(!error.to_string().contains(value));
++        }
+     }
+ }
+diff --git a/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/ingress.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/ingress.rs
+new file mode 100644
+index 0000000..91ac6a1
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/src/hub/ingress.rs
+@@ -0,0 +1,986 @@
++//! Hub ingress: the agent TCP link and the hook HTTP endpoint.
++//!
++//! Both check the shared secret before anything else and hand what they
++//! accept to the hub over bounded channels ([`AgentEvent`], [`HookPost`]).
++//! Nothing here logs message contents, paths or the secret: log lines carry
++//! the connection number, the peer address and fixed text only.
++
++use std::collections::{HashSet, VecDeque};
++use std::net::SocketAddr;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
++use tokio::net::{TcpListener, TcpStream};
++use tokio::sync::{Semaphore, mpsc};
++use tokio::task::JoinSet;
++use tracing::{debug, info, warn};
++
++use crate::wire::{
++    self, AgentMsg, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, Register, Rejection,
++    Secret, WireError,
++};
++
++/// Time an agent has to send `hello` and `register`.
++const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
++/// Time a hook has to deliver its whole request.
++const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
++const MAX_AGENTS: usize = 256;
++const MAX_HOOK_REQUESTS: usize = 64;
++const MAX_HEAD: usize = 8 * 1024;
++const TO_AGENT_QUEUE: usize = 64;
++/// How long, and how much, a rejected peer's unread input is drained.
++const LINGER: Duration = Duration::from_millis(250);
++const LINGER_BYTES: usize = 64 * 1024;
++/// A re-sent POST arrives within the hook's own lifetime (seconds, at most
++/// its timeout), so ten minutes is ample; the size cap bounds memory.
++pub const DEDUP_TTL: Duration = Duration::from_secs(10 * 60);
++pub const DEDUP_MAX: usize = 4096;
++
++/// Binds `addr`. A non-loopback address was configured explicitly; say so.
++pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
++    let listener = TcpListener::bind(addr).await?;
++    let local = listener.local_addr()?;
++    if !local.ip().is_loopback() {
++        warn!(%local, "listening beyond loopback: plain TCP, keep it on a private network");
++    }
++    Ok(listener)
++}
++
++/// What the agent link hands to the hub. `conn` numbers are unique per hub run.
++#[derive(Debug)]
++pub enum AgentEvent {
++    Registered {
++        conn: u64,
++        register: Register,
++        /// Dropping it stops outbound traffic, not the connection.
++        to_agent: mpsc::Sender<HubMsg>,
++    },
++    /// A `reply` or `permission_request` after registration.
++    Message {
++        conn: u64,
++        msg: AgentMsg,
++    },
++    Disconnected {
++        conn: u64,
++    },
++}
++
++/// Accepts agents until the task is dropped; dropping it also closes every
++/// agent connection, which is what a hub restart looks like to an agent.
++pub async fn serve_agents(listener: TcpListener, secret: Secret, events: mpsc::Sender<AgentEvent>) {
++    let secret = Arc::new(secret);
++    let slots = Arc::new(Semaphore::new(MAX_AGENTS));
++    let next_conn = AtomicU64::new(1);
++    let mut sessions = JoinSet::new();
++    loop {
++        tokio::select! {
++            accepted = listener.accept() => {
++                let (stream, peer) = match accepted {
++                    Ok(accepted) => accepted,
++                    Err(error) => {
++                        warn!(kind = ?error.kind(), "agent accept failed");
++                        tokio::time::sleep(Duration::from_millis(100)).await;
++                        continue;
++                    }
++                };
++                let Ok(permit) = slots.clone().try_acquire_owned() else {
++                    warn!(%peer, "too many agent connections; refused");
++                    continue;
++                };
++                let conn = next_conn.fetch_add(1, Ordering::Relaxed);
++                let (secret, events) = (secret.clone(), events.clone());
++                sessions.spawn(async move {
++                    agent_session(stream, peer, conn, &secret, &events).await;
++                    drop(permit);
++                });
++            }
++            Some(_) = sessions.join_next() => {}
++        }
++    }
++}
++
++async fn reject(write: &mut (impl AsyncWriteExt + Unpin), reason: Rejection) {
++    let _ = wire::write_msg(write, &HubMsg::Rejected { reason }).await;
++    let _ = write.shutdown().await;
++}
++
++/// Closing a socket with unread input sends a reset, which can destroy the
++/// answer just written. Discard a bounded amount of input first.
++async fn linger(read: &mut (impl AsyncRead + Unpin)) {
++    let drain = async {
++        let mut chunk = [0u8; 4096];
++        let mut total = 0;
++        while total < LINGER_BYTES {
++            match read.read(&mut chunk).await {
++                Ok(0) | Err(_) => break,
++                Ok(n) => total += n,
++            }
++        }
++    };
++    let _ = tokio::time::timeout(LINGER, drain).await;
++}
++
++async fn agent_session(
++    stream: TcpStream,
++    peer: SocketAddr,
++    conn: u64,
++    secret: &Secret,
++    events: &mpsc::Sender<AgentEvent>,
++) {
++    let _ = stream.set_nodelay(true);
++    let (read, mut write) = stream.into_split();
++    let mut reader = BufReader::new(read);
++    let mut line = Vec::new();
++
++    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
++        wire::read_line(&mut reader, &mut line)
++            .await
++            .map_err(|_| Rejection::Protocol)?;
++        let authed = match wire::decode::<AgentMsg>(&line) {
++            Ok(AgentMsg::Hello { secret: offered }) => secret.matches(offered.expose().as_bytes()),
++            Err(WireError::Version) => return Err(Rejection::Version),
++            _ => false,
++        };
++        if !authed {
++            return Err(Rejection::Auth);
++        }
++        wire::read_line(&mut reader, &mut line)
++            .await
++            .map_err(|_| Rejection::Protocol)?;
++        match wire::decode::<AgentMsg>(&line) {
++            Ok(AgentMsg::Register(register)) => Ok(register),
++            Err(WireError::Version) => Err(Rejection::Version),
++            _ => Err(Rejection::Protocol),
++        }
++    })
++    .await;
++    let register = match handshake {
++        Ok(Ok(register)) => register,
++        Ok(Err(reason)) => {
++            warn!(conn, %peer, ?reason, "agent rejected");
++            reject(&mut write, reason).await;
++            linger(&mut reader).await;
++            return;
++        }
++        Err(_) => {
++            warn!(conn, %peer, "agent handshake timed out");
++            return;
++        }
++    };
++
++    let session = short(&register.session_id).to_owned();
++    let (to_agent, mut outbound) = mpsc::channel(TO_AGENT_QUEUE);
++    let registered = AgentEvent::Registered {
++        conn,
++        register,
++        to_agent,
++    };
++    if events.send(registered).await.is_err()
++        || wire::write_msg(&mut write, &HubMsg::Registered)
++            .await
++            .is_err()
++    {
++        return;
++    }
++    info!(conn, session, "agent registered");
++
++    let mut outbound_open = true;
++    loop {
++        tokio::select! {
++            read = wire::read_line(&mut reader, &mut line) => {
++                if let Err(error) = read {
++                    debug!(conn, %error, "agent link ended");
++                    break;
++                }
++                match wire::decode::<AgentMsg>(&line) {
++                    Ok(msg @ (AgentMsg::Reply { .. } | AgentMsg::PermissionRequest(_))) => {
++                        if events.send(AgentEvent::Message { conn, msg }).await.is_err() {
++                            break;
++                        }
++                    }
++                    Ok(_) => warn!(conn, "agent repeated its handshake; ignored"),
++                    Err(WireError::Version) => {
++                        warn!(conn, "agent changed protocol version; closing");
++                        reject(&mut write, Rejection::Version).await;
++                        break;
++                    }
++                    Err(error) => warn!(conn, %error, "agent line ignored"),
++                }
++            }
++            msg = outbound.recv(), if outbound_open => match msg {
++                Some(msg) => {
++                    if wire::write_msg(&mut write, &msg).await.is_err() {
++                        break;
++                    }
++                }
++                None => outbound_open = false,
++            },
++        }
++    }
++    let _ = events.send(AgentEvent::Disconnected { conn }).await;
++    info!(conn, session, "agent disconnected");
++}
++
++/// First 8 characters: enough to recognise a session in logs.
++fn short(session_id: &str) -> &str {
++    session_id
++        .char_indices()
++        .nth(8)
++        .map_or(session_id, |(end, _)| &session_id[..end])
++}
++
++/// Recently accepted hook event ids, bounded by count and age.
++#[derive(Debug)]
++pub struct Dedup {
++    ttl: Duration,
++    max: usize,
++    seen: HashSet<EventId>,
++    order: VecDeque<(Instant, EventId)>,
++}
++
++impl Dedup {
++    pub fn new(max: usize, ttl: Duration) -> Self {
++        Self {
++            ttl,
++            max,
++            seen: HashSet::new(),
++            order: VecDeque::new(),
++        }
++    }
++
++    pub fn contains(&mut self, id: &EventId, now: Instant) -> bool {
++        self.expire(now);
++        self.seen.contains(id)
++    }
++
++    pub fn insert(&mut self, id: EventId, now: Instant) {
++        if self.seen.insert(id.clone()) {
++            self.order.push_back((now, id));
++        }
++        self.expire(now);
++    }
++
++    pub fn len(&self) -> usize {
++        self.order.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.order.is_empty()
++    }
++
++    fn expire(&mut self, now: Instant) {
++        while let Some((at, _)) = self.order.front() {
++            let stale = now.saturating_duration_since(*at) >= self.ttl;
++            if !stale && self.order.len() <= self.max {
++                break;
++            }
++            if let Some((_, id)) = self.order.pop_front() {
++                self.seen.remove(&id);
++            }
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Status {
++    NoContent,
++    BadRequest,
++    Unauthorized,
++    NotFound,
++    MethodNotAllowed,
++    LengthRequired,
++    PayloadTooLarge,
++    HeaderTooLarge,
++    Unavailable,
++}
++
++impl Status {
++    pub fn code(self) -> u16 {
++        match self {
++            Self::NoContent => 204,
++            Self::BadRequest => 400,
++            Self::Unauthorized => 401,
++            Self::NotFound => 404,
++            Self::MethodNotAllowed => 405,
++            Self::LengthRequired => 411,
++            Self::PayloadTooLarge => 413,
++            Self::HeaderTooLarge => 431,
++            Self::Unavailable => 503,
++        }
++    }
++
++    fn reason(self) -> &'static str {
++        match self {
++            Self::NoContent => "No Content",
++            Self::BadRequest => "Bad Request",
++            Self::Unauthorized => "Unauthorized",
++            Self::NotFound => "Not Found",
++            Self::MethodNotAllowed => "Method Not Allowed",
++            Self::LengthRequired => "Length Required",
++            Self::PayloadTooLarge => "Content Too Large",
++            Self::HeaderTooLarge => "Request Header Fields Too Large",
++            Self::Unavailable => "Service Unavailable",
++        }
++    }
++}
++
++/// Serves `POST /v1/hook` until the task is dropped. Each accepted, new
++/// event id goes to `events` once; a repeat is answered 204 and dropped.
++pub async fn serve_hooks(listener: TcpListener, secret: Secret, events: mpsc::Sender<HookPost>) {
++    let secret = Arc::new(secret);
++    let dedup = Arc::new(Mutex::new(Dedup::new(DEDUP_MAX, DEDUP_TTL)));
++    let slots = Arc::new(Semaphore::new(MAX_HOOK_REQUESTS));
++    let mut requests = JoinSet::new();
++    loop {
++        tokio::select! {
++            accepted = listener.accept() => {
++                let (stream, peer) = match accepted {
++                    Ok(accepted) => accepted,
++                    Err(error) => {
++                        warn!(kind = ?error.kind(), "hook accept failed");
++                        tokio::time::sleep(Duration::from_millis(100)).await;
++                        continue;
++                    }
++                };
++                let Ok(permit) = slots.clone().try_acquire_owned() else {
++                    warn!(%peer, "too many hook requests; refused");
++                    continue;
++                };
++                let (secret, dedup, events) = (secret.clone(), dedup.clone(), events.clone());
++                requests.spawn(async move {
++                    hook_request(stream, peer, &secret, &dedup, &events).await;
++                    drop(permit);
++                });
++            }
++            Some(_) = requests.join_next() => {}
++        }
++    }
++}
++
++async fn hook_request(
++    mut stream: TcpStream,
++    peer: SocketAddr,
++    secret: &Secret,
++    dedup: &Mutex<Dedup>,
++    events: &mpsc::Sender<HookPost>,
++) {
++    let status =
++        match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream, secret)).await {
++            Ok(Ok(body)) => accept_hook(&body, dedup, events),
++            Ok(Err(status)) => status,
++            Err(_) => {
++                warn!(%peer, "hook request timed out");
++                return;
++            }
++        };
++    if status == Status::Unauthorized {
++        warn!(%peer, "hook request rejected: bad or missing secret");
++    } else if status != Status::NoContent {
++        warn!(%peer, status = status.code(), "hook request rejected");
++    }
++    let response = format!(
++        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
++        status.code(),
++        status.reason()
++    );
++    let _ = stream.write_all(response.as_bytes()).await;
++    let _ = stream.shutdown().await;
++    linger(&mut stream).await;
++}
++
++fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost>) -> Status {
++    let post = match wire::decode_hook(body) {
++        Ok(post) => post,
++        Err(error) => {
++            debug!(%error, "hook body rejected");
++            return Status::BadRequest;
++        }
++    };
++    let Ok(mut dedup) = dedup.lock() else {
++        return Status::Unavailable;
++    };
++    let now = Instant::now();
++    if dedup.contains(&post.event_id, now) {
++        debug!(event = post.event.kind(), "repeated hook event dropped");
++        return Status::NoContent;
++    }
++    let (id, kind, session) = (
++        post.event_id.clone(),
++        post.event.kind(),
++        short(&post.session_id).to_owned(),
++    );
++    match events.try_send(post) {
++        Ok(()) => {
++            // Remembered only once handed over, so a 503 can be re-sent.
++            dedup.insert(id, now);
++            info!(event = kind, session, "hook event accepted");
++            Status::NoContent
++        }
++        Err(_) => Status::Unavailable,
++    }
++}
++
++/// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
++/// and returns its body. The secret is checked before the body is read.
++async fn read_request<S: AsyncRead + Unpin>(
++    stream: &mut S,
++    secret: &Secret,
++) -> Result<Vec<u8>, Status> {
++    let mut buf = Vec::with_capacity(1024);
++    let head_end = loop {
++        if let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
++            break end;
++        }
++        if buf.len() >= MAX_HEAD {
++            return Err(Status::HeaderTooLarge);
++        }
++        let mut chunk = [0u8; 1024];
++        let read = stream
++            .read(&mut chunk)
++            .await
++            .map_err(|_| Status::BadRequest)?;
++        if read == 0 {
++            return Err(Status::BadRequest);
++        }
++        buf.extend_from_slice(&chunk[..read]);
++    };
++    let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| Status::BadRequest)?;
++    let mut lines = head.split("\r\n");
++    let mut request_line = lines.next().unwrap_or_default().split(' ');
++    let (method, target, version) = (
++        request_line.next().unwrap_or_default(),
++        request_line.next().unwrap_or_default(),
++        request_line.next().unwrap_or_default(),
++    );
++    if request_line.next().is_some() || !version.starts_with("HTTP/1.") {
++        return Err(Status::BadRequest);
++    }
++    if method != "POST" {
++        return Err(Status::MethodNotAllowed);
++    }
++    if target != HOOK_PATH {
++        return Err(Status::NotFound);
++    }
++
++    let mut length = None;
++    let mut authorized = false;
++    for line in lines {
++        let (name, value) = line.split_once(':').ok_or(Status::BadRequest)?;
++        if name.is_empty() || name.bytes().any(|byte| byte.is_ascii_whitespace()) {
++            return Err(Status::BadRequest);
++        }
++        let value = value.trim();
++        if name.eq_ignore_ascii_case("content-length") {
++            // RFC 9112 6.3: a repeated or invalid length is an error.
++            if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
++                return Err(Status::BadRequest);
++            }
++            length = Some(value.parse::<usize>().unwrap_or(usize::MAX));
++        } else if name.eq_ignore_ascii_case("transfer-encoding") {
++            return Err(Status::BadRequest);
++        } else if name.eq_ignore_ascii_case("authorization") {
++            let token = value
++                .split_once(' ')
++                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
++                .map(|(_, token)| token.trim());
++            authorized = token.is_some_and(|token| secret.matches(token.as_bytes()));
++        }
++    }
++    if !authorized {
++        return Err(Status::Unauthorized);
++    }
++    let length = length.ok_or(Status::LengthRequired)?;
++    if length > MAX_HOOK_BODY {
++        return Err(Status::PayloadTooLarge);
++    }
++    let mut body = buf.split_off(head_end + 4);
++    if body.len() > length {
++        return Err(Status::BadRequest);
++    }
++    let received = body.len();
++    body.resize(length, 0);
++    stream
++        .read_exact(&mut body[received..])
++        .await
++        .map_err(|_| Status::BadRequest)?;
++    Ok(body)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::net::{Ipv4Addr, SocketAddrV4};
++
++    use tokio::io::AsyncBufReadExt;
++
++    use super::*;
++    use crate::wire::HookEvent;
++
++    const SECRET: &str = "0123456789abcdef-secret";
++    const WAIT: Duration = Duration::from_secs(10);
++
++    fn secret() -> Secret {
++        Secret::parse(SECRET).unwrap()
++    }
++
++    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
++        tokio::time::timeout(WAIT, future).await.expect("in time")
++    }
++
++    fn loopback() -> SocketAddr {
++        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
++    }
++
++    async fn agents_hub() -> (
++        SocketAddr,
++        mpsc::Receiver<AgentEvent>,
++        tokio::task::JoinHandle<()>,
++    ) {
++        let listener = bind(loopback()).await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (tx, rx) = mpsc::channel(16);
++        let task = tokio::spawn(serve_agents(listener, secret(), tx));
++        (addr, rx, task)
++    }
++
++    fn register() -> Register {
++        Register {
++            session_id: "5e551017-0000-4000-8000-000000000001".into(),
++            host: "box".into(),
++            cwd: "/w".into(),
++        }
++    }
++
++    struct Peer {
++        reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
++        write: tokio::net::tcp::OwnedWriteHalf,
++        line: Vec<u8>,
++    }
++
++    impl Peer {
++        async fn connect(addr: SocketAddr) -> Self {
++            let (read, write) = TcpStream::connect(addr).await.unwrap().into_split();
++            Self {
++                reader: BufReader::new(read),
++                write,
++                line: Vec::new(),
++            }
++        }
++
++        async fn send(&mut self, msg: &AgentMsg) {
++            wire::write_msg(&mut self.write, msg).await.unwrap();
++        }
++
++        async fn raw(&mut self, bytes: &[u8]) {
++            self.write.write_all(bytes).await.unwrap();
++        }
++
++        async fn recv(&mut self) -> Result<HubMsg, WireError> {
++            tokio::time::timeout(WAIT, wire::read_line(&mut self.reader, &mut self.line))
++                .await
++                .expect("hub answered in time")?;
++            wire::decode(&self.line)
++        }
++    }
++
++    #[tokio::test]
++    async fn a_wrong_secret_is_rejected_before_register() {
++        let (addr, mut events, _hub) = agents_hub().await;
++        let mut peer = Peer::connect(addr).await;
++        let wrong = Secret::parse("0123456789abcdef-secreT").unwrap();
++        peer.send(&AgentMsg::Hello { secret: wrong }).await;
++        peer.send(&AgentMsg::Register(register())).await;
++        assert_eq!(
++            peer.recv().await,
++            Ok(HubMsg::Rejected {
++                reason: Rejection::Auth
++            })
++        );
++        assert_eq!(peer.recv().await, Err(WireError::Closed));
++
++        // Register without hello is not processed either.
++        let mut peer = Peer::connect(addr).await;
++        peer.send(&AgentMsg::Register(register())).await;
++        assert_eq!(
++            peer.recv().await,
++            Ok(HubMsg::Rejected {
++                reason: Rejection::Auth
++            })
++        );
++        assert!(events.try_recv().is_err(), "no event for rejected agents");
++    }
++
++    #[tokio::test]
++    async fn another_version_is_rejected_as_such() {
++        let (addr, _events, _hub) = agents_hub().await;
++        let mut peer = Peer::connect(addr).await;
++        peer.raw(format!("{{\"v\":2,\"type\":\"hello\",\"secret\":\"{SECRET}\"}}\n").as_bytes())
++            .await;
++        assert_eq!(
++            peer.recv().await,
++            Ok(HubMsg::Rejected {
++                reason: Rejection::Version
++            })
++        );
++    }
++
++    #[tokio::test]
++    async fn a_registered_agent_talks_both_ways() {
++        let (addr, mut events, _hub) = agents_hub().await;
++        let mut peer = Peer::connect(addr).await;
++        peer.send(&AgentMsg::Hello { secret: secret() }).await;
++        peer.send(&AgentMsg::Register(register())).await;
++        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
++        let Some(AgentEvent::Registered {
++            conn,
++            register: got,
++            to_agent,
++        }) = within(events.recv()).await
++        else {
++            panic!("expected registration");
++        };
++        assert_eq!(got, register());
++
++        // Unknown types and bad lines are skipped, the link stays up.
++        peer.raw(b"{\"v\":1,\"type\":\"teleport\"}\nnot json\n")
++            .await;
++        let reply = AgentMsg::Reply {
++            text: "done".into(),
++        };
++        peer.send(&reply).await;
++        match within(events.recv()).await {
++            Some(AgentEvent::Message { conn: from, msg }) => {
++                assert_eq!((from, msg), (conn, reply));
++            }
++            other => panic!("expected the reply, got {other:?}"),
++        }
++
++        let inbound = HubMsg::Inbound {
++            content: "hi".into(),
++            meta: Default::default(),
++        };
++        to_agent.send(inbound.clone()).await.unwrap();
++        assert_eq!(peer.recv().await, Ok(inbound));
++
++        drop(peer);
++        match tokio::time::timeout(WAIT, events.recv()).await.unwrap() {
++            Some(AgentEvent::Disconnected { conn: gone }) => assert_eq!(gone, conn),
++            other => panic!("expected disconnect, got {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn an_overlong_line_closes_the_link() {
++        let (addr, mut events, _hub) = agents_hub().await;
++        let mut peer = Peer::connect(addr).await;
++        peer.send(&AgentMsg::Hello { secret: secret() }).await;
++        peer.send(&AgentMsg::Register(register())).await;
++        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
++        let _ = within(events.recv()).await;
++
++        // No newline ever: the hub must stop reading at the limit and close.
++        let Peer {
++            mut reader,
++            mut write,
++            ..
++        } = peer;
++        let flood = tokio::spawn(async move {
++            let chunk = vec![b'a'; 64 * 1024];
++            for _ in 0..(wire::MAX_LINE / chunk.len() + 64) {
++                if write.write_all(&chunk).await.is_err() {
++                    break;
++                }
++            }
++            write
++        });
++        match tokio::time::timeout(WAIT, events.recv()).await.unwrap() {
++            Some(AgentEvent::Disconnected { .. }) => {}
++            other => panic!("expected disconnect, got {other:?}"),
++        }
++        let mut rest = Vec::new();
++        let read = tokio::time::timeout(WAIT, reader.read_until(b'\n', &mut rest)).await;
++        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
++        let _ = flood.await;
++    }
++
++    #[tokio::test]
++    async fn listeners_bind_loopback_and_explicit_addresses() {
++        let listener = bind(loopback()).await.unwrap();
++        assert!(listener.local_addr().unwrap().ip().is_loopback());
++        let any = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
++        let listener = bind(any).await.unwrap();
++        let local = listener.local_addr().unwrap();
++        assert!(!local.ip().is_loopback());
++        let (tx, mut rx) = mpsc::channel(4);
++        let _hub = tokio::spawn(serve_agents(listener, secret(), tx));
++        let mut peer = Peer::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, local.port()))).await;
++        peer.send(&AgentMsg::Hello { secret: secret() }).await;
++        peer.send(&AgentMsg::Register(register())).await;
++        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
++        assert!(matches!(
++            rx.recv().await,
++            Some(AgentEvent::Registered { .. })
++        ));
++    }
++
++    async fn hooks_hub(queue: usize) -> (SocketAddr, mpsc::Receiver<HookPost>) {
++        let listener = bind(loopback()).await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (tx, rx) = mpsc::channel(queue);
++        tokio::spawn(serve_hooks(listener, secret(), tx));
++        (addr, rx)
++    }
++
++    fn post(event: HookEvent) -> HookPost {
++        HookPost::new(
++            "box".into(),
++            "5e551017-0000-4000-8000-000000000001".into(),
++            "/w".into(),
++            "/w/s.jsonl".into(),
++            event,
++        )
++    }
++
++    fn start() -> HookEvent {
++        HookEvent::SessionStart {
++            source: Some("resume".into()),
++            claude_pid: None,
++            parent_claude_pid: None,
++        }
++    }
++
++    fn request(auth: Option<&str>, body: &[u8]) -> Vec<u8> {
++        let mut head = format!(
++            "POST {HOOK_PATH} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n",
++            body.len()
++        );
++        if let Some(auth) = auth {
++            head.push_str(&format!("Authorization: {auth}\r\n"));
++        }
++        head.push_str("\r\n");
++        [head.as_bytes(), body].concat()
++    }
++
++    async fn exchange(addr: SocketAddr, raw: &[u8]) -> u16 {
++        let mut stream = TcpStream::connect(addr).await.unwrap();
++        stream.write_all(raw).await.unwrap();
++        let mut response = Vec::new();
++        tokio::time::timeout(WAIT, stream.read_to_end(&mut response))
++            .await
++            .unwrap()
++            .unwrap();
++        let text = String::from_utf8(response).unwrap();
++        assert!(
++            text.ends_with("\r\n\r\n") && text.contains("Connection: close"),
++            "{text}"
++        );
++        text.get(9..12).unwrap().parse().unwrap()
++    }
++
++    fn body(post: &HookPost) -> Vec<u8> {
++        serde_json::to_vec(post).unwrap()
++    }
++
++    #[tokio::test]
++    async fn a_repeated_post_is_delivered_once() {
++        let (addr, mut events) = hooks_hub(8).await;
++        let bearer = format!("Bearer {SECRET}");
++        let first = post(start());
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body(&first))).await,
++            204
++        );
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body(&first))).await,
++            204
++        );
++        // A resumed session repeats session_id and source: a new event, not a repeat.
++        let resumed = post(start());
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body(&resumed))).await,
++            204
++        );
++        assert_eq!(within(events.recv()).await, Some(first));
++        assert_eq!(within(events.recv()).await, Some(resumed));
++        assert!(events.try_recv().is_err());
++    }
++
++    #[tokio::test]
++    async fn two_stops_of_one_prompt_are_two_events() {
++        let (addr, mut events) = hooks_hub(8).await;
++        let bearer = format!("Bearer {SECRET}");
++        let stop = || HookEvent::Stop {
++            prompt_id: Some("p1".into()),
++            last_assistant_message: Some("same".into()),
++        };
++        for _ in 0..2 {
++            assert_eq!(
++                exchange(addr, &request(Some(&bearer), &body(&post(stop())))).await,
++                204
++            );
++        }
++        assert!(within(events.recv()).await.is_some() && within(events.recv()).await.is_some());
++    }
++
++    #[tokio::test]
++    async fn bad_requests_get_errors_and_no_event() {
++        let (addr, mut events) = hooks_hub(8).await;
++        let bearer = format!("Bearer {SECRET}");
++        let good = body(&post(start()));
++        let cases: Vec<(Vec<u8>, u16)> = vec![
++            (request(None, &good), 401),
++            (request(Some("Bearer 0123456789abcdef-secreT"), &good), 401),
++            (request(Some(SECRET), &good), 401),
++            (request(Some(&bearer), b"{\"v\":1}"), 400),
++            (request(Some(&bearer), b"not json"), 400),
++            (
++                request(
++                    Some(&bearer),
++                    &good.replace_type("session_start", "pre_compact"),
++                ),
++                400,
++            ),
++            (
++                format!("GET {HOOK_PATH} HTTP/1.1\r\nAuthorization: {bearer}\r\n\r\n").into_bytes(),
++                405,
++            ),
++            (
++                format!("POST /other HTTP/1.1\r\nAuthorization: {bearer}\r\nContent-Length: 0\r\n\r\n")
++                    .into_bytes(),
++                404,
++            ),
++            (
++                format!("POST {HOOK_PATH} HTTP/1.1\r\nAuthorization: {bearer}\r\n\r\n").into_bytes(),
++                411,
++            ),
++            (
++                format!(
++                    "POST {HOOK_PATH} HTTP/1.1\r\nAuthorization: {bearer}\r\nContent-Length: {}\r\n\r\n",
++                    MAX_HOOK_BODY + 1
++                )
++                .into_bytes(),
++                413,
++            ),
++            // Both carry a valid body: only the framing headers make them bad.
++            (
++                [
++                    format!(
++                        "POST {HOOK_PATH} HTTP/1.1\r\nAuthorization: {bearer}\r\nTransfer-Encoding: chunked\r\nContent-Length: {}\r\n\r\n",
++                        good.len()
++                    )
++                    .as_bytes(),
++                    &good[..],
++                ]
++                .concat(),
++                400,
++            ),
++            (
++                [
++                    format!(
++                        "POST {HOOK_PATH} HTTP/1.1\r\nAuthorization: {bearer}\r\nContent-Length: {0}\r\nContent-Length: {0}\r\n\r\n",
++                        good.len()
++                    )
++                    .as_bytes(),
++                    &good[..],
++                ]
++                .concat(),
++                400,
++            ),
++            (
++                format!(
++                    "POST {HOOK_PATH} HTTP/1.1\r\nAuthorization: {bearer}\r\nX-Pad: {}\r\n\r\n",
++                    "a".repeat(MAX_HEAD)
++                )
++                .into_bytes(),
++                431,
++            ),
++        ];
++        for (raw, want) in cases {
++            let got = exchange(addr, &raw).await;
++            assert_eq!(
++                got,
++                want,
++                "{}",
++                String::from_utf8_lossy(&raw[..raw.len().min(120)])
++            );
++        }
++        assert!(events.try_recv().is_err());
++    }
++
++    trait ReplaceType {
++        fn replace_type(&self, from: &str, to: &str) -> Vec<u8>;
++    }
++
++    impl ReplaceType for Vec<u8> {
++        fn replace_type(&self, from: &str, to: &str) -> Vec<u8> {
++            String::from_utf8_lossy(self).replace(from, to).into_bytes()
++        }
++    }
++
++    #[tokio::test]
++    async fn a_full_queue_answers_503_and_the_resend_is_delivered() {
++        let (addr, mut events) = hooks_hub(1).await;
++        let bearer = format!("Bearer {SECRET}");
++        let first = post(start());
++        let second = post(HookEvent::SessionEnd { reason: None });
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body(&first))).await,
++            204
++        );
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body(&second))).await,
++            503
++        );
++        assert_eq!(within(events.recv()).await, Some(first));
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body(&second))).await,
++            204
++        );
++        assert_eq!(within(events.recv()).await, Some(second));
++    }
++
++    #[tokio::test]
++    async fn a_body_split_across_writes_is_read_whole() {
++        let (addr, mut events) = hooks_hub(4).await;
++        let sent = post(start());
++        let raw = request(Some(&format!("Bearer {SECRET}")), &body(&sent));
++        let mut stream = TcpStream::connect(addr).await.unwrap();
++        for piece in raw.chunks(7) {
++            stream.write_all(piece).await.unwrap();
++            stream.flush().await.unwrap();
++        }
++        let mut response = Vec::new();
++        stream.read_to_end(&mut response).await.unwrap();
++        assert!(response.starts_with(b"HTTP/1.1 204"));
++        assert_eq!(within(events.recv()).await, Some(sent));
++    }
++
++    #[test]
++    fn dedup_forgets_by_age_and_by_count() {
++        let t0 = Instant::now();
++        let ttl = Duration::from_secs(60);
++        let mut dedup = Dedup::new(3, ttl);
++        let ids: Vec<EventId> = (0..5).map(|_| EventId::new()).collect();
++        dedup.insert(ids[0].clone(), t0);
++        assert!(dedup.contains(&ids[0], t0 + ttl - Duration::from_millis(1)));
++        assert!(!dedup.contains(&ids[0], t0 + ttl));
++        assert!(dedup.is_empty());
++
++        for id in &ids {
++            dedup.insert(id.clone(), t0);
++        }
++        assert_eq!(dedup.len(), 3);
++        assert!(!dedup.contains(&ids[1], t0));
++        assert!(dedup.contains(&ids[2], t0) && dedup.contains(&ids[4], t0));
++        dedup.insert(ids[4].clone(), t0);
++        assert_eq!(dedup.len(), 3);
++    }
++
++    #[test]
++    fn short_ids_cut_at_eight_chars() {
++        assert_eq!(short("5e551017-0000"), "5e551017");
++        assert_eq!(short("abc"), "abc");
++        assert_eq!(short("ééééééééé"), "éééééééé");
++    }
++}
+diff --git a/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/tests/ingress_logs.rs b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/tests/ingress_logs.rs
+new file mode 100644
+index 0000000..2a86430
+--- /dev/null
++++ b/maw/tasks/in_progress/TASK-010/scratch/planner/ws/crates/cctg/tests/ingress_logs.rs
+@@ -0,0 +1,181 @@
++//! Log capture for the agent link and the hook endpoint: the shared secret,
++//! a wrongly offered secret and message contents never reach the logs, on
++//! any path, parse errors included. Its own test binary with a global
++//! subscriber: connection tasks run on runtime workers, and parallel tests
++//! would race on tracing callsite registration.
++
++use std::io;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use cctg::hook;
++use cctg::hub::ingress::{self, AgentEvent};
++use cctg::wire::{self, AgentMsg, HOOK_PATH, HookEvent, HookPost, Register, Secret};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpStream;
++use tokio::sync::mpsc;
++
++#[derive(Clone, Default)]
++struct Captured(Arc<Mutex<Vec<u8>>>);
++
++impl io::Write for Captured {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        if let Ok(mut out) = self.0.lock() {
++            out.extend_from_slice(buf);
++        }
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++/// Sends raw bytes, half-closes, and waits until the hub closes too.
++async fn send_and_wait(addr: SocketAddr, bytes: &[u8]) {
++    let mut stream = TcpStream::connect(addr).await.expect("connect");
++    let _ = stream.write_all(bytes).await;
++    let _ = stream.shutdown().await;
++    let mut sink = Vec::new();
++    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut sink)).await;
++}
++
++fn http(auth: &str, body: &[u8]) -> Vec<u8> {
++    let head = format!(
++        "POST {HOOK_PATH} HTTP/1.1\r\nAuthorization: Bearer {auth}\r\nContent-Length: {}\r\n\r\n",
++        body.len()
++    );
++    [head.as_bytes(), body].concat()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn ingress_logs_carry_no_secrets_or_contents() {
++    let captured = Captured::default();
++    let writer = captured.clone();
++    let subscriber = tracing_subscriber::fmt()
++        .without_time()
++        .with_max_level(tracing::Level::TRACE)
++        .with_writer(move || writer.clone())
++        .finish();
++    tracing::subscriber::set_global_default(subscriber).expect("first subscriber");
++
++    let pid = std::process::id();
++    let real = format!("real-secret-marker-{pid}");
++    let wrong = format!("wrong-secret-marker-{pid}");
++    let content = format!("content-marker-{pid}");
++    let secret = Secret::parse(&real).expect("secret");
++
++    let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
++    let agents = ingress::bind(loopback).await.expect("bind agents");
++    let agents_addr = agents.local_addr().expect("addr");
++    let (agent_tx, mut agent_rx) = mpsc::channel(16);
++    tokio::spawn(ingress::serve_agents(agents, secret.clone(), agent_tx));
++    let hooks = ingress::bind(loopback).await.expect("bind hooks");
++    let hooks_addr = hooks.local_addr().expect("addr");
++    let (hook_tx, mut hook_rx) = mpsc::channel(16);
++    tokio::spawn(ingress::serve_hooks(hooks, secret.clone(), hook_tx));
++
++    // Agent link: wrong secret, broken hello carrying the secret, a version
++    // mismatch carrying it, an overlong line carrying it.
++    let wrong_hello = AgentMsg::Hello {
++        secret: Secret::parse(&wrong).expect("secret"),
++    };
++    send_and_wait(agents_addr, &wire::encode(&wrong_hello)).await;
++    send_and_wait(
++        agents_addr,
++        format!("{{\"v\":1,\"type\":\"hello\",\"secret\":[\"{real}\"]}}\n").as_bytes(),
++    )
++    .await;
++    send_and_wait(
++        agents_addr,
++        format!("{{\"v\":9,\"type\":\"hello\",\"secret\":\"{real}\"}}\n").as_bytes(),
++    )
++    .await;
++    send_and_wait(
++        agents_addr,
++        format!("{real}{}", "x".repeat(wire::MAX_LINE)).as_bytes(),
++    )
++    .await;
++
++    // A registered agent sending junk that carries the secret and content.
++    let register = Register {
++        session_id: "5e551017-0000-4000-8000-000000000001".into(),
++        host: format!("host-{content}"),
++        cwd: format!("/home/{content}"),
++    };
++    let mut lines = wire::encode(&AgentMsg::Hello {
++        secret: secret.clone(),
++    });
++    lines.extend(wire::encode(&AgentMsg::Register(register)));
++    lines.extend(format!("{{\"v\":1,\"type\":\"{real}\"}}\n").as_bytes());
++    lines
++        .extend(format!("{{\"v\":1,\"type\":\"reply\",\"text\":7,\"x\":\"{real}\"}}\n").as_bytes());
++    lines.extend(format!("{real} not json\n").as_bytes());
++    lines.extend(wire::encode(&AgentMsg::Reply {
++        text: content.clone(),
++    }));
++    send_and_wait(agents_addr, &lines).await;
++    let mut registered = 0;
++    while let Ok(event) = agent_rx.try_recv() {
++        if matches!(event, AgentEvent::Registered { .. }) {
++            registered += 1;
++        }
++    }
++    assert_eq!(registered, 1, "only the good agent registers");
++
++    // Hook endpoint: wrong bearer, malformed bodies carrying the secret, one
++    // good post and its repeat.
++    let post = HookPost::new(
++        format!("host-{content}"),
++        "5e551017-0000-4000-8000-000000000001".into(),
++        format!("/home/{content}"),
++        format!("/home/{content}/s.jsonl"),
++        HookEvent::Stop {
++            prompt_id: None,
++            last_assistant_message: Some(content.clone()),
++        },
++    );
++    let body = serde_json::to_vec(&post).expect("body");
++    send_and_wait(hooks_addr, &http(&wrong, &body)).await;
++    send_and_wait(
++        hooks_addr,
++        &http(&real, format!("{{\"v\":1,\"x\":\"{real}\"").as_bytes()),
++    )
++    .await;
++    send_and_wait(
++        hooks_addr,
++        &http(
++            &real,
++            format!("{{\"v\":1,\"event\":{{\"type\":\"{real}\"}}}}").as_bytes(),
++        ),
++    )
++    .await;
++    let timeout = Duration::from_secs(5);
++    hook::post(&hooks_addr.to_string(), &secret, &post, timeout)
++        .await
++        .expect("accepted");
++    hook::post(&hooks_addr.to_string(), &secret, &post, timeout)
++        .await
++        .expect("repeat accepted");
++    assert!(hook_rx.recv().await.is_some());
++    assert!(hook_rx.try_recv().is_err(), "the repeat is dropped");
++
++    let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
++        .unwrap_or_default();
++    for expected in [
++        "agent rejected",
++        "agent registered",
++        "agent line ignored",
++        "hook request rejected",
++        "hook event accepted",
++        "repeated hook event dropped",
++    ] {
++        assert!(
++            logs.contains(expected),
++            "expected {expected:?} in logs: {logs}"
++        );
++    }
++    for leaked in [real.as_str(), wrong.as_str(), content.as_str()] {
++        assert!(!logs.contains(leaked), "{leaked} in logs: {logs}");
++    }
++}

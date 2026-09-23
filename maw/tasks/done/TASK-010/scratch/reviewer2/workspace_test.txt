@@ -1,0 +1,278 @@
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-010\scratch\reviewer2\ws\crates\transcript)
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-010\scratch\reviewer2\ws\crates\cctg)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.42s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\cctg-17c99127d1a4c7b7.exe)
+
+running 102 tests
+test hook::tests::status_lines ... ok
+test hub::api::tests::maps_429_to_retry_after ... ok
+test hub::api::tests::decodes_ok_result_and_ignores_unknown_fields ... ok
+test hub::api::tests::maps_other_errors_with_description ... ok
+test agent::tests::backoff_grows_to_the_cap_with_jitter ... ok
+test agent::tests::dropping_the_receiver_stops_the_link ... ok
+test hook::tests::a_wrong_secret_is_refused ... ok
+test hub::commands::tests::parses_arguments ... ok
+test hub::commands::tests::missing_and_unreadable_files_become_notices ... ok
+test hook::tests::a_truncated_or_foreign_status_line_is_not_success ... ok
+test hub::commands::tests::unreadable_projects_root_has_a_notice ... ok
+test hub::commands::tests::oversized_transcripts_become_a_notice ... ok
+test hub::config::tests::a_bad_hub_secret_is_named_but_not_echoed ... ok
+test hub::config::tests::chat_id_must_use_the_bot_api_form ... ok
+test hub::config::tests::debug_hides_token_user_ids_and_hub_secret ... ok
+test hub::commands::tests::rejected_fallback_document_is_not_retried ... ok
+test hub::config::tests::env_file_token_does_not_enter_process_environment_child ... ignored, run by env_file_token_does_not_enter_process_environment in an isolated process
+test hub::commands::tests::other_errors_do_not_switch_to_a_document ... ok
+test hub::config::tests::listeners_default_to_loopback ... ok
+test hub::config::tests::missing_and_bad_values_are_named_but_not_echoed ... ok
+test hub::commands::tests::multi_chunk_reply_keeps_order ... ok
+test hub::config::tests::missing_env_file_is_named ... ok
+test hub::config::tests::non_loopback_listeners_need_an_explicit_address ... ok
+test hub::commands::tests::large_reply_goes_as_one_document ... ok
+test hub::config::tests::paths_have_defaults_and_overrides ... ok
+test hub::config::tests::reads_a_complete_config ... ok
+test hub::commands::tests::too_long_switches_to_a_document_once ... ok
+test hub::ingress::tests::a_registered_agent_talks_both_ways ... ok
+test hub::ingress::tests::a_body_split_across_writes_is_read_whole ... ok
+test hub::ingress::tests::a_full_queue_answers_503_and_the_resend_is_delivered ... ok
+test hub::ingress::tests::a_repeated_post_is_delivered_once ... ok
+test hub::ingress::tests::a_wrong_secret_is_rejected_before_register ... ok
+test hub::commands::tests::bad_paths_get_a_notice_and_the_worker_keeps_going ... ok
+test hub::commands::tests::worker_handles_the_next_command_after_failed_delivery ... ok
+test hub::ingress::tests::another_version_is_rejected_as_such ... ok
+test hub::ingress::tests::dedup_forgets_by_age_and_by_count ... ok
+test hub::ingress::tests::listeners_bind_loopback_and_explicit_addresses ... ok
+test hub::ingress::tests::short_ids_cut_at_eight_chars ... ok
+test hub::ingress::tests::two_stops_of_one_prompt_are_two_events ... ok
+test hub::ingress::tests::an_early_401_survives_a_body_of_the_full_limit ... ok
+test hub::ingress::tests::an_overlong_line_closes_the_link ... ok
+test hub::ingress::tests::bad_requests_get_errors_and_no_event ... ok
+test hub::scheduler::tests::default_bucket_fits_twenty_per_minute ... ok
+test hub::scheduler::tests::failed_attempts_spend_tokens ... ok
+test hub::offset::tests::an_offset_older_than_a_day_is_ignored ... ok
+test hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order ... ok
+test hub::scheduler::tests::permission_never_overtakes_its_own_topic ... ok
+test hub::scheduler::tests::permission_overtakes_other_topics_only ... ok
+test hub::scheduler::tests::permission_prompt_jumps_the_queue ... ok
+test hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after ... ok
+test hub::scheduler::tests::repeated_edits_of_one_message_coalesce ... ok
+test hub::scheduler::tests::group_limit_and_topic_order_hold ... ok
+test hub::scheduler::tests::retried_permission_keeps_topic_order ... ok
+test hub::scheduler::tests::stops_after_outbox_is_dropped_and_queue_drained ... ok
+test hub::scheduler::tests::retry_after_pauses_everything_and_retries_once ... ok
+test hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens ... ok
+test hub::scheduler::tests::zero_retry_after_still_pauses_for_one_second ... ok
+test hub::sessions::tests::missing_root_is_reported ... ok
+test hub::config::tests::env_file_token_does_not_enter_process_environment ... ok
+test hub::offset::tests::saves_and_reloads_across_instances ... ok
+test hub::sessions::tests::newest_session_wins_without_a_prefix ... ok
+test hub::sessions::tests::session_id_shape ... ok
+test hub::offset::tests::garbage_or_leftover_temp_file_does_not_break_start ... ok
+test hub::sessions::tests::non_session_entries_are_skipped ... ok
+test hub::tests::missing_manage_topics_is_a_startup_error ... ok
+test hub::sessions::tests::prefix_selects_one_or_lists_candidates ... ok
+test hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped ... ok
+test hub::scheduler::tests::sustained_edits_do_not_starve_a_ready_message ... ok
+test hub::updates::tests::forum_service_messages_are_never_input ... ok
+test hook::tests::a_resent_post_reaches_the_hub_once ... ok
+test hub::updates::tests::next_offset_follows_the_batch_even_below_the_old_one ... ok
+test hub::updates::tests::nonempty_batch_without_update_ids_gets_a_short_backoff ... ok
+test hub::sessions::tests::subagent_transcripts_are_never_sessions ... ok
+test hub::ingress::tests::a_body_of_exactly_the_limit_is_accepted ... ok
+test hub::updates::tests::other_chats_and_senderless_messages_are_ignored ... ok
+test hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch ... ok
+test hub::commands::tests::ambiguous_prefix_lists_candidates ... ok
+test wire::tests::bad_hook_bodies_are_typed_errors ... ok
+test wire::tests::bad_lines_are_typed_errors ... ok
+test wire::tests::errors_and_debug_never_show_the_secret ... ok
+test wire::tests::an_endless_line_stops_at_the_limit ... ok
+test wire::tests::every_link_message_round_trips_as_one_versioned_line ... ok
+test wire::tests::hook_posts_round_trip_and_keep_their_event_id ... ok
+test wire::tests::kind_lists_match_the_enums ... ok
+test wire::tests::lines_are_read_one_at_a_time ... ok
+test wire::tests::secret_rules_and_comparison ... ok
+test wire::tests::unknown_fields_are_ignored ... ok
+test wire::tests::event_ids_are_fresh_hex ... ok
+test hub::updates::tests::offset_is_saved_before_the_batch_is_handled ... ok
+test hub::updates::tests::a_briefly_failing_offset_save_is_retried ... ok
+test hub::updates::tests::ids_restarted_below_the_saved_offset_are_handled_once ... ok
+test hub::updates::tests::failing_offset_saves_do_not_stop_polling ... ok
+test hub::commands::tests::replies_match_the_library_on_fixtures ... ok
+test hub::updates::tests::saved_offset_prevents_handling_an_update_twice_after_restart ... ok
+test hub::ingress::tests::one_connection_carries_at_most_one_event ... ok
+test agent::tests::a_rejected_secret_keeps_retrying_quietly ... ok
+test hook::tests::a_silent_hub_costs_at_most_the_timeout ... ok
+test agent::tests::the_agent_reconnects_and_registers_again_after_a_hub_restart ... ok
+test hook::tests::no_hub_is_an_error_within_the_timeout ... ok
+test hub::tests::a_slow_command_does_not_hold_up_polling ... ok
+test hub::ingress::tests::a_slow_request_is_closed_at_the_deadline_without_an_event ... ok
+test hub::api::tests::transport_errors_never_contain_the_token ... ok
+
+test result: ok. 101 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.04s
+
+     Running unittests src\main.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\cctg-22ab1ece8a8eda80.exe)
+
+running 1 test
+test tests::parses_all_subcommands ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\command_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\command_logs-323c00108aa7ac52.exe)
+
+running 1 test
+test command_logs_carry_no_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+
+     Running tests\ingress_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\ingress_logs-d2386a147f95d351.exe)
+
+running 1 test
+test ingress_logs_carry_no_secrets_or_contents ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\routing_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\routing_logs-f8a7be0c75d67dea.exe)
+
+running 1 test
+test routing_logs_never_contain_user_ids ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\stdout.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\stdout-e7fa70ece9ca6ebc.exe)
+
+running 3 tests
+test hub_without_config_fails_on_stderr_only ... ok
+test subcommands_do_not_write_to_stdout ... ok
+test malformed_env_file_does_not_echo_its_contents ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\transcript-fd18daa87666c345.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\parse_fixtures-03b8d614a417fff1.exe)
+
+running 10 tests
+test privacy_detectors_fire ... ok
+test string_content_fixture ... ok
+test sidechain_fixture ... ok
+test null_string_fields_fixture ... ok
+test plain_text_fixture ... ok
+test thinking_ai_title_fixture ... ok
+test final_answer_fixture_stop_reasons ... ok
+test tool_use_result_fixture ... ok
+test thinking_never_escapes ... ok
+test fixtures_have_no_private_data ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\parse_tolerance-7457103340f1661c.exe)
+
+running 15 tests
+test flags_are_tolerant ... ok
+test ai_title_rules ... ok
+test stop_reason_is_tolerant ... ok
+test known_block_with_missing_fields_keeps_defaults ... ok
+test irrelevant_wrong_typed_fields_do_not_drop_a_turn ... ok
+test unknown_record_and_bad_lines_keep_neighbours ... ok
+test unknown_and_malformed_blocks_drop_only_themselves ... ok
+test empty_and_ignored_only_inputs_give_nothing ... ok
+test unusable_message_shapes_are_skipped ... ok
+test both_content_shapes_for_both_roles ... ok
+test tool_result_shapes ... ok
+test crlf_matches_lf ... ok
+test truncated_last_line_keeps_earlier_turns ... ok
+test deep_nesting_is_skipped_without_panic ... ok
+test garbage_never_panics ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\purity.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\purity-0a3e95de11fb5407.exe)
+
+running 3 tests
+test library_has_only_pure_dependencies ... ok
+test every_source_file_is_scanned ... ok
+test library_source_has_no_io_or_panicking_calls ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\render.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\render-b17a2d1e0c80d574.exe)
+
+running 19 tests
+test multiline_prompt_keeps_its_text_verbatim ... ok
+test channel_attribute_may_contain_a_greater_than_sign ... ok
+test only_channel_meta_is_shown_and_user_tags_stay_visible ... ok
+test finished_exchanges_have_no_marker ... ok
+test slash_command_args_use_the_last_closing_tag ... ok
+test slash_command_without_args_is_still_a_prompt ... ok
+test last_prompts_counts_only_what_renders_as_a_prompt ... ok
+test service_records_are_hidden_in_brief_and_keep_the_state ... ok
+test null_stop_reason_falls_back_to_structure ... ok
+test full_truncates_long_results_safely ... ok
+test compact_summary_is_hidden_in_brief_and_keeps_the_state ... ok
+test slash_commands_are_one_line_prompts ... ok
+test unfinished_tail_is_marked_in_progress ... ok
+test brief_has_one_line_per_tool_call_and_no_io ... ok
+test last_prompts_keeps_the_last_n_exchanges ... ok
+test slices_render_independently ... ok
+test final_answer_fixture_brief_and_full ... ok
+test thinking_never_rendered ... ok
+test five_thousand_turns_render_in_linear_time ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests\split.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\split-91d9db22c439d970.exe)
+
+running 14 tests
+test short_text_is_one_chunk ... ok
+test emoji_on_the_boundary_is_never_cut ... ok
+test telegram_len_counts_utf16_units ... ok
+test crlf_is_not_split_at_the_limit ... ok
+test threshold_is_configurable ... ok
+test exact_limit_fits_and_one_more_splits ... ok
+test paragraph_separator_is_kept_exactly ... ok
+test flags_after_an_odd_prefix_are_not_split ... ok
+test blank_run_longer_than_the_limit_drops_only_whitespace ... ok
+test only_emoji_line_splits_on_char_boundaries ... ok
+test prefers_paragraph_then_line_then_space ... ok
+test oversized_grapheme_falls_back_to_char_boundaries ... ok
+test fifty_kb_block_is_deterministic_and_prefers_file ... ok
+test grapheme_clusters_on_the_boundary_stay_whole ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\subagent.rs (C:\Users\user\AppData\Local/Temp/cctg-task010-reviewer2-target\debug\deps\subagent-fbc7adb177770aef.exe)
+
+running 14 tests
+test meta_fixture_is_parsed ... ok
+test missing_or_broken_meta_falls_back_without_error ... ok
+test last_message_must_equal_the_final_answer ... ok
+test meta_description_and_type_win ... ok
+test report_replaces_the_transcript_final_text ... ok
+test background_agent_embeds_an_in_progress_body ... ok
+test embedded_header_is_the_block_header ... ok
+test agent_id_is_one_line_without_breaking_parent_lookup ... ok
+test duplicate_agent_ids_use_the_last_slice_entry ... ok
+test only_known_agents_get_a_body ... ok
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test body_source_order_is_fixed ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test sidechain_turns_never_reach_the_parent_top_level ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cctg
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests transcript
+
+running 1 test
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 83) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+

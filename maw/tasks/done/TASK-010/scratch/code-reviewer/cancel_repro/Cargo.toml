@@ -1,0 +1,11 @@
+[package]
+name = "cancel_repro"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cctg = { path = "C:/Users/user/dev/cctg/crates/cctg" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "sync", "time"] }

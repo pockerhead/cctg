@@ -1,0 +1,2 @@
+KILLED: R4 CR/LF/NUL in field value accepted (planner) ['test hub::ingress::tests::bad_requests_get_errors_and_no_event ... FAILED']
+KILLED: R5 lenient hook status line (planner parse_status) ['test hook::tests::status_lines ... FAILED', 'test hook::tests::a_truncated_or_foreign_status_line_is_not_success ... FAILED']

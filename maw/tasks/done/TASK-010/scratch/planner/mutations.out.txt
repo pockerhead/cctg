@@ -1,0 +1,10 @@
+KILLED: dedup disabled
+KILLED: dedup keyed by session
+KILLED: insert before try_send
+KILLED: hook body logged
+KILLED: secret compare skipped
+KILLED: no backoff
+KILLED: no re-register
+KILLED: TE allowed
+KILLED: non-loopback default
+KILLED: unknown kind as malformed

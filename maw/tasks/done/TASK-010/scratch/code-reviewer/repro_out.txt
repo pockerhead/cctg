@@ -1,0 +1,30 @@
+
+     Running tests\repro.rs (C:\Users\user\AppData\Local\Temp/cctg-task010-crev-target\debug\deps\repro-ba008265824a3766.exe)
+
+running 2 tests
+test agent_side_split_line_survives_outbox ... FAILED
+test hub_side_split_line_survives_outbound ... FAILED
+
+failures:
+
+---- agent_side_split_line_survives_outbox stdout ----
+
+thread 'agent_side_split_line_survives_outbox' (34108) panicked at tests\repro.rs:79:5:
+assertion `left == right` failed: inbound lost
+  left: None
+ right: Some(Message(Inbound { content: "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", meta: {} }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- hub_side_split_line_survives_outbound stdout ----
+
+thread 'hub_side_split_line_survives_outbound' (7528) panicked at tests\repro.rs:47:18:
+reply lost: Err(Elapsed(()))
+
+
+failures:
+    agent_side_split_line_survives_outbox
+    hub_side_split_line_survives_outbound
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.13s
+
+error: test failed, to rerun pass `--test repro`
