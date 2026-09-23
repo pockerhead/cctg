@@ -1,0 +1,354 @@
+//! `cctg hub`: Telegram side of the bridge.
+
+pub mod api;
+pub mod commands;
+pub mod config;
+pub mod ingress;
+pub mod offset;
+pub mod registry;
+pub mod scheduler;
+pub mod sessions;
+pub mod slots;
+#[cfg(test)]
+pub(crate) mod testdir;
+pub mod updates;
+
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Context;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use api::{BotApi, ChatMember};
+use config::{AGENT_LISTEN_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR};
+use offset::OffsetStore;
+use registry::{Icons, RegistryStore};
+use scheduler::{BucketConfig, Scheduler};
+use sessions::{ProjectsDir, SlotLocator};
+use slots::{Control, Slots};
+use updates::{Inbound, Routed, ServiceKind};
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RightsError {
+    #[error(
+        "the bot is not an administrator of the configured chat (status: {0}); \
+         promote it and grant the \"Manage Topics\" right"
+    )]
+    NotAdmin(String),
+    #[error(
+        "the bot is an administrator without the \"Manage Topics\" right \
+         (can_manage_topics); grant it in the group admin settings"
+    )]
+    NoManageTopics,
+}
+
+/// Startup check: the hub cannot create topics without `can_manage_topics`.
+pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
+    match member.status.as_str() {
+        "creator" => Ok(()),
+        "administrator" if member.can_manage_topics => Ok(()),
+        "administrator" => Err(RightsError::NoManageTopics),
+        other => Err(RightsError::NotAdmin(other.to_owned())),
+    }
+}
+
+/// The poll callback: commands go to the command worker's queue and topic
+/// edit notices to the slot actor; nothing here waits, so a slow command
+/// never holds up polling.
+fn route_inbound<'a>(
+    commands: &'a mpsc::UnboundedSender<Inbound>,
+    control: &'a mpsc::UnboundedSender<Control>,
+) -> impl FnMut(Routed) + 'a {
+    move |routed| match routed {
+        Routed::Input(input) if commands::is_command(&input) => {
+            if commands.send(input).is_err() {
+                warn!("command worker stopped; command dropped");
+            }
+        }
+        Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
+        Routed::Callback(_) => info!("inbound button press"),
+        Routed::Service(service) if service.kind == ServiceKind::TopicEdited => {
+            let edited = Control::TopicEdited {
+                thread_id: service.thread_id,
+                message_id: service.message_id,
+            };
+            if control.send(edited).is_err() {
+                warn!("slot actor stopped; service message kept");
+            }
+        }
+        Routed::Service(_) | Routed::Ignored(_) => {}
+    }
+}
+
+/// Default icons that Telegram does not offer are dropped with a warning; a
+/// failed lookup keeps the defaults.
+async fn checked_icons(api: &BotApi) -> Icons {
+    let mut icons = Icons::default();
+    match api.get_forum_topic_icon_stickers().await {
+        Ok(stickers) => {
+            let offered: HashSet<String> = stickers
+                .into_iter()
+                .filter_map(|sticker| sticker.custom_emoji_id)
+                .collect();
+            for state in icons.keep_valid(&offered) {
+                warn!(
+                    state,
+                    "topic icon is not offered by Telegram; that state keeps the current icon"
+                );
+            }
+        }
+        Err(error) => warn!(%error, "getForumTopicIconStickers failed; using the default icons"),
+    }
+    icons
+}
+
+pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+    let config = Config::load(env_file)?;
+    let projects_dir = config.projects_dir.clone().with_context(|| {
+        format!("no home directory found; set {PROJECTS_VAR} to the Claude Code projects directory")
+    })?;
+    let offsets = OffsetStore::open(&config.state_dir)
+        .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
+    let registry_store = RegistryStore::open(&config.state_dir)
+        .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
+    let registry = registry_store
+        .load()
+        .with_context(|| format!("cannot load the slot registry from {STATE_VAR}"))?;
+    let secret = config.hub_secret.clone().with_context(|| {
+        format!("{SECRET_VAR} is not set; agents and hooks authenticate with it (16+ visible ASCII characters)")
+    })?;
+    let agent_listener = ingress::bind(config.agent_listen)
+        .await
+        .with_context(|| format!("cannot listen for agents; check {AGENT_LISTEN_VAR}"))?;
+    let hook_listener = ingress::bind(config.hook_listen)
+        .await
+        .with_context(|| format!("cannot listen for hooks; check {HOOK_LISTEN_VAR}"))?;
+    let api = Arc::new(BotApi::new(&config.token, config.chat_id)?);
+
+    let me = api
+        .get_me()
+        .await
+        .context("getMe failed; check CCTG_BOT_TOKEN")?;
+    let member = api.get_chat_member(me.id).await.context(
+        "getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group",
+    )?;
+    check_topic_rights(&member)?;
+    let can_delete = member.status == "creator" || member.can_delete_messages;
+    if !can_delete {
+        warn!("the bot lacks can_delete_messages; forum service messages will stay visible");
+    }
+    let icons = checked_icons(&api).await;
+    info!(
+        bot = me.username.as_deref().unwrap_or("?"),
+        "hub started, polling"
+    );
+
+    let (scheduler, outbox) = Scheduler::new(api.clone(), BucketConfig::default());
+    tokio::spawn(scheduler.run());
+    let options = slots::Options {
+        icons,
+        can_delete,
+        ..slots::Options::default()
+    };
+    let (slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    tokio::spawn(commands::serve(
+        commands_rx,
+        outbox,
+        Arc::new(SlotLocator::new(view, ProjectsDir::new(projects_dir))),
+        me.username.clone(),
+    ));
+    let (agents_tx, agents_rx) = mpsc::channel(256);
+    let (hooks_tx, hooks_rx) = mpsc::channel(256);
+    tokio::spawn(ingress::serve_agents(
+        agent_listener,
+        secret.clone(),
+        agents_tx,
+    ));
+    tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
+
+    updates::poll(
+        api.as_ref(),
+        &config.allowlist,
+        &offsets,
+        route_inbound(&commands_tx, &control_tx),
+    )
+    .await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tokio::sync::Notify;
+
+    use super::*;
+    use api::{ApiError, Message};
+    use scheduler::{Delivery, Op, Outcome, Transport};
+    use sessions::{LocateError, Located, TranscriptLocator};
+    use testdir::TempDir;
+    use updates::UpdateSource;
+
+    const CHAT: i64 = -1000000000001;
+    const ALLOWED: i64 = 1001;
+    const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
+
+    /// One command per call, then an idle long poll; counts calls.
+    struct Batches {
+        calls: AtomicUsize,
+        polled_twice: Notify,
+    }
+
+    impl UpdateSource for Batches {
+        fn chat_id(&self) -> i64 {
+            CHAT
+        }
+
+        async fn get_updates(&self, _: Option<i64>, _: Duration) -> Result<Vec<Value>, ApiError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = match call {
+                0 => "/brief",
+                1 => "/full",
+                _ => {
+                    self.polled_twice.notify_one();
+                    return std::future::pending().await;
+                }
+            };
+            Ok(vec![json!({ "update_id": call + 1, "message": {
+                "message_id": call + 10, "date": 1, "text": text,
+                "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
+                "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
+            }})])
+        }
+    }
+
+    /// Blocks each `locate` until the test lets it through.
+    struct Gated {
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+        file: std::path::PathBuf,
+    }
+
+    impl TranscriptLocator for Gated {
+        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
+            let _ = self.gate.lock().unwrap().recv();
+            Ok(Located {
+                session_id: SESSION.to_owned(),
+                project: "C--proj".to_owned(),
+                path: self.file.clone(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Sent(Mutex<Vec<String>>);
+
+    impl Transport for Sent {
+        async fn execute(&self, op: &Op) -> Delivery {
+            if let Op::Send { text, .. } = op {
+                self.0.lock().unwrap().push(text.clone());
+            }
+            Ok(Outcome::Sent(Message::default()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_command_does_not_hold_up_polling() {
+        let dir = TempDir::new("hub-slow-command");
+        let file = dir.path().join(format!("{SESSION}.jsonl"));
+        std::fs::write(
+            &file,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        let sent = Arc::new(Sent::default());
+        let (scheduler, outbox) = Scheduler::new(sent.clone(), BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let locator = Arc::new(Gated {
+            gate: Mutex::new(gate),
+            file: file.clone(),
+        });
+        tokio::spawn(commands::serve(commands_rx, outbox, locator, None));
+
+        let source = Arc::new(Batches {
+            calls: AtomicUsize::new(0),
+            polled_twice: Notify::new(),
+        });
+        let store = Arc::new(OffsetStore::open(dir.path()).unwrap());
+        let polling = {
+            let (source, store) = (source.clone(), store.clone());
+            tokio::spawn(async move {
+                let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
+                let (control_tx, _control_rx) = mpsc::unbounded_channel();
+                updates::poll(
+                    source.as_ref(),
+                    &allowlist,
+                    &store,
+                    route_inbound(&commands_tx, &control_tx),
+                )
+                .await;
+            })
+        };
+
+        // The first command is stuck in `locate`, yet both batches were
+        // fetched and the offset saved past them.
+        tokio::time::timeout(Duration::from_secs(10), source.polled_twice.notified())
+            .await
+            .expect("poll kept going while a command was stuck");
+        assert_eq!(store.load(), Some(3));
+        assert!(sent.0.lock().unwrap().is_empty());
+
+        open_gate.send(()).unwrap();
+        open_gate.send(()).unwrap();
+        let answered = async {
+            while sent.0.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), answered)
+            .await
+            .expect("both commands answered");
+        let turns = transcript::parse(&std::fs::read_to_string(&file).unwrap());
+        let want = [
+            transcript::render_brief(&turns),
+            transcript::render_full(&turns),
+        ];
+        assert_eq!(*sent.0.lock().unwrap(), want);
+        polling.abort();
+    }
+
+    fn member(status: &str, topics: bool) -> ChatMember {
+        ChatMember {
+            status: status.to_owned(),
+            can_manage_topics: topics,
+            can_delete_messages: true,
+        }
+    }
+
+    #[test]
+    fn missing_manage_topics_is_a_startup_error() {
+        assert_eq!(check_topic_rights(&member("administrator", true)), Ok(()));
+        assert_eq!(check_topic_rights(&member("creator", false)), Ok(()));
+        assert_eq!(
+            check_topic_rights(&member("administrator", false)),
+            Err(RightsError::NoManageTopics)
+        );
+        for status in ["member", "restricted", "left", "kicked", ""] {
+            assert_eq!(
+                check_topic_rights(&member(status, false)),
+                Err(RightsError::NotAdmin(status.to_owned()))
+            );
+        }
+        let message = RightsError::NoManageTopics.to_string();
+        assert!(message.contains("can_manage_topics"));
+    }
+}

@@ -105,6 +105,7 @@ mod tests {
             "/w/s.jsonl".into(),
             HookEvent::SessionEnd {
                 reason: Some("other".into()),
+                claude_pid: None,
             },
         )
     }

@@ -1,0 +1,12 @@
+M1 no case-fold: KILLED
+M2 every slot free: KILLED
+M3 invalid ignores thread: KILLED
+M4 nested gets own slot: KILLED
+M5 separator for first session: SURVIVED
+M6 warn every delete failure: KILLED
+M7 not_modified is failure: KILLED
+M8 no grace: KILLED
+M9 delete in any topic: KILLED
+M10 title never read: KILLED
+M11 no pending agent bind: KILLED
+M12 title cut ignores ordinal: KILLED

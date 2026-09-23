@@ -23,4 +23,8 @@ Domains: hub
 - [ ] прерванное сохранение оставляет предыдущий валидный `registry.json`; ошибка `TOPIC_ID_INVALID` очищает только конкретную устаревшую привязку и создаёт ровно одну замену
 - [ ] служебное `forum_topic_edited` после смены иконки удаляется; отсутствие права `can_delete_messages` логируется один раз и не ломает работу
 - [ ] сессия, зарегистрированная только хуком, видна как «нет канала», а подключившийся позже агент привязывается к тому же слоту без создания второй темы
+- [ ] ключ папки слота это нормализованный идентификатор, а не сырой `cwd`: одна чистая функция `folder_key(cwd)` снимает префикс `\\?\`, приводит разделители к `/`, убирает хвостовой разделитель и для Windows-путей (буква диска или UNC) делает case-fold; варианты `C:\Work\Project`, `c:/work/project/`, `\\?\C:\Work\Project` дают один слот и одну тему. Отображаемое имя папки в заголовке берётся из исходного написания. Разрешение symlink/junction и 8.3 коротких имён делает сторона устройства (TASK-012), hub на чужом устройстве путь не канонизирует
 - [ ] Existing tests pass
+
+### Resolved questions
+- 2026-09-23 (premise-challenge PREMISE SUSPECT, resolved by the orchestrator under full autonomy): the wire keeps the raw `cwd`, and on Windows one folder is reported in several spellings (case, separators, `\\?\` prefix), so `(device, folder, ordinal)` on raw strings would create duplicate topics. Amended with a pure lexical `folder_key` on the hub; filesystem canonicalization (symlinks, junctions, 8.3 names) belongs to the reporting device in TASK-012 because the hub cannot resolve paths of another machine.

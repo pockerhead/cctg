@@ -1,0 +1,4 @@
+kind Nested { parent: Some("aaaaaaaa-0000-4000-8000-000000000001") } slot Some(SlotId(0)) was Some(SlotId(1))
+crev_nested_resume_of_other_toplevel_loses_its_slot_forever: left Some(SlotId(0)) right Some(SlotId(1)) FAILED
+B ordinal 2 C ordinal 1
+crev_clear_in_real_hook_order_jumps_topic: clear jumped from #2 to #1 FAILED

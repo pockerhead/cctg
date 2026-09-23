@@ -17,6 +17,7 @@
 - A freshly started session that has not had a single user turn may accept channel notifications without starting a turn (one observation, TASK-004 I3). Buffer on the hub side until the agent confirms delivery.
 - Messages reach Claude only while the session is alive; the hub buffers everything addressed to a dead session.
 - The channel server does not know its own session id; it reads env `CLAUDE_CODE_SESSION_ID` (inherited from the claude process) and the hub matches it to the hook's `session_id`.
+- `cctg agent` reports `Register.cwd` canonicalized exactly like the hook (shared helper: `std::fs::canonicalize` with fallback, no `\\?\`) and the same host name, so the agent and hook of one session land in one slot (TASK-011).
 - stdout is reserved for JSON-RPC only. All logging goes to stderr or a file; one stray print on stdout breaks the transport.
 
 ## Risk lessons

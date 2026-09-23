@@ -23,4 +23,7 @@ Domains: hooks
 - [ ] snippet настроек регистрирует все события и не содержит секретов и машинно-специфичных путей
 - [ ] отчёт субагента захватывается matcher-ом на `SubagentHandback` (`tool_input.message`), а `SubagentStop` передаёт `agent_transcript_path`, `agent_type`, `agent_id`, `last_assistant_message`; события с пустым `agent_type` или с `agent_type`, равным имени `--agent` сессии без соответствующего SubagentStart, отбрасываются как внутренние
 - [ ] `source` читается только из `SessionStart` (для остальных событий он не документирован) и его отсутствие не считается ошибкой
+- [ ] хук отправляет в hub `cwd`, канонизированный на своём устройстве (`std::fs::canonicalize` с fallback на исходный путь при ошибке, без префикса `\?\`), чтобы symlink/junction и 8.3 короткие имена одной папки давали один слот (решение TASK-011: лексическую нормализацию делает hub, файловую — устройство)
+- [ ] `SessionStart.parent_claude_pid` заполняется только когда обход дерева процессов нашёл claude-предка, отличного от собственного claude этой сессии (hub после TASK-011 любое `Some` считает вложенностью); top-level сессия шлёт `None`
+- [ ] `SessionEnd` несёт `claude_pid` собственного claude-процесса сессии (тот же, что в SessionStart; брать из обхода дерева процессов, т.к. env `CLAUDE_PID` не гарантирован): hub после TASK-011 игнорирует SessionEnd с чужим pid, это защищает живую сессию от конца вложенного `--resume`
 - [ ] Existing tests pass

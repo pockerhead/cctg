@@ -1,0 +1,454 @@
+{
+ "ok": true,
+ "count": 112,
+ "stickers": [
+  {
+   "emoji": "📰",
+   "custom_emoji_id": "5434144690511290129"
+  },
+  {
+   "emoji": "💡",
+   "custom_emoji_id": "5312536423851630001"
+  },
+  {
+   "emoji": "⚡️",
+   "custom_emoji_id": "5312016608254762256"
+  },
+  {
+   "emoji": "🎙",
+   "custom_emoji_id": "5377544228505134960"
+  },
+  {
+   "emoji": "🔝",
+   "custom_emoji_id": "5418085807791545980"
+  },
+  {
+   "emoji": "🗣",
+   "custom_emoji_id": "5370870893004203704"
+  },
+  {
+   "emoji": "🆒",
+   "custom_emoji_id": "5420216386448270341"
+  },
+  {
+   "emoji": "❗️",
+   "custom_emoji_id": "5379748062124056162"
+  },
+  {
+   "emoji": "📝",
+   "custom_emoji_id": "5373251851074415873"
+  },
+  {
+   "emoji": "📆",
+   "custom_emoji_id": "5433614043006903194"
+  },
+  {
+   "emoji": "📁",
+   "custom_emoji_id": "5357315181649076022"
+  },
+  {
+   "emoji": "🔎",
+   "custom_emoji_id": "5309965701241379366"
+  },
+  {
+   "emoji": "📣",
+   "custom_emoji_id": "5309984423003823246"
+  },
+  {
+   "emoji": "🔥",
+   "custom_emoji_id": "5312241539987020022"
+  },
+  {
+   "emoji": "❤️",
+   "custom_emoji_id": "5312138559556164615"
+  },
+  {
+   "emoji": "❓",
+   "custom_emoji_id": "5377316857231450742"
+  },
+  {
+   "emoji": "📈",
+   "custom_emoji_id": "5350305691942788490"
+  },
+  {
+   "emoji": "📉",
+   "custom_emoji_id": "5350713563512052787"
+  },
+  {
+   "emoji": "💎",
+   "custom_emoji_id": "5309958691854754293"
+  },
+  {
+   "emoji": "💰",
+   "custom_emoji_id": "5350452584119279096"
+  },
+  {
+   "emoji": "💸",
+   "custom_emoji_id": "5309929258443874898"
+  },
+  {
+   "emoji": "🪙",
+   "custom_emoji_id": "5377690785674175481"
+  },
+  {
+   "emoji": "💱",
+   "custom_emoji_id": "5310107765874632305"
+  },
+  {
+   "emoji": "⁉️",
+   "custom_emoji_id": "5377438129928020693"
+  },
+  {
+   "emoji": "🎮",
+   "custom_emoji_id": "5309950797704865693"
+  },
+  {
+   "emoji": "💻",
+   "custom_emoji_id": "5350554349074391003"
+  },
+  {
+   "emoji": "📱",
+   "custom_emoji_id": "5409357944619802453"
+  },
+  {
+   "emoji": "🚗",
+   "custom_emoji_id": "5312322066328853156"
+  },
+  {
+   "emoji": "🏠",
+   "custom_emoji_id": "5312486108309757006"
+  },
+  {
+   "emoji": "💘",
+   "custom_emoji_id": "5310029292527164639"
+  },
+  {
+   "emoji": "🎉",
+   "custom_emoji_id": "5310228579009699834"
+  },
+  {
+   "emoji": "‼️",
+   "custom_emoji_id": "5377498341074542641"
+  },
+  {
+   "emoji": "🏆",
+   "custom_emoji_id": "5312315739842026755"
+  },
+  {
+   "emoji": "🏁",
+   "custom_emoji_id": "5408906741125490282"
+  },
+  {
+   "emoji": "🎬",
+   "custom_emoji_id": "5368653135101310687"
+  },
+  {
+   "emoji": "🎵",
+   "custom_emoji_id": "5310045076531978942"
+  },
+  {
+   "emoji": "🔞",
+   "custom_emoji_id": "5420331611830886484"
+  },
+  {
+   "emoji": "📚",
+   "custom_emoji_id": "5350481781306958339"
+  },
+  {
+   "emoji": "👑",
+   "custom_emoji_id": "5357107601584693888"
+  },
+  {
+   "emoji": "⚽️",
+   "custom_emoji_id": "5375159220280762629"
+  },
+  {
+   "emoji": "🏀",
+   "custom_emoji_id": "5384327463629233871"
+  },
+  {
+   "emoji": "📺",
+   "custom_emoji_id": "5350513667144163474"
+  },
+  {
+   "emoji": "👀",
+   "custom_emoji_id": "5357121491508928442"
+  },
+  {
+   "emoji": "🫦",
+   "custom_emoji_id": "5357185426392096577"
+  },
+  {
+   "emoji": "🍓",
+   "custom_emoji_id": "5310157398516703416"
+  },
+  {
+   "emoji": "💄",
+   "custom_emoji_id": "5310262535021142850"
+  },
+  {
+   "emoji": "👠",
+   "custom_emoji_id": "5368741306484925109"
+  },
+  {
+   "emoji": "✈️",
+   "custom_emoji_id": "5348436127038579546"
+  },
+  {
+   "emoji": "🧳",
+   "custom_emoji_id": "5357120306097956843"
+  },
+  {
+   "emoji": "🏖",
+   "custom_emoji_id": "5310303848311562896"
+  },
+  {
+   "emoji": "⛅️",
+   "custom_emoji_id": "5350424168615649565"
+  },
+  {
+   "emoji": "🦄",
+   "custom_emoji_id": "5413625003218313783"
+  },
+  {
+   "emoji": "🛍",
+   "custom_emoji_id": "5350699789551935589"
+  },
+  {
+   "emoji": "👜",
+   "custom_emoji_id": "5377478880577724584"
+  },
+  {
+   "emoji": "🛒",
+   "custom_emoji_id": "5431492767249342908"
+  },
+  {
+   "emoji": "🚂",
+   "custom_emoji_id": "5350497316203668441"
+  },
+  {
+   "emoji": "🛥",
+   "custom_emoji_id": "5350422527938141909"
+  },
+  {
+   "emoji": "🏔",
+   "custom_emoji_id": "5418196338774907917"
+  },
+  {
+   "emoji": "🏕",
+   "custom_emoji_id": "5350648297189023928"
+  },
+  {
+   "emoji": "🤖",
+   "custom_emoji_id": "5309832892262654231"
+  },
+  {
+   "emoji": "🪩",
+   "custom_emoji_id": "5350751634102166060"
+  },
+  {
+   "emoji": "🎟",
+   "custom_emoji_id": "5377624166436445368"
+  },
+  {
+   "emoji": "🏴‍☠️",
+   "custom_emoji_id": "5386395194029515402"
+  },
+  {
+   "emoji": "🗳",
+   "custom_emoji_id": "5350387571199319521"
+  },
+  {
+   "emoji": "🎓",
+   "custom_emoji_id": "5357419403325481346"
+  },
+  {
+   "emoji": "🔭",
+   "custom_emoji_id": "5368585403467048206"
+  },
+  {
+   "emoji": "🔬",
+   "custom_emoji_id": "5377580546748588396"
+  },
+  {
+   "emoji": "🎶",
+   "custom_emoji_id": "5377317729109811382"
+  },
+  {
+   "emoji": "🎤",
+   "custom_emoji_id": "5382003830487523366"
+  },
+  {
+   "emoji": "🕺",
+   "custom_emoji_id": "5357298525765902091"
+  },
+  {
+   "emoji": "💃",
+   "custom_emoji_id": "5357370526597653193"
+  },
+  {
+   "emoji": "🪖",
+   "custom_emoji_id": "5357188789351490453"
+  },
+  {
+   "emoji": "💼",
+   "custom_emoji_id": "5348227245599105972"
+  },
+  {
+   "emoji": "🧪",
+   "custom_emoji_id": "5411138633765757782"
+  },
+  {
+   "emoji": "👨‍👩‍👧‍👦",
+   "custom_emoji_id": "5386435923204382258"
+  },
+  {
+   "emoji": "👶",
+   "custom_emoji_id": "5377675010259297233"
+  },
+  {
+   "emoji": "🤰",
+   "custom_emoji_id": "5386609083400856174"
+  },
+  {
+   "emoji": "💅",
+   "custom_emoji_id": "5368808634392257474"
+  },
+  {
+   "emoji": "🏛",
+   "custom_emoji_id": "5350548830041415279"
+  },
+  {
+   "emoji": "🧮",
+   "custom_emoji_id": "5355127101970194557"
+  },
+  {
+   "emoji": "🖨",
+   "custom_emoji_id": "5386379624773066504"
+  },
+  {
+   "emoji": "👮‍♂️",
+   "custom_emoji_id": "5377494501373780436"
+  },
+  {
+   "emoji": "🩺",
+   "custom_emoji_id": "5350307998340226571"
+  },
+  {
+   "emoji": "💊",
+   "custom_emoji_id": "5310094636159607472"
+  },
+  {
+   "emoji": "💉",
+   "custom_emoji_id": "5310139157790596888"
+  },
+  {
+   "emoji": "🧼",
+   "custom_emoji_id": "5377468357907849200"
+  },
+  {
+   "emoji": "🪪",
+   "custom_emoji_id": "5418115271267197333"
+  },
+  {
+   "emoji": "🛃",
+   "custom_emoji_id": "5372819184658949787"
+  },
+  {
+   "emoji": "🍽",
+   "custom_emoji_id": "5350344462612570293"
+  },
+  {
+   "emoji": "🐟",
+   "custom_emoji_id": "5384574037701696503"
+  },
+  {
+   "emoji": "🎨",
+   "custom_emoji_id": "5310039132297242441"
+  },
+  {
+   "emoji": "🎭",
+   "custom_emoji_id": "5350658016700013471"
+  },
+  {
+   "emoji": "🎩",
+   "custom_emoji_id": "5357504778685392027"
+  },
+  {
+   "emoji": "🔮",
+   "custom_emoji_id": "5350367161514732241"
+  },
+  {
+   "emoji": "🍹",
+   "custom_emoji_id": "5350520238444126134"
+  },
+  {
+   "emoji": "🎂",
+   "custom_emoji_id": "5310132165583840589"
+  },
+  {
+   "emoji": "☕️",
+   "custom_emoji_id": "5350392020785437399"
+  },
+  {
+   "emoji": "🍣",
+   "custom_emoji_id": "5350406176997646350"
+  },
+  {
+   "emoji": "🍔",
+   "custom_emoji_id": "5350403544182694064"
+  },
+  {
+   "emoji": "🍕",
+   "custom_emoji_id": "5350444672789519765"
+  },
+  {
+   "emoji": "🦠",
+   "custom_emoji_id": "5312424913615723286"
+  },
+  {
+   "emoji": "💬",
+   "custom_emoji_id": "5417915203100613993"
+  },
+  {
+   "emoji": "🎄",
+   "custom_emoji_id": "5312054580060625569"
+  },
+  {
+   "emoji": "🎃",
+   "custom_emoji_id": "5309744892677727325"
+  },
+  {
+   "emoji": "✍️",
+   "custom_emoji_id": "5238156910363950406"
+  },
+  {
+   "emoji": "⭐️",
+   "custom_emoji_id": "5235579393115438657"
+  },
+  {
+   "emoji": "✅",
+   "custom_emoji_id": "5237699328843200968"
+  },
+  {
+   "emoji": "🎖",
+   "custom_emoji_id": "5238027455754680851"
+  },
+  {
+   "emoji": "🤡",
+   "custom_emoji_id": "5238234236955148254"
+  },
+  {
+   "emoji": "🧠",
+   "custom_emoji_id": "5237889595894414384"
+  },
+  {
+   "emoji": "🦮",
+   "custom_emoji_id": "5237999392438371490"
+  },
+  {
+   "emoji": "🐈",
+   "custom_emoji_id": "5235912661102773458"
+  }
+ ]
+}

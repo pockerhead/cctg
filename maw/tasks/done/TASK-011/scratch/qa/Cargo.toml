@@ -1,0 +1,20 @@
+[package]
+name = "qa011"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+cctg = { path = "../../../../../../crates/cctg" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde_json = "1"
+transcript = { path = "../../../../../../crates/transcript" }
+
+[profile.dev]
+debug = "line-tables-only"

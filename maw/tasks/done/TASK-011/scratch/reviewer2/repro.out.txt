@@ -1,0 +1,9 @@
+test hub::slots::tests::a_gone_topic_during_a_session_change_is_replaced_once ... FAILED
+test hub::slots::tests::unknown_sessions_make_no_topics_until_their_session_start ... FAILED
+test hub::slots::tests::a_stalled_telegram_never_stalls_ingress ... FAILED
+test hub::slots::tests::a_failed_separator_is_sent_again ... FAILED
+thread 'hub::slots::tests::a_gone_topic_during_a_session_change_is_replaced_once' (37508) panicked at crates\cctg\src\hub\slots.rs:1144:9:
+thread 'hub::slots::tests::unknown_sessions_make_no_topics_until_their_session_start' (14888) panicked at crates\cctg\src\hub\slots.rs:1037:9:
+thread 'hub::slots::tests::a_stalled_telegram_never_stalls_ingress' (27284) panicked at crates\cctg\src\hub\slots.rs:1067:14:
+thread 'hub::slots::tests::a_failed_separator_is_sent_again' (8116) panicked at crates\cctg\src\hub\slots.rs:1111:14:
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 138 filtered out; finished in 10.12s
