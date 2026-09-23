@@ -37,7 +37,7 @@ const SERVICE_PREFIXES: [&str; 7] = [
 
 /// A visible user text: a prompt (typed or from the channel) or a service record.
 enum UserText<'a> {
-    Prompt(&'a str),
+    Prompt(Cow<'a, str>),
     Service(&'a str),
 }
 
@@ -96,7 +96,7 @@ pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (Str
                 (Role::User, Block::Text(text)) => {
                     let (shown, is_prompt) = match user_text(turn, text) {
                         Some(UserText::Prompt(prompt)) => (prompt, true),
-                        Some(UserText::Service(service)) if full => (service, false),
+                        Some(UserText::Service(service)) if full => (Cow::Borrowed(service), false),
                         _ => continue,
                     };
                     if !out.is_empty() {
@@ -173,15 +173,40 @@ fn user_text<'a>(turn: &Turn, text: &'a str) -> Option<UserText<'a>> {
         return None;
     }
     if !turn.is_meta {
+        if let Some(command) = slash_command(text) {
+            return Some(UserText::Prompt(Cow::Owned(command)));
+        }
         if SERVICE_PREFIXES
             .iter()
             .any(|prefix| text.starts_with(prefix))
         {
             return Some(UserText::Service(text));
         }
-        return Some(UserText::Prompt(text));
+        return Some(UserText::Prompt(Cow::Borrowed(text)));
     }
-    channel_body(text).map(UserText::Prompt)
+    channel_body(text).map(|body| UserText::Prompt(Cow::Borrowed(body)))
+}
+
+fn slash_command(text: &str) -> Option<String> {
+    if !text.starts_with("<command-name>") && !text.starts_with("<command-message>") {
+        return None;
+    }
+    let (_, rest) = text.split_once("<command-name>")?;
+    let (name, _) = rest.split_once("</command-name>")?;
+    let args = match text.split_once("<command-args>") {
+        Some((_, rest)) => rest.rsplit_once("</command-args>")?.0,
+        None => "",
+    };
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    let args = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if args.is_empty() {
+        name
+    } else {
+        format!("{name} {args}")
+    })
 }
 
 fn channel_body(text: &str) -> Option<&str> {

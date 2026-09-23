@@ -1,0 +1,1 @@
+- 2026-09-23: QA low bug (opening `<command-args>` without a closing tag hides the command) not fixed: no such record in 632 real files. Local command at the tail shows «в работе…» by spec; noted in domains/transcript.md for TASK-016.
