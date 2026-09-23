@@ -13,7 +13,8 @@ mod split;
 mod subagent;
 
 pub use render::{
-    render_brief, render_brief_with_subagents, render_full, render_full_with_subagents,
+    last_prompts, render_brief, render_brief_with_subagents, render_full,
+    render_full_with_subagents,
 };
 pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
 pub use subagent::{Subagent, SubagentBody, SubagentInput, SubagentMeta, parse_subagent_meta};

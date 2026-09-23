@@ -1,20 +1,28 @@
 //! `cctg hub`: Telegram side of the bridge.
 
 pub mod api;
+pub mod commands;
 pub mod config;
+pub mod offset;
 pub mod scheduler;
+pub mod sessions;
+#[cfg(test)]
+pub(crate) mod testdir;
 pub mod updates;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use api::{BotApi, ChatMember};
-use config::Config;
+use config::{Config, PROJECTS_VAR, STATE_VAR};
+use offset::OffsetStore;
 use scheduler::{BucketConfig, Scheduler};
-use updates::Routed;
+use sessions::ProjectsDir;
+use updates::{Inbound, Routed};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RightsError {
@@ -40,8 +48,28 @@ pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
     }
 }
 
+/// The poll callback: commands go to the command worker's queue, nothing here
+/// waits, so a slow command never holds up polling.
+fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed) + '_ {
+    move |routed| match routed {
+        Routed::Input(input) if commands::is_command(&input) => {
+            if commands.send(input).is_err() {
+                warn!("command worker stopped; command dropped");
+            }
+        }
+        Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
+        Routed::Callback(_) => info!("inbound button press"),
+        Routed::Service(_) | Routed::Ignored(_) => {}
+    }
+}
+
 pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     let config = Config::load(env_file)?;
+    let projects_dir = config.projects_dir.clone().with_context(|| {
+        format!("no home directory found; set {PROJECTS_VAR} to the Claude Code projects directory")
+    })?;
+    let offsets = OffsetStore::open(&config.state_dir)
+        .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
     let api = Arc::new(BotApi::new(&config.token, config.chat_id)?);
 
     let me = api
@@ -62,23 +90,167 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
 
     let (scheduler, outbox) = Scheduler::new(api.clone(), BucketConfig::default());
     tokio::spawn(scheduler.run());
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    tokio::spawn(commands::serve(
+        commands_rx,
+        outbox,
+        Arc::new(ProjectsDir::new(projects_dir)),
+        me.username.clone(),
+    ));
 
-    updates::poll(&api, &config.allowlist, |routed| {
-        // Handlers arrive with TASK-009/011; the outbox is kept alive for them.
-        let _ = &outbox;
-        match routed {
-            Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
-            Routed::Callback(_) => info!("inbound button press"),
-            Routed::Service(_) | Routed::Ignored(_) => {}
-        }
-    })
+    updates::poll(
+        api.as_ref(),
+        &config.allowlist,
+        &offsets,
+        route_inbound(&commands_tx),
+    )
     .await;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tokio::sync::Notify;
+
     use super::*;
+    use api::{ApiError, Message};
+    use scheduler::{Delivery, Op, Outcome, Transport};
+    use sessions::{LocateError, Located, TranscriptLocator};
+    use testdir::TempDir;
+    use updates::UpdateSource;
+
+    const CHAT: i64 = -1000000000001;
+    const ALLOWED: i64 = 1001;
+    const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
+
+    /// One command per call, then an idle long poll; counts calls.
+    struct Batches {
+        calls: AtomicUsize,
+        polled_twice: Notify,
+    }
+
+    impl UpdateSource for Batches {
+        fn chat_id(&self) -> i64 {
+            CHAT
+        }
+
+        async fn get_updates(&self, _: Option<i64>, _: Duration) -> Result<Vec<Value>, ApiError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = match call {
+                0 => "/brief",
+                1 => "/full",
+                _ => {
+                    self.polled_twice.notify_one();
+                    return std::future::pending().await;
+                }
+            };
+            Ok(vec![json!({ "update_id": call + 1, "message": {
+                "message_id": call + 10, "date": 1, "text": text,
+                "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
+                "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
+            }})])
+        }
+    }
+
+    /// Blocks each `locate` until the test lets it through.
+    struct Gated {
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+        file: std::path::PathBuf,
+    }
+
+    impl TranscriptLocator for Gated {
+        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
+            let _ = self.gate.lock().unwrap().recv();
+            Ok(Located {
+                session_id: SESSION.to_owned(),
+                project: "C--proj".to_owned(),
+                path: self.file.clone(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Sent(Mutex<Vec<String>>);
+
+    impl Transport for Sent {
+        async fn execute(&self, op: &Op) -> Delivery {
+            if let Op::Send { text, .. } = op {
+                self.0.lock().unwrap().push(text.clone());
+            }
+            Ok(Outcome::Sent(Message::default()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_command_does_not_hold_up_polling() {
+        let dir = TempDir::new("hub-slow-command");
+        let file = dir.path().join(format!("{SESSION}.jsonl"));
+        std::fs::write(
+            &file,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        let sent = Arc::new(Sent::default());
+        let (scheduler, outbox) = Scheduler::new(sent.clone(), BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let locator = Arc::new(Gated {
+            gate: Mutex::new(gate),
+            file: file.clone(),
+        });
+        tokio::spawn(commands::serve(commands_rx, outbox, locator, None));
+
+        let source = Arc::new(Batches {
+            calls: AtomicUsize::new(0),
+            polled_twice: Notify::new(),
+        });
+        let store = Arc::new(OffsetStore::open(dir.path()).unwrap());
+        let polling = {
+            let (source, store) = (source.clone(), store.clone());
+            tokio::spawn(async move {
+                let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
+                updates::poll(
+                    source.as_ref(),
+                    &allowlist,
+                    &store,
+                    route_inbound(&commands_tx),
+                )
+                .await;
+            })
+        };
+
+        // The first command is stuck in `locate`, yet both batches were
+        // fetched and the offset saved past them.
+        tokio::time::timeout(Duration::from_secs(10), source.polled_twice.notified())
+            .await
+            .expect("poll kept going while a command was stuck");
+        assert_eq!(store.load(), Some(3));
+        assert!(sent.0.lock().unwrap().is_empty());
+
+        open_gate.send(()).unwrap();
+        open_gate.send(()).unwrap();
+        let answered = async {
+            while sent.0.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), answered)
+            .await
+            .expect("both commands answered");
+        let turns = transcript::parse(&std::fs::read_to_string(&file).unwrap());
+        let want = [
+            transcript::render_brief(&turns),
+            transcript::render_full(&turns),
+        ];
+        assert_eq!(*sent.0.lock().unwrap(), want);
+        polling.abort();
+    }
 
     fn member(status: &str, topics: bool) -> ChatMember {
         ChatMember {

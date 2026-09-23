@@ -2,6 +2,8 @@
 //!
 //! `Routed` values carry no Telegram user id, so nothing downstream can log one.
 
+use std::future::Future;
+use std::io;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -9,10 +11,14 @@ use tracing::{debug, warn};
 
 use super::api::{ApiError, BotApi, Message, Update};
 use super::config::Allowlist;
+use super::offset::OffsetStore;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STALLED_BATCH_BACKOFF: Duration = Duration::from_secs(1);
+/// Waits before the second and third attempt to save the offset (a file held
+/// open by a scanner or indexer on Windows makes the rename fail for a moment).
+const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Routed {
@@ -139,18 +145,22 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
 /// Routes a raw `getUpdates` batch. Returns the next offset and the routed
 /// updates. A malformed update is skipped, not fatal, and still advances the
 /// offset so it is not fetched again.
+///
+/// The next offset is one past the highest `update_id` of this batch, even
+/// when that is below `offset`: after a week without updates Telegram picks
+/// the next id at random, and keeping the old, higher offset would fetch and
+/// handle the same update again on every call.
 pub fn route_batch(
     raw: Vec<Value>,
     offset: Option<i64>,
     chat_id: i64,
     allowlist: &Allowlist,
 ) -> (Option<i64>, Vec<Routed>) {
-    let mut next = offset;
+    let mut highest: Option<i64> = None;
     let mut routed = Vec::with_capacity(raw.len());
     for value in raw {
         if let Some(id) = value.get("update_id").and_then(Value::as_i64) {
-            let following = id.saturating_add(1);
-            next = Some(next.map_or(following, |current| current.max(following)));
+            highest = Some(highest.map_or(id, |current| current.max(id)));
         }
         let item = match serde_json::from_value::<Update>(value) {
             Ok(update) => classify(update, chat_id, allowlist),
@@ -163,7 +173,32 @@ pub fn route_batch(
         }
         routed.push(item);
     }
+    let next = highest.map(|id| id.saturating_add(1)).or(offset);
     (next, routed)
+}
+
+/// Where updates come from: `BotApi` in production, a fake in tests.
+pub trait UpdateSource {
+    fn chat_id(&self) -> i64;
+    fn get_updates(
+        &self,
+        offset: Option<i64>,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Vec<Value>, ApiError>> + Send;
+}
+
+impl UpdateSource for BotApi {
+    fn chat_id(&self) -> i64 {
+        BotApi::chat_id(self)
+    }
+
+    async fn get_updates(
+        &self,
+        offset: Option<i64>,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, ApiError> {
+        BotApi::get_updates(self, offset, timeout).await
+    }
 }
 
 fn stalled_batch_backoff(
@@ -174,19 +209,57 @@ fn stalled_batch_backoff(
     (batch_len > 0 && next == previous).then_some(STALLED_BATCH_BACKOFF)
 }
 
+/// Saves `offset`, retrying twice. A save that still fails is logged and the
+/// poll goes on: an unwritable state directory must not stop the hub; the
+/// cost is that a restart before the next successful save repeats the batch.
+async fn save_offset_once(store: &OffsetStore, offset: i64) -> io::Result<()> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || store.save(offset))
+        .await
+        .map_err(|_| io::Error::other("offset save worker failed"))?
+}
+
+async fn save_offset(store: &OffsetStore, offset: i64) {
+    let mut result = save_offset_once(store, offset).await;
+    for wait in SAVE_RETRY_WAITS {
+        if result.is_ok() {
+            return;
+        }
+        tokio::time::sleep(wait).await;
+        result = save_offset_once(store, offset).await;
+    }
+    if let Err(error) = result {
+        warn!(kind = ?error.kind(), "cannot save the getUpdates offset; a restart may repeat this batch");
+    }
+}
+
 /// Long-polls forever and hands every routed update to `handle`. Errors never
 /// stop the loop: 429 waits `retry_after`, other errors back off up to 30 s.
-pub async fn poll(api: &BotApi, allowlist: &Allowlist, mut handle: impl FnMut(Routed)) {
-    let mut offset = None;
+///
+/// Starts from the offset in `store` and saves each new offset before the
+/// batch is handled: a crash in between skips those updates instead of
+/// handling them twice (at most once, so a command is never answered twice).
+pub async fn poll<S: UpdateSource>(
+    source: &S,
+    allowlist: &Allowlist,
+    store: &OffsetStore,
+    mut handle: impl FnMut(Routed),
+) {
+    let mut offset = store.load();
     let mut backoff = Duration::from_secs(1);
     loop {
-        match api.get_updates(offset, POLL_TIMEOUT).await {
+        match source.get_updates(offset, POLL_TIMEOUT).await {
             Ok(raw) => {
                 backoff = Duration::from_secs(1);
                 let batch_len = raw.len();
                 let previous = offset;
-                let (next, routed) = route_batch(raw, offset, api.chat_id(), allowlist);
+                let (next, routed) = route_batch(raw, offset, source.chat_id(), allowlist);
                 offset = next;
+                if next != previous
+                    && let Some(next) = next
+                {
+                    save_offset(store, next).await;
+                }
                 routed.into_iter().for_each(&mut handle);
                 if let Some(wait) = stalled_batch_backoff(batch_len, previous, next) {
                     warn!(?wait, "getUpdates batch did not contain an update_id");
@@ -362,6 +435,189 @@ mod tests {
 
         let (next, routed) = route_batch(Vec::new(), Some(3), CHAT, &allowlist());
         assert_eq!((next, routed.len()), (Some(3), 0));
+    }
+
+    #[test]
+    fn next_offset_follows_the_batch_even_below_the_old_one() {
+        // Telegram restarts ids at random after a week without updates.
+        let batch = vec![json!({ "update_id": 40 }), json!({ "update_id": 42 })];
+        let (next, _) = route_batch(batch, Some(9000), CHAT, &allowlist());
+        assert_eq!(next, Some(43));
+        let (next, _) = route_batch(vec![json!({ "x": 1 })], Some(9000), CHAT, &allowlist());
+        assert_eq!(next, Some(9000));
+    }
+
+    /// Answers like Telegram: every update at or above `offset`, or waits out
+    /// the long poll when there is none. It never forgets an update, which is
+    /// what Telegram does for an update that was not yet confirmed.
+    struct FakeTelegram(Vec<Value>);
+
+    impl UpdateSource for FakeTelegram {
+        fn chat_id(&self) -> i64 {
+            CHAT
+        }
+
+        async fn get_updates(
+            &self,
+            offset: Option<i64>,
+            timeout: Duration,
+        ) -> Result<Vec<Value>, ApiError> {
+            let batch: Vec<Value> = self
+                .0
+                .iter()
+                .filter(|update| {
+                    let id = update["update_id"].as_i64().unwrap_or_default();
+                    offset.is_none_or(|offset| id >= offset)
+                })
+                .cloned()
+                .collect();
+            if batch.is_empty() {
+                tokio::time::sleep(timeout).await;
+            }
+            Ok(batch)
+        }
+    }
+
+    fn text_update(id: i64, text: &str) -> Value {
+        json!({ "update_id": id, "message": message(ALLOWED, json!({ "text": text })) })
+    }
+
+    /// Polls `updates` for a few simulated minutes; returns the handled texts.
+    async fn handled(updates: Vec<Value>, store: &OffsetStore) -> Vec<String> {
+        let mut texts = Vec::new();
+        let source = FakeTelegram(updates);
+        let allowlist = allowlist();
+        let polling = poll(&source, &allowlist, store, |routed| {
+            if let Routed::Input(input) = routed {
+                texts.push(input.text.unwrap_or_default());
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
+        texts
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saved_offset_prevents_handling_an_update_twice_after_restart() {
+        let dir = crate::hub::testdir::TempDir::new("poll-restart");
+        let first_run = OffsetStore::open(dir.path()).unwrap();
+        assert_eq!(
+            handled(vec![text_update(5, "/brief")], &first_run).await,
+            ["/brief"]
+        );
+
+        // Restart: a new store over the same directory, and Telegram still
+        // holds update 5 because no later getUpdates confirmed it.
+        let restarted = OffsetStore::open(dir.path()).unwrap();
+        assert_eq!(restarted.load(), Some(6));
+        let pending = vec![text_update(5, "/brief"), text_update(6, "/full")];
+        assert_eq!(handled(pending.clone(), &restarted).await, ["/full"]);
+
+        // Control: without the saved offset the old command runs again.
+        let empty = crate::hub::testdir::TempDir::new("poll-no-offset");
+        let fresh = OffsetStore::open(empty.path()).unwrap();
+        assert_eq!(handled(pending, &fresh).await, ["/brief", "/full"]);
+    }
+
+    /// Keeps returning its updates until `getUpdates` is called with an offset
+    /// above them, whatever offset it was called with before: what a bot saw
+    /// after a week-long pause, when Telegram restarted ids below the offset.
+    struct RestartedIds(Vec<Value>, std::sync::Mutex<i64>);
+
+    impl UpdateSource for RestartedIds {
+        fn chat_id(&self) -> i64 {
+            CHAT
+        }
+
+        async fn get_updates(
+            &self,
+            offset: Option<i64>,
+            timeout: Duration,
+        ) -> Result<Vec<Value>, ApiError> {
+            // Only an offset just above the update confirms it; the stale
+            // 5000 does not (the observed behaviour this models).
+            let confirmed = {
+                let mut confirmed = self.1.lock().unwrap();
+                if let Some(offset) = offset.filter(|offset| *offset < 1000) {
+                    *confirmed = (*confirmed).max(offset);
+                }
+                *confirmed
+            };
+            let batch: Vec<Value> = self
+                .0
+                .iter()
+                .filter(|update| update["update_id"].as_i64().unwrap_or_default() >= confirmed)
+                .cloned()
+                .collect();
+            if batch.is_empty() {
+                tokio::time::sleep(timeout).await;
+            }
+            Ok(batch)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ids_restarted_below_the_saved_offset_are_handled_once() {
+        let dir = crate::hub::testdir::TempDir::new("poll-restarted-ids");
+        let store = OffsetStore::open(dir.path()).unwrap();
+        store.save(5000).unwrap();
+        let mut texts = Vec::new();
+        let source = RestartedIds(vec![text_update(7, "/brief")], std::sync::Mutex::new(0));
+        let allowlist = allowlist();
+        let polling = poll(&source, &allowlist, &store, |routed| {
+            if let Routed::Input(input) = routed {
+                texts.push(input.text.unwrap_or_default());
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
+        assert_eq!(texts, ["/brief"]);
+        assert_eq!(store.load(), Some(8));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offset_is_saved_before_the_batch_is_handled() {
+        let dir = crate::hub::testdir::TempDir::new("poll-save-first");
+        let store = OffsetStore::open(dir.path()).unwrap();
+        let mut seen = Vec::new();
+        let source = FakeTelegram(vec![text_update(5, "/brief")]);
+        let allowlist = allowlist();
+        let polling = poll(&source, &allowlist, &store, |_| seen.push(store.load()));
+        let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
+        assert_eq!(seen, [Some(6)]);
+    }
+
+    /// Makes `offset` a non-empty directory, so every save fails.
+    fn block_saves(dir: &std::path::Path) -> std::path::PathBuf {
+        let blocker = dir.join("offset");
+        std::fs::create_dir_all(blocker.join("inside")).unwrap();
+        blocker
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failing_offset_saves_do_not_stop_polling() {
+        let dir = crate::hub::testdir::TempDir::new("poll-save-fails");
+        let store = OffsetStore::open(dir.path()).unwrap();
+        block_saves(dir.path());
+        let updates = vec![text_update(5, "/brief"), text_update(6, "/full")];
+        // Both handled once: the in-memory offset still moves on.
+        assert_eq!(handled(updates, &store).await, ["/brief", "/full"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_briefly_failing_offset_save_is_retried() {
+        let dir = crate::hub::testdir::TempDir::new("poll-save-retry");
+        let store = OffsetStore::open(dir.path()).unwrap();
+        let blocker = block_saves(dir.path());
+        // Unblocked after the first attempt, before the retry 100 ms later.
+        let unblock = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            std::fs::remove_dir_all(blocker).unwrap();
+        });
+        assert_eq!(
+            handled(vec![text_update(5, "/brief")], &store).await,
+            ["/brief"]
+        );
+        unblock.await.unwrap();
+        assert_eq!(store.load(), Some(6));
     }
 
     #[test]

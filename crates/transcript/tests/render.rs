@@ -2,7 +2,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use transcript::{
-    Block, Role, SplitOptions, Turn, parse, render_brief, render_full, split_for_telegram,
+    Block, Role, SplitOptions, Turn, last_prompts, parse, render_brief, render_full,
+    split_for_telegram,
 };
 
 const IN_PROGRESS_MARKER: &str = "в работе…";
@@ -353,5 +354,58 @@ fn five_thousand_turns_render_in_linear_time() {
     assert!(
         t_large < t_small * 8 + Duration::from_millis(50),
         "{t_small:?} -> {t_large:?}"
+    );
+}
+
+#[test]
+fn last_prompts_keeps_the_last_n_exchanges() {
+    let turns = parse(FINAL_ANSWER);
+    assert_eq!(
+        render_brief(last_prompts(&turns, 1)),
+        "> Explore the crate
+↳ Explore a0000000000000002: Explore crate
+The crate has three modules."
+    );
+    assert_eq!(render_brief(last_prompts(&turns, 2)), FINAL_ANSWER_BRIEF);
+    assert_eq!(render_full(last_prompts(&turns, 99)), FINAL_ANSWER_FULL);
+    assert!(last_prompts(&turns, 0).is_empty());
+    assert!(last_prompts(&[], 3).is_empty());
+}
+
+#[test]
+fn last_prompts_counts_only_what_renders_as_a_prompt() {
+    let turns = [
+        prompt("first"),
+        say(Some("end_turn"), "one"),
+        prompt("second"),
+        bash("t1", "ls"),
+        result("t1", "a.txt"),
+        prompt(
+            "<task-notification>
+<task-id>x</task-id>
+</task-notification>",
+        ),
+        meta("<system-reminder>hidden</system-reminder>"),
+        say(Some("end_turn"), "two"),
+    ];
+    // Tool results, service records and hidden meta turns are not boundaries.
+    assert_eq!(
+        render_brief(last_prompts(&turns, 1)),
+        "> second
+• Bash: ls
+two"
+    );
+    assert_eq!(last_prompts(&turns, 2).len(), turns.len());
+
+    let channel = [
+        prompt("typed"),
+        say(Some("end_turn"), "a"),
+        meta("<channel source=\"cctg\" chat_id=\"1\">from telegram</channel>"),
+        say(Some("end_turn"), "b"),
+    ];
+    assert_eq!(
+        render_brief(last_prompts(&channel, 1)),
+        "> from telegram
+b"
     );
 }

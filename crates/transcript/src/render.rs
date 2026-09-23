@@ -237,18 +237,40 @@ fn is_final(turn: &Turn, tool_after: bool) -> bool {
     }
 }
 
+/// The tail of `turns` that starts at the `n`-th prompt from the end, so the renderers show the last
+/// `n` exchanges. All of `turns` when there are fewer prompts; empty for `n == 0`. A prompt is what
+/// the renderers show as `> ...` and count as a boundary: typed text, a slash command, a Telegram
+/// message; service records and tool results are not prompts.
+pub fn last_prompts(turns: &[Turn], n: usize) -> &[Turn] {
+    if n == 0 {
+        return &[];
+    }
+    let start = turns
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, turn)| is_prompt(turn))
+        .nth(n - 1)
+        .map_or(0, |(index, _)| index);
+    &turns[start..]
+}
+
+/// A user turn with at least one prompt text.
+fn is_prompt(turn: &Turn) -> bool {
+    turn.role == Role::User
+        && turn.blocks.iter().any(|block| match block {
+            Block::Text(text) => matches!(user_text(turn, text), Some(UserText::Prompt(_))),
+            _ => false,
+        })
+}
+
 /// For each turn: does a tool call appear in it or later, before the next prompt? Service records
 /// are not prompts.
 fn tool_after(turns: &[Turn]) -> Vec<bool> {
     let mut flags = vec![false; turns.len()];
     let mut seen = false;
     for (i, turn) in turns.iter().enumerate().rev() {
-        if turn.role == Role::User
-            && turn.blocks.iter().any(|block| match block {
-                Block::Text(text) => matches!(user_text(turn, text), Some(UserText::Prompt(_))),
-                _ => false,
-            })
-        {
+        if is_prompt(turn) {
             seen = false;
         }
         seen |= turn
