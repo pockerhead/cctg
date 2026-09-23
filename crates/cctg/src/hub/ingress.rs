@@ -1165,7 +1165,10 @@ mod tests {
         let (addr, mut events) = hooks_hub(1).await;
         let bearer = format!("Bearer {SECRET}");
         let first = post(start());
-        let second = post(HookEvent::SessionEnd { reason: None });
+        let second = post(HookEvent::SessionEnd {
+            reason: None,
+            claude_pid: None,
+        });
         assert_eq!(
             exchange(addr, &request(Some(&bearer), &body(&first))).await,
             204

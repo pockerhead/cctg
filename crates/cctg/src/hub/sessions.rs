@@ -1,12 +1,18 @@
 //! Which transcript `/brief` and `/full` read.
 //!
-//! `TranscriptLocator` is the seam: today `ProjectsDir` scans the Claude Code
-//! projects directory; the slot registry (TASK-011) replaces it with
-//! "current session of the slot behind this topic".
+//! `TranscriptLocator` is the seam. `SlotLocator` answers a command in a slot
+//! topic with the current session of that slot; everything else (General, a
+//! session id prefix, a topic the registry does not know) goes to
+//! `ProjectsDir`, which scans the Claude Code projects directory.
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::sync::watch;
+
+use super::registry::TopicView;
 
 /// A top-level session transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +37,9 @@ pub enum LocateError {
     /// Every match, newest first.
     #[error("the prefix matches {} sessions", .0.len())]
     Ambiguous(Vec<Located>),
+    /// The topic's session was announced without a transcript path.
+    #[error("the session of this topic has no known transcript")]
+    NoTranscript,
 }
 
 pub trait TranscriptLocator: Send + Sync + 'static {
@@ -123,6 +132,41 @@ impl TranscriptLocator for ProjectsDir {
             0 => Err(LocateError::NoMatch),
             1 => Ok(sessions.remove(0)),
             _ => Err(LocateError::Ambiguous(sessions)),
+        }
+    }
+}
+
+/// The slot registry's view first, `ProjectsDir` for the rest.
+#[derive(Debug)]
+pub struct SlotLocator {
+    view: watch::Receiver<Arc<TopicView>>,
+    fallback: ProjectsDir,
+}
+
+impl SlotLocator {
+    pub fn new(view: watch::Receiver<Arc<TopicView>>, fallback: ProjectsDir) -> Self {
+        Self { view, fallback }
+    }
+}
+
+impl TranscriptLocator for SlotLocator {
+    fn locate(
+        &self,
+        thread_id: Option<i64>,
+        session_prefix: Option<&str>,
+    ) -> Result<Located, LocateError> {
+        let current = match (thread_id, session_prefix) {
+            (Some(thread_id), None) => self.view.borrow().get(&thread_id).cloned(),
+            _ => None,
+        };
+        match current {
+            Some((_, path)) if path.is_empty() => Err(LocateError::NoTranscript),
+            Some((session_id, path)) => Ok(Located {
+                session_id,
+                project: String::new(),
+                path: PathBuf::from(path),
+            }),
+            None => self.fallback.locate(thread_id, session_prefix),
         }
     }
 }
@@ -240,6 +284,32 @@ mod tests {
         let dir = TempDir::new("sessions-missing");
         let missing = ProjectsDir::new(dir.path().join("absent"));
         assert_eq!(missing.locate(None, None), Err(LocateError::RootMissing));
+    }
+
+    #[test]
+    fn a_slot_topic_reads_its_current_session() {
+        let dir = root();
+        let view: TopicView = [
+            (7, (NEW.to_owned(), "/somewhere/new.jsonl".to_owned())),
+            (8, (OLD.to_owned(), String::new())),
+        ]
+        .into();
+        let (_tx, rx) = watch::channel(Arc::new(view));
+        let locator = SlotLocator::new(rx, ProjectsDir::new(dir.path().to_owned()));
+        let found = locator.locate(Some(7), None).unwrap();
+        assert_eq!(found.session_id, NEW);
+        assert_eq!(found.path, PathBuf::from("/somewhere/new.jsonl"));
+        assert_eq!(
+            locator.locate(Some(8), None),
+            Err(LocateError::NoTranscript)
+        );
+        // General, unknown topics and prefixes keep the directory scan.
+        assert_eq!(locator.locate(None, None).unwrap().session_id, OTHER);
+        assert_eq!(locator.locate(Some(9), None).unwrap().session_id, OTHER);
+        assert_eq!(
+            locator.locate(Some(7), Some("0a1b2")).unwrap().session_id,
+            OLD
+        );
     }
 
     #[test]

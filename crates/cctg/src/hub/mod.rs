@@ -5,8 +5,10 @@ pub mod commands;
 pub mod config;
 pub mod ingress;
 pub mod offset;
+pub mod registry;
 pub mod scheduler;
 pub mod sessions;
+pub mod slots;
 #[cfg(test)]
 pub(crate) mod testdir;
 pub mod updates;
@@ -18,14 +20,14 @@ use anyhow::Context;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::wire::HookPost;
-use api::{BotApi, ChatMember};
+use api::{ApiError, BotApi, ChatMember, Sticker};
 use config::{AGENT_LISTEN_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR};
-use ingress::AgentEvent;
 use offset::OffsetStore;
+use registry::{Icons, RegistryStore};
 use scheduler::{BucketConfig, Scheduler};
-use sessions::ProjectsDir;
-use updates::{Inbound, Routed};
+use sessions::{ProjectsDir, SlotLocator};
+use slots::{Control, Slots};
+use updates::{Inbound, Routed, ServiceKind};
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RightsError {
@@ -51,9 +53,13 @@ pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
     }
 }
 
-/// The poll callback: commands go to the command worker's queue, nothing here
-/// waits, so a slow command never holds up polling.
-fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed) + '_ {
+/// The poll callback: commands go to the command worker's queue and topic
+/// edit notices to the slot actor; nothing here waits, so a slow command
+/// never holds up polling.
+fn route_inbound<'a>(
+    commands: &'a mpsc::UnboundedSender<Inbound>,
+    control: &'a mpsc::UnboundedSender<Control>,
+) -> impl FnMut(Routed) + 'a {
     move |routed| match routed {
         Routed::Input(input) if commands::is_command(&input) => {
             if commands.send(input).is_err() {
@@ -62,27 +68,37 @@ fn route_inbound(commands: &mpsc::UnboundedSender<Inbound>) -> impl FnMut(Routed
         }
         Routed::Input(input) => info!(thread = ?input.thread_id, "inbound message"),
         Routed::Callback(_) => info!("inbound button press"),
+        Routed::Service(service) if service.kind == ServiceKind::TopicEdited => {
+            let edited = Control::TopicEdited {
+                thread_id: service.thread_id,
+                message_id: service.message_id,
+            };
+            if control.send(edited).is_err() {
+                warn!("slot actor stopped; service message kept");
+            }
+        }
         Routed::Service(_) | Routed::Ignored(_) => {}
     }
 }
 
-/// Until the slot registry exists, ingress only logs what arrives (short
-/// session ids and event types, never paths or text).
-async fn drain_ingress(
-    mut agents: mpsc::Receiver<AgentEvent>,
-    mut hooks: mpsc::Receiver<HookPost>,
-) {
-    loop {
-        tokio::select! {
-            Some(event) = agents.recv() => {
-                if let AgentEvent::Message { conn, .. } = event {
-                    info!(conn, "agent message not routed yet");
-                }
-            }
-            Some(_) = hooks.recv() => {}
-            else => return,
-        }
+/// Topic icons from `getForumTopicIconStickers`. A failed lookup stops the
+/// start: an icon id Telegram did not offer is never sent. A preferred icon
+/// that is not offered is replaced from the offered set with a warning.
+fn checked_icons(lookup: Result<Vec<Sticker>, ApiError>) -> anyhow::Result<Icons> {
+    let stickers =
+        lookup.context("getForumTopicIconStickers failed; topic icons must come from it")?;
+    let (icons, substituted) = Icons::from_offered(
+        stickers
+            .into_iter()
+            .filter_map(|sticker| sticker.custom_emoji_id),
+    )?;
+    for state in substituted {
+        warn!(
+            state,
+            "preferred topic icon is not offered by Telegram; another offered icon stands in"
+        );
     }
+    Ok(icons)
 }
 
 pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
@@ -92,6 +108,11 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     })?;
     let offsets = OffsetStore::open(&config.state_dir)
         .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
+    let registry_store = RegistryStore::open(&config.state_dir)
+        .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
+    let registry = registry_store
+        .load()
+        .with_context(|| format!("cannot load the slot registry from {STATE_VAR}"))?;
     let secret = config.hub_secret.clone().with_context(|| {
         format!("{SECRET_VAR} is not set; agents and hooks authenticate with it (16+ visible ASCII characters)")
     })?;
@@ -111,9 +132,11 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
         "getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group",
     )?;
     check_topic_rights(&member)?;
-    if member.status == "administrator" && !member.can_delete_messages {
+    let can_delete = member.status == "creator" || member.can_delete_messages;
+    if !can_delete {
         warn!("the bot lacks can_delete_messages; forum service messages will stay visible");
     }
+    let icons = checked_icons(api.get_forum_topic_icon_stickers().await)?;
     info!(
         bot = me.username.as_deref().unwrap_or("?"),
         "hub started, polling"
@@ -121,11 +144,17 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
 
     let (scheduler, outbox) = Scheduler::new(api.clone(), BucketConfig::default());
     tokio::spawn(scheduler.run());
+    let options = slots::Options {
+        icons,
+        can_delete,
+        ..slots::Options::default()
+    };
+    let (slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     tokio::spawn(commands::serve(
         commands_rx,
         outbox,
-        Arc::new(ProjectsDir::new(projects_dir)),
+        Arc::new(SlotLocator::new(view, ProjectsDir::new(projects_dir))),
         me.username.clone(),
     ));
     let (agents_tx, agents_rx) = mpsc::channel(256);
@@ -136,13 +165,14 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
         agents_tx,
     ));
     tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx));
-    tokio::spawn(drain_ingress(agents_rx, hooks_rx));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
 
     updates::poll(
         api.as_ref(),
         &config.allowlist,
         &offsets,
-        route_inbound(&commands_tx),
+        route_inbound(&commands_tx, &control_tx),
     )
     .await;
     Ok(())
@@ -158,7 +188,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use api::{ApiError, Message};
+    use api::Message;
     use scheduler::{Delivery, Op, Outcome, Transport};
     use sessions::{LocateError, Located, TranscriptLocator};
     use testdir::TempDir;
@@ -255,11 +285,12 @@ mod tests {
             let (source, store) = (source.clone(), store.clone());
             tokio::spawn(async move {
                 let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
+                let (control_tx, _control_rx) = mpsc::unbounded_channel();
                 updates::poll(
                     source.as_ref(),
                     &allowlist,
                     &store,
-                    route_inbound(&commands_tx),
+                    route_inbound(&commands_tx, &control_tx),
                 )
                 .await;
             })
@@ -298,6 +329,24 @@ mod tests {
             can_manage_topics: topics,
             can_delete_messages: true,
         }
+    }
+
+    #[test]
+    fn icons_come_only_from_a_successful_lookup() {
+        let failed = checked_icons(Err(ApiError::Telegram {
+            code: 500,
+            description: "Internal Server Error".to_owned(),
+        }));
+        assert!(failed.is_err());
+        let sticker = |id: &str| Sticker {
+            custom_emoji_id: Some(id.to_owned()),
+            ..Sticker::default()
+        };
+        let offered = vec![sticker("4"), sticker("3"), sticker("2"), sticker("1")];
+        let icons = checked_icons(Ok(offered)).unwrap();
+        assert_eq!(icons.alive.as_deref(), Some("1"));
+        assert_eq!(icons.no_channel.as_deref(), Some("4"));
+        assert!(checked_icons(Ok(vec![sticker("1")])).is_err());
     }
 
     #[test]

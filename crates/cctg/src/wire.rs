@@ -371,6 +371,10 @@ pub enum HookEvent {
     SessionEnd {
         #[serde(default)]
         reason: Option<String>,
+        /// `CLAUDE_PID` of the hook. Tells the end of a nested
+        /// `claude -p --resume <id>` from the end of the session itself.
+        #[serde(default)]
+        claude_pid: Option<u32>,
     },
     UserPromptSubmit {
         #[serde(default)]
@@ -503,6 +507,7 @@ mod tests {
             },
             HookEvent::SessionEnd {
                 reason: Some("prompt_input_exit".into()),
+                claude_pid: Some(10),
             },
             HookEvent::UserPromptSubmit {
                 prompt_id: Some("p1".into()),
@@ -727,7 +732,10 @@ mod tests {
         let base = |event: Value| json!({ "v": 1, "event_id": id.as_str(), "host": "h", "session_id": "s", "event": event });
         assert_eq!(
             decode_hook(&body(base(json!({ "type": "session_end" })))).map(|p| p.event),
-            Ok(HookEvent::SessionEnd { reason: None })
+            Ok(HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: None,
+            })
         );
         let mut v2 = base(json!({ "type": "stop" }));
         v2["v"] = json!(2);

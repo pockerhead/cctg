@@ -212,6 +212,9 @@ fn locate_notice(error: &LocateError) -> String {
         }
         LocateError::NoSessions => "Сессий Claude Code пока нет.".to_owned(),
         LocateError::NoMatch => "Нет сессии с таким началом id.".to_owned(),
+        LocateError::NoTranscript => {
+            "У сессии этой темы пока нет известного транскрипта.".to_owned()
+        }
         LocateError::Ambiguous(candidates) => {
             let mut text = format!(
                 "Под это начало id подходят {} сессий, уточните:",
