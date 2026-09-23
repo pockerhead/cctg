@@ -130,6 +130,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 host: "box".into(),
                 cwd: cwd.clone(),
                 claude_pid: None,
+                verdict_ack: false,
             },
             to_agent,
         })

@@ -181,6 +181,7 @@ impl Server {
             LinkEvent::Message(HubMsg::PermissionVerdict {
                 request_id,
                 behavior,
+                ..
             }) => {
                 // Claude Code applies a verdict only to its own pending id,
                 // so every well-formed one is passed on.
@@ -633,6 +634,7 @@ mod tests {
         let verdict = LinkEvent::Message(HubMsg::PermissionVerdict {
             request_id: "abcde".into(),
             behavior: Behavior::Allow,
+            verdict_id: None,
         });
         assert_eq!(server.on_link(verdict).len(), 1);
         // After its verdict, the same id may be asked again.
@@ -674,6 +676,7 @@ mod tests {
         LinkEvent::Message(HubMsg::PermissionVerdict {
             request_id: id.into(),
             behavior: Behavior::Deny,
+            verdict_id: None,
         })
     }
 
@@ -940,11 +943,13 @@ mod tests {
         let stray = server.on_link(LinkEvent::Message(HubMsg::PermissionVerdict {
             request_id: "zzzzl".into(),
             behavior: Behavior::Allow,
+            verdict_id: None,
         }));
         assert!(stray.is_empty());
         let verdict = LinkEvent::Message(HubMsg::PermissionVerdict {
             request_id: "tcmbm".into(),
             behavior: Behavior::Deny,
+            verdict_id: None,
         });
         let out = parse(&server.on_link(verdict));
         assert_eq!(out.len(), 1);

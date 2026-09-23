@@ -16,13 +16,22 @@
 //! [`MAX_QUEUED_MESSAGES`] such messages wait for Telegram at a time, and a
 //! slot gets each kind of notice at most once per `Options::notice_every`.
 //!
+//! Permission requests become prompts with Allow/Deny buttons in the topic of
+//! the requesting session's own slot (see [`permissions`]). They bypass the
+//! message cap and ride the scheduler's permission lane. The first press
+//! fixes the answer; the verdict goes only to an agent of the requesting
+//! session, and again after a link drop until that agent acknowledges it.
+//! Later presses only get "already decided". The end of the session closes
+//! its open prompts; every ended prompt loses its buttons, retried on the
+//! tick.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title or message text.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
@@ -31,10 +40,12 @@ use transcript::{SplitOptions, split_for_telegram};
 
 use super::api::{ApiError, Document};
 use super::ingress::AgentEvent;
+use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::registry::{Icons, Registry, RegistryStore, SlotId, TopicJob, TopicView};
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
-use super::updates::Inbound;
-use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg};
+use super::updates::{CallbackInput, Inbound};
+use crate::channel::is_request_id;
+use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest};
 
 /// A transcript is scanned line by line for its first ai-title up to this
 /// many bytes (the same cap as `/brief`).
@@ -87,6 +98,8 @@ pub enum Control {
     },
     /// A message from an allowlisted user that is not a command.
     Message(Inbound),
+    /// A button press from an allowlisted user.
+    Callback(CallbackInput),
 }
 
 #[derive(Debug)]
@@ -99,6 +112,18 @@ enum Done {
     Delete(Option<Delivery>),
     /// A reply chunk or a notice.
     Message(Option<Delivery>),
+    /// A permission prompt, by its key in [`Prompts`].
+    Permission {
+        key: u64,
+        delivery: Option<Delivery>,
+    },
+    /// The final edit of a prompt, by its key.
+    PromptEdit {
+        key: u64,
+        delivery: Option<Delivery>,
+    },
+    /// A button answer or the edit of an expired prompt.
+    Callback(Option<Delivery>),
     Title {
         session: String,
         path: String,
@@ -114,6 +139,9 @@ enum Work {
     Topic(TopicJob),
     Delete,
     Message,
+    Permission(u64),
+    PromptEdit(u64),
+    Callback,
 }
 
 fn short(session_id: &str) -> &str {
@@ -193,9 +221,14 @@ fn first_ai_title(jsonl: impl Read, limit: u64) -> (Option<String>, u64) {
 struct Conn {
     /// The session it is bound to or waits for.
     session: String,
+    /// Binding changes by actor time. Frames carry their read time, so a
+    /// frame read before `/clear` keeps the old session if consumed later.
+    bindings: Vec<(StdInstant, String)>,
     host: String,
     claude_pid: Option<u32>,
     to_agent: mpsc::Sender<HubMsg>,
+    /// It acknowledges permission verdicts ([`crate::wire::Register::verdict_ack`]).
+    acks: bool,
 }
 
 pub struct Slots {
@@ -216,6 +249,7 @@ pub struct Slots {
     overflow_warned: bool,
     /// When a slot last got a notice of a kind.
     notices: HashMap<(SlotId, &'static str), Instant>,
+    prompts: Prompts,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -251,6 +285,7 @@ impl Slots {
             queued_messages: 0,
             overflow_warned: false,
             notices: HashMap::new(),
+            prompts: Prompts::default(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -316,22 +351,35 @@ impl Slots {
                 self.conns.insert(
                     conn,
                     Conn {
-                        session,
+                        session: session.clone(),
+                        bindings: vec![(StdInstant::now(), session.clone())],
                         host: register.host,
                         claude_pid: register.claude_pid,
                         to_agent,
+                        acks: register.verdict_ack,
                     },
                 );
+                // A link that came back takes the answers that wait for it.
+                self.push_selected(Some(&session));
+                self.sync_waiting(&session);
             }
-            AgentEvent::Message { conn, msg } => {
-                let Some(bound) = self.conns.get(&conn) else {
+            AgentEvent::Message {
+                conn,
+                received_at,
+                msg,
+            } => {
+                if !self.conns.contains_key(&conn) {
                     return;
-                };
+                }
+                let session = self.session_at(conn, received_at);
                 match msg {
-                    AgentMsg::PermissionRequest(_) => {
-                        self.registry.set_waiting(&bound.session, true);
+                    AgentMsg::PermissionRequest(request) => {
+                        self.on_permission_request(conn, &session, request);
                     }
-                    AgentMsg::Reply { text } => self.on_reply(conn, &text),
+                    AgentMsg::PermissionAck { verdict_id } => {
+                        self.on_verdict_ack(conn, &session, verdict_id);
+                    }
+                    AgentMsg::Reply { text } => self.on_reply_for(conn, &session, &text),
                     _ => debug!(conn, "agent message not routed yet"),
                 }
             }
@@ -361,6 +409,23 @@ impl Slots {
         register.session_id.clone()
     }
 
+    /// Session to which `conn` was bound when a frame was read. Frames from
+    /// one connection arrive in order, so older binding history is no longer
+    /// needed after the corresponding frame has been consumed.
+    fn session_at(&mut self, conn: u64, received_at: StdInstant) -> String {
+        let bound = self.conns.get_mut(&conn).expect("known connection");
+        let index = bound
+            .bindings
+            .iter()
+            .rposition(|(at, _)| *at <= received_at)
+            .unwrap_or(0);
+        let session = bound.bindings[index].1.clone();
+        if index > 0 {
+            bound.bindings.drain(..index);
+        }
+        session
+    }
+
     /// Moves the agents of a claude process to the session that process now
     /// runs. Nothing moves when the pid names no running top-level session.
     fn follow_pid(&mut self, host: &str, pid: u32) {
@@ -387,7 +452,9 @@ impl Slots {
         let Some(bound) = self.conns.get_mut(&conn) else {
             return;
         };
+        let rebound_at = StdInstant::now();
         let old = std::mem::replace(&mut bound.session, session.clone());
+        bound.bindings.push((rebound_at, session.clone()));
         self.registry.agent_disconnected(&old, conn);
         if self.pending.get(&old) == Some(&conn) {
             self.pending.remove(&old);
@@ -420,6 +487,13 @@ impl Slots {
         {
             self.follow_pid(&post.host, pid);
         }
+        if matches!(
+            post.event,
+            HookEvent::Stop { .. } | HookEvent::UserPromptSubmit { .. }
+        ) {
+            self.prompts.quiet(session);
+        }
+        self.close_prompts(&followup.ended_sessions);
         if let Some((session, path)) = followup.read_title {
             self.read_title(session, path);
         }
@@ -457,6 +531,7 @@ impl Slots {
                 message_id,
             } => (thread_id, message_id),
             Control::Message(input) => return self.on_topic_message(input),
+            Control::Callback(input) => return self.on_callback(input),
         };
         if !self.options.can_delete
             || thread_id
@@ -538,8 +613,8 @@ impl Slots {
 
     /// The running top-level session currently represented by `conn` and
     /// its slot. This is the reply-side counterpart of [`Self::live_agent`].
-    fn live_reply_slot(&self, conn: u64) -> Option<(String, SlotId)> {
-        let session = self.conns.get(&conn)?.session.as_str();
+    fn live_reply_slot(&self, conn: u64, session: &str) -> Option<(String, SlotId)> {
+        self.conns.get(&conn)?;
         if !self.registry.is_live_top_level(session) {
             return None;
         }
@@ -555,8 +630,16 @@ impl Slots {
 
     /// Sends an agent's reply to the topic of its session: the chunks of
     /// `split_for_telegram` in order, or one document when it prefers a file.
+    #[cfg(test)]
     fn on_reply(&mut self, conn: u64, text: &str) {
-        let Some((session, slot)) = self.live_reply_slot(conn) else {
+        let Some(session) = self.conns.get(&conn).map(|bound| bound.session.clone()) else {
+            return;
+        };
+        self.on_reply_for(conn, &session, text);
+    }
+
+    fn on_reply_for(&mut self, conn: u64, frame_session: &str, text: &str) {
+        let Some((session, slot)) = self.live_reply_slot(conn, frame_session) else {
             debug!(
                 conn,
                 "reply from an agent without the current live session; dropped"
@@ -594,6 +677,361 @@ impl Slots {
                 "agent reply queued"
             );
         }
+    }
+
+    /// Remembers a relayed permission request; [`Self::send_prompts`] puts it
+    /// into the topic of the session's own slot. Unlike a reply it needs no
+    /// "current session of the slot" check: a session that ended has its
+    /// prompts closed (see [`Self::close_ended_prompts`]).
+    fn on_permission_request(
+        &mut self,
+        conn: u64,
+        frame_session: &str,
+        request: PermissionRequest,
+    ) {
+        let Some(bound) = self.conns.get(&conn) else {
+            return;
+        };
+        if !is_request_id(&request.request_id) {
+            debug!(
+                conn,
+                "permission request without a valid request id; dropped"
+            );
+            return;
+        }
+        let session = frame_session.to_owned();
+        if self
+            .registry
+            .sessions
+            .get(&session)
+            .is_some_and(|entry| entry.ended)
+        {
+            debug!(
+                conn,
+                session = short(&session),
+                "permission request for an ended session; dropped"
+            );
+            return;
+        }
+        let prompt = Prompt::new(
+            conn,
+            bound.host.clone(),
+            bound.claude_pid,
+            session.clone(),
+            &request,
+        );
+        match self.prompts.open(prompt) {
+            Opened::Added { expired, .. } => {
+                info!(
+                    conn,
+                    session = short(&session),
+                    "permission request queued for the topic"
+                );
+                if let Some(gone) = expired {
+                    self.expire(gone);
+                }
+            }
+            Opened::Duplicate => debug!(conn, "permission request already shown; not repeated"),
+            Opened::Full => warn!(
+                conn,
+                session = short(&session),
+                "too many permission prompts wait for an answer; this one only in the terminal"
+            ),
+        }
+        self.sync_waiting(&session);
+    }
+
+    /// An open prompt the full book let go: its buttons go away. One try: a
+    /// press on buttons that stayed only answers "expired".
+    fn expire(&mut self, gone: Prompt) {
+        info!(
+            session = short(&gone.session),
+            "oldest open permission prompt expired to make room"
+        );
+        if let Some(message_id) = gone.message_id {
+            self.hand_off(
+                Work::Callback,
+                Op::Edit {
+                    message_id,
+                    text: permissions::ANSWER_EXPIRED.to_owned(),
+                    reply_markup: Some(permissions::no_keyboard()),
+                },
+            );
+        }
+        self.sync_waiting(&gone.session);
+    }
+
+    /// The waiting icon of `session` shows whether it has a prompt that
+    /// still counts (see [`Prompt::waits`]).
+    fn sync_waiting(&mut self, session: &str) {
+        let waiting = self.prompts.waiting(session);
+        self.registry.set_waiting(session, waiting);
+    }
+
+    /// Ends an active prompt: its final edit goes out on the next pump.
+    fn finish(&mut self, key: u64, state: State) {
+        let Some(session) = self.prompts.get(key).map(|prompt| prompt.session.clone()) else {
+            return;
+        };
+        if self.prompts.finish(key, state) {
+            self.sync_waiting(&session);
+        }
+    }
+
+    /// Closes the active prompts of every session the registry marks ended:
+    /// by its SessionEnd, by `/clear` or by a new session on a reused pid.
+    /// A SessionEnd the registry ignored (a nested resume) closes nothing.
+    fn close_prompts(&mut self, ended_sessions: &[String]) {
+        for key in self.prompts.active() {
+            let Some(session) = self.prompts.get(key).map(|prompt| prompt.session.clone()) else {
+                continue;
+            };
+            if ended_sessions.iter().any(|ended| ended == &session) {
+                info!(
+                    session = short(&session),
+                    "permission prompt closed: its session ended"
+                );
+                self.finish(key, State::Closed);
+            }
+        }
+    }
+
+    /// Hands every active prompt whose session's slot has a topic to
+    /// Telegram, on the permission lane. Prompts are never counted against
+    /// [`MAX_QUEUED_MESSAGES`]; [`permissions::MAX_PROMPTS`] bounds them.
+    fn send_prompts(&mut self) {
+        for key in self.prompts.unsent() {
+            let Some(session) = self.prompts.get(key).map(|prompt| prompt.session.clone()) else {
+                continue;
+            };
+            let Some(entry) = self.registry.sessions.get(&session) else {
+                // Agent-before-SessionStart: retain it until the hook arrives.
+                continue;
+            };
+            if entry.ended {
+                self.finish(key, State::Closed);
+                continue;
+            }
+            let thread_id = entry
+                .slot
+                .and_then(|slot| self.registry.slot(slot))
+                .and_then(|slot| slot.topic_id);
+            let Some(thread_id) = thread_id else {
+                continue;
+            };
+            let Some(prompt) = self.prompts.get(key) else {
+                continue;
+            };
+            let op = Op::Send {
+                thread_id: Some(thread_id),
+                text: prompt.text.clone(),
+                reply_markup: Some(permissions::keyboard(&prompt.request_id)),
+                permission: true,
+            };
+            if let Some(prompt) = self.prompts.get_mut(key) {
+                prompt.sent = true;
+            }
+            self.hand_off(Work::Permission(key), op);
+        }
+    }
+
+    /// Hands out the final edits that are due: the decision or the end of
+    /// the session, always without buttons.
+    fn send_prompt_edits(&mut self) {
+        for key in self.prompts.due_edits() {
+            let Some(prompt) = self.prompts.get_mut(key) else {
+                continue;
+            };
+            let (Some(message_id), Some(text)) = (prompt.message_id, prompt.final_text()) else {
+                continue;
+            };
+            prompt.edit = Edit::InFlight;
+            self.hand_off(
+                Work::PromptEdit(key),
+                Op::Edit {
+                    message_id,
+                    text,
+                    reply_markup: Some(permissions::no_keyboard()),
+                },
+            );
+        }
+    }
+
+    /// Answers every button press at once; the final edit follows when the
+    /// prompt ends.
+    fn on_callback(&mut self, input: CallbackInput) {
+        let answer = self.press(&input);
+        self.hand_off(
+            Work::Callback,
+            Op::AnswerCallback {
+                query_id: input.query_id,
+                text: answer.map(str::to_owned),
+            },
+        );
+    }
+
+    /// The first press on an open prompt fixes the answer for good; later
+    /// presses only push the same verdict again. Buttons that are not
+    /// permission buttons get an empty answer.
+    fn press(&mut self, input: &CallbackInput) -> Option<&'static str> {
+        let Some((behavior, request_id)) =
+            input.data.as_deref().and_then(permissions::parse_callback)
+        else {
+            debug!("button press that is not a permission answer");
+            return None;
+        };
+        let expired = Some(permissions::ANSWER_EXPIRED);
+        let Some(message_id) = input.message_id else {
+            return expired;
+        };
+        let Some(key) = self.prompts.by_message(message_id) else {
+            debug!("button of a prompt this hub does not know");
+            return expired;
+        };
+        let Some(prompt) = self
+            .prompts
+            .get_mut(key)
+            .filter(|prompt| prompt.request_id == request_id)
+        else {
+            return expired;
+        };
+        match prompt.state {
+            State::Closed => expired,
+            State::Selected { .. } | State::Decided(_) => {
+                debug!(
+                    session = short(&prompt.session),
+                    "prompt already answered; no second verdict"
+                );
+                self.push_verdict(key);
+                Some(permissions::ANSWER_DECIDED)
+            }
+            State::Open => {
+                prompt.state = State::Selected {
+                    behavior,
+                    verdict_id: crate::wire::random_u64(),
+                };
+                info!(
+                    session = short(&prompt.session),
+                    ?behavior,
+                    "permission answer chosen in Telegram"
+                );
+                if self.push_verdict(key) {
+                    Some(permissions::answer(behavior))
+                } else {
+                    Some(permissions::ANSWER_OFFLINE)
+                }
+            }
+        }
+    }
+
+    /// Hands the fixed answer of a selected prompt to an agent of its
+    /// session. An agent that acknowledges verdicts decides the prompt with
+    /// its ack; for an older agent the hand-off is all there is to know.
+    /// `false`: no agent of the session could take it now.
+    fn push_verdict(&mut self, key: u64) -> bool {
+        let Some(prompt) = self.prompts.get(key) else {
+            return false;
+        };
+        let State::Selected {
+            behavior,
+            verdict_id,
+        } = prompt.state
+        else {
+            return false;
+        };
+        let Some((conn, bound)) = self
+            .verdict_conn(prompt)
+            .and_then(|conn| self.conns.get(&conn).map(|bound| (conn, bound)))
+        else {
+            info!(
+                session = short(&prompt.session),
+                "permission answer for an agent that is not on line; it waits"
+            );
+            return false;
+        };
+        let verdict = HubMsg::PermissionVerdict {
+            request_id: prompt.request_id.clone(),
+            behavior,
+            verdict_id: bound.acks.then_some(verdict_id),
+        };
+        if bound.to_agent.try_send(verdict).is_err() {
+            warn!(
+                conn,
+                "agent queue full or closed; the permission answer waits"
+            );
+            return false;
+        }
+        info!(
+            conn,
+            session = short(&prompt.session),
+            ?behavior,
+            "permission verdict forwarded to the session agent"
+        );
+        if !bound.acks {
+            self.finish(key, State::Decided(behavior));
+        }
+        true
+    }
+
+    /// Selected prompts go again to their session's agents: after a link
+    /// came back (`session`) or on the retry tick (all). The agent drops a
+    /// verdict id it already passed on and acks it again.
+    fn push_selected(&mut self, session: Option<&str>) {
+        for key in self.prompts.selected() {
+            let wanted = self
+                .prompts
+                .get(key)
+                .is_some_and(|prompt| session.is_none_or(|session| prompt.session == session));
+            if wanted {
+                self.push_verdict(key);
+            }
+        }
+    }
+
+    /// The agent took the verdict: the prompt is decided.
+    fn on_verdict_ack(&mut self, conn: u64, frame_session: &str, verdict_id: u64) {
+        let Some(key) = self.prompts.by_verdict(verdict_id) else {
+            debug!(conn, "ack of a verdict nothing waits for");
+            return;
+        };
+        let Some(prompt) = self.prompts.get(key) else {
+            return;
+        };
+        let State::Selected { behavior, .. } = prompt.state else {
+            return;
+        };
+        if frame_session != prompt.session {
+            debug!(
+                conn,
+                "verdict ack from an agent of another session; ignored"
+            );
+            return;
+        }
+        info!(
+            conn,
+            session = short(&prompt.session),
+            "permission verdict taken by the session agent"
+        );
+        self.finish(key, State::Decided(behavior));
+    }
+
+    /// An agent bound to the prompt's session: the one that relayed it, or
+    /// after a link drop the newest connection of the same claude process.
+    /// A connection that follows another session (after `/clear`) or another
+    /// process on a reused pid never qualifies.
+    fn verdict_conn(&self, prompt: &Prompt) -> Option<u64> {
+        let serves = |bound: &Conn| bound.session == prompt.session;
+        if self.conns.get(&prompt.conn).is_some_and(serves) {
+            return Some(prompt.conn);
+        }
+        let pid = prompt.claude_pid?;
+        self.conns
+            .iter()
+            .filter(|(_, bound)| {
+                serves(bound) && bound.host == prompt.host && bound.claude_pid == Some(pid)
+            })
+            .map(|(conn, _)| *conn)
+            .max()
     }
 
     /// Sends `notice` to the slot's topic unless the slot got it within
@@ -644,6 +1082,8 @@ impl Slots {
         let now = Instant::now();
         if now >= self.next_retry {
             self.registry.retry_failed();
+            self.prompts.retry_failed_edits();
+            self.push_selected(None);
             self.next_retry = now + self.options.retry_every;
         }
     }
@@ -674,6 +1114,32 @@ impl Slots {
                     None => warn!("message to a topic got no answer"),
                 }
             }
+            Done::Permission { key, delivery } => {
+                match delivery {
+                    Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                        self.prompts.delivered(key, message.message_id);
+                        return;
+                    }
+                    Some(Ok(_)) => {
+                        warn!(
+                            "permission prompt sent without a message id; its buttons cannot work"
+                        );
+                    }
+                    Some(Err(error)) => {
+                        warn!(%error, "permission prompt not delivered; it can be answered in the terminal");
+                    }
+                    None => warn!("permission prompt got no answer"),
+                }
+                if let Some(gone) = self.prompts.remove(key) {
+                    self.sync_waiting(&gone.session);
+                }
+            }
+            Done::PromptEdit { key, delivery } => self.on_prompt_edit_done(key, delivery),
+            Done::Callback(delivery) => {
+                if let Some(Err(error)) = delivery {
+                    debug!(%error, "button answer or expired prompt edit failed");
+                }
+            }
             Done::Title {
                 session,
                 path,
@@ -698,6 +1164,34 @@ impl Slots {
                     None => {}
                 }
             }
+        }
+    }
+
+    fn on_prompt_edit_done(&mut self, key: u64, delivery: Option<Delivery>) {
+        let applied = match &delivery {
+            Some(Ok(_)) => true,
+            // Shown already, or the message is gone: nothing left to fix.
+            Some(delivery) => telegram_error(
+                delivery,
+                &[
+                    "message is not modified",
+                    "message to edit not found",
+                    "message can't be edited",
+                ],
+            ),
+            None => false,
+        };
+        if applied {
+            self.prompts.edit_done(key);
+            return;
+        }
+        let attempts = self.prompts.edit_failed(key);
+        if attempts == 1 {
+            warn!("permission prompt edit failed; its buttons stay until a retry works");
+        } else if attempts >= permissions::MAX_EDIT_ATTEMPTS {
+            warn!("permission prompt edit keeps failing; given up");
+        } else {
+            debug!(attempts, "permission prompt edit failed again");
         }
     }
 
@@ -788,8 +1282,8 @@ impl Slots {
         }
     }
 
-    /// Hands pending topic work to the dispatch task, publishes the view and
-    /// the snapshot to save.
+    /// Hands pending topic work and prompts to the dispatch task, publishes
+    /// the view and the snapshot to save.
     fn pump(&mut self) {
         let edits = Instant::now() >= self.grace_until;
         for job in self.registry.topic_work(&self.options.icons, edits) {
@@ -819,6 +1313,8 @@ impl Slots {
             };
             self.hand_off(Work::Topic(job), op);
         }
+        self.send_prompts();
+        self.send_prompt_edits();
         let view = self.registry.topic_view();
         self.view.send_if_modified(|current| {
             let changed = **current != view;
@@ -860,6 +1356,9 @@ async fn dispatch_loop(
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
                 Work::Message => Done::Message(delivery),
+                Work::Permission(key) => Done::Permission { key, delivery },
+                Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
+                Work::Callback => Done::Callback(delivery),
             });
         });
     }
@@ -894,6 +1393,7 @@ async fn save_loop(store: RegistryStore, mut saves: watch::Receiver<Option<Arc<V
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Mutex;
 
     use super::*;
@@ -901,7 +1401,7 @@ mod tests {
     use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL};
     use crate::hub::scheduler::{BucketConfig, Scheduler, Transport};
     use crate::hub::testdir::TempDir;
-    use crate::wire::{HookEvent, PermissionRequest, Register};
+    use crate::wire::{Behavior, HookEvent, PermissionRequest, Register};
 
     const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
     const B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -910,15 +1410,19 @@ mod tests {
     // generous bound only protects against a loaded host, it hides nothing.
     const WAIT: Duration = Duration::from_secs(60);
 
-    /// Records every op. Topics are numbered from 100. `edit_errors` and
+    /// Records every op. Topics are numbered from 100, sent messages from
+    /// 1000. `edit_errors` and
     /// `send_errors` answer the next edits or sends with these Telegram
     /// errors (last first). `stall`: no call ever returns.
     #[derive(Default)]
     struct Fake {
         ops: Mutex<Vec<Op>>,
         next_topic: Mutex<i64>,
+        next_message: Mutex<i64>,
         edit_errors: Mutex<Vec<&'static str>>,
         send_errors: Mutex<Vec<&'static str>>,
+        /// Answers the next `editMessageText` calls (last first).
+        message_edit_errors: Mutex<Vec<(i64, &'static str)>>,
         delete_error: Option<&'static str>,
         stall: bool,
         /// Only sends never return; topic calls still answer.
@@ -954,13 +1458,29 @@ mod tests {
                     Some(description) => error(description),
                     None => Ok(Outcome::Done),
                 },
+                Op::Edit { .. } => match self.message_edit_errors.lock().unwrap().pop() {
+                    Some((code, description)) => Err(ApiError::Telegram {
+                        code,
+                        description: description.to_owned(),
+                    }),
+                    None => Ok(Outcome::Done),
+                },
                 Op::Delete { .. } => match self.delete_error {
                     Some(description) => error(description),
                     None => Ok(Outcome::Done),
                 },
                 Op::Send { .. } => match self.send_errors.lock().unwrap().pop() {
                     Some(description) => error(description),
-                    None => Ok(Outcome::Sent(Message::default())),
+                    None => {
+                        let mut next = self.next_message.lock().unwrap();
+                        *next = (*next).max(1000);
+                        let message_id = *next;
+                        *next += 1;
+                        Ok(Outcome::Sent(Message {
+                            message_id,
+                            ..Message::default()
+                        }))
+                    }
                 },
                 _ => Ok(Outcome::Sent(Message::default())),
             }
@@ -1047,8 +1567,19 @@ mod tests {
             self.agent_of(conn, session, None).await;
         }
 
-        /// An agent that reports the pid of its claude process.
+        /// An agent that reports the pid of its claude process and does not
+        /// acknowledge verdicts (built before TASK-014).
         async fn agent_of(&mut self, conn: u64, session: &str, claude_pid: Option<u32>) {
+            self.agent_with(conn, session, claude_pid, false).await;
+        }
+
+        async fn agent_with(
+            &mut self,
+            conn: u64,
+            session: &str,
+            claude_pid: Option<u32>,
+            verdict_ack: bool,
+        ) {
             let (to_agent, rx) = mpsc::channel(4);
             self._to_agent.push(rx);
             let register = Register {
@@ -1056,6 +1587,7 @@ mod tests {
                 host: "box".into(),
                 cwd: CWD.into(),
                 claude_pid,
+                verdict_ack,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -1297,6 +1829,7 @@ mod tests {
     fn reply(conn: u64, text: &str) -> AgentEvent {
         AgentEvent::Message {
             conn,
+            received_at: StdInstant::now(),
             msg: AgentMsg::Reply { text: text.into() },
         }
     }
@@ -1418,6 +1951,1025 @@ mod tests {
         assert!(fake.ops().is_empty(), "{:?}", fake.ops());
     }
 
+    fn permission(conn: u64, request_id: &str, preview: &str) -> AgentEvent {
+        AgentEvent::Message {
+            conn,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::PermissionRequest(PermissionRequest {
+                request_id: request_id.into(),
+                tool_name: "Bash".into(),
+                description: "run the tests".into(),
+                input_preview: preview.into(),
+            }),
+        }
+    }
+
+    fn press(query: &str, message_id: Option<i64>, data: &str) -> Control {
+        Control::Callback(CallbackInput {
+            query_id: query.into(),
+            data: Some(data.into()),
+            message_id,
+        })
+    }
+
+    /// Permission prompts sent so far: (thread, text, message id Telegram gave).
+    fn prompts(ops: &[Op]) -> Vec<(i64, String, i64)> {
+        let mut message_id = 1000;
+        let mut found = Vec::new();
+        for op in ops {
+            if let Op::Send {
+                thread_id: Some(thread),
+                text,
+                permission,
+                ..
+            } = op
+            {
+                if *permission {
+                    found.push((*thread, text.clone(), message_id));
+                }
+                message_id += 1;
+            }
+        }
+        found
+    }
+
+    fn answers(ops: &[Op]) -> Vec<Option<&str>> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::AnswerCallback { text, .. } => Some(text.as_deref()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn verdicts(got: &[HubMsg]) -> Vec<(String, Behavior)> {
+        got.iter()
+            .filter_map(|msg| match msg {
+                HubMsg::PermissionVerdict {
+                    request_id,
+                    behavior,
+                    ..
+                } => Some((request_id.clone(), *behavior)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_prompt_reaches_its_topic_with_two_bounded_buttons() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        let huge = "😀".repeat(16 * 1024);
+        rig.agents
+            .send(permission(2, "abcde", &huge))
+            .await
+            .unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let sent = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    op,
+                    Op::Send {
+                        permission: true,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let Op::Send {
+            thread_id,
+            text,
+            reply_markup: Some(markup),
+            ..
+        } = sent
+        else {
+            panic!("{sent:?}");
+        };
+        assert_eq!(*thread_id, Some(101), "B's topic");
+        assert!(transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT);
+        let data: Vec<&str> = markup["inline_keyboard"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|button| button["callback_data"].as_str().unwrap())
+            .collect();
+        assert_eq!(data, ["allow:abcde", "deny:abcde"]);
+        assert!(
+            data.iter()
+                .all(|d| d.len() <= permissions::MAX_CALLBACK_DATA)
+        );
+        settled(&rig, |ops| {
+            last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_first_press_sends_one_verdict_and_later_presses_do_not() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, text, message_id) = prompts(&ops).remove(0);
+        // Let Done::Permission record the message id.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q1", Some(message_id), "allow:abcde"))
+            .unwrap();
+        rig.control
+            .send(press("q2", Some(message_id), "allow:abcde"))
+            .unwrap();
+        rig.control
+            .send(press("q3", Some(message_id), "deny:abcde"))
+            .unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 3).await;
+        assert_eq!(
+            answers(&ops),
+            [
+                Some(permissions::ANSWER_ALLOWED),
+                Some(permissions::ANSWER_DECIDED),
+                Some(permissions::ANSWER_DECIDED),
+            ]
+        );
+        let got = received(&mut rig, 1).await;
+        assert_eq!(verdicts(&got), [("abcde".to_owned(), Behavior::Allow)]);
+        assert!(
+            matches!(
+                got.as_slice(),
+                [HubMsg::PermissionVerdict {
+                    verdict_id: None,
+                    ..
+                }]
+            ),
+            "an agent without acks gets the v1 verdict: {got:?}"
+        );
+        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+        let edits: Vec<&Op> = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Edit { .. }))
+            .collect();
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert!(
+            matches!(edits[0], Op::Edit { message_id: id, text: edited, reply_markup: Some(markup) }
+            if *id == message_id
+                && *edited == format!("{text}{}", permissions::ALLOWED_MARK)
+                && *markup == permissions::no_keyboard())
+        );
+        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
+    }
+
+    #[tokio::test]
+    async fn one_request_id_in_two_sessions_is_told_apart_by_its_message() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.agents.send(permission(1, "abcde", "a")).await.unwrap();
+        rig.agents.send(permission(2, "abcde", "b")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let of_b = prompts(&ops)
+            .into_iter()
+            .find(|(thread, _, _)| *thread == 101)
+            .unwrap();
+        rig.control
+            .send(press("q", Some(of_b.2), "deny:abcde"))
+            .unwrap();
+        settled(&rig, |ops| answers(ops).len() == 1).await;
+        assert_eq!(
+            verdicts(&received(&mut rig, 1).await),
+            [("abcde".to_owned(), Behavior::Deny)]
+        );
+        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_or_foreign_presses_send_no_verdict() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, _, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for control in [
+            press("q1", Some(message_id + 50), "allow:abcde"), // unknown message
+            press("q2", Some(message_id), "allow:bcdef"),      // another id
+            press("q3", None, "allow:abcde"),                  // inaccessible message
+            press("q4", Some(message_id), "allow:abcdl"),      // not a request id
+            press("q5", Some(message_id), "resume:x"),         // another button
+        ] {
+            rig.control.send(control).unwrap();
+        }
+        let ops = settled(&rig, |ops| answers(ops).len() == 5).await;
+        let expired = Some(permissions::ANSWER_EXPIRED);
+        assert_eq!(answers(&ops), [expired, expired, expired, None, None]);
+        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+        assert!(!ops.iter().any(|op| matches!(op, Op::Edit { .. })));
+    }
+
+    // ---- TASK-014 review 2: lifecycle defects of the planner reference ----
+
+    const CLOSED: &str = "Сессия завершилась";
+
+    #[test]
+    fn the_closing_text_is_the_decided_wording() {
+        assert_eq!(permissions::CLOSED_TEXT, CLOSED);
+    }
+
+    impl Rig {
+        /// An agent that acknowledges verdicts (`Register::verdict_ack`).
+        async fn agent_acking(&mut self, conn: u64, session: &str, claude_pid: Option<u32>) {
+            self.agent_with(conn, session, claude_pid, true).await;
+        }
+    }
+
+    /// The actor driven by direct calls over a Telegram that answers at once
+    /// (answers are not fed back: there is no run loop).
+    fn live_slots(dir: &TempDir, options: Options) -> (Arc<Fake>, Slots) {
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let fake = Arc::new(Fake::default());
+        let fast = BucketConfig {
+            capacity: 1000,
+            refill_every: Duration::from_millis(1),
+            min_gap: Duration::ZERO,
+        };
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), fast);
+        tokio::spawn(scheduler.run());
+        let slots = Slots::new(Registry::default(), store, outbox, options).0;
+        (fake, slots)
+    }
+
+    fn edits_of(ops: &[Op], message: i64) -> Vec<(String, Option<serde_json::Value>)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Edit {
+                    message_id,
+                    text,
+                    reply_markup,
+                } if *message_id == message => Some((text.clone(), reply_markup.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Five letters without `l`, distinct for every `n` below 25^5.
+    fn request_id(mut n: usize) -> String {
+        const LETTERS: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+        let mut id = String::new();
+        for _ in 0..5 {
+            id.push(LETTERS[n % LETTERS.len()] as char);
+            n /= LETTERS.len();
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn session_end_closes_its_open_prompt_and_a_late_press_does_nothing() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, _, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.hook(hook(
+            B,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(11),
+            },
+        ))
+        .await;
+        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_DEAD)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.control
+            .send(press("late", Some(message_id), "allow:abcde"))
+            .unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
+        assert!(
+            verdicts(&received(&mut rig, 1).await).is_empty(),
+            "no verdict after the end"
+        );
+        assert_eq!(answers(&ops), [Some(permissions::ANSWER_EXPIRED)]);
+        assert_eq!(
+            edits_of(&ops, message_id),
+            [(CLOSED.to_owned(), Some(permissions::no_keyboard()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permission_request_consumed_after_session_end_is_dropped() {
+        let dir = TempDir::new("slots-late-permission");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, mut from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: false,
+            },
+            to_agent,
+        });
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+
+        slots.on_agent(permission(1, "abcde", "late"));
+        slots.pump();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(slots.prompts.is_empty());
+        assert!(!fake.ops().iter().any(|op| matches!(
+            op,
+            Op::Send {
+                permission: true,
+                ..
+            }
+        )));
+        assert!(from_hub.try_recv().is_err(), "no verdict after SessionEnd");
+    }
+
+    #[tokio::test]
+    async fn a_frame_read_before_clear_is_not_attributed_to_the_new_session() {
+        let dir = TempDir::new("slots-clear-frame-binding");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        let queued = permission(1, "abcde", "before clear");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ));
+        slots.on_agent(queued);
+        assert!(
+            slots.prompts.is_empty(),
+            "the pre-clear frame belonged to A"
+        );
+
+        slots.on_agent(permission(1, "bcdef", "after clear"));
+        assert_eq!(
+            slots.prompts.get(0).map(|prompt| prompt.session.as_str()),
+            Some(B)
+        );
+        slots.pump();
+        let wait = async {
+            while !fake.ops().iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Send {
+                        permission: true,
+                        ..
+                    }
+                )
+            }) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, wait)
+            .await
+            .expect("prompt in time");
+        let ops = fake.ops();
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(
+                    op,
+                    Op::Send {
+                        permission: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn start_first_clear_closes_a_prompt_even_when_pruning_removes_its_session() {
+        let dir = TempDir::new("slots-clear-prune-prompt");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_agent(permission(1, "abcde", "p"));
+        slots.prompts.get_mut(0).unwrap().sent = true;
+        slots.prompts.delivered(0, 500);
+
+        for i in 0..crate::hub::registry::MAX_SESSIONS - 1 {
+            let session = format!("nested-{i:04}");
+            slots.on_hook(&hook(
+                &session,
+                HookEvent::SessionStart {
+                    source: Some("startup".into()),
+                    claude_pid: None,
+                    parent_claude_pid: Some(50_000 + i as u32),
+                },
+            ));
+        }
+        assert_eq!(
+            slots.registry.sessions.len(),
+            crate::hub::registry::MAX_SESSIONS
+        );
+
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ));
+        assert!(!slots.registry.sessions.contains_key(A), "A was pruned");
+        assert_eq!(
+            slots.prompts.get(0).map(|prompt| prompt.state),
+            Some(State::Closed)
+        );
+
+        slots.pump();
+        let wait = async {
+            while edits_of(&fake.ops(), 500).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, wait)
+            .await
+            .expect("edit in time");
+        let ops = fake.ops();
+        assert_eq!(
+            edits_of(&ops, 500),
+            [(CLOSED.to_owned(), Some(permissions::no_keyboard()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_stays_in_its_slot_topic_when_clear_moves_the_slot_on() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.agents.send(permission(1, "abcde", "a")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (thread, _, old) = prompts(&ops).remove(0);
+        assert_eq!(thread, 100);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        rig.hook(hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ))
+        .await;
+        settled(&rig, |ops| {
+            sent_to(ops, 100).contains(&"── session bbbbbbbb · new ──")
+        })
+        .await;
+        // B, on the same agent (it follows its claude process), asks with the
+        // same five letters.
+        rig.agents.send(permission(1, "abcde", "b")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
+        let (thread, _, new) = prompts(&ops)[1].clone();
+        assert_eq!(thread, 100, "the slot's topic");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("old", Some(old), "allow:abcde"))
+            .unwrap();
+        rig.control
+            .send(press("new", Some(new), "deny:abcde"))
+            .unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 2).await;
+        assert_eq!(
+            verdicts(&received(&mut rig, 0).await),
+            [("abcde".to_owned(), Behavior::Deny)]
+        );
+        assert_eq!(
+            answers(&ops),
+            [
+                Some(permissions::ANSWER_EXPIRED),
+                Some(permissions::ANSWER_DENIED)
+            ]
+        );
+        assert_eq!(
+            edits_of(&ops, old),
+            [(CLOSED.to_owned(), Some(permissions::no_keyboard()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ended_sessions_prompt_never_reaches_the_topic_its_slot_moved_on_to() {
+        let dir = TempDir::new("slots-prompt-moved");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        connect(&mut slots, 1, A, Some(10));
+        // A asks while its slot has no topic yet.
+        slots.on_agent(permission(1, "abcde", "p"));
+        slots.pump();
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&start(B, 11));
+        slots.registry.topic_created(SlotId(0), 100, "t", None);
+        slots.pump();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !fake.ops().iter().any(|op| matches!(
+                op,
+                Op::Send {
+                    permission: true,
+                    ..
+                }
+            )),
+            "{:?}",
+            fake.ops()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verdict_lost_with_the_link_goes_again_to_the_reconnected_agent() {
+        let mut rig = rig(Fake::default(), message_options());
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_acking(1, A, Some(10)).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, _, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q1", Some(message_id), "allow:abcde"))
+            .unwrap();
+        assert_eq!(
+            verdicts(&received(&mut rig, 0).await),
+            [("abcde".to_owned(), Behavior::Allow)]
+        );
+        // The link drops before the agent read the verdict: no ack came back.
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        rig.agent_acking(2, A, Some(10)).await;
+        let again = received(&mut rig, 1).await;
+        assert_eq!(
+            verdicts(&again),
+            [("abcde".to_owned(), Behavior::Allow)],
+            "the same verdict again"
+        );
+        let [
+            HubMsg::PermissionVerdict {
+                verdict_id: Some(verdict_id),
+                ..
+            },
+        ] = again.as_slice()
+        else {
+            panic!("{again:?}");
+        };
+        assert!(
+            edits_of(&rig.fake.ops(), message_id).is_empty(),
+            "not decided before the ack"
+        );
+        rig.agents
+            .send(AgentEvent::Message {
+                conn: 2,
+                received_at: StdInstant::now(),
+                msg: AgentMsg::PermissionAck {
+                    verdict_id: *verdict_id,
+                },
+            })
+            .await
+            .unwrap();
+        settled(&rig, |ops| edits_of(ops, message_id).len() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn an_acking_agent_decides_a_prompt_only_with_its_own_ack() {
+        let options = Options {
+            retry_every: Duration::from_millis(100),
+            ..message_options()
+        };
+        let mut rig = rig(Fake::default(), options);
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        rig.hook(start(B, 11)).await;
+        settled(&rig, |ops| count(ops, is_create) == 2).await;
+        rig.agent_acking(2, B, Some(11)).await;
+        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| {
+            prompts(ops).len() == 1
+                && last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
+        })
+        .await;
+        let (_, text, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q1", Some(message_id), "deny:abcde"))
+            .unwrap();
+        // Unacked, it goes again on every tick with the same id.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let got = received(&mut rig, 1).await;
+        let ids: HashSet<Option<u64>> = got
+            .iter()
+            .map(|msg| match msg {
+                HubMsg::PermissionVerdict { verdict_id, .. } => *verdict_id,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(got.len() >= 2, "{got:?}");
+        assert_eq!(ids.len(), 1, "{got:?}");
+        let Some(Some(verdict_id)) = ids.into_iter().next() else {
+            panic!("an acking agent gets an id");
+        };
+        assert!(edits_of(&rig.fake.ops(), message_id).is_empty());
+        assert_eq!(
+            last_icon(&rig.fake.ops(), 101),
+            Some(crate::hub::registry::ICON_WAITING)
+        );
+        // An ack from an agent of another session decides nothing.
+        rig.agents
+            .send(AgentEvent::Message {
+                conn: 1,
+                received_at: StdInstant::now(),
+                msg: AgentMsg::PermissionAck { verdict_id },
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(edits_of(&rig.fake.ops(), message_id).is_empty());
+        rig.agents
+            .send(AgentEvent::Message {
+                conn: 2,
+                received_at: StdInstant::now(),
+                msg: AgentMsg::PermissionAck { verdict_id },
+            })
+            .await
+            .unwrap();
+        let ops = settled(&rig, |ops| {
+            edits_of(ops, message_id).len() == 1 && last_icon(ops, 101) == Some(ICON_ALIVE)
+        })
+        .await;
+        assert_eq!(
+            edits_of(&ops, message_id),
+            [(
+                format!("{text}{}", permissions::DENIED_MARK),
+                Some(permissions::no_keyboard())
+            )]
+        );
+        // Decided: nothing goes again, a press only hears "already decided".
+        let _ = received(&mut rig, 1).await;
+        rig.control
+            .send(press("q2", Some(message_id), "allow:abcde"))
+            .unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 2).await;
+        assert_eq!(
+            answers(&ops),
+            [
+                Some(permissions::ANSWER_DENIED),
+                Some(permissions::ANSWER_DECIDED)
+            ]
+        );
+        assert!(received(&mut rig, 1).await.is_empty());
+        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_nested_resume_ending_leaves_the_prompt_open() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, _, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The end of a nested `claude -p --resume` of B: another pid.
+        rig.hook(hook(
+            B,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(99),
+            },
+        ))
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.control
+            .send(press("q", Some(message_id), "allow:abcde"))
+            .unwrap();
+        settled(&rig, |ops| answers(ops).len() == 1).await;
+        assert_eq!(
+            verdicts(&received(&mut rig, 1).await),
+            [("abcde".to_owned(), Behavior::Allow)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_boundary_stops_an_unanswered_prompt_from_holding_the_icon() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        // Answered in the terminal: the hub only sees the turn end.
+        rig.agents.send(permission(2, "abcde", "1")).await.unwrap();
+        settled(&rig, |ops| {
+            last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
+        })
+        .await;
+        rig.hook(hook(
+            B,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        ))
+        .await;
+        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
+        rig.agents.send(permission(2, "bcdef", "2")).await.unwrap();
+        let ops = settled(&rig, |ops| {
+            prompts(ops).len() == 2
+                && last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
+        })
+        .await;
+        let second = prompts(&ops)[1].2;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q", Some(second), "allow:bcdef"))
+            .unwrap();
+        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
+    }
+
+    #[tokio::test]
+    async fn a_verdict_never_reaches_another_session_on_the_same_pid() {
+        let mut rig = rig(Fake::default(), message_options());
+        // A hook without a pid: the registry cannot tie pid 10 to A.
+        rig.hook(hook(
+            A,
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: None,
+                parent_claude_pid: None,
+            },
+        ))
+        .await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, _, message_id) = prompts(&ops).remove(0);
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        // An agent of another session reports the same claude pid (a reused
+        // pid); its SessionStart has not arrived yet, so it waits unbound.
+        rig.agent_of(7, "cccccccc-0000-4000-8000-000000000003", Some(10))
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        rig.control
+            .send(press("q", Some(message_id), "allow:abcde"))
+            .unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
+        assert!(verdicts(&received(&mut rig, 1).await).is_empty());
+        assert_eq!(answers(&ops), [Some(permissions::ANSWER_OFFLINE)]);
+    }
+
+    #[tokio::test]
+    async fn the_waiting_icon_stays_while_another_prompt_of_the_session_is_open() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.agents.send(permission(2, "abcde", "1")).await.unwrap();
+        rig.agents.send(permission(2, "bcdef", "2")).await.unwrap();
+        let ops = settled(&rig, |ops| {
+            prompts(ops).len() == 2
+                && last_icon(ops, 101) == Some(crate::hub::registry::ICON_WAITING)
+        })
+        .await;
+        let shown = prompts(&ops);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q1", Some(shown[0].2), "allow:abcde"))
+            .unwrap();
+        settled(&rig, |ops| edits_of(ops, shown[0].2).len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            last_icon(&rig.fake.ops(), 101),
+            Some(crate::hub::registry::ICON_WAITING),
+            "the second prompt is still open"
+        );
+        rig.control
+            .send(press("q2", Some(shown[1].2), "allow:bcdef"))
+            .unwrap();
+        settled(&rig, |ops| last_icon(ops, 101) == Some(ICON_ALIVE)).await;
+    }
+
+    #[tokio::test]
+    async fn a_prompt_telegram_refused_leaves_no_waiting_icon() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.fake
+            .send_errors
+            .lock()
+            .unwrap()
+            .push("Bad Request: message text is empty");
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        settled(&rig, |ops| {
+            ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Send {
+                        permission: true,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(last_icon(&rig.fake.ops(), 101), Some(ICON_ALIVE));
+    }
+
+    #[tokio::test]
+    async fn a_failed_decision_edit_is_tried_again_on_the_tick() {
+        let options = Options {
+            retry_every: Duration::from_millis(100),
+            ..message_options()
+        };
+        let mut rig = rig(Fake::default(), options);
+        two_live_slots(&mut rig, true).await;
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, text, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.fake
+            .message_edit_errors
+            .lock()
+            .unwrap()
+            .push((500, "Internal Server Error"));
+        rig.control
+            .send(press("q1", Some(message_id), "allow:abcde"))
+            .unwrap();
+        settled(&rig, |ops| !edits_of(ops, message_id).is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let decided = (
+            format!("{text}{}", permissions::ALLOWED_MARK),
+            Some(permissions::no_keyboard()),
+        );
+        assert_eq!(
+            edits_of(&rig.fake.ops(), message_id),
+            [decided.clone(), decided],
+            "one failure, one retry, then done"
+        );
+        assert_eq!(verdicts(&received(&mut rig, 1).await).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_permission_edit_errors_are_treated_as_applied() {
+        let dir = TempDir::new("slots-terminal-prompt-edits");
+        let mut slots = stalled_slots(&dir, message_options());
+        connect(&mut slots, 1, A, Some(10));
+
+        for (key, description) in [
+            "Bad Request: message is not modified",
+            "Bad Request: message to edit not found",
+            "Bad Request: message can't be edited",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            slots.on_agent(permission(1, &request_id(key), "p"));
+            let key = key as u64;
+            slots.prompts.get_mut(key).unwrap().sent = true;
+            slots.prompts.delivered(key, 500 + key as i64);
+            slots.finish(key, State::Closed);
+            slots.on_prompt_edit_done(
+                key,
+                Some(Err(ApiError::Telegram {
+                    code: 400,
+                    description: description.to_owned(),
+                })),
+            );
+            let prompt = slots.prompts.get(key).unwrap();
+            assert_eq!(prompt.edit, Edit::Done, "{description}");
+            assert_eq!(prompt.edit_failures, 0, "{description}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_prompt_book_expires_its_oldest_prompt_visibly() {
+        let dir = TempDir::new("slots-prompt-book");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        for n in 0..permissions::MAX_PROMPTS {
+            slots.on_agent(permission(1, &request_id(n), "p"));
+        }
+        // All shown (no pump: nothing else goes out).
+        for key in 0..permissions::MAX_PROMPTS as u64 {
+            slots.prompts.get_mut(key).unwrap().sent = true;
+            slots.prompts.delivered(key, 5000 + key as i64);
+        }
+        slots.on_agent(permission(1, "zzzzz", "p"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ops = fake.ops();
+        let old = edits_of(&ops, 5000);
+        assert!(
+            old.len() == 1 && old[0].1 == Some(permissions::no_keyboard()),
+            "{ops:?}"
+        );
+        assert_eq!(ops.len(), 1, "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn the_first_press_stays_the_answer_while_the_agent_is_away() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (_, _, message_id) = prompts(&ops).remove(0);
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_NO_CHANNEL)).await;
+        rig.control
+            .send(press("q1", Some(message_id), "deny:abcde"))
+            .unwrap();
+        settled(&rig, |ops| answers(ops).len() == 1).await;
+        // A second thought while the agent is still away changes nothing.
+        rig.control
+            .send(press("q2", Some(message_id), "allow:abcde"))
+            .unwrap();
+        settled(&rig, |ops| answers(ops).len() == 2).await;
+        rig.agent_of(2, A, Some(10)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        rig.control
+            .send(press("q3", Some(message_id), "allow:abcde"))
+            .unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 3).await;
+        assert_eq!(
+            verdicts(&received(&mut rig, 1).await),
+            [("abcde".to_owned(), Behavior::Deny)],
+            "the first choice, once"
+        );
+        assert_eq!(
+            answers(&ops),
+            [
+                Some(permissions::ANSWER_OFFLINE),
+                Some(permissions::ANSWER_DECIDED),
+                Some(permissions::ANSWER_DECIDED)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompt_overtakes_a_full_reply_backlog() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        // Fill the reply cap for topic 100, then ask for a permission in 101.
+        for i in 0..MAX_QUEUED_MESSAGES + 10 {
+            rig.agents.send(reply(1, &format!("r{i}"))).await.unwrap();
+        }
+        rig.agents.send(permission(2, "abcde", "p")).await.unwrap();
+        // Identified by its text, not by the lane flag under test.
+        let is_prompt = |text: &&str| text.starts_with("Запрос разрешения");
+        let ops = settled(&rig, |ops| {
+            sends(ops).iter().any(is_prompt) || sends(ops).len() >= 3
+        })
+        .await;
+        let sends: Vec<&str> = sends(&ops);
+        // The first reply may already be on its way; nothing else is ahead.
+        let at = sends.iter().position(is_prompt);
+        assert!(at.is_some_and(|at| at <= 1), "prompt at {at:?}: {sends:?}");
+    }
+
     #[tokio::test]
     async fn a_multi_chunk_reply_is_rejected_atomically_at_the_cap() {
         let dir = TempDir::new("slots-atomic-reply");
@@ -1503,6 +3055,7 @@ mod tests {
                 host: "box".into(),
                 cwd: CWD.into(),
                 claude_pid,
+                verdict_ack: false,
             },
             to_agent,
         });
@@ -1560,6 +3113,7 @@ mod tests {
                 host: "box".into(),
                 cwd: CWD.into(),
                 claude_pid: Some(10),
+                verdict_ack: false,
             },
             to_agent,
         });
@@ -1836,6 +3390,7 @@ mod tests {
         rig.agents
             .send(AgentEvent::Message {
                 conn: 1,
+                received_at: StdInstant::now(),
                 msg: AgentMsg::PermissionRequest(PermissionRequest {
                     request_id: "abcde".into(),
                     tool_name: "Bash".into(),

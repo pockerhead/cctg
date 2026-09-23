@@ -5,6 +5,7 @@ pub mod commands;
 pub mod config;
 pub mod ingress;
 pub mod offset;
+pub mod permissions;
 pub mod registry;
 pub mod scheduler;
 pub mod sessions;
@@ -54,7 +55,7 @@ pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
 }
 
 /// The poll callback: commands go to the command worker's queue; other
-/// messages and topic edit notices go to the slot actor. Nothing here waits,
+/// messages, button presses and topic edit notices go to the slot actor. Nothing here waits,
 /// so a slow command or a slow Telegram never holds up polling.
 fn route_inbound<'a>(
     commands: &'a mpsc::UnboundedSender<Inbound>,
@@ -71,7 +72,11 @@ fn route_inbound<'a>(
                 warn!("slot actor stopped; message dropped");
             }
         }
-        Routed::Callback(_) => info!("inbound button press"),
+        Routed::Callback(input) => {
+            if control.send(Control::Callback(input)).is_err() {
+                warn!("slot actor stopped; button press dropped");
+            }
+        }
         Routed::Service(service) if service.kind == ServiceKind::TopicEdited => {
             let edited = Control::TopicEdited {
                 thread_id: service.thread_id,
@@ -345,6 +350,12 @@ mod tests {
             text: None,
             ..input("")
         }));
+        let press = updates::CallbackInput {
+            query_id: "q".to_owned(),
+            data: Some("allow:abcde".to_owned()),
+            message_id: Some(9),
+        };
+        route(Routed::Callback(press.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {
             route(Routed::Service(updates::ServiceMessage {
                 kind,
@@ -366,6 +377,7 @@ mod tests {
             control_rx.try_recv().unwrap(),
             Control::Message(Inbound { text: None, .. })
         ));
+        assert_eq!(control_rx.try_recv().unwrap(), Control::Callback(press));
         assert!(
             control_rx.try_recv().is_err(),
             "service messages are not input"

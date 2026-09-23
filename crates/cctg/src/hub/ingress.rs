@@ -58,9 +58,12 @@ pub enum AgentEvent {
         /// Dropping it stops outbound traffic, not the connection.
         to_agent: mpsc::Sender<HubMsg>,
     },
-    /// A `reply` or `permission_request` after registration.
+    /// A `reply`, `permission_request` or `permission_ack` after registration.
     Message {
         conn: u64,
+        /// Captured as soon as the complete frame was read, before delivery
+        /// can race with a `/clear` hook on the slots actor's other channel.
+        received_at: Instant,
         msg: AgentMsg,
     },
     Disconnected {
@@ -206,22 +209,26 @@ async fn agent_session(
         tokio::select! {
             frame = frames.recv() => {
                 match frame {
-                    Some(Ok(msg @ (AgentMsg::Reply { .. } | AgentMsg::PermissionRequest(_)))) => {
-                        if events.send(AgentEvent::Message { conn, msg }).await.is_err() {
+                    Some((received_at, Ok(
+                        msg @ (AgentMsg::Reply { .. }
+                        | AgentMsg::PermissionRequest(_)
+                        | AgentMsg::PermissionAck { .. }),
+                    ))) => {
+                        if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(_)) => warn!(conn, "agent repeated its handshake; ignored"),
-                    Some(Err(WireError::Version)) => {
+                    Some((_, Ok(_))) => warn!(conn, "agent repeated its handshake; ignored"),
+                    Some((_, Err(WireError::Version))) => {
                         warn!(conn, "agent changed protocol version; closing");
                         reject(&mut write, Rejection::Version).await;
                         break;
                     }
-                    Some(Err(error @ (WireError::Closed | WireError::TooLong | WireError::Io(_)))) => {
+                    Some((_, Err(error @ (WireError::Closed | WireError::TooLong | WireError::Io(_))))) => {
                         debug!(conn, %error, "agent link ended");
                         break;
                     }
-                    Some(Err(error)) => warn!(conn, %error, "agent line ignored"),
+                    Some((_, Err(error))) => warn!(conn, %error, "agent line ignored"),
                     None => break,
                 }
             }
@@ -243,14 +250,14 @@ async fn agent_session(
 
 async fn read_agent_frames(
     mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-    frames: mpsc::Sender<Result<AgentMsg, WireError>>,
+    frames: mpsc::Sender<(Instant, Result<AgentMsg, WireError>)>,
 ) {
     let mut line = Vec::new();
     loop {
         let frame = match wire::read_line(&mut reader, &mut line).await {
-            Ok(()) => wire::decode::<AgentMsg>(&line),
+            Ok(()) => (Instant::now(), wire::decode::<AgentMsg>(&line)),
             Err(error) => {
-                let _ = frames.send(Err(error)).await;
+                let _ = frames.send((Instant::now(), Err(error))).await;
                 return;
             }
         };
@@ -625,6 +632,7 @@ mod tests {
             host: "box".into(),
             cwd: "/w".into(),
             claude_pid: None,
+            verdict_ack: false,
         }
     }
 
@@ -728,7 +736,9 @@ mod tests {
         };
         peer.send(&reply).await;
         match within(events.recv()).await {
-            Some(AgentEvent::Message { conn: from, msg }) => {
+            Some(AgentEvent::Message {
+                conn: from, msg, ..
+            }) => {
                 assert_eq!((from, msg), (conn, reply));
             }
             other => panic!("expected the reply, got {other:?}"),

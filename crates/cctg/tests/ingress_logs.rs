@@ -103,6 +103,7 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
         host: format!("host-{content}"),
         cwd: format!("/home/{content}"),
         claude_pid: None,
+        verdict_ack: false,
     };
     let mut lines = wire::encode(&AgentMsg::Hello {
         secret: secret.clone(),
