@@ -11,6 +11,7 @@
 //! ```text
 //! CCTG_HUB_SECRET=<same value as on the hub>
 //! CCTG_HUB_HOOK_ADDR=127.0.0.1:47292   # optional, ip:port or host:port
+//! CCTG_HUB_AGENT_ADDR=127.0.0.1:47291  # optional, the hub agent listener
 //! CCTG_HOST=laptop                     # optional, defaults to the machine name
 //! ```
 
@@ -18,11 +19,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::hub::config::{DEFAULT_HOOK_LISTEN, SECRET_VAR};
+use crate::hub::config::{DEFAULT_AGENT_LISTEN, DEFAULT_HOOK_LISTEN, SECRET_VAR};
 use crate::wire::Secret;
 
 /// `host:port` of the hub hook endpoint.
 pub const HOOK_ADDR_VAR: &str = "CCTG_HUB_HOOK_ADDR";
+/// `host:port` of the hub agent listener (`cctg agent`).
+pub const AGENT_ADDR_VAR: &str = "CCTG_HUB_AGENT_ADDR";
 /// Optional override of the host name this device reports.
 pub const HOST_VAR: &str = "CCTG_HOST";
 /// Location of the device config file, relative to the home directory.
@@ -53,6 +56,7 @@ impl fmt::Display for ConfigProblem {
 pub struct DeviceConfig {
     pub secret: Result<Secret, ConfigProblem>,
     pub hook_addr: String,
+    pub agent_addr: String,
     pub host: String,
 }
 
@@ -83,9 +87,11 @@ impl DeviceConfig {
             Some(raw) => Secret::parse(&raw).map_err(|_| ConfigProblem::BadSecret),
         };
         let hook_addr = value(HOOK_ADDR_VAR).unwrap_or_else(|| DEFAULT_HOOK_LISTEN.to_string());
+        let agent_addr = value(AGENT_ADDR_VAR).unwrap_or_else(|| DEFAULT_AGENT_LISTEN.to_string());
         Self {
             secret,
             hook_addr,
+            agent_addr,
             host: host_name(&value),
         }
     }
@@ -189,9 +195,14 @@ mod tests {
         let config = DeviceConfig::from_vars(vars(&[(SECRET_VAR, SECRET), (HOST_VAR, " laptop ")]));
         assert_eq!(config.secret.as_ref().map(Secret::expose), Ok(SECRET));
         assert_eq!(config.hook_addr, "127.0.0.1:47292");
+        assert_eq!(config.agent_addr, "127.0.0.1:47291");
         assert_eq!(config.host, "laptop");
 
-        let config = DeviceConfig::from_vars(vars(&[(HOOK_ADDR_VAR, "hub.tail:47292")]));
+        let config = DeviceConfig::from_vars(vars(&[
+            (HOOK_ADDR_VAR, "hub.tail:47292"),
+            (AGENT_ADDR_VAR, "hub.tail:47291"),
+        ]));
+        assert_eq!(config.agent_addr, "hub.tail:47291");
         assert_eq!(config.secret.err(), Some(ConfigProblem::NoSecret));
         assert_eq!(config.hook_addr, "hub.tail:47292");
         assert!(!config.host.is_empty());

@@ -2,6 +2,7 @@
 //! subcommands can use the hub modules.
 
 pub mod agent;
+pub mod channel;
 pub mod device;
 pub mod hook;
 pub mod hub;

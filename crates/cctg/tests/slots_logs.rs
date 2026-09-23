@@ -129,6 +129,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 session_id: "0dd0dd0d-0000-4000-8000-000000000009".into(),
                 host: "box".into(),
                 cwd: cwd.clone(),
+                claude_pid: None,
             },
             to_agent,
         })

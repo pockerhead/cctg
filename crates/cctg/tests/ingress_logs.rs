@@ -102,6 +102,7 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
         session_id: "5e551017-0000-4000-8000-000000000001".into(),
         host: format!("host-{content}"),
         cwd: format!("/home/{content}"),
+        claude_pid: None,
     };
     let mut lines = wire::encode(&AgentMsg::Hello {
         secret: secret.clone(),

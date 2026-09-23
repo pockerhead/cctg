@@ -164,13 +164,22 @@ fn first_ai_title(jsonl: impl Read, limit: u64) -> (Option<String>, u64) {
     }
 }
 
+/// One registered agent connection.
+struct Conn {
+    /// The session it is bound to or waits for.
+    session: String,
+    host: String,
+    claude_pid: Option<u32>,
+    _to_agent: mpsc::Sender<HubMsg>,
+}
+
 pub struct Slots {
     registry: Registry,
     dispatch: mpsc::UnboundedSender<(Work, Op)>,
     options: Options,
     saver: watch::Sender<Option<Arc<Vec<u8>>>>,
     view: watch::Sender<Arc<TopicView>>,
-    conns: HashMap<u64, (String, mpsc::Sender<HubMsg>)>,
+    conns: HashMap<u64, Conn>,
     /// Agents of sessions no SessionStart announced yet: session -> conn.
     pending: HashMap<String, u64>,
     reading: HashSet<String>,
@@ -256,7 +265,7 @@ impl Slots {
                 register,
                 to_agent,
             } => {
-                let session = register.session_id.clone();
+                let session = self.agent_session(&register);
                 if self.registry.agent_connected(&session, conn) {
                     info!(
                         conn,
@@ -271,24 +280,87 @@ impl Slots {
                     );
                     self.pending.insert(session.clone(), conn);
                 }
-                self.conns.insert(conn, (session, to_agent));
+                self.conns.insert(
+                    conn,
+                    Conn {
+                        session,
+                        host: register.host,
+                        claude_pid: register.claude_pid,
+                        _to_agent: to_agent,
+                    },
+                );
             }
             AgentEvent::Message { conn, msg } => {
-                let Some((session, _)) = self.conns.get(&conn) else {
+                let Some(bound) = self.conns.get(&conn) else {
                     return;
                 };
                 match msg {
-                    AgentMsg::PermissionRequest(_) => self.registry.set_waiting(session, true),
+                    AgentMsg::PermissionRequest(_) => {
+                        self.registry.set_waiting(&bound.session, true);
+                    }
                     _ => debug!(conn, "agent message not routed yet"),
                 }
             }
             AgentEvent::Disconnected { conn } => {
-                if let Some((session, _)) = self.conns.remove(&conn) {
-                    self.registry.agent_disconnected(&session, conn);
-                    if self.pending.get(&session) == Some(&conn) {
-                        self.pending.remove(&session);
+                if let Some(gone) = self.conns.remove(&conn) {
+                    self.registry.agent_disconnected(&gone.session, conn);
+                    if self.pending.get(&gone.session) == Some(&conn) {
+                        self.pending.remove(&gone.session);
                     }
                 }
+            }
+        }
+    }
+
+    /// The session a registering agent belongs to. Its env session id, unless
+    /// that session is over and the registry knows a newer session of the
+    /// same claude process: after `/clear` Claude Code keeps the channel
+    /// server running with the old id (TASK-013).
+    fn agent_session(&self, register: &crate::wire::Register) -> String {
+        if !self.registry.is_live_top_level(&register.session_id)
+            && let Some(current) = register
+                .claude_pid
+                .and_then(|pid| self.registry.live_session_of_pid(&register.host, pid))
+        {
+            return current.to_owned();
+        }
+        register.session_id.clone()
+    }
+
+    /// Moves the agents of a claude process to the session that process now
+    /// runs. Nothing moves when the pid names no running top-level session.
+    fn follow_pid(&mut self, host: &str, pid: u32) {
+        let Some(session) = self
+            .registry
+            .live_session_of_pid(host, pid)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let movers: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, bound)| {
+                bound.host == host && bound.claude_pid == Some(pid) && bound.session != session
+            })
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in movers {
+            let Some(bound) = self.conns.get_mut(&conn) else {
+                continue;
+            };
+            let old = std::mem::replace(&mut bound.session, session.clone());
+            self.registry.agent_disconnected(&old, conn);
+            if self.pending.get(&old) == Some(&conn) {
+                self.pending.remove(&old);
+            }
+            if self.registry.agent_connected(&session, conn) {
+                info!(
+                    conn,
+                    from = short(&old),
+                    session = short(&session),
+                    "agent follows its claude process to a new session"
+                );
             }
         }
     }
@@ -303,6 +375,13 @@ impl Slots {
             && let Some(conn) = self.pending.remove(session)
         {
             self.registry.agent_connected(session, conn);
+        }
+        if let HookEvent::SessionStart {
+            claude_pid: Some(pid),
+            ..
+        } = post.event
+        {
+            self.follow_pid(&post.host, pid);
         }
         if let Some((session, path)) = followup.read_title {
             self.read_title(session, path);
@@ -736,12 +815,18 @@ mod tests {
         }
 
         async fn agent(&mut self, conn: u64, session: &str) {
+            self.agent_of(conn, session, None).await;
+        }
+
+        /// An agent that reports the pid of its claude process.
+        async fn agent_of(&mut self, conn: u64, session: &str, claude_pid: Option<u32>) {
             let (to_agent, rx) = mpsc::channel(4);
             self._to_agent.push(rx);
             let register = Register {
                 session_id: session.into(),
                 host: "box".into(),
                 cwd: CWD.into(),
+                claude_pid,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -784,6 +869,142 @@ mod tests {
 
     fn is_create(op: &Op) -> bool {
         matches!(op, Op::CreateTopic { .. })
+    }
+
+    #[tokio::test]
+    async fn the_agent_follows_its_claude_process_through_clear() {
+        let mut rig = rig(Fake::default(), options());
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        let ops = rig.ops_after(2).await;
+        assert_eq!(icon_edit(&ops[1]), Some(ICON_ALIVE), "{ops:?}");
+
+        // `/clear`: the channel server keeps running with the old id.
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        rig.hook(hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ))
+        .await;
+        // The end may flash "dead" before the start arrives; what matters is
+        // that the new session ends up alive, never "no channel".
+        let ops = rig.ops_after(5).await;
+        assert_eq!(count(&ops, is_create), 1, "same slot: {ops:?}");
+        assert!(
+            ops[1..]
+                .iter()
+                .all(|op| icon_edit(op) != Some(ICON_NO_CHANNEL)),
+            "{ops:?}"
+        );
+        let last_icon = ops.iter().rev().find_map(icon_edit);
+        assert_eq!(last_icon, Some(ICON_ALIVE), "{ops:?}");
+
+        // The link drops and comes back with the stale env id: still B.
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        let before = rig.ops_after(ops.len() + 1).await.len();
+        rig.agent_of(2, A, Some(10)).await;
+        let ops = rig.ops_after(before + 1).await;
+        assert_eq!(icon_edit(ops.last().unwrap()), Some(ICON_ALIVE), "{ops:?}");
+    }
+
+    /// The recorded ops, once they satisfy `ready`.
+    async fn settled(rig: &Rig, ready: impl Fn(&[Op]) -> bool) -> Vec<Op> {
+        let reached = async {
+            loop {
+                let ops = rig.fake.ops();
+                if ready(&ops) {
+                    return ops;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        match tokio::time::timeout(WAIT, reached).await {
+            Ok(ops) => ops,
+            Err(_) => panic!("ops never settled: {:?}", rig.fake.ops()),
+        }
+    }
+
+    fn last_icon(ops: &[Op], thread: i64) -> Option<&str> {
+        ops.iter().rev().find_map(|op| match op {
+            Op::EditTopic {
+                thread_id,
+                icon_custom_emoji_id: Some(icon),
+                ..
+            } if *thread_id == thread => Some(icon.as_str()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_agent_follows_its_claude_process_when_the_new_start_comes_first() {
+        let mut rig = rig(Fake::default(), options());
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        rig.ops_after(2).await;
+
+        // `/clear` hooks run as separate processes: the new start can win.
+        rig.hook(hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ))
+        .await;
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        // B takes A's slot (same claude pid) and the agent moves with it:
+        // the topic is renamed and never shows "no channel".
+        let named_b = |ops: &[Op]| {
+            ops.iter().any(|op| {
+                matches!(op, Op::EditTopic { thread_id: 100, name: Some(name), .. }
+                    if name.ends_with("bbbbbbbb"))
+            })
+        };
+        settled(&rig, named_b).await;
+        // Room for a wrong "no channel" edit to show up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let ops = rig.fake.ops();
+        assert_eq!(count(&ops, is_create), 1, "{ops:?}");
+        assert!(
+            ops.iter().all(|op| icon_edit(op) != Some(ICON_NO_CHANNEL)),
+            "{ops:?}"
+        );
+        assert_eq!(last_icon(&ops, 100), Some(ICON_ALIVE), "{ops:?}");
+
+        // The late end of A must not take the pid away from B: the link
+        // drops (B loses its agent) and a reconnect with the stale env id
+        // lands on B again.
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_NO_CHANNEL)).await;
+        rig.agent_of(2, A, Some(10)).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
     }
 
     #[tokio::test]

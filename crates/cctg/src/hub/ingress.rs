@@ -624,6 +624,7 @@ mod tests {
             session_id: "5e551017-0000-4000-8000-000000000001".into(),
             host: "box".into(),
             cwd: "/w".into(),
+            claude_pid: None,
         }
     }
 

@@ -115,6 +115,11 @@ pub struct Register {
     pub session_id: String,
     pub host: String,
     pub cwd: String,
+    /// The Claude Code process that spawned the agent. `CLAUDE_CODE_SESSION_ID`
+    /// goes stale after `/clear` (the server is not restarted, TASK-013); the
+    /// hub follows the process through its `pids` map instead.
+    #[serde(default)]
+    pub claude_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -458,6 +463,7 @@ mod tests {
                 session_id: "5e551017-0000-4000-8000-000000000001".into(),
                 host: "box".into(),
                 cwd: "C:\\work\\app".into(),
+                claude_pid: Some(4242),
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -601,6 +607,20 @@ mod tests {
         assert_eq!(
             decode::<HubMsg>(br#"{"v":1,"type":"hello","secret":"x"}"#),
             Err(WireError::UnknownKind)
+        );
+    }
+
+    #[test]
+    fn a_register_without_claude_pid_still_decodes() {
+        let line = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
+        assert_eq!(
+            decode::<AgentMsg>(line),
+            Ok(AgentMsg::Register(Register {
+                session_id: "s".into(),
+                host: "h".into(),
+                cwd: "/w".into(),
+                claude_pid: None,
+            }))
         );
     }
 

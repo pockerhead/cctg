@@ -17,8 +17,11 @@ enum Command {
         #[arg(long)]
         env_file: Option<PathBuf>,
     },
-    /// Run the Claude Code channel agent.
+    /// Run the Claude Code channel agent (spawned by Claude Code over stdio).
     Agent,
+    /// Print the command that registers `cctg agent` with Claude Code at
+    /// user scope, with this executable's absolute path.
+    AgentInstall,
     /// Handle a Claude Code hook event.
     Hook {
         /// Hook event name.
@@ -37,7 +40,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(error) => error.exit(),
     };
-    init_tracing(matches!(&cli.command, Command::Hook { .. }));
+    init_tracing(matches!(
+        &cli.command,
+        Command::Hook { .. } | Command::Agent
+    ));
     match cli.command {
         Command::Hub { env_file } => cctg::hub::run(env_file.as_deref()).await?,
         Command::Hook { event } => {
@@ -49,14 +55,30 @@ async fn main() -> anyhow::Result<()> {
             let _ = tokio::spawn(async move { cctg::hook::run(&event).await }).await;
             std::process::exit(0);
         }
-        Command::Agent => {}
+        Command::Agent => {
+            // stdout belongs to JSON-RPC; a panic message goes to stderr as a
+            // fixed line (it could quote channel content).
+            std::panic::set_hook(Box::new(|_| {
+                let _ = cctg::agent::write_panic_message(std::io::stderr());
+            }));
+            let _ = tokio::spawn(cctg::agent::run_stdio()).await;
+            // At once: the stdin reader thread may still be blocked.
+            std::process::exit(0);
+        }
+        Command::AgentInstall => {
+            let exe = std::env::current_exe()?;
+            let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
+            println!("{}", cctg::agent::install_command(&exe));
+        }
     }
 
     Ok(())
 }
 
-fn init_tracing(is_hook: bool) {
-    if is_hook {
+/// `plain`: no colours and no time, for output Claude Code captures (hooks,
+/// the agent's stderr lands in its debug log).
+fn init_tracing(plain: bool) {
+    if plain {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_target(false)
@@ -91,6 +113,12 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["cctg", "agent"]).unwrap().command,
             Command::Agent
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "agent-install"])
+                .unwrap()
+                .command,
+            Command::AgentInstall
         ));
         assert!(matches!(
             Cli::try_parse_from(["cctg", "hook", "SessionStart"])

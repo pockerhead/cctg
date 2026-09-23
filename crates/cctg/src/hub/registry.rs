@@ -760,15 +760,33 @@ impl Registry {
 
     /// An agent registered. `false`: the session is unknown; the caller keeps
     /// the agent waiting for its SessionStart and never adopts it (without a
-    /// SessionStart a nested run cannot be told from a top-level one).
+    /// SessionStart a nested run cannot be told from a top-level one). The
+    /// agent of a nested run is never bound: it is not a channel of any slot.
     pub fn agent_connected(&mut self, session: &str, conn: u64) -> bool {
         match self.sessions.get_mut(session) {
-            Some(entry) => {
+            Some(entry) if entry.kind == SessionKind::TopLevel => {
                 entry.agent = Some(conn);
                 true
             }
-            None => false,
+            _ => false,
         }
+    }
+
+    /// The running top-level session of a claude process, if the registry
+    /// knows one. After `/clear` this is the new session of the same process.
+    pub fn live_session_of_pid(&self, host: &str, pid: u32) -> Option<&str> {
+        let session = self.pids.get(&pid_key(host, pid))?;
+        self.sessions
+            .get(session)
+            .filter(|entry| !entry.ended && entry.kind == SessionKind::TopLevel)
+            .map(|_| session.as_str())
+    }
+
+    /// A known top-level session that has not ended.
+    pub fn is_live_top_level(&self, session: &str) -> bool {
+        self.sessions
+            .get(session)
+            .is_some_and(|entry| !entry.ended && entry.kind == SessionKind::TopLevel)
     }
 
     pub fn agent_disconnected(&mut self, session: &str, conn: u64) {
@@ -1462,6 +1480,34 @@ mod tests {
         registry.apply_hook(&start_from(A, CWD, Some(30), None, "resume"));
         assert_eq!(registry.sessions[A].kind, SessionKind::TopLevel);
         assert_eq!(registry.sessions[A].slot, before.slot);
+    }
+
+    #[test]
+    fn the_pid_of_a_cleared_process_names_the_new_session() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        assert_eq!(registry.live_session_of_pid("box", 10), Some(A));
+        assert!(registry.is_live_top_level(A));
+        registry.apply_hook(&clear_end(A));
+        assert_eq!(registry.live_session_of_pid("box", 10), None);
+        assert!(!registry.is_live_top_level(A));
+        registry.apply_hook(&start_from(B, CWD, Some(10), None, "clear"));
+        assert_eq!(registry.live_session_of_pid("box", 10), Some(B));
+        assert_eq!(registry.live_session_of_pid("other", 10), None);
+        // A nested run's own pid never names a channel session.
+        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
+        assert_eq!(registry.live_session_of_pid("box", 20), None);
+        assert!(!registry.is_live_top_level(N));
+    }
+
+    #[test]
+    fn the_agent_of_a_nested_run_is_never_bound() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
+        assert!(!registry.agent_connected(N, 5));
+        assert_eq!(registry.sessions[N].agent, None);
+        assert!(registry.agent_connected(A, 6));
     }
 
     #[test]
