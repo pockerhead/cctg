@@ -1,0 +1,21 @@
+import datetime, io, json, os
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'log.jsonl')
+ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+base = dict(stage='planner', provider='claude', model='opus', effort='medium')
+H, P, D = 'crates/cctg/src/hook.rs', 'crates/cctg/src/proctree.rs', 'crates/cctg/src/device.rs'
+S = 'maw/tasks/in_progress/TASK-012/scratch/planner/'
+entries = [
+ ('decision', "Process tree on Windows via one CreateToolhelp32Snapshot through windows-sys 0.61 (already in Cargo.lock via tokio, cfg(windows) only, features Win32_Foundation + Win32_System_Diagnostics_ToolHelp); Linux walks /proc/<pid>/stat; other OS returns no chain (top-level, env CLAUDE_PID as own pid). Measured: snapshot 7 ms median vs PowerShell Get-CimInstance 271 ms. Alternative: sysinfo crate (heavy, refreshes far more than ppid+name) or shelling out (too slow for the 1.5 s SessionEnd budget).", [P, S + 'probe_timing.out']),
+ ('decision', "Own claude = nearest claude-named ancestor of the hook (the hook is always spawned by its own session), falling back to the ancestor whose pid == CLAUDE_PID, then to CLAUDE_PID; parent = next claude-named ancestor above it. Alternative: skip only the ancestor whose pid == CLAUDE_PID (TASK-003 wording) - identical when CLAUDE_PID is right, reports the session itself as parent when CLAUDE_PID is stale (the TASK-003 synthetic bug).", [P]),
+ ('decision', "One POST timeout of 500 ms for every event. Measured with the reference debug build: a closed local port costs the full timeout on Windows (SYN retried after RST), SessionEnd against a silent or absent hub 526-538 ms wall, answering hub 18-39 ms. Alternative: 500 ms for SessionEnd and 1 s for the rest (every prompt would wait 1 s whenever the hub is stopped).", [H, S + 'measure_session_end.debug.out']),
+ ('decision', "Device config (hub hook addr, shared secret, host override) comes from process env first, then <home>/.cctg/device.env read with dotenvy::from_path_iter into memory, never set_var; module crate::device, reused by TASK-013 together with host_name and canonical_cwd. Alternative: CCTG_* user environment variables only (every Bash tool call and every child of claude would carry the secret in its env).", [D]),
+ ('decision', "SubagentStop with a non-empty agent_type is dropped as internal when neither agent-<id>.jsonl nor agent-<id>.meta.json exists next to agent_transcript_path (14/14 internal events of TASK-003 have neither, the real Explore has both). Covers the --agent session-name case on the device, without SubagentStart state. Alternative: send the session's --agent name in SessionStart (new wire field) and filter in hub registry against seen SubagentStart (touches registry.rs, relies on SubagentStart that hooks installed mid-session miss).", [H, S + 'probe_internal_agents.out']),
+ ('decision', "Settings snippet (docs/hook-settings.json) registers the handback matcher on PostToolUse only; the binary accepts PreToolUse and PostToolUse alike. Alternative: both (every report reaches the hub twice under different event ids; PreToolUse also blocks the subagent before its tool runs).", ['docs/hook-settings.json', H]),
+ ('decision', "Shell-form commands 'cctg hook <Event>' in the snippet. Alternative: exec form (command 'cctg' + args) - no Git Bash in the chain and faster, but whether exec form resolves 'cctg' to cctg.exe via PATH on Windows is not verified.", ['docs/hook-settings.json']),
+ ('dead_end', "First reference build passed the Probe (with &dyn Fn fields, not Sync) across an .await inside a tokio::spawn'ed future: E0277. Fixed by building the POST in a sync helper (build_here) so the probe never lives across an await.", [H]),
+ ('dead_end', "First hook_cli run asserted < 1.2 s for SessionStart against a closed port while SessionStart had a 1 s timeout; flaked under parallel load because Windows retries the refused connect until the timeout. Led to the single 500 ms timeout.", ['crates/cctg/tests/hook_cli.rs']),
+]
+with io.open(LOG, 'a', encoding='utf-8', newline='\n') as f:
+    for kind, body, refs in entries:
+        f.write(json.dumps(dict(ts=ts, **base, kind=kind, body=body, refs=refs), ensure_ascii=False) + '\n')
+print('appended', len(entries))

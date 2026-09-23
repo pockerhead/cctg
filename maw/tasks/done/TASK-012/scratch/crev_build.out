@@ -1,0 +1,77 @@
+test last_prompts_keeps_the_last_n_exchanges ... ok
+test slices_render_independently ... ok
+test thinking_never_rendered ... ok
+test five_thousand_turns_render_in_linear_time ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-crev012-target\debug\deps\split-91d9db22c439d970.exe)
+
+running 14 tests
+test emoji_on_the_boundary_is_never_cut ... ok
+test crlf_is_not_split_at_the_limit ... ok
+test short_text_is_one_chunk ... ok
+test telegram_len_counts_utf16_units ... ok
+test paragraph_separator_is_kept_exactly ... ok
+test threshold_is_configurable ... ok
+test exact_limit_fits_and_one_more_splits ... ok
+test flags_after_an_odd_prefix_are_not_split ... ok
+test only_emoji_line_splits_on_char_boundaries ... ok
+test blank_run_longer_than_the_limit_drops_only_whitespace ... ok
+test prefers_paragraph_then_line_then_space ... ok
+test oversized_grapheme_falls_back_to_char_boundaries ... ok
+test fifty_kb_block_is_deterministic_and_prefers_file ... ok
+test grapheme_clusters_on_the_boundary_stay_whole ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-crev012-target\debug\deps\subagent-fbc7adb177770aef.exe)
+
+running 14 tests
+test meta_fixture_is_parsed ... ok
+test missing_or_broken_meta_falls_back_without_error ... ok
+test report_replaces_the_transcript_final_text ... ok
+test background_agent_embeds_an_in_progress_body ... ok
+test last_message_must_equal_the_final_answer ... ok
+test agent_id_is_one_line_without_breaking_parent_lookup ... ok
+test meta_description_and_type_win ... ok
+test embedded_header_is_the_block_header ... ok
+test duplicate_agent_ids_use_the_last_slice_entry ... ok
+test only_known_agents_get_a_body ... ok
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test sidechain_turns_never_reach_the_parent_top_level ... ok
+test body_source_order_is_fixed ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cctg
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests transcript
+
+running 1 test
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 83) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+===CLIPPY
+    Checking base64 v0.23.1
+    Checking thiserror v2.0.20
+    Checking tracing-subscriber v0.3.23
+    Checking clap v4.6.6
+    Checking anyhow v1.0.104
+    Checking dotenvy v0.15.7
+   Compiling aws-lc-rs v1.18.1
+   Compiling rustls v0.23.45
+    Checking rustls-webpki v0.103.15
+    Checking tokio-rustls v0.26.5
+    Checking rustls-platform-verifier v0.7.0
+    Checking hyper-rustls v0.27.10
+    Checking reqwest v0.13.5
+    Checking cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 59.38s
+===FMT

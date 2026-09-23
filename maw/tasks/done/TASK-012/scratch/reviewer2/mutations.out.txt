@@ -1,0 +1,6 @@
+M1 no node exception: KILLED ['test proctree::tests::a_node_claude_below_a_native_claude_is_the_own_process ... FAILED']
+M2 any name by env pid: KILLED ['test proctree::tests::a_stale_env_pid_on_a_wrapper_does_not_move_the_own_process ... FAILED']
+M3 env pid wins even when farther: KILLED ['test proctree::tests::a_stale_env_pid_on_a_wrapper_does_not_move_the_own_process ... FAILED']
+M4 typed stop without path passes: KILLED ['test hook::build_tests::internal_agents_are_dropped ... FAILED']
+M5 one timeout for all: KILLED ['test hook::build_tests::only_the_prompt_hook_uses_the_short_post_timeout ... FAILED']
+M6 stdin waits 5 s: KILLED ['test an_open_silent_stdin_does_not_hold_the_hook ... FAILED']

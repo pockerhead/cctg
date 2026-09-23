@@ -1,0 +1,9 @@
+[package]
+name = "reviewer1-probe"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+cctg = { path = "../planner/ws/crates/cctg" }
+
+[workspace]

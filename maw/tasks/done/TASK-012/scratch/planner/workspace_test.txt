@@ -1,0 +1,32 @@
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\cctg-2c5090c5fefadede.exe)
+test result: ok. 183 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.37s
+     Running unittests src\main.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\cctg-0e3abc3c0d4bc893.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\command_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\command_logs-4a41624b64f13dd7.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.03s
+     Running tests\hook_cli.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\hook_cli-94c3ef737d30d9b4.exe)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+     Running tests\ingress_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\ingress_logs-8b41c9876e8a7d31.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+     Running tests\routing_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\routing_logs-101ead006334a525.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\slots_logs.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\slots_logs-e1a740bc14e437c5.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+     Running tests\stdout.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\stdout-cc89e480409f7ddb.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\transcript-fd18daa87666c345.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\parse_fixtures-03b8d614a417fff1.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\parse_tolerance-7457103340f1661c.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\purity-0a3e95de11fb5407.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\render-b17a2d1e0c80d574.exe)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+     Running tests\split.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\split-91d9db22c439d970.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\subagent.rs (C:\Users\user\AppData\Local/Temp/cctg-task012-target\debug\deps\subagent-fbc7adb177770aef.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

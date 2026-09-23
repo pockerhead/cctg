@@ -1,0 +1,6 @@
+closed port    SessionEnd  : median 529 ms, max 538 ms
+closed port    SessionStart: median 528 ms, max 531 ms
+silent hub     SessionEnd  : median 526 ms, max 532 ms
+silent hub     SessionStart: median 530 ms, max 533 ms
+answering hub  SessionEnd  : median 18 ms, max 39 ms
+answering hub  SessionStart: median 18 ms, max 19 ms

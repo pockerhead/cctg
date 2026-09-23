@@ -1,0 +1,22 @@
+   Compiling thiserror v2.0.20
+   Compiling thiserror-impl v2.0.20
+test proctree::tests::no_chain_falls_back_to_env_pid_and_top_level ... ok
+test proctree::tests::foreign_env_session_names_the_parent_only_as_a_fallback ... ok
+test proctree::tests::exec_form_hook_is_a_direct_child_of_claude ... ok
+test proctree::tests::a_stale_env_pid_on_a_wrapper_does_not_move_the_own_process ... ok
+test proctree::tests::env_stripped_nested_run_and_interactive_start ... ok
+test proctree::tests::claude_names ... ok
+test proctree::tests::nested_session_reports_the_next_claude ... ok
+test proctree::tests::npm_only_chain_keeps_the_own_pid_and_finds_no_parent ... ok
+test proctree::tests::top_level_session_has_no_parent ... ok
+test proctree::tests::a_node_claude_below_a_native_claude_is_the_own_process ... FAILED
+test hook::build_tests::internal_agents_are_dropped ... FAILED
+test proctree::tests::proc_stat_lines ... ok
+test proctree::tests::the_live_chain_starts_at_this_process ... ok
+thread 'proctree::tests::a_node_claude_below_a_native_claude_is_the_own_process' (38492) panicked at crates\cctg\src\proctree.rs:360:9:
+assertion `left == right` failed
+  left: Lineage { claude_pid: Some(5), parent_claude_pid: None }
+ right: Lineage { claude_pid: Some(3), parent_claude_pid: Some(5) }
+thread 'hook::build_tests::internal_agents_are_dropped' (3444) panicked at crates\cctg\src\hook.rs:741:57:
+test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 174 filtered out; finished in 0.01s
+error: test failed, to rerun pass `-p cctg --lib`

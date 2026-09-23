@@ -1,0 +1,10 @@
+run 1 exit=0 ms=573 stdout_len=0 secret_in_err=False sid_in_err=False
+  stderr: 2026-09-23T10:00:00.072154Z  WARN hook event not delivered event="session_end" error=hub did not answer within 500ms
+run 2 exit=0 ms=563 stdout_len=0 secret_in_err=False sid_in_err=False
+  stderr: 2026-09-23T10:00:00.647004Z  WARN hook event not delivered event="session_end" error=hub did not answer within 500ms
+run 3 exit=0 ms=562 stdout_len=0 secret_in_err=False sid_in_err=False
+  stderr: 2026-09-23T10:00:01.208521Z  WARN hook event not delivered event="session_end" error=hub did not answer within 500ms
+run 4 exit=0 ms=573 stdout_len=0 secret_in_err=False sid_in_err=False
+  stderr: 2026-09-23T10:00:01.782493Z  WARN hook event not delivered event="session_end" error=hub did not answer within 500ms
+run 5 exit=0 ms=593 stdout_len=0 secret_in_err=False sid_in_err=False
+  stderr: 2026-09-23T10:00:02.376473Z  WARN hook event not delivered event="session_end" error=hub did not answer within 500ms

@@ -1,0 +1,1859 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -145,6 +145,7 @@
+  "tracing",
+  "tracing-subscriber",
+  "transcript",
++ "windows-sys 0.61.2",
+ ]
+ 
+ [[package]]
+diff --git a/crates/cctg/Cargo.toml b/crates/cctg/Cargo.toml
+--- a/crates/cctg/Cargo.toml
++++ b/crates/cctg/Cargo.toml
+@@ -17,5 +17,10 @@
+ tracing-subscriber.workspace = true
+ transcript = { path = "../transcript" }
+ 
++# Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot).
++# Already in the lock file through tokio; no new download.
++[target.'cfg(windows)'.dependencies]
++windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
++
+ [dev-dependencies]
+ tokio = { workspace = true, features = ["test-util"] }
+diff --git a/crates/cctg/src/device.rs b/crates/cctg/src/device.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/device.rs
+@@ -0,0 +1,249 @@
++//! Device side of the hub link, shared by `cctg hook` and `cctg agent`: where
++//! the hub is, the shared secret, this device's host name, and the folder
++//! spelling that goes into a slot key.
++//!
++//! Configuration comes from the process environment first, then from
++//! `<home>/.cctg/device.env` (dotenv syntax). The file is read into memory;
++//! nothing is put into the process environment, so the secret never reaches
++//! the children of a hook. The Claude Code settings snippet never carries any
++//! of these values.
++//!
++//! ```text
++//! CCTG_HUB_SECRET=<same value as on the hub>
++//! CCTG_HUB_HOOK_ADDR=127.0.0.1:47292   # optional, ip:port or host:port
++//! CCTG_HOST=laptop                     # optional, defaults to the machine name
++//! ```
++
++use std::collections::HashMap;
++use std::fmt;
++use std::path::{Path, PathBuf};
++
++use crate::hub::config::{DEFAULT_HOOK_LISTEN, SECRET_VAR};
++use crate::wire::Secret;
++
++/// `host:port` of the hub hook endpoint.
++pub const HOOK_ADDR_VAR: &str = "CCTG_HUB_HOOK_ADDR";
++/// Optional override of the host name this device reports.
++pub const HOST_VAR: &str = "CCTG_HOST";
++/// Location of the device config file, relative to the home directory.
++pub const DEVICE_ENV: &str = ".cctg/device.env";
++
++/// Why the config is unusable. Never carries a value.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ConfigProblem {
++    /// `CCTG_HUB_SECRET` is not set anywhere.
++    NoSecret,
++    /// `CCTG_HUB_SECRET` is set but does not pass [`Secret::parse`].
++    BadSecret,
++    /// The device env file exists but cannot be read or parsed.
++    BadFile,
++}
++
++impl fmt::Display for ConfigProblem {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::NoSecret => "CCTG_HUB_SECRET is not set (process env or ~/.cctg/device.env)",
++            Self::BadSecret => "CCTG_HUB_SECRET is invalid (16+ visible ASCII characters)",
++            Self::BadFile => "~/.cctg/device.env cannot be read (contents are not shown)",
++        })
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct DeviceConfig {
++    pub secret: Result<Secret, ConfigProblem>,
++    pub hook_addr: String,
++    pub host: String,
++}
++
++impl DeviceConfig {
++    /// Never fails: a missing or broken config is reported through `secret`,
++    /// so a hook can still exit quietly.
++    pub fn load() -> Self {
++        let file = home_dir(|name| std::env::var(name).ok())
++            .map(|home| read_env_file(&home.join(DEVICE_ENV)))
++            .unwrap_or(Ok(HashMap::new()));
++        let (file_vars, file_ok) = match file {
++            Ok(vars) => (vars, true),
++            Err(()) => (HashMap::new(), false),
++        };
++        let mut config = Self::from_vars(|name| {
++            std::env::var(name)
++                .ok()
++                .or_else(|| file_vars.get(name).cloned())
++        });
++        if !file_ok && config.secret == Err(ConfigProblem::NoSecret) {
++            config.secret = Err(ConfigProblem::BadFile);
++        }
++        config
++    }
++
++    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
++        let value = |name: &str| {
++            var(name)
++                .map(|value| value.trim().to_owned())
++                .filter(|value| !value.is_empty())
++        };
++        let secret = match value(SECRET_VAR) {
++            None => Err(ConfigProblem::NoSecret),
++            Some(raw) => Secret::parse(&raw).map_err(|_| ConfigProblem::BadSecret),
++        };
++        let hook_addr = value(HOOK_ADDR_VAR).unwrap_or_else(|| DEFAULT_HOOK_LISTEN.to_string());
++        Self {
++            secret,
++            hook_addr,
++            host: host_name(&value),
++        }
++    }
++}
++
++fn home_dir(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
++    let names: &[&str] = if cfg!(windows) {
++        &["USERPROFILE", "HOME"]
++    } else {
++        &["HOME"]
++    };
++    names
++        .iter()
++        .find_map(|name| var(name).filter(|value| !value.trim().is_empty()))
++        .map(PathBuf::from)
++}
++
++/// A missing file is an empty config; any other failure is `Err(())`, with no
++/// `dotenvy::Error` kept: its parse error quotes the file contents.
++fn read_env_file(path: &Path) -> Result<HashMap<String, String>, ()> {
++    match dotenvy::from_path_iter(path) {
++        Ok(iter) => iter.collect::<Result<_, _>>().map_err(|_| ()),
++        Err(error) if error.not_found() => Ok(HashMap::new()),
++        Err(_) => Err(()),
++    }
++}
++
++/// `CCTG_HOST`, else the OS machine name, else `unknown`. The hook and the
++/// agent of one device must report the same value: both call this.
++fn host_name(value: &impl Fn(&str) -> Option<String>) -> String {
++    value(HOST_VAR)
++        .or_else(|| {
++            if cfg!(windows) {
++                value("COMPUTERNAME")
++            } else {
++                std::fs::read_to_string("/proc/sys/kernel/hostname")
++                    .ok()
++                    .map(|name| name.trim().to_owned())
++                    .filter(|name| !name.is_empty())
++                    .or_else(|| value("HOSTNAME"))
++            }
++        })
++        .unwrap_or_else(|| "unknown".to_owned())
++}
++
++/// The folder as this device resolves it: symlinks, junctions and 8.3 short
++/// names become one spelling. Falls back to `cwd` unchanged when the folder
++/// cannot be resolved (deleted, no access). The hub only normalizes lexically.
++pub fn canonical_cwd(cwd: &str) -> String {
++    if cwd.is_empty() {
++        return String::new();
++    }
++    match std::fs::canonicalize(cwd) {
++        Ok(path) => match path.into_os_string().into_string() {
++            Ok(path) => strip_verbatim(&path),
++            Err(_) => cwd.to_owned(),
++        },
++        Err(_) => cwd.to_owned(),
++    }
++}
++
++/// Windows `canonicalize` answers in the `\\?\` form; drop it where a plain
++/// spelling exists (`\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`).
++fn strip_verbatim(path: &str) -> String {
++    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
++        return format!(r"\\{rest}");
++    }
++    match path.strip_prefix(r"\\?\") {
++        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
++        _ => path.to_owned(),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const SECRET: &str = "0123456789abcdef-secret";
++
++    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
++        move |name| {
++            pairs
++                .iter()
++                .find(|(key, _)| *key == name)
++                .map(|(_, value)| (*value).to_owned())
++        }
++    }
++
++    #[test]
++    fn defaults_and_overrides() {
++        let config = DeviceConfig::from_vars(vars(&[(SECRET_VAR, SECRET), (HOST_VAR, " laptop ")]));
++        assert_eq!(config.secret.as_ref().map(Secret::expose), Ok(SECRET));
++        assert_eq!(config.hook_addr, "127.0.0.1:47292");
++        assert_eq!(config.host, "laptop");
++
++        let config = DeviceConfig::from_vars(vars(&[(HOOK_ADDR_VAR, "hub.tail:47292")]));
++        assert_eq!(config.secret.err(), Some(ConfigProblem::NoSecret));
++        assert_eq!(config.hook_addr, "hub.tail:47292");
++        assert!(!config.host.is_empty());
++    }
++
++    #[test]
++    fn a_bad_secret_is_named_but_not_echoed() {
++        let config = DeviceConfig::from_vars(vars(&[(SECRET_VAR, "short-secret")]));
++        let problem = config.secret.clone().unwrap_err();
++        assert_eq!(problem, ConfigProblem::BadSecret);
++        assert!(!format!("{problem} {problem:?} {config:?}").contains("short-secret"));
++        let config = DeviceConfig::from_vars(vars(&[(SECRET_VAR, SECRET)]));
++        assert!(!format!("{config:?}").contains(SECRET));
++    }
++
++    #[test]
++    fn verbatim_prefixes_are_dropped() {
++        assert_eq!(strip_verbatim(r"\\?\C:\Users\u\dev"), r"C:\Users\u\dev");
++        assert_eq!(strip_verbatim(r"\\?\UNC\srv\share\x"), r"\\srv\share\x");
++        assert_eq!(strip_verbatim(r"\\?\Volume{0000}\x"), r"\\?\Volume{0000}\x");
++        assert_eq!(strip_verbatim("/home/u/dev"), "/home/u/dev");
++    }
++
++    #[test]
++    fn canonical_cwd_resolves_or_keeps_the_input() {
++        let missing = "/definitely/not/here/cctg-device-test";
++        assert_eq!(canonical_cwd(missing), missing);
++        assert_eq!(canonical_cwd(""), "");
++        let here = std::env::current_dir().unwrap();
++        let resolved = canonical_cwd(here.to_str().unwrap());
++        assert!(!resolved.starts_with(r"\\?\"), "{resolved}");
++        // A lexically different spelling of the same folder resolves the same.
++        let dotted = here.join(".").join("..").join(here.file_name().unwrap());
++        assert_eq!(canonical_cwd(dotted.to_str().unwrap()), resolved);
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn canonical_cwd_expands_short_names_and_case() {
++        let here = std::env::current_dir().unwrap();
++        let resolved = canonical_cwd(here.to_str().unwrap());
++        let upper = here.to_str().unwrap().to_uppercase();
++        assert_eq!(canonical_cwd(&upper), resolved);
++    }
++
++    #[test]
++    fn env_file_is_read_without_touching_the_environment() {
++        let dir = std::env::temp_dir().join(format!("cctg-device-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let file = dir.join("device.env");
++        std::fs::write(&file, format!("{SECRET_VAR}={SECRET}\n{HOST_VAR}=box\n")).unwrap();
++        let vars = read_env_file(&file).unwrap();
++        assert_eq!(vars.get(HOST_VAR).map(String::as_str), Some("box"));
++        std::fs::write(&file, "CCTG_HUB_SECRET='unterminated\n").unwrap();
++        assert_eq!(read_env_file(&file), Err(()));
++        assert_eq!(read_env_file(&dir.join("absent.env")), Ok(HashMap::new()));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/crates/cctg/src/hook.rs b/crates/cctg/src/hook.rs
+--- a/crates/cctg/src/hook.rs
++++ b/crates/cctg/src/hook.rs
+@@ -1,18 +1,257 @@
+-//! Hook end of the hub ingress: one HTTP POST per call, one overall timeout,
+-//! no retry loop. Plain TCP instead of `reqwest`: the body is tiny, the hub is
++//! `cctg hook <event>`: read the Claude Code hook input from stdin, keep only
++//! the fields the hub uses, and send them in one HTTP POST. The hook always
++//! exits 0 and never writes to stdout (for `SessionStart` and
++//! `UserPromptSubmit` stdout would become context for Claude). Failures go to
++//! stderr as fixed texts: never the input, never the secret.
++//!
++//! Transport: plain TCP instead of `reqwest`: the body is tiny, the hub is
+ //! local or on a private network, and a TLS-capable client costs start-up
+ //! time the `SessionEnd` budget (1.5 s shared) cannot spare.
+ //!
+ //! [`HookPost::new`](crate::wire::HookPost::new) mints the event id; calling
+ //! [`post`] again with the same value re-sends the same event, which the hub
+ //! drops as a repeat.
+-
++//!
++//! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
++
++use std::io::Read;
++use std::path::Path;
+ use std::time::Duration;
+ 
++use serde::Deserialize;
+ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+ use tokio::net::TcpStream;
+-
+-use crate::wire::{HOOK_PATH, HookPost, Secret};
++use tracing::{debug, warn};
++
++use crate::device::{self, DeviceConfig};
++use crate::proctree::{self, Lineage};
++use crate::wire::{HOOK_PATH, HookEvent, HookPost, Secret};
++
++/// Budget of the POST, connect included. `SessionEnd` hooks share 1.5 s in
++/// all, start-up and the process snapshot included; `UserPromptSubmit` and the
++/// handback matcher block Claude Code while they run. On Windows a connect to
++/// a closed local port is retried and lasts until this timeout, so a stopped
++/// hub costs every hook exactly this much.
++pub const POST_TIMEOUT: Duration = Duration::from_millis(500);
++/// Claude Code writes the whole input at once and closes stdin.
++pub const STDIN_TIMEOUT: Duration = Duration::from_millis(300);
++/// Larger input is dropped, not truncated: cut JSON is not JSON.
++pub const MAX_STDIN: u64 = 8 << 20;
++/// Cap of one free-text field (assistant message, handback report), in bytes.
++/// Even fully `\u`-escaped it keeps the body under `wire::MAX_HOOK_BODY`.
++pub const MAX_TEXT: usize = 128 << 10;
++const HANDBACK_TOOL: &str = "SubagentHandback";
++
++/// Runs one hook invocation. Never fails: every problem ends as one fixed
++/// line on stderr.
++pub async fn run(event: &str) {
++    let Some(input) = read_stdin(MAX_STDIN, STDIN_TIMEOUT) else {
++        warn!("hook input unreadable, too large or late; nothing sent");
++        return;
++    };
++    let config = DeviceConfig::load();
++    let hook_post = match build_here(event, &input, &config.host) {
++        Ok(hook_post) => hook_post,
++        Err(skip) => {
++            debug!(reason = skip.0, "hook event skipped");
++            return;
++        }
++    };
++    let secret = match &config.secret {
++        Ok(secret) => secret,
++        Err(problem) => {
++            warn!(%problem, "hook event not sent");
++            return;
++        }
++    };
++    if let Err(error) = post(&config.hook_addr, secret, &hook_post, POST_TIMEOUT).await {
++        warn!(event = hook_post.event.kind(), %error, "hook event not delivered");
++    }
++}
++
++/// [`build`] with this device as the probe.
++fn build_here(event: &str, input: &[u8], host: &str) -> Result<HookPost, Skip> {
++    let env_pid = std::env::var("CLAUDE_PID")
++        .ok()
++        .and_then(|pid| pid.trim().parse().ok());
++    let env_session = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
++    let lineage =
++        |session: &str| proctree::current_lineage(env_pid, env_session.as_deref(), session);
++    let probe = Probe {
++        host,
++        cwd: &device::canonical_cwd,
++        lineage: &lineage,
++        exists: &|path| path.exists(),
++    };
++    build(event, input, &probe)
++}
++
++/// Reads stdin on its own thread: a blocking read cannot be cancelled, and a
++/// tokio stdin read would hold up runtime shutdown. The caller exits the
++/// process, which ends the thread if it is still blocked.
++fn read_stdin(limit: u64, timeout: Duration) -> Option<Vec<u8>> {
++    let (tx, rx) = std::sync::mpsc::channel();
++    std::thread::spawn(move || {
++        let mut buf = Vec::new();
++        let read = std::io::stdin()
++            .lock()
++            .take(limit + 1)
++            .read_to_end(&mut buf);
++        let _ = tx.send(read.ok().map(|_| buf));
++    });
++    let buf = rx.recv_timeout(timeout).ok()??;
++    (buf.len() as u64 <= limit).then_some(buf)
++}
++
++/// What a hook learns from its device besides stdin. Injected for tests.
++pub struct Probe<'a> {
++    pub host: &'a str,
++    /// Folder resolution, see [`device::canonical_cwd`].
++    pub cwd: &'a dyn Fn(&str) -> String,
++    /// Process-tree lineage for the stdin session id; asked only by
++    /// `SessionStart` and `SessionEnd`.
++    pub lineage: &'a dyn Fn(&str) -> Lineage,
++    pub exists: &'a dyn Fn(&Path) -> bool,
++}
++
++/// Why an input produced no POST. Fixed text, safe to log.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Skip(pub &'static str);
++
++/// The hook input fields cctg uses; everything else is ignored.
++#[derive(Debug, Default, Deserialize)]
++#[serde(default)]
++struct Input {
++    session_id: String,
++    cwd: String,
++    transcript_path: String,
++    hook_event_name: Option<String>,
++    source: Option<String>,
++    reason: Option<String>,
++    prompt_id: Option<String>,
++    last_assistant_message: Option<String>,
++    agent_id: Option<String>,
++    agent_type: Option<String>,
++    agent_transcript_path: Option<String>,
++    tool_name: Option<String>,
++    tool_input: Option<ToolInput>,
++}
++
++#[derive(Debug, Default, Deserialize)]
++#[serde(default)]
++struct ToolInput {
++    message: Option<String>,
++}
++
++/// Turns one hook input into the POST for the hub, or says why there is none.
++/// `event` is the name the settings passed on the command line.
++pub fn build(event: &str, input: &[u8], probe: &Probe<'_>) -> Result<HookPost, Skip> {
++    let input: Input =
++        serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
++    if input.session_id.is_empty() {
++        return Err(Skip("input has no session_id"));
++    }
++    if input
++        .hook_event_name
++        .as_deref()
++        .is_some_and(|name| name != event)
++    {
++        return Err(Skip("input is for another hook event"));
++    }
++    let hook_event = match event {
++        "SessionStart" => {
++            let lineage = (probe.lineage)(&input.session_id);
++            HookEvent::SessionStart {
++                source: input.source,
++                claude_pid: lineage.claude_pid,
++                parent_claude_pid: lineage.parent_claude_pid,
++            }
++        }
++        "SessionEnd" => HookEvent::SessionEnd {
++            reason: input.reason,
++            claude_pid: (probe.lineage)(&input.session_id).claude_pid,
++        },
++        "UserPromptSubmit" => HookEvent::UserPromptSubmit {
++            prompt_id: input.prompt_id,
++        },
++        "Stop" => HookEvent::Stop {
++            prompt_id: input.prompt_id,
++            last_assistant_message: input.last_assistant_message.map(cap_text),
++        },
++        "SubagentStart" => HookEvent::SubagentStart {
++            agent_id: agent_id(input.agent_id)?,
++            agent_type: agent_type(input.agent_type)?,
++        },
++        "SubagentStop" => {
++            let agent_id = agent_id(input.agent_id)?;
++            let agent_type = agent_type(input.agent_type)?;
++            let agent_transcript_path = input.agent_transcript_path.filter(|path| !path.is_empty());
++            if let Some(path) = &agent_transcript_path
++                && !has_agent_files(path, probe.exists)
++            {
++                // Claude Code's own agents (prompt suggestions, /btw, the
++                // `--agent` session name) leave no subagent files behind.
++                return Err(Skip("internal agent"));
++            }
++            HookEvent::SubagentStop {
++                agent_id,
++                agent_type,
++                agent_transcript_path,
++                last_assistant_message: input.last_assistant_message.map(cap_text),
++            }
++        }
++        "PreToolUse" | "PostToolUse" => {
++            if input.tool_name.as_deref() != Some(HANDBACK_TOOL) {
++                return Err(Skip("tool is not SubagentHandback"));
++            }
++            let message = input
++                .tool_input
++                .and_then(|tool_input| tool_input.message)
++                .ok_or(Skip("handback without a message"))?;
++            HookEvent::SubagentHandback {
++                agent_id: agent_id(input.agent_id)?,
++                message: cap_text(message),
++            }
++        }
++        _ => return Err(Skip("unsupported hook event")),
++    };
++    Ok(HookPost::new(
++        probe.host.to_owned(),
++        input.session_id,
++        (probe.cwd)(&input.cwd),
++        input.transcript_path,
++        hook_event,
++    ))
++}
++
++fn agent_id(id: Option<String>) -> Result<String, Skip> {
++    id.filter(|id| !id.is_empty())
++        .ok_or(Skip("subagent event without agent_id"))
++}
++
++/// An empty type is a Claude Code internal agent (TASK-003: 14 of 14).
++fn agent_type(kind: Option<String>) -> Result<String, Skip> {
++    kind.filter(|kind| !kind.is_empty())
++        .ok_or(Skip("internal agent"))
++}
++
++/// A real subagent leaves `agent-<id>.jsonl` and/or `agent-<id>.meta.json`;
++/// the 14 internal agents of TASK-003 left neither.
++fn has_agent_files(transcript: &str, exists: &dyn Fn(&Path) -> bool) -> bool {
++    let meta = transcript
++        .strip_suffix(".jsonl")
++        .map(|stem| format!("{stem}.meta.json"));
++    exists(Path::new(transcript)) || meta.is_some_and(|meta| exists(Path::new(&meta)))
++}
++
++fn cap_text(mut text: String) -> String {
++    if text.len() > MAX_TEXT {
++        let cut = text.floor_char_boundary(MAX_TEXT - '\u{2026}'.len_utf8());
++        text.truncate(cut);
++        text.push('\u{2026}');
++    }
++    text
++}
+ 
+ const MAX_STATUS_LINE: u64 = 256;
+ 
+@@ -253,3 +492,336 @@
+         assert_eq!(post(&addr, &secret(), &sample(), timeout).await, Ok(()));
+     }
+ }
++
++#[cfg(test)]
++mod build_tests {
++    use std::cell::Cell;
++    use std::collections::BTreeSet;
++    use std::path::Path;
++
++    use serde_json::Value;
++
++    use super::*;
++
++    fn fixture(name: &str) -> Vec<u8> {
++        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("tests/fixtures/hook")
++            .join(format!("{name}.json"));
++        std::fs::read(&path).expect("hook fixture")
++    }
++
++    const OWN: Lineage = Lineage {
++        claude_pid: Some(28764),
++        parent_claude_pid: None,
++    };
++
++    /// `exists` answers true for every path: subagent files present.
++    fn with_probe<T>(
++        lineage: Lineage,
++        exists: bool,
++        f: impl FnOnce(&Probe<'_>, &Cell<u32>) -> T,
++    ) -> T {
++        let asked = Cell::new(0);
++        let lineage_fn = |_: &str| {
++            asked.set(asked.get() + 1);
++            lineage
++        };
++        let cwd_fn = |cwd: &str| format!("canon:{cwd}");
++        let exists_fn = move |_: &Path| exists;
++        let probe = Probe {
++            host: "box",
++            cwd: &cwd_fn,
++            lineage: &lineage_fn,
++            exists: &exists_fn,
++        };
++        f(&probe, &asked)
++    }
++
++    fn keys(value: &Value) -> BTreeSet<String> {
++        value.as_object().unwrap().keys().cloned().collect()
++    }
++
++    fn set(names: &[&str]) -> BTreeSet<String> {
++        names.iter().map(|name| (*name).to_owned()).collect()
++    }
++
++    /// Serialized POST: the top-level keys are always the same, and the
++    /// event object has exactly `want` keys.
++    fn check(event: &str, input: &[u8], lineage: Lineage, want: &[&str]) -> Value {
++        with_probe(lineage, true, |probe, asked| {
++            let post = build(event, input, probe).expect("event is sent");
++            let value = serde_json::to_value(&post).unwrap();
++            assert_eq!(
++                keys(&value),
++                set(&[
++                    "v",
++                    "event_id",
++                    "host",
++                    "session_id",
++                    "cwd",
++                    "transcript_path",
++                    "event"
++                ])
++            );
++            assert_eq!(keys(&value["event"]), set(want), "{event}");
++            let walks = u32::from(matches!(event, "SessionStart" | "SessionEnd"));
++            assert_eq!(asked.get(), walks, "{event}: process tree asked");
++            assert_eq!(value["host"], "box");
++            assert!(value["cwd"].as_str().unwrap().starts_with("canon:"));
++            value
++        })
++    }
++
++    #[test]
++    fn each_event_carries_its_fields_and_nothing_else() {
++        let v = check(
++            "SessionStart",
++            &fixture("session_start"),
++            OWN,
++            &["type", "source", "claude_pid", "parent_claude_pid"],
++        );
++        assert_eq!(v["event"]["source"], "startup");
++        assert_eq!(v["event"]["claude_pid"], 28764);
++        assert_eq!(v["event"]["parent_claude_pid"], Value::Null);
++        assert_eq!(v["session_id"], "1e087ca8-58b5-4c0b-9f03-b7926645b744");
++        assert_eq!(v["cwd"], "canon:~\\dev\\cctg");
++        assert!(
++            v["transcript_path"]
++                .as_str()
++                .unwrap()
++                .ends_with("1e087ca8-58b5-4c0b-9f03-b7926645b744.jsonl")
++        );
++
++        let v = check(
++            "SessionEnd",
++            &fixture("session_end"),
++            OWN,
++            &["type", "reason", "claude_pid"],
++        );
++        assert_eq!(v["event"]["reason"], "other");
++        assert_eq!(v["event"]["claude_pid"], 28764);
++
++        let v = check(
++            "UserPromptSubmit",
++            &fixture("user_prompt_submit"),
++            OWN,
++            &["type", "prompt_id"],
++        );
++        assert_eq!(
++            v["event"]["prompt_id"],
++            "0bb27012-0d04-43a9-9fa9-128e91ee7e34"
++        );
++        assert!(!v.to_string().contains("private prompt text"));
++
++        let v = check(
++            "Stop",
++            &fixture("stop"),
++            OWN,
++            &["type", "prompt_id", "last_assistant_message"],
++        );
++        assert_eq!(v["event"]["last_assistant_message"], "Ok.");
++
++        let v = check(
++            "SubagentStart",
++            &fixture("subagent_start"),
++            OWN,
++            &["type", "agent_id", "agent_type"],
++        );
++        assert_eq!(v["event"]["agent_id"], "a8c1bff86acd31609");
++        assert_eq!(v["event"]["agent_type"], "Explore");
++
++        let v = check(
++            "SubagentStop",
++            &fixture("subagent_stop"),
++            OWN,
++            &[
++                "type",
++                "agent_id",
++                "agent_type",
++                "agent_transcript_path",
++                "last_assistant_message",
++            ],
++        );
++        assert!(
++            v["event"]["agent_transcript_path"]
++                .as_str()
++                .unwrap()
++                .ends_with("agent-a8c1bff86acd31609.jsonl")
++        );
++        assert!(
++            v["event"]["last_assistant_message"]
++                .as_str()
++                .unwrap()
++                .contains("cctg")
++        );
++        assert!(!v.to_string().contains("background_tasks"));
++
++        for (event, name) in [
++            ("PreToolUse", "pre_tool_use_handback"),
++            ("PostToolUse", "post_tool_use_handback"),
++        ] {
++            let v = check(event, &fixture(name), OWN, &["type", "agent_id", "message"]);
++            assert_eq!(v["event"]["type"], "subagent_handback");
++            assert_eq!(v["event"]["agent_id"], "ae1e99b76211e2536");
++            assert_eq!(v["event"]["message"], "2+2 = 4.");
++        }
++    }
++
++    #[test]
++    fn nesting_comes_from_the_lineage() {
++        let nested = Lineage {
++            claude_pid: Some(25388),
++            parent_claude_pid: Some(776),
++        };
++        let v = check(
++            "SessionStart",
++            &fixture("session_start"),
++            nested,
++            &["type", "source", "claude_pid", "parent_claude_pid"],
++        );
++        assert_eq!(v["event"]["claude_pid"], 25388);
++        assert_eq!(v["event"]["parent_claude_pid"], 776);
++        // SessionEnd reports the own pid only, never the parent.
++        let v = check(
++            "SessionEnd",
++            &fixture("session_end"),
++            nested,
++            &["type", "reason", "claude_pid"],
++        );
++        assert_eq!(v["event"]["claude_pid"], 25388);
++    }
++
++    #[test]
++    fn source_is_optional_and_read_only_from_session_start() {
++        let v = check(
++            "SessionStart",
++            br#"{"session_id":"s","cwd":"/w","transcript_path":"/t"}"#,
++            OWN,
++            &["type", "source", "claude_pid", "parent_claude_pid"],
++        );
++        assert_eq!(v["event"]["source"], Value::Null);
++        // A `source` on another event is ignored, not an error.
++        check(
++            "SessionEnd",
++            br#"{"session_id":"s","source":"startup","hook_event_name":"SessionEnd"}"#,
++            OWN,
++            &["type", "reason", "claude_pid"],
++        );
++    }
++
++    #[test]
++    fn internal_agents_are_dropped() {
++        with_probe(OWN, true, |probe, _| {
++            // Empty agent_type, as in all 14 TASK-003 noise events.
++            assert_eq!(
++                build("SubagentStop", &fixture("subagent_stop_internal"), probe).unwrap_err(),
++                Skip("internal agent")
++            );
++            let start = br#"{"session_id":"s","agent_id":"a1","agent_type":""}"#;
++            assert_eq!(
++                build("SubagentStart", start, probe).unwrap_err(),
++                Skip("internal agent")
++            );
++        });
++        // A typed agent (the `--agent` session name) with no subagent files.
++        let typed = br#"{"session_id":"s","agent_id":"a1","agent_type":"my-agent","agent_transcript_path":"/p/s/subagents/agent-a1.jsonl"}"#;
++        with_probe(OWN, false, |probe, _| {
++            assert_eq!(
++                build("SubagentStop", typed, probe).unwrap_err(),
++                Skip("internal agent")
++            );
++        });
++        // Only the meta file exists yet: a real subagent.
++        let asked = std::cell::RefCell::new(Vec::new());
++        let exists = |path: &Path| {
++            asked.borrow_mut().push(path.to_string_lossy().into_owned());
++            path.to_string_lossy().ends_with(".meta.json")
++        };
++        let probe = Probe {
++            host: "box",
++            cwd: &|cwd: &str| cwd.to_owned(),
++            lineage: &|_: &str| OWN,
++            exists: &exists,
++        };
++        assert!(build("SubagentStop", typed, &probe).is_ok());
++        assert!(
++            asked
++                .borrow()
++                .contains(&"/p/s/subagents/agent-a1.meta.json".to_owned())
++        );
++    }
++
++    #[test]
++    fn other_tools_and_incomplete_handbacks_are_skipped() {
++        with_probe(OWN, true, |probe, _| {
++            let bash = br#"{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
++            assert!(build("PreToolUse", bash, probe).is_err());
++            let no_message = br#"{"session_id":"s","agent_id":"a","tool_name":"SubagentHandback","tool_input":{}}"#;
++            assert!(build("PostToolUse", no_message, probe).is_err());
++            let no_agent = br#"{"session_id":"s","tool_name":"SubagentHandback","tool_input":{"message":"m"}}"#;
++            assert!(build("PostToolUse", no_agent, probe).is_err());
++        });
++    }
++
++    #[test]
++    fn broken_input_is_skipped_without_panicking() {
++        let whole = fixture("session_start");
++        with_probe(OWN, true, |probe, asked| {
++            for cut in 0..whole.len() {
++                // Every prefix of a real input, plus garbage.
++                let _ = build("SessionStart", &whole[..cut], probe);
++            }
++            for input in [
++                &b""[..],
++                b"\xff\xfe\x00",
++                b"null",
++                b"[]",
++                b"42",
++                br#"{"session_id":7}"#,
++                br#"{"session_id":""}"#,
++                br#"{"cwd":"/w"}"#,
++                br#"{"session_id":"s","tool_input":"x"}"#,
++            ] {
++                assert!(build("SessionStart", input, probe).is_err());
++                assert!(build("PostToolUse", input, probe).is_err());
++            }
++            assert!(asked.get() <= 1, "tree walked for rejected input");
++        });
++    }
++
++    #[test]
++    fn misrouted_and_unknown_events_are_skipped() {
++        with_probe(OWN, true, |probe, _| {
++            assert_eq!(
++                build("SessionStart", &fixture("session_end"), probe).unwrap_err(),
++                Skip("input is for another hook event")
++            );
++            assert_eq!(
++                build("PreCompact", br#"{"session_id":"s"}"#, probe).unwrap_err(),
++                Skip("unsupported hook event")
++            );
++        });
++    }
++
++    #[test]
++    fn long_texts_are_capped_on_a_char_boundary() {
++        let long = "й".repeat(MAX_TEXT); // 2 bytes each
++        let input = serde_json::json!({
++            "session_id": "s",
++            "agent_id": "a",
++            "tool_name": "SubagentHandback",
++            "tool_input": { "message": long },
++        });
++        with_probe(OWN, true, |probe, _| {
++            let post = build("PostToolUse", input.to_string().as_bytes(), probe).unwrap();
++            let HookEvent::SubagentHandback { message, .. } = &post.event else {
++                panic!("wrong event");
++            };
++            assert!(message.len() <= MAX_TEXT);
++            assert!(message.ends_with('\u{2026}'));
++            let body = serde_json::to_vec(&post).unwrap();
++            assert!(body.len() < crate::wire::MAX_HOOK_BODY);
++        });
++        assert_eq!(cap_text("short".into()), "short");
++    }
++}
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -2,6 +2,8 @@
+ //! subcommands can use the hub modules.
+ 
+ pub mod agent;
++pub mod device;
+ pub mod hook;
+ pub mod hub;
++pub mod proctree;
+ pub mod wire;
+diff --git a/crates/cctg/src/main.rs b/crates/cctg/src/main.rs
+--- a/crates/cctg/src/main.rs
++++ b/crates/cctg/src/main.rs
+@@ -33,7 +33,16 @@
+     let cli = Cli::parse();
+     match cli.command {
+         Command::Hub { env_file } => cctg::hub::run(env_file.as_deref()).await?,
+-        Command::Agent | Command::Hook { .. } => {}
++        Command::Hook { event } => {
++            // A panic message could quote hook input: print a fixed line.
++            std::panic::set_hook(Box::new(|_| eprintln!("cctg hook: internal error")));
++            // Spawned, so a panic ends the task, not the process; the hook
++            // exits 0 whatever happened, and at once: the stdin reader thread
++            // may still be blocked.
++            let _ = tokio::spawn(async move { cctg::hook::run(&event).await }).await;
++            std::process::exit(0);
++        }
++        Command::Agent => {}
+     }
+ 
+     Ok(())
+diff --git a/crates/cctg/src/proctree.rs b/crates/cctg/src/proctree.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/proctree.rs
+@@ -0,0 +1,418 @@
++//! Which claude process runs this hook, and which claude process (if any)
++//! runs that one: the nesting evidence of TASK-003 (`FINDINGS.md`, Контракт).
++//!
++//! Env cannot tell a nested `claude -p` from a top-level session: every claude
++//! overwrites `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` with its own values.
++//! The process tree can, as long as the processes between the two claudes are
++//! still alive when the hook runs (a blocking Bash tool call keeps them).
++//!
++//! Windows reads one ToolHelp snapshot (about 7 ms for ~450 processes on the
++//! dev host); Linux follows `/proc/<pid>/stat` upward; other systems report no
++//! chain. Nothing here spawns a process.
++
++/// One process of the ancestor chain; `chain[0]` is the hook itself.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Proc {
++    pub pid: u32,
++    pub name: String,
++}
++
++/// What the hook reports to the hub.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Lineage {
++    /// The claude process of this session.
++    pub claude_pid: Option<u32>,
++    /// The next claude process above it: this session is nested. `None` means
++    /// top-level as far as this device can see.
++    pub parent_claude_pid: Option<u32>,
++}
++
++/// Longest chain followed; real chains are under 20 processes.
++const MAX_DEPTH: usize = 64;
++
++/// Walks the tree of the current process. `env_*` are `CLAUDE_PID` and
++/// `CLAUDE_CODE_SESSION_ID` as the hook sees them.
++pub fn current_lineage(
++    env_claude_pid: Option<u32>,
++    env_session_id: Option<&str>,
++    stdin_session_id: &str,
++) -> Lineage {
++    let chain = ancestors(std::process::id()).unwrap_or_default();
++    lineage(&chain, env_claude_pid, env_session_id, stdin_session_id)
++}
++
++/// Pure decision over a chain (`chain[0]` = the hook).
++///
++/// - The session's own claude is the nearest claude ancestor: the hook is
++///   spawned by it (directly or through a shell), never by another claude.
++///   When the chain has no claude by name (unknown platform, a renamed
++///   binary), the ancestor whose pid equals `CLAUDE_PID` is used, and without
++///   one `CLAUDE_PID` itself.
++/// - The parent is the next claude ancestor above the own one.
++/// - `CLAUDE_CODE_SESSION_ID != stdin session_id` (never observed, TASK-003
++///   rule 1) means the env was inherited from a parent session: then
++///   `CLAUDE_PID` is the parent's pid, used only when the walk found no parent.
++pub fn lineage(
++    chain: &[Proc],
++    env_claude_pid: Option<u32>,
++    env_session_id: Option<&str>,
++    stdin_session_id: &str,
++) -> Lineage {
++    let ancestors = chain.get(1..).unwrap_or_default();
++    let own_index = ancestors
++        .iter()
++        .position(|proc| is_claude(&proc.name))
++        .or_else(|| {
++            let pid = env_claude_pid?;
++            ancestors.iter().position(|proc| proc.pid == pid)
++        });
++    let claude_pid = own_index
++        .map(|index| ancestors[index].pid)
++        .or(env_claude_pid);
++    let mut parent_claude_pid = own_index.and_then(|index| {
++        ancestors[index + 1..]
++            .iter()
++            .find(|proc| is_claude(&proc.name) && Some(proc.pid) != claude_pid)
++            .map(|proc| proc.pid)
++    });
++    let env_is_foreign = env_session_id
++        .is_some_and(|id| !id.is_empty() && !stdin_session_id.is_empty() && id != stdin_session_id);
++    if parent_claude_pid.is_none() && env_is_foreign && env_claude_pid != claude_pid {
++        parent_claude_pid = env_claude_pid;
++    }
++    Lineage {
++        claude_pid,
++        parent_claude_pid,
++    }
++}
++
++/// `claude.exe` on Windows, `claude` elsewhere; case-insensitive.
++fn is_claude(name: &str) -> bool {
++    let stem = name
++        .len()
++        .checked_sub(4)
++        .filter(|&cut| name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(".exe"))
++        .map_or(name, |cut| &name[..cut]);
++    stem.eq_ignore_ascii_case("claude")
++}
++
++/// The chain from `pid` upward, `pid` first. `None` when this platform has no
++/// supported source; a chain that stops early is returned as far as it goes.
++pub fn ancestors(pid: u32) -> Option<Vec<Proc>> {
++    let table = table()?;
++    let mut chain = Vec::new();
++    let mut current = pid;
++    while chain.len() < MAX_DEPTH {
++        let Some((parent, name)) = table.lookup(current) else {
++            break;
++        };
++        if chain.iter().any(|proc: &Proc| proc.pid == current) {
++            break;
++        }
++        chain.push(Proc { pid: current, name });
++        if parent == 0 || parent == current {
++            break;
++        }
++        current = parent;
++    }
++    Some(chain)
++}
++
++#[cfg(windows)]
++fn table() -> Option<windows::Snapshot> {
++    windows::Snapshot::take()
++}
++
++#[cfg(target_os = "linux")]
++fn table() -> Option<linux::Proc> {
++    Some(linux::Proc)
++}
++
++#[cfg(not(any(windows, target_os = "linux")))]
++fn table() -> Option<NoTable> {
++    None
++}
++
++#[cfg(not(any(windows, target_os = "linux")))]
++struct NoTable;
++
++#[cfg(not(any(windows, target_os = "linux")))]
++impl NoTable {
++    fn lookup(&self, _pid: u32) -> Option<(u32, String)> {
++        None
++    }
++}
++
++#[cfg(windows)]
++mod windows {
++    use std::collections::HashMap;
++
++    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
++    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
++        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
++        TH32CS_SNAPPROCESS,
++    };
++
++    /// pid -> (parent pid, image name) at one instant.
++    pub struct Snapshot(HashMap<u32, (u32, String)>);
++
++    impl Snapshot {
++        pub fn take() -> Option<Self> {
++            let mut table = HashMap::new();
++            // SAFETY: the snapshot handle is checked, used only in this block
++            // and closed exactly once; `entry` is a plain C struct whose
++            // `dwSize` is set as the API requires before the first call.
++            unsafe {
++                let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++                if snapshot == INVALID_HANDLE_VALUE {
++                    return None;
++                }
++                let mut entry: PROCESSENTRY32W = std::mem::zeroed();
++                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
++                let mut ok = Process32FirstW(snapshot, &mut entry);
++                while ok != 0 {
++                    let name = &entry.szExeFile;
++                    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
++                    table.insert(
++                        entry.th32ProcessID,
++                        (
++                            entry.th32ParentProcessID,
++                            String::from_utf16_lossy(&name[..len]),
++                        ),
++                    );
++                    ok = Process32NextW(snapshot, &mut entry);
++                }
++                CloseHandle(snapshot);
++            }
++            Some(Self(table))
++        }
++
++        pub fn lookup(&self, pid: u32) -> Option<(u32, String)> {
++            self.0.get(&pid).cloned()
++        }
++    }
++}
++
++#[cfg(target_os = "linux")]
++mod linux {
++    /// Reads `/proc/<pid>/stat` on demand.
++    pub struct Proc;
++
++    impl Proc {
++        pub fn lookup(&self, pid: u32) -> Option<(u32, String)> {
++            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
++            super::parse_stat(&stat)
++        }
++    }
++}
++
++/// `pid (comm) state ppid ...`; `comm` may itself contain `)` and spaces.
++#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
++fn parse_stat(stat: &str) -> Option<(u32, String)> {
++    let open = stat.find('(')?;
++    let close = stat.rfind(')')?;
++    let name = stat.get(open + 1..close)?.to_owned();
++    let mut rest = stat.get(close + 1..)?.split_whitespace();
++    let _state = rest.next()?;
++    let parent = rest.next()?.parse().ok()?;
++    Some((parent, name))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn chain(nodes: &[(u32, &str)]) -> Vec<Proc> {
++        nodes
++            .iter()
++            .map(|&(pid, name)| Proc {
++                pid,
++                name: name.to_owned(),
++            })
++            .collect()
++    }
++
++    const SID: &str = "4abcca41-a869-41e8-a7a3-3760d0ebfbb4";
++
++    // Chains copied from maw/tasks/done/TASK-003/scratch/capture_*.jsonl
++    // (hook = python.exe there, cctg.exe in production).
++
++    #[test]
++    fn top_level_session_has_no_parent() {
++        // capture_B_nested.jsonl #0 (outer session, chain ends at env.exe).
++        let nodes = chain(&[
++            (35960, "python.exe"),
++            (32724, "bash.exe"),
++            (29164, "bash.exe"),
++            (776, "claude.exe"),
++            (34164, "env.exe"),
++        ]);
++        assert_eq!(
++            lineage(&nodes, Some(776), Some(SID), SID),
++            Lineage {
++                claude_pid: Some(776),
++                parent_claude_pid: None
++            }
++        );
++    }
++
++    #[test]
++    fn nested_session_reports_the_next_claude() {
++        // capture_B_nested.jsonl #1 and #3 (SessionStart and SessionEnd).
++        let nodes = chain(&[
++            (14588, "python.exe"),
++            (17412, "bash.exe"),
++            (27048, "bash.exe"),
++            (25388, "claude.exe"),
++            (20976, "bash.exe"),
++            (31964, "bash.exe"),
++            (2168, "bash.exe"),
++            (776, "claude.exe"),
++            (34164, "env.exe"),
++        ]);
++        let want = Lineage {
++            claude_pid: Some(25388),
++            parent_claude_pid: Some(776),
++        };
++        assert_eq!(lineage(&nodes, Some(25388), Some(SID), SID), want);
++        // Stale CLAUDE_PID that is nowhere in the chain: position decides.
++        assert_eq!(lineage(&nodes, Some(4242), Some(SID), SID), want);
++        // No CLAUDE_PID at all.
++        assert_eq!(lineage(&nodes, None, None, SID), want);
++    }
++
++    #[test]
++    fn env_stripped_nested_run_and_interactive_start() {
++        // capture_D_nested_env_stripped.jsonl #1.
++        let nodes = chain(&[
++            (32380, "python.exe"),
++            (10064, "bash.exe"),
++            (28028, "bash.exe"),
++            (16024, "claude.exe"),
++            (29360, "bash.exe"),
++            (29560, "bash.exe"),
++            (28544, "bash.exe"),
++            (7100, "claude.exe"),
++            (32968, "env.exe"),
++        ]);
++        assert_eq!(
++            lineage(&nodes, Some(16024), Some(SID), SID).parent_claude_pid,
++            Some(7100)
++        );
++        // capture_E_interactive.jsonl #0: parent claude is alive two levels up.
++        let nodes = chain(&[
++            (33220, "python.exe"),
++            (35944, "bash.exe"),
++            (15248, "bash.exe"),
++            (28764, "claude.exe"),
++            (31852, "python.exe"),
++            (13672, "bash.exe"),
++            (35000, "bash.exe"),
++            (30500, "bash.exe"),
++            (15320, "claude.exe"),
++            (34616, "bash.exe"),
++            (15580, "bash.exe"),
++        ]);
++        assert_eq!(
++            lineage(&nodes, Some(28764), Some(SID), SID),
++            Lineage {
++                claude_pid: Some(28764),
++                parent_claude_pid: Some(15320)
++            }
++        );
++    }
++
++    #[test]
++    fn exec_form_hook_is_a_direct_child_of_claude() {
++        let nodes = chain(&[(1, "cctg.exe"), (2, "Claude.EXE"), (3, "explorer.exe")]);
++        assert_eq!(
++            lineage(&nodes, Some(2), Some(SID), SID),
++            Lineage {
++                claude_pid: Some(2),
++                parent_claude_pid: None
++            }
++        );
++    }
++
++    #[test]
++    fn no_chain_falls_back_to_env_pid_and_top_level() {
++        assert_eq!(
++            lineage(&[], Some(10), Some(SID), SID),
++            Lineage {
++                claude_pid: Some(10),
++                parent_claude_pid: None
++            }
++        );
++        assert_eq!(lineage(&[], None, None, SID), Lineage::default());
++        // A claude under another name (npm install: node.exe) found by pid.
++        let nodes = chain(&[
++            (1, "cctg.exe"),
++            (2, "bash.exe"),
++            (3, "node.exe"),
++            (4, "claude.exe"),
++        ]);
++        assert_eq!(
++            lineage(&nodes, Some(3), Some(SID), SID),
++            Lineage {
++                claude_pid: Some(4),
++                parent_claude_pid: None
++            },
++            "a claude by name wins over the env pid"
++        );
++    }
++
++    #[test]
++    fn foreign_env_session_names_the_parent_only_as_a_fallback() {
++        let nodes = chain(&[(1, "cctg.exe"), (2, "claude.exe")]);
++        assert_eq!(
++            lineage(&nodes, Some(9), Some("parent-session"), SID),
++            Lineage {
++                claude_pid: Some(2),
++                parent_claude_pid: Some(9)
++            }
++        );
++        // Same pid as our own claude: never our own parent.
++        assert_eq!(
++            lineage(&nodes, Some(2), Some("parent-session"), SID).parent_claude_pid,
++            None
++        );
++    }
++
++    #[test]
++    fn claude_names() {
++        for name in ["claude.exe", "CLAUDE.EXE", "claude", "Claude"] {
++            assert!(is_claude(name), "{name}");
++        }
++        for name in [
++            "claude-code.exe",
++            "node.exe",
++            "claude.ex",
++            "xclaude",
++            "",
++            "é.exe",
++        ] {
++            assert!(!is_claude(name), "{name}");
++        }
++    }
++
++    #[test]
++    fn proc_stat_lines() {
++        assert_eq!(
++            parse_stat("4242 (claude) S 4000 4242 4242 0 -1"),
++            Some((4000, "claude".to_owned()))
++        );
++        assert_eq!(
++            parse_stat("7 (a) b) c) R 1 7 7 0"),
++            Some((1, "a) b) c".to_owned()))
++        );
++        assert_eq!(parse_stat("garbage"), None);
++    }
++
++    #[cfg(any(windows, target_os = "linux"))]
++    #[test]
++    fn the_live_chain_starts_at_this_process() {
++        let chain = ancestors(std::process::id()).expect("supported platform");
++        assert_eq!(chain.first().map(|proc| proc.pid), Some(std::process::id()));
++        assert!(chain.len() >= 2, "{chain:?}");
++    }
++}
+diff --git a/crates/cctg/tests/fixtures/hook/post_tool_use_handback.json b/crates/cctg/tests/fixtures/hook/post_tool_use_handback.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/post_tool_use_handback.json
+@@ -0,0 +1,24 @@
++{
++  "session_id": "1f2c01a2-63e9-464d-a70f-4a4283d3cd8b",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "scratchpad_dir": "~\\AppData\\Local\\Temp\\claude\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b\\scratchpad",
++  "prompt_id": "7d0affaf-0ef2-40db-bdd0-a34fbe9228af",
++  "permission_mode": "auto",
++  "agent_id": "ae1e99b76211e2536",
++  "agent_type": "Explore",
++  "effort": {
++    "level": "medium"
++  },
++  "hook_event_name": "PostToolUse",
++  "tool_name": "SubagentHandback",
++  "tool_input": {
++    "message": "2+2 = 4."
++  },
++  "tool_response": {
++    "success": true,
++    "message": "Report delivered to your caller."
++  },
++  "tool_use_id": "toolu_01Bw4fMqw9yT2zzdH192LAjP",
++  "duration_ms": 15
++}
+diff --git a/crates/cctg/tests/fixtures/hook/pre_tool_use_handback.json b/crates/cctg/tests/fixtures/hook/pre_tool_use_handback.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/pre_tool_use_handback.json
+@@ -0,0 +1,19 @@
++{
++  "session_id": "1f2c01a2-63e9-464d-a70f-4a4283d3cd8b",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "scratchpad_dir": "~\\AppData\\Local\\Temp\\claude\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b\\scratchpad",
++  "prompt_id": "7d0affaf-0ef2-40db-bdd0-a34fbe9228af",
++  "permission_mode": "auto",
++  "agent_id": "ae1e99b76211e2536",
++  "agent_type": "Explore",
++  "effort": {
++    "level": "medium"
++  },
++  "hook_event_name": "PreToolUse",
++  "tool_name": "SubagentHandback",
++  "tool_input": {
++    "message": "2+2 = 4."
++  },
++  "tool_use_id": "toolu_01Bw4fMqw9yT2zzdH192LAjP"
++}
+diff --git a/crates/cctg/tests/fixtures/hook/session_end.json b/crates/cctg/tests/fixtures/hook/session_end.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/session_end.json
+@@ -0,0 +1,8 @@
++{
++  "session_id": "745465f7-0b40-42e9-a499-ec0af37607ad",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\745465f7-0b40-42e9-a499-ec0af37607ad.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "prompt_id": "0bb27012-0d04-43a9-9fa9-128e91ee7e34",
++  "hook_event_name": "SessionEnd",
++  "reason": "other"
++}
+diff --git a/crates/cctg/tests/fixtures/hook/session_start.json b/crates/cctg/tests/fixtures/hook/session_start.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/session_start.json
+@@ -0,0 +1,9 @@
++{
++  "session_id": "1e087ca8-58b5-4c0b-9f03-b7926645b744",
++  "transcript_path": "~\\.claude\\projects\\~-dev-cctg\\1e087ca8-58b5-4c0b-9f03-b7926645b744.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "scratchpad_dir": "~\\AppData\\Local\\Temp\\claude\\~-dev-cctg\\1e087ca8-58b5-4c0b-9f03-b7926645b744\\scratchpad",
++  "hook_event_name": "SessionStart",
++  "source": "startup",
++  "model": "claude-fable-5-1"
++}
+diff --git a/crates/cctg/tests/fixtures/hook/stop.json b/crates/cctg/tests/fixtures/hook/stop.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/stop.json
+@@ -0,0 +1,12 @@
++{
++  "session_id": "745465f7-0b40-42e9-a499-ec0af37607ad",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\745465f7-0b40-42e9-a499-ec0af37607ad.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "prompt_id": "0bb27012-0d04-43a9-9fa9-128e91ee7e34",
++  "permission_mode": "default",
++  "hook_event_name": "Stop",
++  "stop_hook_active": false,
++  "last_assistant_message": "Ok.",
++  "background_tasks": [],
++  "session_crons": []
++}
+diff --git a/crates/cctg/tests/fixtures/hook/subagent_start.json b/crates/cctg/tests/fixtures/hook/subagent_start.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/subagent_start.json
+@@ -0,0 +1,9 @@
++{
++  "session_id": "d8c72910-ea17-4d68-9c75-57e097fafeea",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\d8c72910-ea17-4d68-9c75-57e097fafeea.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "prompt_id": "4cc17910-4a0d-426b-bd04-33b2aa0e54ec",
++  "agent_id": "a8c1bff86acd31609",
++  "agent_type": "Explore",
++  "hook_event_name": "SubagentStart"
++}
+diff --git a/crates/cctg/tests/fixtures/hook/subagent_stop.json b/crates/cctg/tests/fixtures/hook/subagent_stop.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/subagent_stop.json
+@@ -0,0 +1,23 @@
++{
++  "session_id": "d8c72910-ea17-4d68-9c75-57e097fafeea",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\d8c72910-ea17-4d68-9c75-57e097fafeea.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "prompt_id": "4cc17910-4a0d-426b-bd04-33b2aa0e54ec",
++  "permission_mode": "bypassPermissions",
++  "agent_id": "a8c1bff86acd31609",
++  "agent_type": "Explore",
++  "hook_event_name": "SubagentStop",
++  "stop_hook_active": false,
++  "agent_transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\d8c72910-ea17-4d68-9c75-57e097fafeea\\subagents\\agent-a8c1bff86acd31609.jsonl",
++  "last_assistant_message": "The directories directly under `crates/` are: **cctg** and **transcript**.",
++  "background_tasks": [
++    {
++      "id": "a8c1bff86acd31609",
++      "type": "subagent",
++      "status": "running",
++      "description": "List crates directories",
++      "agent_type": "Explore"
++    }
++  ],
++  "session_crons": []
++}
+diff --git a/crates/cctg/tests/fixtures/hook/subagent_stop_internal.json b/crates/cctg/tests/fixtures/hook/subagent_stop_internal.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/subagent_stop_internal.json
+@@ -0,0 +1,19 @@
++{
++  "session_id": "1f2c01a2-63e9-464d-a70f-4a4283d3cd8b",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "scratchpad_dir": "~\\AppData\\Local\\Temp\\claude\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b\\scratchpad",
++  "prompt_id": "7d0affaf-0ef2-40db-bdd0-a34fbe9228af",
++  "permission_mode": "auto",
++  "agent_id": "acc9ca60c285ff315",
++  "agent_type": "",
++  "effort": {
++    "level": "medium"
++  },
++  "hook_event_name": "SubagentStop",
++  "stop_hook_active": false,
++  "agent_transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\1f2c01a2-63e9-464d-a70f-4a4283d3cd8b\\subagents\\agent-acc9ca60c285ff315.jsonl",
++  "last_assistant_message": "Running a command",
++  "background_tasks": [],
++  "session_crons": []
++}
+diff --git a/crates/cctg/tests/fixtures/hook/user_prompt_submit.json b/crates/cctg/tests/fixtures/hook/user_prompt_submit.json
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/fixtures/hook/user_prompt_submit.json
+@@ -0,0 +1,9 @@
++{
++  "session_id": "745465f7-0b40-42e9-a499-ec0af37607ad",
++  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\745465f7-0b40-42e9-a499-ec0af37607ad.jsonl",
++  "cwd": "~\\dev\\cctg",
++  "prompt_id": "0bb27012-0d04-43a9-9fa9-128e91ee7e34",
++  "permission_mode": "default",
++  "hook_event_name": "UserPromptSubmit",
++  "prompt": "private prompt text that must not reach the hub"
++}
+diff --git a/crates/cctg/tests/hook_cli.rs b/crates/cctg/tests/hook_cli.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/hook_cli.rs
+@@ -0,0 +1,259 @@
++//! `cctg hook <event>` as Claude Code runs it: a process with JSON on stdin,
++//! configured through `<home>/.cctg/device.env`, talking to a real hub hook
++//! endpoint. Exit code, stdout and stderr are what Claude Code sees.
++
++use std::io::Write;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output, Stdio};
++use std::time::{Duration, Instant};
++
++use cctg::hub::ingress;
++use cctg::wire::{HookEvent, HookPost, Secret};
++use tokio::net::TcpListener;
++use tokio::sync::mpsc;
++
++const SECRET: &str = "hook-cli-secret-0123456789";
++
++fn fixture(name: &str) -> Vec<u8> {
++    std::fs::read(
++        Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("tests/fixtures/hook")
++            .join(format!("{name}.json")),
++    )
++    .expect("hook fixture")
++}
++
++/// A home directory whose `.cctg/device.env` points at `addr`.
++fn home(test: &str, addr: Option<&str>) -> PathBuf {
++    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hook-cli-{test}"));
++    let dir = home.join(".cctg");
++    std::fs::create_dir_all(&dir).unwrap();
++    let mut env = String::new();
++    if let Some(addr) = addr {
++        env.push_str(&format!(
++            "CCTG_HUB_SECRET={SECRET}\nCCTG_HUB_HOOK_ADDR={addr}\nCCTG_HOST=box\n"
++        ));
++    }
++    std::fs::write(dir.join("device.env"), env).unwrap();
++    home
++}
++
++fn run_hook(home: &Path, event: &str, stdin: &[u8]) -> (Output, Duration) {
++    let started = Instant::now();
++    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
++        .args(["hook", event])
++        .env("USERPROFILE", home)
++        .env("HOME", home)
++        .env_remove("CCTG_HUB_SECRET")
++        .env_remove("CCTG_HUB_HOOK_ADDR")
++        .env_remove("CCTG_HOST")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .expect("cctg starts");
++    let mut input = child.stdin.take().unwrap();
++    let _ = input.write_all(stdin);
++    drop(input);
++    let output = child.wait_with_output().unwrap();
++    (output, started.elapsed())
++}
++
++fn assert_quiet(output: &Output, secret_free_of: &[&str]) {
++    assert!(output.status.success(), "{:?}", output.status);
++    assert!(
++        output.stdout.is_empty(),
++        "stdout: {}",
++        String::from_utf8_lossy(&output.stdout)
++    );
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(!stderr.contains(SECRET), "{stderr}");
++    for needle in secret_free_of {
++        assert!(!stderr.contains(needle), "{needle} in {stderr}");
++    }
++}
++
++async fn hub() -> (String, mpsc::Receiver<HookPost>) {
++    let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        .await
++        .unwrap();
++    let addr = listener.local_addr().unwrap().to_string();
++    let (tx, rx) = mpsc::channel(16);
++    tokio::spawn(ingress::serve_hooks(
++        listener,
++        Secret::parse(SECRET).unwrap(),
++        tx,
++    ));
++    (addr, rx)
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn every_event_reaches_the_hub() {
++    let (addr, mut events) = hub().await;
++    let home = home("deliver", Some(&addr));
++    // The fixture's subagent files live on another machine: point at real ones.
++    let agents = home.join("subagents");
++    std::fs::create_dir_all(&agents).unwrap();
++    let transcript = agents.join("agent-a8c1bff86acd31609.jsonl");
++    std::fs::write(&transcript, "").unwrap();
++    let mut stop: serde_json::Value = serde_json::from_slice(&fixture("subagent_stop")).unwrap();
++    stop["agent_transcript_path"] = transcript.to_string_lossy().into_owned().into();
++    let stop = stop.to_string().into_bytes();
++
++    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
++        ("SessionStart", fixture("session_start"), "session_start"),
++        ("SessionEnd", fixture("session_end"), "session_end"),
++        (
++            "UserPromptSubmit",
++            fixture("user_prompt_submit"),
++            "user_prompt_submit",
++        ),
++        ("Stop", fixture("stop"), "stop"),
++        ("SubagentStart", fixture("subagent_start"), "subagent_start"),
++        ("SubagentStop", stop, "subagent_stop"),
++        (
++            "PostToolUse",
++            fixture("post_tool_use_handback"),
++            "subagent_handback",
++        ),
++    ];
++    for (event, input, kind) in cases {
++        let (output, _) = tokio::task::spawn_blocking({
++            let home = home.clone();
++            move || run_hook(&home, event, &input)
++        })
++        .await
++        .unwrap();
++        assert_quiet(&output, &[]);
++        let post = tokio::time::timeout(Duration::from_secs(5), events.recv())
++            .await
++            .expect("hub got the event")
++            .unwrap();
++        assert_eq!(post.event.kind(), kind, "{event}");
++        assert_eq!(post.host, "box");
++        assert!(!post.session_id.is_empty());
++        if let HookEvent::SessionStart {
++            claude_pid,
++            parent_claude_pid,
++            ..
++        } = post.event
++        {
++            // The test runner may itself run under claude; whatever the tree,
++            // a parent is never the session's own process.
++            assert!(parent_claude_pid.is_none() || parent_claude_pid != claude_pid);
++        }
++    }
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn a_silent_hub_keeps_session_end_well_inside_its_budget() {
++    // Accepts and never answers: the POST runs into its timeout.
++    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        .await
++        .unwrap();
++    let addr = listener.local_addr().unwrap().to_string();
++    tokio::spawn(async move {
++        let mut open = Vec::new();
++        while let Ok((stream, _)) = listener.accept().await {
++            open.push(stream);
++        }
++    });
++    let home = home("silent", Some(&addr));
++    let (output, elapsed) =
++        tokio::task::spawn_blocking(move || run_hook(&home, "SessionEnd", &fixture("session_end")))
++            .await
++            .unwrap();
++    assert_quiet(&output, &["745465f7", "\"reason\""]);
++    // Claude Code allows 1.5 s for all SessionEnd hooks together.
++    assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
++    assert!(!output.stderr.is_empty(), "a failed delivery is reported");
++}
++
++#[test]
++fn no_hub_listening_is_quiet_and_fast() {
++    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
++        .unwrap()
++        .local_addr()
++        .unwrap();
++    let home = home("refused", Some(&port.to_string()));
++    for (event, name) in [
++        ("SessionStart", "session_start"),
++        ("SessionEnd", "session_end"),
++    ] {
++        let (output, elapsed) = run_hook(&home, event, &fixture(name));
++        assert_quiet(&output, &["1e087ca8", "745465f7", "~\\"]);
++        assert!(
++            elapsed < Duration::from_millis(1200),
++            "{event}: {elapsed:?}"
++        );
++    }
++}
++
++#[test]
++fn broken_input_and_missing_config_exit_zero_quietly() {
++    let home_ok = home("broken", Some("127.0.0.1:9"));
++    let whole = fixture("session_start");
++    for input in [
++        &b""[..],
++        b"{",
++        b"\xff\xfe",
++        &whole[..whole.len() / 2],
++        b"[1,2]",
++    ] {
++        let (output, _) = run_hook(&home_ok, "SessionStart", input);
++        assert_quiet(&output, &["1e087ca8"]);
++    }
++    let home_empty = home("unconfigured", None);
++    let (output, _) = run_hook(&home_empty, "Stop", &fixture("stop"));
++    assert_quiet(&output, &["Ok.", "745465f7"]);
++    assert!(String::from_utf8_lossy(&output.stderr).contains("CCTG_HUB_SECRET is not set"));
++}
++
++#[test]
++fn settings_snippet_registers_every_event_without_secrets_or_paths() {
++    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/hook-settings.json");
++    let text = std::fs::read_to_string(path).expect("docs/hook-settings.json");
++    let settings: serde_json::Value = serde_json::from_str(&text).unwrap();
++    let hooks = settings["hooks"].as_object().unwrap();
++    let mut events: Vec<&str> = hooks.keys().map(String::as_str).collect();
++    events.sort_unstable();
++    assert_eq!(
++        events,
++        [
++            "PostToolUse",
++            "SessionEnd",
++            "SessionStart",
++            "Stop",
++            "SubagentStart",
++            "SubagentStop",
++            "UserPromptSubmit"
++        ]
++    );
++    for (event, groups) in hooks {
++        let groups = groups.as_array().unwrap();
++        assert_eq!(groups.len(), 1, "{event}");
++        let matcher = groups[0].get("matcher").and_then(|m| m.as_str());
++        assert_eq!(
++            matcher,
++            (event == "PostToolUse").then_some("SubagentHandback"),
++            "{event}"
++        );
++        let commands = groups[0]["hooks"].as_array().unwrap();
++        assert_eq!(commands.len(), 1, "{event}");
++        assert_eq!(commands[0]["type"], "command");
++        assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
++    }
++    for needle in [
++        "CCTG_",
++        "SECRET",
++        "secret",
++        ":\\",
++        "/",
++        "\\\\",
++        "~",
++        "127.0.0.1",
++    ] {
++        assert!(!text.contains(needle), "{needle}");
++    }
++}
+diff --git a/docs/hook-settings.json b/docs/hook-settings.json
+new file mode 100644
+--- /dev/null
++++ b/docs/hook-settings.json
+@@ -0,0 +1,75 @@
++{
++  "hooks": {
++    "SessionStart": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook SessionStart"
++          }
++        ]
++      }
++    ],
++    "SessionEnd": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook SessionEnd"
++          }
++        ]
++      }
++    ],
++    "UserPromptSubmit": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook UserPromptSubmit"
++          }
++        ]
++      }
++    ],
++    "Stop": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook Stop"
++          }
++        ]
++      }
++    ],
++    "SubagentStart": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook SubagentStart"
++          }
++        ]
++      }
++    ],
++    "SubagentStop": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook SubagentStop"
++          }
++        ]
++      }
++    ],
++    "PostToolUse": [
++      {
++        "matcher": "SubagentHandback",
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook PostToolUse"
++          }
++        ]
++      }
++    ]
++  }
++}

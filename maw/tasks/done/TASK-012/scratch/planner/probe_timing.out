@@ -1,0 +1,3 @@
+toolhelp snapshot+iterate: median 7.1 ms, max 8.7 ms (448)
+spawn cctg.exe hook SessionEnd (current no-op, tokio mt runtime): median 6.8 ms, max 214.6 ms (0)
+spawn powershell -NoProfile Get-CimInstance Win32_Process: median 271.2 ms, max 305.8 ms (0)
