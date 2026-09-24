@@ -806,12 +806,65 @@ impl Slots {
             }
             AgentEvent::Disconnected { conn } => {
                 if let Some(gone) = self.conns.remove(&conn) {
-                    self.registry.agent_disconnected(&gone.session, conn);
-                    if self.pending.get(&gone.session) == Some(&conn) {
-                        self.pending.remove(&gone.session);
+                    let session = gone.session;
+                    let bound = self
+                        .registry
+                        .sessions
+                        .get(&session)
+                        .is_some_and(|entry| entry.agent == Some(conn));
+                    self.registry.agent_disconnected(&session, conn);
+                    if self.pending.get(&session) == Some(&conn) {
+                        self.pending.remove(&session);
+                        if let Some(heir) = self.heir(&session) {
+                            self.pending.insert(session.clone(), heir);
+                        }
+                    }
+                    if bound {
+                        self.rebind(&session, conn);
                     }
                 }
             }
+        }
+    }
+
+    /// The newest connection still open for `session` that belongs to the
+    /// session's current claude process (any, when the session's pid is
+    /// unknown).
+    fn heir(&self, session: &str) -> Option<u64> {
+        let run_pid = self
+            .registry
+            .sessions
+            .get(session)
+            .and_then(|entry| entry.claude_pid);
+        self.conns
+            .iter()
+            .filter(|(_, bound)| {
+                bound.session == session && (run_pid.is_none() || bound.claude_pid == run_pid)
+            })
+            .map(|(conn, _)| *conn)
+            .max()
+    }
+
+    /// The bound connection `gone` of a running session closed while an
+    /// older one of the same run is still open (a short-lived second agent,
+    /// TASK-042): the session goes back to that one instead of showing
+    /// "no channel".
+    fn rebind(&mut self, session: &str, gone: u64) {
+        if !self.registry.is_live_top_level(session) {
+            return;
+        }
+        let Some(heir) = self.heir(session) else {
+            return;
+        };
+        if self.registry.agent_connected(session, heir) {
+            info!(
+                conn = heir,
+                gone,
+                session = short(session),
+                "agent bound again after a newer link of its session closed"
+            );
+            self.push_selected(Some(session));
+            self.sync_waiting(session);
         }
     }
 
@@ -4439,6 +4492,55 @@ again"
         assert!(
             matches!(&ops[0], Op::Send { thread_id: Some(100), text, .. } if text == "current connection")
         );
+    }
+
+    #[tokio::test]
+    async fn a_short_lived_second_agent_leaves_the_session_bound_to_the_first() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        // A second link of the same session registers and closes at once
+        // (TASK-042: a `cctg agent` of a test run with the session's env).
+        rig.agent_of(2, A, Some(10)).await;
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 2 })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ops = rig.fake.ops();
+        assert!(
+            ops.iter().all(|op| icon_edit(op) != Some(ICON_NO_CHANNEL)),
+            "{ops:?}"
+        );
+        assert_eq!(last_icon(&ops, 100), Some(ICON_ALIVE), "{ops:?}");
+
+        rig.control
+            .send(say(Some(100), 42, Some("still here")))
+            .unwrap();
+        let got = received(&mut rig, 0).await;
+        assert!(
+            matches!(got.as_slice(), [HubMsg::Inbound { content, .. }] if content == "still here"),
+            "{got:?}"
+        );
+        let before = rig.fake.ops().len();
+        rig.agents.send(reply(1, "from the first")).await.unwrap();
+        let ops = rig.ops_after(before + 1).await;
+        assert!(sent_to(&ops, 100).contains(&"from the first"), "{ops:?}");
+    }
+
+    #[tokio::test]
+    async fn a_link_of_another_claude_process_does_not_inherit_the_session() {
+        let mut rig = rig(Fake::default(), message_options());
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        // A foreign process claims A's id, then A's own agent binds and drops.
+        rig.agent_of(1, A, Some(99)).await;
+        rig.agent_of(2, A, Some(10)).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 2 })
+            .await
+            .unwrap();
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_NO_CHANNEL)).await;
     }
 
     #[tokio::test]

@@ -5,13 +5,15 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use cctg::hub::ingress;
 use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+
+mod common;
 
 const SECRET: &str = "hook-cli-secret-0123456789";
 
@@ -41,13 +43,8 @@ fn home(test: &str, addr: Option<&str>) -> PathBuf {
 
 fn run_hook(home: &Path, event: &str, stdin: &[u8]) -> (Output, Duration) {
     let started = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+    let mut child = common::cctg(home)
         .args(["hook", event])
-        .env("USERPROFILE", home)
-        .env("HOME", home)
-        .env_remove("CCTG_HUB_SECRET")
-        .env_remove("CCTG_HUB_HOOK_ADDR")
-        .env_remove("CCTG_HOST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -197,11 +194,10 @@ fn an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure() {
         .local_addr()
         .unwrap();
     // No home and no CCTG_STATE_DIR: the device has no spool.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+    let mut child = common::cctg(Path::new(env!("CARGO_TARGET_TMPDIR")))
         .args(["hook", "Stop"])
         .env_remove("USERPROFILE")
         .env_remove("HOME")
-        .env_remove("CCTG_STATE_DIR")
         .env("CCTG_HUB_SECRET", SECRET)
         .env("CCTG_HUB_HOOK_ADDR", port.to_string())
         .env("CCTG_HOST", "box")
@@ -251,7 +247,7 @@ fn broken_input_and_missing_config_exit_zero_quietly() {
 #[test]
 fn bad_hook_arguments_still_exit_zero() {
     for args in [&["hook"][..], &["hook", "Stop", "extra"][..]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        let output = common::cctg(&home("bad-args", None))
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -265,13 +261,8 @@ fn bad_hook_arguments_still_exit_zero() {
 fn an_open_silent_stdin_does_not_hold_the_hook() {
     let home = home("hung-stdin", Some("127.0.0.1:9"));
     let started = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+    let mut child = common::cctg(&home)
         .args(["hook", "SessionEnd"])
-        .env("USERPROFILE", &home)
-        .env("HOME", &home)
-        .env_remove("CCTG_HUB_SECRET")
-        .env_remove("CCTG_HUB_HOOK_ADDR")
-        .env_remove("CCTG_HOST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

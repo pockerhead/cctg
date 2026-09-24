@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,8 @@ use cctg::hub::updates::CallbackInput;
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest, Register, Secret};
 use serde_json::Value;
 use tokio::sync::mpsc;
+
+mod common;
 
 const SECRET: &str = "permission-hook-secret-0123456789";
 const SESSION: &str = "5e551017-0000-4000-8000-00000000c0de";
@@ -258,15 +260,9 @@ fn input() -> Vec<u8> {
 async fn run_hook(home: PathBuf) -> (Output, Duration) {
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        let mut child = common::cctg(&home)
             .args(["hook", "PermissionRequest"])
-            .env("USERPROFILE", &home)
-            .env("HOME", &home)
             .env("RUST_LOG", "trace")
-            .env_remove("CCTG_HUB_SECRET")
-            .env_remove("CCTG_HUB_HOOK_ADDR")
-            .env_remove("CCTG_HOST")
-            .env_remove("CCTG_STATE_DIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

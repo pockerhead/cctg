@@ -15,6 +15,8 @@ use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+mod common;
+
 const SECRET: &str = "spool-e2e-secret-0123456789";
 const SESSION: &str = "5b001e2e-0000-4000-8000-000000000001";
 const WAIT: Duration = Duration::from_secs(20);
@@ -66,16 +68,7 @@ impl Home {
 }
 
 fn command(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cctg"));
-    command
-        .env("USERPROFILE", home)
-        .env("HOME", home)
-        .env_remove("CCTG_HUB_SECRET")
-        .env_remove("CCTG_HUB_HOOK_ADDR")
-        .env_remove("CCTG_HUB_AGENT_ADDR")
-        .env_remove("CCTG_HOST")
-        .env_remove("CCTG_STATE_DIR");
-    command
+    common::cctg(home)
 }
 
 /// Runs `cctg hook <event>` with `input` as stdin; returns its stderr.
