@@ -13,7 +13,8 @@
 //! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; so does a new
 //! message type that a peer sends only after the other side announced it in
 //! such a field (`permission_ack`, see [`Register::verdict_ack`];
-//! `transcript_read`, see [`Register::transcript_reads`]). Any other
+//! `transcript_read`, see [`Register::transcript_reads`]; `console_key`,
+//! see [`Register::console_keys`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -132,6 +133,11 @@ pub struct Register {
     /// Agents built before leave it out and are never asked.
     #[serde(default)]
     pub transcript_reads: bool,
+    /// The agent can press a key in the console of its Claude Code process
+    /// and answers `console_key` with `console_key_written` (TASK-029). Only
+    /// Windows agents that know their claude pid announce it.
+    #[serde(default)]
+    pub console_keys: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +184,22 @@ pub enum AgentMsg {
         #[serde(default)]
         reset: bool,
     },
+    /// The answer to one `console_key`: whether the key events were written
+    /// into the console input of the agent's Claude Code process. Written
+    /// is not handled: Claude Code may not have read the key yet, and Esc
+    /// does not always end a turn (it answers an open dialog).
+    ConsoleKeyWritten {
+        key_id: u64,
+        written: bool,
+    },
+}
+
+/// A key the agent presses in its Claude Code console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleKey {
+    /// Esc: stops the running turn.
+    Interrupt,
 }
 
 /// The stream events of one transcript line that ends at byte `end`.
@@ -228,6 +250,7 @@ impl Kinds for AgentMsg {
         "permission_request",
         "permission_ack",
         "transcript_chunk",
+        "console_key_written",
     ];
 }
 
@@ -278,6 +301,13 @@ pub enum HubMsg {
         #[serde(default)]
         from: Option<u64>,
     },
+    /// Sent only to an agent that registered with `console_keys`: press
+    /// `key` in the console of its Claude Code process and answer with one
+    /// `console_key_written` carrying the same `key_id`.
+    ConsoleKey {
+        key_id: u64,
+        key: ConsoleKey,
+    },
 }
 
 impl Kinds for HubMsg {
@@ -287,6 +317,7 @@ impl Kinds for HubMsg {
         "inbound",
         "permission_verdict",
         "transcript_read",
+        "console_key",
     ];
 }
 
@@ -516,6 +547,27 @@ pub enum HookEvent {
     },
     /// `SubagentHandback` report, taken from `PreToolUse`/`PostToolUse`.
     SubagentHandback { agent_id: String, message: String },
+    /// A tool call of the main conversation started (`PreToolUse`, TASK-029).
+    /// `line`: its `/brief` line.
+    ToolStart { tool_use_id: String, line: String },
+    /// A tool call of the main conversation ended (`PostToolUse` or
+    /// `PostToolUseFailure`).
+    ToolEnd { tool_use_id: String },
+    /// Numbers from Claude Code's status line input (`cctg statusline`):
+    /// percentages rounded to whole numbers, each absent when Claude Code
+    /// did not give it.
+    StatusLine {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        context: Option<u32>,
+        #[serde(default)]
+        five_hour: Option<u32>,
+        #[serde(default)]
+        seven_day: Option<u32>,
+    },
 }
 
 impl HookEvent {
@@ -528,7 +580,18 @@ impl HookEvent {
             Self::SubagentStart { .. } => "subagent_start",
             Self::SubagentStop { .. } => "subagent_stop",
             Self::SubagentHandback { .. } => "subagent_handback",
+            Self::ToolStart { .. } => "tool_start",
+            Self::ToolEnd { .. } => "tool_end",
+            Self::StatusLine { .. } => "status_line",
         }
+    }
+
+    /// Events that come many times a turn; the hub logs them at debug only.
+    pub fn is_frequent(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolStart { .. } | Self::ToolEnd { .. } | Self::StatusLine { .. }
+        )
     }
 }
 
@@ -541,6 +604,9 @@ impl Kinds for HookEvent {
         "subagent_start",
         "subagent_stop",
         "subagent_handback",
+        "tool_start",
+        "tool_end",
+        "status_line",
     ];
 }
 
@@ -605,6 +671,7 @@ mod tests {
                 claude_pid: Some(4242),
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: true,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -643,6 +710,10 @@ mod tests {
                 more: true,
                 reset: false,
             },
+            AgentMsg::ConsoleKeyWritten {
+                key_id: u64::MAX,
+                written: true,
+            },
         ]
     }
 
@@ -676,6 +747,10 @@ mod tests {
                 session_id: "s".into(),
                 path: "/p/s.jsonl".into(),
                 from: None,
+            },
+            HubMsg::ConsoleKey {
+                key_id: 7,
+                key: ConsoleKey::Interrupt,
             },
         ]
     }
@@ -711,6 +786,20 @@ mod tests {
             HookEvent::SubagentHandback {
                 agent_id: "a1".into(),
                 message: "report".into(),
+            },
+            HookEvent::ToolStart {
+                tool_use_id: "toolu_1".into(),
+                line: "• Bash: run tests".into(),
+            },
+            HookEvent::ToolEnd {
+                tool_use_id: "toolu_1".into(),
+            },
+            HookEvent::StatusLine {
+                model: Some("Opus".into()),
+                effort: Some("high".into()),
+                context: Some(50),
+                five_hour: Some(3),
+                seven_day: None,
             },
         ]
     }
@@ -798,8 +887,56 @@ mod tests {
                 claude_pid: None,
                 verdict_ack: false,
                 transcript_reads: false,
+                console_keys: false,
             }))
         );
+    }
+
+    #[test]
+    fn console_keys_and_status_events_stay_compatible_with_version_one_peers() {
+        // An agent before TASK-029 never announces console keys; a hub
+        // before it never sends one, so the new kinds stay behind the flag.
+        let line = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w","console_keys":true}"#;
+        assert!(matches!(
+            decode::<AgentMsg>(line),
+            Ok(AgentMsg::Register(Register {
+                console_keys: true,
+                ..
+            }))
+        ));
+        let key = encode(&HubMsg::ConsoleKey {
+            key_id: 3,
+            key: ConsoleKey::Interrupt,
+        });
+        let value: Value = serde_json::from_slice(&key).unwrap();
+        assert_eq!(value["v"], 1);
+        assert_eq!(value["key"], "interrupt");
+        // Esc is the only key.
+        for other in ["reboot", "esc"] {
+            let line = format!(r#"{{"v":1,"type":"console_key","key_id":3,"key":"{other}"}}"#);
+            assert_eq!(decode::<HubMsg>(line.as_bytes()), Err(WireError::Malformed));
+        }
+        // A status line without numbers is still one event.
+        let id = EventId::new();
+        let body = json!({ "v": 1, "event_id": id.as_str(), "host": "h", "session_id": "s",
+            "event": { "type": "status_line" } });
+        assert_eq!(
+            decode_hook(&serde_json::to_vec(&body).unwrap()).map(|post| post.event),
+            Ok(HookEvent::StatusLine {
+                model: None,
+                effort: None,
+                context: None,
+                five_hour: None,
+                seven_day: None,
+            })
+        );
+        assert!(
+            HookEvent::ToolEnd {
+                tool_use_id: "t".into()
+            }
+            .is_frequent()
+        );
+        assert!(!HookEvent::UserPromptSubmit { prompt_id: None }.is_frequent());
     }
 
     #[test]

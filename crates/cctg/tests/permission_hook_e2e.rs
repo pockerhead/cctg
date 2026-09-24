@@ -209,6 +209,7 @@ async fn hub(test: &str) -> Hub {
                 claude_pid: Some(10),
                 verdict_ack: true,
                 transcript_reads: false,
+                console_keys: false,
             },
             to_agent,
         })

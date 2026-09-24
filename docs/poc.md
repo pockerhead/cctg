@@ -4,7 +4,7 @@
 
 ## Что нужно заранее
 
-- Закрытая супергруппа с темами, бот в ней админ с правами "Manage Topics" и "Delete Messages".
+- Закрытая супергруппа с темами, бот в ней админ с правами "Manage Topics", "Delete Messages" и "Pin Messages" (без последнего сообщение статуса не закрепляется, hub пишет об этом при старте).
 - Файл `.env` в корне репозитория (в git не попадает):
 
   ```
@@ -81,6 +81,7 @@ cargo build --release -p cctg
 
 ```json
 {
+  "statusLine": { "type": "command", "command": "\"<cctg>\" statusline" },
   "hooks": {
     "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SessionStart" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SessionEnd" }] }],
@@ -88,11 +89,20 @@ cargo build --release -p cctg
     "Stop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook Stop" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStart" }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStop" }] }],
-    "PostToolUse": [{ "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] }],
+    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }],
+    "PostToolUse": [
+      { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] },
+      { "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }
+    ],
+    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }],
     "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PermissionRequest", "timeout": 100 }] }]
   }
 }
 ```
+
+`statusLine` и `ToolStatus` нужны для закреплённого сообщения статуса в теме (что делает сессия, модель, контекст и лимиты, кнопка ⏹). `ToolStatus` помечен `"async": true`: Claude Code его не ждёт, один вызов инструмента стоит два коротких процесса в фоне. `cctg statusline` на каждом вызове читает `statusLine.command` из ваших пользовательских настроек (`$CLAUDE_CONFIG_DIR/settings.json` или `~/.claude/settings.json`), запускает его с тем же stdin через Git Bash (на Windows без Git Bash через PowerShell) и печатает его вывод байт в байт, так что строка в терминале остаётся вашей; без своей команды печатается короткая строка cctg. Если в вашем `statusLine` есть `padding`, `refreshInterval` или `hideVimModeIndicator`, скопируйте их в `statusLine` этого файла: `--settings` заменяет `statusLine` целиком, и без них строка будет выглядеть или обновляться иначе. Цифры уходят в hub параллельно вашей команде с таймаутом 80 мс (при остановленном hub строка появляется на столько же позже).
+
+Кнопка ⏹ (с подтверждением вторым нажатием за 10 с) работает только на Windows: агент пишет Esc во входной буфер консоли своего claude (`WriteConsoleInputW`; проверено в обычной консоли conhost, в Windows Terminal не проверено, в mintty без консоли не работает, тогда в тему приходит одно уведомление). После этого статус показывает «⏹ Esc отправлен в терминал», а не «ждёт вас»: запись в буфер не значит, что ход остановлен. Конец хода статус узнаёт из `Stop`, заметки о прерывании в транскрипте, следующего промпта или конца сессии; прерывание во время размышления не даёт ни того, ни другого, тогда статус сменится со следующим промптом. Пока ждёт запрос разрешения, ⏹ не показывается: Esc в этот момент отвечает на запрос, а не останавливает ход, поэтому сначала нажмите Allow или Deny.
 
 `PermissionRequest` ждёт ответа из Telegram до 90 с (кнопки для диалогов, которые канал не пересылает, например проверка безопасности auto mode), поэтому ему нужен свой `"timeout": 100`. Запрос, который уже пришёл через канал, хук отпускает без решения за ~1.5 с.
 

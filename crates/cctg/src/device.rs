@@ -120,7 +120,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+pub(crate) fn home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["USERPROFILE", "HOME"]
     } else {

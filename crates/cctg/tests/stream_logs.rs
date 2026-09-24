@@ -153,6 +153,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
                 claude_pid: Some(10),
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: false,
             },
             to_agent,
         })

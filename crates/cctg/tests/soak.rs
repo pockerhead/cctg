@@ -480,6 +480,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
         Op::React { message_id, emoji } => ("react", None, emoji.clone(), Some(*message_id)),
         Op::AnswerCallback { query_id, .. } => ("callback", None, query_id.clone(), None),
         Op::Delete { message_id } => ("delete", None, String::new(), Some(*message_id)),
+        Op::Pin { message_id } => ("pin", None, String::new(), Some(*message_id)),
         Op::CreateTopic { name, .. } => ("create_topic", None, name.clone(), None),
         Op::EditTopic {
             thread_id,

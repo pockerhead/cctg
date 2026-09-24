@@ -5,7 +5,8 @@
 //!    queued (stream lines do not count); metered.
 //! 2. `Edit` - `editMessageText` and `setMessageReaction` (both coalesced per
 //!    message) and `answerCallbackQuery`.
-//! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`.
+//! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`,
+//!    `pinChatMessage`.
 //! 4. `Message` - `sendMessage`, `sendDocument` and transcript stream lines;
 //!    metered, one FIFO. Permission prompts live here too, so they never
 //!    overtake their own topic's ordinary messages; they do overtake its
@@ -82,6 +83,10 @@ pub enum Op {
     Delete {
         message_id: i64,
     },
+    /// `pinChatMessage` without a notification.
+    Pin {
+        message_id: i64,
+    },
     CreateTopic {
         name: String,
         icon_custom_emoji_id: Option<String>,
@@ -124,7 +129,9 @@ impl Op {
         match self {
             Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => Lane::Message(0),
             Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit,
-            Op::Delete { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => Lane::Topic,
+            Op::Delete { .. } | Op::Pin { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => {
+                Lane::Topic
+            }
         }
     }
 
@@ -209,6 +216,10 @@ impl Transport for BotApi {
                 .map(|()| Outcome::Done),
             Op::Delete { message_id } => self
                 .delete_message(*message_id)
+                .await
+                .map(|()| Outcome::Done),
+            Op::Pin { message_id } => self
+                .pin_chat_message(*message_id)
                 .await
                 .map(|()| Outcome::Done),
             Op::CreateTopic {

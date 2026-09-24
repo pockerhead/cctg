@@ -1,4 +1,8 @@
 {
+  "statusLine": {
+    "type": "command",
+    "command": "cctg statusline"
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -60,6 +64,17 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cctg hook ToolStatus",
+            "async": true
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "SubagentHandback",
@@ -67,6 +82,26 @@
           {
             "type": "command",
             "command": "cctg hook PostToolUse"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cctg hook ToolStatus",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cctg hook ToolStatus",
+            "async": true
           }
         ]
       }

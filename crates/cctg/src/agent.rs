@@ -21,6 +21,10 @@
 //! endpoint: a session that started while the hub was down becomes known as
 //! soon as the hub is back, without waiting for its next hook.
 //!
+//! On Windows the agent also presses Esc in its claude's console when the
+//! hub asks (`console_key`, see [`crate::keys`]) and answers whether the key
+//! events were written.
+//!
 //! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
 //! channel from Claude Code (TASK-004), so its agent answers MCP but never
 //! connects: a nested `claude -p` cannot show up as a routable channel even
@@ -29,6 +33,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
@@ -40,10 +45,11 @@ use tracing::{debug, info, warn};
 
 use crate::channel::{self, Hub, NoHub};
 use crate::device::{self, DeviceConfig};
+use crate::keys;
 use crate::proctree;
 use crate::spool;
 use crate::tail;
-use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
+use crate::wire::{self, AgentMsg, ConsoleKey, HubMsg, Register, Rejection, Secret, WireError};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -351,22 +357,30 @@ pub enum Frame {
     TooLong,
 }
 
+/// Writes one key into the claude console; `false` when it was not written.
+pub type Presser = Arc<dyn Fn(ConsoleKey) -> bool + Send + Sync>;
+
 /// Runs `cctg agent` until stdin closes.
 pub async fn run_stdio() {
     let config = DeviceConfig::load();
     let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
     let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
+    // Not env `CLAUDE_PID`: in an MCP server it is inherited from an outer
+    // claude, or unset (TASK-004).
+    let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
+    let presser: Option<Presser> = claude_pid
+        .filter(|_| keys::SUPPORTED)
+        .map(|pid| Arc::new(move |key| keys::press(pid, key)) as Presser);
     let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
         Ok((secret, session_id)) => {
             let register = Register {
                 session_id,
                 host: config.host.clone(),
                 cwd: device::canonical_cwd(&current_dir()),
-                // Not env `CLAUDE_PID`: in an MCP server it is inherited
-                // from an outer claude, or unset (TASK-004).
-                claude_pid: proctree::current_lineage(None, None, "").claude_pid,
+                claude_pid,
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: presser.is_some(),
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: config.agent_addr.clone(),
@@ -387,7 +401,9 @@ pub async fn run_stdio() {
     };
     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
     let projects = tail::projects_root();
-    if let Err(error) = serve_channel(frames, tokio::io::stdout(), hub, events, projects).await {
+    if let Err(error) =
+        serve_channel(frames, tokio::io::stdout(), hub, events, projects, presser).await
+    {
         debug!(kind = ?error.kind(), "stdout closed");
     }
 }
@@ -478,16 +494,22 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
 /// when stdin ends (the hub link stops with it) or stdout fails. Transcript
 /// reads are answered only from under `projects` ([`tail::projects_root`]).
+/// Console keys are pressed with `presser`; without one a `console_key` is
+/// answered as failed.
 pub async fn serve_channel<W: AsyncWrite + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     mut output: W,
     hub: Hub,
     mut events: Option<mpsc::Receiver<LinkEvent>>,
     projects: Option<PathBuf>,
+    presser: Option<Presser>,
 ) -> std::io::Result<()> {
-    let reads = match &hub {
-        Hub::Link(outbox) => Some(spawn_reader(outbox.clone(), projects)),
-        Hub::Off(_) => None,
+    let (reads, keys) = match &hub {
+        Hub::Link(outbox) => (
+            Some(spawn_reader(outbox.clone(), projects)),
+            Some(spawn_presser(outbox.clone(), presser)),
+        ),
+        Hub::Off(_) => (None, None),
     };
     let mut server = channel::Server::new(hub);
     loop {
@@ -506,6 +528,16 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                         && reads.try_send((session_id, path, from)).is_err()
                     {
                         debug!("transcript read busy; request dropped");
+                    }
+                    Vec::new()
+                }
+                Some(LinkEvent::Message(HubMsg::ConsoleKey { key_id, key })) => {
+                    // Presses queue up; one beyond the queue is dropped (the
+                    // hub takes a missing answer as nothing done).
+                    if let Some(keys) = &keys
+                        && keys.try_send((key_id, key)).is_err()
+                    {
+                        debug!("console key queue full; key dropped");
                     }
                     Vec::new()
                 }
@@ -545,6 +577,39 @@ fn spawn_reader(
                 && outbox.send(chunk).await.is_err()
             {
                 debug!("hub link gone; transcript chunk dropped");
+                return;
+            }
+        }
+    });
+    requests
+}
+
+/// The one worker that presses console keys off the loop, one at a time (a
+/// console is attached per process), and answers each with
+/// `console_key_written`.
+fn spawn_presser(
+    outbox: mpsc::Sender<AgentMsg>,
+    presser: Option<Presser>,
+) -> mpsc::Sender<(u64, ConsoleKey)> {
+    let (requests, mut pending) = mpsc::channel::<(u64, ConsoleKey)>(4);
+    tokio::spawn(async move {
+        while let Some((key_id, key)) = pending.recv().await {
+            let written = match presser.clone() {
+                Some(press) => tokio::task::spawn_blocking(move || press(key))
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            };
+            if written {
+                info!(?key, "console key written");
+            } else {
+                warn!(?key, "console key not written");
+            }
+            if outbox
+                .send(AgentMsg::ConsoleKeyWritten { key_id, written })
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -600,6 +665,7 @@ mod tests {
             claude_pid: None,
             verdict_ack: true,
             transcript_reads: true,
+            console_keys: false,
         }
     }
 
@@ -1024,7 +1090,7 @@ mod tests {
     ) -> Claude {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 16);
-        tokio::spawn(serve_channel(frames_rx, ours, hub, events, projects));
+        tokio::spawn(serve_channel(frames_rx, ours, hub, events, projects, None));
         Claude {
             frames,
             out: tokio::io::BufReader::new(theirs),
@@ -1260,6 +1326,7 @@ mod tests {
             Hub::Link(outbox),
             Some(events),
             None,
+            None,
         ));
         let (_first, _) = listener.accept().await.unwrap();
         drop(frames);
@@ -1333,5 +1400,93 @@ mod tests {
             .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
             .await;
         assert_eq!(claude.recv().await["id"], 5);
+    }
+
+    #[tokio::test]
+    async fn a_console_key_is_pressed_answered_and_never_reaches_claude() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (outbox, events) = spawn(config(addr, Backoff::default()));
+        let pressed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = pressed.clone();
+        // The first write works, the second does not.
+        let presser: Presser = Arc::new(move |key| {
+            let mut seen = seen.lock().unwrap();
+            seen.push(key);
+            seen.len() == 1
+        });
+        let (frames, frames_rx) = mpsc::channel(16);
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        tokio::spawn(serve_channel(
+            frames_rx,
+            ours,
+            Hub::Link(outbox),
+            Some(events),
+            None,
+            Some(presser),
+        ));
+        let mut claude = Claude {
+            frames,
+            out: tokio::io::BufReader::new(theirs),
+        };
+        let (mut reader, mut write) = raw_hub(&listener).await;
+        for key_id in [7, 8] {
+            let key = ConsoleKey::Interrupt;
+            wire::write_msg(&mut write, &HubMsg::ConsoleKey { key_id, key })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            agent_line(&mut reader).await,
+            AgentMsg::ConsoleKeyWritten {
+                key_id: 7,
+                written: true
+            }
+        );
+        assert_eq!(
+            agent_line(&mut reader).await,
+            AgentMsg::ConsoleKeyWritten {
+                key_id: 8,
+                written: false
+            }
+        );
+        assert_eq!(
+            *pressed.lock().unwrap(),
+            [ConsoleKey::Interrupt, ConsoleKey::Interrupt]
+        );
+        // Claude Code saw nothing of it.
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 5);
+    }
+
+    #[tokio::test]
+    async fn without_a_presser_a_console_key_is_answered_as_failed() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (outbox, events) = spawn(config(addr, Backoff::default()));
+        let _claude = claude(Hub::Link(outbox), Some(events));
+        let (mut reader, mut write) = raw_hub(&listener).await;
+        wire::write_msg(
+            &mut write,
+            &HubMsg::ConsoleKey {
+                key_id: 1,
+                key: ConsoleKey::Interrupt,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agent_line(&mut reader).await,
+            AgentMsg::ConsoleKeyWritten {
+                key_id: 1,
+                written: false
+            }
+        );
     }
 }

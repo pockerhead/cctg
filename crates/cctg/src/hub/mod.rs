@@ -11,6 +11,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod sessions;
 pub mod slots;
+pub mod status;
 pub mod stream;
 pub mod subagents;
 #[cfg(test)]
@@ -62,10 +63,13 @@ pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
 
 /// The poll callback: commands go to the command worker's queue; other
 /// messages, button presses and topic edit notices go to the slot actor. Nothing here waits,
-/// so a slow command or a slow Telegram never holds up polling.
+/// so a slow command or a slow Telegram never holds up polling. A pin notice
+/// goes to the slot actor only when this bot (`bot_id`) pinned: a person's
+/// pin, even of a status message, is theirs to keep.
 fn route_inbound<'a>(
     commands: &'a mpsc::UnboundedSender<Inbound>,
     control: &'a mpsc::UnboundedSender<Control>,
+    bot_id: i64,
 ) -> impl FnMut(Routed) + 'a {
     move |routed| match routed {
         Routed::Input(input) if commands::is_command(&input) => {
@@ -89,6 +93,19 @@ fn route_inbound<'a>(
                 message_id: service.message_id,
             };
             if control.send(edited).is_err() {
+                warn!("slot actor stopped; service message kept");
+            }
+        }
+        Routed::Service(updates::ServiceMessage {
+            kind: ServiceKind::Pinned(pinned),
+            message_id,
+            from: Some(from),
+            ..
+        }) if from == bot_id => {
+            if control
+                .send(Control::Pinned { message_id, pinned })
+                .is_err()
+            {
                 warn!("slot actor stopped; service message kept");
             }
         }
@@ -186,6 +203,10 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     if !can_delete {
         warn!("the bot lacks can_delete_messages; forum service messages will stay visible");
     }
+    let can_pin = member.status == "creator" || member.can_pin_messages;
+    if !can_pin {
+        warn!("the bot lacks can_pin_messages; status messages will not be pinned");
+    }
     let icons = checked_icons(api.get_forum_topic_icon_stickers().await)?;
     info!(
         bot = me.username.as_deref().unwrap_or("?"),
@@ -198,6 +219,8 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         icons,
         chat_id: config.chat_id,
         can_delete,
+        can_pin,
+        status_every: Some(slots::STATUS_EVERY),
         ..slots::Options::default()
     };
     let (mut slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
@@ -229,7 +252,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         api.as_ref(),
         &config.allowlist,
         &offsets,
-        route_inbound(&commands_tx, &control_tx),
+        route_inbound(&commands_tx, &control_tx, me.id),
         stop_requested(stop_on_stdin),
     )
     .await;
@@ -261,6 +284,8 @@ mod tests {
 
     const CHAT: i64 = -1000000000001;
     const ALLOWED: i64 = 1001;
+    /// The bot's own user id (`getMe`).
+    const BOT: i64 = 4242;
     const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
 
     /// One command per call, then an idle long poll; counts calls.
@@ -355,7 +380,7 @@ mod tests {
                     source.as_ref(),
                     &allowlist,
                     &store,
-                    route_inbound(&commands_tx, &control_tx),
+                    route_inbound(&commands_tx, &control_tx, BOT),
                 )
                 .await;
             })
@@ -400,7 +425,7 @@ mod tests {
             quote: None,
             forwarded: false,
         };
-        let mut route = route_inbound(&commands_tx, &control_tx);
+        let mut route = route_inbound(&commands_tx, &control_tx, BOT);
         route(Routed::Input(input("hello")));
         route(Routed::Input(input("/brief 2")));
         route(Routed::Input(Inbound {
@@ -418,6 +443,17 @@ mod tests {
                 kind,
                 message_id: 9,
                 thread_id: Some(100),
+                from: Some(BOT),
+            }));
+        }
+        // Pins of the status message by a person (allowlisted or not) or
+        // by nobody known stay; only the bot's own pin notice goes on.
+        for from in [Some(ALLOWED), Some(BOT + 1), None, Some(BOT)] {
+            route(Routed::Service(updates::ServiceMessage {
+                kind: ServiceKind::Pinned(1000),
+                message_id: 11,
+                thread_id: Some(100),
+                from,
             }));
         }
         drop(route);
@@ -435,9 +471,16 @@ mod tests {
             Control::Message(Inbound { text: None, .. })
         ));
         assert_eq!(control_rx.try_recv().unwrap(), Control::Callback(press));
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            Control::Pinned {
+                message_id: 11,
+                pinned: 1000
+            }
+        );
         assert!(
             control_rx.try_recv().is_err(),
-            "service messages are not input"
+            "other service messages are not input"
         );
     }
 
@@ -446,6 +489,7 @@ mod tests {
             status: status.to_owned(),
             can_manage_topics: topics,
             can_delete_messages: true,
+            can_pin_messages: true,
         }
     }
 

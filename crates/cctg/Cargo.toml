@@ -17,10 +17,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 transcript = { path = "../transcript" }
 
-# Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot).
-# Already in the lock file through tokio; no new download.
+# Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot);
+# console key presses of the agent (TASK-029: AttachConsole, CreateFileW
+# CONIN$, WriteConsoleInputW). Already in the lock file through tokio; no new
+# download.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

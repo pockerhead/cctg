@@ -170,6 +170,7 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
                 claude_pid: Some(10),
                 verdict_ack: true,
                 transcript_reads: false,
+                console_keys: false,
             },
             to_agent,
         })

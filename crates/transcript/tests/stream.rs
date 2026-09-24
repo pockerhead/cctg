@@ -169,3 +169,20 @@ fn a_thinking_cut_never_splits_a_grapheme() {
     let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"thinking","thinking":"x"}]}}"#;
     assert!(stream_events(user).is_empty());
 }
+
+#[test]
+fn a_call_line_from_hook_input_matches_the_streamed_line() {
+    // The status message shows a running call with the line the stream
+    // shows when it ends (TASK-029): from the tool name and input alone.
+    let input = serde_json::json!({ "command": "cargo test", "description": "Run the  tests\n" });
+    assert_eq!(
+        transcript::call_line("Bash", &input),
+        "• Bash: Run the tests"
+    );
+    let agent = serde_json::json!({ "subagent_type": "Explore", "description": "find it" });
+    assert_eq!(transcript::call_line("Agent", &agent), "↳ Explore: find it");
+    assert_eq!(
+        transcript::call_line("Read", &serde_json::Value::Null),
+        "• Read"
+    );
+}

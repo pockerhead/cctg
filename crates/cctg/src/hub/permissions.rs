@@ -20,8 +20,10 @@
 //! a request that is no longer pending is ignored by Claude Code.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::time::Instant;
 use transcript::{TELEGRAM_TEXT_LIMIT, telegram_len};
 
 use super::registry::cut;
@@ -192,6 +194,8 @@ pub struct Prompt {
     /// Asked by a `PermissionRequest` hook, not relayed by an agent: the
     /// answer goes back to the waiting hook, never to an agent.
     pub hook: bool,
+    /// When the hub got the request.
+    pub opened: Instant,
 }
 
 impl Prompt {
@@ -216,6 +220,7 @@ impl Prompt {
             edit: Edit::None,
             edit_failures: 0,
             hook: false,
+            opened: Instant::now(),
         }
     }
 
@@ -392,6 +397,19 @@ impl Prompts {
     pub fn quiet(&mut self, session: &str) {
         for prompt in self.prompts.values_mut() {
             if prompt.session == session {
+                prompt.waits = false;
+            }
+        }
+    }
+
+    /// A later call of `session` started or ended: its prompts that came in
+    /// at least `settle` before `now` were answered in the terminal and stop
+    /// counting for the icon. Younger ones still count: the tool hooks run
+    /// in the background, so the end of the call before a prompt can come in
+    /// after it. Their buttons stay.
+    pub fn quiet_settled(&mut self, session: &str, now: Instant, settle: Duration) {
+        for prompt in self.prompts.values_mut() {
+            if prompt.session == session && prompt.opened + settle <= now {
                 prompt.waits = false;
             }
         }
@@ -651,6 +669,28 @@ mod tests {
         book.finish(third, State::Closed);
         assert!(!book.waiting("A"));
         assert_eq!(book.active(), [second]);
+    }
+
+    #[test]
+    fn a_later_call_quiets_only_prompts_older_than_the_settle_time() {
+        let mut book = Prompts::default();
+        let old = added(book.open(prompt("A", "abcde")));
+        let young = added(book.open(prompt("A", "bcdef")));
+        let settle = Duration::from_secs(2);
+        let opened = book.get(old).unwrap().opened;
+        book.get_mut(young).unwrap().opened = opened + Duration::from_secs(1);
+        book.quiet_settled("A", opened + Duration::from_millis(1500), settle);
+        assert!(book.waiting("A"), "neither has settled");
+        book.quiet_settled("A", opened + settle, settle);
+        assert!(!book.get(old).unwrap().waits);
+        assert!(
+            book.get(young).unwrap().waits,
+            "the younger one still waits"
+        );
+        assert!(book.waiting("A"));
+        book.quiet_settled("B", opened + Duration::from_secs(9), settle);
+        assert!(book.waiting("A"), "another session's call changes nothing");
+        assert_eq!(book.active(), [old, young], "the buttons stay");
     }
 
     #[test]

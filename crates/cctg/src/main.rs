@@ -54,6 +54,9 @@ enum Command {
         /// Hook event name.
         event: String,
     },
+    /// Claude Code status line command of cctg sessions: sends the numbers
+    /// to the hub and prints the user's own status line.
+    Statusline,
 }
 
 #[tokio::main]
@@ -65,11 +68,15 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("cctg hook: bad arguments");
             std::process::exit(0);
         }
+        Err(_) if std::env::args().nth(1).as_deref() == Some("statusline") => {
+            eprintln!("cctg statusline: bad arguments");
+            std::process::exit(0);
+        }
         Err(error) => error.exit(),
     };
     init_tracing(matches!(
         &cli.command,
-        Command::Hook { .. } | Command::Agent
+        Command::Hook { .. } | Command::Agent | Command::Statusline
     ));
     match cli.command {
         Command::Hub {
@@ -127,6 +134,13 @@ async fn main() -> anyhow::Result<()> {
             let _ = tokio::spawn(cctg::agent::run_stdio()).await;
             // At once: the stdin reader thread may still be blocked.
             std::process::exit(0);
+        }
+        Command::Statusline => {
+            // Status line input carries paths and names: a fixed line only.
+            std::panic::set_hook(Box::new(|_| eprintln!("cctg statusline: internal error")));
+            let code = tokio::spawn(cctg::statusline::run()).await.unwrap_or(0);
+            // At once: the stdin reader thread may still be blocked.
+            std::process::exit(code);
         }
         Command::AgentInstall => {
             let exe = std::env::current_exe()?;
@@ -215,6 +229,10 @@ mod tests {
                 .unwrap()
                 .command,
             Command::Hook { event } if event == "SessionStart"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "statusline"]).unwrap().command,
+            Command::Statusline
         ));
     }
 }
