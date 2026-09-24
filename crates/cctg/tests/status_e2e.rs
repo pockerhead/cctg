@@ -344,6 +344,18 @@ impl Hub {
                 status_sends(ops).iter().any(|(t, _)| *t == thread) && !pins(ops).is_empty()
             })
             .await;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                Op::Send {
+                    reply_markup: Some(_),
+                    permission: false,
+                    notify: true,
+                    ..
+                }
+            )),
+            "status messages go without a sound"
+        );
         // Sends are numbered from 1000 in call order.
         let index = ops
             .iter()

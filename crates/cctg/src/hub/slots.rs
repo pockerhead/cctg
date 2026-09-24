@@ -1239,6 +1239,7 @@ impl Slots {
                         bytes: whole.into_bytes(),
                         caption: None,
                     },
+                    notify: false,
                 }]);
             }
         }
@@ -1556,6 +1557,7 @@ impl Slots {
                     reply_markup,
                     permission: false,
                     reply_to: None,
+                    notify: false,
                 },
             );
         }
@@ -1746,7 +1748,7 @@ impl Slots {
         if answer.trim().is_empty() {
             return;
         }
-        if let Some(parts) = self.send_text(thread_id, session, answer, "answer") {
+        if let Some(parts) = self.send_text(thread_id, session, answer, "answer", true) {
             info!(
                 ordinal,
                 session = short(session),
@@ -1775,7 +1777,7 @@ impl Slots {
         if held.answer.trim().is_empty() {
             return;
         }
-        if let Some(parts) = self.send_text(held.thread_id, session, &held.answer, "answer") {
+        if let Some(parts) = self.send_text(held.thread_id, session, &held.answer, "answer", true) {
             info!(session = short(session), parts, "turn answer queued");
         }
     }
@@ -2085,6 +2087,7 @@ impl Slots {
                                 html,
                                 merge,
                                 restart: std::mem::take(&mut live.restart),
+                                notify: false,
                             };
                             actions.push(Action::Stream(live.sent(), op));
                         }
@@ -2239,7 +2242,7 @@ impl Slots {
             warn!(ordinal, "reply for a slot without a topic yet; dropped");
             return;
         };
-        if let Some(parts) = self.send_text(thread_id, &session, text, "reply") {
+        if let Some(parts) = self.send_text(thread_id, &session, text, "reply", false) {
             info!(
                 ordinal,
                 session = short(&session),
@@ -2250,7 +2253,8 @@ impl Slots {
     }
 
     /// Queues `text` for the topic: the chunks of `split_for_telegram` in
-    /// order, or one document `<kind>-<short id>.txt` when it prefers a file.
+    /// order, or one document `<kind>-<short id>.txt` when it prefers a file,
+    /// with a sound when `notify`.
     /// The number of parts, or `None` when the message cap refused them.
     fn send_text(
         &mut self,
@@ -2258,6 +2262,7 @@ impl Slots {
         session: &str,
         text: &str,
         kind: &str,
+        notify: bool,
     ) -> Option<usize> {
         let split = split_markdown_for_telegram(text, SplitOptions::default());
         let ops: Vec<Op> = if split.prefer_file {
@@ -2268,6 +2273,7 @@ impl Slots {
                     bytes: text.as_bytes().to_vec(),
                     caption: None,
                 },
+                notify,
             }]
         } else {
             split
@@ -2280,6 +2286,7 @@ impl Slots {
                     reply_markup: None,
                     permission: false,
                     reply_to: None,
+                    notify,
                 })
                 .collect()
         };
@@ -2629,6 +2636,7 @@ impl Slots {
                 reply_markup: Some(permissions::keyboard(&prompt.request_id)),
                 permission: true,
                 reply_to: None,
+                notify: true,
             };
             if let Some(prompt) = self.prompts.get_mut(key) {
                 prompt.sent = true;
@@ -2987,6 +2995,7 @@ impl Slots {
                     reply_markup: Some(keyboard.clone()),
                     permission: false,
                     reply_to: None,
+                    notify: false,
                 },
                 StatusJob::Edit {
                     message_id,
@@ -3465,6 +3474,7 @@ impl Slots {
                 reply_markup: None,
                 permission: false,
                 reply_to: Some(notice.reply_to),
+                notify: true,
             }]);
         }
     }
@@ -3617,6 +3627,7 @@ impl Slots {
                     reply_markup: None,
                     permission: false,
                     reply_to: None,
+                    notify: false,
                 },
             };
             self.hand_off(Work::Topic(job), op);
@@ -3688,6 +3699,7 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         html: Some(chunk.html),
         merge: false,
         restart: std::mem::take(&mut live.restart),
+        notify: true,
     };
     let mut ops = Vec::with_capacity(chunks.len() + 1);
     for chunk in chunks {
@@ -3717,6 +3729,7 @@ fn stream_chunks(text: &str, markdown: bool) -> Vec<(String, Option<String>)> {
     }
 }
 
+/// A plain message without a sound.
 fn message_op(thread_id: i64, text: String) -> Op {
     Op::Send {
         thread_id: Some(thread_id),
@@ -3725,6 +3738,7 @@ fn message_op(thread_id: i64, text: String) -> Op {
         reply_markup: None,
         permission: false,
         reply_to: None,
+        notify: false,
     }
 }
 
@@ -4097,6 +4111,21 @@ mod tests {
         got
     }
 
+    /// Texts of the messages sent with a sound (TASK-041).
+    fn loud(ops: &[Op]) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    text, notify: true, ..
+                }
+                | Op::Stream {
+                    text, notify: true, ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn sent_to(ops: &[Op], thread: i64) -> Vec<&str> {
         ops.iter()
             .filter_map(|op| match op {
@@ -4341,6 +4370,7 @@ again"
         let ops = settled(&rig, |ops| sent_to(ops, 101).len() == expected.len()).await;
         assert_eq!(sent_to(&ops, 101), expected);
         assert!(sent_to(&ops, 100).is_empty());
+        assert!(loud(&ops).is_empty(), "replies go without a sound");
 
         // More chunks than `max_chunks`: one document with the whole text.
         let huge = "x".repeat(5 * 4096);
@@ -4350,7 +4380,7 @@ again"
         })
         .await;
         assert!(ops.iter().any(|op| matches!(op,
-            Op::SendDocument { thread_id: Some(100), document } if document.bytes == huge.as_bytes())));
+            Op::SendDocument { thread_id: Some(100), document, notify: false } if document.bytes == huge.as_bytes())));
     }
 
     #[tokio::test]
@@ -4506,6 +4536,7 @@ again"
         let ops = settled(&rig, |ops| sent_to(ops, 101).len() == expected.len()).await;
         assert_eq!(sent_to(&ops, 101), expected);
         assert!(sent_to(&ops, 100).is_empty());
+        assert_eq!(loud(&ops), expected, "only turn answers have a sound");
 
         // More chunks than `max_chunks`: one document with the whole text.
         let huge = "x".repeat(5 * 4096);
@@ -4515,7 +4546,7 @@ again"
         })
         .await;
         assert!(ops.iter().any(|op| matches!(op,
-            Op::SendDocument { thread_id: Some(100), document }
+            Op::SendDocument { thread_id: Some(100), document, notify: true }
                 if document.bytes == huge.as_bytes() && document.file_name == "answer-aaaaaaaa.txt")));
     }
 
@@ -4896,6 +4927,7 @@ again"
             thread_id,
             text,
             reply_markup: Some(markup),
+            notify: true,
             ..
         } = sent
         else {
@@ -6816,7 +6848,7 @@ again"
             .collect();
         assert_eq!(separators.len(), 1);
         assert!(
-            matches!(separators[0], Op::Send { thread_id: Some(100), text, .. }
+            matches!(separators[0], Op::Send { thread_id: Some(100), text, notify: false, .. }
             if text == "── session bbbbbbbb · new ──")
         );
         assert!(
@@ -7316,6 +7348,7 @@ again"
             replies(&ops),
             [(100, block, "✓ nested bbbbbbbb закончил".to_owned())]
         );
+        assert_eq!(loud(&ops), ["✓ nested bbbbbbbb закончил"]);
         assert_eq!(shown(&ops)[&block], "⇣ nested bbbbbbbb\nnested answer");
     }
 

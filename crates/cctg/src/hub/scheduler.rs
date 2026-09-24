@@ -66,10 +66,14 @@ pub enum Op {
         permission: bool,
         /// The message this one answers (`reply_parameters`).
         reply_to: Option<i64>,
+        /// With a sound; `false` sends it with `disable_notification`.
+        notify: bool,
     },
     SendDocument {
         thread_id: Option<i64>,
         document: Document,
+        /// As in `Send`.
+        notify: bool,
     },
     Edit {
         message_id: i64,
@@ -107,6 +111,8 @@ pub enum Op {
         html: Option<String>,
         merge: bool,
         restart: bool,
+        /// As in `Send`; only lines of equal `notify` share a message.
+        notify: bool,
     },
     /// `setMessageReaction` with one emoji; a newer one for the same message
     /// replaces a queued one.
@@ -182,6 +188,7 @@ impl Transport for BotApi {
                 html,
                 reply_markup,
                 reply_to,
+                notify,
                 ..
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
@@ -191,6 +198,7 @@ impl Transport for BotApi {
                     reply_markup.as_ref(),
                     parse_mode,
                     *reply_to,
+                    *notify,
                 )
                 .await
                 .map(Outcome::Sent)
@@ -198,8 +206,9 @@ impl Transport for BotApi {
             Op::SendDocument {
                 thread_id,
                 document,
+                notify,
             } => self
-                .send_document(*thread_id, document)
+                .send_document(*thread_id, document, *notify)
                 .await
                 .map(Outcome::Sent),
             Op::Edit {
@@ -241,10 +250,11 @@ impl Transport for BotApi {
                 thread_id,
                 text,
                 html,
+                notify,
                 ..
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
-                self.send_message(Some(*thread_id), text, None, parse_mode, None)
+                self.send_message(Some(*thread_id), text, None, parse_mode, None, *notify)
                     .await
                     .map(Outcome::Sent)
             }
@@ -661,6 +671,7 @@ impl<T: Transport> Scheduler<T> {
             text,
             html,
             merge: true,
+            notify,
             ..
         } = &mut job.op
         else {
@@ -681,11 +692,15 @@ impl<T: Transport> Scheduler<T> {
                 text: next,
                 html: next_html,
                 merge: true,
+                notify: next_notify,
                 ..
             } = queued
             else {
                 break;
             };
+            if next_notify != notify {
+                break;
+            }
             // One formatted line makes the whole message HTML.
             let joined_html = (html.is_some() || next_html.is_some()).then(|| {
                 format!(
@@ -812,6 +827,7 @@ mod tests {
             reply_markup: None,
             permission: false,
             reply_to: None,
+            notify: false,
         }
     }
 
@@ -908,6 +924,7 @@ mod tests {
             reply_markup: None,
             permission: true,
             reply_to: None,
+            notify: true,
         });
         run(&fake, ops).await;
         let calls = fake.calls();
@@ -1054,6 +1071,7 @@ mod tests {
             reply_markup: None,
             permission: true,
             reply_to: None,
+            notify: true,
         }
     }
 
@@ -1074,6 +1092,7 @@ mod tests {
                 bytes: Vec::new(),
                 caption: None,
             },
+            notify: false,
         };
         run(
             &fake,
@@ -1169,6 +1188,7 @@ mod tests {
             html: None,
             merge: true,
             restart: false,
+            notify: false,
         }
     }
 
@@ -1237,6 +1257,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn loud_and_quiet_lines_never_share_a_message() {
+        let fake = Fake::new(&[]);
+        let loud = |text: &str| {
+            let mut op = line(1, text);
+            if let Op::Stream { notify, .. } = &mut op {
+                *notify = true;
+            }
+            op
+        };
+        let mut ops: Vec<Op> = (0..10).map(|i| line(1, &format!("q{i}"))).collect();
+        ops.extend((0..3).map(|i| loud(&format!("l{i}"))));
+        ops.extend((10..20).map(|i| line(1, &format!("q{i}"))));
+        run(&fake, ops).await;
+        let messages: Vec<(bool, String)> = fake
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call.op {
+                Op::Stream { notify, text, .. } => Some((notify, text)),
+                _ => None,
+            })
+            .collect();
+        assert!(messages.len() < 23, "lines were merged: {messages:?}");
+        for (notify, text) in &messages {
+            let prefix = if *notify { 'l' } else { 'q' };
+            assert!(
+                text.split('\n').all(|line| line.starts_with(prefix)),
+                "{notify} {text:?}"
+            );
+        }
+        let lines: Vec<String> = messages
+            .iter()
+            .flat_map(|(_, text)| text.split('\n').map(str::to_owned))
+            .collect();
+        let want: Vec<String> = (0..10)
+            .map(|i| format!("q{i}"))
+            .chain((0..3).map(|i| format!("l{i}")))
+            .chain((10..20).map(|i| format!("q{i}")))
+            .collect();
+        assert_eq!(lines, want, "same lines, same order");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_refused_merged_message_answers_none_of_its_lines_as_merged() {
         let fake = Fake::refusing("t-7\n");
         let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
@@ -1286,6 +1348,7 @@ mod tests {
             html: None,
             merge: false,
             restart,
+            notify: false,
         }
     }
 
@@ -1386,6 +1449,7 @@ mod tests {
                 html: None,
                 merge: false,
                 restart: false,
+                notify: false,
             })
             .collect();
         ops.push(permission(1, "prompt"));
@@ -1456,6 +1520,7 @@ mod tests {
             reply_markup: None,
             permission: false,
             reply_to: None,
+            notify: false,
         }
     }
 
@@ -1484,6 +1549,7 @@ mod tests {
                 html: Some("<i>b</i>".to_owned()),
                 merge: false,
                 restart: true,
+                notify: false,
             })
             .await;
         let next = outbox.submit(send(1, "after")).await;
@@ -1535,6 +1601,7 @@ mod tests {
             html: Some("\u{1F4AD} <b>x</b>".to_owned()),
             merge: true,
             restart: false,
+            notify: false,
         };
         let mut ops: Vec<Op> = (0..8).map(|i| line(1, &format!("• a<{i}> ✓"))).collect();
         ops.insert(6, formatted);
@@ -1572,6 +1639,7 @@ mod tests {
                 html: Some(format!("<b>l{i}</b>")),
                 merge: true,
                 restart: false,
+                notify: false,
             };
             receivers.push(outbox.submit(op).await);
         }
