@@ -53,6 +53,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
 use transcript::{HtmlChunk, SplitOptions, split_for_telegram, split_markdown_for_telegram};
@@ -159,6 +160,9 @@ pub enum Control {
     Message(Inbound),
     /// A button press from an allowlisted user.
     Callback(CallbackInput),
+    /// The hub stops: [`Slots::run`] handles what already came in, writes
+    /// the registry and returns.
+    Stop,
 }
 
 #[derive(Debug)]
@@ -348,6 +352,8 @@ pub struct Slots {
     dispatch: mpsc::UnboundedSender<(Work, Op)>,
     options: Options,
     saver: watch::Sender<Option<Arc<Vec<u8>>>>,
+    /// The save task; awaited on [`Control::Stop`].
+    save_task: Option<JoinHandle<()>>,
     view: watch::Sender<Arc<TopicView>>,
     conns: HashMap<u64, Conn>,
     /// Agents of sessions no SessionStart announced yet: session -> conn.
@@ -407,7 +413,7 @@ impl Slots {
             .collect();
         registry.lose_blocks(&ended);
         let (saver, saves) = watch::channel(None);
-        tokio::spawn(save_loop(store, saves));
+        let save_task = tokio::spawn(save_loop(store, saves));
         let (view, view_rx) = watch::channel(Arc::new(registry.topic_view()));
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         let (dispatch, work) = mpsc::unbounded_channel();
@@ -417,6 +423,7 @@ impl Slots {
             registry,
             dispatch,
             saver,
+            save_task: Some(save_task),
             view,
             conns: HashMap::new(),
             pending: HashMap::new(),
@@ -447,8 +454,9 @@ impl Slots {
         (slots, view_rx)
     }
 
-    /// Runs for the life of the hub; a closed input channel is just no
-    /// longer polled.
+    /// Runs until [`Control::Stop`]; a closed input channel is just no
+    /// longer polled. On stop, hook posts and agent frames already queued are
+    /// handled and the last registry snapshot is on disk before it returns.
     pub async fn run(
         mut self,
         mut agents: mpsc::Receiver<AgentEvent>,
@@ -462,12 +470,35 @@ impl Slots {
             tokio::select! {
                 Some(event) = agents.recv() => self.on_agent(event),
                 Some(post) = hooks.recv() => self.on_hook(&post),
-                Some(control) = control.recv() => self.on_control(control),
+                Some(control) = control.recv() => {
+                    if control == Control::Stop {
+                        break;
+                    }
+                    self.on_control(control);
+                }
                 Some(finished) = done.recv() => self.on_done(finished),
                 () = sleep_until(deadline) => self.on_tick(),
             }
             self.pump();
         }
+        // New posts and frames now fail at ingress (a hook gets 503 and
+        // spools it) instead of being accepted and lost with the receiver.
+        hooks.close();
+        agents.close();
+        while let Ok(post) = hooks.try_recv() {
+            self.on_hook(&post);
+        }
+        while let Ok(event) = agents.try_recv() {
+            self.on_agent(event);
+        }
+        self.pump();
+        let save_task = self.save_task.take();
+        // Closes the save channel: the task writes the last snapshot and ends.
+        drop(self);
+        if let Some(task) = save_task {
+            let _ = task.await;
+        }
+        info!("slot registry saved");
     }
 
     fn next_deadline(&self) -> Instant {
@@ -1004,6 +1035,8 @@ impl Slots {
             } => (thread_id, message_id),
             Control::Message(input) => return self.on_topic_message(input),
             Control::Callback(input) => return self.on_callback(input),
+            // Handled by `run`.
+            Control::Stop => return,
         };
         if !self.options.can_delete
             || thread_id

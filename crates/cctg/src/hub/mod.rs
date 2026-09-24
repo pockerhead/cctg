@@ -19,13 +19,16 @@ pub mod updates;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use api::{ApiError, BotApi, ChatMember, Sticker};
-use config::{AGENT_LISTEN_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR};
+use config::{
+    AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR,
+};
 use offset::OffsetStore;
 use registry::{Icons, RegistryStore};
 use scheduler::{BucketConfig, Scheduler};
@@ -113,7 +116,34 @@ fn checked_icons(lookup: Result<Vec<Sticker>, ApiError>) -> anyhow::Result<Icons
     Ok(icons)
 }
 
-pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
+/// How long a stopping hub waits for the slot actor to write the registry.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Completes on Ctrl+C (Ctrl+Break on Windows, SIGTERM on Unix), or when
+/// stdin closes if `watch_stdin` (how `cctg supervise` stops its hub: it
+/// closes the pipe, also when it dies itself).
+async fn stop_requested(watch_stdin: bool) {
+    let stdin_closed = async {
+        if !watch_stdin {
+            return std::future::pending().await;
+        }
+        let (closed, closed_rx) = oneshot::channel();
+        // A plain thread: it never holds up the runtime's shutdown.
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            let _ = closed.send(());
+        });
+        let _ = closed_rx.await;
+    };
+    tokio::select! {
+        () = stdin_closed => info!("stdin closed; hub stopping"),
+        signal = crate::supervise::stop_signal() => info!(signal, "hub stopping"),
+    }
+}
+
+/// Runs the hub until [`stop_requested`]; then stops polling between
+/// batches and lets the slot actor write the registry before returning.
+pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result<()> {
     let config = Config::load(env_file)?;
     let projects_dir = config.projects_dir.clone().with_context(|| {
         format!("no home directory found; set {PROJECTS_VAR} to the Claude Code projects directory")
@@ -134,7 +164,15 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     let hook_listener = ingress::bind(config.hook_listen)
         .await
         .with_context(|| format!("cannot listen for hooks; check {HOOK_LISTEN_VAR}"))?;
-    let api = Arc::new(BotApi::new(&config.token, config.chat_id)?);
+    if config.api_url != api::TELEGRAM_API {
+        // Never the URL: it is the base of every request URL.
+        warn!("{API_URL_VAR} is set: the hub talks to another Bot API server (test only)");
+    }
+    let api = Arc::new(BotApi::with_api_url(
+        &config.api_url,
+        &config.token,
+        config.chat_id,
+    )?);
 
     let me = api
         .get_me()
@@ -179,15 +217,23 @@ pub async fn run(env_file: Option<&Path>) -> anyhow::Result<()> {
     ));
     tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
+    let actor = tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
 
-    updates::poll(
+    updates::poll_until(
         api.as_ref(),
         &config.allowlist,
         &offsets,
         route_inbound(&commands_tx, &control_tx),
+        stop_requested(stop_on_stdin),
     )
     .await;
+    // Behind every message the poll already handed over.
+    let _ = control_tx.send(Control::Stop);
+    match tokio::time::timeout(STOP_TIMEOUT, actor).await {
+        Ok(Ok(())) => info!("hub stopped"),
+        Ok(Err(_)) => warn!("slot actor failed; the registry may miss the last changes"),
+        Err(_) => warn!("slot actor did not stop in time; the registry may miss the last changes"),
+    }
     Ok(())
 }
 

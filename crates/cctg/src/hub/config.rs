@@ -27,6 +27,10 @@ pub const DEFAULT_AGENT_LISTEN: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47291));
 pub const DEFAULT_HOOK_LISTEN: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 47292));
+/// Optional, test only: Bot API base URL; defaults to Telegram. Tests point
+/// it at a fake. Plain `http://` only to a loopback host: the token travels
+/// in the URL path.
+pub const API_URL_VAR: &str = "CCTG_BOT_API_URL";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -50,6 +54,8 @@ pub enum ConfigError {
     Secret(SecretError),
     #[error("{0} must be an ip:port address such as 127.0.0.1:47291 (host names are not resolved)")]
     ListenAddr(&'static str),
+    #[error("{API_URL_VAR} must start with https://, or http:// to a loopback host")]
+    ApiUrl,
 }
 
 /// Bot token. `Debug` never prints it.
@@ -105,6 +111,8 @@ pub struct Config {
     /// Loopback unless configured; any other address is an explicit choice.
     pub agent_listen: SocketAddr,
     pub hook_listen: SocketAddr,
+    /// Bot API base URL, [`super::api::TELEGRAM_API`] unless configured.
+    pub api_url: String,
 }
 
 impl Config {
@@ -187,6 +195,10 @@ impl Config {
         };
         let agent_listen = listen(AGENT_LISTEN_VAR, DEFAULT_AGENT_LISTEN)?;
         let hook_listen = listen(HOOK_LISTEN_VAR, DEFAULT_HOOK_LISTEN)?;
+        let api_url = optional(API_URL_VAR).unwrap_or_else(|| super::api::TELEGRAM_API.to_owned());
+        if !(api_url.starts_with("https://") || is_loopback_http(&api_url)) {
+            return Err(ConfigError::ApiUrl);
+        }
 
         Ok(Self {
             token: BotToken(token),
@@ -197,8 +209,25 @@ impl Config {
             hub_secret,
             agent_listen,
             hook_listen,
+            api_url,
         })
     }
+}
+
+/// `http://localhost`, `http://127.x.x.x` or `http://[::1]`, any port and path.
+fn is_loopback_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn env_file_error(path: &Path, error: dotenvy::Error) -> ConfigError {
@@ -275,6 +304,42 @@ mod tests {
         let config = Config::from_vars(vars(&overridden)).unwrap();
         assert_eq!(config.projects_dir, Some(PathBuf::from("other-projects")));
         assert_eq!(config.state_dir, Path::new("state"));
+    }
+
+    #[test]
+    fn api_url_defaults_to_telegram_and_must_be_http() {
+        let base = [
+            (TOKEN_VAR, TOKEN),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+        ];
+        let config = Config::from_vars(vars(&base)).unwrap();
+        assert_eq!(config.api_url, crate::hub::api::TELEGRAM_API);
+        let fake = [base.as_slice(), &[(API_URL_VAR, " http://127.0.0.1:9 ")]].concat();
+        let config = Config::from_vars(vars(&fake)).unwrap();
+        assert_eq!(config.api_url, "http://127.0.0.1:9");
+        for bad in [
+            "127.0.0.1:9",
+            "http://api.example.org",
+            "http://10.0.0.1:8081",
+            "http://127.0.0.1.example.org",
+            "http://user@example.org",
+        ] {
+            let bad = [base.as_slice(), &[(API_URL_VAR, bad)]].concat();
+            assert_eq!(
+                Config::from_vars(vars(&bad)).unwrap_err(),
+                ConfigError::ApiUrl
+            );
+        }
+        for good in [
+            "https://api.example.org",
+            "http://localhost:8081/",
+            "http://[::1]:8081",
+            "http://127.0.0.2",
+        ] {
+            let good = [base.as_slice(), &[(API_URL_VAR, good)]].concat();
+            assert!(Config::from_vars(vars(&good)).is_ok(), "{good:?}");
+        }
     }
 
     #[test]
