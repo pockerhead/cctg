@@ -1,6 +1,7 @@
 //! `cctg hub`: Telegram side of the bridge.
 
 pub mod api;
+pub mod buffer;
 pub mod commands;
 pub mod config;
 pub mod ingress;

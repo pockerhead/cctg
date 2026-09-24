@@ -1,5 +1,6 @@
-//! Log capture for topic messages, agent replies and turn answers: their
-//! text and the sender's user id never reach the logs. Its own test binary with a
+//! Log capture for topic messages (also kept ones), agent replies and turn
+//! answers: their text and the sender's user id never reach the logs, and
+//! the kept message's `registry.json` carries no user id. Its own test binary with a
 //! global subscriber, like `slots_logs.rs`: the actor runs on runtime
 //! workers and parallel tests would race on tracing callsite registration.
 
@@ -8,11 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::buffer::QUEUED_NOTICE;
 use cctg::hub::config::Allowlist;
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
-use cctg::hub::slots::{Control, OFFLINE_NOTICE, Options, Slots};
+use cctg::hub::slots::{Control, Options, Slots};
 use cctg::hub::updates::{Routed, route_batch};
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, Register};
 use serde_json::json;
@@ -133,7 +135,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         .await
         .expect("hook");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // No agent yet: the user gets the offline notice.
+    // No agent yet: the message is kept and the user is told.
     control
         .send(topic_message(1, &offline_text))
         .expect("control");
@@ -146,7 +148,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 .lock()
                 .expect("ops")
                 .iter()
-                .any(|op| matches!(op, Op::Send { text, .. } if text == OFFLINE_NOTICE));
+                .any(|op| matches!(op, Op::Send { text, .. } if text == QUEUED_NOTICE));
             if sent {
                 return;
             }
@@ -155,7 +157,13 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     };
     tokio::time::timeout(Duration::from_secs(30), noticed)
         .await
-        .expect("offline notice in time");
+        .expect("queued notice in time");
+    let saved = std::fs::read_to_string(state.join("registry.json")).unwrap_or_default();
+    assert!(saved.contains(&offline_text), "the kept message is saved");
+    assert!(
+        !saved.contains(&USER.to_string()),
+        "no user id in the saved buffer"
+    );
     let (to_agent, mut to_agent_rx) = mpsc::channel(4);
     agents
         .send(AgentEvent::Registered {
@@ -172,7 +180,14 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         })
         .await
         .expect("agent");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The agent takes the kept message first.
+    let got = tokio::time::timeout(Duration::from_secs(30), to_agent_rx.recv())
+        .await
+        .expect("kept message in time");
+    assert!(
+        matches!(got, Some(HubMsg::Inbound { ref content, .. }) if *content == offline_text),
+        "{got:?}"
+    );
     control
         .send(topic_message(2, &inbound_text))
         .expect("control");
@@ -217,7 +232,8 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
         .unwrap_or_default();
     for expected in [
-        "message for a session that is not on line",
+        "message kept for the slot until a session is on line",
+        "kept messages handed to the slot's session",
         "message forwarded to the session agent",
         "agent reply queued",
         "turn answer queued",

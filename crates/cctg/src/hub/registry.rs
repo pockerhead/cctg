@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use transcript::telegram_len;
 
+use super::buffer::Buffer;
 use crate::wire::{HookEvent, HookPost};
 
 pub const VERSION: u32 = 1;
@@ -273,6 +274,9 @@ pub struct Slot {
     /// Separator to post once the topic exists.
     #[serde(default)]
     pub pending_separator: Option<String>,
+    /// Topic messages no session of the slot could take yet (TASK-017).
+    #[serde(default, skip_serializing_if = "Buffer::is_idle")]
+    pub buffer: Buffer,
     /// A topic call for this slot is in flight.
     #[serde(skip)]
     pub busy: bool,
@@ -528,6 +532,11 @@ impl Registry {
         self.slots.get(id.0)
     }
 
+    /// The caller sets [`Registry::dirty`] when it changes a saved field.
+    pub fn slot_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
+        self.slots.get_mut(id.0)
+    }
+
     pub fn slot_by_topic(&self, thread_id: i64) -> Option<SlotId> {
         self.slots
             .iter()
@@ -642,6 +651,7 @@ impl Registry {
             applied_title: None,
             applied_icon: None,
             pending_separator: None,
+            buffer: Buffer::default(),
             busy: false,
             failed: None,
         });
@@ -861,6 +871,11 @@ impl Registry {
                 }
                 entry.ended = true;
                 entry.waiting = false;
+                // The run's agent goes with it: a resume starts a new claude
+                // and a new agent, and the old link, still open for a moment,
+                // must not take the slot's kept messages (TASK-017). After
+                // `/clear` the agent follows its pid (`Slots::follow_pid`).
+                entry.agent = None;
                 // A nested entry's slot is its parent's: never handed on.
                 let clear = entry
                     .claude_pid
@@ -2807,6 +2822,46 @@ mod tests {
         assert!(!loaded.sessions[A].waiting);
         assert!(!loaded.slots[0].busy);
         assert_eq!(loaded.state(SlotId(0)), SlotState::NoChannel);
+    }
+
+    #[test]
+    fn a_slot_buffer_survives_a_restart_and_an_older_file_loads_without_one() {
+        use crate::hub::buffer::{Parked, ResumeNote};
+        let dir = TempDir::new("registry-buffer");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(B, CWD, Some(11), None));
+        // An idle buffer is not written: the file looks like a TASK-011 one.
+        let idle = String::from_utf8(RegistryStore::encode(&registry)).unwrap();
+        assert!(!idle.contains("\"buffer\""), "{idle}");
+        std::fs::write(dir.path().join(FILE_NAME), &idle).unwrap();
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .slots
+                .iter()
+                .all(|slot| slot.buffer.is_idle())
+        );
+
+        let buffer = &mut registry.slots[0].buffer;
+        buffer.push(Parked {
+            message_id: 5,
+            thread_id: 100,
+            text: "kept".into(),
+            reply_to: Some(4),
+        });
+        buffer.overflow_told = true;
+        buffer.resume = Some(ResumeNote {
+            session: A.into(),
+            number: 1,
+            message_id: Some(900),
+        });
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.slots[0].buffer, registry.slots[0].buffer);
+        assert!(loaded.slots[1].buffer.is_idle());
     }
 
     #[test]

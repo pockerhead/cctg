@@ -111,7 +111,7 @@ async fn one_overflow_warning_per_episode() {
     let store = RegistryStore::open(&state).expect("store");
     let options = Options {
         grace: Duration::ZERO,
-        // Every message to the dead session asks for a notice.
+        // Every photo asks for a text-only notice.
         notice_every: Duration::ZERO,
         ..Options::default()
     };
@@ -140,12 +140,12 @@ async fn one_overflow_warning_per_episode() {
             .send(Control::Message(Inbound {
                 message_id,
                 thread_id: Some(100),
-                text: Some("x".into()),
+                text: None,
                 reply_to: None,
             }))
             .expect("control");
     };
-    // The session has no agent: every message becomes an offline notice.
+    // Photos: every one becomes a text-only notice.
     // Resend until the topic is known and the first notice is out.
     until("the first notice", || {
         say(0);
