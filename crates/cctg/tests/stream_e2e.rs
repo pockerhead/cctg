@@ -42,6 +42,9 @@ struct Fake {
     ops: Mutex<Vec<Rec>>,
     /// The next this many stream sends fail with a 502.
     refuse_streams: AtomicUsize,
+    /// A stream send containing one of these fails once with a 502 (the
+    /// entry is used up).
+    refuse_once: Mutex<Vec<String>>,
     next_id: AtomicI64,
 }
 
@@ -54,11 +57,12 @@ impl Transport for Fake {
                 name: name.clone(),
                 icon_custom_emoji_id: None,
             })),
-            Op::Stream { .. } => {
-                let refuse = self
-                    .refuse_streams
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok();
+            Op::Stream { text, .. } => {
+                let refuse = self.take_refusal(text)
+                    || self
+                        .refuse_streams
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
                 if refuse {
                     Err(ApiError::Telegram {
                         code: 502,
@@ -86,12 +90,19 @@ impl Transport for Fake {
 }
 
 impl Fake {
+    fn take_refusal(&self, text: &str) -> bool {
+        let mut once = self.refuse_once.lock().unwrap();
+        let hit = once
+            .iter()
+            .position(|needle| text.contains(needle.as_str()));
+        hit.map(|at| once.remove(at)).is_some()
+    }
     fn recs(&self) -> Vec<Rec> {
         self.ops.lock().unwrap().clone()
     }
     /// Accepted stream messages, each split into its lines (merged messages
-    /// hold several), plus accepted plain sends of the topic (answers), in
-    /// Telegram order.
+    /// hold several), plus accepted plain sends of the topic (answers) and
+    /// documents (as `[document]`), in Telegram order.
     fn topic_lines(&self) -> Vec<String> {
         let mut out = Vec::new();
         for rec in self.recs() {
@@ -100,6 +111,7 @@ impl Fake {
             }
             match rec.op {
                 Op::Stream { text, .. } => out.extend(text.lines().map(str::to_owned)),
+                Op::SendDocument { .. } => out.push("[document]".into()),
                 Op::Send {
                     text, thread_id, ..
                 } if thread_id == Some(THREAD) && !text.starts_with("──") => out.push(text),
@@ -686,5 +698,452 @@ async fn e2e_resume_at_a_torn_end_does_not_replay_history() {
         !got.iter().any(|l| l.starts_with("> history")),
         "history replayed after resume: {got:?}"
     );
+    hub.stop();
+}
+
+/// The first appearance of each line, in order (a refused message is sent
+/// again, so accepted lines may repeat).
+fn firsts(lines: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    lines
+        .iter()
+        .filter(|line| seen.insert(line.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// TASK-023 (QA of TASK-016, BUG-1): Telegram refuses stream messages of a
+/// turn (502) while its answer is held; the answer still shows only after
+/// every tool line of its turn, in time, and nothing is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_answer_after_a_refused_line_still_follows_its_lines() {
+    let s = session("refuse-answer", 7);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    // Under the group limit, so tool lines merge and a refusal takes several.
+    let bucket = BucketConfig {
+        capacity: 2,
+        refill_every: Duration::from_millis(300),
+        min_gap: Duration::ZERO,
+    };
+    let hub = start_hub(&s.state, l, bucket, fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    // The agent is bound and the stream reads before the turn starts.
+    s.append(&prompt("gamma warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec!["c05".into(), "c11".into()];
+    let mut want = vec!["> gamma warm".to_owned(), "> gamma run".to_owned()];
+    let mut batch = prompt("gamma run");
+    for n in 0..16 {
+        batch.push_str(&call(&format!("g{n}"), &format!("c{n:02}")));
+        batch.push_str(&result(&format!("g{n}"), false));
+        want.push(ok_line(&format!("c{n:02}")));
+    }
+    batch.push_str(&answer("GAMMA DONE"));
+    want.push("GAMMA DONE".into());
+    // Written in three pieces, the middle one ending mid-line; the Stop
+    // comes after the first.
+    let third = batch.len() / 3;
+    let (p1, rest) = batch.split_at(third);
+    let (p2, p3) = rest.split_at(third);
+    s.append(p1);
+    hub.hooks
+        .send(s.post(HookEvent::Stop {
+            prompt_id: None,
+            last_assistant_message: Some("GAMMA DONE".into()),
+        }))
+        .await
+        .unwrap();
+    let stopped = Instant::now();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    s.append(p2);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    s.append(p3);
+    wait_for("everything once", 60, || {
+        let got = fake.topic_lines();
+        want.iter().all(|w| got.contains(w))
+    })
+    .await;
+    // Not later than the hold plus one rewind cycle (and a loaded host).
+    let bound = Options::default().hold_answer + options().stream_retry + Duration::from_secs(3);
+    assert!(
+        stopped.elapsed() < bound,
+        "answer after {:?}",
+        stopped.elapsed()
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let got = fake.topic_lines();
+    for rec in fake.recs() {
+        match &rec.op {
+            Op::Stream { text, restart, .. } => eprintln!(
+                "stream accepted={} restart={restart} {:?}",
+                rec.accepted,
+                text.lines().collect::<Vec<_>>()
+            ),
+            Op::Send { text, .. } => eprintln!("send accepted={} {text:?}", rec.accepted),
+            _ => {}
+        }
+    }
+    let refused = fake.recs().iter().filter(|r| !r.accepted).count();
+    assert_eq!(refused, 2, "both refusals happened");
+    assert_eq!(firsts(&got), want, "got {got:?}");
+    assert_eq!(
+        got.iter().filter(|line| *line == "GAMMA DONE").count(),
+        1,
+        "the answer once: {got:?}"
+    );
+    hub.stop();
+}
+
+/// Every stream and plain send, for a failing test's output.
+fn dump(fake: &Fake) {
+    for rec in fake.recs() {
+        match &rec.op {
+            Op::Stream { text, restart, .. } => eprintln!(
+                "stream accepted={} restart={restart} {:?}",
+                rec.accepted,
+                text.lines()
+                    .map(|l| l.chars().take(40).collect::<String>())
+                    .collect::<Vec<_>>()
+            ),
+            Op::Send { text, .. } => eprintln!("send accepted={} {text:?}", rec.accepted),
+            Op::SendDocument { .. } => eprintln!("document accepted={}", rec.accepted),
+            _ => {}
+        }
+    }
+}
+
+/// Accepted stream messages containing `needle`.
+fn accepted_count(fake: &Fake, needle: &str) -> usize {
+    fake.recs()
+        .iter()
+        .filter(|r| r.accepted)
+        .filter(|r| matches!(&r.op, Op::Stream { text, .. } if text.contains(needle)))
+        .count()
+}
+
+async fn stop(hub: &Hub, s: &Session, text: &str) {
+    hub.hooks
+        .send(s.post(HookEvent::Stop {
+            prompt_id: None,
+            last_assistant_message: Some(text.into()),
+        }))
+        .await
+        .unwrap();
+}
+
+/// One turn: its transcript bytes and its topic lines (answer last).
+fn turn(name: &str, calls: usize, answer_text: &str) -> (String, Vec<String>) {
+    let mut bytes = prompt(name);
+    let mut lines = vec![format!("> {name}")];
+    for n in 0..calls {
+        let id = format!("{name}c{n}");
+        bytes.push_str(&call(&id, &id));
+        bytes.push_str(&result(&id, false));
+        lines.push(ok_line(&id));
+    }
+    bytes.push_str(&answer(answer_text));
+    lines.push(answer_text.to_owned());
+    (bytes, lines)
+}
+
+/// TASK-023 (QA, adopted): several turns under a slow Telegram (turn ends of
+/// two turns land in one read chunk), refusals of a tool line, of an answer
+/// and of a prompt line at different points, Stops both before and after
+/// their transcript turn ends. Every answer shows exactly once, after all
+/// lines of its own turn and before the next turn's prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_turns_with_refusals_under_a_slow_telegram_keep_their_answers_in_place() {
+    let s = session("multi-refuse", 8);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let bucket = BucketConfig {
+        capacity: 1,
+        refill_every: Duration::from_millis(250),
+        min_gap: Duration::ZERO,
+    };
+    let hub = start_hub(&s.state, l, bucket, fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec![
+        "t1c1".into(),  // a tool line of turn 1
+        "ANS-2".into(), // the answer of turn 2
+        "> t3".into(),  // the prompt line of turn 3
+        "t4c0".into(),  // a tool line of turn 4 (its answer is claimed)
+        "ANS-5".into(), // the answer of turn 5
+    ];
+    let mut want = vec!["> warm".to_owned()];
+    let (t1, w1) = turn("t1", 3, "ANS-1");
+    let (t2, w2) = turn("t2", 2, "ANS-2");
+    let (t3, w3) = turn("t3", 0, "ANS-3");
+    let (t4, w4) = turn("t4", 2, "ANS-4");
+    let (t5, w5) = turn("t5", 1, "ANS-5");
+    for w in [&w1, &w2, &w3, &w4, &w5] {
+        want.extend(w.iter().cloned());
+    }
+    // Both Stops held before their turns reach the file, then both turns in
+    // one write (two turn ends in one read chunk).
+    stop(&hub, &s, "ANS-1").await;
+    stop(&hub, &s, "ANS-2").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.append(&(t1 + &t2));
+    // Turns 3 and 4 in one piece while Telegram is still behind; their Stops
+    // come after the file (claim path).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.append(&(t3 + &t4));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop(&hub, &s, "ANS-3").await;
+    stop(&hub, &s, "ANS-4").await;
+    // Turn 5: Stop first, file 300 ms later.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop(&hub, &s, "ANS-5").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.append(&t5);
+    wait_for("everything", 90, || {
+        let got = fake.topic_lines();
+        want.iter().all(|w| got.contains(w))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    dump(&fake);
+    let got = fake.topic_lines();
+    let refused = fake.recs().iter().filter(|r| !r.accepted).count();
+    assert_eq!(refused, 5, "every planned refusal happened");
+    assert_eq!(firsts(&got), want, "got {got:?}");
+    for n in 1..=5 {
+        let a = format!("ANS-{n}");
+        assert_eq!(accepted_count(&fake, &a), 1, "{a} once: {got:?}");
+    }
+    // Every appearance of an answer comes after at least one appearance of
+    // each line of its turn.
+    for w in [&w1, &w2, &w3, &w4, &w5] {
+        let ans = w.last().unwrap();
+        let at = got.iter().position(|l| l == ans).unwrap();
+        for line in &w[..w.len() - 1] {
+            assert!(got[..at].contains(line), "{ans} before {line}: {got:?}");
+        }
+    }
+    hub.stop();
+}
+
+/// TASK-023 (QA BUG-1): turn 1's answer is long and goes as a document,
+/// outside the stream; turn 2's prompt line is refused, so the rewind reads
+/// turn 1's end again. That end is answered and must not be claimable: turn
+/// 3's Stop comes before its lines reach the file (the usual order) and its
+/// answer still waits for its own lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_document_answer_read_again_does_not_let_the_next_answer_go_early() {
+    let s = session("doc-answer", 9);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let hub = start_hub(&s.state, l, fast_bucket(), fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec!["> t2".into()];
+    let big: String = (0..600)
+        .map(|n| format!("big answer line {n:04} ....................\n"))
+        .collect();
+    let (t1, _) = turn("t1", 1, &big);
+    let (t2, w2) = turn("t2", 1, "ANS-2");
+    let (t3, w3) = turn("t3", 1, "ANS-3");
+    stop(&hub, &s, &big).await;
+    stop(&hub, &s, "ANS-2").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.append(&(t1 + &t2));
+    wait_for("ANS-2", 30, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-2")
+    })
+    .await;
+    // Turn 3: its Stop first, its lines 500 ms later.
+    stop(&hub, &s, "ANS-3").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    s.append(&t3);
+    wait_for("ANS-3", 30, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-3")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    dump(&fake);
+    let got = fake.topic_lines();
+    let mut want = vec![
+        "> warm".to_owned(),
+        "> t1".into(),
+        ok_line("t1c0"),
+        "[document]".into(),
+    ];
+    want.extend(w2.iter().cloned());
+    want.extend(w3.iter().cloned());
+    assert_eq!(firsts(&got), want, "got {got:?}");
+    hub.stop();
+}
+
+/// Asserts the topic lines (first appearances) equals `want` and every answer was
+/// accepted exactly once.
+fn check_answers(fake: &Fake, want: &[String], answers: &[&str]) {
+    dump(fake);
+    let got = fake.topic_lines();
+    assert_eq!(firsts(&got), want, "got {got:?}");
+    for a in answers {
+        assert_eq!(accepted_count(fake, a), 1, "{a} accepted once: {got:?}");
+    }
+}
+
+/// TASK-023 (QA BUG-2): turn 2's prompt line is refused twice, so two
+/// rewinds read turn 1's end again while its answer is in the topic. Both
+/// reads must leave that end answered, not claimable: turn 3's Stop comes
+/// before its lines and its answer still waits for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early() {
+    let s = session("double-rewind", 10);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let hub = start_hub(&s.state, l, fast_bucket(), fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec!["> t2".into(), "> t2".into()];
+    let (t1, w1) = turn("t1", 1, "ANS-1");
+    let (t2, w2) = turn("t2", 1, "ANS-2");
+    let (t3, w3) = turn("t3", 1, "ANS-3");
+    stop(&hub, &s, "ANS-1").await;
+    stop(&hub, &s, "ANS-2").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.append(&(t1 + &t2));
+    wait_for("ANS-2", 30, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-2")
+    })
+    .await;
+    // Turn 3: its Stop first (the usual order), its lines 500 ms later.
+    stop(&hub, &s, "ANS-3").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    s.append(&t3);
+    wait_for("ANS-3", 30, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-3")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let refused = fake.recs().iter().filter(|r| !r.accepted).count();
+    let mut want = vec!["> warm".to_owned()];
+    for w in [&w1, &w2, &w3] {
+        want.extend(w.iter().cloned());
+    }
+    check_answers(&fake, &want, &["ANS-1", "ANS-2", "ANS-3"]);
+    assert_eq!(refused, 2);
+    hub.stop();
+}
+
+/// Broad acceptance run: six turns under a slow Telegram (two turn ends in
+/// one read chunk twice), refusals of tool lines, of answers and of a prompt
+/// line at different points, Stops before and after their turn ends.
+/// Every answer exactly once, right after its own turn's lines, none lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_six_turns_with_refusals_keep_every_answer_in_place() {
+    let s = session("six-turns", 11);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let bucket = BucketConfig {
+        capacity: 1,
+        refill_every: Duration::from_millis(200),
+        min_gap: Duration::ZERO,
+    };
+    let hub = start_hub(&s.state, l, bucket, fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec![
+        "t1c0".into(),  // a tool line of turn 1
+        "ANS-1".into(), // the answer of turn 1
+        "t2c1".into(),  // a tool line of turn 2
+        "ANS-4".into(), // the claimed answer of turn 4
+        "> t5".into(),  // the prompt line of turn 5
+        "t6c0".into(),  // a tool line of turn 6
+    ];
+    let (t1, w1) = turn("t1", 2, "ANS-1");
+    let (t2, w2) = turn("t2", 2, "ANS-2");
+    let (t3, w3) = turn("t3", 1, "ANS-3");
+    let (t4, w4) = turn("t4", 1, "ANS-4");
+    let (t5, w5) = turn("t5", 2, "ANS-5");
+    let (t6, w6) = turn("t6", 1, "ANS-6");
+    let mut want = vec!["> warm".to_owned()];
+    for w in [&w1, &w2, &w3, &w4, &w5, &w6] {
+        want.extend(w.iter().cloned());
+    }
+    // Turns 1+2: Stops held first, both turns in one write.
+    stop(&hub, &s, "ANS-1").await;
+    stop(&hub, &s, "ANS-2").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.append(&(t1 + &t2));
+    // Turns 3+4 in one write while Telegram is behind; Stops after (claim).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.append(&(t3 + &t4));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    stop(&hub, &s, "ANS-3").await;
+    stop(&hub, &s, "ANS-4").await;
+    wait_for("ANS-4", 60, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-4")
+    })
+    .await;
+    // Turn 5: Stop first, file 300 ms later.
+    stop(&hub, &s, "ANS-5").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.append(&t5);
+    wait_for("ANS-5", 60, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-5")
+    })
+    .await;
+    // Turn 6: file first, Stop 300 ms later.
+    s.append(&t6);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop(&hub, &s, "ANS-6").await;
+    wait_for("everything", 90, || {
+        let got = fake.topic_lines();
+        want.iter().all(|w| got.contains(w))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let refused = fake.recs().iter().filter(|r| !r.accepted).count();
+    check_answers(
+        &fake,
+        &want,
+        &["ANS-1", "ANS-2", "ANS-3", "ANS-4", "ANS-5", "ANS-6"],
+    );
+    assert_eq!(refused, 6, "every planned refusal happened");
     hub.stop();
 }
