@@ -142,6 +142,8 @@ async fn one_overflow_warning_per_episode() {
                 thread_id: Some(100),
                 text: None,
                 reply_to: None,
+                quote: None,
+                forwarded: false,
             }))
             .expect("control");
     };

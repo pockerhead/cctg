@@ -84,6 +84,8 @@ fn say(message_id: i64, text: &str) -> Control {
         thread_id: Some(100),
         text: Some(text.into()),
         reply_to: None,
+        quote: None,
+        forwarded: false,
     })
 }
 

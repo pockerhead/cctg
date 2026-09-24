@@ -86,17 +86,30 @@ pub struct Message {
     /// In a forum topic every message that is not an explicit reply points
     /// at the topic root (the `forum_topic_created` message).
     pub reply_to_message: Option<MessageRef>,
+    /// The part of the replied message the user selected (`TextQuote`).
+    pub quote: Option<TextQuote>,
+    /// Present on a forwarded message (`MessageOrigin`); only its presence
+    /// is read.
+    pub forward_origin: Option<IgnoredAny>,
     pub forum_topic_created: Option<IgnoredAny>,
     pub forum_topic_edited: Option<IgnoredAny>,
     pub forum_topic_closed: Option<IgnoredAny>,
     pub forum_topic_reopened: Option<IgnoredAny>,
 }
 
-/// Only the id of a message another message refers to.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+/// The id and the words of a message another message refers to.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MessageRef {
     pub message_id: i64,
+    pub text: Option<String>,
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TextQuote {
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

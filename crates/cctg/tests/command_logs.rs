@@ -61,6 +61,8 @@ fn input(text: &str) -> Inbound {
         thread_id: None,
         text: Some(text.to_owned()),
         reply_to: None,
+        quote: None,
+        forwarded: false,
     }
 }
 

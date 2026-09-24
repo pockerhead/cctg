@@ -2851,6 +2851,8 @@ mod tests {
             thread_id: 100,
             text: "kept".into(),
             reply_to: Some(4),
+            quote: None,
+            forwarded: false,
         });
         buffer.overflow_told = true;
         buffer.resume = Some(ResumeNote {

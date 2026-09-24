@@ -13,10 +13,13 @@ use tracing::{debug, warn};
 use super::api::{ApiError, BotApi, Message, Update};
 use super::config::Allowlist;
 use super::offset::OffsetStore;
+use super::registry::cut;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STALLED_BATCH_BACKOFF: Duration = Duration::from_secs(1);
+/// UTF-16 units kept of a replied message quoted for the session.
+pub const QUOTE_LIMIT: usize = 500;
 /// Waits before the second and third attempt to save the offset (a file held
 /// open by a scanner or indexer on Windows makes the rename fail for a moment).
 const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
@@ -41,6 +44,12 @@ pub struct Inbound {
     /// The message this one explicitly answers. `None` for the implicit
     /// reply to the topic root that Telegram sets on every topic message.
     pub reply_to: Option<i64>,
+    /// The words an explicit reply answers: the fragment the user selected,
+    /// else the start of the replied text or caption, at most
+    /// [`QUOTE_LIMIT`]. Never logged.
+    pub quote: Option<String>,
+    /// A forwarded message: someone else's words, not the user's.
+    pub forwarded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,15 +125,24 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         let thread_id = message
             .message_thread_id
             .filter(|_| message.is_topic_message);
-        let reply_to = message
+        let replied = message
             .reply_to_message
-            .map(|replied| replied.message_id)
-            .filter(|&id| id != 0 && Some(id) != thread_id);
+            .filter(|replied| replied.message_id != 0 && Some(replied.message_id) != thread_id);
+        let reply_to = replied.as_ref().map(|replied| replied.message_id);
+        let quote = replied.and_then(|replied| {
+            let words = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
+            words(message.quote.map(|quote| quote.text))
+                .or_else(|| words(replied.text))
+                .or_else(|| words(replied.caption))
+                .map(|text| cut(&text, QUOTE_LIMIT))
+        });
         return Routed::Input(Inbound {
             message_id: message.message_id,
             thread_id,
             text: message.text,
             reply_to,
+            quote,
+            forwarded: message.forward_origin.is_some(),
         });
     }
 
@@ -364,6 +382,8 @@ mod tests {
                 thread_id: Some(7),
                 text: Some("hi".to_owned()),
                 reply_to: None,
+                quote: None,
+                forwarded: false,
             })
         );
 
@@ -421,6 +441,93 @@ mod tests {
             ),
             Some(42)
         );
+    }
+
+    fn input(extra: Value) -> Inbound {
+        match route_one(json!({ "update_id": 1, "message": message(ALLOWED, extra) })) {
+            Routed::Input(input) => input,
+            other => panic!("not input: {other:?}"),
+        }
+    }
+
+    /// The replied message as Telegram nests it: a bot message in topic 7.
+    fn replied(message_id: i64, words: Value) -> Value {
+        let mut replied = json!({
+            "message_id": message_id, "message_thread_id": 7, "is_topic_message": true,
+            "date": 1, "from": { "id": BOT, "is_bot": true, "first_name": "bot" },
+            "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
+        });
+        if let (Some(target), Some(words)) = (replied.as_object_mut(), words.as_object()) {
+            target.extend(words.clone());
+        }
+        replied
+    }
+
+    #[test]
+    fn an_explicit_reply_carries_the_selected_quote_or_the_start_of_the_message() {
+        let selected = input(json!({
+            "text": "Удаляй",
+            "reply_to_message": replied(42, json!({ "text": "Удалить build/ и dist/?" })),
+            "quote": { "text": "dist/", "position": 17, "is_manual": true },
+        }));
+        assert_eq!(selected.reply_to, Some(42));
+        assert_eq!(selected.quote.as_deref(), Some("dist/"));
+
+        let whole = input(json!({
+            "text": "да",
+            "reply_to_message": replied(42, json!({ "text": "Удалить build/?" })),
+        }));
+        assert_eq!(whole.quote.as_deref(), Some("Удалить build/?"));
+
+        let caption = input(json!({
+            "text": "да",
+            "reply_to_message": replied(43, json!({
+                "photo": [{ "file_id": "f", "file_unique_id": "u", "width": 1, "height": 1 }],
+                "caption": "схема",
+            })),
+        }));
+        assert_eq!(caption.quote.as_deref(), Some("схема"));
+
+        let long = "я".repeat(QUOTE_LIMIT + 100);
+        let cut = input(json!({
+            "text": "да", "reply_to_message": replied(44, json!({ "text": long })),
+        }))
+        .quote
+        .unwrap_or_default();
+        assert_eq!(cut.chars().count(), QUOTE_LIMIT);
+        assert!(cut.ends_with("я…"), "{cut}");
+
+        // A replied message without words (a sticker) gives no quote.
+        let bare = input(json!({
+            "text": "?", "reply_to_message": replied(45, json!({ "sticker": {} })),
+        }));
+        assert_eq!((bare.reply_to, bare.quote), (Some(45), None));
+    }
+
+    #[test]
+    fn the_implicit_reply_to_the_topic_root_carries_no_quote() {
+        let root = input(json!({
+            "text": "hi",
+            "reply_to_message": replied(7, json!({
+                "forum_topic_created": { "name": "[box] p", "icon_color": 7322096 },
+            })),
+        }));
+        assert_eq!((root.reply_to, root.quote), (None, None));
+        let plain = input(json!({ "text": "hi" }));
+        assert_eq!((plain.quote, plain.forwarded), (None, false));
+    }
+
+    #[test]
+    fn a_forwarded_message_is_marked() {
+        for origin in [
+            json!({ "type": "hidden_user", "sender_user_name": "someone", "date": 1 }),
+            json!({ "type": "channel", "date": 1, "message_id": 5,
+                "chat": { "id": -1009, "type": "channel", "title": "c" } }),
+        ] {
+            let forwarded = input(json!({ "text": "чужие слова", "forward_origin": origin }));
+            assert!(forwarded.forwarded, "{forwarded:?}");
+            assert_eq!(forwarded.text.as_deref(), Some("чужие слова"));
+        }
     }
 
     #[test]

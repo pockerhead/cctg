@@ -44,6 +44,35 @@ pub struct Parked {
     /// An explicit reply (see [`crate::hub::updates::Inbound::reply_to`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<i64>,
+    /// See [`crate::hub::updates::Inbound::quote`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forwarded: bool,
+}
+
+/// Heads a forwarded message in the content the session reads.
+pub const FORWARDED: &str = "(переслано)";
+
+impl Parked {
+    /// What the session reads: the quoted words as `> ` lines and a blank
+    /// line, then [`FORWARDED`] on its own line for a forward, then the text.
+    pub fn content(&self) -> String {
+        let mut content = String::new();
+        if let Some(quote) = &self.quote {
+            for line in quote.lines() {
+                content.push_str(format!("> {line}").trim_end());
+                content.push('\n');
+            }
+            content.push('\n');
+        }
+        if self.forwarded {
+            content.push_str(FORWARDED);
+            content.push('\n');
+        }
+        content.push_str(&self.text);
+        content
+    }
 }
 
 /// The Resume message of an offline period.
@@ -164,6 +193,8 @@ mod tests {
             thread_id: 100,
             text: format!("m{message_id}"),
             reply_to: None,
+            quote: None,
+            forwarded: false,
         }
     }
 
@@ -177,6 +208,23 @@ mod tests {
         assert!(buffer.push(parked(51)));
         let ids: Vec<i64> = buffer.messages.iter().map(|m| m.message_id).collect();
         assert_eq!(ids, (2..52).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_content_puts_the_quote_first_and_marks_a_forward() {
+        assert_eq!(parked(1).content(), "m1");
+        let reply = Parked {
+            quote: Some("Удалить build/?\n\nи dist/".into()),
+            text: "Удаляй".into(),
+            ..parked(1)
+        };
+        assert_eq!(reply.content(), "> Удалить build/?\n>\n> и dist/\n\nУдаляй");
+        let forward = Parked {
+            forwarded: true,
+            text: "чужие\nслова".into(),
+            ..parked(2)
+        };
+        assert_eq!(forward.content(), "(переслано)\nчужие\nслова");
     }
 
     #[test]
@@ -240,10 +288,24 @@ mod tests {
     fn an_old_file_without_a_buffer_and_a_full_one_both_load() {
         let old: Buffer = serde_json::from_str("{}").unwrap();
         assert!(old.is_idle());
+        // A message kept before quotes and forwards were read.
+        let old: Parked =
+            serde_json::from_str(r#"{"message_id":1,"thread_id":100,"text":"m1"}"#).unwrap();
+        assert_eq!(old, parked(1));
+        let plain = serde_json::to_string(&parked(1)).unwrap();
+        assert!(
+            !plain.contains("quote") && !plain.contains("forwarded"),
+            "{plain}"
+        );
         let mut buffer = Buffer::default();
         buffer.push(Parked {
             reply_to: Some(5),
+            quote: Some("q".into()),
             ..parked(1)
+        });
+        buffer.push(Parked {
+            forwarded: true,
+            ..parked(2)
         });
         buffer.resume = Some(ResumeNote {
             session: A.into(),

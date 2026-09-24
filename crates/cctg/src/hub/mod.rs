@@ -391,6 +391,8 @@ mod tests {
             thread_id: Some(100),
             text: Some(text.to_owned()),
             reply_to: None,
+            quote: None,
+            forwarded: false,
         };
         let mut route = route_inbound(&commands_tx, &control_tx);
         route(Routed::Input(input("hello")));

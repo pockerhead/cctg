@@ -794,6 +794,8 @@ impl Soak {
                 thread_id: Some(thread),
                 text: Some(text.to_owned()),
                 reply_to: None,
+                quote: None,
+                forwarded: false,
             }));
             return;
         }

@@ -652,6 +652,8 @@ async fn e2e_reactions() {
             thread_id: Some(THREAD),
             text: Some("from telegram".into()),
             reply_to: None,
+            quote: None,
+            forwarded: false,
         }))
         .unwrap();
     wait_for("eyes", 10, || fake.reactions() == [(555, "👀".to_owned())]).await;
