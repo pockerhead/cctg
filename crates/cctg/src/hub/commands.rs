@@ -330,6 +330,7 @@ pub async fn send_text(
     let op = Op::Send {
         thread_id,
         text,
+        html: None,
         reply_markup: None,
         permission: false,
     };

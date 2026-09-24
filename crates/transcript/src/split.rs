@@ -39,7 +39,7 @@ pub fn split_for_telegram(text: &str, options: SplitOptions) -> SplitResult {
     let mut chunks = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let (chunk, tail) = rest.split_at(cut(rest));
+        let (chunk, tail) = rest.split_at(cut(rest, TELEGRAM_TEXT_LIMIT));
         if !chunk.trim().is_empty() {
             chunks.push(chunk.to_owned());
         }
@@ -52,14 +52,15 @@ pub fn split_for_telegram(text: &str, options: SplitOptions) -> SplitResult {
     }
 }
 
-/// Byte length (> 0, a char boundary) of the next chunk of non-empty `text`. Scans one chunk's worth
-/// of chars; grapheme rules are only consulted at the few candidate cut points.
-fn cut(text: &str) -> usize {
+/// Byte length (> 0, a char boundary) of the next chunk of non-empty `text` within `limit` UTF-16
+/// units (`limit >= 2`, so one char always fits). Scans one chunk's worth of chars; grapheme rules
+/// are only consulted at the few candidate cut points.
+pub(crate) fn cut(text: &str, limit: usize) -> usize {
     let (mut units, mut fit) = (0, text.len());
     let (mut paragraph, mut line, mut space) = (0, 0, 0);
     let mut previous = '\0';
     for (index, c) in text.char_indices() {
-        if units + c.len_utf16() > TELEGRAM_TEXT_LIMIT {
+        if units + c.len_utf16() > limit {
             fit = index;
             break;
         }

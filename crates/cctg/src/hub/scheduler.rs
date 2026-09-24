@@ -23,6 +23,10 @@
 //! marked `restart` comes. So a later line never shows before the one the
 //! stream sends again.
 //!
+//! A message with `html` goes out as Telegram HTML. When Telegram cannot parse
+//! it (`400 can't parse entities`), the same job goes again once, at the head
+//! of its lane, as its plain `text` without the markup.
+//!
 //! A ready ordinary message is served after a bounded run of unmetered jobs,
 //! while a ready permission prompt always remains first.
 //!
@@ -51,7 +55,10 @@ const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 pub enum Op {
     Send {
         thread_id: Option<i64>,
+        /// Plain text; the fallback when `html` is set and refused.
         text: String,
+        /// `text` as Telegram HTML (`parse_mode: HTML`), sent instead of it.
+        html: Option<String>,
         reply_markup: Option<Value>,
         /// Permission prompts jump ahead of ordinary messages of other topics,
         /// never ahead of older messages of their own topic.
@@ -89,6 +96,8 @@ pub enum Op {
     Stream {
         thread_id: i64,
         text: String,
+        /// As in `Send`.
+        html: Option<String>,
         merge: bool,
         restart: bool,
     },
@@ -161,12 +170,15 @@ impl Transport for BotApi {
             Op::Send {
                 thread_id,
                 text,
+                html,
                 reply_markup,
                 ..
-            } => self
-                .send_message(*thread_id, text, reply_markup.as_ref())
-                .await
-                .map(Outcome::Sent),
+            } => {
+                let (text, parse_mode) = formatted(text, html.as_deref());
+                self.send_message(*thread_id, text, reply_markup.as_ref(), parse_mode)
+                    .await
+                    .map(Outcome::Sent)
+            }
             Op::SendDocument {
                 thread_id,
                 document,
@@ -206,16 +218,51 @@ impl Transport for BotApi {
                 .await
                 .map(|()| Outcome::Done),
             Op::Stream {
-                thread_id, text, ..
-            } => self
-                .send_message(Some(*thread_id), text, None)
-                .await
-                .map(Outcome::Sent),
+                thread_id,
+                text,
+                html,
+                ..
+            } => {
+                let (text, parse_mode) = formatted(text, html.as_deref());
+                self.send_message(Some(*thread_id), text, None, parse_mode)
+                    .await
+                    .map(Outcome::Sent)
+            }
             Op::React { message_id, emoji } => self
                 .set_message_reaction(*message_id, emoji)
                 .await
                 .map(|()| Outcome::Done),
         }
+    }
+}
+
+/// The text to send and its `parse_mode`: the HTML when there is one.
+fn formatted<'a>(text: &'a str, html: Option<&'a str>) -> (&'a str, Option<&'static str>) {
+    match html {
+        Some(html) => (html, Some("HTML")),
+        None => (text, None),
+    }
+}
+
+/// Telegram could not parse the HTML of a message:
+/// `400 Bad Request: can't parse entities: ...`.
+fn is_bad_markup(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Telegram { code: 400, description }
+            if description.to_ascii_lowercase().contains("can't parse entities")
+    )
+}
+
+fn html_or_escaped(text: &str, html: Option<&str>) -> String {
+    html.map_or_else(|| transcript::escape_html(text), str::to_owned)
+}
+
+/// Drops the HTML of a message op; true when it had some.
+fn drop_html(op: &mut Op) -> bool {
+    match op {
+        Op::Send { html, .. } | Op::Stream { html, .. } => html.take().is_some(),
+        _ => false,
     }
 }
 
@@ -291,6 +338,9 @@ struct Job {
     reply: oneshot::Sender<Delivery>,
     /// Stream lines sent inside this job's message.
     merged: Vec<oneshot::Sender<Delivery>>,
+    /// Goes again as plain text after Telegram refused its HTML: never takes
+    /// more lines in, so it cannot become HTML and be refused a second time.
+    plain_retry: bool,
 }
 
 /// Cloneable handle that enqueues outbound operations.
@@ -312,6 +362,7 @@ impl Outbox {
                 op,
                 reply,
                 merged: Vec::new(),
+                plain_retry: false,
             })
             .await;
         receiver
@@ -522,7 +573,15 @@ impl<T: Transport> Scheduler<T> {
         } else {
             self.consecutive_unmetered = self.consecutive_unmetered.saturating_add(1);
         }
-        match self.transport.execute(&job.op).await {
+        let result = self.transport.execute(&job.op).await;
+        if matches!(&result, Err(error) if is_bad_markup(error)) && drop_html(&mut job.op) {
+            // Once: the op has no HTML left to refuse.
+            warn!("telegram could not parse a formatted message; sending it as plain text");
+            job.plain_retry = true;
+            self.lane_mut(lane).push_front(job);
+            return;
+        }
+        match result {
             Err(ApiError::RetryAfter(wait)) => {
                 let wait = wait.max(MIN_RETRY_AFTER);
                 warn!(?wait, "telegram flood control, outbound queue paused");
@@ -574,9 +633,13 @@ impl<T: Transport> Scheduler<T> {
     /// Joins the stream lines of `job`'s topic queued right after it into
     /// its text when more messages wait than the bucket has tokens.
     fn merge_lines(&mut self, job: &mut Job, now: Instant) {
+        if job.plain_retry {
+            return;
+        }
         let Op::Stream {
             thread_id,
             text,
+            html,
             merge: true,
             ..
         } = &mut job.op
@@ -596,19 +659,32 @@ impl<T: Transport> Scheduler<T> {
             }
             let Op::Stream {
                 text: next,
+                html: next_html,
                 merge: true,
                 ..
             } = queued
             else {
                 break;
             };
+            // One formatted line makes the whole message HTML.
+            let joined_html = (html.is_some() || next_html.is_some()).then(|| {
+                format!(
+                    "{}\n{}",
+                    html_or_escaped(text, html.as_deref()),
+                    html_or_escaped(next, next_html.as_deref())
+                )
+            });
+            let too_long =
+                |text: &str| transcript::telegram_len(text) > transcript::TELEGRAM_TEXT_LIMIT;
             if transcript::telegram_len(text) + 1 + transcript::telegram_len(next)
                 > transcript::TELEGRAM_TEXT_LIMIT
+                || joined_html.as_deref().is_some_and(too_long)
             {
                 break;
             }
             text.push('\n');
             text.push_str(next);
+            *html = joined_html;
             let Some(next) = self.message.remove(index) else {
                 break;
             };
@@ -712,6 +788,7 @@ mod tests {
         Op::Send {
             thread_id: Some(thread),
             text: text.to_owned(),
+            html: None,
             reply_markup: None,
             permission: false,
         }
@@ -806,6 +883,7 @@ mod tests {
         ops.push(Op::Send {
             thread_id: Some(2),
             text: "permission".to_owned(),
+            html: None,
             reply_markup: None,
             permission: true,
         });
@@ -950,6 +1028,7 @@ mod tests {
         Op::Send {
             thread_id: Some(thread),
             text: text.to_owned(),
+            html: None,
             reply_markup: None,
             permission: true,
         }
@@ -1064,6 +1143,7 @@ mod tests {
         Op::Stream {
             thread_id: thread,
             text: text.to_owned(),
+            html: None,
             merge: true,
             restart: false,
         }
@@ -1180,6 +1260,7 @@ mod tests {
         Op::Stream {
             thread_id: thread,
             text: text.to_owned(),
+            html: None,
             merge: false,
             restart,
         }
@@ -1279,6 +1360,7 @@ mod tests {
             .map(|i| Op::Stream {
                 thread_id: 1,
                 text: format!("s{i}"),
+                html: None,
                 merge: false,
                 restart: false,
             })
@@ -1314,5 +1396,185 @@ mod tests {
                 (6, "👀".to_owned(), Duration::ZERO)
             ]
         );
+    }
+
+    /// Refuses every message with HTML as Telegram does when it cannot parse
+    /// it, and with `plain_too` the plain retry as well.
+    #[derive(Default)]
+    struct BadMarkup {
+        calls: Mutex<Vec<Op>>,
+        plain_too: bool,
+    }
+
+    impl Transport for BadMarkup {
+        async fn execute(&self, op: &Op) -> Delivery {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(op.clone());
+            }
+            let html = matches!(
+                op,
+                Op::Send { html: Some(_), .. } | Op::Stream { html: Some(_), .. }
+            );
+            if html || self.plain_too {
+                return Err(ApiError::Telegram {
+                    code: 400,
+                    description: "Bad Request: can't parse entities: Unsupported start tag \"x\" at byte offset 0".to_owned(),
+                });
+            }
+            Ok(Outcome::Sent(Message::default()))
+        }
+    }
+
+    fn formatted_send(text: &str, html: &str) -> Op {
+        Op::Send {
+            thread_id: Some(1),
+            text: text.to_owned(),
+            html: Some(html.to_owned()),
+            reply_markup: None,
+            permission: false,
+        }
+    }
+
+    fn sent(fake: &BadMarkup) -> Vec<(String, Option<String>)> {
+        fake.calls
+            .lock()
+            .map(|calls| calls.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Send { text, html, .. } | Op::Stream { text, html, .. } => Some((text, html)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn html_telegram_cannot_parse_goes_again_once_as_its_plain_text() {
+        let fake = Arc::new(BadMarkup::default());
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let answer = outbox.submit(formatted_send("**a**", "<b>a</b>")).await;
+        let line = outbox
+            .submit(Op::Stream {
+                thread_id: 1,
+                text: "_b_".to_owned(),
+                html: Some("<i>b</i>".to_owned()),
+                merge: false,
+                restart: true,
+            })
+            .await;
+        let next = outbox.submit(send(1, "after")).await;
+        drop(outbox);
+        scheduler.run().await;
+        for receiver in [answer, line, next] {
+            assert!(matches!(receiver.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        let own = |text: &str, html: Option<&str>| (text.to_owned(), html.map(str::to_owned));
+        assert_eq!(
+            sent(&fake),
+            [
+                own("**a**", Some("<b>a</b>")),
+                own("**a**", None),
+                own("_b_", Some("<i>b</i>")),
+                own("_b_", None),
+                own("after", None),
+            ],
+            "each refused message goes again at once, before the next one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_message_telegram_cannot_parse_is_not_sent_again() {
+        let fake = Arc::new(BadMarkup {
+            plain_too: true,
+            ..BadMarkup::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let formatted = outbox.submit(formatted_send("**a**", "<b>a</b>")).await;
+        let plain = outbox.submit(send(1, "plain")).await;
+        drop(outbox);
+        scheduler.run().await;
+        for receiver in [formatted, plain] {
+            assert!(matches!(
+                receiver.await,
+                Ok(Err(ApiError::Telegram { code: 400, .. }))
+            ));
+        }
+        assert_eq!(sent(&fake).len(), 3, "one retry for the HTML one only");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_formatted_line_merged_with_plain_lines_makes_one_html_message() {
+        let fake = Fake::new(&[]);
+        let formatted = Op::Stream {
+            thread_id: 1,
+            text: "\u{1F4AD} **x**".to_owned(),
+            html: Some("\u{1F4AD} <b>x</b>".to_owned()),
+            merge: true,
+            restart: false,
+        };
+        let mut ops: Vec<Op> = (0..8).map(|i| line(1, &format!("• a<{i}> ✓"))).collect();
+        ops.insert(6, formatted);
+        run(&fake, ops).await;
+        let merged = fake
+            .calls()
+            .into_iter()
+            .find_map(|call| match call.op {
+                Op::Stream {
+                    text,
+                    html: Some(html),
+                    ..
+                } => Some((text, html)),
+                _ => None,
+            })
+            .expect("the formatted line went out");
+        assert!(merged.0.contains("• a<5> ✓\n\u{1F4AD} **x**"), "{merged:?}");
+        assert!(
+            merged.1.contains("• a&lt;5&gt; ✓\n\u{1F4AD} <b>x</b>"),
+            "plain lines are escaped: {merged:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_plain_retry_never_merges_formatted_lines_back_into_html() {
+        // Five formatted lines and five tokens: the first goes alone, and its
+        // plain retry finds fewer tokens than waiting lines, so it would merge.
+        let fake = Arc::new(BadMarkup::default());
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let mut receivers = Vec::new();
+        for i in 0..5 {
+            let op = Op::Stream {
+                thread_id: 1,
+                text: format!("**l{i}**"),
+                html: Some(format!("<b>l{i}</b>")),
+                merge: true,
+                restart: false,
+            };
+            receivers.push(outbox.submit(op).await);
+        }
+        drop(outbox);
+        scheduler.run().await;
+        for receiver in receivers {
+            assert!(matches!(
+                receiver.await,
+                Ok(Ok(Outcome::Sent(_) | Outcome::Merged))
+            ));
+        }
+        let calls = sent(&fake);
+        assert!(calls.len().is_multiple_of(2), "{calls:?}");
+        for pair in calls.chunks(2) {
+            assert!(pair[0].1.is_some(), "an HTML attempt first: {calls:?}");
+            assert_eq!(
+                pair[1],
+                (pair[0].0.clone(), None),
+                "then its own plain text"
+            );
+        }
+        let lines: Vec<String> = calls
+            .iter()
+            .filter(|(_, html)| html.is_none())
+            .flat_map(|(text, _)| text.split('\n').map(str::to_owned).collect::<Vec<_>>())
+            .collect();
+        let want: Vec<String> = (0..5).map(|i| format!("**l{i}**")).collect();
+        assert_eq!(lines, want, "every line once, in order");
     }
 }

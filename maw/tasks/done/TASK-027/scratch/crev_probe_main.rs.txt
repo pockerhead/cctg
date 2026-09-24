@@ -1,0 +1,101 @@
+use transcript::*;
+fn main() {
+    let cases = [
+        r"C:\Users\user\.claude\projects and C:\dev\_x and `C:\a\_b`",
+        "see [wiki](https://en.wikipedia.org/wiki/Rust_(language)) ok",
+        "[`file.rs`](https://x.y/f)",
+        "**`code` in bold**",
+        "a*b*c and 2*3*4 and x * y",
+        "foo.__init__ and __bar",
+        "src/*/mod.rs and tests/*/x",
+        "Vec<T> & Option<&str>",
+        "unclosed `tick here",
+        "**bold across\nlines**",
+        ">= 5 items",
+        "~~~\ncode tilde\n~~~",
+        "~~~~~~~~",
+        "***",
+        "* * *",
+        "_ _ _",
+        "**a** __b__ ***c*** _d_",
+        "[a](javascript:alert(1))",
+        "[a](http://x.y/\"><b>)",
+        "text\\",
+        r"x \\ y \* \_",
+        "*a **b* c**",
+        "_a *b_ c*",
+        "`` ` ``",
+        "***x** y*",
+        "**x *y***",
+        "# `code` head",
+        "> **q** `c`\n>\n> end",
+        "1) item\n10. ten",
+        "\u{1F600} *émoji* _ü_",
+        "[x](<https://a>)",
+        "<https://a.b/c?x=1&y=2>",
+        "a <b> c",
+        "*",
+        "**",
+        "`",
+        "```",
+        "~~a~~~",
+        "_a_b_",
+        "__a__b",
+    ];
+    for c in cases { println!("{c:?}\n  => {:?}", markdown_to_html(c)); }
+    // split: fence opening line cut
+    let mut t = String::from("```rust\n");
+    t.push_str(&"x & y < z;\n".repeat(900));
+    t.push_str("```\nafter **bold**\n");
+    let s = split_markdown_for_telegram(&t, SplitOptions::default());
+    for c in &s.chunks { println!("chunk html_len={} text_len={} start={:?} end={:?}", telegram_len(&c.html), telegram_len(&c.text), &c.html.chars().take(40).collect::<String>(), &c.html.chars().rev().take(30).collect::<String>().chars().rev().collect::<String>()); }
+    // long single line with emphasis cut
+    let long = format!("**{}**", "word ".repeat(1200));
+    let s = split_markdown_for_telegram(&long, SplitOptions::default());
+    for c in &s.chunks { println!("long chunk len={} head={:?}", telegram_len(&c.html), c.html.chars().take(20).collect::<String>()); }
+    // fence closing then quote with fence
+    let q = "> ```\n> code\n> ```";
+    println!("{:?}", markdown_to_html(q));
+    // many empty code blocks
+    let e = "```\n```\n".repeat(1000);
+    let s = split_markdown_for_telegram(&e, SplitOptions::default());
+    println!("empty blocks chunks={}", s.chunks.len());
+    // pathological emphasis perf
+    let p = "*a ".repeat(20000);
+    let t0 = std::time::Instant::now();
+    let _ = split_markdown_for_telegram(&p, SplitOptions::default());
+    println!("perf *a x20000: {:?}", t0.elapsed());
+    let p = "**".repeat(3000) + "x";
+    let t0 = std::time::Instant::now();
+    let _ = markdown_to_html(&p);
+    println!("perf ** run: {:?}", t0.elapsed());
+    let p = "*a".repeat(3000);
+    let t0 = std::time::Instant::now();
+    let h = markdown_to_html(&p);
+    println!("perf *a nested: {:?} len {}", t0.elapsed(), h.len());
+    let p = "[".repeat(5000) + "](http://x)";
+    let t0 = std::time::Instant::now();
+    let _ = markdown_to_html(&p);
+    println!("perf [[: {:?}", t0.elapsed());
+    let p = "`".to_string() + &"a`` ".repeat(4000);
+    let t0 = std::time::Instant::now();
+    let _ = markdown_to_html(&p);
+    println!("perf backticks: {:?}", t0.elapsed());
+    let p = "*a&".repeat(700) + "
+
+" + &"x ".repeat(3000);
+    let t0 = std::time::Instant::now();
+    let s = split_markdown_for_telegram(&p, SplitOptions::default());
+    println!("perf shrink loop: {:?} chunks {}", t0.elapsed(), s.chunks.len());
+    let p = "*a&".repeat(1360) + &"x ".repeat(3000);
+    let t0 = std::time::Instant::now();
+    let s = split_markdown_for_telegram(&p, SplitOptions::default());
+    println!("perf one line: {:?} chunks {}", t0.elapsed(), s.chunks.len());
+    for n in [100usize, 600, 1300] {
+        let d = "**_".repeat(n) + "x" + &"_**".repeat(n);
+        let h = std::thread::Builder::new().stack_size(2 << 20).spawn(move || { let s = split_markdown_for_telegram(&d, SplitOptions::default()); s.chunks.len() }).unwrap().join();
+        println!("deep n={n} ok={:?}", h.is_ok());
+    }
+}
+#[allow(dead_code)]
+fn deep() {}

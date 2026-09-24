@@ -8,11 +8,15 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+mod markdown;
 mod render;
 mod split;
 mod stream;
 mod subagent;
 
+pub use markdown::{
+    HtmlChunk, HtmlSplit, escape_html, markdown_to_html, split_markdown_for_telegram,
+};
 pub use render::{
     last_prompts, render_brief, render_brief_with_subagents, render_full,
     render_full_with_subagents,

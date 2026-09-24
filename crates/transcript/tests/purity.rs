@@ -1,5 +1,6 @@
-const SOURCES: [(&str, &str); 5] = [
+const SOURCES: [(&str, &str); 6] = [
     ("lib.rs", include_str!("../src/lib.rs")),
+    ("markdown.rs", include_str!("../src/markdown.rs")),
     ("render.rs", include_str!("../src/render.rs")),
     ("split.rs", include_str!("../src/split.rs")),
     ("stream.rs", include_str!("../src/stream.rs")),
