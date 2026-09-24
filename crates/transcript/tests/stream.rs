@@ -186,3 +186,29 @@ fn a_call_line_from_hook_input_matches_the_streamed_line() {
         "• Read"
     );
 }
+
+#[test]
+fn terminal_bang_commands_and_local_command_output_stream_as_prompt_and_code() {
+    let listing = (1..20)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        events(include_str!("fixtures/console_commands.jsonl")),
+        [
+            StreamEvent::Prompt("! echo hi".to_owned()),
+            StreamEvent::Note("```\nhi\n```".to_owned()),
+            StreamEvent::Prompt("! git status".to_owned()),
+            // stderr counts as output.
+            StreamEvent::Note("```\nfatal: not a git repository\n```".to_owned()),
+            // No output, no note.
+            StreamEvent::Prompt("! true".to_owned()),
+            StreamEvent::Prompt("/cost".to_owned()),
+            // Colours dropped.
+            StreamEvent::Note("```\nTotal cost: $0.12\nTotal duration: 3m\n```".to_owned()),
+            StreamEvent::Prompt("! cat notes.md".to_owned()),
+            // 20 lines at most; the fence is longer than any backtick run.
+            StreamEvent::Note(format!("````\n```rust\n{listing}\n\u{2026}\n````")),
+        ]
+    );
+}

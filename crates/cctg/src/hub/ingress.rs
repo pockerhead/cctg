@@ -222,6 +222,7 @@ async fn agent_session(
                         | AgentMsg::PermissionAck { .. }
                         | AgentMsg::TranscriptChunk { .. }
                         | AgentMsg::ConsoleKeyWritten { .. }
+                        | AgentMsg::ConsoleCommandTyped { .. }
                         | AgentMsg::UpdateAnswer { .. }),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
@@ -834,6 +835,7 @@ mod tests {
             verdict_ack: false,
             transcript_reads: false,
             console_keys: false,
+            console_commands: false,
             client: None,
         }
     }

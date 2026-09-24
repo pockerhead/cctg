@@ -179,6 +179,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         verdict_ack: true,
         transcript_reads: false,
         console_keys: false,
+        console_commands: false,
         client: None,
     };
     write

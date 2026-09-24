@@ -20,9 +20,11 @@ use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Control, Options, Slots};
 use cctg::hub::status;
-use cctg::hub::updates::CallbackInput;
+use cctg::hub::updates::{CallbackInput, Inbound};
+use cctg::hub::{console, stream};
 use cctg::wire::{
-    self, AgentMsg, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionRequest, Register, Secret,
+    self, AgentMsg, CommandOutcome, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionRequest,
+    Register, Secret,
 };
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -384,7 +386,8 @@ impl Hub {
 
 // ---------------------------------------------------------------- agent
 
-/// A session agent on a real link that presses keys (`console_keys`).
+/// A session agent on a real link that presses keys and types commands
+/// (`console_keys`, `console_commands`).
 struct Agent {
     reader: BufReader<OwnedReadHalf>,
     write: OwnedWriteHalf,
@@ -406,6 +409,7 @@ impl Agent {
             verdict_ack: true,
             transcript_reads: false,
             console_keys: true,
+            console_commands: true,
             client: None,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
@@ -867,4 +871,66 @@ async fn edits_are_paced_and_a_deleted_status_message_comes_back() {
         status_sends(&ops)[1],
         (100, "💭 Думает\nctx 19%".to_owned())
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
+    let hub = start_hub("console", Duration::from_millis(50)).await;
+    hub.start(A, 10).await;
+    let mut agent = Agent::connect(&hub, A, 10).await;
+    hub.status_message(100).await;
+    let say = |message_id: i64, text: &str| {
+        hub.control
+            .send(Control::Message(Inbound {
+                message_id,
+                thread_id: Some(100),
+                text: Some(text.into()),
+                reply_to: None,
+                quote: None,
+                forwarded: false,
+            }))
+            .unwrap();
+    };
+    let mut typed = Vec::new();
+    for (message_id, text) in [(41, "!echo hi"), (42, "/compact")] {
+        say(message_id, text);
+        match agent.next().await {
+            Some(HubMsg::ConsoleCommand {
+                command_id,
+                text: got,
+            }) => {
+                assert_eq!(got, text);
+                typed.push(command_id);
+            }
+            other => panic!("no console command: {other:?}"),
+        }
+    }
+    let answer = |command_id, outcome| AgentMsg::ConsoleCommandTyped {
+        command_id,
+        outcome,
+    };
+    agent.send(answer(typed[0], CommandOutcome::Sent)).await;
+    agent.send(answer(typed[1], CommandOutcome::Draft)).await;
+    let ops = hub
+        .until("both answers handled", |ops| {
+            let reacted = ops.iter().any(|op| {
+                matches!(op, Op::React { message_id: 41, emoji } if emoji == stream::ACCEPTED)
+            });
+            let told = ops.iter().any(|op| {
+                matches!(op, Op::Send { reply_to: Some(42), text, .. } if text == console::DRAFT_NOTICE)
+            });
+            reacted && told
+        })
+        .await;
+    assert!(
+        !ops.iter().any(|op| matches!(
+            op,
+            Op::Send {
+                reply_to: Some(41),
+                ..
+            }
+        )),
+        "a typed command gets no text answer"
+    );
+    assert!(agent.quiet().await, "nothing went to the model");
 }

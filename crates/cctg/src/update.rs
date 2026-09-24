@@ -21,7 +21,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::client;
-use crate::keys::{self, ExitTyped};
+use crate::keys::{self, Typed};
 use crate::proctree::Proc;
 use crate::shim;
 
@@ -145,24 +145,24 @@ impl Worker {
 
     /// Writes the request for `cctg run` and types `/exit`. The request is
     /// removed again when `/exit` was not sent.
-    pub fn restart(&self, session_id: &str) -> ExitTyped {
+    pub fn restart(&self, session_id: &str) -> Typed {
         let (Some(state), Some(run_pid), Some(claude_pid)) =
             (&self.state_dir, self.run_pid, self.claude_pid)
         else {
-            return ExitTyped::Failed;
+            return Typed::Failed;
         };
         if !is_session_id(session_id) {
-            return ExitTyped::Failed;
+            return Typed::Failed;
         }
         let path = request_path(state, run_pid);
         let request = Request {
             args: relaunch_args(&self.run_args, session_id),
         };
         if write_request(&path, &request).is_err() {
-            return ExitTyped::Failed;
+            return Typed::Failed;
         }
         let typed = keys::type_exit(claude_pid);
-        if typed != ExitTyped::Sent {
+        if typed != Typed::Sent {
             let _ = std::fs::remove_file(&path);
         }
         typed
@@ -594,6 +594,6 @@ mod tests {
         };
         w.withdraw_request();
         assert!(!path.exists());
-        assert_eq!(w.restart("5e55"), ExitTyped::Failed, "no claude pid");
+        assert_eq!(w.restart("5e55"), Typed::Failed, "no claude pid");
     }
 }

@@ -70,8 +70,9 @@ pub enum Parsed {
 }
 
 /// True for texts the command worker should see: only `/brief` and `/full`
-/// (optionally `@bot`). Any other text, including `/compact` or a path like
-/// `/tmp/x`, is a message for the session.
+/// (optionally `@bot`). Any other text goes to the slot actor: `/compact`
+/// or `!ls` as a console command ([`super::console`]), a path like `/tmp/x`
+/// as a message for the session.
 pub fn is_command(input: &Inbound) -> bool {
     input.text.as_deref().is_some_and(|text| {
         text.split_whitespace()
