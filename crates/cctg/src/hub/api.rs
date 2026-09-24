@@ -270,6 +270,19 @@ impl BotApi {
         decode(response).await
     }
 
+    /// Replaces the bot's reaction on a message with one emoji from the Bot
+    /// API list (`👀`, `✍` are in it; bots set at most one reaction).
+    pub async fn set_message_reaction(&self, message_id: i64, emoji: &str) -> Result<(), ApiError> {
+        let body = json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "reaction": [{ "type": "emoji", "emoji": emoji }],
+        });
+        self.call::<IgnoredAny>("setMessageReaction", body, None)
+            .await
+            .map(drop)
+    }
+
     pub async fn delete_message(&self, message_id: i64) -> Result<(), ApiError> {
         let body = json!({ "chat_id": self.chat_id, "message_id": message_id });
         self.call::<IgnoredAny>("deleteMessage", body, None)

@@ -131,6 +131,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 cwd: cwd.clone(),
                 claude_pid: None,
                 verdict_ack: false,
+                transcript_reads: false,
             },
             to_agent,
         })

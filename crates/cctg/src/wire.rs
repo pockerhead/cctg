@@ -12,7 +12,8 @@
 //!
 //! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; so does a new
 //! message type that a peer sends only after the other side announced it in
-//! such a field (`permission_ack`, see [`Register::verdict_ack`]). Any other
+//! such a field (`permission_ack`, see [`Register::verdict_ack`];
+//! `transcript_read`, see [`Register::transcript_reads`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -127,6 +128,10 @@ pub struct Register {
     /// hub then takes a verdict handed to their link as delivered.
     #[serde(default)]
     pub verdict_ack: bool,
+    /// The agent answers `transcript_read` with `transcript_chunk` (TASK-016).
+    /// Agents built before leave it out and are never asked.
+    #[serde(default)]
+    pub transcript_reads: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,6 +160,60 @@ pub enum AgentMsg {
     PermissionAck {
         verdict_id: u64,
     },
+    /// The answer to one `transcript_read`: the stream events of the complete
+    /// lines in `from..to`. `missing`: the file is not there (yet). `more`:
+    /// the file has complete lines past `to` that did not fit. `reset`: the
+    /// file no longer continues at `from` (it is shorter, or `from` is not
+    /// the end of a line): a new file, to be read from its start.
+    TranscriptChunk {
+        session_id: String,
+        from: u64,
+        to: u64,
+        #[serde(default)]
+        lines: Vec<StreamLine>,
+        #[serde(default)]
+        missing: bool,
+        #[serde(default)]
+        more: bool,
+        #[serde(default)]
+        reset: bool,
+    },
+}
+
+/// The stream events of one transcript line that ends at byte `end`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamLine {
+    pub end: u64,
+    pub items: Vec<StreamItem>,
+}
+
+/// [`transcript::StreamEvent`] on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamItem {
+    Prompt {
+        text: String,
+    },
+    Channel {
+        message_id: i64,
+    },
+    Note {
+        text: String,
+    },
+    Call {
+        id: String,
+        line: String,
+    },
+    Result {
+        id: String,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    /// The assistant text that ends a turn; its text comes from `Stop`.
+    TurnEnd,
+    /// A kind from a newer agent; skipped.
+    #[serde(other)]
+    Other,
 }
 
 impl Kinds for AgentMsg {
@@ -164,6 +223,7 @@ impl Kinds for AgentMsg {
         "reply",
         "permission_request",
         "permission_ack",
+        "transcript_chunk",
     ];
 }
 
@@ -204,11 +264,26 @@ pub enum HubMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         verdict_id: Option<u64>,
     },
+    /// Sent only to an agent that registered with `transcript_reads`: read
+    /// the complete lines of the transcript `path` from byte `from` (`None`:
+    /// from the end of its last complete line) and answer with one
+    /// `transcript_chunk`.
+    TranscriptRead {
+        session_id: String,
+        path: String,
+        #[serde(default)]
+        from: Option<u64>,
+    },
 }
 
 impl Kinds for HubMsg {
-    const KINDS: &'static [&'static str] =
-        &["registered", "rejected", "inbound", "permission_verdict"];
+    const KINDS: &'static [&'static str] = &[
+        "registered",
+        "rejected",
+        "inbound",
+        "permission_verdict",
+        "transcript_read",
+    ];
 }
 
 /// One agent-link line: the message plus `"v"`, newline-terminated.
@@ -487,6 +562,7 @@ mod tests {
                 cwd: "C:\\work\\app".into(),
                 claude_pid: Some(4242),
                 verdict_ack: true,
+                transcript_reads: true,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -499,6 +575,31 @@ mod tests {
             }),
             AgentMsg::PermissionAck {
                 verdict_id: u64::MAX,
+            },
+            AgentMsg::TranscriptChunk {
+                session_id: "s".into(),
+                from: 10,
+                to: 20,
+                lines: vec![StreamLine {
+                    end: 20,
+                    items: vec![
+                        StreamItem::Prompt { text: "p".into() },
+                        StreamItem::Channel { message_id: 7 },
+                        StreamItem::Note { text: "n".into() },
+                        StreamItem::Call {
+                            id: "t1".into(),
+                            line: "• Bash: x".into(),
+                        },
+                        StreamItem::Result {
+                            id: "t1".into(),
+                            error: Some("boom".into()),
+                        },
+                        StreamItem::TurnEnd,
+                    ],
+                }],
+                missing: false,
+                more: true,
+                reset: false,
             },
         ]
     }
@@ -528,6 +629,11 @@ mod tests {
                 request_id: "abcde".into(),
                 behavior: Behavior::Deny,
                 verdict_id: Some(u64::MAX),
+            },
+            HubMsg::TranscriptRead {
+                session_id: "s".into(),
+                path: "/p/s.jsonl".into(),
+                from: None,
             },
         ]
     }
@@ -649,6 +755,7 @@ mod tests {
                 cwd: "/w".into(),
                 claude_pid: None,
                 verdict_ack: false,
+                transcript_reads: false,
             }))
         );
     }
@@ -692,6 +799,32 @@ mod tests {
             decode::<AgentMsg>(br#"{"v":1,"type":"permission_ack"}"#),
             Err(WireError::Malformed)
         );
+    }
+
+    #[test]
+    fn transcript_chunks_stay_readable_across_agent_versions() {
+        // A kind from a newer agent is skipped, not a broken chunk.
+        let line = br#"{"v":1,"type":"transcript_chunk","session_id":"s","from":0,"to":9,"lines":[{"end":9,"items":[{"kind":"diff","x":1},{"kind":"channel","message_id":3}]}]}"#;
+        assert_eq!(
+            decode::<AgentMsg>(line),
+            Ok(AgentMsg::TranscriptChunk {
+                session_id: "s".into(),
+                from: 0,
+                to: 9,
+                lines: vec![StreamLine {
+                    end: 9,
+                    items: vec![StreamItem::Other, StreamItem::Channel { message_id: 3 }],
+                }],
+                missing: false,
+                more: false,
+                reset: false,
+            })
+        );
+        let read = br#"{"v":1,"type":"transcript_read","session_id":"s","path":"/p"}"#;
+        assert!(matches!(
+            decode::<HubMsg>(read),
+            Ok(HubMsg::TranscriptRead { from: None, .. })
+        ));
     }
 
     #[test]

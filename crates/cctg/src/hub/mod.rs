@@ -10,6 +10,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod sessions;
 pub mod slots;
+pub mod stream;
 pub mod subagents;
 #[cfg(test)]
 pub(crate) mod testdir;

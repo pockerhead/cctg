@@ -202,7 +202,10 @@ impl Server {
                 );
                 self.emit(line)
             }
-            LinkEvent::Message(HubMsg::Registered | HubMsg::Rejected { .. }) => Vec::new(),
+            // Transcript reads are the agent loop's, not the channel's.
+            LinkEvent::Message(
+                HubMsg::Registered | HubMsg::Rejected { .. } | HubMsg::TranscriptRead { .. },
+            ) => Vec::new(),
         }
     }
 

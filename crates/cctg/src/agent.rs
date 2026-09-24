@@ -23,6 +23,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
@@ -34,6 +35,7 @@ use tracing::{debug, info, warn};
 use crate::channel::{self, Hub, NoHub};
 use crate::device::{self, DeviceConfig};
 use crate::proctree;
+use crate::tail;
 use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -310,6 +312,7 @@ pub async fn run_stdio() {
                 // from an outer claude, or unset (TASK-004).
                 claude_pid: proctree::current_lineage(None, None, "").claude_pid,
                 verdict_ack: true,
+                transcript_reads: true,
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: config.agent_addr.clone(),
@@ -325,7 +328,8 @@ pub async fn run_stdio() {
         }
     };
     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
-    if let Err(error) = serve_channel(frames, tokio::io::stdout(), hub, events).await {
+    let projects = tail::projects_root();
+    if let Err(error) = serve_channel(frames, tokio::io::stdout(), hub, events, projects).await {
         debug!(kind = ?error.kind(), "stdout closed");
     }
 }
@@ -414,13 +418,19 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 }
 
 /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
-/// when stdin ends (the hub link stops with it) or stdout fails.
+/// when stdin ends (the hub link stops with it) or stdout fails. Transcript
+/// reads are answered only from under `projects` ([`tail::projects_root`]).
 pub async fn serve_channel<W: AsyncWrite + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     mut output: W,
     hub: Hub,
     mut events: Option<mpsc::Receiver<LinkEvent>>,
+    projects: Option<PathBuf>,
 ) -> std::io::Result<()> {
+    let reads = match &hub {
+        Hub::Link(outbox) => Some(spawn_reader(outbox.clone(), projects)),
+        Hub::Off(_) => None,
+    };
     let mut server = channel::Server::new(hub);
     loop {
         let lines = tokio::select! {
@@ -430,6 +440,17 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                 None => break,
             },
             event = recv_event(&mut events), if events.is_some() => match event {
+                Some(LinkEvent::Message(HubMsg::TranscriptRead { session_id, path, from })) => {
+                    // One read at a time: while one runs, a request waits in
+                    // the slot and a further one is dropped (the hub asks
+                    // again after its timeout).
+                    if let Some(reads) = &reads
+                        && reads.try_send((session_id, path, from)).is_err()
+                    {
+                        debug!("transcript read busy; request dropped");
+                    }
+                    Vec::new()
+                }
                 Some(event) => server.on_link(event),
                 None => {
                     events = None;
@@ -443,6 +464,34 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         output.flush().await?;
     }
     output.flush().await
+}
+
+type ReadRequest = (String, String, Option<u64>);
+
+/// The one worker that reads transcript chunks off the loop, one blocking
+/// read at a time, and queues each answer for the hub; the hub asks again if
+/// an answer gets lost with the link.
+fn spawn_reader(
+    outbox: mpsc::Sender<AgentMsg>,
+    projects: Option<PathBuf>,
+) -> mpsc::Sender<ReadRequest> {
+    let (requests, mut pending) = mpsc::channel::<ReadRequest>(1);
+    tokio::spawn(async move {
+        while let Some((session_id, path, from)) = pending.recv().await {
+            let root = projects.clone();
+            let chunk = tokio::task::spawn_blocking(move || {
+                tail::read_chunk(root.as_deref(), &session_id, &path, from)
+            })
+            .await;
+            if let Ok(chunk) = chunk
+                && outbox.send(chunk).await.is_err()
+            {
+                debug!("hub link gone; transcript chunk dropped");
+                return;
+            }
+        }
+    });
+    requests
 }
 
 async fn recv_event(events: &mut Option<mpsc::Receiver<LinkEvent>>) -> Option<LinkEvent> {
@@ -492,6 +541,7 @@ mod tests {
             cwd: "/w".into(),
             claude_pid: None,
             verdict_ack: true,
+            transcript_reads: true,
         }
     }
 
@@ -856,9 +906,17 @@ mod tests {
     }
 
     fn claude(hub: Hub, events: Option<mpsc::Receiver<LinkEvent>>) -> Claude {
+        claude_reading(hub, events, None)
+    }
+
+    fn claude_reading(
+        hub: Hub,
+        events: Option<mpsc::Receiver<LinkEvent>>,
+        projects: Option<PathBuf>,
+    ) -> Claude {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 16);
-        tokio::spawn(serve_channel(frames_rx, ours, hub, events));
+        tokio::spawn(serve_channel(frames_rx, ours, hub, events, projects));
         Claude {
             frames,
             out: tokio::io::BufReader::new(theirs),
@@ -1093,6 +1151,7 @@ mod tests {
             ours,
             Hub::Link(outbox),
             Some(events),
+            None,
         ));
         let (_first, _) = listener.accept().await.unwrap();
         drop(frames);
@@ -1100,5 +1159,71 @@ mod tests {
             .await
             .expect("loop ends");
         assert!(done.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_transcript_read_is_answered_over_the_link_and_never_reaches_claude() {
+        let dir = crate::hub::testdir::TempDir::new("agent-transcript-read");
+        let session = "5e551017-0000-4000-8000-000000000001";
+        let project = dir.path().join("projects").join("C--w");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{session}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (outbox, events) = spawn(config(addr, Backoff::default()));
+        let mut claude = claude_reading(
+            Hub::Link(outbox),
+            Some(events),
+            Some(dir.path().join("projects")),
+        );
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 0);
+        claude
+            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await;
+        let (mut reader, mut write) = raw_hub(&listener).await;
+        wire::write_msg(
+            &mut write,
+            &HubMsg::TranscriptRead {
+                session_id: session.into(),
+                path: path.to_string_lossy().into_owned(),
+                from: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        match agent_line(&mut reader).await {
+            AgentMsg::TranscriptChunk {
+                from: 0,
+                to,
+                lines,
+                missing: false,
+                ..
+            } => {
+                assert_eq!(to, std::fs::metadata(&path).unwrap().len());
+                assert_eq!(
+                    lines[0].items,
+                    [wire::StreamItem::Prompt {
+                        text: "hello".into()
+                    }]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Claude Code saw nothing of it: the next line it gets is the answer
+        // to its own request.
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 5);
     }
 }

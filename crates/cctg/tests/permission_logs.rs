@@ -169,6 +169,7 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
                 cwd: r"C:\w\p".into(),
                 claude_pid: Some(10),
                 verdict_ack: true,
+                transcript_reads: false,
             },
             to_agent,
         })

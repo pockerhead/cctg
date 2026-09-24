@@ -166,6 +166,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 cwd: r"C:\w\p".into(),
                 claude_pid: Some(10),
                 verdict_ack: false,
+                transcript_reads: false,
             },
             to_agent,
         })

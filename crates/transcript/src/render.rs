@@ -23,7 +23,7 @@ const SUMMARY_KEYS: [&str; 8] = [
 const SUMMARY_CHARS: usize = 120;
 const INPUT_CHARS: usize = 500;
 const RESULT_CHARS: usize = 1500;
-const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
+pub(crate) const INTERRUPT_PREFIX: &str = "[Request interrupted by user";
 /// Non-meta user records written by Claude Code itself: hidden in brief, shown in full.
 const SERVICE_PREFIXES: [&str; 7] = [
     "<task-notification>",
@@ -36,7 +36,7 @@ const SERVICE_PREFIXES: [&str; 7] = [
 ];
 
 /// A visible user text: a prompt (typed or from the channel) or a service record.
-enum UserText<'a> {
+pub(crate) enum UserText<'a> {
     Prompt(Cow<'a, str>),
     Service(&'a str),
 }
@@ -167,7 +167,7 @@ pub(crate) fn render(turns: &[Turn], full: bool, subagents: &[Subagent]) -> (Str
 
 /// Classifies a user text; `None` for blank text and hidden meta records. A meta `<channel>` record is
 /// a Telegram prompt and shows its body only. A service record never changes the in-progress state.
-fn user_text<'a>(turn: &Turn, text: &'a str) -> Option<UserText<'a>> {
+pub(crate) fn user_text<'a>(turn: &Turn, text: &'a str) -> Option<UserText<'a>> {
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -309,7 +309,7 @@ fn agent_ids(turns: &[Turn]) -> HashMap<&str, &str> {
 }
 
 /// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
-fn tool_line(
+pub(crate) fn tool_line(
     name: &str,
     input: &Value,
     agent_id: Option<&str>,
