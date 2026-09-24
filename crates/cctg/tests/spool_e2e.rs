@@ -300,6 +300,7 @@ async fn the_spool_holds_no_text_and_is_bounded() {
         assert_eq!(
             keys,
             [
+                "client_version",
                 "cwd",
                 "event",
                 "event_id",

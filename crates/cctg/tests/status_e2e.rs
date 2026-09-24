@@ -406,6 +406,7 @@ impl Agent {
             verdict_ack: true,
             transcript_reads: false,
             console_keys: true,
+            client: None,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
         let mut agent = Self {

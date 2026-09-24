@@ -360,6 +360,10 @@ pub struct SessionEntry {
     /// The last status line numbers of a live top-level session (TASK-029).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
+    /// The hub build this session's topic was last warned about: its agent
+    /// runs another cctg build (TASK-040). One warning per hub build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_warned: Option<String>,
 }
 
 /// What survives a restart of a session's transcript stream.
@@ -838,6 +842,7 @@ impl Registry {
                 block: None,
                 stream: None,
                 metrics: None,
+                update_warned: None,
             });
         entry.kind = kind.clone();
         entry.slot = slot;

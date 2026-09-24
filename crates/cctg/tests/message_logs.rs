@@ -187,6 +187,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         })

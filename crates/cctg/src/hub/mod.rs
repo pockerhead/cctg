@@ -208,8 +208,17 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         warn!("the bot lacks can_pin_messages; status messages will not be pinned");
     }
     let icons = checked_icons(api.get_forum_topic_icon_stickers().await)?;
+    // Agents running another build are shown as outdated (TASK-040).
+    let build = tokio::task::spawn_blocking(crate::client::own_build)
+        .await
+        .ok()
+        .flatten();
+    if build.is_none() {
+        warn!("cannot read this executable; agents are not checked for updates");
+    }
     info!(
         bot = me.username.as_deref().unwrap_or("?"),
+        build = build.as_deref().map_or("?", crate::client::short),
         "hub started, polling"
     );
 
@@ -221,6 +230,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         can_delete,
         can_pin,
         status_every: Some(slots::STATUS_EVERY),
+        build,
         ..slots::Options::default()
     };
     let (mut slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);

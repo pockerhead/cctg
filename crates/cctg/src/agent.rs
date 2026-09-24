@@ -25,6 +25,11 @@
 //! hub asks (`console_key`, see [`crate::keys`]) and answers whether the key
 //! events were written.
 //!
+//! Update (TASK-040): the agent runs as `cctg agent-worker` under the
+//! `cctg agent` shim ([`crate::shim`]) and registers with its build
+//! ([`Client`]); on the hub's `update` it hands over to a newer binary or
+//! restarts claude through `cctg run` ([`crate::update`]).
+//!
 //! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
 //! channel from Claude Code (TASK-004), so its agent answers MCP but never
 //! connects: a nested `claude -p` cannot show up as a routable channel even
@@ -43,13 +48,21 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use tokio::time::{Instant, sleep_until};
+
 use crate::channel::{self, Hub, NoHub};
+use crate::client;
 use crate::device::{self, DeviceConfig};
-use crate::keys;
+use crate::keys::{self, ExitTyped};
 use crate::proctree;
+use crate::shim;
 use crate::spool;
 use crate::tail;
-use crate::wire::{self, AgentMsg, ConsoleKey, HubMsg, Register, Rejection, Secret, WireError};
+use crate::update::{self, Plan, Worker};
+use crate::wire::{
+    self, AgentMsg, Client, ConsoleKey, HubMsg, Register, Rejection, Secret, UpdateOutcome,
+    WireError,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -360,17 +373,58 @@ pub enum Frame {
 /// Writes one key into the claude console; `false` when it was not written.
 pub type Presser = Arc<dyn Fn(ConsoleKey) -> bool + Send + Sync>;
 
-/// Runs `cctg agent` until stdin closes.
-pub async fn run_stdio() {
+/// Runs the worker agent (`cctg agent-worker`, started by the shim) until
+/// stdin closes. Returns the exit code: [`shim::HANDOVER`] after handing over
+/// to a newer binary, else 0.
+pub async fn run_stdio() -> i32 {
     let config = DeviceConfig::load();
     let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
     let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
     // Not env `CLAUDE_PID`: in an MCP server it is inherited from an outer
-    // claude, or unset (TASK-004).
+    // claude, or unset (TASK-004). The shim between claude and this worker
+    // is no claude and the walk passes it.
     let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
     let presser: Option<Presser> = claude_pid
         .filter(|_| keys::SUPPORTED)
         .map(|pid| Arc::new(move |key| keys::press(pid, key)) as Presser);
+    let mut worker = Worker::from_env(
+        |name| std::env::var(name).ok(),
+        claude_pid,
+        config.state_dir.clone(),
+        presser.is_some(),
+    );
+    // Only the `cctg run` that started this claude restarts it; an inherited
+    // `CCTG_RUN` of another session's terminal does not count.
+    if let (Some(run), Some(claude)) = (worker.run_pid, claude_pid) {
+        let chain = tokio::task::spawn_blocking(move || proctree::ancestors(claude))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if !update::launched_by(&chain, run) {
+            debug!("CCTG_RUN is not this claude's parent; no restarts");
+            worker.run_pid = None;
+        }
+    }
+    // The build is this process's own file (the shim's copy); a new build
+    // shows up in the file the copy came from.
+    let (exe, build) = tokio::task::spawn_blocking(|| {
+        let own = std::env::current_exe().ok();
+        let build = own.as_deref().and_then(|own| client::build_of(own).ok());
+        let exe = std::env::var_os(shim::SOURCE_VAR)
+            .map(PathBuf::from)
+            .or(own);
+        (exe, build)
+    })
+    .await
+    .unwrap_or_default();
+    worker.exe = exe;
+    worker.build = build;
+    let client = worker.build.clone().map(|build| Client {
+        version: client::VERSION.to_owned(),
+        build,
+        self_update: worker.self_update(),
+    });
     let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
         Ok((secret, session_id)) => {
             let register = Register {
@@ -381,6 +435,7 @@ pub async fn run_stdio() {
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: presser.is_some(),
+                client,
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: config.agent_addr.clone(),
@@ -401,10 +456,24 @@ pub async fn run_stdio() {
     };
     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
     let projects = tail::projects_root();
-    if let Err(error) =
-        serve_channel(frames, tokio::io::stdout(), hub, events, projects, presser).await
+    let worker = Some(Arc::new(worker));
+    match serve_channel(
+        frames,
+        tokio::io::stdout(),
+        hub,
+        events,
+        projects,
+        presser,
+        worker,
+    )
+    .await
     {
-        debug!(kind = ?error.kind(), "stdout closed");
+        Ok(Ended::Handover) => shim::HANDOVER,
+        Ok(Ended::Input) => 0,
+        Err(error) => {
+            debug!(kind = ?error.kind(), "stdout closed");
+            0
+        }
     }
 }
 
@@ -496,6 +565,14 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 /// reads are answered only from under `projects` ([`tail::projects_root`]).
 /// Console keys are pressed with `presser`; without one a `console_key` is
 /// answered as failed.
+///
+/// `worker` (TASK-040): the worker's place, for `update`. A resumed worker
+/// starts with the channel initialized. On `update` see [`crate::update`]:
+/// for a newer binary the loop writes [`shim::SWITCH`], answers every line
+/// the shim still hands over, tells the hub it leaves and returns
+/// [`Ended::Handover`] once the hub released it (or [`LEAVE_WAIT`] passed);
+/// for a claude restart it leaves the hub, types `/exit` and runs on until
+/// claude closes stdin. Without `worker` an `update` is ignored.
 pub async fn serve_channel<W: AsyncWrite + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     mut output: W,
@@ -503,23 +580,149 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     mut events: Option<mpsc::Receiver<LinkEvent>>,
     projects: Option<PathBuf>,
     presser: Option<Presser>,
-) -> std::io::Result<()> {
-    let (reads, keys) = match &hub {
+    worker: Option<Arc<Worker>>,
+) -> std::io::Result<Ended> {
+    let (reads, keys, outbox) = match &hub {
         Hub::Link(outbox) => (
             Some(spawn_reader(outbox.clone(), projects)),
             Some(spawn_presser(outbox.clone(), presser)),
+            Some(outbox.clone()),
         ),
-        Hub::Off(_) => (None, None),
+        Hub::Off(_) => (None, None, None),
     };
     let mut server = channel::Server::new(hub);
+    if worker.as_ref().is_some_and(|worker| worker.resumed) {
+        server = server.initialized();
+    }
+    let mut leaving: Option<Leaving> = None;
+    let mut frames_open = true;
+    let answer = |update_id, outcome| {
+        let outbox = outbox.clone();
+        async move {
+            info!(?outcome, "update answered");
+            if let Some(outbox) = outbox {
+                let _ = outbox
+                    .send(AgentMsg::UpdateAnswer { update_id, outcome })
+                    .await;
+            }
+        }
+    };
     loop {
+        let deadline = leaving.as_ref().and_then(Leaving::until);
         let lines = tokio::select! {
-            frame = frames.recv() => match frame {
+            frame = frames.recv(), if frames_open => match frame {
                 Some(Frame::Line(line)) => server.on_line(&line),
                 Some(Frame::TooLong) => server.on_oversized_line(),
-                None => break,
+                None => match leaving {
+                    // The shim sends nothing more: every line was answered.
+                    Some(Leaving::Draining { update_id }) => {
+                        frames_open = false;
+                        answer(update_id, UpdateOutcome::Reloading).await;
+                        leaving = Some(Leaving::Released {
+                            update_id,
+                            restart: false,
+                            until: Instant::now() + LEAVE_WAIT,
+                        });
+                        Vec::new()
+                    }
+                    _ => break,
+                },
             },
+            () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
+                match leaving.take() {
+                    Some(Leaving::Released { restart: false, .. }) => {
+                        warn!("hub did not release the agent in time; handing over anyway");
+                        output.flush().await?;
+                        return Ok(Ended::Handover);
+                    }
+                    Some(Leaving::Released { update_id, .. }) => {
+                        warn!("hub did not release the agent in time; claude stays");
+                        answer(update_id, UpdateOutcome::Failed).await;
+                    }
+                    Some(Leaving::Exiting { update_id, .. }) => {
+                        warn!("claude did not exit after /exit; restart request withdrawn");
+                        if let Some(worker) = &worker {
+                            worker.withdraw_request();
+                        }
+                        answer(update_id, UpdateOutcome::Failed).await;
+                    }
+                    other => leaving = other,
+                }
+                Vec::new()
+            }
             event = recv_event(&mut events), if events.is_some() => match event {
+                Some(LinkEvent::Message(HubMsg::Update { update_id })) => {
+                    let Some(worker) = worker.clone().filter(|_| leaving.is_none()) else {
+                        debug!("update without a worker or during another one; ignored");
+                        continue;
+                    };
+                    let plan = tokio::task::spawn_blocking({
+                        let worker = worker.clone();
+                        move || worker.plan()
+                    })
+                    .await
+                    .unwrap_or(Plan::Failed);
+                    info!(?plan, "update asked");
+                    match plan {
+                        Plan::Reload => {
+                            leaving = Some(Leaving::Draining { update_id });
+                            vec![shim::SWITCH.to_vec()]
+                        }
+                        Plan::Restart => {
+                            answer(update_id, UpdateOutcome::Restarting).await;
+                            leaving = Some(Leaving::Released {
+                                update_id,
+                                restart: true,
+                                until: Instant::now() + LEAVE_WAIT,
+                            });
+                            Vec::new()
+                        }
+                        Plan::ManualRestart => {
+                            answer(update_id, UpdateOutcome::NeedsManualRestart).await;
+                            Vec::new()
+                        }
+                        Plan::UpToDate => {
+                            answer(update_id, UpdateOutcome::UpToDate).await;
+                            Vec::new()
+                        }
+                        Plan::Failed => {
+                            answer(update_id, UpdateOutcome::Failed).await;
+                            Vec::new()
+                        }
+                    }
+                }
+                Some(LinkEvent::Message(HubMsg::Released { update_id, session_id })) => {
+                    match leaving.take() {
+                        Some(Leaving::Released { update_id: id, restart: false, .. }) if id == update_id => {
+                            output.flush().await?;
+                            return Ok(Ended::Handover);
+                        }
+                        Some(Leaving::Released { update_id: id, restart: true, .. }) if id == update_id => {
+                            let typed = match worker.clone() {
+                                Some(worker) => tokio::task::spawn_blocking(move || worker.restart(&session_id))
+                                    .await
+                                    .unwrap_or(ExitTyped::Failed),
+                                None => ExitTyped::Failed,
+                            };
+                            info!(?typed, "claude restart");
+                            match typed {
+                                ExitTyped::Sent => {
+                                    leaving = Some(Leaving::Exiting {
+                                        update_id,
+                                        until: Instant::now() + EXIT_WAIT,
+                                    });
+                                }
+                                ExitTyped::Draft => answer(update_id, UpdateOutcome::DraftInInput).await,
+                                ExitTyped::Failed => answer(update_id, UpdateOutcome::Failed).await,
+                            }
+                        }
+                        other => {
+                            debug!("release of another update; ignored");
+                            leaving = other;
+                        }
+                    }
+                    Vec::new()
+                }
                 Some(LinkEvent::Message(HubMsg::TranscriptRead { session_id, path, from })) => {
                     // One read at a time: while one runs, a request waits in
                     // the slot and a further one is dropped (the hub asks
@@ -553,7 +756,46 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         }
         output.flush().await?;
     }
-    output.flush().await
+    output.flush().await?;
+    Ok(Ended::Input)
+}
+
+/// How [`serve_channel`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// stdin closed.
+    Input,
+    /// Handed over to a newer binary; exit with [`shim::HANDOVER`].
+    Handover,
+}
+
+/// How long a leaving agent waits for the hub's `released`.
+pub const LEAVE_WAIT: Duration = Duration::from_secs(5);
+/// How long claude gets to exit after `/exit` went in.
+pub const EXIT_WAIT: Duration = Duration::from_secs(20);
+
+/// An update in progress.
+enum Leaving {
+    /// [`shim::SWITCH`] went out; the lines the shim still hands over are
+    /// answered until its stdin ends.
+    Draining { update_id: u64 },
+    /// The leaving answer went to the hub; `released` is due before `until`.
+    Released {
+        update_id: u64,
+        restart: bool,
+        until: Instant,
+    },
+    /// `/exit` went in; claude closes stdin before `until`.
+    Exiting { update_id: u64, until: Instant },
+}
+
+impl Leaving {
+    fn until(&self) -> Option<Instant> {
+        match self {
+            Self::Draining { .. } => None,
+            Self::Released { until, .. } | Self::Exiting { until, .. } => Some(*until),
+        }
+    }
 }
 
 type ReadRequest = (String, String, Option<u64>);
@@ -666,6 +908,7 @@ mod tests {
             verdict_ack: true,
             transcript_reads: true,
             console_keys: false,
+            client: None,
         }
     }
 
@@ -1090,7 +1333,9 @@ mod tests {
     ) -> Claude {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 16);
-        tokio::spawn(serve_channel(frames_rx, ours, hub, events, projects, None));
+        tokio::spawn(serve_channel(
+            frames_rx, ours, hub, events, projects, None, None,
+        ));
         Claude {
             frames,
             out: tokio::io::BufReader::new(theirs),
@@ -1327,6 +1572,7 @@ mod tests {
             Some(events),
             None,
             None,
+            None,
         ));
         let (_first, _) = listener.accept().await.unwrap();
         drop(frames);
@@ -1426,6 +1672,7 @@ mod tests {
             Some(events),
             None,
             Some(presser),
+            None,
         ));
         let mut claude = Claude {
             frames,

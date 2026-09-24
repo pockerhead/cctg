@@ -7,7 +7,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -221,7 +221,8 @@ async fn agent_session(
                         | AgentMsg::PermissionRequest(_)
                         | AgentMsg::PermissionAck { .. }
                         | AgentMsg::TranscriptChunk { .. }
-                        | AgentMsg::ConsoleKeyWritten { .. }),
+                        | AgentMsg::ConsoleKeyWritten { .. }
+                        | AgentMsg::UpdateAnswer { .. }),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
@@ -597,6 +598,7 @@ fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost
         debug!(event = post.event.kind(), "repeated hook event dropped");
         return Status::NoContent;
     }
+    note_hook_version(post.client_version.as_deref());
     let (id, kind, session, frequent) = (
         post.event_id.clone(),
         post.event.kind(),
@@ -616,6 +618,33 @@ fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost
         }
         Err(_) => Status::Unavailable,
     }
+}
+
+/// Logs once per hub run that a hook runs another cctg version than the hub
+/// (TASK-040). Builds are compared on the agent link; hooks carry only the
+/// version, which changes rarely, so one line is enough.
+fn note_hook_version(version: Option<&str>) {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if let Some(version) = other_version(version)
+        && !NOTED.swap(true, Ordering::Relaxed)
+    {
+        info!(
+            hook = version,
+            hub = crate::client::VERSION,
+            "a hook runs another cctg version"
+        );
+    }
+}
+
+/// `version` when it is not this hub's, cut to 32 characters for the log.
+fn other_version(version: Option<&str>) -> Option<&str> {
+    let version = version.filter(|version| *version != crate::client::VERSION)?;
+    Some(
+        version
+            .char_indices()
+            .nth(32)
+            .map_or(version, |(at, _)| &version[..at]),
+    )
 }
 
 /// The two endpoints.
@@ -753,6 +782,15 @@ fn is_tchar(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_another_hook_version_is_noted() {
+        assert_eq!(other_version(None), None);
+        assert_eq!(other_version(Some(crate::client::VERSION)), None);
+        assert_eq!(other_version(Some("9.9.9")), Some("9.9.9"));
+        let long = "ü".repeat(40);
+        assert_eq!(other_version(Some(&long)), Some("ü".repeat(32).as_str()));
+    }
+
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use tokio::io::AsyncBufReadExt;
@@ -796,6 +834,7 @@ mod tests {
             verdict_ack: false,
             transcript_reads: false,
             console_keys: false,
+            client: None,
         }
     }
 

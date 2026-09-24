@@ -134,6 +134,7 @@ name = "cctg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "clap",
  "dotenvy",
  "reqwest",

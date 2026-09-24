@@ -212,6 +212,7 @@ async fn hub(test: &str) -> Hub {
                 verdict_ack: true,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         })

@@ -1,4 +1,5 @@
-//! `cctg supervise` and `cctg deploy` with real processes (TASK-026).
+//! `cctg supervise` and `cctg deploy` with real processes (TASK-026; since
+//! TASK-040 `cctg deploy` swaps and rolls back, the supervisor only restarts).
 //!
 //! A copy of the built `cctg` in a temp bin directory runs `supervise`; its
 //! hubs talk to a fake Bot API (`CCTG_BOT_API_URL`) served by this test. Home,
@@ -18,7 +19,7 @@
 //! 5. a file that is no program: `rejected`, nothing changes;
 //! 6. the running binary again: `unchanged`;
 //!    (Windows) a swap that fails (`cctg.old` held open): `failed`, exit 1,
-//!    the candidate is withdrawn and the hub restarts once, not in a loop;
+//!    the copy is removed and the hub is not restarted at all;
 //! 7. Ctrl+Break (SIGTERM on Unix): the supervisor stops, its hub stops
 //!    gracefully (registry written), nothing listens any more.
 //!
@@ -342,7 +343,7 @@ async fn deploy(exe: &Path, candidate: &Path, home: &Path) -> (bool, String) {
     command
         .arg("deploy")
         .arg(candidate)
-        .args(["--timeout-secs", "90"])
+        .args(["--timeout-secs", "90", "--trial-secs", "3"])
         .stdin(Stdio::null());
     let output = tokio::task::spawn_blocking(move || command.output())
         .await
@@ -406,7 +407,7 @@ async fn scenario() {
     // 1. The supervisor, and restarts after a failing start.
     let mut command = clean_command(&exe, &home);
     command
-        .args(["supervise", "--trial-secs", "3"])
+        .arg("supervise")
         .current_dir(&work)
         .env("CCTG_BOT_TOKEN", TOKEN)
         .env("CCTG_CHAT_ID", CHAT.to_string())
@@ -533,7 +534,7 @@ async fn scenario() {
         original,
         "the old binary is kept"
     );
-    assert!(!bin.join(format!("cctg.next{EXE}")).exists());
+    assert!(!bin.join(format!("cctg.next{EXE}.part")).exists());
     assert!(registry_has_session(&state));
     fake.push_message(thread_id, "after-deploy");
     wait_for(
@@ -581,7 +582,7 @@ async fn scenario() {
     assert!(ok && out.starts_with("unchanged"), "{out}");
     assert_eq!(fake.calls_of("createForumTopic").len(), 1);
 
-    // 6b. A swap that fails: the candidate leaves, no restart loop.
+    // 6b. A swap that fails: the copy leaves, the hub is not restarted.
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -599,17 +600,16 @@ async fn scenario() {
         let starts = fake.calls_of("getMe").len();
         let (ok, out) = deploy(&exe, &other_path, &home).await;
         assert!(!ok && out.starts_with("failed: "), "{out}");
-        assert!(!bin.join(format!("cctg.next{EXE}")).exists(), "withdrawn");
+        assert!(
+            !bin.join(format!("cctg.next{EXE}.part")).exists(),
+            "removed"
+        );
         assert_eq!(std::fs::read(&exe).unwrap(), good);
-        wait_for("the hub after the failed swap", || {
-            fake.calls_of("getMe").len() > starts
-        })
-        .await;
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(
             fake.calls_of("getMe").len(),
-            starts + 1,
-            "one restart, no loop"
+            starts,
+            "the running hub was left alone"
         );
         drop(held);
         std::fs::remove_file(&old).unwrap();
