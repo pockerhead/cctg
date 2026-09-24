@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "probe": {
+      "command": "C:/Program Files/Python310/python.exe",
+      "args": [
+        "C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/probe_mcp.py"
+      ]
+    }
+  }
+}

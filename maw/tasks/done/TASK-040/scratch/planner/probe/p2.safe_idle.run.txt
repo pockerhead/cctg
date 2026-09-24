@@ -1,0 +1,37 @@
+P2 typed /exit (safe_idle): sid=81f34e98
+4.3s ready
+4.3s flag written (safe_idle)
+7.5s claude exited rc=0 (3.2s after flag)
+VERDICT exited=True rc=0 session_end_reason=['prompt_input_exit']
+--- events ---
+{"t": 1.82, "kind": "session_start", "hook": "SessionStart", "session_id": "81f34e98", "source": "startup"}
+{"t": 1.82, "kind": "statusline", "session_id": "81f34e98"}
+{"t": 4.96, "kind": "statusline", "session_id": "81f34e98"}
+{"t": 6.53, "kind": "session_end", "hook": "SessionEnd", "session_id": "81f34e98", "reason": "prompt_input_exit"}
+--- mcp.log ---
+1790272737.698 43080 start parent=38820 image=claude.exe channel=False sid=81f34e98
+1790272737.699 43080 in server/discover
+1790272737.915 43080 in initialize
+1790272737.977 43080 in notifications/initialized
+1790272738.002 43080 in tools/list
+1790272740.487 43080 safe: type /exit ok=True written=10
+1790272740.895 43080 safe: box=['❯\xa0/exit']
+1790272740.896 43080 safe: Enter ok=True written=2
+1790272740.994 43080 stdin EOF
+--- screen plus1_5 (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+❯ /exit
+
+· Boogieing…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None                                                                         ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent
+
+

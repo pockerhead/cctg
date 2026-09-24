@@ -1,0 +1,15 @@
+M1 the spaces around /exit (U+00A0 after the glyph) are not trimmed: KILLED keys::tests::the_input_box_is_between_the_last_two_rules
+M2 the shim forwards the switch marker to Claude Code: KILLED a_new_binary_is_taken_without_losing_a_line
+M3 lines that came during the switch are dropped: KILLED a_new_binary_is_taken_without_losing_a_line
+M4 a resumed worker waits for a second initialize: KILLED a_new_binary_is_taken_without_losing_a_line
+M5 an update goes out during a running turn: KILLED hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn
+M6 a leaving agent stays bound: KILLED hub::slots::tests::a_refused_restart_binds_the_agent_back_and_old_clients_are_told, hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn
+M7 the outdated warning repeats: KILLED hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn
+M8 a restart keeps --continue: KILLED update::tests::a_restart_resumes_the_session_with_the_options_and_no_prompt
+M9 changed settings do not ask for a restart: KILLED update::tests::the_plan_follows_the_disk_the_config_and_cctg_run
+M10 ingress drops update answers: KILLED a_new_binary_is_taken_without_losing_a_line
+M11 a hub that exits in its trial is not rolled back: KILLED (harness=false test or build failure)
+M12 a prompt argument is sent again on a restart: KILLED update::tests::a_restart_resumes_the_session_with_the_options_and_no_prompt
+M13 an inherited CCTG_RUN of another session counts: KILLED update::tests::only_the_cctg_run_right_above_claude_restarts_it
+M14 the outdated warning is silent: KILLED hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn
+M15 cctg run ignores the arguments of the request: KILLED (harness=false test or build failure)

@@ -1,0 +1,55 @@
+P2 typed /exit (safe_draft): sid=ae607458
+7.5s ready
+9.2s flag written (safe_draft)
+claude still running 30 s after flag
+VERDICT exited=False rc=None session_end_reason=[]
+--- events ---
+{"t": 4.88, "kind": "session_start", "hook": "SessionStart", "session_id": "ae607458", "source": "startup"}
+{"t": 4.88, "kind": "statusline", "session_id": "ae607458"}
+--- mcp.log ---
+1790272679.828 8116 start parent=25552 image=claude.exe channel=False sid=ae607458
+1790272679.829 8116 in server/discover
+1790272679.836 8116 in initialize
+1790272680.128 8116 in notifications/initialized
+1790272680.224 8116 in tools/list
+1790272684.481 8116 safe: type /exit ok=True written=10
+1790272684.893 8116 safe: box=['❯\xa0draft text/exit']
+1790272684.893 8116 safe: 5x Backspace, no exit ok=True written=10
+1790272685.306 8116 safe: box after=['❯\xa0draft text']
+--- screen draft (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ draft text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None                                                                         ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+--- screen plus1_5 (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ draft text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None                                                                         ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+--- screen still_running (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ draft text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+

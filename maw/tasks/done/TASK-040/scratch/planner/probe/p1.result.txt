@@ -1,0 +1,41 @@
+P1 settings reload: sid=fa90d056
+4.2s ready
+4.2s settings replaced (A -> B)
+14.5s prompt sent
+statusline kinds after swap: ['statusline_A']
+prompt hook kinds after swap: ['prompt_A']
+new Stop hook fired: False
+VERDICT statusLine_reloaded=False changed_hook_reloaded=False new_event_hook_reloaded=False
+--- events ---
+{"t": 1.81, "kind": "statusline_A", "hook": null, "session_id": "fa90d056"}
+{"t": 14.16, "kind": "prompt_A", "hook": "UserPromptSubmit", "session_id": "fa90d056"}
+{"t": 16.36, "kind": "statusline_A", "hook": null, "session_id": "fa90d056"}
+{"t": 16.91, "kind": "statusline_A", "hook": null, "session_id": "fa90d056"}
+--- screen after_swap (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "how do I log an error?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent
+
+--- screen final (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+❯ Reply with the single word hi.
+
+● hi
+
+✻ Cogitated for 2s · done 20:50
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent
+

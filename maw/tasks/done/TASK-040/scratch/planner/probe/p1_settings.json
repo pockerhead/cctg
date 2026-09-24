@@ -1,0 +1,28 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/dump.py\" statusline_B"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/dump.py\" prompt_B"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/dump.py\" stop_B"
+          }
+        ]
+      }
+    ]
+  }
+}

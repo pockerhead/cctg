@@ -133,6 +133,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         })

@@ -171,6 +171,7 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
                 verdict_ack: true,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         })

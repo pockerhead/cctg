@@ -14,7 +14,8 @@
 //! message type that a peer sends only after the other side announced it in
 //! such a field (`permission_ack`, see [`Register::verdict_ack`];
 //! `transcript_read`, see [`Register::transcript_reads`]; `console_key`,
-//! see [`Register::console_keys`]). Any other
+//! see [`Register::console_keys`]; `update` and `released`, see
+//! [`Client::self_update`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -138,6 +139,26 @@ pub struct Register {
     /// Windows agents that know their claude pid announce it.
     #[serde(default)]
     pub console_keys: bool,
+    /// Which cctg build the agent runs and what it can do about a newer one
+    /// (TASK-040). Agents built before leave it out: the hub shows them as
+    /// outdated and never sends them `update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<Client>,
+}
+
+/// The agent's build and update abilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Client {
+    /// `CARGO_PKG_VERSION` of the agent.
+    pub version: String,
+    /// sha256 of the agent's executable as it started, lowercase hex. Two
+    /// agents run the same build exactly when these match.
+    pub build: String,
+    /// The agent runs under the `cctg agent` shim: it answers `update` with
+    /// `update_answer` and can hand over to a newer binary without Claude
+    /// Code noticing.
+    #[serde(default)]
+    pub self_update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,6 +213,36 @@ pub enum AgentMsg {
         key_id: u64,
         written: bool,
     },
+    /// The answer to one `update`. For `reloading` and `restarting` the
+    /// agent leaves: the hub stops handing it messages and answers
+    /// `released` behind everything already queued for it.
+    UpdateAnswer {
+        update_id: u64,
+        outcome: UpdateOutcome,
+    },
+}
+
+/// What an agent does about an `update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateOutcome {
+    /// A newer binary is on disk: the agent hands over to it; Claude Code
+    /// keeps running.
+    Reloading,
+    /// Claude must restart to load changed settings or a newer shim: the
+    /// agent asked `cctg run` for it and types `/exit`.
+    Restarting,
+    /// A restart is needed but claude does not run under `cctg run`.
+    NeedsManualRestart,
+    /// The terminal input holds unsent text; `/exit` was not sent.
+    DraftInInput,
+    /// Already up to date: no newer binary, no restart needed.
+    UpToDate,
+    /// Something failed; nothing changed.
+    Failed,
+    /// An outcome of a newer agent.
+    #[serde(other)]
+    Other,
 }
 
 /// A key the agent presses in its Claude Code console.
@@ -251,6 +302,7 @@ impl Kinds for AgentMsg {
         "permission_ack",
         "transcript_chunk",
         "console_key_written",
+        "update_answer",
     ];
 }
 
@@ -308,6 +360,20 @@ pub enum HubMsg {
         key_id: u64,
         key: ConsoleKey,
     },
+    /// Sent only to an agent whose [`Client::self_update`] is set, on the
+    /// user's "Обновить": take a newer binary, or restart claude when
+    /// needed; answered with one `update_answer`.
+    Update {
+        update_id: u64,
+    },
+    /// The answer to a leaving `update_answer`, queued behind every message
+    /// handed to the agent before it: after it nothing more comes.
+    /// `session_id`: the session the hub had bound the agent to (after
+    /// `/clear` not the agent's env id), for `claude --resume`.
+    Released {
+        update_id: u64,
+        session_id: String,
+    },
 }
 
 impl Kinds for HubMsg {
@@ -318,6 +384,8 @@ impl Kinds for HubMsg {
         "permission_verdict",
         "transcript_read",
         "console_key",
+        "update",
+        "released",
     ];
 }
 
@@ -475,6 +543,9 @@ pub struct HookPost {
     /// kept in the spool: a late list would end sessions started after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_claude_pids: Option<Vec<u32>>,
+    /// `CARGO_PKG_VERSION` of the hook (TASK-040), for the hub log only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
 }
 
 impl HookPost {
@@ -495,6 +566,7 @@ impl HookPost {
             transcript_path,
             event,
             live_claude_pids: None,
+            client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         }
     }
 }
@@ -672,6 +744,7 @@ mod tests {
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: true,
+                client: None,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -714,6 +787,10 @@ mod tests {
                 key_id: u64::MAX,
                 written: true,
             },
+            AgentMsg::UpdateAnswer {
+                update_id: 9,
+                outcome: UpdateOutcome::DraftInInput,
+            },
         ]
     }
 
@@ -751,6 +828,11 @@ mod tests {
             HubMsg::ConsoleKey {
                 key_id: 7,
                 key: ConsoleKey::Interrupt,
+            },
+            HubMsg::Update { update_id: 9 },
+            HubMsg::Released {
+                update_id: 9,
+                session_id: "s".into(),
             },
         ]
     }
@@ -888,6 +970,7 @@ mod tests {
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             }))
         );
     }
@@ -901,6 +984,7 @@ mod tests {
             decode::<AgentMsg>(line),
             Ok(AgentMsg::Register(Register {
                 console_keys: true,
+                client: None,
                 ..
             }))
         ));
@@ -1015,6 +1099,67 @@ mod tests {
             decode::<AgentMsg>(line),
             Ok(AgentMsg::Reply { text: "t".into() })
         );
+    }
+
+    #[test]
+    fn client_builds_and_updates_stay_compatible_with_version_one_peers() {
+        // An agent before TASK-040 sends no client; the hub reads it as None.
+        let legacy = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
+        match decode::<AgentMsg>(legacy) {
+            Ok(AgentMsg::Register(register)) => assert_eq!(register.client, None),
+            other => panic!("{other:?}"),
+        }
+        let register = Register {
+            session_id: "s".into(),
+            host: "h".into(),
+            cwd: "/w".into(),
+            claude_pid: None,
+            verdict_ack: true,
+            transcript_reads: true,
+            console_keys: true,
+            client: Some(Client {
+                version: "0.1.0".into(),
+                build: "ab".repeat(32),
+                self_update: true,
+            }),
+        };
+        let line = encode(&AgentMsg::Register(register.clone()));
+        assert_eq!(decode::<AgentMsg>(&line), Ok(AgentMsg::Register(register)));
+        // Without a client the field stays out of the line: older hubs see
+        // exactly what they saw before.
+        let bare = encode(&AgentMsg::Register(Register {
+            client: None,
+            ..match decode::<AgentMsg>(legacy) {
+                Ok(AgentMsg::Register(register)) => register,
+                other => panic!("{other:?}"),
+            }
+        }));
+        assert!(!String::from_utf8_lossy(&bare).contains("client"));
+        // An outcome a newer agent invents is read, not refused.
+        let newer = br#"{"v":1,"type":"update_answer","update_id":3,"outcome":"teleported"}"#;
+        assert_eq!(
+            decode::<AgentMsg>(newer),
+            Ok(AgentMsg::UpdateAnswer {
+                update_id: 3,
+                outcome: UpdateOutcome::Other
+            })
+        );
+        // Hook posts carry the hook's version; older ones leave it out.
+        let post = HookPost::new(
+            "h".into(),
+            "s".into(),
+            String::new(),
+            String::new(),
+            HookEvent::UserPromptSubmit { prompt_id: None },
+        );
+        assert_eq!(
+            post.client_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let mut old = serde_json::to_value(&post).unwrap();
+        old.as_object_mut().unwrap().remove("client_version");
+        let old = decode_hook(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(old.client_version, None);
     }
 
     #[test]

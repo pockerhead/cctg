@@ -1,0 +1,6 @@
+     Running tests\supervise_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\supervise_e2e-2ce66f8f72540f6e.exe)
+supervise_e2e: ok
+     Running tests\update_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\update_e2e-eacbf2401d4cf15b.exe)
+test a_new_binary_is_taken_without_losing_a_line ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.30s
+run_e2e: ok; spool_e2e: 4 passed (same session, after the full run picked up a foreign target/debug/cctg.exe)

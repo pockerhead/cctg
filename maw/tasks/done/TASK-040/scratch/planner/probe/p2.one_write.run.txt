@@ -1,0 +1,17 @@
+P2 typed /exit (one_write): sid=762b6892
+4.2s ready
+4.2s flag written (one_write)
+5.7s claude exited rc=0 (1.5s after flag)
+VERDICT exited=True rc=0 session_end_reason=['prompt_input_exit']
+--- events ---
+{"t": 1.61, "kind": "statusline", "session_id": "762b6892"}
+{"t": 4.41, "kind": "session_end", "hook": "SessionEnd", "session_id": "762b6892", "reason": "prompt_input_exit"}
+--- mcp.log ---
+1790272348.258 8296 start parent=43356 image=claude.exe channel=False sid=762b6892
+1790272348.259 8296 in server/discover
+1790272348.468 8296 in initialize
+1790272348.511 8296 in notifications/initialized
+1790272348.534 8296 in tools/list
+1790272351.079 8296 inject /exit+Enter in one write ok=True written=12
+1790272351.123 8296 stdin EOF
+

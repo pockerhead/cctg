@@ -1134,7 +1134,8 @@ mod build_tests {
                     "session_id",
                     "cwd",
                     "transcript_path",
-                    "event"
+                    "event",
+                    "client_version"
                 ])
             );
             assert_eq!(keys(&value["event"]), set(want), "{event}");

@@ -111,6 +111,14 @@ impl Server {
         }
     }
 
+    /// A server for a session whose channel an earlier worker already set up
+    /// (TASK-040): Claude Code sends no second `initialize`, so channel
+    /// notifications go out at once.
+    pub fn initialized(mut self) -> Self {
+        self.initialized = true;
+        self
+    }
+
     /// One line from Claude Code (newline optional). Returns the lines to
     /// write, each a complete JSON object followed by `\n`.
     pub fn on_line(&mut self, line: &[u8]) -> Vec<Vec<u8>> {
@@ -201,13 +209,15 @@ impl Server {
                 );
                 self.emit(line)
             }
-            // Transcript reads and console keys are the agent loop's, not
-            // the channel's.
+            // Transcript reads, console keys and updates are the agent
+            // loop's, not the channel's.
             LinkEvent::Message(
                 HubMsg::Registered
                 | HubMsg::Rejected { .. }
                 | HubMsg::TranscriptRead { .. }
-                | HubMsg::ConsoleKey { .. },
+                | HubMsg::ConsoleKey { .. }
+                | HubMsg::Update { .. }
+                | HubMsg::Released { .. },
             ) => Vec::new(),
         }
     }
@@ -884,6 +894,28 @@ mod tests {
             parse(&server.on_oversized_line())[0]["error"]["code"],
             PARSE_ERROR
         );
+    }
+
+    #[test]
+    fn a_resumed_worker_sends_inbound_at_once_and_ignores_update_messages() {
+        let (server, _rx) = linked();
+        let mut server = server.initialized();
+        let lines = server.on_link(LinkEvent::Message(HubMsg::Inbound {
+            content: "after the hand-over".into(),
+            meta: BTreeMap::new(),
+        }));
+        let out = parse(&lines);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["method"], "notifications/claude/channel");
+        for msg in [
+            HubMsg::Update { update_id: 1 },
+            HubMsg::Released {
+                update_id: 1,
+                session_id: "s".into(),
+            },
+        ] {
+            assert!(server.on_link(LinkEvent::Message(msg)).is_empty());
+        }
     }
 
     #[test]

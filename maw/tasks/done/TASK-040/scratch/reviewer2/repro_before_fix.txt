@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized] target(s) in 12.48s
+     Running unittests src\lib.rs (C:/Users/user/dev/cctg/target\debug\deps\cctg-519c9ab4d99b0f46.exe)
+
+running 2 tests
+test run::tests::reviewer2_a_prompt_argument_is_not_sent_again ... FAILED
+test hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn ... FAILED
+
+failures:
+
+---- run::tests::reviewer2_a_prompt_argument_is_not_sent_again stdout ----
+
+thread 'run::tests::reviewer2_a_prompt_argument_is_not_sent_again' (23808) panicked at crates\cctg\src\run.rs:208:9:
+assertion `left == right` failed
+  left: ["--model", "haiku", "fix the bug", "--resume", "5e55"]
+ right: ["--model", "haiku", "--resume", "5e55"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn stdout ----
+
+thread 'hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn' (16920) panicked at crates\cctg\src\hub\slots.rs:10229:9:
+reviewer2: the warning is loud
+
+
+failures:
+    hub::slots::tests::an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn
+    run::tests::reviewer2_a_prompt_argument_is_not_sent_again
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 492 filtered out; finished in 0.22s
+
+error: test failed, to rerun pass `-p cctg --lib`

@@ -1,0 +1,28 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/dump.py\" statusline"
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/dump.py\" session_end"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-040/scratch/planner/probe/dump.py\" session_start"
+          }
+        ]
+      }
+    ]
+  }
+}

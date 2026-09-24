@@ -21,18 +21,15 @@ enum Command {
         #[arg(long)]
         stop_on_stdin: bool,
     },
-    /// Keep `cctg hub` running from this executable's directory and install
-    /// binaries that `cctg deploy` puts there.
+    /// Keep `cctg hub` running from this executable's file; restart it when
+    /// `cctg deploy` asks.
     Supervise {
         /// Passed to `cctg hub`.
         #[arg(long)]
         env_file: Option<PathBuf>,
-        /// Seconds a new hub must keep running before a deploy counts as done.
-        #[arg(long, default_value_t = cctg::supervise::DEFAULT_TRIAL.as_secs())]
-        trial_secs: u64,
     },
-    /// Hand a built binary to the running `cctg supervise` and wait for the
-    /// result.
+    /// Install a built binary next to the running `cctg supervise`, have the
+    /// hub restarted on it and roll back when it does not keep running.
     Deploy {
         /// The new cctg executable.
         exe: PathBuf,
@@ -40,12 +37,26 @@ enum Command {
         /// directory.
         #[arg(long)]
         bin_dir: Option<PathBuf>,
-        /// Seconds to wait for the supervisor's answer.
-        #[arg(long, default_value_t = cctg::supervise::DEFAULT_DEPLOY_TIMEOUT.as_secs())]
+        /// Seconds to wait for the supervisor to start a hub.
+        #[arg(long, default_value_t = cctg::deploy::DEFAULT_DEPLOY_TIMEOUT.as_secs())]
         timeout_secs: u64,
+        /// Seconds a new hub must keep running before a deploy counts as done.
+        #[arg(long, default_value_t = cctg::deploy::DEFAULT_TRIAL.as_secs())]
+        trial_secs: u64,
     },
-    /// Run the Claude Code channel agent (spawned by Claude Code over stdio).
+    /// Run the Claude Code channel agent (spawned by Claude Code over stdio):
+    /// a shim that runs the worker agent and hands over to a newer binary.
     Agent,
+    /// The worker agent behind `cctg agent`.
+    #[command(hide = true)]
+    AgentWorker,
+    /// Run claude in this console and start it again (`--resume`) when its
+    /// cctg agent asks for a restart.
+    Run {
+        /// Arguments for claude, after `--`.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Print the command that registers `cctg agent` with Claude Code at
     /// user scope, with this executable's absolute path.
     AgentInstall,
@@ -76,24 +87,24 @@ async fn main() -> anyhow::Result<()> {
     };
     init_tracing(matches!(
         &cli.command,
-        Command::Hook { .. } | Command::Agent | Command::Statusline
+        Command::Hook { .. }
+            | Command::Agent
+            | Command::AgentWorker
+            | Command::Statusline
+            | Command::Run { .. }
     ));
     match cli.command {
         Command::Hub {
             env_file,
             stop_on_stdin,
         } => cctg::hub::run(env_file.as_deref(), stop_on_stdin).await?,
-        Command::Supervise {
-            env_file,
-            trial_secs,
-        } => {
+        Command::Supervise { env_file } => {
             let hub_args = env_file
                 .map(|path| vec!["--env-file".into(), path.into_os_string()])
                 .unwrap_or_default();
             cctg::supervise::supervise(cctg::supervise::Settings {
-                files: cctg::supervise::Files::of_current_exe()?,
+                exe: std::env::current_exe()?,
                 hub_args,
-                trial: Duration::from_secs(trial_secs),
             })
             .await?;
         }
@@ -101,16 +112,22 @@ async fn main() -> anyhow::Result<()> {
             exe,
             bin_dir,
             timeout_secs,
+            trial_secs,
         } => {
             let files = match bin_dir {
                 Some(dir) => {
                     let exe_name = format!("cctg{}", std::env::consts::EXE_SUFFIX);
-                    cctg::supervise::Files::new(&dir, &exe_name)
+                    cctg::deploy::Files::new(&dir, &exe_name)
                 }
-                None => cctg::supervise::Files::of_current_exe()?,
+                None => cctg::deploy::Files::of_current_exe()?,
             };
-            let outcome =
-                cctg::supervise::deploy(&exe, &files, Duration::from_secs(timeout_secs)).await?;
+            let outcome = cctg::deploy::deploy(
+                &exe,
+                &files,
+                Duration::from_secs(timeout_secs),
+                Duration::from_secs(trial_secs),
+            )
+            .await?;
             println!("{outcome}");
             if !outcome.is_success() {
                 std::process::exit(1);
@@ -131,9 +148,20 @@ async fn main() -> anyhow::Result<()> {
             std::panic::set_hook(Box::new(|_| {
                 let _ = cctg::agent::write_panic_message(std::io::stderr());
             }));
-            let _ = tokio::spawn(cctg::agent::run_stdio()).await;
             // At once: the stdin reader thread may still be blocked.
-            std::process::exit(0);
+            std::process::exit(cctg::shim::run());
+        }
+        Command::AgentWorker => {
+            std::panic::set_hook(Box::new(|_| {
+                let _ = cctg::agent::write_panic_message(std::io::stderr());
+            }));
+            let code = tokio::spawn(cctg::agent::run_stdio()).await.unwrap_or(0);
+            // At once: the stdin reader thread may still be blocked.
+            std::process::exit(code);
+        }
+        Command::Run { args } => {
+            let state = cctg::device::DeviceConfig::load().state_dir;
+            std::process::exit(cctg::run::run(args, state).await);
         }
         Command::Statusline => {
             // Status line input carries paths and names: a fixed line only.
@@ -200,23 +228,38 @@ mod tests {
             }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cctg", "supervise", "--trial-secs", "3"])
-                .unwrap()
-                .command,
-            Command::Supervise {
-                env_file: None,
-                trial_secs: 3
-            }
+            Cli::try_parse_from(["cctg", "supervise"]).unwrap().command,
+            Command::Supervise { env_file: None }
         ));
         assert!(matches!(
             Cli::try_parse_from(["cctg", "deploy", "new.exe"])
                 .unwrap()
                 .command,
-            Command::Deploy { exe, bin_dir: None, timeout_secs: 120 } if exe == std::path::Path::new("new.exe")
+            Command::Deploy { exe, bin_dir: None, timeout_secs: 120, trial_secs: 10 } if exe == std::path::Path::new("new.exe")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "deploy", "new.exe", "--trial-secs", "3"])
+                .unwrap()
+                .command,
+            Command::Deploy { trial_secs: 3, .. }
         ));
         assert!(matches!(
             Cli::try_parse_from(["cctg", "agent"]).unwrap().command,
             Command::Agent
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "agent-worker"])
+                .unwrap()
+                .command,
+            Command::AgentWorker
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "run"]).unwrap().command,
+            Command::Run { args } if args.is_empty()
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "run", "--", "--resume", "x", "-c"]).unwrap().command,
+            Command::Run { args } if args == ["--resume", "x", "-c"]
         ));
         assert!(matches!(
             Cli::try_parse_from(["cctg", "agent-install"])

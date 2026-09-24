@@ -64,6 +64,20 @@
 //! never while a permission prompt of that session waits (Esc would answer
 //! the prompt), and a written Esc is shown as sent, not as the turn's end.
 //!
+//! Client updates (TASK-040): an agent registers with its cctg build. A
+//! live current session whose agent runs another build than the hub (or is
+//! too old to say) is outdated: its topic gets one warning per hub build with
+//! ⬆️ Обновить, and its status message a line and the same button. Nothing
+//! updates without a press. A press (allowlisted, like every callback) asks
+//! the agent with `update` once no turn runs; an agent that hands over or
+//! restarts claude leaves (it is unbound at once and gets `released` behind
+//! what was queued for it, later messages wait in the slot), and the next
+//! agent of the session is asked again, at most [`UPDATE_ROUNDS`] times
+//! within [`UPDATE_WAIT`]; the last answer ends in one notice. A press never
+//! expires while a turn runs (the topic is told once), and a restart whose
+//! answer finds a turn begun meanwhile is not released: no `/exit` goes into
+//! a turn; the press is asked again after it.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title or message text.
 
@@ -95,8 +109,8 @@ use super::subagents::{
 use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
 use crate::wire::{
-    AgentMsg, Behavior, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest,
-    StreamItem, StreamLine,
+    AgentMsg, Behavior, Client, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionPost,
+    PermissionRequest, StreamItem, StreamLine, UpdateOutcome,
 };
 
 /// A transcript is scanned line by line for its first ai-title up to this
@@ -134,6 +148,12 @@ pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят то
 /// A status message is edited at most this often (edits have no published
 /// limit, but a busy session changes every second).
 pub const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// Agents one update press asks at most: the first, the one after a
+/// hand-over, the one after a claude restart.
+pub const UPDATE_ROUNDS: u8 = 3;
+/// An update press is forgotten this long after it came.
+pub const UPDATE_WAIT: Duration = Duration::from_secs(120);
+
 /// A call of a session that starts or ends this long after one of its
 /// permission prompts came in means the prompt was answered in the terminal
 /// (the tool hooks reach the hub ~0.1 s after the call).
@@ -175,6 +195,9 @@ pub struct Options {
     pub can_pin: bool,
     /// [`PROMPT_SETTLE`].
     pub prompt_settle: Duration,
+    /// The hub's own build ([`crate::client`]); `None`: agents are never
+    /// outdated.
+    pub build: Option<String>,
 }
 
 impl Default for Options {
@@ -199,6 +222,7 @@ impl Default for Options {
             status_every: None,
             can_pin: true,
             prompt_settle: PROMPT_SETTLE,
+            build: None,
         }
     }
 }
@@ -473,6 +497,30 @@ struct Conn {
     reads: bool,
     /// It presses console keys ([`crate::wire::Register::console_keys`]).
     keys: bool,
+    /// Its build and update abilities ([`crate::wire::Register::client`]).
+    client: Option<Client>,
+    /// It is leaving after an update answer: bound to nothing, never
+    /// rebound by its claude pid.
+    leaving: bool,
+}
+
+/// An update press of a session, until its last answer.
+struct UpdateAsk {
+    /// The `update` in flight: its id and connection.
+    sent: Option<(u64, u64)>,
+    /// The last `update` whose agent answered that it leaves: a later answer
+    /// of it (a refused restart) still ends the press, and the next round
+    /// never goes to that agent.
+    left: Option<(u64, u64)>,
+    /// Agents asked so far.
+    rounds: u8,
+    /// Forgotten then; pushed on while a turn runs.
+    until: Instant,
+    /// The topic was told that the press waits for a long turn.
+    told: bool,
+    /// A restart held back because a turn began: its agent was not released
+    /// and gives the `update` up by itself; that answer is only noted.
+    held: Option<(u64, u64)>,
 }
 
 pub struct Slots {
@@ -530,6 +578,8 @@ pub struct Slots {
     shown: HashMap<SlotId, Shown>,
     /// Keys agents were asked to press, by key id.
     key_asks: HashMap<u64, KeyAsk>,
+    /// Update presses by session.
+    updates: HashMap<String, UpdateAsk>,
     pin_warned: bool,
     grace_until: Instant,
     next_retry: Instant,
@@ -595,6 +645,7 @@ impl Slots {
             activity: HashMap::new(),
             shown: HashMap::new(),
             key_asks: HashMap::new(),
+            updates: HashMap::new(),
             pin_warned: false,
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
@@ -731,6 +782,18 @@ impl Slots {
                 to_agent,
             } => {
                 let session = self.agent_session(&register);
+                if let Some(hub) = self.options.build.as_deref() {
+                    let agent = register.client.as_ref().map(|client| client.build.as_str());
+                    if agent != Some(hub) {
+                        info!(
+                            conn,
+                            session = short(&session),
+                            agent = agent.map_or("none", crate::client::short),
+                            hub = crate::client::short(hub),
+                            "agent runs another cctg build"
+                        );
+                    }
+                }
                 if self.registry.agent_connected(&session, conn) {
                     info!(
                         conn,
@@ -756,6 +819,8 @@ impl Slots {
                         acks: register.verdict_ack,
                         reads: register.transcript_reads,
                         keys: register.console_keys,
+                        client: register.client,
+                        leaving: false,
                     },
                 );
                 // A link that came back takes the answers that wait for it.
@@ -801,10 +866,22 @@ impl Slots {
                     AgentMsg::ConsoleKeyWritten { key_id, written } => {
                         self.on_key_written(conn, &session, key_id, written);
                     }
+                    AgentMsg::UpdateAnswer { update_id, outcome } => {
+                        self.on_update_answer(conn, &session, update_id, outcome);
+                    }
                     _ => debug!(conn, "agent message not routed"),
                 }
             }
             AgentEvent::Disconnected { conn } => {
+                // An update it did not answer goes to the session's next agent.
+                for ask in self.updates.values_mut() {
+                    if ask.sent.is_some_and(|(_, to)| to == conn) {
+                        ask.sent = None;
+                    }
+                    if ask.held.is_some_and(|(_, to)| to == conn) {
+                        ask.held = None;
+                    }
+                }
                 if let Some(gone) = self.conns.remove(&conn) {
                     let session = gone.session;
                     let bound = self
@@ -829,7 +906,7 @@ impl Slots {
 
     /// The newest connection still open for `session` that belongs to the
     /// session's current claude process (any, when the session's pid is
-    /// unknown).
+    /// unknown) and is not leaving after an update answer.
     fn heir(&self, session: &str) -> Option<u64> {
         let run_pid = self
             .registry
@@ -839,7 +916,9 @@ impl Slots {
         self.conns
             .iter()
             .filter(|(_, bound)| {
-                bound.session == session && (run_pid.is_none() || bound.claude_pid == run_pid)
+                !bound.leaving
+                    && bound.session == session
+                    && (run_pid.is_none() || bound.claude_pid == run_pid)
             })
             .map(|(conn, _)| *conn)
             .max()
@@ -916,7 +995,10 @@ impl Slots {
             .conns
             .iter()
             .filter(|(_, bound)| {
-                bound.host == host && bound.claude_pid == Some(pid) && bound.session != session
+                !bound.leaving
+                    && bound.host == host
+                    && bound.claude_pid == Some(pid)
+                    && bound.session != session
             })
             .map(|(conn, _)| *conn)
             .max();
@@ -2743,6 +2825,10 @@ impl Slots {
         if let Some(press) = input.data.as_deref().and_then(status::parse_callback) {
             return Some(self.press_status(input.message_id, press));
         }
+        if let Some(session) = input.data.as_deref().and_then(status::parse_update) {
+            let session = session.to_owned();
+            return Some(self.press_update(&session));
+        }
         let Some((behavior, request_id)) =
             input.data.as_deref().and_then(permissions::parse_callback)
         else {
@@ -2809,6 +2895,9 @@ impl Slots {
         let Some((session, conn)) = self.live_agent(slot) else {
             return status::ANSWER_OFFLINE;
         };
+        if press == Press::Update {
+            return self.press_update(&session);
+        }
         if !self.conns.get(&conn).is_some_and(|bound| bound.keys) {
             return status::ANSWER_NO_KEYS;
         }
@@ -2828,6 +2917,7 @@ impl Slots {
             return status::ANSWER_WAITING;
         }
         match press {
+            Press::Update => unreachable!("answered above"),
             _ if !busy => status::ANSWER_IDLE,
             Press::Confirm if armed => {
                 shown.confirm = None;
@@ -2849,6 +2939,294 @@ impl Slots {
                 shown.next_at = Some(now);
                 status::ANSWER_CONFIRM
             }
+        }
+    }
+
+    /// Agent `conn` runs another build than the hub, or is too old to say.
+    /// Never when the hub does not know its own build.
+    fn outdated(&self, conn: u64) -> bool {
+        let Some(hub) = self.options.build.as_deref() else {
+            return false;
+        };
+        self.conns.get(&conn).is_some_and(|bound| {
+            bound
+                .client
+                .as_ref()
+                .is_none_or(|client| client.build != hub)
+        })
+    }
+
+    /// One loud warning per hub build in the topic of each live current
+    /// session whose agent is outdated, with ⬆️ Обновить.
+    fn warn_outdated(&mut self) {
+        let Some(hub) = self.options.build.clone() else {
+            return;
+        };
+        for index in 0..self.registry.slots.len() {
+            let slot = SlotId(index);
+            let Some(thread_id) = self.registry.slots[index].topic_id else {
+                continue;
+            };
+            let Some((session, conn)) = self.live_agent(slot) else {
+                continue;
+            };
+            let warned = self
+                .registry
+                .sessions
+                .get(&session)
+                .is_some_and(|entry| entry.update_warned.as_deref() == Some(hub.as_str()));
+            if warned || !self.outdated(conn) {
+                continue;
+            }
+            let Some(keyboard) = status::update_keyboard(&session) else {
+                continue;
+            };
+            let agent = self
+                .conns
+                .get(&conn)
+                .and_then(|bound| bound.client.as_ref())
+                .map(|client| crate::client::short(&client.build).to_owned());
+            let op = Op::Send {
+                thread_id: Some(thread_id),
+                text: status::outdated_text(agent.as_deref(), crate::client::short(&hub)),
+                html: None,
+                reply_markup: Some(keyboard),
+                permission: false,
+                reply_to: None,
+                // Loud (decision 2026-09-24): the user asked to be told.
+                notify: true,
+            };
+            if !self.send_messages(vec![op]) {
+                return;
+            }
+            if let Some(entry) = self.registry.sessions.get_mut(&session) {
+                entry.update_warned = Some(hub.clone());
+                self.registry.dirty = true;
+            }
+            info!(
+                ordinal = self.ordinal(slot),
+                session = short(&session),
+                "outdated client warned about"
+            );
+        }
+    }
+
+    /// ⬆️ Обновить for `session`: only its live agent in its current slot,
+    /// only when outdated and able to update itself. The `update` goes out
+    /// from [`Self::pump_updates`], after the running turn.
+    fn press_update(&mut self, session: &str) -> &'static str {
+        let Some(slot) = self.current_slot(session) else {
+            return status::ANSWER_OFFLINE;
+        };
+        let Some((_, conn)) = self.live_agent(slot).filter(|(live, _)| live == session) else {
+            return status::ANSWER_OFFLINE;
+        };
+        if self.updates.contains_key(session) {
+            return status::ANSWER_UPDATE_RUNNING;
+        }
+        if !self.outdated(conn) {
+            return status::ANSWER_CURRENT;
+        }
+        let self_update = self
+            .conns
+            .get(&conn)
+            .and_then(|bound| bound.client.as_ref())
+            .is_some_and(|client| client.self_update);
+        if !self_update {
+            return status::ANSWER_OLD_CLIENT;
+        }
+        info!(
+            ordinal = self.ordinal(slot),
+            session = short(session),
+            "update asked in Telegram"
+        );
+        self.updates.insert(
+            session.to_owned(),
+            UpdateAsk {
+                sent: None,
+                left: None,
+                rounds: 0,
+                until: Instant::now() + UPDATE_WAIT,
+                told: false,
+                held: None,
+            },
+        );
+        if self.busy(session) {
+            status::ANSWER_AFTER_TURN
+        } else {
+            status::ANSWER_UPDATING
+        }
+    }
+
+    /// Sends `update` for every press whose session has a bound agent that
+    /// can take it and no turn running; forgets presses past their time or
+    /// rounds. A press that waits for a turn longer than [`UPDATE_WAIT`]
+    /// stays until the turn ends, and the topic is told once.
+    fn pump_updates(&mut self) {
+        let now = Instant::now();
+        let sessions: Vec<String> = self.updates.keys().cloned().collect();
+        for session in sessions {
+            let Some(ask) = self.updates.get(&session) else {
+                continue;
+            };
+            let (expired, idle, told) = (now >= ask.until, ask.sent.is_none(), ask.told);
+            if expired && idle && self.busy(&session) {
+                if let Some(ask) = self.updates.get_mut(&session) {
+                    ask.until = now + UPDATE_WAIT;
+                    ask.told = true;
+                }
+                if !told
+                    && let Some(slot) = self.current_slot(&session)
+                    && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+                {
+                    self.notify(slot, thread_id, status::UPDATE_WAITS_NOTICE);
+                }
+                continue;
+            }
+            let Some(ask) = self.updates.get(&session) else {
+                continue;
+            };
+            if expired || (idle && ask.rounds >= UPDATE_ROUNDS) {
+                debug!(session = short(&session), "update press forgotten");
+                self.updates.remove(&session);
+                continue;
+            }
+            if ask.sent.is_some() || ask.held.is_some() || self.busy(&session) {
+                continue;
+            }
+            let Some(conn) = self
+                .current_slot(&session)
+                .and_then(|slot| self.live_agent(slot))
+                .filter(|(live, _)| *live == session)
+                .map(|(_, conn)| conn)
+                .filter(|conn| ask.left.is_none_or(|(_, left)| left != *conn))
+            else {
+                continue;
+            };
+            let able = self
+                .conns
+                .get(&conn)
+                .and_then(|bound| bound.client.as_ref())
+                .is_some_and(|client| client.self_update);
+            let update_id = crate::wire::random_u64();
+            let sent = able
+                && self.conns.get(&conn).is_some_and(|bound| {
+                    bound
+                        .to_agent
+                        .try_send(HubMsg::Update { update_id })
+                        .is_ok()
+                });
+            if !sent {
+                continue;
+            }
+            if let Some(ask) = self.updates.get_mut(&session) {
+                ask.sent = Some((update_id, conn));
+                ask.rounds += 1;
+                info!(
+                    conn,
+                    session = short(&session),
+                    round = ask.rounds,
+                    "update sent to the session agent"
+                );
+            }
+        }
+    }
+
+    /// An agent's answer to `update`. A leaving one is unbound at once and
+    /// released behind what was queued for it; the session's next agent is
+    /// asked again. Any other answer ends the press with one notice and
+    /// binds a leaving agent back.
+    fn on_update_answer(
+        &mut self,
+        conn: u64,
+        session: &str,
+        update_id: u64,
+        outcome: UpdateOutcome,
+    ) {
+        if let Some(ask) = self.updates.get_mut(session)
+            && ask.held == Some((update_id, conn))
+        {
+            // The held-back agent gave its `update` up (`failed`); the press
+            // goes again after the turn.
+            ask.held = None;
+            debug!(conn, ?outcome, "held-back update given up by the agent");
+            return;
+        }
+        if outcome == UpdateOutcome::Restarting
+            && let Some(ask) = self
+                .updates
+                .get_mut(session)
+                .filter(|ask| ask.sent == Some((update_id, conn)))
+            && self.activity.get(session).is_some_and(Activity::busy)
+        {
+            // A turn began after the `update` went out (a terminal prompt
+            // too): no `/exit` into it. Not released, the agent stays bound;
+            // this round does not count.
+            ask.sent = None;
+            ask.held = Some((update_id, conn));
+            ask.rounds = ask.rounds.saturating_sub(1);
+            info!(
+                conn,
+                session = short(session),
+                "restart held back: a turn runs"
+            );
+            return;
+        }
+        let asked = self.updates.get(session).is_some_and(|ask| {
+            ask.sent == Some((update_id, conn)) || ask.left == Some((update_id, conn))
+        });
+        if !asked {
+            debug!(conn, "update answer nothing waits for");
+        }
+        info!(conn, session = short(session), ?outcome, "update answered");
+        if matches!(
+            outcome,
+            UpdateOutcome::Reloading | UpdateOutcome::Restarting
+        ) {
+            if let Some(ask) = self.updates.get_mut(session).filter(|_| asked) {
+                ask.sent = None;
+                ask.left = Some((update_id, conn));
+            }
+            if let Some(bound) = self.conns.get_mut(&conn) {
+                bound.leaving = true;
+                let _ = bound.to_agent.try_send(HubMsg::Released {
+                    update_id,
+                    session_id: session.to_owned(),
+                });
+            }
+            self.registry.agent_disconnected(session, conn);
+            return;
+        }
+        if asked {
+            self.updates.remove(session);
+        }
+        if self.conns.get(&conn).is_some_and(|bound| bound.leaving) {
+            if let Some(bound) = self.conns.get_mut(&conn) {
+                bound.leaving = false;
+            }
+            if self.registry.agent_connected(session, conn) {
+                info!(conn, session = short(session), "leaving agent stays");
+            }
+        }
+        let notice = match outcome {
+            UpdateOutcome::UpToDate if self.outdated(conn) => status::NO_NEW_BUILD_NOTICE,
+            UpdateOutcome::UpToDate => status::UPDATED_NOTICE,
+            UpdateOutcome::NeedsManualRestart => status::MANUAL_RESTART_NOTICE,
+            UpdateOutcome::DraftInInput => status::DRAFT_NOTICE,
+            _ => status::UPDATE_FAILED_NOTICE,
+        };
+        if !asked && outcome == UpdateOutcome::UpToDate {
+            return;
+        }
+        if let Some(slot) = self.current_slot(session)
+            && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+        {
+            self.notify(slot, thread_id, notice);
+        }
+        if let Some(slot) = self.current_slot(session)
+            && let Some(shown) = self.shown.get_mut(&slot)
+        {
+            shown.next_at = Some(Instant::now());
         }
     }
 
@@ -2973,9 +3351,14 @@ impl Slots {
                 .as_ref()
                 .is_some_and(|(armed, until)| armed == session && now < *until)
         });
+        let update = !ended
+            && self
+                .live_agent(slot)
+                .is_some_and(|(_, conn)| self.outdated(conn));
         let buttons = Buttons {
             interrupt: keys && !waiting && self.busy(session),
             confirm,
+            update,
         };
         status::render(&phase, metrics, buttons)
     }
@@ -3705,6 +4088,8 @@ impl Slots {
         self.send_prompts();
         self.send_prompt_edits();
         self.pump_streams();
+        self.warn_outdated();
+        self.pump_updates();
         self.pump_status();
         let view = self.registry.topic_view();
         self.view.send_if_modified(|current| {
@@ -4098,6 +4483,7 @@ mod tests {
                 verdict_ack,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -5318,6 +5704,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         });
@@ -6106,6 +6493,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         });
@@ -6192,6 +6580,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         });
@@ -8575,6 +8964,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                client: None,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -8864,6 +9254,7 @@ again"
                     verdict_ack: true,
                     transcript_reads: true,
                     console_keys: false,
+                    client: None,
                 },
                 to_agent,
             })
@@ -8910,6 +9301,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         });
@@ -8949,6 +9341,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         });
@@ -9000,6 +9393,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                client: None,
             },
             to_agent,
         });
@@ -9797,6 +10191,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: true,
+                client: None,
             },
             to_agent,
         });
@@ -9911,5 +10306,311 @@ again"
             last_status_text(ops).as_deref() == Some("💤 Ждёт вас")
         })
         .await;
+    }
+
+    // ------------------------------------------------------------ TASK-040
+
+    const HUB_BUILD: &str = "a0a0a0a0b1b1b1b1c2c2c2c2d3d3d3d3e4e4e4e4f5f5f5f5a6a6a6a6b7b7b7b7";
+    const OLD_BUILD: &str = "0101010102020202030303030404040405050505060606060707070708080808";
+
+    fn client(build: &str, self_update: bool) -> Option<Client> {
+        Some(Client {
+            version: "0.1.0".into(),
+            build: build.into(),
+            self_update,
+        })
+    }
+
+    /// A live session A in slot 0 with topic 100; the hub runs `HUB_BUILD`.
+    fn updating_slots(dir: &TempDir) -> (Arc<Fake>, Slots) {
+        let options = Options {
+            build: Some(HUB_BUILD.into()),
+            ..options()
+        };
+        let (fake, mut slots) = live_slots(dir, options);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        (fake, slots)
+    }
+
+    fn register_client(
+        slots: &mut Slots,
+        conn: u64,
+        client: Option<Client>,
+    ) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(8);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: false,
+                transcript_reads: false,
+                console_keys: true,
+                client,
+            },
+            to_agent,
+        });
+        from_hub
+    }
+
+    fn answer(slots: &mut Slots, conn: u64, update_id: u64, outcome: UpdateOutcome) {
+        slots.on_agent(AgentEvent::Message {
+            conn,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::UpdateAnswer { update_id, outcome },
+        });
+    }
+
+    async fn sent_texts(fake: &Fake) -> Vec<(String, Option<serde_json::Value>)> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fake.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(100),
+                    text,
+                    reply_markup,
+                    ..
+                } => Some((text, reply_markup)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn() {
+        let dir = TempDir::new("slots-update-flow");
+        let (fake, mut slots) = updating_slots(&dir);
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        slots.pump();
+        slots.pump();
+        let warnings = sent_texts(&fake).await;
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            fake.ops().iter().any(|op| matches!(
+                op,
+                Op::Send {
+                    thread_id: Some(100),
+                    notify: true,
+                    ..
+                }
+            )),
+            "the warning is loud (decision 2026-09-24)"
+        );
+        let (text, keyboard) = &warnings[0];
+        assert!(
+            text.contains("01010101") && text.contains("a0a0a0a0"),
+            "{text}"
+        );
+        assert_eq!(keyboard, &status::update_keyboard(A));
+        assert_eq!(
+            slots.registry.sessions[A].update_warned.as_deref(),
+            Some(HUB_BUILD)
+        );
+        let (text, keyboard) = slots.status_view(SlotId(0), A, Instant::now());
+        assert!(text.ends_with(status::OUTDATED_LINE), "{text}");
+        assert!(keyboard.to_string().contains("status:update"), "{keyboard}");
+        // Nothing goes to the agent without a press.
+        assert!(first.try_recv().is_err());
+
+        // A press during the turn waits for its end.
+        assert_eq!(slots.press_update(A), status::ANSWER_AFTER_TURN);
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATE_RUNNING);
+        slots.pump();
+        assert!(first.try_recv().is_err(), "the turn runs");
+        slots.on_hook(&hook(
+            A,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        ));
+        slots.pump();
+        let Ok(HubMsg::Update { update_id }) = first.try_recv() else {
+            panic!("no update after the turn");
+        };
+
+        // The agent hands over: unbound at once, released behind its queue.
+        answer(&mut slots, 1, update_id, UpdateOutcome::Reloading);
+        assert_eq!(
+            first.try_recv().ok(),
+            Some(HubMsg::Released {
+                update_id,
+                session_id: A.into()
+            })
+        );
+        assert_eq!(slots.live_agent(SlotId(0)), None);
+        slots.follow_pid("box", 10);
+        assert_eq!(slots.live_agent(SlotId(0)), None, "never rebound by pid");
+
+        // The next agent runs the hub's build and is asked again.
+        let mut second = register_client(&mut slots, 2, client(HUB_BUILD, true));
+        slots.pump();
+        let Ok(HubMsg::Update { update_id }) = second.try_recv() else {
+            panic!("no second round");
+        };
+        answer(&mut slots, 2, update_id, UpdateOutcome::UpToDate);
+        assert!(slots.updates.is_empty());
+        let (text, _) = slots.status_view(SlotId(0), A, Instant::now());
+        assert!(!text.contains(status::OUTDATED_LINE), "{text}");
+        slots.pump();
+        let texts = sent_texts(&fake).await;
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert_eq!(texts[1].0, status::UPDATED_NOTICE);
+        assert_eq!(slots.press_update(A), status::ANSWER_CURRENT);
+    }
+
+    #[tokio::test]
+    async fn a_refused_restart_binds_the_agent_back_and_old_clients_are_told() {
+        let dir = TempDir::new("slots-update-refused");
+        let (fake, mut slots) = updating_slots(&dir);
+        let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let Ok(HubMsg::Update { update_id }) = agent.try_recv() else {
+            panic!("no update");
+        };
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(agent.try_recv(), Ok(HubMsg::Released { .. })));
+        assert_eq!(slots.live_agent(SlotId(0)), None);
+        // A draft in the terminal: the agent stays and the topic is told.
+        answer(&mut slots, 1, update_id, UpdateOutcome::DraftInInput);
+        assert_eq!(slots.live_agent(SlotId(0)), Some((A.to_owned(), 1)));
+        assert!(!slots.conns[&1].leaving);
+        slots.pump();
+        let texts = sent_texts(&fake).await;
+        assert!(
+            texts.iter().any(|(text, _)| text == status::DRAFT_NOTICE),
+            "{texts:?}"
+        );
+        // A client too old to update itself: told, nothing sent.
+        let mut old = register_client(&mut slots, 2, None);
+        assert_eq!(slots.press_update(A), status::ANSWER_OLD_CLIENT);
+        slots.pump();
+        assert!(old.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_press_outlasting_its_wait_in_a_turn_is_kept_and_told_once() {
+        let dir = TempDir::new("slots-update-long-turn");
+        let (fake, mut slots) = updating_slots(&dir);
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        assert_eq!(slots.press_update(A), status::ANSWER_AFTER_TURN);
+        let before = sent_texts(&fake).await.len();
+        for _ in 0..2 {
+            slots.updates.get_mut(A).unwrap().until = Instant::now();
+            slots.pump();
+        }
+        assert!(slots.updates.contains_key(A), "kept while the turn runs");
+        assert!(first.try_recv().is_err(), "the turn runs");
+        let texts = sent_texts(&fake).await;
+        let told: Vec<_> = texts[before..]
+            .iter()
+            .filter(|(text, _)| text == status::UPDATE_WAITS_NOTICE)
+            .collect();
+        assert_eq!(told.len(), 1, "told once: {texts:?}");
+        slots.on_hook(&hook(
+            A,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        ));
+        slots.pump();
+        assert!(
+            matches!(first.try_recv(), Ok(HubMsg::Update { .. })),
+            "the update goes after the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_is_held_back_when_a_turn_began_meanwhile() {
+        let dir = TempDir::new("slots-update-restart-turn");
+        let (fake, mut slots) = updating_slots(&dir);
+        let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let Ok(HubMsg::Update { update_id }) = agent.try_recv() else {
+            panic!("no update");
+        };
+        // A prompt from the terminal between `update` and its answer.
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(
+            agent.try_recv().is_err(),
+            "not released: no /exit into the turn"
+        );
+        assert_eq!(slots.live_agent(SlotId(0)), Some((A.to_owned(), 1)));
+        assert!(!slots.conns[&1].leaving);
+        // The agent gives that `update` up by itself: noted, nothing told.
+        let before = sent_texts(&fake).await.len();
+        answer(&mut slots, 1, update_id, UpdateOutcome::Failed);
+        assert!(
+            slots.updates.contains_key(A),
+            "the press waits for the turn"
+        );
+        slots.pump();
+        assert!(agent.try_recv().is_err(), "the turn runs");
+        slots.on_hook(&hook(
+            A,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        ));
+        slots.pump();
+        let Ok(HubMsg::Update { update_id }) = agent.try_recv() else {
+            panic!("no update after the turn");
+        };
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(agent.try_recv(), Ok(HubMsg::Released { .. })));
+        let texts = sent_texts(&fake).await;
+        assert_eq!(
+            texts.len(),
+            before,
+            "no notice for the held round: {texts:?}"
+        );
+    }
+
+    /// TASK-042 rebinds a session to an older open link of its run when the
+    /// bound one closes; a leaving worker is never that heir.
+    #[tokio::test]
+    async fn a_leaving_agent_is_never_the_heir_of_a_closed_link() {
+        let dir = TempDir::new("slots-update-heir");
+        let (_fake, mut slots) = updating_slots(&dir);
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let Ok(HubMsg::Update { update_id }) = first.try_recv() else {
+            panic!("no update");
+        };
+        answer(&mut slots, 1, update_id, UpdateOutcome::Reloading);
+        let _second = register_client(&mut slots, 2, client(HUB_BUILD, true));
+        assert_eq!(slots.live_agent(SlotId(0)), Some((A.to_owned(), 2)));
+        slots.on_agent(AgentEvent::Disconnected { conn: 2 });
+        assert_eq!(
+            slots.live_agent(SlotId(0)),
+            None,
+            "the leaving link stays unbound"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_its_own_build_the_hub_never_calls_a_client_outdated() {
+        let dir = TempDir::new("slots-update-unknown");
+        let (fake, mut slots) = live_slots(&dir, options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let _agent = register_client(&mut slots, 1, None);
+        slots.pump();
+        assert!(sent_texts(&fake).await.is_empty());
+        assert_eq!(slots.press_update(A), status::ANSWER_CURRENT);
+        let (text, _) = slots.status_view(SlotId(0), A, Instant::now());
+        assert!(!text.contains(status::OUTDATED_LINE));
     }
 }

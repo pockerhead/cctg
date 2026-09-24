@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# sha256 of the cctg executable (TASK-040 build identity). Already built for
+# rustls (reqwest) with these features; no new download.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 clap.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true
@@ -42,4 +45,10 @@ harness = false
 # candidate whose hub exits at once.
 [[test]]
 name = "supervise_e2e"
+harness = false
+
+# The TASK-040 `cctg run` test runs its own main: it is also the claude
+# stand-in that `cctg run` starts.
+[[test]]
+name = "run_e2e"
 harness = false

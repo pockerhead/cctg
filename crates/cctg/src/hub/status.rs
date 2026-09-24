@@ -37,6 +37,9 @@ pub const INTERRUPT_NOTE: &str = "[Request interrupted by user";
 
 const STOP: &str = "status:stop";
 const CONFIRM: &str = "status:confirm";
+const UPDATE: &str = "status:update";
+/// The update button of an outdated-client warning: `update:<session id>`.
+const UPDATE_PREFIX: &str = "update:";
 
 pub const ANSWER_CONFIRM: &str = "Нажмите ещё раз, чтобы прервать";
 pub const ANSWER_INTERRUPTING: &str = "Прерываю";
@@ -47,6 +50,23 @@ pub const ANSWER_NO_KEYS: &str = "Эта сессия не принимает к
 pub const ANSWER_STALE: &str = "Кнопка устарела";
 pub const KEY_FAILED_NOTICE: &str = "Не получилось нажать клавишу в терминале сессии.";
 
+pub const UPDATE_BUTTON: &str = "⬆️ Обновить";
+pub const OUTDATED_LINE: &str = "⬆️ Клиент cctg устарел";
+pub const ANSWER_UPDATING: &str = "Обновляю";
+pub const ANSWER_AFTER_TURN: &str = "Идёт ход: обновлю, когда он закончится (⏹ прервёт его)";
+pub const ANSWER_UPDATE_RUNNING: &str = "Обновление уже идёт";
+pub const ANSWER_CURRENT: &str = "Клиент уже обновлён";
+pub const ANSWER_OLD_CLIENT: &str =
+    "Этот клиент старше обновлений из Telegram: перезапустите сессию вручную";
+pub const UPDATED_NOTICE: &str = "✅ Клиент cctg обновлён.";
+pub const NO_NEW_BUILD_NOTICE: &str =
+    "На машине этой сессии нет новой сборки cctg: сначала cctg deploy, потом «Обновить».";
+pub const MANUAL_RESTART_NOTICE: &str = "Нужен перезапуск claude, а сессия запущена не через cctg run (claude-cctg). Выйдите из claude и запустите claude-cctg --resume с id этой сессии.";
+pub const DRAFT_NOTICE: &str = "В поле ввода терминала есть неотправленный текст, поэтому /exit не отправлен. Отправьте или сотрите его и нажмите «Обновить» ещё раз.";
+pub const UPDATE_WAITS_NOTICE: &str = "⏳ Обновление клиента ждёт конца хода и продолжится само, когда он закончится (⏹ прервёт ход).";
+pub const UPDATE_FAILED_NOTICE: &str =
+    "Обновить клиент не получилось; подробности в debug-логе claude этой сессии.";
+
 /// A status button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Press {
@@ -54,6 +74,8 @@ pub enum Press {
     Stop,
     /// ⏹, the confirming press.
     Confirm,
+    /// ⬆️ Обновить.
+    Update,
 }
 
 /// The status button of `data`; anything else is not one.
@@ -61,8 +83,33 @@ pub fn parse_callback(data: &str) -> Option<Press> {
     match data {
         STOP => Some(Press::Stop),
         CONFIRM => Some(Press::Confirm),
+        UPDATE => Some(Press::Update),
         _ => None,
     }
+}
+
+/// The keyboard of an outdated-client warning for `session`; `None` when
+/// the id does not fit Telegram's 64 bytes of callback data.
+pub fn update_keyboard(session: &str) -> Option<Value> {
+    let data = format!("{UPDATE_PREFIX}{session}");
+    (data.len() <= 64)
+        .then(|| json!({ "inline_keyboard": [[{ "text": UPDATE_BUTTON, "callback_data": data }]] }))
+}
+
+/// The session of a warning's update button.
+pub fn parse_update(data: &str) -> Option<&str> {
+    data.strip_prefix(UPDATE_PREFIX)
+        .filter(|session| !session.is_empty())
+}
+
+/// The warning sent once per hub build to the topic of a session whose agent
+/// runs another build. `agent`: its short build, `None` for an agent too
+/// old to say.
+pub fn outdated_text(agent: Option<&str>, hub: &str) -> String {
+    let agent = agent.unwrap_or("старый, без номера сборки");
+    format!(
+        "⬆️ Клиент cctg в этой сессии устарел: сборка {agent}, у hub {hub}. Сам он не обновится: нажмите «Обновить», когда будет удобно."
+    )
 }
 
 /// Numbers from Claude Code's status line, as `cctg statusline` sent them.
@@ -244,6 +291,8 @@ pub struct Buttons {
     pub interrupt: bool,
     /// ⏹ asks for its confirming press.
     pub confirm: bool,
+    /// The session's client is outdated: a line and ⬆️ Обновить.
+    pub update: bool,
 }
 
 /// The text and keyboard of the status message. The keyboard is always
@@ -265,11 +314,15 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
         Phase::Idle => "💤 Ждёт вас".to_owned(),
     };
     let numbers = metrics.map(Metrics::line).unwrap_or_default();
-    let text = if numbers.is_empty() {
+    let mut text = if numbers.is_empty() {
         head
     } else {
         format!("{head}\n{numbers}")
     };
+    if buttons.update {
+        text.push('\n');
+        text.push_str(OUTDATED_LINE);
+    }
     let mut row = Vec::new();
     if buttons.interrupt {
         row.push(if buttons.confirm {
@@ -277,6 +330,9 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
         } else {
             json!({ "text": "⏹ Прервать", "callback_data": STOP })
         });
+    }
+    if buttons.update {
+        row.push(json!({ "text": UPDATE_BUTTON, "callback_data": UPDATE }));
     }
     let keyboard = if row.is_empty() {
         permissions::no_keyboard()
@@ -428,6 +484,7 @@ mod tests {
         let stop = Buttons {
             interrupt: true,
             confirm: false,
+            update: false,
         };
         let (text, keyboard) = render(&running, None, stop);
         assert_eq!(text, "⚙️ Bash: Run tests (+2)");
@@ -439,6 +496,22 @@ mod tests {
             confirm: true,
             ..stop
         };
+        let outdated = Buttons {
+            update: true,
+            ..stop
+        };
+        let (text, keyboard) = render(&Phase::Idle, Some(&metrics()), outdated);
+        assert_eq!(
+            text,
+            "💤 Ждёт вас\nOpus 5.5 · high · ctx 50% · 5h 3%\n⬆️ Клиент cctg устарел"
+        );
+        assert_eq!(
+            buttons(&keyboard),
+            [
+                ("⏹ Прервать".to_owned(), STOP.to_owned()),
+                (UPDATE_BUTTON.to_owned(), UPDATE.to_owned())
+            ]
+        );
         let (_, keyboard) = render(&running, None, confirm);
         assert_eq!(
             buttons(&keyboard),
@@ -464,13 +537,36 @@ mod tests {
     fn only_status_buttons_parse_and_they_fit_callback_data() {
         assert_eq!(parse_callback(STOP), Some(Press::Stop));
         assert_eq!(parse_callback(CONFIRM), Some(Press::Confirm));
-        for other in ["allow:abcde", "resume:x", "status:", "status:stop ", ""] {
+        assert_eq!(parse_callback(UPDATE), Some(Press::Update));
+        for other in [
+            "allow:abcde",
+            "resume:x",
+            "status:",
+            "status:stop ",
+            "",
+            "update:x",
+        ] {
             assert_eq!(parse_callback(other), None, "{other}");
         }
         // Telegram allows 1-64 bytes of callback data.
-        for data in [STOP, CONFIRM] {
+        for data in [STOP, CONFIRM, UPDATE] {
             assert!(data.len() <= 64);
         }
+        let session = "5e551017-0000-4000-8000-000000000001";
+        let keyboard = update_keyboard(session).unwrap();
+        let data = keyboard["inline_keyboard"][0][0]["callback_data"]
+            .as_str()
+            .unwrap();
+        assert_eq!(parse_update(data), Some(session));
+        assert_eq!(parse_update("update:"), None);
+        assert_eq!(parse_update("status:update"), None);
+        assert_eq!(
+            update_keyboard(&"x".repeat(58)),
+            None,
+            "65 bytes do not fit"
+        );
+        assert!(outdated_text(Some("ab12cd34"), "ffee0011").contains("ab12cd34"));
+        assert!(outdated_text(None, "ffee0011").contains("ffee0011"));
     }
 
     #[test]

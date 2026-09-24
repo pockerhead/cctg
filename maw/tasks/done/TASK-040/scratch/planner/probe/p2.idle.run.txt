@@ -1,0 +1,35 @@
+P2 typed /exit (idle): sid=90f20d41
+4.2s ready
+4.2s flag written (idle)
+7.1s claude exited rc=0 (2.9s after flag)
+VERDICT exited=True rc=0 session_end_reason=['prompt_input_exit']
+--- events ---
+{"t": 1.52, "kind": "statusline", "session_id": "90f20d41"}
+{"t": 4.84, "kind": "statusline", "session_id": "90f20d41"}
+{"t": 6.38, "kind": "session_end", "hook": "SessionEnd", "session_id": "90f20d41", "reason": "prompt_input_exit"}
+--- mcp.log ---
+1790272339.534 42572 start parent=2836 image=claude.exe channel=False sid=90f20d41
+1790272339.534 42572 in server/discover
+1790272339.698 42572 in initialize
+1790272339.739 42572 in notifications/initialized
+1790272339.761 42572 in tools/list
+1790272342.454 42572 inject /exit ok=True written=10
+1790272342.865 42572 inject Enter ok=True written=2
+1790272342.947 42572 stdin EOF
+--- screen plus1_5 (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+❯ /exit
+
+· Wibbling…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None                                                                         ◐ medium · /effort
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent
+
+
