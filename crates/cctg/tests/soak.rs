@@ -474,6 +474,11 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             document,
             ..
         } => ("document", *thread_id, document.file_name.clone(), None),
+        Op::SendPhoto {
+            thread_id,
+            document,
+            ..
+        } => ("photo", *thread_id, document.file_name.clone(), None),
         Op::Stream {
             thread_id, text, ..
         } => ("stream", Some(*thread_id), text.clone(), None),
@@ -800,6 +805,7 @@ impl Soak {
                 reply_to: None,
                 quote: None,
                 forwarded: false,
+                media: None,
             }));
             return;
         }

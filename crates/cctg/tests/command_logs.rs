@@ -63,6 +63,7 @@ fn input(text: &str) -> Inbound {
         reply_to: None,
         quote: None,
         forwarded: false,
+        media: None,
     }
 }
 

@@ -3284,14 +3284,18 @@ mod tests {
         );
 
         let buffer = &mut registry.slots[0].buffer;
-        buffer.push(Parked {
-            message_id: 5,
-            thread_id: 100,
-            text: "kept".into(),
-            reply_to: Some(4),
-            quote: None,
-            forwarded: false,
-        });
+        buffer.push(
+            Parked {
+                message_id: 5,
+                thread_id: 100,
+                text: "kept".into(),
+                reply_to: Some(4),
+                quote: None,
+                forwarded: false,
+                file: None,
+            },
+            false,
+        );
         buffer.overflow_told = true;
         buffer.resume = Some(ResumeNote {
             session: A.into(),

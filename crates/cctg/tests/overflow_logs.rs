@@ -144,6 +144,7 @@ async fn one_overflow_warning_per_episode() {
                 reply_to: None,
                 quote: None,
                 forwarded: false,
+                media: None,
             }))
             .expect("control");
     };

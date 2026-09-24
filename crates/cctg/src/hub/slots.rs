@@ -86,8 +86,22 @@
 //! otherwise, and when the agent answers that a draft was in the way or
 //! typing failed, the message gets a short answer. A typed command gets 👀.
 //!
+//! Files (TASK-032): a topic message with a file waits in its slot like any
+//! other, as a reference to the Telegram file. When the slot's live agent
+//! can take files, the download task ([`fetch`], see [`Slots::fetch_files`])
+//! fetches it and hands it to the agent in chunks; the slot's later
+//! messages wait behind it, and it leaves the slot once all its chunks are
+//! in the link queue (a closed link keeps it for the next agent). A file
+//! over the Bot API's 20 MB, a failed download, or an agent too old for
+//! files each give the topic a notice (the old agent still gets the
+//! caption). The other way, `file_offer` from the agent of a slot's live
+//! current session is accepted while less than [`MAX_FILE_BYTES`] of
+//! files wait; its chunks are put together here and the file goes to the
+//! topic as a photo (a JPEG, PNG or WebP of at most 10 MB) or a document,
+//! and the agent learns what Telegram did.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
-//! a folder, a title or message text.
+//! a folder, a title, message text, a file name or a caption.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -103,13 +117,14 @@ use transcript::{
 };
 
 use super::api::{ApiError, Document};
-use super::buffer::{self, Parked, ResumeNote};
+use super::buffer::{self, Attachment, Parked, ResumeNote};
 use super::console;
+use super::fetch::{self, Fetch, Fetched};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::registry::{
     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
-    StatusMessage, TopicJob, TopicView,
+    StatusMessage, TopicJob, TopicView, cut,
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
 use super::status::{self, Activity, Buttons, Press};
@@ -119,9 +134,10 @@ use super::subagents::{
 };
 use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
+use crate::files;
 use crate::wire::{
-    AgentMsg, Behavior, Client, CommandOutcome, ConsoleKey, HookEvent, HookPost, HubMsg,
-    PermissionPost, PermissionRequest, StreamItem, StreamLine, UpdateOutcome,
+    AgentMsg, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome, HookEvent,
+    HookPost, HubMsg, PermissionPost, PermissionRequest, StreamItem, StreamLine, UpdateOutcome,
 };
 
 /// A transcript is scanned line by line for its first ai-title up to this
@@ -155,7 +171,22 @@ pub const HOOK_ANSWER_WAIT: Duration = Duration::from_secs(90);
 const HOOK_CHECK_EVERY: Duration = Duration::from_secs(1);
 /// Channel requests remembered for a hook that comes after them.
 const MAX_RELAYED: usize = 64;
-pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
+/// Bytes of files from sessions held at a time, being received or waiting
+/// for Telegram (one file of Telegram's largest size); an offer beyond gets
+/// `busy`.
+pub const MAX_FILE_BYTES: u64 = files::MAX_UPLOAD;
+/// An accepted file from an agent that got no chunk for this long is
+/// dropped at the next offer: the agent gave up waiting for `accepted`, or
+/// the offer came late over a new link.
+pub const UPLOAD_IDLE: Duration = Duration::from_secs(60);
+/// Files of kept messages waiting for the download task.
+const FETCH_QUEUE: usize = 64;
+/// Hand-overs of one kept file cut by a closing agent link before it is
+/// dropped with [`buffer::LINK_LOST_NOTICE`] (a link too slow for a chunk
+/// line would otherwise fetch and cut it again forever).
+const MAX_LINK_LOSSES: u32 = 3;
+/// Telegram shows at most this much of a caption.
+const CAPTION_LIMIT: usize = 1024;
 /// A status message is edited at most this often (edits have no published
 /// limit, but a busy session changes every second).
 pub const STATUS_EVERY: Duration = Duration::from_secs(5);
@@ -209,6 +240,34 @@ pub struct Options {
     /// The hub's own build ([`crate::client`]); `None`: agents are never
     /// outdated.
     pub build: Option<String>,
+}
+
+/// The kept file of a slot on its way to an agent.
+#[derive(Debug, Clone, Copy)]
+struct Fetching {
+    transfer_id: u64,
+    message_id: i64,
+    /// The link it goes to: it counts only while that is still the
+    /// slot's live agent.
+    conn: u64,
+}
+
+/// What became of a kept file on its way to the agent.
+enum FileStep {
+    /// It waits in the slot: being fetched, or no room now.
+    Wait,
+    /// It left the slot; `delivered`: something of it reached the agent.
+    Gone { delivered: bool },
+}
+
+/// A file from an agent being received.
+struct Upload {
+    transfer_id: u64,
+    name: String,
+    caption: Option<String>,
+    assembly: files::Assembly,
+    /// When it was accepted or its last chunk came.
+    touched: Instant,
 }
 
 impl Default for Options {
@@ -320,6 +379,20 @@ enum Done {
         job: StatusJob,
         delivery: Option<Delivery>,
     },
+    /// The file of the message at the front of `slot` went to its agent,
+    /// or did not.
+    Fetched {
+        slot: SlotId,
+        transfer_id: u64,
+        outcome: Fetched,
+    },
+    /// A file of an agent's `send_file`.
+    File {
+        conn: u64,
+        transfer_id: u64,
+        size: u64,
+        delivery: Option<Delivery>,
+    },
 }
 
 /// A call about a slot's status message; at most one per slot in flight.
@@ -398,11 +471,25 @@ enum Work {
     Permission(u64),
     PromptEdit(u64),
     Callback,
-    Resume { slot: SlotId, number: u64 },
+    Resume {
+        slot: SlotId,
+        number: u64,
+    },
     Block(BlockJob),
-    Stream { session: String, number: u64 },
+    Stream {
+        session: String,
+        number: u64,
+    },
     Reaction,
-    Status { slot: SlotId, job: StatusJob },
+    Status {
+        slot: SlotId,
+        job: StatusJob,
+    },
+    File {
+        conn: u64,
+        transfer_id: u64,
+        size: u64,
+    },
 }
 
 fn short(session_id: &str) -> &str {
@@ -523,6 +610,8 @@ struct Conn {
     commands: bool,
     /// Its build and update abilities ([`crate::wire::Register::client`]).
     client: Option<Client>,
+    /// It takes files ([`crate::wire::Register::files`]).
+    files: bool,
     /// It is leaving after an update answer: bound to nothing, never
     /// rebound by its claude pid.
     leaving: bool,
@@ -606,6 +695,19 @@ pub struct Slots {
     command_asks: HashMap<u64, CommandAsk>,
     /// Update presses by session.
     updates: HashMap<String, UpdateAsk>,
+    /// The download task, once [`Slots::fetch_files`] started it.
+    fetcher: Option<mpsc::Sender<fetch::Job>>,
+    /// The kept file of a slot on its way to the agent.
+    fetching: HashMap<SlotId, Fetching>,
+    /// Hand-overs of the slot's front file (by message id) cut by a closed
+    /// link, in a row.
+    link_losses: HashMap<SlotId, (i64, u32)>,
+    /// Transfers to agents of this run.
+    transfers: u64,
+    /// Files coming from agents, one per connection.
+    uploads: HashMap<u64, Upload>,
+    /// Bytes of [`Self::uploads`] and of files waiting for Telegram.
+    file_bytes: u64,
     pin_warned: bool,
     grace_until: Instant,
     next_retry: Instant,
@@ -673,6 +775,12 @@ impl Slots {
             key_asks: HashMap::new(),
             command_asks: HashMap::new(),
             updates: HashMap::new(),
+            fetcher: None,
+            fetching: HashMap::new(),
+            link_losses: HashMap::new(),
+            transfers: 0,
+            uploads: HashMap::new(),
+            file_bytes: 0,
             pin_warned: false,
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
@@ -681,6 +789,26 @@ impl Slots {
             options,
         };
         (slots, view_rx)
+    }
+
+    /// Starts the task that downloads the files of kept messages with
+    /// `fetch` and hands them to agents; call before [`Self::run`]. Without
+    /// it a file from the topic gets the failed-download notice.
+    pub fn fetch_files<F: Fetch>(&mut self, fetch: Arc<F>) {
+        let (jobs, jobs_rx) = mpsc::channel(FETCH_QUEUE);
+        let done = self.done_tx.clone();
+        tokio::spawn(fetch::serve(
+            fetch,
+            jobs_rx,
+            move |slot, transfer_id, outcome| {
+                let _ = done.send(Done::Fetched {
+                    slot,
+                    transfer_id,
+                    outcome,
+                });
+            },
+        ));
+        self.fetcher = Some(jobs);
     }
 
     /// The channel for `PermissionRequest` hooks
@@ -848,6 +976,7 @@ impl Slots {
                         keys: register.console_keys,
                         commands: register.console_commands,
                         client: register.client,
+                        files: register.files,
                         leaving: false,
                     },
                 );
@@ -902,10 +1031,21 @@ impl Slots {
                     AgentMsg::UpdateAnswer { update_id, outcome } => {
                         self.on_update_answer(conn, &session, update_id, outcome);
                     }
+                    AgentMsg::FileOffer {
+                        transfer_id,
+                        name,
+                        size,
+                        caption,
+                    } => self.on_file_offer(conn, &session, transfer_id, name, size, caption),
+                    AgentMsg::FileChunk(chunk) => self.on_file_chunk(conn, &session, &chunk),
                     _ => debug!(conn, "agent message not routed"),
                 }
             }
             AgentEvent::Disconnected { conn } => {
+                if let Some(upload) = self.uploads.remove(&conn) {
+                    self.file_bytes = self.file_bytes.saturating_sub(upload.assembly.size());
+                    info!(conn, "agent link closed during a file; the file is dropped");
+                }
                 // An update it did not answer goes to the session's next agent.
                 for ask in self.updates.values_mut() {
                     if ask.sent.is_some_and(|(_, to)| to == conn) {
@@ -1493,12 +1633,31 @@ impl Slots {
             debug!("message in a topic without a slot; not forwarded");
             return;
         };
-        let Some(text) = input.text else {
-            self.notify(slot, thread_id, TEXT_ONLY_NOTICE);
-            return;
+        let (text, file) = match (input.text, input.media) {
+            (Some(text), _) => (text, None),
+            (None, Some(media)) => {
+                let size = media.file.size.unwrap_or_default();
+                if size > files::MAX_DOWNLOAD {
+                    info!(
+                        ordinal = self.ordinal(slot),
+                        kind = media.file.kind.as_str(),
+                        size,
+                        "file from the topic larger than a bot may download"
+                    );
+                    self.notify(slot, thread_id, buffer::TOO_BIG_NOTICE);
+                    return;
+                }
+                (media.caption.unwrap_or_default(), Some(media.file))
+            }
+            (None, None) => {
+                self.notify(slot, thread_id, buffer::UNSUPPORTED_NOTICE);
+                return;
+            }
         };
-        // A forward is someone else's words, never a command.
+        // A forward is someone else's words and a caption goes with a file:
+        // neither is a command.
         if !input.forwarded
+            && file.is_none()
             && let Some(command) = console::classify(&text)
         {
             self.on_console_command(slot, thread_id, input.message_id, command);
@@ -1513,6 +1672,7 @@ impl Slots {
                 reply_to: input.reply_to,
                 quote: input.quote,
                 forwarded: input.forwarded,
+                file,
             },
         );
         self.flush(slot);
@@ -1530,7 +1690,8 @@ impl Slots {
         let Some(entry) = self.registry.slot_mut(slot) else {
             return;
         };
-        let dropped = entry.buffer.push(parked);
+        // The file on its way to the agent is not the one an overflow drops.
+        let dropped = entry.buffer.push(parked, self.fetching.contains_key(&slot));
         let tell_overflow = dropped && !entry.buffer.overflow_told;
         let tell_queued = offline && !dead && !entry.buffer.queued_told;
         self.registry.dirty = true;
@@ -1582,23 +1743,35 @@ impl Slots {
             .and_then(|entry| entry.buffer.messages.front())
             .cloned()
         {
-            let inbound = self.inbound(&session, &parked);
-            let sent = self
-                .conns
-                .get(&conn)
-                .is_some_and(|bound| bound.to_agent.try_send(inbound).is_ok());
-            if !sent {
-                debug!(
-                    ordinal,
-                    session = short(&session),
-                    "agent queue full or closed; messages stay in the slot"
-                );
-                break;
-            }
+            let delivered = match parked.file.clone() {
+                Some(file) => match self.hand_file(slot, &session, conn, &parked, file) {
+                    FileStep::Wait => break,
+                    FileStep::Gone { delivered } => delivered,
+                },
+                None => {
+                    let inbound = self.inbound(&session, &parked);
+                    let sent = self
+                        .conns
+                        .get(&conn)
+                        .is_some_and(|bound| bound.to_agent.try_send(inbound).is_ok());
+                    if !sent {
+                        debug!(
+                            ordinal,
+                            session = short(&session),
+                            "agent queue full or closed; messages stay in the slot"
+                        );
+                        break;
+                    }
+                    true
+                }
+            };
             if let Some(entry) = self.registry.slot_mut(slot) {
                 entry.buffer.messages.pop_front();
             }
             self.registry.dirty = true;
+            if !delivered {
+                continue;
+            }
             handed += 1;
             if let Some(stream) = self
                 .registry
@@ -1637,11 +1810,377 @@ impl Slots {
         }
     }
 
-    /// The Inbound of a topic message for `session`: meta `chat_id`,
-    /// `message_id`, `thread_id`, `reply_to_message_id` for an explicit
-    /// reply, `target_agent` for a reply to a block of its subagent and
-    /// `forwarded` for a forward; the content is [`Parked::content`].
+    /// The kept file at the front of `slot` for the agent `conn` of its
+    /// live session: handed to the download task (it waits in the slot
+    /// until [`Self::on_fetched`]), or, for an agent that takes no files,
+    /// dropped with a notice while its caption goes as text.
+    fn hand_file(
+        &mut self,
+        slot: SlotId,
+        session: &str,
+        conn: u64,
+        parked: &Parked,
+        file: Attachment,
+    ) -> FileStep {
+        if self.fetching.contains_key(&slot) {
+            return FileStep::Wait;
+        }
+        let Some(bound) = self.conns.get(&conn) else {
+            return FileStep::Wait;
+        };
+        let ordinal = self.ordinal(slot);
+        let kind = file.kind.as_str();
+        if !bound.files {
+            if !parked.text.is_empty()
+                && bound
+                    .to_agent
+                    .try_send(self.inbound(session, parked))
+                    .is_err()
+            {
+                return FileStep::Wait;
+            }
+            info!(ordinal, kind, "agent takes no files; the file is dropped");
+            self.notify(slot, parked.thread_id, buffer::OLD_AGENT_NOTICE);
+            return FileStep::Gone {
+                delivered: !parked.text.is_empty(),
+            };
+        }
+        if bound.to_agent.is_closed() {
+            return FileStep::Wait;
+        }
+        let Some(fetcher) = &self.fetcher else {
+            warn!(
+                ordinal,
+                kind, "no download task; a file from the topic is dropped"
+            );
+            self.notify(slot, parked.thread_id, buffer::FETCH_FAILED_NOTICE);
+            return FileStep::Gone { delivered: false };
+        };
+        let transfer_id = self.transfers + 1;
+        let job = fetch::Job {
+            slot,
+            transfer_id,
+            file,
+            content: parked.content(),
+            meta: self.inbound_meta(session, parked),
+            to_agent: bound.to_agent.clone(),
+        };
+        if fetcher.try_send(job).is_err() {
+            debug!(ordinal, "download queue full; the file waits in the slot");
+            return FileStep::Wait;
+        }
+        self.transfers = transfer_id;
+        self.fetching.insert(
+            slot,
+            Fetching {
+                transfer_id,
+                message_id: parked.message_id,
+                conn,
+            },
+        );
+        info!(
+            ordinal,
+            session = short(session),
+            kind,
+            "file of a kept message being fetched for the session agent"
+        );
+        FileStep::Wait
+    }
+
+    /// The download task is done with the kept file of `slot`: it leaves
+    /// the slot, and the topic hears of a file that did not go. It stays
+    /// for the next agent when its link closed first (up to
+    /// [`MAX_LINK_LOSSES`] times in a row) or when it went to a link that
+    /// is no longer the slot's live agent (its session ended meanwhile:
+    /// TASK-017, the old link never takes the slot's kept messages).
+    fn on_fetched(&mut self, slot: SlotId, transfer_id: u64, outcome: Fetched) {
+        let Some(fetching) = self
+            .fetching
+            .get(&slot)
+            .copied()
+            .filter(|fetching| fetching.transfer_id == transfer_id)
+        else {
+            return;
+        };
+        self.fetching.remove(&slot);
+        let message_id = fetching.message_id;
+        let ordinal = self.ordinal(slot);
+        let to_live = self
+            .live_agent(slot)
+            .is_some_and(|(_, conn)| conn == fetching.conn);
+        match outcome {
+            Fetched::Handed { .. } if !to_live => {
+                debug!(
+                    ordinal,
+                    "file handed to a link that is no longer the slot's agent; it stays in the slot"
+                );
+                // A newer agent of the slot may be waiting for it.
+                self.flush(slot);
+                return;
+            }
+            Fetched::LinkClosed => {
+                let losses = match self.link_losses.get(&slot) {
+                    Some(&(id, losses)) if id == message_id => losses + 1,
+                    _ => 1,
+                };
+                if losses < MAX_LINK_LOSSES {
+                    self.link_losses.insert(slot, (message_id, losses));
+                    debug!(
+                        ordinal,
+                        losses,
+                        "agent link closed before the file was handed over; it stays in the slot"
+                    );
+                    self.flush(slot);
+                    return;
+                }
+                warn!(
+                    ordinal,
+                    losses, "agent link closed during every hand-over of a file; it is dropped"
+                );
+            }
+            _ => {}
+        }
+        self.link_losses.remove(&slot);
+        // Unless it left the slot meanwhile.
+        let front = self
+            .registry
+            .slot(slot)
+            .and_then(|entry| entry.buffer.messages.front())
+            .map(|parked| (parked.message_id, parked.thread_id));
+        let Some((_, thread_id)) = front.filter(|(id, _)| *id == message_id) else {
+            return;
+        };
+        if let Some(entry) = self.registry.slot_mut(slot) {
+            entry.buffer.messages.pop_front();
+        }
+        self.registry.dirty = true;
+        match outcome {
+            Fetched::Handed { size } => {
+                info!(
+                    ordinal,
+                    size, "file of a kept message handed to the session agent"
+                );
+                if let Some((session, _)) = self.live_agent(slot)
+                    && let Some(stream) = self
+                        .registry
+                        .sessions
+                        .get_mut(&session)
+                        .and_then(|entry| entry.stream.as_mut())
+                {
+                    stream::receipt(stream, message_id);
+                }
+                self.react(message_id, stream::ACCEPTED);
+            }
+            Fetched::TooBig => self.notify(slot, thread_id, buffer::TOO_BIG_NOTICE),
+            Fetched::Failed => self.notify(slot, thread_id, buffer::FETCH_FAILED_NOTICE),
+            Fetched::LinkClosed => self.notify(slot, thread_id, buffer::LINK_LOST_NOTICE),
+        }
+        // The next kept message goes, or the offline period ends.
+        self.flush(slot);
+    }
+
+    /// A `file_offer` from `conn`: accepted when its session is the live
+    /// one of a slot with a topic, the size is one Telegram takes and less
+    /// than [`MAX_FILE_BYTES`] would wait. A new offer drops an unfinished
+    /// file of the same link and any file idle for [`UPLOAD_IDLE`].
+    fn on_file_offer(
+        &mut self,
+        conn: u64,
+        frame_session: &str,
+        transfer_id: u64,
+        name: String,
+        size: u64,
+        caption: Option<String>,
+    ) {
+        if let Some(old) = self.uploads.remove(&conn) {
+            self.file_bytes = self.file_bytes.saturating_sub(old.assembly.size());
+            debug!(
+                conn,
+                "an unfinished file of the agent is dropped for its next offer"
+            );
+        }
+        let now = Instant::now();
+        let idle: Vec<u64> = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| now.duration_since(upload.touched) >= UPLOAD_IDLE)
+            .map(|(&conn, _)| conn)
+            .collect();
+        for idle in idle {
+            if let Some(upload) = self.uploads.remove(&idle) {
+                self.file_bytes = self.file_bytes.saturating_sub(upload.assembly.size());
+                info!(conn = idle, "file from an agent stopped coming; dropped");
+                self.answer_file(idle, upload.transfer_id, FileOutcome::Failed);
+            }
+        }
+        let target = self
+            .live_reply_slot(conn, frame_session)
+            .filter(|(_, slot)| {
+                self.registry
+                    .slot(*slot)
+                    .is_some_and(|entry| entry.topic_id.is_some())
+            });
+        let outcome = if target.is_none() {
+            FileOutcome::NoTopic
+        } else if size == 0 || size > files::MAX_UPLOAD {
+            FileOutcome::Failed
+        } else if self.file_bytes + size > MAX_FILE_BYTES
+            || self.queued_messages >= MAX_QUEUED_MESSAGES
+        {
+            FileOutcome::Busy
+        } else {
+            FileOutcome::Accepted
+        };
+        info!(conn, size, ?outcome, "file offered by an agent");
+        if outcome == FileOutcome::Accepted {
+            self.file_bytes += size;
+            self.uploads.insert(
+                conn,
+                Upload {
+                    transfer_id,
+                    name,
+                    caption,
+                    assembly: files::Assembly::new(size),
+                    touched: Instant::now(),
+                },
+            );
+        }
+        self.answer_file(conn, transfer_id, outcome);
+    }
+
+    /// A chunk of the file `conn` is sending; the complete file goes to the
+    /// topic of its session, checked again (the session may have ended or
+    /// left its slot meanwhile).
+    fn on_file_chunk(&mut self, conn: u64, frame_session: &str, chunk: &FileChunk) {
+        let Some(upload) = self
+            .uploads
+            .get_mut(&conn)
+            .filter(|upload| upload.transfer_id == chunk.transfer_id)
+        else {
+            debug!(conn, "chunk of a file not being received; dropped");
+            return;
+        };
+        upload.touched = Instant::now();
+        let broken = match upload.assembly.push(chunk) {
+            Ok(false) => return,
+            Ok(true) => None,
+            Err(error) => Some(error),
+        };
+        let Some(upload) = self.uploads.remove(&conn) else {
+            return;
+        };
+        let size = upload.assembly.size();
+        if let Some(error) = broken {
+            self.file_bytes = self.file_bytes.saturating_sub(size);
+            warn!(conn, %error, "file from an agent broken; dropped");
+            self.answer_file(conn, upload.transfer_id, FileOutcome::Failed);
+            return;
+        }
+        let target = self
+            .live_reply_slot(conn, frame_session)
+            .and_then(|(_, slot)| {
+                let thread_id = self.registry.slot(slot)?.topic_id?;
+                Some((slot, thread_id))
+            });
+        let refused = match target {
+            None => Some(FileOutcome::NoTopic),
+            Some(_) if self.queued_messages >= MAX_QUEUED_MESSAGES => Some(FileOutcome::Busy),
+            Some(_) => None,
+        };
+        let (Some((slot, thread_id)), None) = (target, refused) else {
+            self.file_bytes = self.file_bytes.saturating_sub(size);
+            let outcome = refused.unwrap_or(FileOutcome::NoTopic);
+            info!(conn, size, ?outcome, "file from an agent not sent");
+            self.answer_file(conn, upload.transfer_id, outcome);
+            return;
+        };
+        let bytes = upload.assembly.into_bytes();
+        let photo = size <= files::MAX_PHOTO && files::is_photo(&bytes);
+        let document = Document {
+            file_name: files::clean_name(&upload.name, "file"),
+            bytes,
+            caption: upload.caption.map(|caption| cut(&caption, CAPTION_LIMIT)),
+        };
+        let thread_id = Some(thread_id);
+        let op = if photo {
+            Op::SendPhoto {
+                thread_id,
+                document,
+                notify: false,
+            }
+        } else {
+            Op::SendDocument {
+                thread_id,
+                document,
+                notify: false,
+            }
+        };
+        self.queued_messages += 1;
+        info!(
+            ordinal = self.ordinal(slot),
+            size, photo, "file from the session queued for its topic"
+        );
+        self.hand_off(
+            Work::File {
+                conn,
+                transfer_id: upload.transfer_id,
+                size,
+            },
+            op,
+        );
+    }
+
+    /// Telegram answered a file of `conn`: the agent hears whether it went.
+    fn on_file_done(&mut self, conn: u64, transfer_id: u64, size: u64, delivery: Option<Delivery>) {
+        self.queued_messages = self.queued_messages.saturating_sub(1);
+        if self.queued_messages == 0 {
+            self.overflow_warned = false;
+        }
+        self.file_bytes = self.file_bytes.saturating_sub(size);
+        let outcome = match delivery {
+            Some(Ok(_)) => {
+                info!(conn, size, "file from the session sent to its topic");
+                FileOutcome::Sent
+            }
+            Some(Err(error)) => {
+                warn!(%error, size, "file from the session not delivered");
+                FileOutcome::Failed
+            }
+            None => {
+                warn!(size, "file from the session got no answer");
+                FileOutcome::Failed
+            }
+        };
+        self.answer_file(conn, transfer_id, outcome);
+    }
+
+    fn answer_file(&self, conn: u64, transfer_id: u64, outcome: FileOutcome) {
+        let answer = HubMsg::FileAnswer {
+            transfer_id,
+            outcome,
+        };
+        if self
+            .conns
+            .get(&conn)
+            .is_none_or(|bound| bound.to_agent.try_send(answer).is_err())
+        {
+            debug!(conn, "agent queue full or closed; file answer dropped");
+        }
+    }
+
+    /// The Inbound of a topic message for `session`: its
+    /// [`Self::inbound_meta`] and [`Parked::content`].
     fn inbound(&self, session: &str, parked: &Parked) -> HubMsg {
+        HubMsg::Inbound {
+            content: parked.content(),
+            meta: self.inbound_meta(session, parked),
+        }
+    }
+
+    /// Meta `chat_id`, `message_id`, `thread_id`, `reply_to_message_id` for
+    /// an explicit reply, `target_agent` for a reply to a block of its
+    /// subagent and `forwarded` for a forward.
+    fn inbound_meta(&self, session: &str, parked: &Parked) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::from([
             ("chat_id".to_owned(), self.options.chat_id.to_string()),
             ("message_id".to_owned(), parked.message_id.to_string()),
@@ -1661,10 +2200,7 @@ impl Slots {
                 meta.insert("target_agent".to_owned(), agent_id.to_owned());
             }
         }
-        HubMsg::Inbound {
-            content: parked.content(),
-            meta,
-        }
+        meta
     }
 
     /// Every slot with kept messages tries its live session again: the
@@ -4043,6 +4579,17 @@ impl Slots {
                 job,
                 delivery,
             } => self.on_status_done(slot, job, delivery),
+            Done::Fetched {
+                slot,
+                transfer_id,
+                outcome,
+            } => self.on_fetched(slot, transfer_id, outcome),
+            Done::File {
+                conn,
+                transfer_id,
+                size,
+                delivery,
+            } => self.on_file_done(conn, transfer_id, size, delivery),
         }
     }
 
@@ -4417,6 +4964,16 @@ async fn dispatch_loop(
                     job,
                     delivery,
                 },
+                Work::File {
+                    conn,
+                    transfer_id,
+                    size,
+                } => Done::File {
+                    conn,
+                    transfer_id,
+                    size,
+                    delivery,
+                },
             });
         });
     }
@@ -4506,7 +5063,10 @@ mod tests {
     impl Transport for Fake {
         async fn execute(&self, op: &Op) -> Delivery {
             self.ops.lock().unwrap().push(op.clone());
-            let send = matches!(op, Op::Send { .. } | Op::SendDocument { .. });
+            let send = matches!(
+                op,
+                Op::Send { .. } | Op::SendDocument { .. } | Op::SendPhoto { .. }
+            );
             if self.stall || (self.stall_sends && send) {
                 return std::future::pending().await;
             }
@@ -4686,6 +5246,7 @@ mod tests {
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -4732,6 +5293,7 @@ mod tests {
             reply_to: None,
             quote: None,
             forwarded: false,
+            media: None,
         })
     }
 
@@ -4809,6 +5371,7 @@ mod tests {
                 reply_to: Some(40),
                 quote: Some("Удалить build/?".into()),
                 forwarded: false,
+                media: None,
             }))
             .unwrap();
         rig.control
@@ -4819,6 +5382,7 @@ mod tests {
                 reply_to: None,
                 quote: None,
                 forwarded: true,
+                media: None,
             }))
             .unwrap();
         // General and a topic that is no slot reach nobody and say nothing.
@@ -4901,13 +5465,13 @@ again"
         rig.control.send(say(Some(100), 1, Some("one"))).unwrap();
         rig.control.send(say(Some(100), 2, Some("two"))).unwrap();
         settled(&rig, |ops| sent_to(ops, 100).len() == 1).await;
-        // A photo: only text is forwarded.
+        // A sticker: it never reaches a session.
         rig.control.send(say(Some(100), 3, None)).unwrap();
         settled(&rig, |ops| sent_to(ops, 100).len() == 2).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             sent_to(&rig.fake.ops(), 100),
-            [buffer::QUEUED_NOTICE, TEXT_ONLY_NOTICE]
+            [buffer::QUEUED_NOTICE, buffer::UNSUPPORTED_NOTICE]
         );
         // The agent comes: both messages, in order, once; no Resume button.
         rig.agent_of(1, A, Some(10)).await;
@@ -5908,6 +6472,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -6698,6 +7263,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -6719,7 +7285,7 @@ again"
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_burst_of_photos_gets_one_notice_a_minute() {
+    async fn a_burst_of_stickers_gets_one_notice_a_minute() {
         let dir = TempDir::new("slots-notice");
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
@@ -6731,7 +7297,7 @@ again"
         }
         assert_eq!(
             slots.queued_messages, 1,
-            "one text-only notice for the burst"
+            "one unsupported-message notice for the burst"
         );
         for i in 10..15 {
             slots.on_control(say(Some(101), i, None));
@@ -6786,6 +7352,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -7975,6 +8542,7 @@ again"
                     reply_to: Some(reply_to),
                     quote: None,
                     forwarded: false,
+                    media: None,
                 }))
                 .unwrap();
         }
@@ -9171,6 +9739,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -9462,6 +10031,7 @@ again"
                     console_keys: false,
                     console_commands: false,
                     client: None,
+                    files: false,
                 },
                 to_agent,
             })
@@ -9510,6 +10080,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -9551,6 +10122,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -9604,6 +10176,7 @@ again"
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -10403,6 +10976,7 @@ again"
                 console_keys: true,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -10562,6 +11136,7 @@ again"
                 console_keys: true,
                 console_commands: false,
                 client,
+                files: false,
             },
             to_agent,
         });
@@ -10845,6 +11420,7 @@ again"
                 console_keys: true,
                 console_commands: commands,
                 client: None,
+                files: false,
             },
             to_agent,
         });
@@ -10859,6 +11435,7 @@ again"
             reply_to: None,
             quote: None,
             forwarded,
+            media: None,
         }
     }
 
@@ -11025,5 +11602,594 @@ again"
         );
         // Not kept for a later session either.
         assert!(slots.registry.slots[0].buffer.messages.is_empty());
+    }
+
+    /// Telegram's files for the download task, by id; `big` is too big for
+    /// a bot, any other unknown id fails.
+    struct TelegramFiles(HashMap<String, Vec<u8>>);
+
+    impl Fetch for TelegramFiles {
+        async fn fetch(&self, file_id: &str, _limit: u64) -> Result<fetch::Download, ApiError> {
+            match self.0.get(file_id) {
+                Some(bytes) => Ok(fetch::Download {
+                    bytes: bytes.clone(),
+                    path: Some(format!("photos/{file_id}.jpg")),
+                }),
+                None if file_id == "big" => Err(ApiError::Telegram {
+                    code: 400,
+                    description: crate::hub::api::FILE_TOO_BIG.to_owned(),
+                }),
+                None => Err(ApiError::Telegram {
+                    code: 400,
+                    description: "Bad Request: wrong file_id".to_owned(),
+                }),
+            }
+        }
+    }
+
+    fn photo(message_id: i64, file_id: &str, caption: Option<&str>, size: Option<u64>) -> Control {
+        Control::Message(Inbound {
+            message_id,
+            thread_id: Some(100),
+            text: None,
+            reply_to: None,
+            quote: None,
+            forwarded: false,
+            media: Some(crate::hub::updates::Media {
+                file: Attachment {
+                    kind: crate::wire::FileKind::Photo,
+                    file_id: file_id.into(),
+                    name: None,
+                    size,
+                },
+                caption: caption.map(str::to_owned),
+            }),
+        })
+    }
+
+    /// Like [`connect_queue`] with room for 64, for an agent that takes
+    /// files or not.
+    fn connect_files(
+        slots: &mut Slots,
+        conn: u64,
+        session: &str,
+        claude_pid: Option<u32>,
+        files: bool,
+    ) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(64);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                session_id: session.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid,
+                verdict_ack: false,
+                transcript_reads: false,
+                console_keys: false,
+                console_commands: false,
+                client: None,
+                files,
+            },
+            to_agent,
+        });
+        from_hub
+    }
+
+    /// A live in slot 0 with topic 100, the download task on `files`;
+    /// returns the actor, what it hands to the scheduler and the download
+    /// task's answers.
+    fn file_slots(
+        dir: &TempDir,
+        files: TelegramFiles,
+    ) -> (
+        Slots,
+        mpsc::UnboundedReceiver<(Work, Op)>,
+        mpsc::UnboundedReceiver<Done>,
+    ) {
+        let options = Options {
+            notice_every: Duration::ZERO,
+            ..message_options()
+        };
+        let mut slots = stalled_slots(dir, options);
+        let work = capture_dispatch(&mut slots);
+        slots.fetch_files(Arc::new(files));
+        let done = slots.done_rx.take().unwrap();
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        (slots, work, done)
+    }
+
+    async fn fetched(slots: &mut Slots, done: &mut mpsc::UnboundedReceiver<Done>) {
+        let finished = tokio::time::timeout(WAIT, done.recv())
+            .await
+            .expect("a download answer in time")
+            .expect("download task alive");
+        slots.on_done(finished);
+        slots.pump();
+    }
+
+    /// What reached the agent: `text <content>` per inbound, `file <name>
+    /// <content>` per complete file (its bytes in `bytes`).
+    fn arrived(from_hub: &mut mpsc::Receiver<HubMsg>, bytes: &mut Vec<Vec<u8>>) -> Vec<String> {
+        let mut got = Vec::new();
+        let mut open: Option<(String, String, files::Assembly)> = None;
+        while let Ok(msg) = from_hub.try_recv() {
+            match msg {
+                HubMsg::Inbound { content, .. } => got.push(format!("text {content}")),
+                HubMsg::FileStart {
+                    name,
+                    size,
+                    content,
+                    meta,
+                    ..
+                } => {
+                    assert!(meta.contains_key("message_id") && meta.contains_key("chat_id"));
+                    let assembly = files::Assembly::new(size);
+                    if assembly.is_complete() {
+                        got.push(format!("file {name} {content}"));
+                        bytes.push(Vec::new());
+                    } else {
+                        open = Some((name, content, assembly));
+                    }
+                }
+                HubMsg::FileChunk(chunk) => {
+                    let (name, content, mut assembly) = open.take().expect("a started file");
+                    if assembly.push(&chunk).unwrap() {
+                        got.push(format!("file {name} {content}"));
+                        bytes.push(assembly.into_bytes());
+                    } else {
+                        open = Some((name, content, assembly));
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(open.is_none(), "a file came only in part");
+        got
+    }
+
+    /// The texts sent to topic 100 and the messages reacted to, handed out
+    /// since the last call.
+    fn topic_ops(work: &mut mpsc::UnboundedReceiver<(Work, Op)>) -> (Vec<String>, Vec<i64>) {
+        let (mut texts, mut reacted) = (Vec::new(), Vec::new());
+        while let Ok((_, op)) = work.try_recv() {
+            match op {
+                Op::Send {
+                    thread_id: Some(100),
+                    text,
+                    ..
+                } => texts.push(text),
+                Op::React { message_id, .. } => reacted.push(message_id),
+                _ => {}
+            }
+        }
+        (texts, reacted)
+    }
+
+    #[tokio::test]
+    async fn a_kept_file_reaches_the_agent_in_its_place_among_the_messages() {
+        let dir = TempDir::new("slots-file-order");
+        let png: Vec<u8> = (0..files::CHUNK + 10).map(|n| (n % 251) as u8).collect();
+        let (mut slots, mut work, mut done) =
+            file_slots(&dir, TelegramFiles([("p".to_owned(), png.clone())].into()));
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        slots.on_control(say(Some(100), 1, Some("one")));
+        slots.on_control(photo(2, "p", Some("look"), Some(png.len() as u64)));
+        slots.on_control(say(Some(100), 3, Some("two")));
+        slots.pump();
+        // The file is on its way; the message after it waits behind it.
+        assert_eq!(buffered(&slots, 0), [2, 3]);
+        fetched(&mut slots, &mut done).await;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            arrived(&mut agent, &mut bytes),
+            ["text one", "file photo.jpg look", "text two"]
+        );
+        assert_eq!(bytes, [png]);
+        assert!(slots.registry.slots[0].buffer.is_idle());
+        let (texts, reacted) = topic_ops(&mut work);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert_eq!(reacted, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_takes_no_files_gets_the_caption_and_the_topic_a_notice() {
+        let dir = TempDir::new("slots-file-old-agent");
+        let (mut slots, mut work, _done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), false);
+        slots.on_control(photo(2, "p", Some("look"), None));
+        slots.on_control(photo(3, "p", None, None));
+        slots.on_control(say(Some(100), 4, Some("after")));
+        slots.pump();
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["text look", "text after"]
+        );
+        let (texts, reacted) = topic_ops(&mut work);
+        assert_eq!(texts, [buffer::OLD_AGENT_NOTICE, buffer::OLD_AGENT_NOTICE]);
+        assert_eq!(reacted, [2, 4]);
+        assert!(slots.fetching.is_empty());
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test]
+    async fn a_dead_slot_keeps_a_file_as_its_reference_and_hands_it_over_on_revival() {
+        let dir = TempDir::new("slots-file-dead");
+        let png = b"\x89PNG\r\n\x1a\nbytes".to_vec();
+        let (mut slots, _work, mut done) =
+            file_slots(&dir, TelegramFiles([("p".to_owned(), png.clone())].into()));
+        slots.on_hook(&end(A, 10));
+        slots.on_control(photo(2, "p", Some("look"), Some(png.len() as u64)));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [2]);
+        assert!(
+            slots.fetching.is_empty(),
+            "nothing is downloaded for a dead slot"
+        );
+        // registry.json keeps the reference, not the bytes.
+        let saved: serde_json::Value =
+            serde_json::from_slice(&RegistryStore::encode(&slots.registry)).unwrap();
+        assert_eq!(
+            saved["slots"][0]["buffer"]["messages"][0]["file"],
+            serde_json::json!({ "kind": "photo", "file_id": "p", "size": 13 })
+        );
+        slots.on_hook(&resumed(A, 11));
+        slots.pump();
+        let mut agent = connect_files(&mut slots, 1, A, Some(11), true);
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        let mut bytes = Vec::new();
+        assert_eq!(arrived(&mut agent, &mut bytes), ["file photo.jpg look"]);
+        assert_eq!(bytes, [png]);
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test]
+    async fn a_file_too_big_or_not_downloaded_is_told_and_a_closed_link_keeps_it() {
+        let dir = TempDir::new("slots-file-fail");
+        let (mut slots, mut work, mut done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        // Announced too big: told at once, never kept.
+        slots.on_control(photo(1, "p", None, Some(files::MAX_DOWNLOAD + 1)));
+        assert!(buffered(&slots, 0).is_empty());
+        // Too big only by Telegram's answer, and a file Telegram does not give.
+        slots.on_control(photo(2, "big", None, None));
+        slots.on_control(photo(3, "gone", None, None));
+        slots.on_control(say(Some(100), 4, Some("after")));
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(arrived(&mut agent, &mut Vec::new()), ["text after"]);
+        let (texts, reacted) = topic_ops(&mut work);
+        assert_eq!(
+            texts,
+            [
+                buffer::TOO_BIG_NOTICE,
+                buffer::TOO_BIG_NOTICE,
+                buffer::FETCH_FAILED_NOTICE
+            ]
+        );
+        assert_eq!(reacted, [4]);
+        // The link closes before the file goes: it waits for the next agent.
+        slots.on_control(photo(5, "p", Some("again"), None));
+        drop(agent);
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(buffered(&slots, 0), [5]);
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        let mut next = connect_files(&mut slots, 2, A, Some(10), true);
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut next, &mut Vec::new()),
+            ["file photo.jpg again"]
+        );
+    }
+
+    /// Code-review repro (TASK-032). TASK-017 contract: an ended session's
+    /// still-open link never gets the slot's kept messages; they wait for
+    /// the next live session. A file whose download was already running
+    /// when the session ended stays in the slot too, without 👀.
+    #[tokio::test]
+    async fn a_file_downloading_when_its_session_ends_stays_in_the_slot() {
+        let dir = TempDir::new("slots-file-end");
+        let png = b"x".to_vec();
+        let (mut slots, mut work, mut done) =
+            file_slots(&dir, TelegramFiles([("p".to_owned(), png.clone())].into()));
+        let agent = connect_files(&mut slots, 1, A, Some(10), true);
+        slots.on_control(photo(2, "p", Some("look"), None));
+        slots.pump();
+        assert_eq!(slots.fetching.len(), 1, "download started");
+        // The session ends (/exit) while the file downloads; its agent's
+        // link is still open for a moment, as in production.
+        slots.on_hook(&end(A, 10));
+        slots.on_control(say(Some(100), 3, Some("after")));
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        // The bytes went into the old link (nobody takes them back), but
+        // the message counts as not delivered.
+        let (_, reacted) = topic_ops(&mut work);
+        assert!(reacted.is_empty(), "{reacted:?}");
+        assert_eq!(buffered(&slots, 0), [2, 3]);
+        assert!(slots.fetching.is_empty());
+        // The next session of the slot gets both, in order.
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        drop(agent);
+        slots.on_hook(&resumed(A, 11));
+        let mut next = connect_files(&mut slots, 2, A, Some(11), true);
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            arrived(&mut next, &mut bytes),
+            ["file photo.jpg look", "text after"]
+        );
+        assert_eq!(bytes, [png]);
+        let (_, reacted) = topic_ops(&mut work);
+        assert_eq!(reacted, [2, 3]);
+    }
+
+    #[tokio::test]
+    async fn an_overflow_while_a_file_downloads_drops_the_next_oldest_and_keeps_the_order() {
+        let dir = TempDir::new("slots-file-overflow");
+        let (mut slots, mut work, mut done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        slots.on_control(photo(1, "p", Some("look"), None));
+        slots.pump();
+        assert_eq!(slots.fetching.len(), 1, "download started");
+        // 50 texts behind the file: the 51st kept message drops text 2, not
+        // the file on its way.
+        for id in 2..=51 {
+            slots.on_control(say(Some(100), id, Some(&format!("m{id}"))));
+        }
+        slots.pump();
+        let kept = buffered(&slots, 0);
+        assert_eq!(kept.len(), 50);
+        assert_eq!(kept[..2], [1, 3]);
+        let (texts, _) = topic_ops(&mut work);
+        assert_eq!(texts, [buffer::OVERFLOW_NOTICE]);
+        fetched(&mut slots, &mut done).await;
+        let got = arrived(&mut agent, &mut Vec::new());
+        let want: Vec<String> = ["file photo.jpg look".to_owned()]
+            .into_iter()
+            .chain((3..=51).map(|id| format!("text m{id}")))
+            .collect();
+        assert_eq!(got, want);
+        let (_, reacted) = topic_ops(&mut work);
+        assert_eq!(reacted, [1].into_iter().chain(3..=51).collect::<Vec<i64>>());
+    }
+
+    #[tokio::test]
+    async fn a_file_whose_hand_over_is_cut_again_and_again_is_dropped_with_a_notice() {
+        let dir = TempDir::new("slots-file-losses");
+        let (mut slots, mut work, mut done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        let mut agent = Some(connect_files(&mut slots, 1, A, Some(10), true));
+        slots.on_control(photo(2, "p", Some("look"), None));
+        slots.on_control(say(Some(100), 3, Some("after")));
+        for conn in 1..=MAX_LINK_LOSSES as u64 {
+            if agent.is_none() {
+                agent = Some(connect_files(&mut slots, conn, A, Some(10), true));
+            }
+            slots.pump();
+            // The link closes before the file goes.
+            drop(agent.take());
+            fetched(&mut slots, &mut done).await;
+            slots.on_agent(AgentEvent::Disconnected { conn });
+        }
+        let (texts, reacted) = topic_ops(&mut work);
+        assert_eq!(texts, [buffer::LINK_LOST_NOTICE]);
+        assert!(reacted.is_empty(), "{reacted:?}");
+        assert_eq!(buffered(&slots, 0), [3]);
+        // The message after it goes to the next agent.
+        let mut next = connect_files(&mut slots, 9, A, Some(10), true);
+        slots.pump();
+        assert_eq!(arrived(&mut next, &mut Vec::new()), ["text after"]);
+    }
+
+    /// The file answers the agent got since the last call.
+    fn file_answers(from_hub: &mut mpsc::Receiver<HubMsg>) -> Vec<(u64, FileOutcome)> {
+        let mut answers = Vec::new();
+        while let Ok(msg) = from_hub.try_recv() {
+            if let HubMsg::FileAnswer {
+                transfer_id,
+                outcome,
+            } = msg
+            {
+                answers.push((transfer_id, outcome));
+            }
+        }
+        answers
+    }
+
+    fn from_agent(slots: &mut Slots, conn: u64, msg: AgentMsg) {
+        slots.on_agent(AgentEvent::Message {
+            conn,
+            received_at: StdInstant::now(),
+            msg,
+        });
+    }
+
+    fn offer(slots: &mut Slots, conn: u64, transfer_id: u64, name: &str, size: u64) {
+        let msg = AgentMsg::FileOffer {
+            transfer_id,
+            name: name.into(),
+            size,
+            caption: Some("see".into()),
+        };
+        from_agent(slots, conn, msg);
+    }
+
+    fn send_bytes(slots: &mut Slots, conn: u64, transfer_id: u64, bytes: &[u8]) {
+        for chunk in files::chunks(transfer_id, bytes) {
+            from_agent(slots, conn, AgentMsg::FileChunk(chunk));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_from_the_session_goes_to_its_topic_as_a_photo_or_a_document() {
+        let dir = TempDir::new("slots-file-upload");
+        let (mut slots, mut work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        let png = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; files::CHUNK]].concat();
+        offer(&mut slots, 1, 1, "../shot.png", png.len() as u64);
+        assert_eq!(file_answers(&mut agent), [(1, FileOutcome::Accepted)]);
+        send_bytes(&mut slots, 1, 1, &png);
+        let (job, op) = work.try_recv().expect("the photo is handed out");
+        let size = png.len() as u64;
+        assert!(matches!(
+            job,
+            Work::File {
+                conn: 1,
+                transfer_id: 1,
+                size: s
+            } if s == size
+        ));
+        match op {
+            Op::SendPhoto {
+                thread_id: Some(100),
+                document,
+                notify: false,
+            } => {
+                assert_eq!(document.file_name, "shot.png");
+                assert_eq!(document.caption.as_deref(), Some("see"));
+                assert_eq!(document.bytes, png);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!((slots.file_bytes, slots.queued_messages), (size, 1));
+        slots.on_done(Done::File {
+            conn: 1,
+            transfer_id: 1,
+            size,
+            delivery: Some(Ok(Outcome::Sent(Message::default()))),
+        });
+        assert_eq!(file_answers(&mut agent), [(1, FileOutcome::Sent)]);
+        assert_eq!((slots.file_bytes, slots.queued_messages), (0, 0));
+        // Not a picture: a document; Telegram refuses it: failed.
+        offer(&mut slots, 1, 2, "notes.txt", 5);
+        send_bytes(&mut slots, 1, 2, b"hello");
+        let (_, op) = work.try_recv().unwrap();
+        assert!(
+            matches!(op, Op::SendDocument { ref document, .. } if document.file_name == "notes.txt")
+        );
+        slots.on_done(Done::File {
+            conn: 1,
+            transfer_id: 2,
+            size: 5,
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: file is empty".into(),
+            })),
+        });
+        assert_eq!(
+            file_answers(&mut agent),
+            [(2, FileOutcome::Accepted), (2, FileOutcome::Failed)]
+        );
+        // Too big for Telegram, too much waiting, a broken transfer.
+        offer(&mut slots, 1, 3, "huge.bin", files::MAX_UPLOAD + 1);
+        slots.file_bytes = MAX_FILE_BYTES - 4;
+        offer(&mut slots, 1, 4, "a.bin", 5);
+        slots.file_bytes = 0;
+        offer(&mut slots, 1, 5, "b.bin", 10);
+        from_agent(
+            &mut slots,
+            1,
+            AgentMsg::FileChunk(FileChunk {
+                transfer_id: 5,
+                offset: 3,
+                data: "AAAA".into(),
+            }),
+        );
+        assert_eq!(
+            file_answers(&mut agent),
+            [
+                (3, FileOutcome::Failed),
+                (4, FileOutcome::Busy),
+                (5, FileOutcome::Accepted),
+                (5, FileOutcome::Failed)
+            ]
+        );
+        assert_eq!(slots.file_bytes, 0);
+        // The session ends before the last chunk: nothing goes out.
+        offer(&mut slots, 1, 6, "c.txt", files::CHUNK as u64 + 1);
+        let bytes = vec![b'c'; files::CHUNK + 1];
+        let mut pieces = files::chunks(6, &bytes);
+        from_agent(&mut slots, 1, AgentMsg::FileChunk(pieces.next().unwrap()));
+        slots.on_hook(&end(A, 10));
+        from_agent(&mut slots, 1, AgentMsg::FileChunk(pieces.next().unwrap()));
+        assert_eq!(
+            file_answers(&mut agent),
+            [(6, FileOutcome::Accepted), (6, FileOutcome::NoTopic)]
+        );
+        assert!(work.try_recv().is_err(), "no send");
+        // An agent of a session that is no slot's live one is refused, and
+        // a closed link drops its unfinished file.
+        let mut stranger = connect_files(&mut slots, 2, B, Some(12), true);
+        offer(&mut slots, 2, 7, "x.txt", 3);
+        assert_eq!(file_answers(&mut stranger), [(7, FileOutcome::NoTopic)]);
+        // B takes the slot A left; its agent is bound now.
+        slots.on_hook(&start(B, 12));
+        offer(&mut slots, 2, 8, "x.txt", 3);
+        assert_eq!(file_answers(&mut stranger), [(8, FileOutcome::Accepted)]);
+        assert_eq!(slots.file_bytes, 3);
+        slots.on_agent(AgentEvent::Disconnected { conn: 2 });
+        assert_eq!(slots.file_bytes, 0);
+        assert!(slots.uploads.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_file_whose_bytes_never_come_does_not_hold_the_budget() {
+        let dir = TempDir::new("slots-file-idle");
+        let (mut slots, _work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
+        let mut first = connect_files(&mut slots, 1, A, Some(10), true);
+        // A second session in the same folder: slot #2 with its own topic.
+        slots.on_hook(&start(B, 12));
+        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        let mut second = connect_files(&mut slots, 2, B, Some(12), true);
+        offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
+        assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
+        // Chunks that keep coming keep the file.
+        let half = UPLOAD_IDLE / 2 + Duration::from_secs(1);
+        tokio::time::advance(half).await;
+        let piece = vec![0u8; files::CHUNK];
+        send_bytes(&mut slots, 1, 1, &piece);
+        tokio::time::advance(half).await;
+        offer(&mut slots, 2, 2, "b.bin", 1);
+        assert_eq!(file_answers(&mut second), [(2, FileOutcome::Busy)]);
+        assert!(slots.uploads.contains_key(&1));
+        // Then the first agent stops sending: its share is freed and it
+        // hears that the file failed.
+        tokio::time::advance(half).await;
+        offer(&mut slots, 2, 3, "b.bin", 1);
+        assert_eq!(file_answers(&mut second), [(3, FileOutcome::Accepted)]);
+        assert_eq!(file_answers(&mut first), [(1, FileOutcome::Failed)]);
+        assert!(!slots.uploads.contains_key(&1));
+        assert_eq!(slots.file_bytes, 1);
+    }
+
+    #[tokio::test]
+    async fn at_most_one_file_of_the_largest_size_waits_at_a_time() {
+        let dir = TempDir::new("slots-file-cap");
+        let (mut slots, _work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
+        let mut first = connect_files(&mut slots, 1, A, Some(10), true);
+        slots.on_hook(&start(B, 12));
+        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        let mut second = connect_files(&mut slots, 2, B, Some(12), true);
+        offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
+        assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
+        offer(&mut slots, 2, 2, "b.bin", 1);
+        assert_eq!(file_answers(&mut second), [(2, FileOutcome::Busy)]);
     }
 }

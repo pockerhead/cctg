@@ -16,7 +16,9 @@
 //! `transcript_read`, see [`Register::transcript_reads`]; `console_key`,
 //! see [`Register::console_keys`]; `console_command`, see
 //! [`Register::console_commands`]; `update` and `released`, see
-//! [`Client::self_update`]). Any other
+//! [`Client::self_update`]; `file_start` and the hub's `file_chunk`, see
+//! [`Register::files`]; `file_offer` and the agent's `file_chunk`, see
+//! [`HubMsg::Registered`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -150,6 +152,11 @@ pub struct Register {
     /// outdated and never sends them `update`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<Client>,
+    /// The agent takes files from the topic: `file_start` and `file_chunk`
+    /// (TASK-032). Agents built before leave it out and get a notice in the
+    /// topic instead of a file.
+    #[serde(default)]
+    pub files: bool,
 }
 
 /// The agent's build and update abilities.
@@ -235,6 +242,78 @@ pub enum AgentMsg {
         update_id: u64,
         outcome: UpdateOutcome,
     },
+    /// The `send_file` tool (TASK-032) wants to send `size` bytes named
+    /// `name` to the session's topic. Sent only to a hub whose `registered`
+    /// said `files`. The hub answers `file_answer`: `accepted` asks for the
+    /// bytes as `file_chunk`s, anything else ends the transfer.
+    FileOffer {
+        transfer_id: u64,
+        name: String,
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    /// Bytes of an accepted offer ([`FileChunk`]).
+    FileChunk(FileChunk),
+}
+
+/// One piece of a file transfer on the agent link, either way: the bytes
+/// from `offset` on, standard base64. The pieces of a transfer come in
+/// order, each right after the last; the transfer is complete when they
+/// reach its size, and broken by anything else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub transfer_id: u64,
+    pub offset: u64,
+    pub data: String,
+}
+
+/// What a Telegram message carried, as the agent names the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Photo,
+    Document,
+    Video,
+    Voice,
+    Audio,
+    Animation,
+    /// A kind of a newer hub.
+    #[serde(other)]
+    Other,
+}
+
+impl FileKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Photo => "photo",
+            Self::Document => "document",
+            Self::Video => "video",
+            Self::Voice => "voice",
+            Self::Audio => "audio",
+            Self::Animation => "animation",
+            Self::Other => "file",
+        }
+    }
+}
+
+/// The hub's answer to a `file_offer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOutcome {
+    /// Send the bytes.
+    Accepted,
+    /// Telegram took the file.
+    Sent,
+    /// The session is not the live one of a slot with a topic.
+    NoTopic,
+    /// Too much waits for Telegram; nothing was taken.
+    Busy,
+    /// Telegram refused the file, or the transfer broke.
+    Failed,
+    /// An outcome of a newer hub.
+    #[serde(other)]
+    Other,
 }
 
 /// What an agent does about an `update`.
@@ -335,6 +414,8 @@ impl Kinds for AgentMsg {
         "console_key_written",
         "console_command_typed",
         "update_answer",
+        "file_offer",
+        "file_chunk",
     ];
 }
 
@@ -357,7 +438,12 @@ pub enum Behavior {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HubMsg {
-    Registered,
+    /// `files`: the hub takes `file_offer` (TASK-032). Hubs built before
+    /// leave it out.
+    Registered {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        files: bool,
+    },
     Rejected {
         reason: Rejection,
     },
@@ -415,6 +501,28 @@ pub enum HubMsg {
         update_id: u64,
         session_id: String,
     },
+    /// Sent only to an agent that registered with `files`: a file from the
+    /// topic follows as `file_chunk`s of `size` bytes in all. Once they are
+    /// all there the agent saves it as `name` and hands Claude Code
+    /// `content` and `meta` like an `inbound`, with where the file is.
+    FileStart {
+        transfer_id: u64,
+        name: String,
+        size: u64,
+        kind: FileKind,
+        #[serde(default)]
+        content: String,
+        #[serde(default)]
+        meta: BTreeMap<String, String>,
+    },
+    /// Bytes of the file of a `file_start` ([`FileChunk`]).
+    FileChunk(FileChunk),
+    /// The answer to a `file_offer`; `accepted` comes first, then `sent`
+    /// or `failed` once Telegram answered.
+    FileAnswer {
+        transfer_id: u64,
+        outcome: FileOutcome,
+    },
 }
 
 impl Kinds for HubMsg {
@@ -428,6 +536,9 @@ impl Kinds for HubMsg {
         "console_command",
         "update",
         "released",
+        "file_start",
+        "file_chunk",
+        "file_answer",
     ];
 }
 
@@ -788,6 +899,7 @@ mod tests {
                 console_keys: true,
                 console_commands: true,
                 client: None,
+                files: true,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -844,12 +956,24 @@ mod tests {
                 update_id: 9,
                 outcome: UpdateOutcome::DraftInInput,
             },
+            AgentMsg::FileOffer {
+                transfer_id: u64::MAX,
+                name: "\u{448}\u{43e}\u{442} \"1\".png".into(),
+                size: 3,
+                caption: Some("see".into()),
+            },
+            AgentMsg::FileChunk(FileChunk {
+                transfer_id: 1,
+                offset: 0,
+                data: "AAEC".into(),
+            }),
         ]
     }
 
     fn hub_samples() -> Vec<HubMsg> {
         vec![
-            HubMsg::Registered,
+            HubMsg::Registered { files: false },
+            HubMsg::Registered { files: true },
             HubMsg::Rejected {
                 reason: Rejection::Auth,
             },
@@ -890,6 +1014,23 @@ mod tests {
             HubMsg::Released {
                 update_id: 9,
                 session_id: "s".into(),
+            },
+            HubMsg::FileStart {
+                transfer_id: 4,
+                name: "photo.jpg".into(),
+                size: 3,
+                kind: FileKind::Photo,
+                content: "caption".into(),
+                meta: [("message_id".to_owned(), "5".to_owned())].into(),
+            },
+            HubMsg::FileChunk(FileChunk {
+                transfer_id: 4,
+                offset: 0,
+                data: "AAEC".into(),
+            }),
+            HubMsg::FileAnswer {
+                transfer_id: 4,
+                outcome: FileOutcome::Accepted,
             },
         ]
     }
@@ -1029,6 +1170,7 @@ mod tests {
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             }))
         );
     }
@@ -1162,7 +1304,10 @@ mod tests {
     #[test]
     fn unknown_fields_are_ignored() {
         let line = br#"{"v":1,"type":"registered","extra":{"a":1}}"#;
-        assert_eq!(decode::<HubMsg>(line), Ok(HubMsg::Registered));
+        assert_eq!(
+            decode::<HubMsg>(line),
+            Ok(HubMsg::Registered { files: false })
+        );
         let line = br#"{"v":1,"type":"reply","text":"t","later":true}"#;
         assert_eq!(
             decode::<AgentMsg>(line),
@@ -1187,6 +1332,7 @@ mod tests {
             transcript_reads: true,
             console_keys: true,
             console_commands: false,
+            files: false,
             client: Some(Client {
                 version: "0.1.0".into(),
                 build: "ab".repeat(32),
@@ -1230,6 +1376,59 @@ mod tests {
         old.as_object_mut().unwrap().remove("client_version");
         let old = decode_hook(&serde_json::to_vec(&old).unwrap()).unwrap();
         assert_eq!(old.client_version, None);
+    }
+
+    #[test]
+    fn files_stay_compatible_with_version_one_peers() {
+        // A hub before TASK-032 answers the bare registration line, which a
+        // newer agent reads as a hub that takes no files; an older agent
+        // reads a newer hub's line as before.
+        let legacy = br#"{"v":1,"type":"registered"}"#;
+        assert_eq!(
+            decode::<HubMsg>(legacy),
+            Ok(HubMsg::Registered { files: false })
+        );
+        assert_eq!(
+            encode(&HubMsg::Registered { files: false }),
+            [&legacy[..], b"\n"].concat()
+        );
+        let newer: Value =
+            serde_json::from_slice(&encode(&HubMsg::Registered { files: true })).unwrap();
+        assert_eq!((&newer["v"], &newer["files"]), (&json!(1), &json!(true)));
+        // An agent before TASK-032 never announces files.
+        let old = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
+        match decode::<AgentMsg>(old) {
+            Ok(AgentMsg::Register(register)) => assert!(!register.files),
+            other => panic!("{other:?}"),
+        }
+        // Kinds and outcomes of a newer peer are read, not refused.
+        let start =
+            br#"{"v":1,"type":"file_start","transfer_id":1,"name":"n","size":0,"kind":"sticker"}"#;
+        assert!(matches!(
+            decode::<HubMsg>(start),
+            Ok(HubMsg::FileStart { kind: FileKind::Other, ref content, .. }) if content.is_empty()
+        ));
+        let answer = br#"{"v":1,"type":"file_answer","transfer_id":1,"outcome":"queued"}"#;
+        assert_eq!(
+            decode::<HubMsg>(answer),
+            Ok(HubMsg::FileAnswer {
+                transfer_id: 1,
+                outcome: FileOutcome::Other
+            })
+        );
+        // Both directions carry the same flat chunk line.
+        let chunk = FileChunk {
+            transfer_id: 2,
+            offset: 7,
+            data: "QQ==".into(),
+        };
+        let line = encode(&AgentMsg::FileChunk(chunk.clone()));
+        assert_eq!(line, encode(&HubMsg::FileChunk(chunk)));
+        assert!(
+            String::from_utf8_lossy(&line)
+                .starts_with(r#"{"v":1,"type":"file_chunk","transfer_id":2,"offset":7"#)
+        );
+        assert_eq!(FileKind::Voice.as_str(), "voice");
     }
 
     #[test]

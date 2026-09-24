@@ -173,6 +173,7 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         })

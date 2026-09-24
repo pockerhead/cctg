@@ -135,6 +135,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         })

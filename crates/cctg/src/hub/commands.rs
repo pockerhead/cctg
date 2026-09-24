@@ -499,6 +499,7 @@ mod tests {
             reply_to: None,
             quote: None,
             forwarded: false,
+            media: None,
         };
         for text in ["/brief", "/full 2", " /brief@cctg_bot 3", "/full@other_bot"] {
             assert!(super::is_command(&input(text)), "{text}");
@@ -627,6 +628,7 @@ mod tests {
                 reply_to: None,
                 quote: None,
                 forwarded: false,
+                media: None,
             })
             .unwrap();
         }

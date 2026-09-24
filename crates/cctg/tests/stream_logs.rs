@@ -156,6 +156,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         })

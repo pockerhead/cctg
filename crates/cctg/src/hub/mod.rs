@@ -5,6 +5,7 @@ pub mod buffer;
 pub mod commands;
 pub mod config;
 pub mod console;
+pub mod fetch;
 pub mod ingress;
 pub mod offset;
 pub mod permissions;
@@ -236,6 +237,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     };
     let (mut slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
     let permission_asks = slots.permission_asks();
+    slots.fetch_files(api.clone());
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     tokio::spawn(commands::serve(
         commands_rx,
@@ -435,6 +437,7 @@ mod tests {
             reply_to: None,
             quote: None,
             forwarded: false,
+            media: None,
         };
         let mut route = route_inbound(&commands_tx, &control_tx, BOT);
         route(Routed::Input(input("hello")));

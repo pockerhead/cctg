@@ -7,8 +7,8 @@
 //!    message) and `answerCallbackQuery`.
 //! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`,
 //!    `pinChatMessage`.
-//! 4. `Message` - `sendMessage`, `sendDocument` and transcript stream lines;
-//!    metered, one FIFO. Permission prompts live here too, so they never
+//! 4. `Message` - `sendMessage`, `sendDocument`, `sendPhoto` and transcript
+//!    stream lines; metered, one FIFO. Permission prompts live here too, so they never
 //!    overtake their own topic's ordinary messages; they do overtake its
 //!    stream lines.
 //!
@@ -75,6 +75,14 @@ pub enum Op {
         /// As in `Send`.
         notify: bool,
     },
+    /// `sendPhoto` (TASK-032); a picture Telegram refuses as a photo (400:
+    /// dimensions, format) goes as a document in the same job.
+    SendPhoto {
+        thread_id: Option<i64>,
+        document: Document,
+        /// As in `Send`.
+        notify: bool,
+    },
     Edit {
         message_id: i64,
         text: String,
@@ -133,7 +141,10 @@ enum Lane {
 impl Op {
     fn lane(&self) -> Lane {
         match self {
-            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => Lane::Message(0),
+            Op::Send { .. }
+            | Op::SendDocument { .. }
+            | Op::SendPhoto { .. }
+            | Op::Stream { .. } => Lane::Message(0),
             Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit,
             Op::Delete { .. } | Op::Pin { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => {
                 Lane::Topic
@@ -145,14 +156,16 @@ impl Op {
     fn metered(&self) -> bool {
         matches!(
             self,
-            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. }
+            Op::Send { .. } | Op::SendDocument { .. } | Op::SendPhoto { .. } | Op::Stream { .. }
         )
     }
 
     /// The topic of a new message.
     fn thread(&self) -> Option<Option<i64>> {
         match self {
-            Op::Send { thread_id, .. } | Op::SendDocument { thread_id, .. } => Some(*thread_id),
+            Op::Send { thread_id, .. }
+            | Op::SendDocument { thread_id, .. }
+            | Op::SendPhoto { thread_id, .. } => Some(*thread_id),
             Op::Stream { thread_id, .. } => Some(Some(*thread_id)),
             _ => None,
         }
@@ -211,6 +224,18 @@ impl Transport for BotApi {
                 .send_document(*thread_id, document, *notify)
                 .await
                 .map(Outcome::Sent),
+            Op::SendPhoto {
+                thread_id,
+                document,
+                notify,
+            } => match self.send_photo(*thread_id, document, *notify).await {
+                Err(error) if error.is_photo_refusal() => {
+                    warn!("telegram did not take a picture as a photo; sending it as a document");
+                    self.send_document(*thread_id, document, *notify).await
+                }
+                sent => sent,
+            }
+            .map(Outcome::Sent),
             Op::Edit {
                 message_id,
                 text,
@@ -486,7 +511,9 @@ impl<T: Transport> Scheduler<T> {
                     permission,
                     ..
                 } => (*thread_id, *permission),
-                Op::SendDocument { thread_id, .. } => (*thread_id, false),
+                Op::SendDocument { thread_id, .. } | Op::SendPhoto { thread_id, .. } => {
+                    (*thread_id, false)
+                }
                 // Stream lines yield to a prompt of their own topic.
                 _ => continue,
             };

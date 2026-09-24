@@ -26,6 +26,14 @@
 //! events were written, and types a one-line command into its input box
 //! (`console_command`, TASK-043) and answers what became of it.
 //!
+//! Files (TASK-032): a hub that takes files says so in `registered`; the
+//! `send_file` tool then offers the file, and once the hub accepts it goes
+//! over in chunks, and the tool answers what Telegram did. A file from the
+//! topic comes as `file_start` and chunks and is kept in memory until
+//! complete, then saved ([`crate::files::save`]) and handed to Claude like a
+//! message, with where it is. A lost link drops a transfer on both ends.
+//! Logs carry kinds and sizes, never names, paths or contents.
+//!
 //! Update (TASK-040): the agent runs as `cctg agent-worker` under the
 //! `cctg agent` shim ([`crate::shim`]) and registers with its build
 //! ([`Client`]); on the hub's `update` it hands over to a newer binary or
@@ -36,11 +44,11 @@
 //! connects: a nested `claude -p` cannot show up as a routable channel even
 //! when the process tree hides its parent.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -51,9 +59,10 @@ use tracing::{debug, info, warn};
 
 use tokio::time::{Instant, sleep_until};
 
-use crate::channel::{self, Hub, NoHub};
+use crate::channel::{self, FileCall, Hub, NoHub};
 use crate::client;
 use crate::device::{self, DeviceConfig};
+use crate::files;
 use crate::keys::{self, Typed};
 use crate::proctree;
 use crate::shim;
@@ -61,8 +70,8 @@ use crate::spool;
 use crate::tail;
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
-    self, AgentMsg, Client, CommandOutcome, ConsoleKey, HubMsg, Register, Rejection, Secret,
-    UpdateOutcome, WireError,
+    self, AgentMsg, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome, HubMsg,
+    Register, Rejection, Secret, UpdateOutcome, WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -154,8 +163,11 @@ fn spawn_replay(config: &LinkConfig, running: &mut Option<JoinHandle<()>>) {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkEvent {
-    /// Registered with the hub (again, after a reconnect).
-    Up,
+    /// Registered with the hub (again, after a reconnect). `files`: the hub
+    /// takes `file_offer` ([`HubMsg::Registered`]).
+    Up {
+        files: bool,
+    },
     /// The link dropped; reconnecting.
     Down,
     Message(HubMsg),
@@ -196,12 +208,12 @@ async fn run(
             return;
         }
         match connect(&config).await {
-            Ok((reader, write)) => {
+            Ok((reader, write, files)) => {
                 attempt = 0;
                 last_error.clear();
                 info!("registered with the hub");
                 spawn_replay(&config, &mut replaying);
-                if events.send(LinkEvent::Up).await.is_err() {
+                if events.send(LinkEvent::Up { files }).await.is_err() {
                     return;
                 }
                 let stopped = serve(reader, write, &mut outbox, &events, &mut verdicts).await;
@@ -237,7 +249,7 @@ async fn write_agent_msg(write: &mut OwnedWriteHalf, msg: &AgentMsg) -> Result<(
 
 async fn connect(
     config: &LinkConfig,
-) -> Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf), ConnectError> {
+) -> Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, bool), ConnectError> {
     let handshake = async {
         let stream = TcpStream::connect(config.addr.as_str())
             .await
@@ -253,7 +265,7 @@ async fn connect(
         let mut line = Vec::new();
         wire::read_line(&mut reader, &mut line).await?;
         match wire::decode::<HubMsg>(&line)? {
-            HubMsg::Registered => Ok((reader, write)),
+            HubMsg::Registered { files } => Ok((reader, write, files)),
             HubMsg::Rejected { reason } => Err(ConnectError::Rejected(reason)),
             _ => Err(ConnectError::Wire(WireError::Malformed)),
         }
@@ -384,6 +396,17 @@ pub struct Console {
     pub type_line: Typist,
 }
 
+/// Folders of the agent.
+#[derive(Debug, Clone, Default)]
+pub struct Dirs {
+    /// Transcript reads are answered only from under it
+    /// ([`tail::projects_root`]).
+    pub projects: Option<PathBuf>,
+    /// The session's working folder: files from the topic are kept under
+    /// it ([`files::save`]) and a relative `send_file` path starts there.
+    pub work: Option<PathBuf>,
+}
+
 /// Runs the worker agent (`cctg agent-worker`, started by the shim) until
 /// stdin closes. Returns the exit code: [`shim::HANDOVER`] after handing over
 /// to a newer binary, else 0.
@@ -449,6 +472,7 @@ pub async fn run_stdio() -> i32 {
                 console_keys: console.is_some(),
                 console_commands: console.is_some(),
                 client,
+                files: true,
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: config.agent_addr.clone(),
@@ -468,14 +492,17 @@ pub async fn run_stdio() -> i32 {
         }
     };
     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
-    let projects = tail::projects_root();
+    let dirs = Dirs {
+        projects: tail::projects_root(),
+        work: std::env::current_dir().ok(),
+    };
     let worker = Some(Arc::new(worker));
     match serve_channel(
         frames,
         tokio::io::stdout(),
         hub,
         events,
-        projects,
+        dirs,
         console,
         worker,
     )
@@ -575,9 +602,10 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 
 /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
 /// when stdin ends (the hub link stops with it) or stdout fails. Transcript
-/// reads are answered only from under `projects` ([`tail::projects_root`]).
-/// Console keys are pressed and commands typed with `console`; without one
-/// a `console_key` or `console_command` is answered as failed.
+/// reads are answered only from under `dirs.projects`
+/// ([`tail::projects_root`]); files from the topic are kept under
+/// `dirs.work`. Console keys are pressed and commands typed with `console`;
+/// without one a `console_key` or `console_command` is answered as failed.
 ///
 /// `worker` (TASK-040): the worker's place, for `update`. A resumed worker
 /// starts with the channel initialized. On `update` see [`crate::update`]:
@@ -585,28 +613,42 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 /// the shim still hands over, tells the hub it leaves and returns
 /// [`Ended::Handover`] once the hub released it (or [`LEAVE_WAIT`] passed);
 /// for a claude restart it leaves the hub, types `/exit` and runs on until
-/// claude closes stdin. Without `worker` an `update` is ignored.
+/// claude closes stdin. Without `worker` an `update` is ignored. A resumed
+/// worker first tells Claude Code to list the tools again: it may offer
+/// more than the worker Claude Code met.
 pub async fn serve_channel<W: AsyncWrite + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     mut output: W,
     hub: Hub,
     mut events: Option<mpsc::Receiver<LinkEvent>>,
-    projects: Option<PathBuf>,
+    dirs: Dirs,
     console: Option<Console>,
     worker: Option<Arc<Worker>>,
 ) -> std::io::Result<Ended> {
     let (reads, console_jobs, outbox) = match &hub {
         Hub::Link(outbox) => (
-            Some(spawn_reader(outbox.clone(), projects)),
+            Some(spawn_reader(outbox.clone(), dirs.projects.clone())),
             Some(spawn_console(outbox.clone(), console)),
             Some(outbox.clone()),
         ),
         Hub::Off(_) => (None, None, None),
     };
+    let mut sender = outbox
+        .clone()
+        .map(|outbox| spawn_sender(outbox, dirs.work.clone()));
     let mut server = channel::Server::new(hub);
     if worker.as_ref().is_some_and(|worker| worker.resumed) {
         server = server.initialized();
+        output.write_all(&channel::tools_changed()).await?;
+        output.flush().await?;
     }
+    // What the hub said at the last registration; nothing while it is away.
+    let mut hub_files = false;
+    let mut inbox: Option<Incoming> = None;
+    // A complete file from the topic being written to disk, off the loop:
+    // hub events wait until its message went to Claude, so the ones after it
+    // stay after it; Claude Code's lines are answered meanwhile.
+    let mut saving: Option<tokio::task::JoinHandle<HubMsg>> = None;
     let mut leaving: Option<Leaving> = None;
     let mut frames_open = true;
     let answer = |update_id, outcome| {
@@ -624,7 +666,13 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         let deadline = leaving.as_ref().and_then(Leaving::until);
         let lines = tokio::select! {
             frame = frames.recv(), if frames_open => match frame {
-                Some(Frame::Line(line)) => server.on_line(&line),
+                Some(Frame::Line(line)) => {
+                    let mut lines = server.on_line(&line);
+                    for call in server.take_file_calls() {
+                        lines.extend(start_upload(sender.as_ref(), hub_files, call));
+                    }
+                    lines
+                }
                 Some(Frame::TooLong) => server.on_oversized_line(),
                 None => match leaving {
                     // The shim sends nothing more: every line was answered.
@@ -663,7 +711,22 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                 }
                 Vec::new()
             }
-            event = recv_event(&mut events), if events.is_some() => match event {
+            saved = async {
+                match saving.as_mut() {
+                    Some(save) => save.await,
+                    None => std::future::pending().await,
+                }
+            }, if saving.is_some() => {
+                saving = None;
+                match saved {
+                    Ok(inbound) => server.on_link(LinkEvent::Message(inbound)),
+                    Err(_) => {
+                        warn!("saving a file from the topic failed");
+                        Vec::new()
+                    }
+                }
+            }
+            event = recv_event(&mut events), if events.is_some() && saving.is_none() => match event {
                 Some(LinkEvent::Message(HubMsg::Update { update_id })) => {
                     let Some(worker) = worker.clone().filter(|_| leaving.is_none()) else {
                         debug!("update without a worker or during another one; ignored");
@@ -767,9 +830,71 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                     }
                     Vec::new()
                 }
+                Some(LinkEvent::Message(HubMsg::FileAnswer { transfer_id, outcome })) => {
+                    if let Some(sender) = &sender {
+                        let _ = sender.events.send(Upload::Answer { transfer_id, outcome });
+                    }
+                    Vec::new()
+                }
+                Some(LinkEvent::Message(HubMsg::FileStart { transfer_id, name, size, kind, content, meta })) => {
+                    // One file at a time: a new start drops an unfinished one.
+                    if size > files::MAX_DOWNLOAD {
+                        warn!(size, "file from the topic larger than the hub may send; dropped");
+                        inbox = None;
+                        Vec::new()
+                    } else {
+                        let incoming = Incoming {
+                            transfer_id,
+                            name,
+                            kind,
+                            content,
+                            meta,
+                            assembly: files::Assembly::new(size),
+                        };
+                        if incoming.assembly.is_complete() {
+                            inbox = None;
+                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone())));
+                            Vec::new()
+                        } else {
+                            inbox = Some(incoming);
+                            Vec::new()
+                        }
+                    }
+                }
+                Some(LinkEvent::Message(HubMsg::FileChunk(chunk))) => {
+                    match receive(&mut inbox, &chunk) {
+                        Some(incoming) => {
+                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone())));
+                            Vec::new()
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                Some(event @ LinkEvent::Up { files }) => {
+                    hub_files = files;
+                    server.on_link(event)
+                }
+                Some(LinkEvent::Down) => {
+                    // A transfer of either way ends with its link.
+                    hub_files = false;
+                    if inbox.take().is_some() {
+                        info!("hub link lost; the unfinished file from the topic is dropped");
+                    }
+                    if let Some(sender) = &sender {
+                        let _ = sender.events.send(Upload::Lost);
+                    }
+                    server.on_link(LinkEvent::Down)
+                }
                 Some(event) => server.on_link(event),
                 None => {
                     events = None;
+                    Vec::new()
+                }
+            },
+            answer = recv_answer(&mut sender), if sender.is_some() => match answer {
+                Some(line) => vec![line],
+                None => {
+                    sender = None;
                     Vec::new()
                 }
             },
@@ -819,6 +944,335 @@ impl Leaving {
             Self::Released { until, .. } | Self::Exiting { until, .. } => Some(*until),
         }
     }
+}
+
+/// A file from the topic being received.
+struct Incoming {
+    transfer_id: u64,
+    name: String,
+    kind: FileKind,
+    content: String,
+    meta: BTreeMap<String, String>,
+    assembly: files::Assembly,
+}
+
+/// Takes a chunk of the file in `inbox`; returns the file once complete.
+/// A chunk of another transfer is dropped; a broken one drops the file.
+fn receive(inbox: &mut Option<Incoming>, chunk: &FileChunk) -> Option<Incoming> {
+    let Some(incoming) = inbox
+        .as_mut()
+        .filter(|incoming| incoming.transfer_id == chunk.transfer_id)
+    else {
+        debug!("chunk of a file not being received; dropped");
+        return None;
+    };
+    match incoming.assembly.push(chunk) {
+        Ok(true) => inbox.take(),
+        Ok(false) => None,
+        Err(error) => {
+            warn!(%error, "file from the topic broken; dropped");
+            *inbox = None;
+            None
+        }
+    }
+}
+
+/// Saves a complete file from the topic and makes the message Claude reads:
+/// where the file is, then the words that came with it; meta `file_kind`,
+/// `file_size` and, when it was saved, `file_path`.
+async fn deliver(incoming: Incoming, work: Option<PathBuf>) -> HubMsg {
+    let Incoming {
+        name,
+        kind,
+        content,
+        mut meta,
+        assembly,
+        ..
+    } = incoming;
+    let size = assembly.size();
+    let name = files::clean_name(&name, kind.as_str());
+    let bytes = assembly.into_bytes();
+    let saved = tokio::task::spawn_blocking(move || {
+        files::save(work.as_deref(), &name, &bytes, SystemTime::now()).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if saved.is_some() {
+        info!(kind = kind.as_str(), size, "file from the topic saved");
+    } else {
+        warn!(
+            kind = kind.as_str(),
+            size, "file from the topic could not be saved"
+        );
+    }
+    meta.insert("file_kind".to_owned(), kind.as_str().to_owned());
+    meta.insert("file_size".to_owned(), size.to_string());
+    if let Some(path) = &saved {
+        meta.insert("file_path".to_owned(), path.to_string_lossy().into_owned());
+    }
+    HubMsg::Inbound {
+        content: file_content(kind, saved.as_deref(), size, &content),
+        meta,
+    }
+}
+
+/// What Claude reads for a file from the topic.
+fn file_content(kind: FileKind, saved: Option<&Path>, size: u64, words: &str) -> String {
+    let kind = kind.as_str();
+    let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "An"
+    } else {
+        "A"
+    };
+    let mut content = match saved {
+        Some(path) => format!(
+            "{article} {kind} from the Telegram topic is saved at {} ({size} bytes).",
+            path.display()
+        ),
+        None => format!(
+            "{article} {kind} ({size} bytes) came from the Telegram topic but could not be saved on this machine."
+        ),
+    };
+    if !words.is_empty() {
+        content.push_str("\n\n");
+        content.push_str(words);
+    }
+    content
+}
+
+/// How long the hub has to accept an offer: it answers at once when it
+/// takes files, so silence means it does not.
+pub const OFFER_WAIT: Duration = Duration::from_secs(10);
+/// How long a `send_file` call waits for Telegram's answer before it says
+/// the file is on its way; below Claude Code's two minutes after which a
+/// call moves to the background.
+pub const SENT_WAIT: Duration = Duration::from_secs(90);
+/// `send_file` calls waiting behind the one being sent.
+const UPLOADS: usize = 4;
+
+/// The one worker that sends `send_file` files to the hub, one at a time.
+struct Sender {
+    calls: mpsc::Sender<FileCall>,
+    /// Hub answers and link losses, from the loop.
+    events: mpsc::UnboundedSender<Upload>,
+    /// Finished tool answer lines.
+    answers: mpsc::Receiver<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum Upload {
+    Answer {
+        transfer_id: u64,
+        outcome: FileOutcome,
+    },
+    Lost,
+}
+
+/// Hands a `send_file` call to the sender; the answer line comes later.
+/// Without a hub on line that takes files it is answered at once.
+fn start_upload(sender: Option<&Sender>, hub_files: bool, call: FileCall) -> Option<Vec<u8>> {
+    let refuse = |call: &FileCall, text: &str| Some(channel::tool_answer(&call.id, text, true));
+    let Some(sender) = sender else {
+        return refuse(&call, "cctg: no hub link; nothing was sent");
+    };
+    if !hub_files {
+        return refuse(
+            &call,
+            "The cctg hub is not reachable right now, or it is older than this agent and takes no files; nothing was sent.",
+        );
+    }
+    match sender.calls.try_send(call) {
+        Ok(()) => None,
+        Err(error) => refuse(
+            &error.into_inner(),
+            "Too many files are being sent; try again when they are done.",
+        ),
+    }
+}
+
+fn spawn_sender(outbox: mpsc::Sender<AgentMsg>, work: Option<PathBuf>) -> Sender {
+    let (calls, mut pending) = mpsc::channel::<FileCall>(UPLOADS);
+    let (events, mut uploads) = mpsc::unbounded_channel();
+    let (answer, answers) = mpsc::channel(UPLOADS + 1);
+    tokio::spawn(async move {
+        while let Some(call) = pending.recv().await {
+            let (text, is_error) = upload(&call, &outbox, &mut uploads, work.as_deref()).await;
+            if answer
+                .send(channel::tool_answer(&call.id, &text, is_error))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    Sender {
+        calls,
+        events,
+        answers,
+    }
+}
+
+async fn recv_answer(sender: &mut Option<Sender>) -> Option<Vec<u8>> {
+    match sender {
+        Some(sender) => sender.answers.recv().await,
+        None => None,
+    }
+}
+
+/// What came of waiting for the hub.
+enum Heard {
+    Outcome(FileOutcome),
+    Lost,
+    Silence,
+}
+
+/// Waits up to `limit` for the hub's answer to `transfer_id`; answers of
+/// other transfers are skipped.
+async fn hear(
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    transfer_id: u64,
+    limit: Duration,
+) -> Heard {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        match tokio::time::timeout_at(deadline, uploads.recv()).await {
+            Ok(Some(Upload::Answer {
+                transfer_id: id,
+                outcome,
+            })) if id == transfer_id => return Heard::Outcome(outcome),
+            Ok(Some(Upload::Answer { .. })) => continue,
+            Ok(Some(Upload::Lost)) | Ok(None) => return Heard::Lost,
+            Err(_) => return Heard::Silence,
+        }
+    }
+}
+
+/// Waits for room in the link queue for the next chunk ([`files::room`]);
+/// an answer to `transfer_id` or a lost link ends the wait: while the link
+/// reconnects nothing drains the queue.
+async fn room_or_heard(
+    outbox: &mpsc::Sender<AgentMsg>,
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    transfer_id: u64,
+) -> Option<Heard> {
+    loop {
+        tokio::select! {
+            biased;
+            event = uploads.recv() => match event {
+                Some(Upload::Answer { transfer_id: id, outcome }) if id == transfer_id => {
+                    return Some(Heard::Outcome(outcome));
+                }
+                Some(Upload::Answer { .. }) => {}
+                Some(Upload::Lost) | None => return Some(Heard::Lost),
+            },
+            ready = files::room(outbox) => return (!ready).then_some(Heard::Lost),
+        }
+    }
+}
+
+const LOST: &str = "The link to the cctg hub dropped during the transfer; the file may not have reached Telegram. Try again.";
+
+/// Sends one file; the tool answer text and whether it is an error.
+async fn upload(
+    call: &FileCall,
+    outbox: &mpsc::Sender<AgentMsg>,
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    work: Option<&Path>,
+) -> (String, bool) {
+    let path = match (Path::new(&call.path), work) {
+        (path, Some(work)) if path.is_relative() => work.join(path),
+        (path, _) => path.to_owned(),
+    };
+    let name = files::clean_name(
+        &path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "file",
+    );
+    let bytes = match tokio::task::spawn_blocking(move || files::read_upload(&path)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => return (format!("Nothing was sent: {error}."), true),
+        Err(_) => {
+            return (
+                "Nothing was sent: the file could not be read.".to_owned(),
+                true,
+            );
+        }
+    };
+    // Answers and losses of earlier transfers mean nothing now.
+    while uploads.try_recv().is_ok() {}
+    let transfer_id = wire::random_u64();
+    let size = bytes.len() as u64;
+    info!(size, "file offered to the hub");
+    let offer = AgentMsg::FileOffer {
+        transfer_id,
+        name,
+        size,
+        caption: call.caption.clone(),
+    };
+    if outbox.send(offer).await.is_err() {
+        return (
+            "The cctg hub link is gone; nothing was sent.".to_owned(),
+            true,
+        );
+    }
+    match hear(uploads, transfer_id, OFFER_WAIT).await {
+        Heard::Outcome(FileOutcome::Accepted) => {}
+        Heard::Outcome(outcome) => return refused(outcome),
+        Heard::Lost => return (LOST.to_owned(), true),
+        Heard::Silence => {
+            return (
+                "The cctg hub did not answer; nothing was sent.".to_owned(),
+                true,
+            );
+        }
+    }
+    for chunk in files::chunks(transfer_id, &bytes) {
+        match room_or_heard(outbox, uploads, transfer_id).await {
+            Some(Heard::Outcome(outcome)) => return refused(outcome),
+            Some(_) => return (LOST.to_owned(), true),
+            None => {}
+        }
+        if outbox.send(AgentMsg::FileChunk(chunk)).await.is_err() {
+            return (LOST.to_owned(), true);
+        }
+    }
+    match hear(uploads, transfer_id, SENT_WAIT).await {
+        Heard::Outcome(FileOutcome::Sent) => {
+            info!(size, "file sent to the topic");
+            (
+                "Sent to the Telegram topic of this session.".to_owned(),
+                false,
+            )
+        }
+        Heard::Outcome(outcome) => refused(outcome),
+        Heard::Lost => (LOST.to_owned(), true),
+        Heard::Silence => (
+            "The file is with the cctg hub; Telegram has not confirmed it yet.".to_owned(),
+            false,
+        ),
+    }
+}
+
+/// The tool answer for a hub outcome that is not success.
+fn refused(outcome: FileOutcome) -> (String, bool) {
+    warn!(?outcome, "file not sent");
+    let text = match outcome {
+        FileOutcome::NoTopic => {
+            "This session is not the live session of a Telegram topic right now; nothing was sent."
+        }
+        FileOutcome::Busy => {
+            "The cctg hub has too many files waiting for Telegram; try again in a minute."
+        }
+        FileOutcome::Failed => "Telegram did not take the file; nothing was sent.",
+        FileOutcome::Accepted | FileOutcome::Sent | FileOutcome::Other => {
+            "The cctg hub gave an answer this agent does not know; the file may not have been sent."
+        }
+    };
+    (text.to_owned(), true)
 }
 
 type ReadRequest = (String, String, Option<u64>);
@@ -962,6 +1416,7 @@ mod tests {
             console_keys: false,
             console_commands: false,
             client: None,
+            files: true,
         }
     }
 
@@ -1045,13 +1500,17 @@ mod tests {
             max: Duration::from_millis(160),
         };
         let (outbox, mut events) = spawn(config(addr, backoff));
-        assert_eq!(next(&mut events).await, LinkEvent::Up);
+        // The hub says it takes files.
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: true });
         let (got, to_agent) = registered(&mut hub_rx).await;
         assert_eq!(got, register());
-        to_agent.send(HubMsg::Registered).await.unwrap();
+        to_agent
+            .send(HubMsg::Registered { files: true })
+            .await
+            .unwrap();
         assert_eq!(
             next(&mut events).await,
-            LinkEvent::Message(HubMsg::Registered)
+            LinkEvent::Message(HubMsg::Registered { files: true })
         );
 
         // Hub goes away: its listener and every connection close.
@@ -1088,7 +1547,7 @@ mod tests {
         let _hub = tokio::spawn(ingress::serve_agents(listener, secret, hub_tx));
         loop {
             match next(&mut events).await {
-                LinkEvent::Up => break,
+                LinkEvent::Up { .. } => break,
                 LinkEvent::Down => continue,
                 other => panic!("unexpected {other:?}"),
             }
@@ -1206,10 +1665,10 @@ mod tests {
         line.clear();
         wire::read_line(&mut reader, &mut line).await.unwrap();
         line.clear();
-        wire::write_msg(&mut write, &HubMsg::Registered)
+        wire::write_msg(&mut write, &HubMsg::Registered { files: false })
             .await
             .unwrap();
-        assert_eq!(next(&mut events).await, LinkEvent::Up);
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
 
         let inbound = HubMsg::Inbound {
             content: "split inbound".repeat(100),
@@ -1386,8 +1845,12 @@ mod tests {
     ) -> Claude {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let dirs = Dirs {
+            projects,
+            work: None,
+        };
         tokio::spawn(serve_channel(
-            frames_rx, ours, hub, events, projects, None, None,
+            frames_rx, ours, hub, events, dirs, None, None,
         ));
         Claude {
             frames,
@@ -1521,23 +1984,10 @@ mod tests {
         );
     }
 
-    /// Accepts one agent on `listener` and answers its handshake.
+    /// Accepts one agent on `listener` and answers its handshake as a hub
+    /// that takes no files.
     async fn raw_hub(listener: &TcpListener) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-        let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
-            .await
-            .expect("agent connects")
-            .unwrap();
-        let (read, mut write) = stream.into_split();
-        let mut reader = BufReader::new(read);
-        let mut line = Vec::new();
-        for _ in 0..2 {
-            wire::read_line(&mut reader, &mut line).await.unwrap();
-            line.clear();
-        }
-        wire::write_msg(&mut write, &HubMsg::Registered)
-            .await
-            .unwrap();
-        (reader, write)
+        raw_hub_files(listener, false).await
     }
 
     async fn agent_line(reader: &mut BufReader<OwnedReadHalf>) -> AgentMsg {
@@ -1567,7 +2017,7 @@ mod tests {
         };
 
         let (mut reader, mut write) = raw_hub(&listener).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up);
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
         wire::write_msg(&mut write, &verdict(Some(7)))
             .await
             .unwrap();
@@ -1583,7 +2033,7 @@ mod tests {
         drop((reader, write));
         assert_eq!(next(&mut events).await, LinkEvent::Down);
         let (mut reader, mut write) = raw_hub(&listener).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up);
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
         wire::write_msg(&mut write, &verdict(Some(7)))
             .await
             .unwrap();
@@ -1623,7 +2073,7 @@ mod tests {
             ours,
             Hub::Link(outbox),
             Some(events),
-            None,
+            Dirs::default(),
             None,
             None,
         ));
@@ -1739,7 +2189,7 @@ mod tests {
             ours,
             Hub::Link(outbox),
             Some(events),
-            None,
+            Dirs::default(),
             Some(console),
             None,
         ));
@@ -1844,5 +2294,400 @@ mod tests {
                 panel: None,
             }
         );
+    }
+
+    /// A raw hub like [`raw_hub`] that says whether it takes files.
+    async fn raw_hub_files(
+        listener: &TcpListener,
+        files: bool,
+    ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+        let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("agent connects")
+            .unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = Vec::new();
+        for _ in 0..2 {
+            wire::read_line(&mut reader, &mut line).await.unwrap();
+            line.clear();
+        }
+        wire::write_msg(&mut write, &HubMsg::Registered { files })
+            .await
+            .unwrap();
+        (reader, write)
+    }
+
+    /// Claude Code with the channel initialized, over a link to `addr`,
+    /// keeping files in `work`.
+    async fn claude_in(addr: SocketAddr, work: &Path) -> Claude {
+        let backoff = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+        };
+        let (outbox, events) = spawn(config(addr, backoff));
+        let (frames, frames_rx) = mpsc::channel(16);
+        let (ours, theirs) = tokio::io::duplex(1 << 20);
+        let dirs = Dirs {
+            projects: None,
+            work: Some(work.to_owned()),
+        };
+        tokio::spawn(serve_channel(
+            frames_rx,
+            ours,
+            Hub::Link(outbox),
+            Some(events),
+            dirs,
+            None,
+            None,
+        ));
+        let mut claude = Claude {
+            frames,
+            out: tokio::io::BufReader::new(theirs),
+        };
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 0);
+        claude
+            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await;
+        claude
+    }
+
+    /// Sends an inbound and waits until Claude has it: the link events
+    /// before it (the registration) are handled then.
+    async fn settle(claude: &mut Claude, write: &mut OwnedWriteHalf) {
+        let inbound = HubMsg::Inbound {
+            content: "settled".into(),
+            meta: Default::default(),
+        };
+        wire::write_msg(write, &inbound).await.unwrap();
+        assert_eq!(claude.recv().await["params"]["content"], "settled");
+    }
+
+    fn file_start(transfer_id: u64, name: &str, size: usize) -> HubMsg {
+        HubMsg::FileStart {
+            transfer_id,
+            name: name.into(),
+            size: size as u64,
+            kind: FileKind::Photo,
+            content: "> quoted\n\nlook".into(),
+            meta: [("message_id".to_owned(), "9".to_owned())].into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_from_the_topic_is_saved_and_handed_to_claude_with_its_path() {
+        let dir = crate::hub::testdir::TempDir::new("agent-inbox");
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let mut claude = claude_in(listener.local_addr().unwrap(), dir.path()).await;
+        let (_reader, mut write) = raw_hub(&listener).await;
+        let bytes: Vec<u8> = (0..files::CHUNK + 100).map(|n| (n % 251) as u8).collect();
+        let pieces: Vec<FileChunk> = files::chunks(2, &bytes).collect();
+        // A transfer with a piece out of order gives Claude nothing.
+        wire::write_msg(&mut write, &file_start(1, "x.png", bytes.len()))
+            .await
+            .unwrap();
+        let wrong = FileChunk {
+            transfer_id: 1,
+            ..pieces[1].clone()
+        };
+        wire::write_msg(&mut write, &HubMsg::FileChunk(wrong))
+            .await
+            .unwrap();
+        // A whole one, with a name that tries to leave the inbox.
+        wire::write_msg(
+            &mut write,
+            &file_start(2, "../../evil name.png", bytes.len()),
+        )
+        .await
+        .unwrap();
+        for piece in &pieces {
+            wire::write_msg(&mut write, &HubMsg::FileChunk(piece.clone()))
+                .await
+                .unwrap();
+        }
+        let note = claude.recv().await;
+        assert_eq!(note["method"], "notifications/claude/channel");
+        let meta = &note["params"]["meta"];
+        assert_eq!(meta["message_id"], "9");
+        assert_eq!(meta["file_kind"], "photo");
+        assert_eq!(meta["file_size"], bytes.len().to_string());
+        let path = PathBuf::from(meta["file_path"].as_str().unwrap());
+        let inbox = dir.path().join(".cctg").join("inbox");
+        assert_eq!(
+            path,
+            inbox.join(format!("{}-evil name.png", files::date(SystemTime::now())))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let content = note["params"]["content"].as_str().unwrap();
+        assert_eq!(
+            content,
+            format!(
+                "A photo from the Telegram topic is saved at {} ({} bytes).\n\n> quoted\n\nlook",
+                path.display(),
+                bytes.len()
+            )
+        );
+        // A link lost in the middle of a file drops it: its rest on the
+        // next link is nobody's.
+        wire::write_msg(&mut write, &file_start(3, "y.png", bytes.len()))
+            .await
+            .unwrap();
+        let first = FileChunk {
+            transfer_id: 3,
+            ..pieces[0].clone()
+        };
+        wire::write_msg(&mut write, &HubMsg::FileChunk(first))
+            .await
+            .unwrap();
+        drop((_reader, write));
+        let (_reader, mut write) = raw_hub(&listener).await;
+        let rest = FileChunk {
+            transfer_id: 3,
+            ..pieces[1].clone()
+        };
+        wire::write_msg(&mut write, &HubMsg::FileChunk(rest))
+            .await
+            .unwrap();
+        settle(&mut claude, &mut write).await;
+        // The one saved file and the inbox's own `.gitignore`.
+        let kept: Vec<_> = std::fs::read_dir(&inbox).unwrap().flatten().collect();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    #[tokio::test]
+    async fn a_file_saved_off_the_loop_still_reaches_claude_before_the_messages_after_it() {
+        let dir = crate::hub::testdir::TempDir::new("agent-inbox-order");
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let mut claude = claude_in(listener.local_addr().unwrap(), dir.path()).await;
+        let (_reader, mut write) = raw_hub(&listener).await;
+        let bytes = vec![3u8; 3 * files::CHUNK + 1];
+        wire::write_msg(&mut write, &file_start(1, "a.png", bytes.len()))
+            .await
+            .unwrap();
+        for piece in files::chunks(1, &bytes) {
+            wire::write_msg(&mut write, &HubMsg::FileChunk(piece))
+                .await
+                .unwrap();
+        }
+        // An empty file is complete at its start.
+        wire::write_msg(&mut write, &file_start(2, "b.png", 0))
+            .await
+            .unwrap();
+        let after = HubMsg::Inbound {
+            content: "after".into(),
+            meta: Default::default(),
+        };
+        wire::write_msg(&mut write, &after).await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            let note = claude.recv().await;
+            let params = &note["params"];
+            got.push(
+                params["meta"]["file_path"]
+                    .as_str()
+                    .map(|path| {
+                        Path::new(path)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|| params["content"].as_str().unwrap().to_owned()),
+            );
+        }
+        let date = files::date(SystemTime::now());
+        assert_eq!(
+            got,
+            [
+                format!("{date}-a.png"),
+                format!("{date}-b.png"),
+                "after".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_reads_where_a_file_is_or_that_it_could_not_be_kept() {
+        let path = Path::new("/w/.cctg/inbox/2026-09-25-voice.oga");
+        assert_eq!(
+            file_content(FileKind::Voice, Some(path), 7, ""),
+            format!(
+                "A voice from the Telegram topic is saved at {} (7 bytes).",
+                path.display()
+            )
+        );
+        assert_eq!(
+            file_content(FileKind::Audio, None, 9, "words"),
+            "An audio (9 bytes) came from the Telegram topic but could not be saved on this machine.\n\nwords"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_file_offers_the_file_and_answers_what_the_hub_did() {
+        let dir = crate::hub::testdir::TempDir::new("agent-send-file");
+        let png = [b"\x89PNG\r\n\x1a\n".to_vec(), vec![3; files::CHUNK]].concat();
+        std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let mut claude = claude_in(listener.local_addr().unwrap(), dir.path()).await;
+        let (mut reader, mut write) = raw_hub_files(&listener, true).await;
+        settle(&mut claude, &mut write).await;
+        let call = |id: u32, path: &str| {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"send_file","arguments":{"path":path,"caption":"look"}}})
+            .to_string()
+        };
+        let text = |answer: &serde_json::Value| {
+            answer["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        // A relative path starts in the session's folder.
+        claude.send(&call(10, "shot.png")).await;
+        let AgentMsg::FileOffer {
+            transfer_id,
+            name,
+            size,
+            caption,
+        } = agent_line(&mut reader).await
+        else {
+            panic!("an offer first");
+        };
+        assert_eq!(
+            (name.as_str(), size, caption.as_deref()),
+            ("shot.png", png.len() as u64, Some("look"))
+        );
+        let accepted = HubMsg::FileAnswer {
+            transfer_id,
+            outcome: FileOutcome::Accepted,
+        };
+        wire::write_msg(&mut write, &accepted).await.unwrap();
+        let mut assembly = files::Assembly::new(size);
+        while !assembly.is_complete() {
+            match agent_line(&mut reader).await {
+                AgentMsg::FileChunk(chunk) => {
+                    assembly.push(&chunk).unwrap();
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(assembly.into_bytes(), png);
+        let sent = HubMsg::FileAnswer {
+            transfer_id,
+            outcome: FileOutcome::Sent,
+        };
+        wire::write_msg(&mut write, &sent).await.unwrap();
+        let answer = claude.recv().await;
+        assert_eq!(
+            (answer["id"].clone(), answer["result"]["isError"].clone()),
+            (10.into(), false.into())
+        );
+        assert_eq!(text(&answer), "Sent to the Telegram topic of this session.");
+        // The hub's refusal is a tool error that says why.
+        let absolute = dir.path().join("shot.png");
+        claude.send(&call(11, &absolute.to_string_lossy())).await;
+        let AgentMsg::FileOffer { transfer_id, .. } = agent_line(&mut reader).await else {
+            panic!("an offer");
+        };
+        let refused = HubMsg::FileAnswer {
+            transfer_id,
+            outcome: FileOutcome::NoTopic,
+        };
+        wire::write_msg(&mut write, &refused).await.unwrap();
+        let answer = claude.recv().await;
+        assert_eq!(answer["result"]["isError"], true);
+        assert!(text(&answer).contains("not the live session"), "{answer}");
+        // Not a file: answered without an offer.
+        claude.send(&call(12, "sub")).await;
+        let answer = claude.recv().await;
+        assert_eq!(
+            (answer["id"].clone(), answer["result"]["isError"].clone()),
+            (12.into(), true.into())
+        );
+        assert!(text(&answer).contains("not a regular file"), "{answer}");
+        // The link drops during a transfer: the tool says so.
+        claude.send(&call(13, "shot.png")).await;
+        let AgentMsg::FileOffer { transfer_id, .. } = agent_line(&mut reader).await else {
+            panic!("an offer");
+        };
+        let accepted = HubMsg::FileAnswer {
+            transfer_id,
+            outcome: FileOutcome::Accepted,
+        };
+        wire::write_msg(&mut write, &accepted).await.unwrap();
+        drop((reader, write));
+        let answer = claude.recv().await;
+        assert_eq!(
+            (answer["id"].clone(), answer["result"]["isError"].clone()),
+            (13.into(), true.into())
+        );
+        assert!(text(&answer).contains("dropped"), "{answer}");
+        // A hub that takes no files is not offered one.
+        let (mut reader, mut write) = raw_hub_files(&listener, false).await;
+        settle(&mut claude, &mut write).await;
+        claude.send(&call(14, "shot.png")).await;
+        let answer = claude.recv().await;
+        assert_eq!(
+            (answer["id"].clone(), answer["result"]["isError"].clone()),
+            (14.into(), true.into())
+        );
+        assert!(text(&answer).contains("takes no files"), "{answer}");
+        let offered = async {
+            loop {
+                if let AgentMsg::FileOffer { .. } = agent_line(&mut reader).await {
+                    return;
+                }
+            }
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), offered)
+                .await
+                .is_err(),
+            "no offer to a hub without files"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_lost_while_chunks_wait_for_room_ends_the_upload_at_once() {
+        let dir = crate::hub::testdir::TempDir::new("agent-upload-lost");
+        let file = dir.path().join("big.bin");
+        std::fs::write(&file, vec![5u8; files::CHUNK * 8]).unwrap();
+        let call = FileCall {
+            id: serde_json::json!(1),
+            path: file.to_string_lossy().into_owned(),
+            caption: None,
+        };
+        // The link queue: the link task stops draining it while it
+        // reconnects, so chunks pile up to the sender's share.
+        let (outbox, mut link) = mpsc::channel(QUEUE);
+        let (events, mut uploads) = mpsc::unbounded_channel();
+        let sending = tokio::spawn(async move { upload(&call, &outbox, &mut uploads, None).await });
+        let Some(AgentMsg::FileOffer { transfer_id, .. }) = link.recv().await else {
+            panic!("an offer first");
+        };
+        events
+            .send(Upload::Answer {
+                transfer_id,
+                outcome: FileOutcome::Accepted,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        events.send(Upload::Lost).unwrap();
+        let (text, is_error) = tokio::time::timeout(Duration::from_secs(3), sending)
+            .await
+            .expect("the tool answers without waiting for the link to come back")
+            .unwrap();
+        assert_eq!((text.as_str(), is_error), (LOST, true));
+        drop(link);
     }
 }

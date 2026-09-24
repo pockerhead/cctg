@@ -200,8 +200,9 @@ async fn agent_session(
         register,
         to_agent,
     };
+    // This hub takes files from agents (TASK-032).
     if events.send(registered).await.is_err()
-        || write_hub_msg(&mut write, &HubMsg::Registered)
+        || write_hub_msg(&mut write, &HubMsg::Registered { files: true })
             .await
             .is_err()
     {
@@ -223,7 +224,9 @@ async fn agent_session(
                         | AgentMsg::TranscriptChunk { .. }
                         | AgentMsg::ConsoleKeyWritten { .. }
                         | AgentMsg::ConsoleCommandTyped { .. }
-                        | AgentMsg::UpdateAnswer { .. }),
+                        | AgentMsg::UpdateAnswer { .. }
+                        | AgentMsg::FileOffer { .. }
+                        | AgentMsg::FileChunk(_)),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
@@ -837,6 +840,7 @@ mod tests {
             console_keys: false,
             console_commands: false,
             client: None,
+            files: false,
         }
     }
 
@@ -921,7 +925,7 @@ mod tests {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
         let Some(AgentEvent::Registered {
             conn,
             register: got,
@@ -968,7 +972,7 @@ mod tests {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
         let Some(AgentEvent::Registered { to_agent, .. }) = within(events.recv()).await else {
             panic!("expected registration");
         };
@@ -981,8 +985,11 @@ mod tests {
         peer.raw(first).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        to_agent.send(HubMsg::Registered).await.unwrap();
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
+        to_agent
+            .send(HubMsg::Registered { files: true })
+            .await
+            .unwrap();
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
         peer.raw(second).await;
 
         match within(events.recv()).await {
@@ -997,7 +1004,7 @@ mod tests {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
         let _ = within(events.recv()).await;
 
         // No newline ever: the hub must stop reading at the limit and close.
@@ -1038,7 +1045,7 @@ mod tests {
         let mut peer = Peer::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, local.port()))).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered));
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
         assert!(matches!(
             rx.recv().await,
             Some(AgentEvent::Registered { .. })
