@@ -159,6 +159,46 @@ pub fn lineage(
     }
 }
 
+/// Longest list of live pids a hook reports; more means no list at all.
+pub const MAX_LIVE_PIDS: usize = 1024;
+
+/// Pids of every process on this device that can be a session's own claude
+/// process: `claude(.exe)` by name (Claude Desktop's `claude.exe` included:
+/// an extra pid only keeps a session alive) and `node(.exe)` (an npm install
+/// nested in a native session, see [`lineage`]). The hub ends the sessions of
+/// this host whose `claude_pid` is not listed. `None`: this platform has no
+/// source, the snapshot failed, or the list is longer than
+/// [`MAX_LIVE_PIDS`]; then nothing is ended.
+pub fn live_claude_pids() -> Option<Vec<u32>> {
+    claude_pids(platform_processes()?)
+}
+
+fn claude_pids(processes: impl IntoIterator<Item = (u32, String)>) -> Option<Vec<u32>> {
+    let mut pids: Vec<u32> = processes
+        .into_iter()
+        .filter(|(_, name)| is_claude(name) || has_stem(name, "node"))
+        .map(|(pid, _)| pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    (pids.len() <= MAX_LIVE_PIDS).then_some(pids)
+}
+
+#[cfg(windows)]
+fn platform_processes() -> Option<Vec<(u32, String)>> {
+    windows::Snapshot::take().map(windows::Snapshot::processes)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_processes() -> Option<Vec<(u32, String)>> {
+    linux::processes()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn platform_processes() -> Option<Vec<(u32, String)>> {
+    None
+}
+
 /// `claude.exe` on Windows, `claude` elsewhere; case-insensitive.
 fn is_claude(name: &str) -> bool {
     has_stem(name, "claude")
@@ -281,6 +321,14 @@ mod windows {
         pub fn lookup(&self, pid: u32) -> Option<(u32, String)> {
             self.0.get(&pid).cloned()
         }
+
+        /// Every process of the snapshot as (pid, image name).
+        pub fn processes(self) -> Vec<(u32, String)> {
+            self.0
+                .into_iter()
+                .map(|(pid, (_, name))| (pid, name))
+                .collect()
+        }
     }
 
     pub fn process_table(pid: u32) -> Option<ProcessTable> {
@@ -382,6 +430,28 @@ mod linux {
             current = parent;
         }
         chain
+    }
+
+    /// Every process in `/proc` as (pid, comm). `None` when `/proc` cannot
+    /// be listed; a process that exits during the scan is skipped.
+    pub fn processes() -> Option<Vec<(u32, String)>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                continue;
+            };
+            if let Some((_, name)) = super::parse_stat(&stat) {
+                out.push((pid, name));
+            }
+        }
+        Some(out)
     }
 }
 
@@ -738,6 +808,33 @@ mod tests {
             Some((1, "a) b) c".to_owned()))
         );
         assert_eq!(parse_stat("garbage"), None);
+    }
+
+    #[test]
+    fn live_pids_are_claude_and_node_processes_only() {
+        let processes = [
+            (30, "claude.exe"),
+            (7, "CLAUDE.EXE"),
+            (12, "node.exe"),
+            (5, "claude"),
+            (8, "bash.exe"),
+            (9, "claude-code.exe"),
+            (10, "cctg.exe"),
+            (7, "claude.exe"),
+        ]
+        .map(|(pid, name)| (pid, name.to_owned()));
+        assert_eq!(claude_pids(processes), Some(vec![5, 7, 12, 30]));
+        assert_eq!(claude_pids(Vec::new()), Some(Vec::new()));
+        let many = (0..=MAX_LIVE_PIDS as u32).map(|pid| (pid, "claude.exe".to_owned()));
+        assert_eq!(claude_pids(many), None, "an overlong list is no list");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn the_live_list_is_readable_here() {
+        // Whatever runs here, the call works and stays bounded.
+        let pids = live_claude_pids().expect("supported platform");
+        assert!(pids.len() <= MAX_LIVE_PIDS);
     }
 
     #[cfg(any(windows, target_os = "linux"))]

@@ -437,6 +437,13 @@ pub struct HookPost {
     #[serde(default)]
     pub transcript_path: String,
     pub event: HookEvent,
+    /// Pids of the claude processes alive on `host` when the hook ran
+    /// (`SessionStart`/`SessionEnd` only; see
+    /// [`proctree::live_claude_pids`](crate::proctree::live_claude_pids)).
+    /// The hub ends that host's sessions whose process is not listed. Never
+    /// kept in the spool: a late list would end sessions started after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_claude_pids: Option<Vec<u32>>,
 }
 
 impl HookPost {
@@ -456,6 +463,7 @@ impl HookPost {
             cwd,
             transcript_path,
             event,
+            live_claude_pids: None,
         }
     }
 }
@@ -979,6 +987,16 @@ mod tests {
             let decoded = decode_hook(&body).unwrap();
             assert_eq!(decoded.event_id, post.event_id);
             assert_eq!(decoded, post);
+            // No list: no key on the wire (an older hub never sees one).
+            assert!(
+                !String::from_utf8(body)
+                    .unwrap()
+                    .contains("live_claude_pids")
+            );
+            let mut listed = post.clone();
+            listed.live_claude_pids = Some(vec![10, 42]);
+            let body = serde_json::to_vec(&listed).unwrap();
+            assert_eq!(decode_hook(&body).unwrap(), listed);
         }
     }
 

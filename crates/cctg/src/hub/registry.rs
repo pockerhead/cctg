@@ -29,6 +29,10 @@ const MAX_HOST: usize = 32;
 pub const MAX_SESSIONS: usize = 1024;
 const SHORT_ID: usize = 8;
 const CLEAR_HANDOFF_TTL: Duration = Duration::from_secs(60);
+/// A session started this recently is never ended by a device's list of live
+/// claude pids: its SessionStart can overtake the POST of a list taken before
+/// its process existed. A hook sends within 0.8 s of its snapshot.
+const REAP_GRACE: Duration = Duration::from_secs(5);
 
 const FILE_NAME: &str = "registry.json";
 const TEMP_NAME: &str = "registry.json.tmp";
@@ -502,6 +506,9 @@ pub struct Followup {
     /// Sessions ended or pruned by this transition. The slots actor uses the
     /// ids to close prompts even when pruning removed the registry entries.
     pub ended_sessions: Vec<String>,
+    /// The part of `ended_sessions` ended because their claude process was
+    /// missing from the device's list of live pids.
+    pub reaped: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,6 +531,10 @@ pub struct Registry {
     /// follows immediately.
     #[serde(skip)]
     recent_clears: BTreeMap<String, (SlotId, Instant)>,
+    /// Sessions whose SessionStart came within [`REAP_GRACE`]. Transient: a
+    /// hub restart takes longer than the grace.
+    #[serde(skip)]
+    recent_starts: BTreeMap<String, Instant>,
     /// Set by every change that must reach `registry.json`.
     #[serde(skip)]
     pub dirty: bool,
@@ -539,6 +550,7 @@ impl Default for Registry {
             subagents: BTreeMap::new(),
             pids: BTreeMap::new(),
             recent_clears: BTreeMap::new(),
+            recent_starts: BTreeMap::new(),
             dirty: false,
         }
     }
@@ -856,8 +868,85 @@ impl Registry {
         }
     }
 
-    /// Handles one hook event.
+    /// Handles one hook event. A `SessionStart`/`SessionEnd` that brings its
+    /// device's live claude pids first ends that host's sessions whose
+    /// process is gone ([`Self::reap`]), so a start takes their slots.
     pub fn apply_hook(&mut self, post: &HookPost) -> Followup {
+        let reaped = self.reap(post);
+        let mut followup = self.apply_event(post);
+        for session in &reaped {
+            if !followup.ended_sessions.contains(session) {
+                followup.ended_sessions.push(session.clone());
+            }
+        }
+        followup.reaped = reaped;
+        followup
+    }
+
+    /// Ends the sessions of `post.host`, top-level and nested, that have a
+    /// `claude_pid` missing from `post.live_claude_pids`: their process died
+    /// without a SessionEnd (window closed, killed, crashed). The end is the
+    /// one a SessionEnd makes, without the `/clear` hand-on. Untouched: the
+    /// posting session, other hosts, sessions without a pid, and starts within
+    /// [`REAP_GRACE`]. A list without the posting process's own pid is not a
+    /// view of this device's claudes and ends nothing.
+    fn reap(&mut self, post: &HookPost) -> Vec<String> {
+        let own = match &post.event {
+            HookEvent::SessionStart { claude_pid, .. }
+            | HookEvent::SessionEnd { claude_pid, .. } => *claude_pid,
+            _ => None,
+        };
+        let Some(live) = post
+            .live_claude_pids
+            .as_ref()
+            .filter(|live| own.is_some_and(|pid| live.contains(&pid)))
+        else {
+            return Vec::new();
+        };
+        let live: HashSet<u32> = live.iter().copied().collect();
+        let now = Instant::now();
+        self.recent_starts
+            .retain(|_, started| now.duration_since(*started) < REAP_GRACE);
+        let dead: Vec<(String, u32)> = self
+            .sessions
+            .iter()
+            .filter(|(id, entry)| {
+                !entry.ended
+                    && entry.host == post.host
+                    && id.as_str() != post.session_id
+                    && !self.recent_starts.contains_key(id.as_str())
+            })
+            .filter_map(|(id, entry)| {
+                entry
+                    .claude_pid
+                    .filter(|pid| !live.contains(pid))
+                    .map(|pid| (id.clone(), pid))
+            })
+            .collect();
+        for (session, pid) in &dead {
+            if let Some(entry) = self.sessions.get_mut(session) {
+                entry.ended = true;
+                entry.waiting = false;
+                entry.agent = None;
+            }
+            let key = pid_key(&post.host, *pid);
+            if self.pids.get(&key) == Some(session) {
+                self.pids.remove(&key);
+            }
+        }
+        if !dead.is_empty() {
+            self.touch();
+        }
+        dead.into_iter().map(|(session, _)| session).collect()
+    }
+
+    /// Every start so far is past [`REAP_GRACE`].
+    #[cfg(test)]
+    pub(crate) fn forget_recent_starts(&mut self) {
+        self.recent_starts.clear();
+    }
+
+    fn apply_event(&mut self, post: &HookPost) -> Followup {
         let session = post.session_id.as_str();
         match &post.event {
             HookEvent::SessionStart {
@@ -871,6 +960,10 @@ impl Registry {
                     .map(|(id, entry)| (id.clone(), entry.ended))
                     .collect();
                 self.session_started(post, source.as_deref(), *claude_pid, *parent_claude_pid);
+                let now = Instant::now();
+                self.recent_starts
+                    .retain(|_, started| now.duration_since(*started) < REAP_GRACE);
+                self.recent_starts.insert(session.to_owned(), now);
                 let ended_sessions = before
                     .into_iter()
                     .filter_map(|(id, was_ended)| match self.sessions.get(&id) {
@@ -1700,6 +1793,12 @@ mod tests {
                 claude_pid: None,
             },
         )
+    }
+
+    /// `post` as sent with the device's live claude pids.
+    fn listing(mut post: HookPost, live: &[u32]) -> HookPost {
+        post.live_claude_pids = Some(live.to_vec());
+        post
     }
 
     fn slot_of(registry: &Registry, session: &str) -> Option<SlotId> {
@@ -2591,6 +2690,130 @@ mod tests {
     }
 
     #[test]
+    fn a_start_takes_the_slot_of_a_session_whose_process_died() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        settle(&mut registry, &mut topic);
+        let a_slot = slot_of(&registry, A).unwrap();
+        registry.forget_recent_starts();
+        // A's window was closed: no SessionEnd, pid 1 is gone.
+        let followup = registry.apply_hook(&listing(start(C, CWD, Some(5), None), &[5, 9]));
+
+        assert_eq!(followup.reaped, [A]);
+        assert_eq!(followup.ended_sessions, [A]);
+        assert!(registry.sessions[A].ended);
+        assert!(!registry.pids.contains_key(&pid_key("box", 1)));
+        assert_eq!(slot_of(&registry, C), Some(a_slot));
+        assert_eq!(registry.slots[a_slot.0].ordinal, 1);
+        assert_eq!(registry.slots.len(), 1, "no #2");
+        assert_eq!(registry.state(a_slot), SlotState::NoChannel);
+    }
+
+    #[test]
+    fn only_dead_pids_of_the_reporting_host_end_sessions() {
+        const L: &str = "11111111-0000-4000-8000-000000000011";
+        const R: &str = "22222222-0000-4000-8000-000000000022";
+        const P: &str = "33333333-0000-4000-8000-000000000033";
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(1), None)); // dead
+        registry.apply_hook(&start(L, CWD, Some(2), None)); // alive
+        registry.apply_hook(&start(N, CWD, Some(3), Some(2))); // nested in L, dead
+        registry.apply_hook(&start(P, CWD, None, None)); // no pid
+        let mut far = start(R, CWD, Some(1), None); // pid 1 of another device
+        far.host = "far".into();
+        registry.apply_hook(&far);
+        assert_eq!(
+            registry.sessions[N].kind,
+            SessionKind::Nested {
+                parent: Some(L.into())
+            }
+        );
+        registry.forget_recent_starts();
+        let followup =
+            registry.apply_hook(&listing(start(C, "/elsewhere", Some(5), None), &[2, 5]));
+
+        let mut reaped = followup.reaped.clone();
+        reaped.sort();
+        assert_eq!(reaped, [A, N]);
+        for (session, ended) in [
+            (A, true),
+            (N, true),
+            (L, false),
+            (P, false),
+            (R, false),
+            (C, false),
+        ] {
+            assert_eq!(registry.sessions[session].ended, ended, "{session}");
+        }
+        assert_eq!(
+            registry.pids.get(&pid_key("far", 1)).map(String::as_str),
+            Some(R)
+        );
+        assert_eq!(
+            registry.pids.get(&pid_key("box", 2)).map(String::as_str),
+            Some(L)
+        );
+    }
+
+    #[test]
+    fn a_start_within_the_grace_is_not_ended_by_an_older_list() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        // B's list was taken before A's process existed; A's start came first.
+        let followup = registry.apply_hook(&listing(start(B, CWD, Some(2), None), &[2]));
+        assert!(followup.reaped.is_empty());
+        assert!(!registry.sessions[A].ended);
+        assert_eq!(registry.slots[slot_of(&registry, B).unwrap().0].ordinal, 2);
+    }
+
+    #[test]
+    fn a_list_ends_nothing_unless_it_shows_the_reporting_process() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        registry.forget_recent_starts();
+        // No list, a list without the own pid, no own pid, a turn event.
+        registry.apply_hook(&start(B, CWD, Some(2), None));
+        registry.apply_hook(&listing(start(C, "/c", Some(3), None), &[2]));
+        registry.apply_hook(&listing(start(N, "/n", None, None), &[2, 3]));
+        let stop = post(
+            B,
+            CWD,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        );
+        registry.apply_hook(&listing(stop, &[2, 3]));
+        assert!(!registry.sessions[A].ended);
+        // A SessionEnd with a list does end it.
+        registry.forget_recent_starts();
+        let followup = registry.apply_hook(&listing(end_by(B, Some(2)), &[2, 3]));
+        assert_eq!(followup.reaped, [A]);
+        let mut ended = followup.ended_sessions.clone();
+        ended.sort();
+        assert_eq!(ended, [A, B]);
+        assert!(!registry.sessions[C].ended);
+    }
+
+    #[test]
+    fn a_resume_in_a_new_process_is_not_ended_by_its_own_list() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        settle(&mut registry, &mut topic);
+        let a_slot = slot_of(&registry, A).unwrap();
+        registry.forget_recent_starts();
+        // `claude --resume A` after A's process was killed.
+        let followup =
+            registry.apply_hook(&listing(start_from(A, CWD, Some(7), None, "resume"), &[7]));
+        assert!(followup.reaped.is_empty());
+        assert!(!registry.sessions[A].ended);
+        assert_eq!(slot_of(&registry, A), Some(a_slot));
+        assert_eq!(registry.sessions[A].claude_pid, Some(7));
+    }
+
+    #[test]
     fn rapid_session_changes_keep_only_the_latest_separator() {
         let mut registry = Registry::default();
         let mut topic = 100;
@@ -2960,6 +3183,8 @@ mod tests {
         .unwrap();
         let mut loaded = store.load().unwrap();
         loaded.dirty = registry.dirty;
+        assert!(loaded.recent_starts.is_empty(), "never saved");
+        loaded.recent_starts.clone_from(&registry.recent_starts);
         assert_eq!(loaded, registry);
         assert_eq!(loaded.slots[0].topic_id, Some(100));
 

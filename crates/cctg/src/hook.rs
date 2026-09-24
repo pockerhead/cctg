@@ -347,6 +347,7 @@ fn build_here(event: &str, input: &[u8], host: &str) -> Result<HookPost, Skip> {
         host,
         cwd: &device::canonical_cwd,
         lineage: &lineage,
+        live_pids: &proctree::live_claude_pids,
         exists: &|path| path.exists(),
     };
     build(event, input, &probe)
@@ -377,6 +378,10 @@ pub struct Probe<'a> {
     /// Process-tree lineage for the stdin session id; asked only by
     /// `SessionStart` and `SessionEnd`.
     pub lineage: &'a dyn Fn(&str) -> Lineage,
+    /// Claude processes alive on this device, see
+    /// [`proctree::live_claude_pids`]; asked only by `SessionStart` and
+    /// `SessionEnd`.
+    pub live_pids: &'a dyn Fn() -> Option<Vec<u32>>,
     pub exists: &'a dyn Fn(&Path) -> bool,
 }
 
@@ -487,13 +492,21 @@ pub fn build(event: &str, input: &[u8], probe: &Probe<'_>) -> Result<HookPost, S
         }
         _ => return Err(Skip("unsupported hook event")),
     };
-    Ok(HookPost::new(
+    let live = matches!(
+        hook_event,
+        HookEvent::SessionStart { .. } | HookEvent::SessionEnd { .. }
+    );
+    let mut post = HookPost::new(
         probe.host.to_owned(),
         input.session_id,
         (probe.cwd)(&input.cwd),
         input.transcript_path,
         hook_event,
-    ))
+    );
+    if live {
+        post.live_claude_pids = (probe.live_pids)();
+    }
+    Ok(post)
 }
 
 fn agent_id(id: Option<String>) -> Result<String, Skip> {
@@ -1019,6 +1032,7 @@ mod build_tests {
             host: "box",
             cwd: &cwd_fn,
             lineage: &lineage_fn,
+            live_pids: &|| None,
             exists: &exists_fn,
         };
         f(&probe, &asked)
@@ -1179,6 +1193,46 @@ mod build_tests {
     }
 
     #[test]
+    fn only_session_start_and_end_carry_the_live_claude_pids() {
+        let asked = Cell::new(0);
+        let live = || {
+            asked.set(asked.get() + 1);
+            Some(vec![7, 28764])
+        };
+        let probe = Probe {
+            host: "box",
+            cwd: &|cwd: &str| cwd.to_owned(),
+            lineage: &|_: &str| OWN,
+            live_pids: &live,
+            exists: &|_: &Path| true,
+        };
+        for (event, name) in [
+            ("SessionStart", "session_start"),
+            ("SessionEnd", "session_end"),
+            ("UserPromptSubmit", "user_prompt_submit"),
+            ("Stop", "stop"),
+            ("SubagentStart", "subagent_start"),
+            ("SubagentStop", "subagent_stop"),
+            ("PostToolUse", "post_tool_use_handback"),
+        ] {
+            let post = build(event, &fixture(name), &probe).unwrap();
+            let want = matches!(event, "SessionStart" | "SessionEnd").then(|| vec![7, 28764]);
+            assert_eq!(post.live_claude_pids, want, "{event}");
+            let value = serde_json::to_value(&post).unwrap();
+            assert_eq!(
+                value.get("live_claude_pids").is_some(),
+                want.is_some(),
+                "{event}"
+            );
+        }
+        assert_eq!(
+            asked.get(),
+            2,
+            "the process list is read by the two lifecycle hooks only"
+        );
+    }
+
+    #[test]
     fn source_is_optional_and_read_only_from_session_start() {
         let v = check(
             "SessionStart",
@@ -1247,6 +1301,7 @@ mod build_tests {
             host: "box",
             cwd: &|cwd: &str| cwd.to_owned(),
             lineage: &|_: &str| OWN,
+            live_pids: &|| None,
             exists: &exists,
         };
         assert!(build("SubagentStop", typed, &probe).is_ok());

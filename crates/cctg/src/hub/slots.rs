@@ -778,6 +778,13 @@ impl Slots {
         if matches!(post.event, HookEvent::SessionEnd { .. }) {
             self.scanned.remove(session);
         }
+        for gone in &followup.reaped {
+            info!(
+                session = short(gone),
+                "session ended: its claude process is gone"
+            );
+            self.scanned.remove(gone);
+        }
         if self.registry.sessions.contains_key(session)
             && let Some(conn) = self.pending.remove(session)
         {
@@ -4506,6 +4513,60 @@ again"
         assert_eq!(
             edits_of(&ops, message_id),
             [(CLOSED.to_owned(), Some(permissions::no_keyboard()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_process_died_ends_as_by_its_session_end() {
+        const C: &str = "cccccccc-0000-4000-8000-000000000003";
+        let dir = TempDir::new("slots-reap");
+        let (_fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        connect(&mut slots, 1, A, Some(10));
+        // A nested run of A, with its block.
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(20),
+                parent_claude_pid: Some(10),
+            },
+        ));
+        slots.on_agent(permission(1, "abcde", "p"));
+        slots.pump();
+        assert_eq!(slots.prompts.active().len(), 1);
+        let nested = BlockKey::Nested(B.into());
+        assert!(
+            slots
+                .registry
+                .block(&nested)
+                .is_some_and(|block| block.running)
+        );
+
+        // A's window was closed (its run with it); C starts in the folder.
+        slots.registry.forget_recent_starts();
+        let mut next = start(C, 30);
+        next.live_claude_pids = Some(vec![30]);
+        slots.on_hook(&next);
+        slots.pump();
+
+        assert!(slots.registry.sessions[A].ended);
+        assert!(slots.registry.sessions[B].ended);
+        assert_eq!(slots.registry.sessions[A].agent, None);
+        assert_eq!(
+            slots.registry.sessions[C].slot,
+            Some(SlotId(0)),
+            "the old topic"
+        );
+        assert_eq!(slots.registry.slots.len(), 1, "no #2");
+        assert!(slots.prompts.active().is_empty(), "the prompt is closed");
+        let block = slots.registry.block(&nested).unwrap();
+        assert!(!block.running, "the nested block is finished");
+        assert_eq!(slots.registry.slots[0].current_session.as_deref(), Some(C));
+        assert_eq!(
+            slots.registry.slots[0].pending_separator.as_deref(),
+            Some("── session cccccccc · new ──")
         );
     }
 

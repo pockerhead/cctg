@@ -173,13 +173,19 @@ fn prune(root: &Path, now: SystemTime) -> usize {
     kept
 }
 
-/// Keeps `post` for a later replay. `now` names and ages the file.
+/// Keeps `post` for a later replay. `now` names and ages the file. The live
+/// claude pids are dropped: replayed later, they would end sessions started
+/// after the list was taken.
 pub fn save(root: &Path, post: &HookPost, now: SystemTime) -> Result<(), SpoolError> {
     if !keeps(&post.event) {
         return Err(SpoolError::NotKept);
     }
     let dir = session_dir(root, &post.session_id).ok_or(SpoolError::BadSession)?;
-    let body = serde_json::to_vec(post).map_err(|_| SpoolError::TooLarge)?;
+    let post = HookPost {
+        live_claude_pids: None,
+        ..post.clone()
+    };
+    let body = serde_json::to_vec(&post).map_err(|_| SpoolError::TooLarge)?;
     if body.len() > MAX_FILE {
         return Err(SpoolError::TooLarge);
     }
@@ -341,6 +347,20 @@ mod tests {
             let name = file.file_name().unwrap().to_string_lossy().into_owned();
             assert!(name.ends_with(&format!("-{}.json", post.event_id.as_str())));
         }
+    }
+
+    #[test]
+    fn a_kept_event_loses_its_live_claude_pids() {
+        let dir = TempDir::new("spool-live-pids");
+        let root = dir.path().join("spool");
+        let mut post = start(SESSION);
+        post.live_claude_pids = Some(vec![7, 9]);
+        save(&root, &post, at(1)).unwrap();
+        let kept = pending(&root, SESSION, at(2));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1.event_id, post.event_id);
+        assert_eq!(kept[0].1.live_claude_pids, None);
+        assert_eq!(kept[0].1.event, post.event);
     }
 
     #[test]
