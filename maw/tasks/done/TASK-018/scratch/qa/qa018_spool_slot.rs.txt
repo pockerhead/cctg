@@ -1,0 +1,344 @@
+//! QA (TASK-018), temporary: real `cctg hook` processes against a stopped,
+//! then a real hub (serve_hooks + Slots + Scheduler + fake Telegram).
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::ingress::serve_hooks;
+use cctg::hub::registry::RegistryStore;
+use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
+use cctg::hub::slots::{Options, Slots};
+use cctg::wire::{HookEvent, HookPost, Secret};
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+
+const SECRET: &str = "qa018-secret-0123456789abcdef";
+const S1: &str = "9a018001-0000-4000-8000-000000000001";
+
+#[derive(Default)]
+struct Fake {
+    ops: Mutex<Vec<Op>>,
+    next: AtomicI64,
+}
+
+impl Transport for Fake {
+    async fn execute(&self, op: &Op) -> Delivery {
+        self.ops.lock().unwrap().push(op.clone());
+        let id = 500 + self.next.fetch_add(1, Ordering::SeqCst);
+        match op {
+            Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
+                message_thread_id: id,
+                name: name.clone(),
+                icon_custom_emoji_id: None,
+            })),
+            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => {
+                Ok(Outcome::Sent(Message {
+                    message_id: id,
+                    ..Message::default()
+                }))
+            }
+            _ => Ok(Outcome::Done),
+        }
+    }
+}
+
+impl Fake {
+    fn creates(&self) -> Vec<String> {
+        self.ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|op| match op {
+                Op::CreateTopic { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+struct Root(PathBuf);
+impl Drop for Root {
+    fn drop(&mut self) {
+        for _ in 0..50 {
+            if std::fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Runs a real `cctg hook`; returns (stderr, wall time).
+fn hook(home: &Path, work: &Path, event: &str, extra: Value) -> (String, Duration) {
+    let mut input = json!({
+        "session_id": S1,
+        "cwd": work.to_string_lossy(),
+        "transcript_path": work.join("t.jsonl").to_string_lossy(),
+        "hook_event_name": event,
+    });
+    input
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let started = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        .args(["hook", event])
+        .env("USERPROFILE", home)
+        .env("HOME", home)
+        .env_remove("CCTG_HUB_SECRET")
+        .env_remove("CCTG_HUB_HOOK_ADDR")
+        .env_remove("CCTG_HUB_AGENT_ADDR")
+        .env_remove("CCTG_HOST")
+        .env_remove("CCTG_STATE_DIR")
+        .env_remove("CLAUDE_PID")
+        .env("CLAUDE_CODE_SESSION_ID", S1)
+        .current_dir(work)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let wall = started.elapsed();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty(), "hook stdout must be empty");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!stderr.contains(SECRET));
+    assert!(!stderr.contains(S1), "session id in stderr: {stderr}");
+    (stderr, wall)
+}
+
+fn spool_files(home: &Path) -> Vec<PathBuf> {
+    let dir = home.join(".cctg").join("spool").join(S1);
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_down_hub_then_up_one_topic_in_order() {
+    let root = std::env::temp_dir().join(format!("cctg-qa018-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _guard = Root(root.clone());
+    let (home, work, state) = (root.join("home"), root.join("work"), root.join("state"));
+    for d in [&home.join(".cctg"), &work, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let port = free_port();
+    std::fs::write(
+        home.join(".cctg").join("device.env"),
+        format!(
+            "CCTG_HUB_SECRET={SECRET}\nCCTG_HUB_HOOK_ADDR=127.0.0.1:{port}\n\
+             CCTG_HUB_AGENT_ADDR=127.0.0.1:{}\nCCTG_HOST=qabox\n",
+            free_port()
+        ),
+    )
+    .unwrap();
+
+    // 1. Hub down: SessionStart is kept, one budget (500 ms + process).
+    let (h, w) = (home.clone(), work.clone());
+    let (stderr, wall) = tokio::task::spawn_blocking(move || {
+        hook(&h, &w, "SessionStart", json!({"source": "startup"}))
+    })
+    .await
+    .unwrap();
+    eprintln!("QA down SessionStart: {wall:?} {stderr:?}");
+    assert!(stderr.contains("kept for the next hook"), "{stderr}");
+    assert_eq!(spool_files(&home).len(), 1);
+
+    // 2. Still down: UserPromptSubmit with a kept start costs one budget
+    //    (300 ms), not 300 + 500; its own event is not kept (no text).
+    let (h, w) = (home.clone(), work.clone());
+    let (stderr, wall_prompt) = tokio::task::spawn_blocking(move || {
+        hook(&h, &w, "UserPromptSubmit", json!({"prompt": "secret prompt text", "prompt_id": "p1"}))
+    })
+    .await
+    .unwrap();
+    eprintln!("QA down UserPromptSubmit: {wall_prompt:?} {stderr:?}");
+    assert!(stderr.contains("hook event not delivered"), "{stderr}");
+    assert_eq!(spool_files(&home).len(), 1, "prompt not kept");
+
+    // 3. Still down: 14 more kept events (SessionEnd x14 is not realistic,
+    //    so plant copies of the start file); a SessionEnd costs one budget.
+    let first = spool_files(&home)[0].clone();
+    let body = std::fs::read_to_string(&first).unwrap();
+    for n in 0..14u32 {
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let mut v = v;
+        let id = format!("{:032x}", 0xabc000 + n);
+        v["event_id"] = json!(id);
+        let name = first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .split('-')
+            .next()
+            .unwrap()
+            .parse::<u128>()
+            .unwrap()
+            + 1
+            + n as u128;
+        std::fs::write(
+            first.with_file_name(format!("{name:020}-{id}.json")),
+            v.to_string(),
+        )
+        .unwrap();
+    }
+    assert_eq!(spool_files(&home).len(), 15);
+    let (h, w) = (home.clone(), work.clone());
+    let (stderr, wall_end) = tokio::task::spawn_blocking(move || {
+        hook(&h, &w, "SessionEnd", json!({"reason": "other"}))
+    })
+    .await
+    .unwrap();
+    eprintln!("QA down SessionEnd with 15 kept: {wall_end:?} {stderr:?}");
+    assert!(wall_end < Duration::from_millis(1500), "SessionEnd budget: {wall_end:?}");
+    assert_eq!(spool_files(&home).len(), 16);
+    // Undo the planted copies and the end: keep only the real start.
+    for f in spool_files(&home).into_iter().skip(1) {
+        std::fs::remove_file(f).unwrap();
+    }
+    assert_eq!(spool_files(&home).len(), 1);
+
+    // 4. The hub comes up (real serve_hooks, Slots, Scheduler, fake Telegram).
+    let fake = Arc::new(Fake::default());
+    let (scheduler, outbox) = Scheduler::new(
+        fake.clone(),
+        BucketConfig {
+            capacity: 100,
+            refill_every: Duration::from_millis(10),
+            min_gap: Duration::ZERO,
+        },
+    );
+    let store = RegistryStore::open(&state).unwrap();
+    let registry = store.load().unwrap();
+    let (slots, _view) = Slots::new(
+        registry,
+        store,
+        outbox,
+        Options {
+            grace: Duration::ZERO,
+            ..Options::default()
+        },
+    );
+    let (hooks_tx, mut hooks_rx) = mpsc::channel::<HookPost>(64);
+    let (slot_hooks, slot_hooks_rx) = mpsc::channel::<HookPost>(64);
+    let (_agents, agents_rx) = mpsc::channel(8);
+    let (_control, control_rx) = mpsc::unbounded_channel();
+    let seen: Arc<Mutex<Vec<HookPost>>> = Arc::default();
+    let tee = seen.clone();
+    let tasks = vec![
+        tokio::spawn(scheduler.run()),
+        tokio::spawn(slots.run(agents_rx, slot_hooks_rx, control_rx)),
+        tokio::spawn(serve_hooks(
+            cctg::hub::ingress::bind(format!("127.0.0.1:{port}").parse().unwrap())
+                .await
+                .unwrap(),
+            Secret::parse(SECRET).unwrap(),
+            hooks_tx,
+        )),
+        tokio::spawn(async move {
+            while let Some(post) = hooks_rx.recv().await {
+                tee.lock().unwrap().push(post.clone());
+                let _ = slot_hooks.send(post).await;
+            }
+        }),
+    ];
+
+    // 5. The next hook of the session: start first, then its own prompt.
+    let (h, w) = (home.clone(), work.clone());
+    let (stderr, _) = tokio::task::spawn_blocking(move || {
+        hook(&h, &w, "UserPromptSubmit", json!({"prompt": "x", "prompt_id": "p2"}))
+    })
+    .await
+    .unwrap();
+    assert!(stderr.is_empty(), "delivered quietly: {stderr}");
+    assert!(spool_files(&home).is_empty(), "spool emptied");
+    assert!(
+        !home.join(".cctg").join("spool").join(S1).exists(),
+        "session dir removed"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let kinds: Vec<&'static str> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| match p.event {
+            HookEvent::SessionStart { .. } => "start",
+            HookEvent::UserPromptSubmit { .. } => "prompt",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["start", "prompt"], "in order, once");
+
+    // 6. Re-plant the delivered start (a crash between 204 and delete) and
+    //    run two more hooks: no second delivery reaches the actor, no topic.
+    let start_post = seen.lock().unwrap()[0].clone();
+    let dir = home.join(".cctg").join("spool").join(S1);
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::fs::write(
+        dir.join(format!("{now:020}-{}.json", start_post.event_id.as_str())),
+        serde_json::to_vec(&start_post).unwrap(),
+    )
+    .unwrap();
+    let (h, w) = (home.clone(), work.clone());
+    tokio::task::spawn_blocking(move || {
+        hook(&h, &w, "Stop", json!({"last_assistant_message": "done"}))
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let kinds: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.event.kind().to_string())
+        .collect();
+    eprintln!("QA events reaching the actor: {kinds:?}");
+    assert_eq!(
+        kinds.iter().filter(|k| k.as_str() == "session_start").count(),
+        1,
+        "the re-planted start is dropped by dedup"
+    );
+    let creates = fake.creates();
+    eprintln!("QA createForumTopic: {creates:?}");
+    assert_eq!(creates.len(), 1, "one topic");
+    let reg: Value =
+        serde_json::from_str(&std::fs::read_to_string(state.join("registry.json")).unwrap())
+            .unwrap();
+    assert_eq!(reg["slots"].as_array().unwrap().len(), 1);
+    assert_eq!(reg["slots"][0]["current_session"], S1);
+    assert_eq!(reg["sessions"][S1]["kind"], json!({"kind": "top_level"}));
+    eprintln!(
+        "QA budgets: SessionStart {:?}, UserPromptSubmit {:?}, SessionEnd(15 kept) {:?}",
+        wall, wall_prompt, wall_end
+    );
+    for t in tasks {
+        t.abort();
+    }
+}

@@ -191,6 +191,36 @@ fn no_hub_listening_is_quiet_and_fast() {
 }
 
 #[test]
+fn an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure() {
+    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    // No home and no CCTG_STATE_DIR: the device has no spool.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        .args(["hook", "Stop"])
+        .env_remove("USERPROFILE")
+        .env_remove("HOME")
+        .env_remove("CCTG_STATE_DIR")
+        .env("CCTG_HUB_SECRET", SECRET)
+        .env("CCTG_HUB_HOOK_ADDR", port.to_string())
+        .env("CCTG_HOST", "box")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cctg starts");
+    let mut input = child.stdin.take().unwrap();
+    let _ = input.write_all(&fixture("stop"));
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert_quiet(&output, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("hook event not delivered"), "{stderr}");
+    assert!(!stderr.contains("not kept"), "{stderr}");
+}
+
+#[test]
 fn broken_input_and_missing_config_exit_zero_quietly() {
     let home_ok = home("broken", Some("127.0.0.1:9"));
     let whole = fixture("session_start");

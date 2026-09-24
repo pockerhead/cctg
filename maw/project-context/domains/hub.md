@@ -49,6 +49,8 @@
 
 - 2026-09-24 (TASK-016 QA): `hub/ingress.rs` forwards only an explicit list of `AgentMsg` variants after registration and drops others as a repeated handshake. A new `AgentMsg` variant needs its arm in that list and at least one test that sends the frame over a real TCP link to `serve_agents` (`tests/stream_e2e.rs` is the model); tests that inject `AgentEvent` into `Slots` directly cannot catch it.
 
+- 2026-09-24 (TASK-018): tests that start a `Slots` actor must not leave its saver writing after the test's TempDir is gone; `hub/testdir.rs` Drop retries removal and the first TempDir of a run removes `cctg-test-*` dirs older than 1 h. A Cargo project (Cargo.toml) under a task's scratch/ gets indexed by the IDE and locks the folder: keep scratch code as `.rs.txt`.
+
 ## Pointers
 - `CLAUDE.md` (repo root), section "Архитектура / 1. cctg hub".
 - https://github.com/robertelee78/claude-telegram-mirror : reference for daemon/hook/cli single binary and topic-per-session layout (Linux/tmux, organisation only).

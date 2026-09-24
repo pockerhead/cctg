@@ -1,0 +1,8 @@
+Q1 permission prompts are not first (scheduler next_permission -> None): KILLED exit=101
+    thread 'tokio-rt-worker' (7800) panicked at crates\cctg\tests\soak.rs:1401:5:
+Q2 a 429 does not pause the queue: KILLED exit=101
+    thread 'tokio-rt-worker' (37004) panicked at crates\cctg\tests\soak.rs:1589:9:
+    a call 155.3047ms after a 429
+Q3 Q1 with the "429s fell into the burst" check neutralised: does the permission assertion itself catch it: KILLED exit=101
+    thread 'tokio-rt-worker' (25748) panicked at crates\cctg\tests\soak.rs:1414:5:
+    the prompt of A2 overtook stream lines of its own topic written before it

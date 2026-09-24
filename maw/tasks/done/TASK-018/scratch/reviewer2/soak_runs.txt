@@ -1,0 +1,15 @@
+run 1 exit 0 25s mode: fake Telegram; duration 15.7 s; 104 Telegram calls; 2 hub runs soak: ok 
+| delete | deleteMessage (service messages) | 14 |
+- topics: 3 (A, A #2, B); separators: 1; service messages: 14 shown, 14 deleted, 0 left
+- 429: 2 (retry_after 1s), each followed by a pause of the whole queue and one retry; other errors: 0; answered locally (live: reactions and callback answers on simulated ids): 0
+- permission latency (request written to the agent -> sendMessage): A 46 ms (other topic), A #2 201 ms (own topic behind its stream); A #2 burst lines written before the request and sent after the prompt: 28
+run 2 exit 0 20s mode: fake Telegram; duration 15.4 s; 104 Telegram calls; 2 hub runs soak: ok 
+| delete | deleteMessage (service messages) | 14 |
+- topics: 3 (A, A #2, B); separators: 1; service messages: 14 shown, 14 deleted, 0 left
+- 429: 2 (retry_after 1s), each followed by a pause of the whole queue and one retry; other errors: 0; answered locally (live: reactions and callback answers on simulated ids): 0
+- permission latency (request written to the agent -> sendMessage): A 31 ms (other topic), A #2 189 ms (own topic behind its stream); A #2 burst lines written before the request and sent after the prompt: 28
+run 3 exit 0 19s mode: fake Telegram; duration 15.3 s; 102 Telegram calls; 2 hub runs soak: ok 
+| delete | deleteMessage (service messages) | 13 |
+- topics: 3 (A, A #2, B); separators: 1; service messages: 13 shown, 13 deleted, 0 left
+- 429: 2 (retry_after 1s), each followed by a pause of the whole queue and one retry; other errors: 0; answered locally (live: reactions and callback answers on simulated ids): 0
+- permission latency (request written to the agent -> sendMessage): A 31 ms (other topic), A #2 189 ms (own topic behind its stream); A #2 burst lines written before the request and sent after the prompt: 28

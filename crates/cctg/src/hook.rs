@@ -12,11 +12,16 @@
 //! [`post`] again with the same value re-sends the same event, which the hub
 //! drops as a repeat.
 //!
+//! A session start or end the hub did not take is kept in the device spool
+//! ([`crate::spool`]); every hook of the same session first sends what its
+//! session has kept, in order, then its own event. Everything shares the one
+//! POST budget: a hub that is down costs a hook no more than before.
+//!
 //! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
 
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -25,6 +30,7 @@ use tracing::{debug, warn};
 
 use crate::device::{self, DeviceConfig};
 use crate::proctree::{self, Lineage};
+use crate::spool;
 use crate::wire::{HOOK_PATH, HookEvent, HookPost, Secret};
 
 /// Budget of the POST, connect included. `SessionEnd` hooks share 1.5 s in
@@ -68,10 +74,63 @@ pub async fn run(event: &str) {
             return;
         }
     };
+    let spool = config.state_dir.as_deref().map(spool::dir);
     let timeout = post_timeout(&hook_post.event);
-    if let Err(error) = post(&config.hook_addr, secret, &hook_post, timeout).await {
-        warn!(event = hook_post.event.kind(), %error, "hook event not delivered");
+    let Err(error) = deliver(
+        spool.as_deref(),
+        &config.hook_addr,
+        secret,
+        &hook_post,
+        timeout,
+    )
+    .await
+    else {
+        return;
+    };
+    let kept = match spool {
+        Some(root) => spool::save(&root, &hook_post, SystemTime::now()),
+        None if !spool::keeps(&hook_post.event) => Err(spool::SpoolError::NotKept),
+        None => Err(spool::SpoolError::Io(std::io::ErrorKind::NotFound)),
+    };
+    match kept {
+        Ok(()) => {
+            warn!(event = hook_post.event.kind(), %error, "hook event not delivered; kept for the next hook")
+        }
+        Err(spool::SpoolError::NotKept) => {
+            warn!(event = hook_post.event.kind(), %error, "hook event not delivered");
+        }
+        Err(problem) => warn!(
+            event = hook_post.event.kind(),
+            %error,
+            %problem,
+            "hook event not delivered and not kept"
+        ),
     }
+}
+
+/// Sends what the session kept in `spool` (when there is one), then `post`,
+/// all within `timeout`. An error means `post` did not reach the hub: either
+/// it failed itself or a kept event before it did (then it was not tried,
+/// so the order holds).
+async fn deliver(
+    spool: Option<&Path>,
+    addr: &str,
+    secret: &Secret,
+    hook_post: &HookPost,
+    timeout: Duration,
+) -> Result<(), PostError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    if let Some(root) = spool {
+        let sent = spool::replay(root, &hook_post.session_id, addr, secret, deadline).await?;
+        if sent > 0 {
+            debug!(sent, "kept hook events delivered");
+        }
+    }
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if left.is_zero() {
+        return Err(PostError::Timeout(timeout));
+    }
+    post(addr, secret, hook_post, left).await
 }
 
 fn post_timeout(event: &HookEvent) -> Duration {
@@ -446,6 +505,110 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_millis(1500));
         assert!(!format!("{error} {error:?}").contains(SECRET));
+    }
+
+    fn kept_start() -> HookPost {
+        HookPost::new(
+            "box".into(),
+            sample().session_id,
+            "/w".into(),
+            "/w/s.jsonl".into(),
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(7),
+                parent_claude_pid: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn kept_events_of_the_session_go_before_its_own() {
+        let dir = crate::hub::testdir::TempDir::new("hook-deliver");
+        let root = dir.path().join("spool");
+        let kept = kept_start();
+        spool::save(&root, &kept, SystemTime::now()).unwrap();
+        let (addr, mut events) = hub().await;
+        let own = sample();
+        let timeout = Duration::from_secs(5);
+        deliver(Some(&root), &addr, &secret(), &own, timeout)
+            .await
+            .unwrap();
+        assert_eq!(events.recv().await, Some(kept));
+        assert_eq!(events.recv().await, Some(own));
+        assert!(spool::pending(&root, &sample().session_id, SystemTime::now()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_kept_event_stops_the_hook_within_its_budget() {
+        let dir = crate::hub::testdir::TempDir::new("hook-deliver-fail");
+        let root = dir.path().join("spool");
+        spool::save(&root, &kept_start(), SystemTime::now()).unwrap();
+        // Accepts, counts and never answers.
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let _held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let result = deliver(Some(&root), &addr, &secret(), &sample(), timeout).await;
+        assert!(matches!(result, Err(PostError::Timeout(_))), "{result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        // The own event was never tried: it would overtake the kept start.
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            spool::pending(&root, &sample().session_id, SystemTime::now()).len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_kept_event_keeps_the_own_event_back() {
+        let dir = crate::hub::testdir::TempDir::new("hook-deliver-refused");
+        let root = dir.path().join("spool");
+        spool::save(&root, &kept_start(), SystemTime::now()).unwrap();
+        // Answers every request 503 at once and counts them.
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let result = deliver(
+            Some(&root),
+            &addr,
+            &secret(),
+            &sample(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(result, Err(PostError::Status(503)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Time was left, yet the own event was not sent past the kept start.
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

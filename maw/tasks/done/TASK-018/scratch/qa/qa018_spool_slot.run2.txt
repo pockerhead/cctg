@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized] target(s) in 0.19s
+     Running tests\qa018_spool_slot.rs (C:\Users\user\AppData\Local\Temp/cctg-018-qa-target\debug\deps\qa018_spool_slot-6fc4de04956650b6.exe)
+
+running 1 test
+QA down SessionStart: 541.4379ms " WARN hook event not delivered; kept for the next hook event=\"session_start\" error=hub did not answer within 499.9198ms\n"
+QA down UserPromptSubmit: 318.4461ms " WARN hook event not delivered event=\"user_prompt_submit\" error=hub did not answer within 294.5946ms\n"
+QA down SessionEnd with 15 kept: 527.9152ms " WARN hook event not delivered; kept for the next hook event=\"session_end\" error=hub did not answer within 440.8773ms\n"
+QA events reaching the actor: ["session_start", "user_prompt_submit", "stop"]
+QA createForumTopic: ["[qabox] work · 9a018001"]
+QA budgets: SessionStart 541.4379ms, UserPromptSubmit 318.4461ms, SessionEnd(15 kept) 527.9152ms
+test qa_down_hub_then_up_one_topic_in_order ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
+
+exit 0

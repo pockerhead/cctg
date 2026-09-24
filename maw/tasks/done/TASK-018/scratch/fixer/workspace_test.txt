@@ -1,0 +1,691 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+    Finished `test` profile [unoptimized] target(s) in 38.50s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\cctg-153a26ffdcdb83a3.exe)
+
+running 408 tests
+test agent::tests::install_command_quotes_the_absolute_path_for_powershell ... ok
+test agent::tests::panic_message_is_fixed_stderr_only ... ok
+test agent::tests::link_plan_rules ... ok
+test agent::tests::backoff_grows_to_the_cap_with_jitter ... ok
+test channel::tests::a_full_hub_queue_is_a_tool_error ... ok
+test channel::tests::a_verdict_is_forwarded_without_a_relayed_request_but_never_malformed ... ok
+test channel::tests::a_notification_without_json_rpc_2_0_does_not_initialize ... ok
+test channel::tests::a_duplicate_permission_request_is_relayed_once ... ok
+test channel::tests::bad_calls_are_answered_not_fatal ... ok
+test channel::tests::inbound_waits_for_initialized_and_keeps_valid_meta_byte_for_byte ... ok
+test channel::tests::initialize_declares_the_channel ... ok
+test agent::tests::closing_stdin_ends_the_loop_and_the_link ... ok
+test channel::tests::held_notifications_are_bounded ... ok
+test agent::tests::dropping_the_receiver_stops_the_link ... ok
+test channel::tests::meta_keys ... ok
+test channel::tests::malformed_permission_requests_are_not_relayed ... ok
+test channel::tests::initialize_negotiates_the_protocol_version ... ok
+test channel::tests::permission_relay_round_trip ... ok
+test channel::tests::ping_answers_an_empty_result_at_any_time ... ok
+test channel::tests::broken_input_gets_controlled_answers ... ok
+test channel::tests::only_json_rpc_2_0_with_structured_params_is_served ... ok
+test channel::tests::reply_goes_to_the_hub ... ok
+test device::tests::a_bad_secret_is_named_but_not_echoed ... ok
+test channel::tests::tools_list_offers_reply_only ... ok
+test device::tests::defaults_and_overrides ... ok
+test device::tests::canonical_cwd_expands_short_names_and_case ... ok
+test channel::tests::without_a_hub_reply_says_why ... ok
+test device::tests::canonical_cwd_resolves_or_keeps_the_input ... ok
+test device::tests::empty_process_values_do_not_override_device_file_values ... ok
+test device::tests::the_state_dir_is_absolute_or_under_home ... ok
+test device::tests::verbatim_prefixes_are_dropped ... ok
+test hook::build_tests::internal_agents_are_dropped ... ok
+test hook::build_tests::each_event_carries_its_fields_and_nothing_else ... ok
+test hook::build_tests::misrouted_and_unknown_events_are_skipped ... ok
+test hook::build_tests::broken_input_is_skipped_without_panicking ... ok
+test hook::build_tests::nesting_comes_from_the_lineage ... ok
+test hook::build_tests::other_tools_and_incomplete_handbacks_are_skipped ... ok
+test hook::build_tests::source_is_optional_and_read_only_from_session_start ... ok
+test channel::tests::a_recent_duplicate_is_suppressed_and_an_evicted_verdict_still_passes ... ok
+test agent::tests::a_transcript_read_is_answered_over_the_link_and_never_reaches_claude ... ok
+test hook::build_tests::only_the_prompt_hook_uses_the_short_post_timeout ... ok
+test channel::tests::prompts_answered_in_the_terminal_never_stop_the_relay ... ok
+test agent::tests::frames_are_lines_and_an_oversized_line_is_skipped_whole ... ok
+test hook::tests::a_wrong_secret_is_refused ... ok
+test hook::tests::a_truncated_or_foreign_status_line_is_not_success ... ok
+test hook::build_tests::long_texts_are_capped_on_a_char_boundary ... ok
+test hook::tests::status_lines ... ok
+test hub::api::tests::decodes_ok_result_and_ignores_unknown_fields ... ok
+test hub::api::tests::maps_429_to_retry_after ... ok
+test hub::api::tests::maps_other_errors_with_description ... ok
+test device::tests::env_file_is_read_without_touching_the_environment ... ok
+test hub::buffer::tests::an_old_file_without_a_buffer_and_a_full_one_both_load ... ok
+test hub::buffer::tests::closing_a_period_forgets_its_marks_and_hands_back_the_note ... ok
+test hub::buffer::tests::one_more_than_the_cap_drops_the_oldest ... ok
+test hub::buffer::tests::resume_data_fits_round_trips_and_never_looks_like_a_verdict ... ok
+test hub::buffer::tests::the_resume_text_names_the_session_and_the_answers_fit_a_toast ... ok
+test agent::tests::a_verdict_sent_again_after_a_reconnect_is_passed_on_once_and_acked_again ... ok
+test hub::commands::tests::bad_paths_get_a_notice_and_the_worker_keeps_going ... ok
+test agent::tests::a_split_hub_line_survives_concurrent_outbox_traffic ... ok
+test hub::commands::tests::missing_and_unreadable_files_become_notices ... ok
+test hook::tests::kept_events_of_the_session_go_before_its_own ... ok
+test hub::commands::tests::only_our_commands_are_commands ... ok
+test hub::commands::tests::large_reply_goes_as_one_document ... ok
+test hub::commands::tests::other_errors_do_not_switch_to_a_document ... ok
+test hub::commands::tests::multi_chunk_reply_keeps_order ... ok
+test hub::commands::tests::parses_arguments ... ok
+test hub::commands::tests::oversized_transcripts_become_a_notice ... ok
+test hub::commands::tests::ambiguous_prefix_lists_candidates ... ok
+test hub::commands::tests::unreadable_projects_root_has_a_notice ... ok
+test channel::tests::long_replies_are_capped ... ok
+test hub::config::tests::a_bad_hub_secret_is_named_but_not_echoed ... ok
+test hub::commands::tests::rejected_fallback_document_is_not_retried ... ok
+test hub::config::tests::chat_id_must_use_the_bot_api_form ... ok
+test hub::config::tests::debug_hides_token_user_ids_and_hub_secret ... ok
+test hub::config::tests::env_file_token_does_not_enter_process_environment_child ... ignored, run by env_file_token_does_not_enter_process_environment in an isolated process
+test hub::commands::tests::too_long_switches_to_a_document_once ... ok
+test hub::config::tests::listeners_default_to_loopback ... ok
+test hub::config::tests::missing_and_bad_values_are_named_but_not_echoed ... ok
+test hub::config::tests::missing_env_file_is_named ... ok
+test hub::config::tests::non_loopback_listeners_need_an_explicit_address ... ok
+test hub::config::tests::paths_have_defaults_and_overrides ... ok
+test hub::config::tests::reads_a_complete_config ... ok
+test hub::ingress::tests::a_body_split_across_writes_is_read_whole ... ok
+test hub::ingress::tests::a_full_queue_answers_503_and_the_resend_is_delivered ... ok
+test hub::commands::tests::worker_handles_the_next_command_after_failed_delivery ... ok
+test hub::ingress::tests::a_registered_agent_talks_both_ways ... ok
+test hub::ingress::tests::a_repeated_post_is_delivered_once ... ok
+test hook::tests::a_resent_post_reaches_the_hub_once ... ok
+test hub::ingress::tests::a_wrong_secret_is_rejected_before_register ... ok
+test hub::ingress::tests::an_early_401_survives_a_body_of_the_full_limit ... ok
+test hub::config::tests::env_file_token_does_not_enter_process_environment ... ok
+test hub::ingress::tests::another_version_is_rejected_as_such ... ok
+test hub::ingress::tests::an_overlong_line_closes_the_link ... ok
+test hub::ingress::tests::dedup_forgets_by_age_and_by_count ... ok
+test hub::ingress::tests::a_split_agent_line_survives_concurrent_outbound_traffic ... ok
+test hub::ingress::tests::bad_requests_get_errors_and_no_event ... ok
+test hub::ingress::tests::short_ids_cut_at_eight_chars ... ok
+test hub::ingress::tests::listeners_bind_loopback_and_explicit_addresses ... ok
+test hub::ingress::tests::a_body_of_exactly_the_limit_is_accepted ... ok
+test hub::ingress::tests::two_stops_of_one_prompt_are_two_events ... ok
+test hub::ingress::tests::the_header_limit_is_exact ... ok
+test hub::commands::tests::replies_match_the_library_on_fixtures ... ok
+test hub::permissions::tests::a_failed_final_edit_is_due_again_until_it_is_given_up ... ok
+test hub::permissions::tests::a_full_book_forgets_finished_then_expires_open_never_selected ... ok
+test hub::permissions::tests::a_huge_prompt_and_its_final_texts_stay_within_the_limit ... ok
+test hub::permissions::tests::a_prompt_that_ends_before_its_message_id_is_edited_once_the_id_comes ... ok
+test hub::permissions::tests::callback_data_fits_and_round_trips ... ok
+test hub::permissions::tests::duplicates_are_refused_per_session_and_the_same_id_lives_in_two ... ok
+test hub::permissions::tests::foreign_callback_data_is_not_a_verdict ... ok
+test hub::permissions::tests::the_answer_is_fixed_once_and_ends_in_one_final_edit ... ok
+test hub::permissions::tests::unsent_lists_only_active_prompts_not_handed_out ... ok
+test hub::permissions::tests::waiting_counts_active_prompts_until_the_turn_ends ... ok
+test hub::offset::tests::an_offset_older_than_a_day_is_ignored ... ok
+test hub::registry::tests::a_clear_hand_off_is_only_for_a_clear_start_in_time ... ok
+test hub::registry::tests::a_failed_block_waits_for_the_tick_and_is_given_up_in_the_end ... ok
+test hub::registry::tests::a_failed_call_is_not_repeated_until_retry ... ok
+test hub::registry::tests::a_gone_topic_is_replaced_exactly_once ... ok
+test hub::registry::tests::a_hook_only_session_is_bound_by_its_agent_later ... ok
+test hub::registry::tests::a_late_gone_report_during_a_replacement_changes_nothing ... ok
+test hub::registry::tests::a_legacy_subagent_record_is_dropped_on_load ... ok
+test hub::registry::tests::a_broken_or_foreign_file_refuses_to_load_without_quoting_it ... ok
+test hub::registry::tests::a_nested_run_gets_one_block_in_its_parents_topic ... ok
+test hub::registry::tests::a_new_transcript_streams_from_its_start_and_a_resume_keeps_its_offset ... ok
+test hub::offset::tests::saves_and_reloads_across_instances ... ok
+test hub::registry::tests::a_parent_pid_that_is_the_session_itself_is_nested_unknown_parent ... ok
+test hub::registry::tests::a_reply_finds_only_its_own_sessions_subagent_block ... ok
+test hub::registry::tests::a_resumed_session_returns_to_its_slot ... ok
+test hub::registry::tests::a_reused_pid_after_a_lost_end_takes_the_first_free_slot ... ok
+test hub::registry::tests::a_separator_stays_pending_until_it_is_delivered ... ok
+test hub::registry::tests::a_session_after_a_dead_one_reuses_the_slot_with_one_separator ... ok
+test hub::registry::tests::a_session_end_ends_a_session_whose_start_had_no_pid ... ok
+test hub::offset::tests::garbage_or_leftover_temp_file_does_not_break_start ... ok
+test hub::registry::tests::an_unclear_first_send_is_never_repeated ... ok
+test hub::registry::tests::block_work_hands_out_at_most_its_limit ... ok
+test hub::registry::tests::a_nested_answer_is_kept_in_the_registry_until_the_run_ends ... ok
+test hub::registry::tests::a_restart_forgets_connections_but_keeps_slots ... ok
+test hub::registry::tests::clear_end_before_start_stays_in_its_slot ... ok
+test hub::registry::tests::clear_in_one_process_stays_in_its_slot ... ok
+test hub::registry::tests::concurrent_sessions_get_new_ordinals_and_free_slots_are_reused_first ... ok
+test hub::registry::tests::edits_wait_for_the_grace_but_creations_do_not ... ok
+test hub::registry::tests::folder_key_normalizes_windows_spellings_only ... ok
+test hub::registry::tests::folder_name_keeps_the_original_spelling ... ok
+test hub::registry::tests::folder_spellings_share_one_slot ... ok
+test hub::registry::tests::icons_come_from_the_offered_set ... ok
+test hub::registry::tests::nested_runs_and_subagents_get_no_slot ... ok
+test hub::registry::tests::nested_start_of_a_known_top_level_does_not_take_its_slot ... ok
+test hub::registry::tests::blocks_survive_a_restart_without_a_second_send ... ok
+test hub::registry::tests::prompt_hooks_of_an_unknown_session_create_nothing ... ok
+test hub::registry::tests::a_slot_buffer_survives_a_restart_and_an_older_file_loads_without_one ... ok
+test hub::registry::tests::rapid_session_changes_keep_only_the_latest_separator ... ok
+test hub::registry::tests::short_id_becomes_the_ai_title ... ok
+test hub::registry::tests::states_map_to_icons_from_the_list ... ok
+test hook::tests::a_refused_kept_event_keeps_the_own_event_back ... ok
+test hub::registry::tests::subagent_records_are_bounded_oldest_settled_first ... ok
+test hub::registry::tests::the_agent_of_a_nested_run_is_never_bound ... ok
+test hub::registry::tests::the_end_of_a_nested_resume_of_a_live_session_does_not_end_it ... ok
+test hub::registry::tests::the_end_of_a_nested_resume_of_the_parent_itself_does_not_end_it ... ok
+test hub::registry::tests::the_pid_of_a_cleared_process_names_the_new_session ... ok
+test hub::registry::tests::two_starts_after_a_death_take_the_old_slot_and_one_new_ordinal ... ok
+test hub::registry::tests::titles_fit_and_keep_host_and_ordinal ... ok
+test hub::scheduler::tests::a_line_telegram_rejects_with_a_4xx_does_not_break_its_stream ... ok
+test hub::scheduler::tests::a_permission_prompt_overtakes_the_stream_lines_of_its_topic ... ok
+test hub::scheduler::tests::a_refused_merged_message_answers_none_of_its_lines_as_merged ... ok
+test hub::scheduler::tests::a_merged_message_stays_within_the_telegram_limit ... ok
+test hub::scheduler::tests::default_bucket_fits_twenty_per_minute ... ok
+test hub::scheduler::tests::after_a_refused_line_its_topic_sends_nothing_until_a_restart_line ... ok
+test hub::scheduler::tests::failed_attempts_spend_tokens ... ok
+test hub::scheduler::tests::mixed_chain_in_one_topic_keeps_enqueue_order ... ok
+test hub::scheduler::tests::permission_never_overtakes_its_own_topic ... ok
+test hub::scheduler::tests::permission_overtakes_other_topics_only ... ok
+test hub::scheduler::tests::permission_prompt_jumps_the_queue ... ok
+test hub::scheduler::tests::group_limit_and_topic_order_hold ... ok
+test hub::scheduler::tests::reactions_are_unmetered_and_the_newest_one_per_message_wins ... ok
+test hub::scheduler::tests::repeated_429_is_one_attempt_per_retry_after ... ok
+test hub::scheduler::tests::repeated_edits_of_one_message_coalesce ... ok
+test hub::scheduler::tests::retried_permission_keeps_topic_order ... ok
+test hub::scheduler::tests::retry_after_pauses_everything_and_retries_once ... ok
+test hub::scheduler::tests::stops_after_outbox_is_dropped_and_queue_drained ... ok
+test hub::scheduler::tests::stream_lines_go_one_per_message_while_the_budget_has_room ... ok
+test hub::scheduler::tests::stream_lines_held_back_by_the_limit_merge_in_order_without_loss ... ok
+test hub::scheduler::tests::topic_mutations_and_edits_do_not_spend_message_tokens ... ok
+test hub::scheduler::tests::zero_retry_after_still_pauses_for_one_second ... ok
+test hub::registry::tests::duplicate_topic_ids_and_slot_identities_refuse_to_load ... ok
+test hub::sessions::tests::missing_root_is_reported ... ok
+test hub::sessions::tests::a_slot_topic_reads_its_current_session ... ok
+test hub::sessions::tests::newest_session_wins_without_a_prefix ... ok
+test hub::registry::tests::saves_are_atomic_and_round_trip ... ok
+test hub::sessions::tests::session_id_shape ... ok
+test hub::sessions::tests::non_session_entries_are_skipped ... ok
+test hub::sessions::tests::prefix_selects_one_or_lists_candidates ... ok
+test hub::slots::tests::a_burst_of_photos_gets_one_notice_a_minute ... ok
+test hub::sessions::tests::subagent_transcripts_are_never_sessions ... ok
+test hub::slots::tests::a_busy_queue_leaves_the_rest_of_a_chunk_in_the_file ... ok
+test hub::slots::tests::a_chunk_for_another_session_on_the_connection_is_dropped ... ok
+test hub::scheduler::tests::sustained_edits_do_not_starve_a_ready_message ... ok
+test hub::ingress::tests::one_connection_carries_at_most_one_event ... ok
+test hub::registry::tests::old_ended_sessions_are_pruned_but_current_ones_stay ... ok
+test agent::tests::a_rejected_secret_keeps_retrying_quietly ... ok
+test agent::tests::dropping_the_outbox_stops_reconnects_while_the_hub_is_unreachable ... ok
+test hook::tests::a_silent_hub_costs_at_most_the_timeout ... ok
+test hook::tests::a_failed_kept_event_stops_the_hook_within_its_budget ... ok
+test agent::tests::one_replay_runs_at_a_time ... ok
+test hub::slots::tests::a_frame_read_before_clear_is_not_attributed_to_the_new_session ... ok
+test hub::slots::tests::a_full_link_queue_keeps_the_rest_in_order_for_the_next_try ... ok
+test agent::tests::the_agent_reconnects_and_registers_again_after_a_hub_restart ... ok
+test hub::slots::tests::a_channel_record_of_another_server_leaves_the_reaction ... ok
+test hub::slots::tests::a_deleted_topic_is_replaced_once ... ok
+test agent::tests::the_channel_relays_both_ways_and_survives_a_hub_restart ... ok
+test hub::slots::tests::a_late_answer_of_an_earlier_period_never_takes_the_new_button ... ok
+test hub::slots::tests::a_full_prompt_book_expires_its_oldest_prompt_visibly ... ok
+test hub::slots::tests::a_cut_transcript_is_read_again_from_its_start ... ok
+test hub::slots::tests::a_huge_call_description_still_fits_one_message ... ok
+test hook::tests::no_hub_is_an_error_within_the_timeout ... ok
+test hub::slots::tests::a_late_reply_cannot_cross_into_a_reused_slot ... ok
+test hub::slots::tests::a_multi_chunk_reply_is_rejected_atomically_at_the_cap ... ok
+test hub::slots::tests::a_dead_slot_shows_one_resume_button_that_records_the_wish ... ok
+test hub::slots::tests::a_first_send_cut_off_by_a_restart_stays_unsent ... ok
+test hub::slots::tests::a_clear_in_the_same_process_streams_the_new_session_after_one_separator ... ok
+test hub::slots::tests::a_gone_topic_during_a_session_change_is_replaced_once ... ok
+test hub::slots::tests::a_nested_answer_after_its_parent_ended_still_shows ... ok
+test hub::slots::tests::a_late_body_read_never_overwrites_a_newer_one ... ok
+test hub::slots::tests::a_block_confirmed_after_its_session_ended_is_marked_lost ... ok
+test hub::slots::tests::a_permission_request_consumed_after_session_end_is_dropped ... ok
+test hub::slots::tests::a_held_answer_goes_out_when_the_agent_never_answers ... ok
+test hub::slots::tests::a_nested_resume_of_a_top_level_id_makes_no_block_and_no_topic ... ok
+test hub::slots::tests::a_nested_run_shows_one_block_and_its_answer_only_there ... ok
+test hub::slots::tests::a_legacy_subagent_record_never_becomes_a_block ... ok
+test hub::slots::tests::a_prompt_reaches_its_topic_with_two_bounded_buttons ... ok
+test hub::slots::tests::a_nested_answer_survives_a_restart_before_its_end ... ok
+test hub::slots::tests::a_nested_resume_ending_leaves_the_prompt_open ... ok
+test hub::slots::tests::a_failed_decision_edit_is_tried_again_on_the_tick ... ok
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test hub::slots::tests::a_new_session_in_the_slot_streams_after_its_one_separator ... ok
+test hub::slots::tests::a_refused_reaction_never_stops_routing ... ok
+test hub::slots::tests::a_failed_separator_is_sent_again ... ok
+test hub::slots::tests::a_resume_message_answered_after_its_period_ended_loses_its_button ... ok
+test hub::slots::tests::a_resume_press_still_counts_after_a_later_session_ended_in_the_slot ... ok
+test hub::slots::tests::a_stale_duplicate_connection_cannot_reply ... ok
+test hub::slots::tests::a_prompt_telegram_refused_leaves_no_waiting_icon ... ok
+test hub::slots::tests::a_reply_from_an_agent_without_a_slot_is_dropped ... ok
+test hub::slots::tests::a_refused_stream_message_is_sent_again_before_the_offset_moves ... ok
+test hub::ingress::tests::a_slow_request_is_closed_at_the_deadline_without_an_event ... ok
+test hub::api::tests::transport_errors_never_contain_the_token ... ok
+test hub::slots::tests::a_refused_stream_message_comes_again_after_a_restart ... ok
+test hub::slots::tests::a_stream_message_telegram_refuses_with_a_4xx_is_skipped_and_the_offset_moves ... ok
+test hub::slots::tests::a_streamed_answer_past_the_message_cap_is_dropped_untracked ... ok
+test hub::slots::tests::a_stalled_telegram_never_stalls_turn_answers ... ok
+test hub::slots::tests::a_title_scan_goes_on_from_where_the_last_one_stopped ... ok
+test hub::slots::tests::a_title_scan_that_ends_after_session_end_keeps_nothing ... ok
+test hub::slots::tests::a_restart_neither_repeats_nor_loses_stream_lines ... ok
+test hub::slots::tests::a_prompt_overtakes_a_full_reply_backlog ... ok
+test hub::slots::tests::a_stopped_scheduler_is_retried_on_the_tick_not_in_a_loop ... ok
+test hub::slots::tests::a_stalled_telegram_never_stalls_inbound ... ok
+test hub::slots::tests::a_restart_keeps_slots_and_waits_out_the_grace ... ok
+test hub::slots::tests::a_turn_end_read_again_lets_only_its_own_answer_go ... ok
+test hub::slots::tests::a_stop_before_its_call_is_visible_still_gets_its_block ... ok
+test hub::slots::tests::a_title_less_transcript_is_scanned_only_past_the_last_scan ... ok
+test hub::slots::tests::a_stop_that_comes_after_the_next_prompt_was_read_still_takes_its_turn_end ... ok
+test hub::slots::tests::a_refused_first_send_is_tried_again ... ok
+test hub::slots::tests::a_message_nobody_can_take_now_is_kept_and_told_once ... ok
+test hub::slots::tests::after_a_restart_blocks_are_edited_never_sent_again ... ok
+test hub::slots::tests::a_topic_message_reaches_only_the_agent_of_its_slot ... ok
+test hub::slots::tests::a_turn_answer_follows_the_lines_read_after_its_stop ... ok
+test hub::slots::tests::an_answer_behind_a_refused_line_is_held_again_and_follows_the_re_read_lines ... ok
+test hub::slots::tests::an_answer_held_again_whose_turn_end_is_committed_goes_first_on_the_re_read ... ok
+test hub::slots::tests::a_turn_end_read_before_its_stop_lets_the_answer_go_at_once ... ok
+test hub::slots::tests::after_clear_the_new_session_of_the_slot_gets_the_message ... ok
+test hub::slots::tests::an_unrebound_connection_cannot_reply_after_clear ... ok
+test hub::slots::tests::a_verdict_never_reaches_another_session_on_the_same_pid ... ok
+test hub::slots::tests::block_messages_in_flight_are_capped ... ok
+test hub::slots::tests::a_reply_to_a_subagent_block_goes_to_the_parent_with_its_agent_id ... ok
+test hub::slots::tests::an_ended_session_gets_no_inbound_even_with_its_agent_still_linked ... ok
+test hub::slots::tests::idle_reads_do_not_rewrite_the_registry ... ok
+test hub::slots::tests::kept_messages_never_go_to_the_agent_of_an_earlier_run ... ok
+test hub::slots::tests::a_verdict_lost_with_the_link_goes_again_to_the_reconnected_agent ... ok
+test hub::slots::tests::an_ended_sessions_prompt_never_reaches_the_topic_its_slot_moved_on_to ... ok
+test hub::slots::tests::an_agent_without_transcript_reads_is_never_asked ... ok
+test hub::slots::tests::nested_runs_and_subagents_never_revive_a_slot ... ok
+test hub::slots::tests::a_first_send_with_an_unclear_answer_is_not_sent_again ... ok
+test hub::slots::tests::an_agent_before_its_hook_is_bound_without_a_second_topic ... ok
+test hub::slots::tests::nested_and_subagent_events_make_no_topics ... ok
+test hub::slots::tests::only_the_slot_that_revives_gets_its_kept_messages ... ok
+test hub::slots::tests::revival_by_resume_new_session_or_clear_delivers_once_in_order ... ok
+test hub::slots::tests::only_a_live_top_level_current_session_with_a_topic_sends_its_answer ... ok
+test hub::slots::tests::appended_lines_reach_the_slot_topic_in_order_and_a_partial_line_waits ... ok
+test hub::slots::tests::a_prompt_stays_in_its_slot_topic_when_clear_moves_the_slot_on ... ok
+test hub::slots::tests::terminal_permission_edit_errors_are_treated_as_applied ... ok
+test hub::slots::tests::the_51st_message_drops_the_oldest_and_warns_once_per_period ... ok
+test hub::slots::tests::the_agent_calls_of_an_ended_session_are_forgotten ... ok
+test hub::slots::tests::every_stop_of_a_turn_follows_its_own_tool_lines ... ok
+test hub::slots::tests::eyes_on_hand_off_and_writing_only_for_the_same_messages_channel_record ... ok
+test hub::slots::tests::lines_after_a_refused_stream_message_never_show_before_it ... ok
+test hub::slots::tests::kept_messages_survive_a_restart_and_go_out_once ... ok
+test hub::slots::tests::the_backlog_of_messages_for_telegram_is_capped ... ok
+test hub::slots::tests::the_closing_text_is_the_decided_wording ... ok
+test hub::slots::tests::a_turn_boundary_stops_an_unanswered_prompt_from_holding_the_icon ... ok
+test hub::slots::tests::start_first_clear_closes_a_prompt_even_when_pruning_removes_its_session ... ok
+test hub::slots::tests::the_ai_title_replaces_the_short_id ... ok
+test hub::slots::tests::one_slot_lives_through_hook_agent_end_and_the_next_session ... ok
+test hub::slots::tests::the_ai_title_is_found_past_the_head_of_a_long_transcript ... ok
+test hub::slots::tests::turn_answers_and_replies_share_the_message_cap ... ok
+test hub::slots::tests::stale_or_foreign_presses_send_no_verdict ... ok
+test hub::slots::tests::session_end_closes_its_open_prompt_and_a_late_press_does_nothing ... ok
+test hub::slots::tests::two_live_sessions_make_two_topics_and_waiting_shows ... ok
+test hub::slots::tests::the_agent_follows_its_claude_process_through_clear ... ok
+test hub::stream::tests::a_refused_message_stops_the_offset_until_the_stream_rewinds ... ok
+test hub::stream::tests::a_rewind_holds_again_the_answers_not_in_the_topic_before_the_held_ones ... ok
+test hub::stream::tests::a_turn_end_answered_outside_the_stream_is_not_claimable_when_read_again ... ok
+test hub::stream::tests::a_turn_end_lets_finished_calls_go_and_never_marks_an_unfinished_one ... ok
+test hub::stream::tests::a_turn_end_read_again_by_two_rewinds_is_not_claimable ... ok
+test hub::stream::tests::an_answer_gone_by_its_timeout_keeps_its_turn_end ... ok
+test hub::stream::tests::idle_reads_while_a_message_waits_keep_one_barrier ... ok
+test hub::stream::tests::only_a_received_message_turns_to_working_and_only_once ... ok
+test hub::stream::tests::open_calls_are_bounded_without_blocking_later_ones ... ok
+test hub::stream::tests::results_out_of_call_order_wait_and_go_in_call_order ... ok
+test hub::stream::tests::the_offset_moves_only_over_accepted_messages ... ok
+test hub::stream::tests::turn_ends_read_before_a_new_turn_stay_claimable_until_they_lapse ... ok
+test hub::subagents::tests::a_candidate_waits_longer_each_time_until_its_window_ends ... ok
+test hub::subagents::tests::a_line_still_being_written_is_left_for_the_next_scan ... ok
+test hub::subagents::tests::a_missing_file_finds_nothing_and_keeps_the_offset ... ok
+test hub::subagents::tests::a_result_without_its_call_or_a_call_without_its_result_links_nothing ... ok
+test hub::subagents::tests::agent_ids_are_plain ... ok
+test hub::subagents::tests::an_agent_call_and_its_result_link_the_agent_id ... ok
+test hub::slots::tests::the_agent_follows_its_claude_process_when_the_new_start_comes_first ... ok
+test hub::subagents::tests::candidates_and_reports_are_bounded ... ok
+test hub::subagents::tests::long_texts_are_cut_to_one_message_and_kept_whole ... ok
+test hub::subagents::tests::the_block_body_follows_the_fallback_order ... ok
+test hub::subagents::tests::the_body_is_read_from_the_subagent_files ... ok
+test hub::subagents::tests::without_a_meta_description_the_saved_header_stays ... ok
+test hub::slots::tests::an_acking_agent_decides_a_prompt_only_with_its_own_ack ... ok
+test hub::testdir::tests::a_save_in_flight_during_the_drop_leaves_no_directory ... ok
+test hub::tests::icons_come_only_from_a_successful_lookup ... ok
+test hub::tests::messages_go_to_the_slot_actor_and_commands_do_not ... ok
+test hub::tests::missing_manage_topics_is_a_startup_error ... ok
+test hub::slots::tests::the_first_press_sends_one_verdict_and_later_presses_do_not ... ok
+test hub::updates::tests::allowlisted_text_is_input_and_strangers_are_dropped ... ok
+test hub::updates::tests::a_briefly_failing_offset_save_is_retried ... ok
+test hub::updates::tests::forum_service_messages_are_never_input ... ok
+test hub::updates::tests::failing_offset_saves_do_not_stop_polling ... ok
+test hub::updates::tests::next_offset_follows_the_batch_even_below_the_old_one ... ok
+test hub::updates::tests::nonempty_batch_without_update_ids_gets_a_short_backoff ... ok
+test hub::updates::tests::ids_restarted_below_the_saved_offset_are_handled_once ... ok
+test hub::updates::tests::only_an_explicit_reply_is_a_reply ... ok
+test hub::updates::tests::other_chats_and_senderless_messages_are_ignored ... ok
+test hub::updates::tests::offset_is_saved_before_the_batch_is_handled ... ok
+test hub::updates::tests::unknown_types_fields_and_bad_shapes_do_not_stop_the_batch ... ok
+test proctree::tests::a_node_claude_below_a_native_claude_is_the_own_process ... ok
+test proctree::tests::a_stale_env_pid_on_a_wrapper_does_not_move_the_own_process ... ok
+test proctree::tests::claude_names ... ok
+test proctree::tests::desktop_images_are_not_cli_parents ... ok
+test proctree::tests::env_stripped_nested_run_and_interactive_start ... ok
+test proctree::tests::exec_form_hook_is_a_direct_child_of_claude ... ok
+test proctree::tests::foreign_env_session_names_the_parent_only_as_a_fallback ... ok
+test proctree::tests::nested_session_reports_the_next_claude ... ok
+test hub::subagents::tests::an_index_keeps_the_newest_calls_and_short_fields ... ok
+test proctree::tests::no_chain_falls_back_to_env_pid_and_top_level ... ok
+test proctree::tests::proc_stat_lines ... ok
+test proctree::tests::npm_only_chain_keeps_the_own_pid_and_finds_no_parent ... ok
+test proctree::tests::process_table_stops_at_reused_or_unqueryable_parent ... ok
+test proctree::tests::top_level_session_has_no_parent ... ok
+test proctree::tests::the_live_chain_starts_at_this_process ... ok
+test hub::slots::tests::the_first_press_stays_the_answer_while_the_agent_is_away ... ok
+test hub::slots::tests::without_the_delete_right_nothing_is_deleted ... ok
+test hub::updates::tests::saved_offset_prevents_handling_an_update_twice_after_restart ... ok
+test spool::tests::broken_foreign_and_old_files_are_dropped_on_read ... ok
+test spool::tests::only_starts_and_ends_are_kept_and_nothing_else_is_written ... ok
+test spool::tests::events_come_back_in_order_with_their_ids ... ok
+test spool::tests::unusable_session_ids_are_not_written ... ok
+test hub::slots::tests::topic_not_modified_counts_as_applied ... ok
+test tail::tests::a_junction_out_of_the_projects_root_is_not_followed ... ok
+test tail::tests::a_missing_file_or_a_foreign_path_is_missing ... ok
+test tail::tests::a_long_backlog_comes_in_bounded_chunks_in_order ... ok
+test hub::slots::tests::a_turn_answer_waits_for_its_turn_end_even_when_the_file_lags ... ok
+test tail::tests::bom_and_crlf_lines_keep_their_byte_offsets ... ok
+test tail::tests::a_shorter_or_rewritten_file_is_reset_and_read_again_from_its_start ... ok
+test spool::tests::a_replay_delivers_in_order_once_and_empties_the_spool ... ok
+test tail::tests::no_offset_in_a_file_without_a_newline_starts_at_its_start ... ok
+test tail::tests::no_offset_at_a_torn_end_starts_at_that_line_and_never_before_it ... ok
+test tail::tests::only_complete_lines_are_read_and_a_partial_one_waits_whole ... ok
+test wire::tests::a_register_without_claude_pid_still_decodes ... ok
+test tail::tests::no_offset_starts_at_the_end_and_lines_without_events_still_move_on ... ok
+test wire::tests::bad_hook_bodies_are_typed_errors ... ok
+test wire::tests::bad_lines_are_typed_errors ... ok
+test wire::tests::errors_and_debug_never_show_the_secret ... ok
+test wire::tests::an_endless_line_stops_at_the_limit ... ok
+test wire::tests::every_link_message_round_trips_as_one_versioned_line ... ok
+test wire::tests::hook_posts_round_trip_and_keep_their_event_id ... ok
+test wire::tests::kind_lists_match_the_enums ... ok
+test wire::tests::lines_are_read_one_at_a_time ... ok
+test wire::tests::secret_rules_and_comparison ... ok
+test wire::tests::transcript_chunks_stay_readable_across_agent_versions ... ok
+test wire::tests::unknown_fields_are_ignored ... ok
+test wire::tests::verdict_acks_stay_compatible_with_version_one_peers ... ok
+test wire::tests::event_ids_are_fresh_hex ... ok
+test wire::tests::a_cancelled_read_keeps_its_partial_line ... ok
+test spool::tests::concurrent_saves_overshoot_a_bound_by_at_most_one_file_each ... ok
+test spool::tests::a_failed_replay_keeps_what_was_not_delivered ... ok
+test hub::slots::tests::two_turn_ends_in_one_read_serve_the_held_answer_and_the_next_stop ... ok
+test hub::slots::tests::one_request_id_in_two_sessions_is_told_apart_by_its_message ... ok
+test hub::slots::tests::unknown_sessions_make_no_topics_until_their_session_start ... ok
+test hub::tests::a_slow_command_does_not_hold_up_polling ... ok
+test hub::slots::tests::the_waiting_icon_stays_while_another_prompt_of_the_session_is_open ... ok
+test tail::tests::no_record_makes_a_chunk_longer_than_a_link_line ... ok
+test hub::slots::tests::a_reply_goes_to_its_session_topic_in_split_order ... ok
+test hub::slots::tests::a_turn_answer_goes_to_its_session_topic_in_split_order ... ok
+test spool::tests::the_spool_is_bounded_per_session_in_all_and_per_file ... ok
+test hub::slots::tests::three_explicit_subagents_make_three_blocks_and_internal_agents_none ... ok
+test hub::slots::tests::a_stalled_telegram_never_stalls_ingress ... ok
+
+test result: ok. 407 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 10.26s
+
+     Running unittests src\main.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\cctg-f8536843a1d6c456.exe)
+
+running 1 test
+test tests::parses_all_subcommands ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\agent_stdio.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\agent_stdio-0a3294b4a67be595.exe)
+
+running 4 tests
+test an_unreachable_listener_does_not_block_mcp_stdio ... ok
+test a_hub_version_rejection_does_not_block_mcp_stdio ... ok
+test headless_and_unconfigured_agents_answer_without_a_hub ... ok
+test a_full_session_with_a_failing_hub_keeps_stdout_pure ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+
+     Running tests\buffer_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\buffer_e2e-955207a3d43c3e34.exe)
+
+running 1 test
+test kept_messages_reach_the_resumed_session_over_tcp_once_in_order ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running tests\command_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\command_logs-78c5f366bbcec7b4.exe)
+
+running 1 test
+test command_logs_carry_no_paths ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.04s
+
+     Running tests\hook_cli.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\hook_cli-37f99d3148737e37.exe)
+
+running 8 tests
+test settings_snippet_registers_every_event_without_secrets_or_paths ... ok
+test bad_hook_arguments_still_exit_zero ... ok
+test broken_input_and_missing_config_exit_zero_quietly ... ok
+test every_event_reaches_the_hub ... ok
+test an_open_silent_stdin_does_not_hold_the_hook ... ok
+test an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure ... ok
+test a_silent_hub_keeps_session_end_well_inside_its_budget ... ok
+test no_hub_listening_is_quiet_and_fast ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running tests\ingress_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\ingress_logs-510bc23878ffd48d.exe)
+
+running 1 test
+test ingress_logs_carry_no_secrets_or_contents ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests\message_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\message_logs-b4c2de1541d541cb.exe)
+
+running 1 test
+test message_logs_carry_no_text_and_no_user_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests\overflow_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\overflow_logs-ec75c54db78440cd.exe)
+
+running 1 test
+test one_overflow_warning_per_episode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+
+     Running tests\permission_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\permission_logs-be059d3b8edb822d.exe)
+
+running 1 test
+test permission_relay_logs_carry_no_request_and_no_user_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+
+     Running tests\routing_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\routing_logs-26c1b38491986e07.exe)
+
+running 1 test
+test routing_logs_never_contain_user_ids ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\slots_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\slots_logs-d9f988e833230198.exe)
+
+running 1 test
+test slot_logs_warn_once_and_carry_no_private_text ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+     Running tests\soak.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\soak-56bb5c4d9d9ec329.exe)
+soak: skipped (slow); run `cargo test -p cctg --test soak -- --ignored`
+     Running tests\spool_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\spool_e2e-ec22948e3d7bcce3.exe)
+
+running 4 tests
+test a_silent_hub_costs_a_hook_one_budget_however_much_is_kept ... ok
+test the_spool_holds_no_text_and_is_bounded ... ok
+test the_agent_delivers_its_sessions_kept_start_when_it_registers ... ok
+test a_missed_session_start_reaches_the_hub_before_the_next_hook ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+
+     Running tests\stdout.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\stdout-9b3c313814116941.exe)
+
+running 3 tests
+test hub_without_config_fails_on_stderr_only ... ok
+test subcommands_do_not_write_to_stdout ... ok
+test malformed_env_file_does_not_echo_its_contents ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests\stream_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\stream_e2e-1490fcb4bb3bda80.exe)
+
+running 11 tests
+test e2e_resume_at_a_torn_end_does_not_replay_history ... ok
+test e2e_refused_sends_lose_nothing ... ok
+test e2e_reactions ... ok
+test e2e_merge_under_the_limit ... ok
+test e2e_a_document_answer_read_again_does_not_let_the_next_answer_go_early ... ok
+test e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early ... ok
+test e2e_hub_restart_neither_repeats_nor_loses ... ok
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... ok
+test e2e_order_partial_line_and_stop_after_lines ... ok
+test e2e_six_turns_with_refusals_keep_every_answer_in_place ... ok
+test e2e_turns_with_refusals_under_a_slow_telegram_keep_their_answers_in_place ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.38s
+
+     Running tests\stream_logs.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\stream_logs-44d41d3b2ee0290e.exe)
+
+running 1 test
+test a_missing_transcript_is_warned_once_and_the_stream_goes_on ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\transcript-43c48b4f8048728b.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\parse_fixtures.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\parse_fixtures-e3c5074e58f0e2d7.exe)
+
+running 10 tests
+test privacy_detectors_fire ... ok
+test string_content_fixture ... ok
+test null_string_fields_fixture ... ok
+test sidechain_fixture ... ok
+test plain_text_fixture ... ok
+test thinking_ai_title_fixture ... ok
+test final_answer_fixture_stop_reasons ... ok
+test tool_use_result_fixture ... ok
+test thinking_never_escapes ... ok
+test fixtures_have_no_private_data ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\parse_tolerance.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\parse_tolerance-580bdb9de32653ff.exe)
+
+running 15 tests
+test flags_are_tolerant ... ok
+test ai_title_rules ... ok
+test irrelevant_wrong_typed_fields_do_not_drop_a_turn ... ok
+test known_block_with_missing_fields_keeps_defaults ... ok
+test unknown_record_and_bad_lines_keep_neighbours ... ok
+test empty_and_ignored_only_inputs_give_nothing ... ok
+test tool_result_shapes ... ok
+test crlf_matches_lf ... ok
+test unknown_and_malformed_blocks_drop_only_themselves ... ok
+test both_content_shapes_for_both_roles ... ok
+test unusable_message_shapes_are_skipped ... ok
+test truncated_last_line_keeps_earlier_turns ... ok
+test stop_reason_is_tolerant ... ok
+test deep_nesting_is_skipped_without_panic ... ok
+test garbage_never_panics ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\purity.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\purity-f83d3eae107f354c.exe)
+
+running 3 tests
+test library_has_only_pure_dependencies ... ok
+test every_source_file_is_scanned ... ok
+test library_source_has_no_io_or_panicking_calls ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\render.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\render-e73cb3fa687cf7f5.exe)
+
+running 19 tests
+test channel_attribute_may_contain_a_greater_than_sign ... ok
+test multiline_prompt_keeps_its_text_verbatim ... ok
+test last_prompts_counts_only_what_renders_as_a_prompt ... ok
+test compact_summary_is_hidden_in_brief_and_keeps_the_state ... ok
+test full_truncates_long_results_safely ... ok
+test finished_exchanges_have_no_marker ... ok
+test slash_command_args_use_the_last_closing_tag ... ok
+test slash_command_without_args_is_still_a_prompt ... ok
+test null_stop_reason_falls_back_to_structure ... ok
+test final_answer_fixture_brief_and_full ... ok
+test slash_commands_are_one_line_prompts ... ok
+test only_channel_meta_is_shown_and_user_tags_stay_visible ... ok
+test brief_has_one_line_per_tool_call_and_no_io ... ok
+test service_records_are_hidden_in_brief_and_keep_the_state ... ok
+test last_prompts_keeps_the_last_n_exchanges ... ok
+test unfinished_tail_is_marked_in_progress ... ok
+test slices_render_independently ... ok
+test thinking_never_rendered ... ok
+test five_thousand_turns_render_in_linear_time ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests\split.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\split-8f59df3ff67037b7.exe)
+
+running 14 tests
+test emoji_on_the_boundary_is_never_cut ... ok
+test exact_limit_fits_and_one_more_splits ... ok
+test short_text_is_one_chunk ... ok
+test telegram_len_counts_utf16_units ... ok
+test crlf_is_not_split_at_the_limit ... ok
+test flags_after_an_odd_prefix_are_not_split ... ok
+test only_emoji_line_splits_on_char_boundaries ... ok
+test threshold_is_configurable ... ok
+test paragraph_separator_is_kept_exactly ... ok
+test prefers_paragraph_then_line_then_space ... ok
+test blank_run_longer_than_the_limit_drops_only_whitespace ... ok
+test oversized_grapheme_falls_back_to_char_boundaries ... ok
+test fifty_kb_block_is_deterministic_and_prefers_file ... ok
+test grapheme_clusters_on_the_boundary_stay_whole ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests\stream.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\stream-9372ea8ab4a0d861.exe)
+
+running 4 tests
+test a_partial_or_foreign_line_gives_nothing ... ok
+test only_cctg_channel_records_match_and_a_bom_line_still_counts ... ok
+test queued_channel_messages_errors_and_service_records ... ok
+test a_turn_streams_its_prompt_notes_and_calls_but_not_its_final_answer ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\subagent.rs (C:\Users\user\AppData\Local\Temp/cctg-018-fix-target\debug\deps\subagent-be1576d16eea8f99.exe)
+
+running 15 tests
+test meta_fixture_is_parsed ... ok
+test the_call_description_stands_in_for_a_missing_meta ... ok
+test missing_or_broken_meta_falls_back_without_error ... ok
+test report_replaces_the_transcript_final_text ... ok
+test last_message_must_equal_the_final_answer ... ok
+test meta_description_and_type_win ... ok
+test embedded_header_is_the_block_header ... ok
+test background_agent_embeds_an_in_progress_body ... ok
+test agent_id_is_one_line_without_breaking_parent_lookup ... ok
+test only_known_agents_get_a_body ... ok
+test duplicate_agent_ids_use_the_last_slice_entry ... ok
+test sidechain_fixture_is_one_block_outside_the_parent_turns ... ok
+test body_is_brief_even_in_a_full_parent ... ok
+test body_source_order_is_fixed ... ok
+test sidechain_turns_never_reach_the_parent_top_level ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests cctg
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests transcript
+
+running 1 test
+test crates\transcript\src\subagent.rs - subagent::Subagent (line 85) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test exit=0

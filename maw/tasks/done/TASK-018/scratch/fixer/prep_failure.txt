@@ -1,0 +1,6 @@
+
+thread 'main' (41100) panicked at crates\cctg\tests\soak.rs:1000:52:
+live config (values not shown): EnvFile { path: "C:\\Users\\user\\AppData\\Local\\Temp/cctg-no-such.env", reason: "file not found" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit=101
+leftover soak dirs: 0

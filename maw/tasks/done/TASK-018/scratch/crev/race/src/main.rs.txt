@@ -1,0 +1,28 @@
+// Two savers of different sessions: one's prune removes the other's fresh,
+// still-empty session dir between its create_dir_all and create_new.
+use cctg::spool::{save, SpoolError};
+use cctg::wire::{HookEvent, HookPost};
+use std::time::SystemTime;
+fn start(s: &str) -> HookPost {
+    HookPost::new("box".into(), s.into(), "/w".into(), "/w/t.jsonl".into(),
+        HookEvent::SessionStart { source: None, claude_pid: None, parent_claude_pid: None })
+}
+fn main() {
+    let root = std::env::temp_dir().join(format!("cctg-crev-race-{}", std::process::id()));
+    let mut lost = 0usize;
+    let rounds = 1500;
+    for round in 0..rounds {
+        let _ = std::fs::remove_dir_all(&root);
+        let barrier = std::sync::Barrier::new(8);
+        let r = std::thread::scope(|s| {
+            let h: Vec<_> = (0..8).map(|t| { let root=&root; let b=&barrier; s.spawn(move || {
+                b.wait();
+                save(root, &start(&format!("s{round}-{t}")), SystemTime::now())
+            })}).collect();
+            h.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+        });
+        for x in r { if let Err(e) = x { if matches!(e, SpoolError::Io(_)) { lost += 1; eprintln!("round {round}: {e}"); } } }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    println!("lost {lost} of {} saves", rounds * 8);
+}
