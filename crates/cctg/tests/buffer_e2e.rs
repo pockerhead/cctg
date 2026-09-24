@@ -178,6 +178,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         claude_pid: Some(11),
         verdict_ack: true,
         transcript_reads: false,
+        console_keys: false,
     };
     write
         .write_all(&wire::encode(&AgentMsg::Register(register)))

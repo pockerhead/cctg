@@ -24,6 +24,11 @@
 //! Claude Code then shows its own dialog as usual. It is never kept in the
 //! spool: an answer that comes late is worthless.
 //!
+//! `cctg hook ToolStatus` is registered as an `async` hook on `PreToolUse`,
+//! `PostToolUse` and `PostToolUseFailure` (TASK-029): Claude Code does not
+//! wait for it. It tells the hub which tool call of the main conversation
+//! runs now, for the status message; calls inside subagents are skipped.
+//!
 //! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
 
 use std::io::Read;
@@ -63,6 +68,10 @@ pub const MAX_STDIN: u64 = 8 << 20;
 pub const MAX_TEXT: usize = 128 << 10;
 const HANDBACK_TOOL: &str = "SubagentHandback";
 pub const PERMISSION_EVENT: &str = "PermissionRequest";
+/// The command-line name of the tool status hook (see the module docs).
+pub const TOOL_STATUS_EVENT: &str = "ToolStatus";
+/// Cap of a tool call line, in bytes: the status message shows one line.
+const MAX_CALL_LINE: usize = 512;
 /// Connect and send of the permission request. On Windows a connect to a
 /// closed local port lasts until the timeout, so a stopped hub costs this.
 pub const PERMISSION_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -330,7 +339,10 @@ async fn deliver(
 
 fn post_timeout(event: &HookEvent) -> Duration {
     match event {
-        HookEvent::UserPromptSubmit { .. } => PROMPT_POST_TIMEOUT,
+        HookEvent::UserPromptSubmit { .. }
+        | HookEvent::ToolStart { .. }
+        | HookEvent::ToolEnd { .. }
+        | HookEvent::StatusLine { .. } => PROMPT_POST_TIMEOUT,
         _ => POST_TIMEOUT,
     }
 }
@@ -356,7 +368,7 @@ fn build_here(event: &str, input: &[u8], host: &str) -> Result<HookPost, Skip> {
 /// Reads stdin on its own thread: a blocking read cannot be cancelled, and a
 /// tokio stdin read would hold up runtime shutdown. The caller exits the
 /// process, which ends the thread if it is still blocked.
-fn read_stdin(limit: u64, timeout: Duration) -> Option<Vec<u8>> {
+pub(crate) fn read_stdin(limit: u64, timeout: Duration) -> Option<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -414,9 +426,70 @@ struct ToolInput {
     message: Option<String>,
 }
 
+/// The fields of a `PreToolUse` / `PostToolUse` / `PostToolUseFailure` input
+/// the tool status uses.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ToolStatusInput {
+    session_id: String,
+    cwd: String,
+    transcript_path: String,
+    hook_event_name: Option<String>,
+    tool_name: String,
+    tool_use_id: String,
+    tool_input: Option<Value>,
+    agent_id: Option<String>,
+}
+
+/// `cctg hook ToolStatus`: the start or the end of a tool call of the main
+/// conversation. Handback calls (their own hook) and every call inside a
+/// subagent are skipped before any POST.
+fn build_tool_status(input: &[u8], probe: &Probe<'_>) -> Result<HookPost, Skip> {
+    let input: ToolStatusInput =
+        serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
+    if input.session_id.is_empty() {
+        return Err(Skip("input has no session_id"));
+    }
+    if input.agent_id.is_some_and(|id| !id.is_empty()) {
+        return Err(Skip("tool call inside a subagent"));
+    }
+    if input.tool_use_id.is_empty() || input.tool_name.trim().is_empty() {
+        return Err(Skip("tool event without its call"));
+    }
+    if input.tool_name == HANDBACK_TOOL {
+        return Err(Skip("handback has its own hook"));
+    }
+    let hook_event = match input.hook_event_name.as_deref() {
+        Some("PreToolUse") => {
+            let tool_input = input.tool_input.unwrap_or(Value::Null);
+            HookEvent::ToolStart {
+                line: cap_to(
+                    transcript::call_line(&input.tool_name, &tool_input),
+                    MAX_CALL_LINE,
+                ),
+                tool_use_id: cap_to(input.tool_use_id, MAX_TOOL_NAME),
+            }
+        }
+        Some("PostToolUse" | "PostToolUseFailure") => HookEvent::ToolEnd {
+            tool_use_id: cap_to(input.tool_use_id, MAX_TOOL_NAME),
+        },
+        _ => return Err(Skip("input is for another hook event")),
+    };
+    Ok(HookPost::new(
+        probe.host.to_owned(),
+        input.session_id,
+        (probe.cwd)(&input.cwd),
+        input.transcript_path,
+        hook_event,
+    ))
+}
+
 /// Turns one hook input into the POST for the hub, or says why there is none.
 /// `event` is the name the settings passed on the command line.
 pub fn build(event: &str, input: &[u8], probe: &Probe<'_>) -> Result<HookPost, Skip> {
+    if event == TOOL_STATUS_EVENT {
+        return build_tool_status(input, probe);
+    }
     let input: Input =
         serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
     if input.session_id.is_empty() {
@@ -1312,6 +1385,82 @@ mod build_tests {
         );
     }
 
+    fn tool_input(event: &str, tool: &str, extra: serde_json::Value) -> Vec<u8> {
+        let mut input = serde_json::json!({
+            "session_id": "s",
+            "cwd": "/w",
+            "transcript_path": "/t/s.jsonl",
+            "hook_event_name": event,
+            "tool_name": tool,
+            "tool_use_id": "toolu_01",
+            "tool_input": { "command": "cargo test", "description": "Run tests" },
+        });
+        if let (Some(target), Some(extra)) = (input.as_object_mut(), extra.as_object()) {
+            target.extend(extra.clone());
+        }
+        input.to_string().into_bytes()
+    }
+
+    #[test]
+    fn tool_status_carries_the_call_line() {
+        let v = check(
+            TOOL_STATUS_EVENT,
+            &tool_input("PreToolUse", "Bash", serde_json::json!({})),
+            OWN,
+            &["type", "tool_use_id", "line"],
+        );
+        assert_eq!(v["event"]["type"], "tool_start");
+        assert_eq!(v["event"]["tool_use_id"], "toolu_01");
+        assert_eq!(v["event"]["line"], "• Bash: Run tests");
+        assert!(!v.to_string().contains("cargo test"), "only the line goes");
+        for event in ["PostToolUse", "PostToolUseFailure"] {
+            let v = check(
+                TOOL_STATUS_EVENT,
+                &tool_input(event, "Bash", serde_json::json!({})),
+                OWN,
+                &["type", "tool_use_id"],
+            );
+            assert_eq!(v["event"]["type"], "tool_end");
+        }
+    }
+
+    #[test]
+    fn tool_status_skips_subagent_calls_handbacks_and_other_events() {
+        with_probe(OWN, true, |probe, asked| {
+            for input in [
+                tool_input(
+                    "PreToolUse",
+                    "Bash",
+                    serde_json::json!({ "agent_id": "a1" }),
+                ),
+                tool_input("PreToolUse", HANDBACK_TOOL, serde_json::json!({})),
+                tool_input(
+                    "PreToolUse",
+                    "Bash",
+                    serde_json::json!({ "tool_use_id": "" }),
+                ),
+                tool_input("Stop", "Bash", serde_json::json!({})),
+                tool_input(
+                    "PreToolUse",
+                    "Bash",
+                    serde_json::json!({ "session_id": "" }),
+                ),
+                br#"{"session_id":"s","tool_name":"Bash","tool_use_id":"t"}"#.to_vec(),
+                b"not json".to_vec(),
+            ] {
+                assert!(
+                    build(TOOL_STATUS_EVENT, &input, probe).is_err(),
+                    "{}",
+                    String::from_utf8_lossy(&input)
+                );
+            }
+            assert_eq!(asked.get(), 0, "no process tree walk for tool events");
+            // The old hooks keep their meaning: a Bash call is no handback.
+            let bash = tool_input("PreToolUse", "Bash", serde_json::json!({}));
+            assert!(build("PreToolUse", &bash, probe).is_err());
+        });
+    }
+
     #[test]
     fn other_tools_and_incomplete_handbacks_are_skipped() {
         with_probe(OWN, true, |probe, _| {
@@ -1389,6 +1538,20 @@ mod build_tests {
             }
         });
         assert!(PROMPT_POST_TIMEOUT < POST_TIMEOUT);
+        for event in [
+            HookEvent::ToolEnd {
+                tool_use_id: "t".into(),
+            },
+            HookEvent::StatusLine {
+                model: None,
+                effort: None,
+                context: None,
+                five_hour: None,
+                seven_day: None,
+            },
+        ] {
+            assert_eq!(post_timeout(&event), PROMPT_POST_TIMEOUT);
+        }
         // SessionEnd: stdin wait + POST stay well inside the shared 1.5 s.
         assert!(STDIN_TIMEOUT + POST_TIMEOUT <= Duration::from_millis(800));
     }

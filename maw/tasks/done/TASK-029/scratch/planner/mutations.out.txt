@@ -1,0 +1,13 @@
+M1 the first stop press already sends Esc: KILLED a_press_reaches_only_the_agent_of_its_own_slot, the_status_message_follows_the_session_and_its_buttons_press_keys
+M2 a status press is not tied to its own message: KILLED the_status_message_follows_the_session_and_its_buttons_press_keys, a_press_reaches_only_the_agent_of_its_own_slot
+M3 an agent without console_keys is asked to press keys: KILLED hub::slots::tests::a_status_button_of_an_agent_without_console_keys_sends_nothing
+M4 status edits are not paced: KILLED edits_are_paced_and_a_deleted_status_message_comes_back
+M5 an interrupt that went in does not end the turn: KILLED the_status_message_follows_the_session_and_its_buttons_press_keys
+M6 every pin notice is deleted: KILLED the_status_message_follows_the_session_and_its_buttons_press_keys
+M7 a pinned status message is pinned again: KILLED the_status_message_follows_the_session_and_its_buttons_press_keys, a_press_reaches_only_the_agent_of_its_own_slot, edits_are_paced_and_a_deleted_status_message_comes_back
+M8 interrupt notes in the stream are ignored: KILLED hub::slots::tests::an_interrupt_note_in_the_stream_ends_the_turn_on_the_status_message
+M9 tool calls inside subagents reach the hub: KILLED hook::build_tests::tool_status_skips_subagent_calls_handbacks_and_other_events
+M10 a start that comes after its end shows a finished call: KILLED hub::status::tests::a_start_after_its_end_and_a_repeated_start_change_nothing
+M11 console key answers are not forwarded by ingress: KILLED the_status_message_follows_the_session_and_its_buttons_press_keys
+M13 the background button shows while it is switched off: KILLED a_press_reaches_only_the_agent_of_its_own_slot
+M12 a running call outranks a waiting permission prompt: KILLED hub::status::tests::the_first_line_follows_what_the_session_does

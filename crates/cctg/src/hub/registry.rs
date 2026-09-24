@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use transcript::telegram_len;
 
 use super::buffer::Buffer;
+use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
 
 pub const VERSION: u32 = 1;
@@ -296,6 +297,9 @@ pub struct Slot {
     /// Topic messages no session of the slot could take yet (TASK-017).
     #[serde(default, skip_serializing_if = "Buffer::is_idle")]
     pub buffer: Buffer,
+    /// The slot's status message in its topic (TASK-029).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatusMessage>,
     /// A topic call for this slot is in flight.
     #[serde(skip)]
     pub busy: bool,
@@ -303,6 +307,14 @@ pub struct Slot {
     /// change or [`Registry::retry_failed`] runs.
     #[serde(skip)]
     pub failed: Option<(String, Option<String>)>,
+}
+
+/// The status message of a slot: sent once per topic, pinned once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusMessage {
+    pub message_id: i64,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +357,9 @@ pub struct SessionEntry {
     /// The live transcript stream of a top-level session (TASK-016).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<Stream>,
+    /// The last status line numbers of a live top-level session (TASK-029).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 /// What survives a restart of a session's transcript stream.
@@ -691,6 +706,7 @@ impl Registry {
             applied_icon: None,
             pending_separator: None,
             buffer: Buffer::default(),
+            status: None,
             busy: false,
             failed: None,
         });
@@ -821,6 +837,7 @@ impl Registry {
                 waiting: false,
                 block: None,
                 stream: None,
+                metrics: None,
             });
         entry.kind = kind.clone();
         entry.slot = slot;
@@ -1049,6 +1066,32 @@ impl Registry {
             HookEvent::SubagentStart { .. }
             | HookEvent::SubagentStop { .. }
             | HookEvent::SubagentHandback { .. } => Followup::default(),
+            // What a session does now lives in the slots actor only.
+            HookEvent::ToolStart { .. } | HookEvent::ToolEnd { .. } => Followup::default(),
+            HookEvent::StatusLine {
+                model,
+                effort,
+                context,
+                five_hour,
+                seven_day,
+            } => {
+                let metrics = Metrics {
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    context: *context,
+                    five_hour: *five_hour,
+                    seven_day: *seven_day,
+                };
+                if let Some(entry) = self.sessions.get_mut(session)
+                    && !entry.ended
+                    && entry.kind == SessionKind::TopLevel
+                    && entry.metrics.as_ref() != Some(&metrics)
+                {
+                    entry.metrics = Some(metrics);
+                    self.dirty = true;
+                }
+                Followup::default()
+            }
         }
     }
 
@@ -1602,6 +1645,8 @@ impl Registry {
             slot.applied_title = None;
             slot.applied_icon = None;
             slot.pending_separator = None;
+            // Its status message went with the topic.
+            slot.status = None;
             slot.failed = None;
             self.dirty = true;
         }

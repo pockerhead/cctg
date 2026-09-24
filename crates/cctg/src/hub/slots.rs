@@ -53,6 +53,17 @@
 //! `Stop` (bounded by `Options::hold_answer`). A message handed to an agent
 //! gets 👀, and ✍ once its own channel record shows up in the transcript.
 //!
+//! The status message (see [`status`], TASK-029): each slot with a topic gets
+//! one message, pinned once, that says what its current session does (from
+//! prompts, `Stop`, the tool hooks, tool results and interrupt notes in the
+//! stream, permission prompts and the session's end) and shows the numbers
+//! of its status line. It is edited at most once per `Options::status_every`,
+//! except right after a button press. Its ⏹ button asks the session's agent
+//! to write Esc into the claude console; only an agent that announced
+//! `console_keys` for the live current session of that very slot is asked,
+//! never while a permission prompt of that session waits (Esc would answer
+//! the prompt), and a written Esc is shown as sent, not as the turn's end.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title or message text.
 
@@ -72,10 +83,11 @@ use super::buffer::{self, Parked, ResumeNote};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::registry::{
-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState, TopicJob,
-    TopicView,
+    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
+    StatusMessage, TopicJob, TopicView,
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
+use super::status::{self, Activity, Buttons, Press};
 use super::stream::{self, Held, Live, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
@@ -83,7 +95,8 @@ use super::subagents::{
 use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
 use crate::wire::{
-    AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest, StreamLine,
+    AgentMsg, Behavior, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest,
+    StreamItem, StreamLine,
 };
 
 /// A transcript is scanned line by line for its first ai-title up to this
@@ -118,6 +131,13 @@ const HOOK_CHECK_EVERY: Duration = Duration::from_secs(1);
 /// Channel requests remembered for a hook that comes after them.
 const MAX_RELAYED: usize = 64;
 pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
+/// A status message is edited at most this often (edits have no published
+/// limit, but a busy session changes every second).
+pub const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// A call of a session that starts or ends this long after one of its
+/// permission prompts came in means the prompt was answered in the terminal
+/// (the tool hooks reach the hub ~0.1 s after the call).
+pub const PROMPT_SETTLE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -148,6 +168,13 @@ pub struct Options {
     /// A hook prompt nobody answered by then gives its hook no decision
     /// ([`HOOK_ANSWER_WAIT`]).
     pub hook_answer_wait: Duration,
+    /// Slots get a status message, edited at most this often; `None`: no
+    /// status messages ([`STATUS_EVERY`] in the hub).
+    pub status_every: Option<Duration>,
+    /// The bot may pin messages (`can_pin_messages`).
+    pub can_pin: bool,
+    /// [`PROMPT_SETTLE`].
+    pub prompt_settle: Duration,
 }
 
 impl Default for Options {
@@ -169,6 +196,9 @@ impl Default for Options {
             hold_answer: Duration::from_secs(5),
             stream_retry: Duration::from_secs(5),
             hook_answer_wait: HOOK_ANSWER_WAIT,
+            status_every: None,
+            can_pin: true,
+            prompt_settle: PROMPT_SETTLE,
         }
     }
 }
@@ -185,6 +215,9 @@ pub enum Control {
     Message(Inbound),
     /// A button press from an allowlisted user.
     Callback(CallbackInput),
+    /// A `pinned_message` service message (`message_id`) about message
+    /// `pinned`, sent by this bot.
+    Pinned { message_id: i64, pinned: i64 },
     /// The hub stops: [`Slots::run`] handles what already came in, writes
     /// the registry and returns.
     Stop,
@@ -247,6 +280,57 @@ enum Done {
         delivery: Option<Delivery>,
     },
     Reaction(Option<Delivery>),
+    Status {
+        slot: SlotId,
+        job: StatusJob,
+        delivery: Option<Delivery>,
+    },
+}
+
+/// A call about a slot's status message; at most one per slot in flight.
+#[derive(Debug, Clone)]
+enum StatusJob {
+    Create {
+        thread_id: i64,
+        text: String,
+        keyboard: serde_json::Value,
+    },
+    Edit {
+        message_id: i64,
+        text: String,
+        keyboard: serde_json::Value,
+    },
+    Pin {
+        message_id: i64,
+    },
+}
+
+/// What the actor knows of a slot's status message beyond the registry.
+#[derive(Debug, Default)]
+struct Shown {
+    /// The text and keyboard Telegram shows, as far as known.
+    content: Option<(String, serde_json::Value)>,
+    /// A [`StatusJob`] is in flight.
+    busy: bool,
+    /// No edit before this (`Options::status_every` after the last one).
+    next_at: Option<Instant>,
+    /// A first ⏹ press of this session waits for its second until then.
+    confirm: Option<(String, Instant)>,
+    /// Pinning failed; not tried again in this run.
+    pin_failed: bool,
+    /// A failed send is tried again after this.
+    retry_at: Option<Instant>,
+    /// A failed send was warned about; the next warn waits for a success.
+    send_warned: bool,
+}
+
+/// An Esc an agent was asked to write: the slot, session and connection it
+/// was asked for. An answer counts only while all three still hold.
+struct KeyAsk {
+    slot: SlotId,
+    session: String,
+    conn: u64,
+    until: Instant,
 }
 
 /// The fields of one `transcript_chunk`.
@@ -272,6 +356,7 @@ enum Work {
     Block(BlockJob),
     Stream { session: String, number: u64 },
     Reaction,
+    Status { slot: SlotId, job: StatusJob },
 }
 
 fn short(session_id: &str) -> &str {
@@ -386,6 +471,8 @@ struct Conn {
     acks: bool,
     /// It answers transcript reads ([`crate::wire::Register::transcript_reads`]).
     reads: bool,
+    /// It presses console keys ([`crate::wire::Register::console_keys`]).
+    keys: bool,
 }
 
 pub struct Slots {
@@ -437,6 +524,13 @@ pub struct Slots {
     reaction_warned: bool,
     /// Reactions handed out and not answered, at most [`MAX_REACTIONS`].
     reactions: usize,
+    /// What live top-level sessions do, for their status messages.
+    activity: HashMap<String, Activity>,
+    /// Status messages by slot.
+    shown: HashMap<SlotId, Shown>,
+    /// Keys agents were asked to press, by key id.
+    key_asks: HashMap<u64, KeyAsk>,
+    pin_warned: bool,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -498,6 +592,10 @@ impl Slots {
             streams: HashMap::new(),
             reaction_warned: false,
             reactions: 0,
+            activity: HashMap::new(),
+            shown: HashMap::new(),
+            key_asks: HashMap::new(),
+            pin_warned: false,
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -596,6 +694,22 @@ impl Slots {
         if !self.hook_asks.is_empty() || !self.hook_waiters.is_empty() {
             deadline = deadline.min(Instant::now() + HOOK_CHECK_EVERY);
         }
+        // A throttled edit, a confirmation that runs out and a failed status
+        // send wake the actor; past times are not waited for again.
+        let now = Instant::now();
+        let status = self
+            .shown
+            .values()
+            .flat_map(|shown| {
+                [
+                    shown.next_at,
+                    shown.confirm.as_ref().map(|(_, until)| *until),
+                    shown.retry_at,
+                ]
+            })
+            .flatten()
+            .filter(|at| *at > now);
+        let deadline = status.fold(deadline, Instant::min);
         self.streams
             .values()
             .flat_map(|live| {
@@ -641,6 +755,7 @@ impl Slots {
                         to_agent,
                         acks: register.verdict_ack,
                         reads: register.transcript_reads,
+                        keys: register.console_keys,
                     },
                 );
                 // A link that came back takes the answers that wait for it.
@@ -682,6 +797,9 @@ impl Slots {
                             reset,
                         };
                         self.on_chunk(conn, &session, &chunk);
+                    }
+                    AgentMsg::ConsoleKeyWritten { key_id, written } => {
+                        self.on_key_written(conn, &session, key_id, written);
                     }
                     _ => debug!(conn, "agent message not routed"),
                 }
@@ -837,10 +955,44 @@ impl Slots {
             }
             _ => {}
         }
+        self.track_activity(session, &post.event);
+        // Every way a session ends (its SessionEnd, `/clear`, a reused pid,
+        // the reaper) drops what it did.
+        let registry = &self.registry;
+        self.activity
+            .retain(|session, _| registry.is_live_top_level(session));
         self.close_prompts(&followup.ended_sessions);
         self.end_blocks(&followup.ended_sessions);
         if let Some((session, path)) = followup.read_title {
             self.read_title(session, path);
+        }
+    }
+
+    /// What a live top-level session does, for its status message. Events of
+    /// other sessions (nested, unknown, ended) are not kept.
+    fn track_activity(&mut self, session: &str, event: &HookEvent) {
+        if !self.registry.is_live_top_level(session) {
+            return;
+        }
+        let activity = self.activity.entry(session.to_owned()).or_default();
+        match event {
+            HookEvent::UserPromptSubmit { .. } => activity.prompt(),
+            HookEvent::Stop { .. } => activity.stop(),
+            HookEvent::ToolStart { tool_use_id, line } => activity.tool_start(tool_use_id, line),
+            HookEvent::ToolEnd { tool_use_id } => activity.tool_end(tool_use_id),
+            // The numbers live in the registry (`SessionEntry::metrics`).
+            _ => return,
+        }
+        if matches!(
+            event,
+            HookEvent::ToolStart { .. } | HookEvent::ToolEnd { .. }
+        ) {
+            // The turn moved on: a prompt of it that settled was answered in
+            // the terminal (Telegram answers are seen). Stream lines do not
+            // count: they can lag the prompt by any time.
+            let settle = self.options.prompt_settle;
+            self.prompts.quiet_settled(session, Instant::now(), settle);
+            self.sync_waiting(session);
         }
     }
 
@@ -1126,6 +1278,7 @@ impl Slots {
             } => (thread_id, message_id),
             Control::Message(input) => return self.on_topic_message(input),
             Control::Callback(input) => return self.on_callback(input),
+            Control::Pinned { message_id, pinned } => return self.on_pinned(message_id, pinned),
             // Handled by `run`.
             Control::Stop => return,
         };
@@ -1137,6 +1290,26 @@ impl Slots {
             return;
         }
         self.hand_off(Work::Delete, Op::Delete { message_id });
+    }
+
+    /// The service message about pinning a slot's status message goes, like
+    /// `forum_topic_edited`; other pins are the users' business.
+    fn on_pinned(&mut self, message_id: i64, pinned: i64) {
+        if self.options.can_delete && self.status_slot(pinned).is_some() {
+            self.hand_off(Work::Delete, Op::Delete { message_id });
+        }
+    }
+
+    /// The slot whose status message is `message_id`.
+    fn status_slot(&self, message_id: i64) -> Option<SlotId> {
+        self.registry
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.status
+                    .is_some_and(|status| status.message_id == message_id)
+            })
+            .map(SlotId)
     }
 
     /// Keeps a topic message in its slot and hands the slot's messages to
@@ -1873,6 +2046,7 @@ impl Slots {
         }
         let mut read_to = to;
         let mut stopped = false;
+        let mut interrupted = false;
         for (index, line) in lines.iter().enumerate() {
             // The first line always goes (the read was asked with room); the
             // rest wait in the file while Telegram is behind.
@@ -1880,6 +2054,19 @@ impl Slots {
                 read_to = lines[index - 1].end;
                 stopped = true;
                 break;
+            }
+            if let Some(activity) = self.activity.get_mut(session) {
+                for item in &line.items {
+                    match item {
+                        // A call that got its result is over, also when no
+                        // PostToolUse came (a denied permission fires none).
+                        StreamItem::Result { id, .. } => activity.tool_end(id),
+                        StreamItem::Note { text } if text.starts_with(status::INTERRUPT_NOTE) => {
+                            interrupted |= activity.interrupted_at(line.end);
+                        }
+                        _ => {}
+                    }
+                }
             }
             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
                 match step {
@@ -1944,6 +2131,11 @@ impl Slots {
                 Action::Release(held) => self.release(session, held),
                 Action::React(message_id) => self.react(message_id, stream::WORKING),
             }
+        }
+        if interrupted {
+            // Esc ended the turn like Stop does, also at an open prompt.
+            self.prompts.quiet(session);
+            self.sync_waiting(session);
         }
         self.stream_answered(session);
     }
@@ -2487,6 +2679,9 @@ impl Slots {
         if let Some(session) = input.data.as_deref().and_then(buffer::parse_callback) {
             return Some(self.press_resume(session));
         }
+        if let Some(press) = input.data.as_deref().and_then(status::parse_callback) {
+            return Some(self.press_status(input.message_id, press));
+        }
         let Some((behavior, request_id)) =
             input.data.as_deref().and_then(permissions::parse_callback)
         else {
@@ -2537,6 +2732,392 @@ impl Slots {
                     Some(permissions::ANSWER_OFFLINE)
                 }
             }
+        }
+    }
+
+    /// A status button. It acts only on the status message's own slot, only
+    /// for its live current session, and only through that session's bound
+    /// agent that presses keys. ⏹ asks for a second press within
+    /// [`status::CONFIRM_FOR`]; while a permission prompt of the session
+    /// waits it sends nothing.
+    fn press_status(&mut self, message_id: Option<i64>, press: Press) -> &'static str {
+        let Some(slot) = message_id.and_then(|id| self.status_slot(id)) else {
+            debug!("status button of a message that is no status message");
+            return status::ANSWER_STALE;
+        };
+        let Some((session, conn)) = self.live_agent(slot) else {
+            return status::ANSWER_OFFLINE;
+        };
+        if !self.conns.get(&conn).is_some_and(|bound| bound.keys) {
+            return status::ANSWER_NO_KEYS;
+        }
+        let now = Instant::now();
+        let waiting = self.waiting(&session);
+        let busy = self.busy(&session);
+        let shown = self.shown.entry(slot).or_default();
+        let armed = shown
+            .confirm
+            .as_ref()
+            .is_some_and(|(armed, until)| *armed == session && now < *until);
+        if waiting {
+            // Esc would answer the prompt, not stop the turn.
+            if shown.confirm.take().is_some() {
+                shown.next_at = Some(now);
+            }
+            return status::ANSWER_WAITING;
+        }
+        match press {
+            _ if !busy => status::ANSWER_IDLE,
+            Press::Confirm if armed => {
+                shown.confirm = None;
+                shown.next_at = Some(now);
+                if !self.send_key(slot, &session, conn) {
+                    return status::ANSWER_OFFLINE;
+                }
+                info!(
+                    ordinal = self.ordinal(slot),
+                    session = short(&session),
+                    "interrupt confirmed in Telegram"
+                );
+                status::ANSWER_INTERRUPTING
+            }
+            // A first press, or a second one after the wait ran out.
+            Press::Stop | Press::Confirm => {
+                shown.confirm = Some((session, now + status::CONFIRM_FOR));
+                // Shown at once, whatever the edit pace.
+                shown.next_at = Some(now);
+                status::ANSWER_CONFIRM
+            }
+        }
+    }
+
+    /// The session works: a turn or a call runs and no Esc went in yet.
+    fn busy(&self, session: &str) -> bool {
+        self.activity.get(session).is_some_and(Activity::busy)
+    }
+
+    /// A permission prompt of the session waits.
+    fn waiting(&self, session: &str) -> bool {
+        self.registry
+            .sessions
+            .get(session)
+            .is_some_and(|entry| entry.waiting)
+    }
+
+    /// Asks agent `conn` of `session` to write Esc. `false`: its queue did
+    /// not take it.
+    fn send_key(&mut self, slot: SlotId, session: &str, conn: u64) -> bool {
+        let key = ConsoleKey::Interrupt;
+        let key_id = crate::wire::random_u64();
+        let asked = self.conns.get(&conn).is_some_and(|bound| {
+            bound
+                .to_agent
+                .try_send(HubMsg::ConsoleKey { key_id, key })
+                .is_ok()
+        });
+        if !asked {
+            warn!(conn, "agent queue full or closed; console key not sent");
+            return false;
+        }
+        let now = Instant::now();
+        self.key_asks.retain(|_, ask| ask.until > now);
+        if self.key_asks.len() >= status::MAX_KEY_ASKS
+            && let Some(oldest) = self
+                .key_asks
+                .iter()
+                .min_by_key(|(_, ask)| ask.until)
+                .map(|(id, _)| *id)
+        {
+            self.key_asks.remove(&oldest);
+        }
+        self.key_asks.insert(
+            key_id,
+            KeyAsk {
+                slot,
+                session: session.to_owned(),
+                conn,
+                until: now + status::KEY_WAIT,
+            },
+        );
+        info!(
+            conn,
+            session = short(session),
+            ?key,
+            "console key sent to the session agent"
+        );
+        true
+    }
+
+    /// An agent wrote Esc, or could not. Written is not stopped: the status
+    /// shows it as sent until `Stop`, an interrupt note, the next prompt or
+    /// the session's end. A key that was not written is told in the topic.
+    /// An answer for a slot, session or connection that changed meanwhile
+    /// (the session ended, the slot got another session, the agent
+    /// reconnected) changes nothing.
+    fn on_key_written(&mut self, conn: u64, frame_session: &str, key_id: u64, written: bool) {
+        let Some(ask) = self.key_asks.remove(&key_id) else {
+            debug!(conn, "answer to a console key nothing waits for");
+            return;
+        };
+        if ask.conn != conn
+            || ask.session != frame_session
+            || self.live_agent(ask.slot) != Some((ask.session.clone(), conn))
+        {
+            debug!(
+                conn,
+                "console key answer for a session that moved on; ignored"
+            );
+            return;
+        }
+        if written {
+            info!(conn, session = short(&ask.session), "Esc written");
+            if let Some(activity) = self.activity.get_mut(&ask.session) {
+                activity.interrupt_written();
+            }
+            // Shown at once, whatever the edit pace.
+            if let Some(shown) = self.shown.get_mut(&ask.slot) {
+                shown.next_at = Some(Instant::now());
+            }
+            return;
+        }
+        warn!(conn, session = short(&ask.session), "Esc not written");
+        if let Some(thread_id) = self.registry.slot(ask.slot).and_then(|slot| slot.topic_id) {
+            self.notify(ask.slot, thread_id, status::KEY_FAILED_NOTICE);
+        }
+    }
+
+    /// Text and keyboard the status message of `slot` should show now.
+    fn status_view(
+        &self,
+        slot: SlotId,
+        session: &str,
+        now: Instant,
+    ) -> (String, serde_json::Value) {
+        let ended = self.registry.state(slot) == SlotState::Dead;
+        let waiting = self.waiting(session);
+        let activity = self.activity.get(session);
+        let metrics = self
+            .registry
+            .sessions
+            .get(session)
+            .and_then(|entry| entry.metrics.as_ref());
+        let phase = status::phase(activity, ended, waiting);
+        let keys = !ended
+            && self
+                .live_agent(slot)
+                .is_some_and(|(_, conn)| self.conns.get(&conn).is_some_and(|bound| bound.keys));
+        let confirm = self.shown.get(&slot).is_some_and(|shown| {
+            shown
+                .confirm
+                .as_ref()
+                .is_some_and(|(armed, until)| armed == session && now < *until)
+        });
+        let buttons = Buttons {
+            interrupt: keys && !waiting && self.busy(session),
+            confirm,
+        };
+        status::render(&phase, metrics, buttons)
+    }
+
+    /// Sends, pins and edits the status messages that need it: one call per
+    /// slot at a time, edits at most once per `Options::status_every`.
+    fn pump_status(&mut self) {
+        let Some(every) = self.options.status_every else {
+            return;
+        };
+        let now = Instant::now();
+        for index in 0..self.registry.slots.len() {
+            let slot = SlotId(index);
+            let entry = &self.registry.slots[index];
+            let (Some(thread_id), Some(session)) = (entry.topic_id, entry.current_session.clone())
+            else {
+                continue;
+            };
+            let message = entry.status;
+            let separated = entry.pending_separator.is_none();
+            if self.shown.get(&slot).is_some_and(|shown| shown.busy) {
+                continue;
+            }
+            let (text, keyboard) = self.status_view(slot, &session, now);
+            let live = self.registry.is_live_top_level(&session);
+            let can_pin = self.options.can_pin;
+            let shown = self.shown.entry(slot).or_default();
+            let job = match message {
+                None => {
+                    // A new message only for a live session, after its
+                    // separator, so it lands below it.
+                    if !live || !separated || shown.retry_at.is_some_and(|at| now < at) {
+                        continue;
+                    }
+                    StatusJob::Create {
+                        thread_id,
+                        text,
+                        keyboard,
+                    }
+                }
+                Some(StatusMessage {
+                    message_id,
+                    pinned: false,
+                }) if can_pin && !shown.pin_failed => StatusJob::Pin { message_id },
+                Some(StatusMessage { message_id, .. }) => {
+                    let current = Some((text.clone(), keyboard.clone()));
+                    if shown.content == current || shown.next_at.is_some_and(|at| now < at) {
+                        continue;
+                    }
+                    StatusJob::Edit {
+                        message_id,
+                        text,
+                        keyboard,
+                    }
+                }
+            };
+            shown.busy = true;
+            if matches!(job, StatusJob::Edit { .. }) {
+                shown.next_at = Some(now + every);
+            }
+            let op = match &job {
+                StatusJob::Create {
+                    thread_id,
+                    text,
+                    keyboard,
+                } => Op::Send {
+                    thread_id: Some(*thread_id),
+                    text: text.clone(),
+                    html: None,
+                    reply_markup: Some(keyboard.clone()),
+                    permission: false,
+                    reply_to: None,
+                },
+                StatusJob::Edit {
+                    message_id,
+                    text,
+                    keyboard,
+                } => Op::Edit {
+                    message_id: *message_id,
+                    text: text.clone(),
+                    reply_markup: Some(keyboard.clone()),
+                },
+                StatusJob::Pin { message_id } => Op::Pin {
+                    message_id: *message_id,
+                },
+            };
+            self.hand_off(Work::Status { slot, job }, op);
+        }
+    }
+
+    /// Telegram answered a status call.
+    fn on_status_done(&mut self, slot: SlotId, job: StatusJob, delivery: Option<Delivery>) {
+        let now = Instant::now();
+        let every = self.options.status_every.unwrap_or(STATUS_EVERY);
+        let retry_every = self.options.retry_every;
+        let ordinal = self.ordinal(slot);
+        let topic_id = self.registry.slot(slot).and_then(|slot| slot.topic_id);
+        let message = self.registry.slot(slot).and_then(|slot| slot.status);
+        let shown = self.shown.entry(slot).or_default();
+        shown.busy = false;
+        match job {
+            StatusJob::Create {
+                thread_id,
+                text,
+                keyboard,
+            } => match delivery {
+                Some(Ok(Outcome::Sent(sent))) if sent.message_id != 0 => {
+                    // A message for a topic the slot no longer has stays there.
+                    if topic_id != Some(thread_id) || message.is_some() {
+                        return;
+                    }
+                    shown.content = Some((text, keyboard));
+                    shown.next_at = Some(now + every);
+                    shown.retry_at = None;
+                    shown.send_warned = false;
+                    if let Some(entry) = self.registry.slot_mut(slot) {
+                        entry.status = Some(StatusMessage {
+                            message_id: sent.message_id,
+                            pinned: false,
+                        });
+                        self.registry.dirty = true;
+                    }
+                    info!(ordinal, "status message sent");
+                }
+                other => {
+                    // Known limitation: a send whose answer was lost may have
+                    // made a message; the retry makes another one.
+                    shown.retry_at = Some(now + retry_every);
+                    let first = !std::mem::replace(&mut shown.send_warned, true);
+                    match other {
+                        Some(Err(error)) if first => {
+                            warn!(%error, ordinal, "status message not sent; retrying later");
+                        }
+                        Some(Err(error)) => {
+                            debug!(%error, ordinal, "status message still not sent");
+                        }
+                        _ if first => {
+                            warn!(ordinal, "status message got no answer; retrying later")
+                        }
+                        _ => debug!(ordinal, "status message still got no answer"),
+                    }
+                }
+            },
+            StatusJob::Edit {
+                message_id,
+                text,
+                keyboard,
+            } => {
+                let applied = matches!(&delivery, Some(Ok(_)))
+                    || delivery.as_ref().is_some_and(|delivery| {
+                        telegram_error(delivery, &["message is not modified"])
+                    });
+                let gone = delivery.as_ref().is_some_and(|delivery| {
+                    telegram_error(
+                        delivery,
+                        &["message to edit not found", "message can't be edited"],
+                    )
+                });
+                if applied {
+                    shown.content = Some((text, keyboard));
+                } else if gone {
+                    // Deleted in Telegram: a new one is sent and pinned.
+                    shown.content = None;
+                    if let Some(entry) = self.registry.slot_mut(slot)
+                        && entry
+                            .status
+                            .is_some_and(|status| status.message_id == message_id)
+                    {
+                        entry.status = None;
+                        self.registry.dirty = true;
+                        info!(ordinal, "status message is gone; sending a new one");
+                    }
+                } else if let Some(Err(error)) = &delivery {
+                    debug!(%error, ordinal, "status edit failed; tried again later");
+                }
+            }
+            StatusJob::Pin { message_id } => match delivery {
+                Some(Ok(_)) => {
+                    if let Some(entry) = self.registry.slot_mut(slot)
+                        && let Some(status) = entry
+                            .status
+                            .as_mut()
+                            .filter(|status| status.message_id == message_id)
+                    {
+                        status.pinned = true;
+                        self.registry.dirty = true;
+                    }
+                }
+                other => {
+                    shown.pin_failed = true;
+                    if !self.pin_warned {
+                        self.pin_warned = true;
+                        match other {
+                            Some(Err(error)) => {
+                                warn!(%error, "cannot pin a status message; not tried again until the hub restarts");
+                            }
+                            _ => warn!(
+                                "status message pin got no answer; not tried again until the hub restarts"
+                            ),
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -2698,6 +3279,7 @@ impl Slots {
 
     fn on_tick(&mut self) {
         let now = Instant::now();
+        self.key_asks.retain(|_, ask| ask.until > now);
         if now >= self.next_retry {
             self.registry.retry_failed();
             self.prompts.retry_failed_edits();
@@ -2817,6 +3399,11 @@ impl Slots {
                 self.reactions = self.reactions.saturating_sub(1);
                 self.on_reaction_done(delivery);
             }
+            Done::Status {
+                slot,
+                job,
+                delivery,
+            } => self.on_status_done(slot, job, delivery),
         }
     }
 
@@ -3054,6 +3641,7 @@ impl Slots {
         self.send_prompts();
         self.send_prompt_edits();
         self.pump_streams();
+        self.pump_status();
         let view = self.registry.topic_view();
         self.view.send_if_modified(|current| {
             let changed = **current != view;
@@ -3171,6 +3759,11 @@ async fn dispatch_loop(
                     delivery,
                 },
                 Work::Reaction => Done::Reaction(delivery),
+                Work::Status { slot, job } => Done::Status {
+                    slot,
+                    job,
+                    delivery,
+                },
             });
         });
     }
@@ -3437,6 +4030,7 @@ mod tests {
                 claude_pid,
                 verdict_ack,
                 transcript_reads: false,
+                console_keys: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -4524,6 +5118,8 @@ again"
         slots.on_hook(&start(A, 10));
         slots.registry.topic_created(SlotId(0), 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        assert!(slots.activity.contains_key(A));
         // A nested run of A, with its block.
         slots.on_hook(&hook(
             B,
@@ -4553,6 +5149,7 @@ again"
 
         assert!(slots.registry.sessions[A].ended);
         assert!(slots.registry.sessions[B].ended);
+        assert!(!slots.activity.contains_key(A), "what A did is dropped");
         assert_eq!(slots.registry.sessions[A].agent, None);
         assert_eq!(
             slots.registry.sessions[C].slot,
@@ -4586,6 +5183,7 @@ again"
                 claude_pid: Some(10),
                 verdict_ack: false,
                 transcript_reads: false,
+                console_keys: false,
             },
             to_agent,
         });
@@ -5373,6 +5971,7 @@ again"
                 claude_pid,
                 verdict_ack: false,
                 transcript_reads: false,
+                console_keys: false,
             },
             to_agent,
         });
@@ -5458,6 +6057,7 @@ again"
                 claude_pid,
                 verdict_ack: false,
                 transcript_reads: false,
+                console_keys: false,
             },
             to_agent,
         });
@@ -7839,6 +8439,7 @@ again"
                 claude_pid: Some(pid),
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -8127,6 +8728,7 @@ again"
                     claude_pid: Some(10),
                     verdict_ack: true,
                     transcript_reads: true,
+                    console_keys: false,
                 },
                 to_agent,
             })
@@ -8172,6 +8774,7 @@ again"
                 claude_pid: Some(10),
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: false,
             },
             to_agent,
         });
@@ -8210,6 +8813,7 @@ again"
                 claude_pid: Some(10),
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: false,
             },
             to_agent,
         });
@@ -8260,6 +8864,7 @@ again"
                 claude_pid: Some(10),
                 verdict_ack: true,
                 transcript_reads: true,
+                console_keys: false,
             },
             to_agent,
         });
@@ -8897,5 +9502,279 @@ again"
         append(&path, &typed("marker"));
         stream_texts(&rig, 100, 1).await;
         assert_eq!(reactions(&rig.fake.ops()), [(42, "👀".to_owned())]);
+    }
+
+    fn status_options() -> Options {
+        Options {
+            status_every: Some(Duration::from_millis(20)),
+            ..stream_options()
+        }
+    }
+
+    /// The status message: the first send of the topic that carries a
+    /// keyboard.
+    fn status_id(ops: &[Op]) -> Option<i64> {
+        let sends: Vec<&Op> = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Send { .. }))
+            .collect();
+        sends
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    Op::Send {
+                        reply_markup: Some(_),
+                        ..
+                    }
+                )
+            })
+            .map(|index| 1000 + index as i64)
+    }
+
+    fn last_status_text(ops: &[Op]) -> Option<String> {
+        let id = status_id(ops)?;
+        edits_of(ops, id).last().map(|(text, _)| text.clone())
+    }
+
+    #[tokio::test]
+    async fn status_messages_are_off_without_status_every() {
+        let mut rig = rig(Fake::default(), options());
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        let ops = settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ops = [ops, rig.fake.ops()].concat();
+        assert!(!ops.iter().any(|op| matches!(op, Op::Pin { .. })));
+        assert_eq!(status_id(&ops), None);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_note_in_the_stream_ends_the_turn_on_the_status_message() {
+        let dir = TempDir::new("slots-status-interrupt");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), status_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| {
+            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
+        })
+        .await;
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("💭 Думает")
+        })
+        .await;
+        // Esc in the terminal: Claude Code writes its note, no Stop comes.
+        append(&path, &typed("[Request interrupted by user]"));
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("💤 Ждёт вас")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_call_whose_result_is_in_the_stream_no_longer_shows_as_running() {
+        let dir = TempDir::new("slots-status-result");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), status_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| {
+            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
+        })
+        .await;
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        rig.hook(hook(
+            A,
+            HookEvent::ToolStart {
+                tool_use_id: "toolu_9".into(),
+                line: "• Bash: deploy".into(),
+            },
+        ))
+        .await;
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("⚙️ Bash: deploy")
+        })
+        .await;
+        // Denied in the terminal: no PostToolUse comes, but the transcript
+        // gets the call and its refused result.
+        append(&path, &tool_call("toolu_9", "deploy"));
+        append(&path, &tool_result("toolu_9", Some("denied")));
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("💭 Думает")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_status_button_of_an_agent_without_console_keys_sends_nothing() {
+        let mut rig = rig(Fake::default(), status_options());
+        rig.hook(start(A, 10)).await;
+        rig.ops_after(1).await;
+        rig.agent_of(1, A, Some(10)).await;
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        let ops = settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("💭 Думает")
+        })
+        .await;
+        let id = status_id(&ops).unwrap();
+        // No buttons: this agent cannot press keys.
+        assert_eq!(
+            edits_of(&ops, id)
+                .last()
+                .and_then(|(_, markup)| markup.clone()),
+            Some(permissions::no_keyboard())
+        );
+        for data in ["status:stop", "status:confirm"] {
+            rig.control.send(press("q", Some(id), data)).unwrap();
+        }
+        let ops = settled(&rig, |ops| answers(ops).len() >= 2).await;
+        assert_eq!(answers(&ops), [Some(status::ANSWER_NO_KEYS); 2]);
+        assert!(
+            !received(&mut rig, 0)
+                .await
+                .iter()
+                .any(|msg| matches!(msg, HubMsg::ConsoleKey { .. }))
+        );
+    }
+
+    /// A live session A in slot 0 with topic 100 and an agent (conn 1) that
+    /// presses keys; what the hub sends that agent comes out of the receiver.
+    fn keyed_slots(dir: &TempDir, options: Options) -> (Slots, mpsc::Receiver<HubMsg>) {
+        let (_fake, mut slots) = live_slots(dir, options);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, from_hub) = mpsc::channel(8);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: false,
+                transcript_reads: false,
+                console_keys: true,
+            },
+            to_agent,
+        });
+        (slots, from_hub)
+    }
+
+    fn offers_stop(slots: &Slots) -> bool {
+        let (_, keyboard) = slots.status_view(SlotId(0), A, Instant::now());
+        keyboard != permissions::no_keyboard()
+    }
+
+    #[tokio::test]
+    async fn a_prompt_answered_in_the_terminal_stops_waiting_once_a_later_call_comes() {
+        let dir = TempDir::new("slots-status-terminal-answer");
+        let (mut slots, _from_hub) = keyed_slots(&dir, options());
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        let start_call = |id: &str| {
+            hook(
+                A,
+                HookEvent::ToolStart {
+                    tool_use_id: id.into(),
+                    line: "• Bash: x".into(),
+                },
+            )
+        };
+        slots.on_hook(&start_call("t1"));
+        slots.on_agent(permission(1, "abcde", "p"));
+        assert!(slots.waiting(A));
+        assert!(!offers_stop(&slots), "Esc would answer the prompt");
+        // The end of the call before the prompt comes in after it (the tool
+        // hooks run in the background): the prompt still waits.
+        slots.on_hook(&hook(
+            A,
+            HookEvent::ToolEnd {
+                tool_use_id: "t1".into(),
+            },
+        ));
+        assert!(slots.waiting(A));
+        // Later, the next call starts: the prompt was answered in the
+        // terminal. Its buttons stay; ⏹ is back.
+        for key in slots.prompts.active() {
+            let prompt = slots.prompts.get_mut(key).unwrap();
+            prompt.opened -= PROMPT_SETTLE;
+        }
+        slots.on_hook(&start_call("t2"));
+        assert!(!slots.waiting(A));
+        assert!(!slots.registry.sessions[A].waiting, "the icon too");
+        assert_eq!(slots.prompts.active().len(), 1);
+        assert!(offers_stop(&slots));
+    }
+
+    #[tokio::test]
+    async fn a_written_esc_is_shown_at_once_whatever_the_edit_pace() {
+        let dir = TempDir::new("slots-status-written");
+        let (mut slots, mut from_hub) = keyed_slots(&dir, status_options());
+        slots.registry.slots[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: true,
+        });
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        assert_eq!(
+            slots.press_status(Some(500), Press::Stop),
+            status::ANSWER_CONFIRM
+        );
+        assert_eq!(
+            slots.press_status(Some(500), Press::Confirm),
+            status::ANSWER_INTERRUPTING
+        );
+        let Some(HubMsg::ConsoleKey { key_id, .. }) = from_hub.recv().await else {
+            panic!("no console key");
+        };
+        // The confirming press's edit went out; the next one waits the pace.
+        let paced = Instant::now() + Duration::from_secs(60);
+        slots.shown.entry(SlotId(0)).or_default().next_at = Some(paced);
+        slots.on_key_written(1, A, key_id, true);
+        assert!(
+            slots.shown[&SlotId(0)]
+                .next_at
+                .is_some_and(|at| at <= Instant::now())
+        );
+        let (text, _) = slots.status_view(SlotId(0), A, Instant::now());
+        assert_eq!(text, "⏹ Esc отправлен в терминал");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_note_at_an_open_prompt_ends_the_wait() {
+        let dir = TempDir::new("slots-status-interrupt-waiting");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), status_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| {
+            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
+        })
+        .await;
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        // The prompt comes after the turn started (hooks and agent frames
+        // travel apart; UserPromptSubmit ends the wait).
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("💭 Думает")
+        })
+        .await;
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("❓ Ждёт разрешения")
+        })
+        .await;
+        // Esc in the terminal at the prompt: the note, no Stop.
+        append(&path, &typed("[Request interrupted by user for tool use]"));
+        settled(&rig, |ops| {
+            last_status_text(ops).as_deref() == Some("💤 Ждёт вас")
+        })
+        .await;
     }
 }

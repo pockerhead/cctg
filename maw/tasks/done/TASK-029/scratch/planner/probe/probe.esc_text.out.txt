@@ -1,0 +1,76 @@
+esc_text: state=done inject_at=13.922097444534302 sid=31b14608
+5.1s ready -> prompt
+13.9s trigger None seen -> inject esc after 6s
+--- events (t relative to start) ---
+{"t": 1.62, "kind": "statusline", "pid": 19984, "shape": {"session_id": "str[36]", "transcript_path": "str[122]", "cwd": "str[48]", "scratchpad_dir": "str[136]", "effort": {"level": "str[6]"}, "model": {"id": "str[19]", "display_name": "str[21]"}, "workspace": {"current_dir": "str[48]", "project_dir": "str[48]", "added_dirs": "list[0]"}, "version": "str[7]", "output_style": {"name": "str[7]"}, "cost": {"total_cost_usd": 0, "total_duration_ms": 1274, "total_api_duration_ms": 0, "total_lines_added": 0, "total_lines_removed": 0}, "context_window": {"total_input_tokens": 0, "total_output_tokens": 0, "context_window_size": 1000000, "current_usage": null, "used_percentage": null, "remaining_percentage": null}, "exceeds_200k_tokens": false, "fast_mode": false, "thinking": {"enabled": true}}, "session_id": "31b14608", "model": {"id": "claude-opus-5-5[1m]", "display_name": "Opus 5.5 (1M context)"}, "effort": {"level": "medium"}, "ctx": null, "rate_limits": null, "env": {"SHELL": "C:\\Program Files\\Git\\bin\\bash.exe", "MSYSTEM": "MINGW64", "EXEPATH": "C:\\Program Files\\Git\\bin", "CLAUDE_CODE_GIT_BASH_PATH": null, "CLAUDE_PID": "10476", "CLAUDE_CODE_SESSION_ID": "31b14608-9923-4007-92d9-cd704568b5ed", "CLAUDE_CONFIG_DIR": null}, "env_path_head": ["C:\\Program Files\\Git\\mingw64\\bin", "C:\\Program Files\\Git\\usr\\bin", "C:\\Users\\user\\bin", "C:\\Program Files\\Git\\bin"]}
+{"t": 6.84, "kind": "prompt", "pid": 22756, "hook": "UserPromptSubmit", "session_id": "31b14608", "keys": ["cwd", "hook_event_name", "permission_mode", "prompt", "prompt_id", "scratchpad_dir", "session_id", "transcript_path"], "tool_name": null, "tool_use_id": null, "tool_input_keys": [], "description": null, "subagent_type": null, "run_in_background": null}
+--- mcp.log ---
+1790260323.606 6648 start parent=10476 image=claude.exe CLAUDE_PID=None
+1790260323.606 6648 start console_hwnd=0x0 console_procs=1
+1790260336.156 6648 inject esc ok=True written=2
+--- transcript ---
+None mode kinds= stop=None marks=[] tur_keys=None
+None permission-mode kinds= stop=None marks=[] tur_keys=None
+None atis-latch kinds= stop=None marks=[] tur_keys=None
+None file-history-snapshot kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.919Z user kinds=string stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:08.918Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:09.030Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:09.030Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:09.030Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:09.031Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:09.032Z attachment kinds= stop=None marks=[] tur_keys=None
+2026-09-24T14:32:09.034Z attachment kinds= stop=None marks=[] tur_keys=None
+None last-prompt kinds= stop=None marks=[] tur_keys=None
+None mode kinds= stop=None marks=[] tur_keys=None
+None permission-mode kinds= stop=None marks=[] tur_keys=None
+None atis-latch kinds= stop=None marks=[] tur_keys=None
+None ai-title kinds= stop=None marks=[] tur_keys=None
+--- screen before (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+❯ Without using any tools, write a 1500-word essay about lighthouses.
+
+✽ Tomfoolering… (6s · thinking)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent
+                                                 You've used 93% of your weekly limit · resets Sep 28, 8pm (Etc/GMT-3)
+
+--- screen plus2 (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Without using any tools, write a 1500-word essay about lighthouses.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None                      You've used 93% of your weekly limit · resets Sep 28, 8pm (Etc/GMT-3)
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+--- screen final (tail) ---
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Without using any tools, write a 1500-word essay about lighthouses.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  probe-statusline ctx:None
+  ⏵⏵ auto mode on (shift+tab to cycle)
+

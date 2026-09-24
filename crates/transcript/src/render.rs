@@ -308,6 +308,12 @@ fn agent_ids(turns: &[Turn]) -> HashMap<&str, &str> {
         .collect()
 }
 
+/// The `/brief` line of a tool call from its name and input alone, as the
+/// stream shows it (`• Bash: description`, `↳ Explore: description`).
+pub fn call_line(name: &str, input: &Value) -> String {
+    tool_line(name, input, None, None)
+}
+
 /// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
 pub(crate) fn tool_line(
     name: &str,

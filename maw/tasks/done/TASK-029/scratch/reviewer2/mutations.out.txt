@@ -1,0 +1,23 @@
+M1 the first stop press already sends Esc: KILLED a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing, a_press_reaches_only_the_agent_of_its_own_slot, the_status_message_follows_the_session_and_its_button_writes_esc
+M2 a status press is not tied to its own message: KILLED the_status_message_follows_the_session_and_its_button_writes_esc, a_press_reaches_only_the_agent_of_its_own_slot
+M3 an agent without console_keys is asked to press keys: KILLED hub::slots::tests::a_status_button_of_an_agent_without_console_keys_sends_nothing
+M4 status edits are not paced: KILLED edits_are_paced_and_a_deleted_status_message_comes_back
+M5 a written Esc is not shown: KILLED the_status_message_follows_the_session_and_its_button_writes_esc
+M6 every pin notice is deleted: KILLED the_status_message_follows_the_session_and_its_button_writes_esc
+M7 a pinned status message is pinned again: KILLED the_status_message_follows_the_session_and_its_button_writes_esc, a_late_key_answer_never_reaches_the_next_session_of_the_slot, a_restarted_hub_keeps_its_status_message_and_the_numbers, a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing
+M8 interrupt notes in the stream are ignored: KILLED hub::slots::tests::an_interrupt_note_in_the_stream_ends_the_turn_on_the_status_message
+M9 tool calls inside subagents reach the hub: KILLED hook::build_tests::tool_status_skips_subagent_calls_handbacks_and_other_events
+M10 a start that comes after its end shows a finished call: KILLED hub::status::tests::a_start_after_its_end_and_a_repeated_start_change_nothing
+M11 console key answers are not forwarded by ingress: KILLED the_status_message_follows_the_session_and_its_button_writes_esc
+M12 a running call outranks a waiting permission prompt: KILLED hub::status::tests::a_written_esc_is_not_the_end_of_the_turn, hub::status::tests::the_first_line_follows_what_the_session_does
+R1 a person's pin notice is deleted too: KILLED hub::tests::messages_go_to_the_slot_actor_and_commands_do_not
+R2a a press while a permission prompt waits writes Esc: KILLED a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing
+R2b the stop button shows while a permission prompt waits: KILLED a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing
+R3 a written Esc counts as the end of the turn: KILLED the_status_message_follows_the_session_and_its_button_writes_esc
+R4 a late key answer of a session that moved on is taken: KILLED a_late_key_answer_never_reaches_the_next_session_of_the_slot
+R5 a tool result in the stream does not end the call: KILLED hub::slots::tests::a_call_whose_result_is_in_the_stream_no_longer_shows_as_running
+R6 status line numbers are not kept in registry.json: KILLED a_restarted_hub_keeps_its_status_message_and_the_numbers
+R7 percentages up to 1000 are shown: KILLED statusline::tests::missing_null_and_odd_fields_are_left_out
+R8 the status line waits 150 ms for a stopped hub: KILLED statusline::tests::missing_null_and_odd_fields_are_left_out
+R9 an empty output of the user command becomes cctg's line: KILLED colours_lines_a_failing_exit_and_empty_output_pass_unchanged
+R10 the user command exit code is dropped: KILLED colours_lines_a_failing_exit_and_empty_output_pass_unchanged

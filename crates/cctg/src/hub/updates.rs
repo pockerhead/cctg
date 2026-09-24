@@ -64,6 +64,8 @@ pub struct ServiceMessage {
     pub kind: ServiceKind,
     pub message_id: i64,
     pub thread_id: Option<i64>,
+    /// Who did it (the bot for its own topic edits and pins). Never logged.
+    pub from: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +74,8 @@ pub enum ServiceKind {
     TopicEdited,
     TopicClosed,
     TopicReopened,
+    /// A message was pinned: its id (TASK-029).
+    Pinned(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +102,10 @@ fn service_kind(message: &Message) -> Option<ServiceKind> {
     } else if message.forum_topic_reopened.is_some() {
         Some(ServiceKind::TopicReopened)
     } else {
-        None
+        message
+            .pinned_message
+            .as_ref()
+            .map(|pinned| ServiceKind::Pinned(pinned.message_id))
     }
 }
 
@@ -114,6 +121,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
                 kind,
                 message_id: message.message_id,
                 thread_id: message.message_thread_id,
+                from: message.from.as_ref().map(|from| from.id),
             });
         }
         let Some(from) = message.from else {
@@ -566,6 +574,11 @@ mod tests {
                 json!({}),
                 ServiceKind::TopicReopened,
             ),
+            (
+                "pinned_message",
+                json!({ "message_id": 42, "date": 1, "chat": { "id": CHAT, "type": "supergroup" } }),
+                ServiceKind::Pinned(42),
+            ),
         ];
         for (field, payload, kind) in cases {
             // Sent by the bot (not allowlisted) and by an allowlisted admin.
@@ -577,7 +590,8 @@ mod tests {
                     Routed::Service(ServiceMessage {
                         kind,
                         message_id: 10,
-                        thread_id: Some(7)
+                        thread_id: Some(7),
+                        from: Some(from),
                     }),
                     "{field}"
                 );

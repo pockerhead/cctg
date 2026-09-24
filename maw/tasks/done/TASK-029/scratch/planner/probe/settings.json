@@ -1,0 +1,48 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-029/scratch/planner/probe/dump.py\" statusline"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-029/scratch/planner/probe/dump.py\" pretooluse"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-029/scratch/planner/probe/dump.py\" posttooluse"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-029/scratch/planner/probe/dump.py\" prompt"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:/Program Files/Python310/python.exe\" \"C:/Users/user/dev/cctg/maw/tasks/in_progress/TASK-029/scratch/planner/probe/dump.py\" stop"
+          }
+        ]
+      }
+    ]
+  }
+}

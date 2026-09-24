@@ -304,6 +304,8 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
         [
             "PermissionRequest",
             "PostToolUse",
+            "PostToolUseFailure",
+            "PreToolUse",
             "SessionEnd",
             "SessionStart",
             "Stop",
@@ -312,27 +314,47 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
             "UserPromptSubmit"
         ]
     );
+    // The status message (TASK-029): the status line command and the tool
+    // status hook, which runs in the background for every tool.
+    assert_eq!(
+        settings["statusLine"],
+        serde_json::json!({ "type": "command", "command": "cctg statusline" })
+    );
+    let mut tool_status = 0;
     for (event, groups) in hooks {
-        let groups = groups.as_array().unwrap();
-        assert_eq!(groups.len(), 1, "{event}");
-        let matcher = groups[0].get("matcher").and_then(|m| m.as_str());
-        assert_eq!(
-            matcher,
-            (event == "PostToolUse").then_some("SubagentHandback"),
-            "{event}"
-        );
-        let commands = groups[0]["hooks"].as_array().unwrap();
-        assert_eq!(commands.len(), 1, "{event}");
-        assert_eq!(commands[0]["type"], "command");
-        assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
-        // Only the waiting hook needs more than Claude Code's default time.
-        let timeout = commands[0].get("timeout").and_then(|t| t.as_u64());
-        assert_eq!(
-            timeout,
-            (event == "PermissionRequest").then_some(100),
-            "{event}"
-        );
+        for group in groups.as_array().unwrap() {
+            let matcher = group.get("matcher").and_then(|m| m.as_str());
+            let commands = group["hooks"].as_array().unwrap();
+            assert_eq!(commands.len(), 1, "{event}");
+            assert_eq!(commands[0]["type"], "command");
+            let timeout = commands[0].get("timeout").and_then(|t| t.as_u64());
+            if commands[0]["command"] == "cctg hook ToolStatus" {
+                tool_status += 1;
+                assert!(
+                    ["PreToolUse", "PostToolUse", "PostToolUseFailure"].contains(&event.as_str()),
+                    "{event}"
+                );
+                assert_eq!(matcher, None, "{event}");
+                assert_eq!(commands[0]["async"], true, "{event}");
+                assert_eq!(timeout, None, "{event}");
+                continue;
+            }
+            assert_eq!(
+                matcher,
+                (event == "PostToolUse").then_some("SubagentHandback"),
+                "{event}"
+            );
+            assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
+            assert_eq!(commands[0].get("async"), None, "{event}");
+            // Only the waiting hook needs more than Claude Code's default time.
+            assert_eq!(
+                timeout,
+                (event == "PermissionRequest").then_some(100),
+                "{event}"
+            );
+        }
     }
+    assert_eq!(tool_status, 3);
     for needle in [
         "CCTG_",
         "SECRET",

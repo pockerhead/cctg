@@ -1,0 +1,16 @@
+== M2: no quiet on a later call
+test hub::slots::tests::a_prompt_answered_in_the_terminal_stops_waiting_once_a_later_call_comes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 478 filtered out; finished in 0.01s
+== M2: quiet without settle
+test hub::slots::tests::a_prompt_answered_in_the_terminal_stops_waiting_once_a_later_call_comes ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 478 filtered out; finished in 0.01s
+== m2: no pace reset
+test hub::slots::tests::a_written_esc_is_shown_at_once_whatever_the_edit_pace ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 478 filtered out; finished in 0.00s
+== m3: no drain
+test a_command_that_prints_too_much_is_cut_without_waiting_for_the_timeout ... FAILED
+assertion `left == right` failed
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 10.71s
+== m5: warn every retry
+test a_status_message_that_keeps_failing_is_warned_about_once ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s

@@ -1,0 +1,7 @@
+hook ToolStatus PreToolUse, hub up                      median   12.0 ms  max   60.8 ms  stdout=b''
+hook ToolStatus PreToolUse, hub down                    median  315.3 ms  max  362.6 ms  stdout=b''
+hook ToolStatus inside a subagent (skipped, no POST)    median    8.9 ms  max   50.3 ms  stdout=b''
+statusline own line, hub up                             median   12.0 ms  max   51.7 ms  stdout=b'Opus \xc2\xb7 ctx 50% \xc2\xb7 5h 3%'
+statusline own line, hub down                           median   92.8 ms  max  139.7 ms  stdout=b'Opus \xc2\xb7 ctx 50% \xc2\xb7 5h 3%'
+statusline chained `echo`, hub up                       median   39.9 ms  max  127.2 ms  stdout=b'user-line\n'
+statusline chained `echo`, hub down                     median  108.5 ms  max  201.0 ms  stdout=b'user-line\n'

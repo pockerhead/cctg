@@ -18,7 +18,7 @@ pub use markdown::{
     HtmlChunk, HtmlSplit, escape_html, markdown_to_html, split_markdown_for_telegram,
 };
 pub use render::{
-    last_prompts, render_brief, render_brief_with_subagents, render_full,
+    call_line, last_prompts, render_brief, render_brief_with_subagents, render_full,
     render_full_with_subagents,
 };
 pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};

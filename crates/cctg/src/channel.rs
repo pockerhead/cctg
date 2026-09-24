@@ -201,9 +201,13 @@ impl Server {
                 );
                 self.emit(line)
             }
-            // Transcript reads are the agent loop's, not the channel's.
+            // Transcript reads and console keys are the agent loop's, not
+            // the channel's.
             LinkEvent::Message(
-                HubMsg::Registered | HubMsg::Rejected { .. } | HubMsg::TranscriptRead { .. },
+                HubMsg::Registered
+                | HubMsg::Rejected { .. }
+                | HubMsg::TranscriptRead { .. }
+                | HubMsg::ConsoleKey { .. },
             ) => Vec::new(),
         }
     }

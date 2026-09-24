@@ -95,6 +95,8 @@ pub struct Message {
     pub forum_topic_edited: Option<IgnoredAny>,
     pub forum_topic_closed: Option<IgnoredAny>,
     pub forum_topic_reopened: Option<IgnoredAny>,
+    /// A `pinned_message` service message: the message that was pinned.
+    pub pinned_message: Option<MessageRef>,
 }
 
 /// The id and the words of a message another message refers to.
@@ -136,6 +138,7 @@ pub struct ChatMember {
     pub status: String,
     pub can_manage_topics: bool,
     pub can_delete_messages: bool,
+    pub can_pin_messages: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -307,6 +310,19 @@ impl BotApi {
             .map(drop)
     }
 
+    /// Pins a message without a notification; a message of a forum topic is
+    /// pinned in that topic.
+    pub async fn pin_chat_message(&self, message_id: i64) -> Result<(), ApiError> {
+        let body = json!({
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "disable_notification": true,
+        });
+        self.call::<IgnoredAny>("pinChatMessage", body, None)
+            .await
+            .map(drop)
+    }
+
     pub async fn delete_message(&self, message_id: i64) -> Result<(), ApiError> {
         let body = json!({ "chat_id": self.chat_id, "message_id": message_id });
         self.call::<IgnoredAny>("deleteMessage", body, None)
@@ -443,7 +459,7 @@ mod tests {
     fn decodes_ok_result_and_ignores_unknown_fields() {
         let member: ChatMember = parse_envelope(200, ADMIN_MEMBER.as_bytes()).unwrap();
         assert_eq!(member.status, "administrator");
-        assert!(member.can_manage_topics && member.can_delete_messages);
+        assert!(member.can_manage_topics && member.can_delete_messages && member.can_pin_messages);
     }
 
     #[test]

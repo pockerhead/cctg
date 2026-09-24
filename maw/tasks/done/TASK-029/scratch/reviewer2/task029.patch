@@ -1,0 +1,4739 @@
+diff --git a/crates/cctg/Cargo.toml b/crates/cctg/Cargo.toml
+--- a/crates/cctg/Cargo.toml
++++ b/crates/cctg/Cargo.toml
+@@ -17,10 +17,12 @@
+ tracing-subscriber.workspace = true
+ transcript = { path = "../transcript" }
+ 
+-# Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot).
+-# Already in the lock file through tokio; no new download.
++# Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot);
++# console key presses of the agent (TASK-029: AttachConsole, CreateFileW
++# CONIN$, WriteConsoleInputW). Already in the lock file through tokio; no new
++# download.
+ [target.'cfg(windows)'.dependencies]
+-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
++windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+ 
+ [dev-dependencies]
+ tokio = { workspace = true, features = ["test-util"] }
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -21,6 +21,10 @@
+ //! endpoint: a session that started while the hub was down becomes known as
+ //! soon as the hub is back, without waiting for its next hook.
+ //!
++//! On Windows the agent also presses Esc in its claude's console when the
++//! hub asks (`console_key`, see [`crate::keys`]) and answers whether the key
++//! events were written.
++//!
+ //! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
+ //! channel from Claude Code (TASK-004), so its agent answers MCP but never
+ //! connects: a nested `claude -p` cannot show up as a routable channel even
+@@ -29,6 +33,7 @@
+ use std::collections::VecDeque;
+ use std::io::{BufRead, Read, Write};
+ use std::path::PathBuf;
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
+@@ -40,10 +45,11 @@
+ 
+ use crate::channel::{self, Hub, NoHub};
+ use crate::device::{self, DeviceConfig};
++use crate::keys;
+ use crate::proctree;
+ use crate::spool;
+ use crate::tail;
+-use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
++use crate::wire::{self, AgentMsg, ConsoleKey, HubMsg, Register, Rejection, Secret, WireError};
+ 
+ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+@@ -351,22 +357,30 @@
+     TooLong,
+ }
+ 
++/// Writes one key into the claude console; `false` when it was not written.
++pub type Presser = Arc<dyn Fn(ConsoleKey) -> bool + Send + Sync>;
++
+ /// Runs `cctg agent` until stdin closes.
+ pub async fn run_stdio() {
+     let config = DeviceConfig::load();
+     let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+     let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
++    // Not env `CLAUDE_PID`: in an MCP server it is inherited from an outer
++    // claude, or unset (TASK-004).
++    let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
++    let presser: Option<Presser> = claude_pid
++        .filter(|_| keys::SUPPORTED)
++        .map(|pid| Arc::new(move |key| keys::press(pid, key)) as Presser);
+     let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
+         Ok((secret, session_id)) => {
+             let register = Register {
+                 session_id,
+                 host: config.host.clone(),
+                 cwd: device::canonical_cwd(&current_dir()),
+-                // Not env `CLAUDE_PID`: in an MCP server it is inherited
+-                // from an outer claude, or unset (TASK-004).
+-                claude_pid: proctree::current_lineage(None, None, "").claude_pid,
++                claude_pid,
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: presser.is_some(),
+             };
+             let (outbox, events) = spawn(LinkConfig {
+                 addr: config.agent_addr.clone(),
+@@ -387,7 +401,9 @@
+     };
+     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
+     let projects = tail::projects_root();
+-    if let Err(error) = serve_channel(frames, tokio::io::stdout(), hub, events, projects).await {
++    if let Err(error) =
++        serve_channel(frames, tokio::io::stdout(), hub, events, projects, presser).await
++    {
+         debug!(kind = ?error.kind(), "stdout closed");
+     }
+ }
+@@ -478,16 +494,22 @@
+ /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
+ /// when stdin ends (the hub link stops with it) or stdout fails. Transcript
+ /// reads are answered only from under `projects` ([`tail::projects_root`]).
++/// Console keys are pressed with `presser`; without one a `console_key` is
++/// answered as failed.
+ pub async fn serve_channel<W: AsyncWrite + Unpin>(
+     mut frames: mpsc::Receiver<Frame>,
+     mut output: W,
+     hub: Hub,
+     mut events: Option<mpsc::Receiver<LinkEvent>>,
+     projects: Option<PathBuf>,
++    presser: Option<Presser>,
+ ) -> std::io::Result<()> {
+-    let reads = match &hub {
+-        Hub::Link(outbox) => Some(spawn_reader(outbox.clone(), projects)),
+-        Hub::Off(_) => None,
++    let (reads, keys) = match &hub {
++        Hub::Link(outbox) => (
++            Some(spawn_reader(outbox.clone(), projects)),
++            Some(spawn_presser(outbox.clone(), presser)),
++        ),
++        Hub::Off(_) => (None, None),
+     };
+     let mut server = channel::Server::new(hub);
+     loop {
+@@ -509,6 +531,16 @@
+                     }
+                     Vec::new()
+                 }
++                Some(LinkEvent::Message(HubMsg::ConsoleKey { key_id, key })) => {
++                    // Presses queue up; one beyond the queue is dropped (the
++                    // hub takes a missing answer as nothing done).
++                    if let Some(keys) = &keys
++                        && keys.try_send((key_id, key)).is_err()
++                    {
++                        debug!("console key queue full; key dropped");
++                    }
++                    Vec::new()
++                }
+                 Some(event) => server.on_link(event),
+                 None => {
+                     events = None;
+@@ -552,6 +584,39 @@
+     requests
+ }
+ 
++/// The one worker that presses console keys off the loop, one at a time (a
++/// console is attached per process), and answers each with
++/// `console_key_written`.
++fn spawn_presser(
++    outbox: mpsc::Sender<AgentMsg>,
++    presser: Option<Presser>,
++) -> mpsc::Sender<(u64, ConsoleKey)> {
++    let (requests, mut pending) = mpsc::channel::<(u64, ConsoleKey)>(4);
++    tokio::spawn(async move {
++        while let Some((key_id, key)) = pending.recv().await {
++            let written = match presser.clone() {
++                Some(press) => tokio::task::spawn_blocking(move || press(key))
++                    .await
++                    .unwrap_or(false),
++                None => false,
++            };
++            if written {
++                info!(?key, "console key written");
++            } else {
++                warn!(?key, "console key not written");
++            }
++            if outbox
++                .send(AgentMsg::ConsoleKeyWritten { key_id, written })
++                .await
++                .is_err()
++            {
++                return;
++            }
++        }
++    });
++    requests
++}
++
+ async fn recv_event(events: &mut Option<mpsc::Receiver<LinkEvent>>) -> Option<LinkEvent> {
+     match events {
+         Some(events) => events.recv().await,
+@@ -600,6 +665,7 @@
+             claude_pid: None,
+             verdict_ack: true,
+             transcript_reads: true,
++            console_keys: false,
+         }
+     }
+ 
+@@ -1024,7 +1090,7 @@
+     ) -> Claude {
+         let (frames, frames_rx) = mpsc::channel(16);
+         let (ours, theirs) = tokio::io::duplex(1 << 16);
+-        tokio::spawn(serve_channel(frames_rx, ours, hub, events, projects));
++        tokio::spawn(serve_channel(frames_rx, ours, hub, events, projects, None));
+         Claude {
+             frames,
+             out: tokio::io::BufReader::new(theirs),
+@@ -1259,6 +1325,7 @@
+             ours,
+             Hub::Link(outbox),
+             Some(events),
++            None,
+             None,
+         ));
+         let (_first, _) = listener.accept().await.unwrap();
+@@ -1334,4 +1401,92 @@
+             .await;
+         assert_eq!(claude.recv().await["id"], 5);
+     }
+-}
++
++    #[tokio::test]
++    async fn a_console_key_is_pressed_answered_and_never_reaches_claude() {
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (outbox, events) = spawn(config(addr, Backoff::default()));
++        let pressed = Arc::new(std::sync::Mutex::new(Vec::new()));
++        let seen = pressed.clone();
++        // The first write works, the second does not.
++        let presser: Presser = Arc::new(move |key| {
++            let mut seen = seen.lock().unwrap();
++            seen.push(key);
++            seen.len() == 1
++        });
++        let (frames, frames_rx) = mpsc::channel(16);
++        let (ours, theirs) = tokio::io::duplex(1 << 16);
++        tokio::spawn(serve_channel(
++            frames_rx,
++            ours,
++            Hub::Link(outbox),
++            Some(events),
++            None,
++            Some(presser),
++        ));
++        let mut claude = Claude {
++            frames,
++            out: tokio::io::BufReader::new(theirs),
++        };
++        let (mut reader, mut write) = raw_hub(&listener).await;
++        for key_id in [7, 8] {
++            let key = ConsoleKey::Interrupt;
++            wire::write_msg(&mut write, &HubMsg::ConsoleKey { key_id, key })
++                .await
++                .unwrap();
++        }
++        assert_eq!(
++            agent_line(&mut reader).await,
++            AgentMsg::ConsoleKeyWritten {
++                key_id: 7,
++                written: true
++            }
++        );
++        assert_eq!(
++            agent_line(&mut reader).await,
++            AgentMsg::ConsoleKeyWritten {
++                key_id: 8,
++                written: false
++            }
++        );
++        assert_eq!(
++            *pressed.lock().unwrap(),
++            [ConsoleKey::Interrupt, ConsoleKey::Interrupt]
++        );
++        // Claude Code saw nothing of it.
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
++            .await;
++        assert_eq!(claude.recv().await["id"], 5);
++    }
++
++    #[tokio::test]
++    async fn without_a_presser_a_console_key_is_answered_as_failed() {
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (outbox, events) = spawn(config(addr, Backoff::default()));
++        let _claude = claude(Hub::Link(outbox), Some(events));
++        let (mut reader, mut write) = raw_hub(&listener).await;
++        wire::write_msg(
++            &mut write,
++            &HubMsg::ConsoleKey {
++                key_id: 1,
++                key: ConsoleKey::Interrupt,
++            },
++        )
++        .await
++        .unwrap();
++        assert_eq!(
++            agent_line(&mut reader).await,
++            AgentMsg::ConsoleKeyWritten {
++                key_id: 1,
++                written: false
++            }
++        );
++    }
++}
+diff --git a/crates/cctg/src/channel.rs b/crates/cctg/src/channel.rs
+--- a/crates/cctg/src/channel.rs
++++ b/crates/cctg/src/channel.rs
+@@ -201,9 +201,13 @@
+                 );
+                 self.emit(line)
+             }
+-            // Transcript reads are the agent loop's, not the channel's.
++            // Transcript reads and console keys are the agent loop's, not
++            // the channel's.
+             LinkEvent::Message(
+-                HubMsg::Registered | HubMsg::Rejected { .. } | HubMsg::TranscriptRead { .. },
++                HubMsg::Registered
++                | HubMsg::Rejected { .. }
++                | HubMsg::TranscriptRead { .. }
++                | HubMsg::ConsoleKey { .. },
+             ) => Vec::new(),
+         }
+     }
+diff --git a/crates/cctg/src/device.rs b/crates/cctg/src/device.rs
+--- a/crates/cctg/src/device.rs
++++ b/crates/cctg/src/device.rs
+@@ -120,7 +120,7 @@
+         .filter(|value| !value.is_empty())
+ }
+ 
+-fn home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
++pub(crate) fn home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+     let names: &[&str] = if cfg!(windows) {
+         &["USERPROFILE", "HOME"]
+     } else {
+diff --git a/crates/cctg/src/hook.rs b/crates/cctg/src/hook.rs
+--- a/crates/cctg/src/hook.rs
++++ b/crates/cctg/src/hook.rs
+@@ -24,6 +24,11 @@
+ //! Claude Code then shows its own dialog as usual. It is never kept in the
+ //! spool: an answer that comes late is worthless.
+ //!
++//! `cctg hook ToolStatus` is registered as an `async` hook on `PreToolUse`,
++//! `PostToolUse` and `PostToolUseFailure` (TASK-029): Claude Code does not
++//! wait for it. It tells the hub which tool call of the main conversation
++//! runs now, for the status message; calls inside subagents are skipped.
++//!
+ //! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
+ 
+ use std::io::Read;
+@@ -63,6 +68,10 @@
+ pub const MAX_TEXT: usize = 128 << 10;
+ const HANDBACK_TOOL: &str = "SubagentHandback";
+ pub const PERMISSION_EVENT: &str = "PermissionRequest";
++/// The command-line name of the tool status hook (see the module docs).
++pub const TOOL_STATUS_EVENT: &str = "ToolStatus";
++/// Cap of a tool call line, in bytes: the status message shows one line.
++const MAX_CALL_LINE: usize = 512;
+ /// Connect and send of the permission request. On Windows a connect to a
+ /// closed local port lasts until the timeout, so a stopped hub costs this.
+ pub const PERMISSION_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+@@ -330,7 +339,10 @@
+ 
+ fn post_timeout(event: &HookEvent) -> Duration {
+     match event {
+-        HookEvent::UserPromptSubmit { .. } => PROMPT_POST_TIMEOUT,
++        HookEvent::UserPromptSubmit { .. }
++        | HookEvent::ToolStart { .. }
++        | HookEvent::ToolEnd { .. }
++        | HookEvent::StatusLine { .. } => PROMPT_POST_TIMEOUT,
+         _ => POST_TIMEOUT,
+     }
+ }
+@@ -355,7 +367,7 @@
+ /// Reads stdin on its own thread: a blocking read cannot be cancelled, and a
+ /// tokio stdin read would hold up runtime shutdown. The caller exits the
+ /// process, which ends the thread if it is still blocked.
+-fn read_stdin(limit: u64, timeout: Duration) -> Option<Vec<u8>> {
++pub(crate) fn read_stdin(limit: u64, timeout: Duration) -> Option<Vec<u8>> {
+     let (tx, rx) = std::sync::mpsc::channel();
+     std::thread::spawn(move || {
+         let mut buf = Vec::new();
+@@ -409,9 +421,70 @@
+     message: Option<String>,
+ }
+ 
++/// The fields of a `PreToolUse` / `PostToolUse` / `PostToolUseFailure` input
++/// the tool status uses.
++#[derive(Debug, Default, Deserialize)]
++#[serde(default)]
++struct ToolStatusInput {
++    session_id: String,
++    cwd: String,
++    transcript_path: String,
++    hook_event_name: Option<String>,
++    tool_name: String,
++    tool_use_id: String,
++    tool_input: Option<Value>,
++    agent_id: Option<String>,
++}
++
++/// `cctg hook ToolStatus`: the start or the end of a tool call of the main
++/// conversation. Handback calls (their own hook) and every call inside a
++/// subagent are skipped before any POST.
++fn build_tool_status(input: &[u8], probe: &Probe<'_>) -> Result<HookPost, Skip> {
++    let input: ToolStatusInput =
++        serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
++    if input.session_id.is_empty() {
++        return Err(Skip("input has no session_id"));
++    }
++    if input.agent_id.is_some_and(|id| !id.is_empty()) {
++        return Err(Skip("tool call inside a subagent"));
++    }
++    if input.tool_use_id.is_empty() || input.tool_name.trim().is_empty() {
++        return Err(Skip("tool event without its call"));
++    }
++    if input.tool_name == HANDBACK_TOOL {
++        return Err(Skip("handback has its own hook"));
++    }
++    let hook_event = match input.hook_event_name.as_deref() {
++        Some("PreToolUse") => {
++            let tool_input = input.tool_input.unwrap_or(Value::Null);
++            HookEvent::ToolStart {
++                line: cap_to(
++                    transcript::call_line(&input.tool_name, &tool_input),
++                    MAX_CALL_LINE,
++                ),
++                tool_use_id: cap_to(input.tool_use_id, MAX_TOOL_NAME),
++            }
++        }
++        Some("PostToolUse" | "PostToolUseFailure") => HookEvent::ToolEnd {
++            tool_use_id: cap_to(input.tool_use_id, MAX_TOOL_NAME),
++        },
++        _ => return Err(Skip("input is for another hook event")),
++    };
++    Ok(HookPost::new(
++        probe.host.to_owned(),
++        input.session_id,
++        (probe.cwd)(&input.cwd),
++        input.transcript_path,
++        hook_event,
++    ))
++}
++
+ /// Turns one hook input into the POST for the hub, or says why there is none.
+ /// `event` is the name the settings passed on the command line.
+ pub fn build(event: &str, input: &[u8], probe: &Probe<'_>) -> Result<HookPost, Skip> {
++    if event == TOOL_STATUS_EVENT {
++        return build_tool_status(input, probe);
++    }
+     let input: Input =
+         serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
+     if input.session_id.is_empty() {
+@@ -1257,6 +1330,82 @@
+         );
+     }
+ 
++    fn tool_input(event: &str, tool: &str, extra: serde_json::Value) -> Vec<u8> {
++        let mut input = serde_json::json!({
++            "session_id": "s",
++            "cwd": "/w",
++            "transcript_path": "/t/s.jsonl",
++            "hook_event_name": event,
++            "tool_name": tool,
++            "tool_use_id": "toolu_01",
++            "tool_input": { "command": "cargo test", "description": "Run tests" },
++        });
++        if let (Some(target), Some(extra)) = (input.as_object_mut(), extra.as_object()) {
++            target.extend(extra.clone());
++        }
++        input.to_string().into_bytes()
++    }
++
++    #[test]
++    fn tool_status_carries_the_call_line() {
++        let v = check(
++            TOOL_STATUS_EVENT,
++            &tool_input("PreToolUse", "Bash", serde_json::json!({})),
++            OWN,
++            &["type", "tool_use_id", "line"],
++        );
++        assert_eq!(v["event"]["type"], "tool_start");
++        assert_eq!(v["event"]["tool_use_id"], "toolu_01");
++        assert_eq!(v["event"]["line"], "• Bash: Run tests");
++        assert!(!v.to_string().contains("cargo test"), "only the line goes");
++        for event in ["PostToolUse", "PostToolUseFailure"] {
++            let v = check(
++                TOOL_STATUS_EVENT,
++                &tool_input(event, "Bash", serde_json::json!({})),
++                OWN,
++                &["type", "tool_use_id"],
++            );
++            assert_eq!(v["event"]["type"], "tool_end");
++        }
++    }
++
++    #[test]
++    fn tool_status_skips_subagent_calls_handbacks_and_other_events() {
++        with_probe(OWN, true, |probe, asked| {
++            for input in [
++                tool_input(
++                    "PreToolUse",
++                    "Bash",
++                    serde_json::json!({ "agent_id": "a1" }),
++                ),
++                tool_input("PreToolUse", HANDBACK_TOOL, serde_json::json!({})),
++                tool_input(
++                    "PreToolUse",
++                    "Bash",
++                    serde_json::json!({ "tool_use_id": "" }),
++                ),
++                tool_input("Stop", "Bash", serde_json::json!({})),
++                tool_input(
++                    "PreToolUse",
++                    "Bash",
++                    serde_json::json!({ "session_id": "" }),
++                ),
++                br#"{"session_id":"s","tool_name":"Bash","tool_use_id":"t"}"#.to_vec(),
++                b"not json".to_vec(),
++            ] {
++                assert!(
++                    build(TOOL_STATUS_EVENT, &input, probe).is_err(),
++                    "{}",
++                    String::from_utf8_lossy(&input)
++                );
++            }
++            assert_eq!(asked.get(), 0, "no process tree walk for tool events");
++            // The old hooks keep their meaning: a Bash call is no handback.
++            let bash = tool_input("PreToolUse", "Bash", serde_json::json!({}));
++            assert!(build("PreToolUse", &bash, probe).is_err());
++        });
++    }
++
+     #[test]
+     fn other_tools_and_incomplete_handbacks_are_skipped() {
+         with_probe(OWN, true, |probe, _| {
+@@ -1334,6 +1483,20 @@
+             }
+         });
+         assert!(PROMPT_POST_TIMEOUT < POST_TIMEOUT);
++        for event in [
++            HookEvent::ToolEnd {
++                tool_use_id: "t".into(),
++            },
++            HookEvent::StatusLine {
++                model: None,
++                effort: None,
++                context: None,
++                five_hour: None,
++                seven_day: None,
++            },
++        ] {
++            assert_eq!(post_timeout(&event), PROMPT_POST_TIMEOUT);
++        }
+         // SessionEnd: stdin wait + POST stay well inside the shared 1.5 s.
+         assert!(STDIN_TIMEOUT + POST_TIMEOUT <= Duration::from_millis(800));
+     }
+diff --git a/crates/cctg/src/hub/api.rs b/crates/cctg/src/hub/api.rs
+--- a/crates/cctg/src/hub/api.rs
++++ b/crates/cctg/src/hub/api.rs
+@@ -95,6 +95,8 @@
+     pub forum_topic_edited: Option<IgnoredAny>,
+     pub forum_topic_closed: Option<IgnoredAny>,
+     pub forum_topic_reopened: Option<IgnoredAny>,
++    /// A `pinned_message` service message: the message that was pinned.
++    pub pinned_message: Option<MessageRef>,
+ }
+ 
+ /// The id and the words of a message another message refers to.
+@@ -136,6 +138,7 @@
+     pub status: String,
+     pub can_manage_topics: bool,
+     pub can_delete_messages: bool,
++    pub can_pin_messages: bool,
+ }
+ 
+ #[derive(Debug, Clone, Default, Deserialize)]
+@@ -307,6 +310,19 @@
+             .map(drop)
+     }
+ 
++    /// Pins a message without a notification; a message of a forum topic is
++    /// pinned in that topic.
++    pub async fn pin_chat_message(&self, message_id: i64) -> Result<(), ApiError> {
++        let body = json!({
++            "chat_id": self.chat_id,
++            "message_id": message_id,
++            "disable_notification": true,
++        });
++        self.call::<IgnoredAny>("pinChatMessage", body, None)
++            .await
++            .map(drop)
++    }
++
+     pub async fn delete_message(&self, message_id: i64) -> Result<(), ApiError> {
+         let body = json!({ "chat_id": self.chat_id, "message_id": message_id });
+         self.call::<IgnoredAny>("deleteMessage", body, None)
+@@ -443,7 +459,7 @@
+     fn decodes_ok_result_and_ignores_unknown_fields() {
+         let member: ChatMember = parse_envelope(200, ADMIN_MEMBER.as_bytes()).unwrap();
+         assert_eq!(member.status, "administrator");
+-        assert!(member.can_manage_topics && member.can_delete_messages);
++        assert!(member.can_manage_topics && member.can_delete_messages && member.can_pin_messages);
+     }
+ 
+     #[test]
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -220,7 +220,8 @@
+                         msg @ (AgentMsg::Reply { .. }
+                         | AgentMsg::PermissionRequest(_)
+                         | AgentMsg::PermissionAck { .. }
+-                        | AgentMsg::TranscriptChunk { .. }),
++                        | AgentMsg::TranscriptChunk { .. }
++                        | AgentMsg::ConsoleKeyWritten { .. }),
+                     ))) => {
+                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
+                             break;
+@@ -596,16 +597,21 @@
+         debug!(event = post.event.kind(), "repeated hook event dropped");
+         return Status::NoContent;
+     }
+-    let (id, kind, session) = (
++    let (id, kind, session, frequent) = (
+         post.event_id.clone(),
+         post.event.kind(),
+         short(&post.session_id).to_owned(),
++        post.event.is_frequent(),
+     );
+     match events.try_send(post) {
+         Ok(()) => {
+             // Remembered only once handed over, so a 503 can be re-sent.
+             dedup.insert(id, now);
+-            info!(event = kind, session, "hook event accepted");
++            if frequent {
++                debug!(event = kind, session, "hook event accepted");
++            } else {
++                info!(event = kind, session, "hook event accepted");
++            }
+             Status::NoContent
+         }
+         Err(_) => Status::Unavailable,
+@@ -789,6 +795,7 @@
+             claude_pid: None,
+             verdict_ack: false,
+             transcript_reads: false,
++            console_keys: false,
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/mod.rs b/crates/cctg/src/hub/mod.rs
+--- a/crates/cctg/src/hub/mod.rs
++++ b/crates/cctg/src/hub/mod.rs
+@@ -11,6 +11,7 @@
+ pub mod scheduler;
+ pub mod sessions;
+ pub mod slots;
++pub mod status;
+ pub mod stream;
+ pub mod subagents;
+ #[cfg(test)]
+@@ -62,10 +63,13 @@
+ 
+ /// The poll callback: commands go to the command worker's queue; other
+ /// messages, button presses and topic edit notices go to the slot actor. Nothing here waits,
+-/// so a slow command or a slow Telegram never holds up polling.
++/// so a slow command or a slow Telegram never holds up polling. A pin notice
++/// goes to the slot actor only when this bot (`bot_id`) pinned: a person's
++/// pin, even of a status message, is theirs to keep.
+ fn route_inbound<'a>(
+     commands: &'a mpsc::UnboundedSender<Inbound>,
+     control: &'a mpsc::UnboundedSender<Control>,
++    bot_id: i64,
+ ) -> impl FnMut(Routed) + 'a {
+     move |routed| match routed {
+         Routed::Input(input) if commands::is_command(&input) => {
+@@ -89,6 +93,19 @@
+                 message_id: service.message_id,
+             };
+             if control.send(edited).is_err() {
++                warn!("slot actor stopped; service message kept");
++            }
++        }
++        Routed::Service(updates::ServiceMessage {
++            kind: ServiceKind::Pinned(pinned),
++            message_id,
++            from: Some(from),
++            ..
++        }) if from == bot_id => {
++            if control
++                .send(Control::Pinned { message_id, pinned })
++                .is_err()
++            {
+                 warn!("slot actor stopped; service message kept");
+             }
+         }
+@@ -186,6 +203,10 @@
+     if !can_delete {
+         warn!("the bot lacks can_delete_messages; forum service messages will stay visible");
+     }
++    let can_pin = member.status == "creator" || member.can_pin_messages;
++    if !can_pin {
++        warn!("the bot lacks can_pin_messages; status messages will not be pinned");
++    }
+     let icons = checked_icons(api.get_forum_topic_icon_stickers().await)?;
+     info!(
+         bot = me.username.as_deref().unwrap_or("?"),
+@@ -198,6 +219,8 @@
+         icons,
+         chat_id: config.chat_id,
+         can_delete,
++        can_pin,
++        status_every: Some(slots::STATUS_EVERY),
+         ..slots::Options::default()
+     };
+     let (mut slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
+@@ -229,7 +252,7 @@
+         api.as_ref(),
+         &config.allowlist,
+         &offsets,
+-        route_inbound(&commands_tx, &control_tx),
++        route_inbound(&commands_tx, &control_tx, me.id),
+         stop_requested(stop_on_stdin),
+     )
+     .await;
+@@ -261,6 +284,8 @@
+ 
+     const CHAT: i64 = -1000000000001;
+     const ALLOWED: i64 = 1001;
++    /// The bot's own user id (`getMe`).
++    const BOT: i64 = 4242;
+     const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
+ 
+     /// One command per call, then an idle long poll; counts calls.
+@@ -355,7 +380,7 @@
+                     source.as_ref(),
+                     &allowlist,
+                     &store,
+-                    route_inbound(&commands_tx, &control_tx),
++                    route_inbound(&commands_tx, &control_tx, BOT),
+                 )
+                 .await;
+             })
+@@ -400,7 +425,7 @@
+             quote: None,
+             forwarded: false,
+         };
+-        let mut route = route_inbound(&commands_tx, &control_tx);
++        let mut route = route_inbound(&commands_tx, &control_tx, BOT);
+         route(Routed::Input(input("hello")));
+         route(Routed::Input(input("/brief 2")));
+         route(Routed::Input(Inbound {
+@@ -418,6 +443,17 @@
+                 kind,
+                 message_id: 9,
+                 thread_id: Some(100),
++                from: Some(BOT),
++            }));
++        }
++        // Pins of the status message by a person (allowlisted or not) or
++        // by nobody known stay; only the bot's own pin notice goes on.
++        for from in [Some(ALLOWED), Some(BOT + 1), None, Some(BOT)] {
++            route(Routed::Service(updates::ServiceMessage {
++                kind: ServiceKind::Pinned(1000),
++                message_id: 11,
++                thread_id: Some(100),
++                from,
+             }));
+         }
+         drop(route);
+@@ -435,9 +471,16 @@
+             Control::Message(Inbound { text: None, .. })
+         ));
+         assert_eq!(control_rx.try_recv().unwrap(), Control::Callback(press));
++        assert_eq!(
++            control_rx.try_recv().unwrap(),
++            Control::Pinned {
++                message_id: 11,
++                pinned: 1000
++            }
++        );
+         assert!(
+             control_rx.try_recv().is_err(),
+-            "service messages are not input"
++            "other service messages are not input"
+         );
+     }
+ 
+@@ -446,6 +489,7 @@
+             status: status.to_owned(),
+             can_manage_topics: topics,
+             can_delete_messages: true,
++            can_pin_messages: true,
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/registry.rs b/crates/cctg/src/hub/registry.rs
+--- a/crates/cctg/src/hub/registry.rs
++++ b/crates/cctg/src/hub/registry.rs
+@@ -17,6 +17,7 @@
+ use transcript::telegram_len;
+ 
+ use super::buffer::Buffer;
++use super::status::Metrics;
+ use crate::wire::{HookEvent, HookPost};
+ 
+ pub const VERSION: u32 = 1;
+@@ -292,6 +293,9 @@
+     /// Topic messages no session of the slot could take yet (TASK-017).
+     #[serde(default, skip_serializing_if = "Buffer::is_idle")]
+     pub buffer: Buffer,
++    /// The slot's status message in its topic (TASK-029).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub status: Option<StatusMessage>,
+     /// A topic call for this slot is in flight.
+     #[serde(skip)]
+     pub busy: bool,
+@@ -299,6 +303,14 @@
+     /// change or [`Registry::retry_failed`] runs.
+     #[serde(skip)]
+     pub failed: Option<(String, Option<String>)>,
++}
++
++/// The status message of a slot: sent once per topic, pinned once.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct StatusMessage {
++    pub message_id: i64,
++    #[serde(default)]
++    pub pinned: bool,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -341,6 +353,9 @@
+     /// The live transcript stream of a top-level session (TASK-016).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub stream: Option<Stream>,
++    /// The last status line numbers of a live top-level session (TASK-029).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub metrics: Option<Metrics>,
+ }
+ 
+ /// What survives a restart of a session's transcript stream.
+@@ -679,6 +694,7 @@
+             applied_icon: None,
+             pending_separator: None,
+             buffer: Buffer::default(),
++            status: None,
+             busy: false,
+             failed: None,
+         });
+@@ -809,6 +825,7 @@
+                 waiting: false,
+                 block: None,
+                 stream: None,
++                metrics: None,
+             });
+         entry.kind = kind.clone();
+         entry.slot = slot;
+@@ -956,6 +973,32 @@
+             HookEvent::SubagentStart { .. }
+             | HookEvent::SubagentStop { .. }
+             | HookEvent::SubagentHandback { .. } => Followup::default(),
++            // What a session does now lives in the slots actor only.
++            HookEvent::ToolStart { .. } | HookEvent::ToolEnd { .. } => Followup::default(),
++            HookEvent::StatusLine {
++                model,
++                effort,
++                context,
++                five_hour,
++                seven_day,
++            } => {
++                let metrics = Metrics {
++                    model: model.clone(),
++                    effort: effort.clone(),
++                    context: *context,
++                    five_hour: *five_hour,
++                    seven_day: *seven_day,
++                };
++                if let Some(entry) = self.sessions.get_mut(session)
++                    && !entry.ended
++                    && entry.kind == SessionKind::TopLevel
++                    && entry.metrics.as_ref() != Some(&metrics)
++                {
++                    entry.metrics = Some(metrics);
++                    self.dirty = true;
++                }
++                Followup::default()
++            }
+         }
+     }
+ 
+@@ -1509,6 +1552,8 @@
+             slot.applied_title = None;
+             slot.applied_icon = None;
+             slot.pending_separator = None;
++            // Its status message went with the topic.
++            slot.status = None;
+             slot.failed = None;
+             self.dirty = true;
+         }
+diff --git a/crates/cctg/src/hub/scheduler.rs b/crates/cctg/src/hub/scheduler.rs
+--- a/crates/cctg/src/hub/scheduler.rs
++++ b/crates/cctg/src/hub/scheduler.rs
+@@ -5,7 +5,8 @@
+ //!    queued (stream lines do not count); metered.
+ //! 2. `Edit` - `editMessageText` and `setMessageReaction` (both coalesced per
+ //!    message) and `answerCallbackQuery`.
+-//! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`.
++//! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`,
++//!    `pinChatMessage`.
+ //! 4. `Message` - `sendMessage`, `sendDocument` and transcript stream lines;
+ //!    metered, one FIFO. Permission prompts live here too, so they never
+ //!    overtake their own topic's ordinary messages; they do overtake its
+@@ -82,6 +83,10 @@
+     Delete {
+         message_id: i64,
+     },
++    /// `pinChatMessage` without a notification.
++    Pin {
++        message_id: i64,
++    },
+     CreateTopic {
+         name: String,
+         icon_custom_emoji_id: Option<String>,
+@@ -124,7 +129,9 @@
+         match self {
+             Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => Lane::Message(0),
+             Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit,
+-            Op::Delete { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => Lane::Topic,
++            Op::Delete { .. } | Op::Pin { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => {
++                Lane::Topic
++            }
+         }
+     }
+ 
+@@ -209,6 +216,10 @@
+                 .map(|()| Outcome::Done),
+             Op::Delete { message_id } => self
+                 .delete_message(*message_id)
++                .await
++                .map(|()| Outcome::Done),
++            Op::Pin { message_id } => self
++                .pin_chat_message(*message_id)
+                 .await
+                 .map(|()| Outcome::Done),
+             Op::CreateTopic {
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -53,6 +53,17 @@
+ //! `Stop` (bounded by `Options::hold_answer`). A message handed to an agent
+ //! gets 👀, and ✍ once its own channel record shows up in the transcript.
+ //!
++//! The status message (see [`status`], TASK-029): each slot with a topic gets
++//! one message, pinned once, that says what its current session does (from
++//! prompts, `Stop`, the tool hooks, tool results and interrupt notes in the
++//! stream, permission prompts and the session's end) and shows the numbers
++//! of its status line. It is edited at most once per `Options::status_every`,
++//! except right after a button press. Its ⏹ button asks the session's agent
++//! to write Esc into the claude console; only an agent that announced
++//! `console_keys` for the live current session of that very slot is asked,
++//! never while a permission prompt of that session waits (Esc would answer
++//! the prompt), and a written Esc is shown as sent, not as the turn's end.
++//!
+ //! Logs carry short session ids, slot ordinals and fixed text; never a path,
+ //! a folder, a title or message text.
+ 
+@@ -72,10 +83,11 @@
+ use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
+ use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
+ use super::registry::{
+-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState, TopicJob,
+-    TopicView,
++    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
++    StatusMessage, TopicJob, TopicView,
+ };
+ use super::scheduler::{Delivery, Op, Outbox, Outcome};
++use super::status::{self, Activity, Buttons, Press};
+ use super::stream::{self, Held, Live, Step};
+ use super::subagents::{
+     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
+@@ -83,7 +95,8 @@
+ use super::updates::{CallbackInput, Inbound};
+ use crate::channel::is_request_id;
+ use crate::wire::{
+-    AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest, StreamLine,
++    AgentMsg, Behavior, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest,
++    StreamItem, StreamLine,
+ };
+ 
+ /// A transcript is scanned line by line for its first ai-title up to this
+@@ -118,6 +131,9 @@
+ /// Channel requests remembered for a hook that comes after them.
+ const MAX_RELAYED: usize = 64;
+ pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
++/// A status message is edited at most this often (edits have no published
++/// limit, but a busy session changes every second).
++pub const STATUS_EVERY: Duration = Duration::from_secs(5);
+ 
+ #[derive(Debug, Clone)]
+ pub struct Options {
+@@ -148,6 +164,11 @@
+     /// A hook prompt nobody answered by then gives its hook no decision
+     /// ([`HOOK_ANSWER_WAIT`]).
+     pub hook_answer_wait: Duration,
++    /// Slots get a status message, edited at most this often; `None`: no
++    /// status messages ([`STATUS_EVERY`] in the hub).
++    pub status_every: Option<Duration>,
++    /// The bot may pin messages (`can_pin_messages`).
++    pub can_pin: bool,
+ }
+ 
+ impl Default for Options {
+@@ -169,6 +190,8 @@
+             hold_answer: Duration::from_secs(5),
+             stream_retry: Duration::from_secs(5),
+             hook_answer_wait: HOOK_ANSWER_WAIT,
++            status_every: None,
++            can_pin: true,
+         }
+     }
+ }
+@@ -185,6 +208,9 @@
+     Message(Inbound),
+     /// A button press from an allowlisted user.
+     Callback(CallbackInput),
++    /// A `pinned_message` service message (`message_id`) about message
++    /// `pinned`, sent by this bot.
++    Pinned { message_id: i64, pinned: i64 },
+     /// The hub stops: [`Slots::run`] handles what already came in, writes
+     /// the registry and returns.
+     Stop,
+@@ -247,6 +273,55 @@
+         delivery: Option<Delivery>,
+     },
+     Reaction(Option<Delivery>),
++    Status {
++        slot: SlotId,
++        job: StatusJob,
++        delivery: Option<Delivery>,
++    },
++}
++
++/// A call about a slot's status message; at most one per slot in flight.
++#[derive(Debug, Clone)]
++enum StatusJob {
++    Create {
++        thread_id: i64,
++        text: String,
++        keyboard: serde_json::Value,
++    },
++    Edit {
++        message_id: i64,
++        text: String,
++        keyboard: serde_json::Value,
++    },
++    Pin {
++        message_id: i64,
++    },
++}
++
++/// What the actor knows of a slot's status message beyond the registry.
++#[derive(Debug, Default)]
++struct Shown {
++    /// The text and keyboard Telegram shows, as far as known.
++    content: Option<(String, serde_json::Value)>,
++    /// A [`StatusJob`] is in flight.
++    busy: bool,
++    /// No edit before this (`Options::status_every` after the last one).
++    next_at: Option<Instant>,
++    /// A first ⏹ press of this session waits for its second until then.
++    confirm: Option<(String, Instant)>,
++    /// Pinning failed; not tried again in this run.
++    pin_failed: bool,
++    /// A failed send is tried again after this.
++    retry_at: Option<Instant>,
++}
++
++/// An Esc an agent was asked to write: the slot, session and connection it
++/// was asked for. An answer counts only while all three still hold.
++struct KeyAsk {
++    slot: SlotId,
++    session: String,
++    conn: u64,
++    until: Instant,
+ }
+ 
+ /// The fields of one `transcript_chunk`.
+@@ -272,6 +347,7 @@
+     Block(BlockJob),
+     Stream { session: String, number: u64 },
+     Reaction,
++    Status { slot: SlotId, job: StatusJob },
+ }
+ 
+ fn short(session_id: &str) -> &str {
+@@ -386,6 +462,8 @@
+     acks: bool,
+     /// It answers transcript reads ([`crate::wire::Register::transcript_reads`]).
+     reads: bool,
++    /// It presses console keys ([`crate::wire::Register::console_keys`]).
++    keys: bool,
+ }
+ 
+ pub struct Slots {
+@@ -437,6 +515,13 @@
+     reaction_warned: bool,
+     /// Reactions handed out and not answered, at most [`MAX_REACTIONS`].
+     reactions: usize,
++    /// What live top-level sessions do, for their status messages.
++    activity: HashMap<String, Activity>,
++    /// Status messages by slot.
++    shown: HashMap<SlotId, Shown>,
++    /// Keys agents were asked to press, by key id.
++    key_asks: HashMap<u64, KeyAsk>,
++    pin_warned: bool,
+     grace_until: Instant,
+     next_retry: Instant,
+     done_tx: mpsc::UnboundedSender<Done>,
+@@ -498,6 +583,10 @@
+             streams: HashMap::new(),
+             reaction_warned: false,
+             reactions: 0,
++            activity: HashMap::new(),
++            shown: HashMap::new(),
++            key_asks: HashMap::new(),
++            pin_warned: false,
+             grace_until: now + options.grace,
+             next_retry: now + options.retry_every,
+             done_tx,
+@@ -596,6 +685,22 @@
+         if !self.hook_asks.is_empty() || !self.hook_waiters.is_empty() {
+             deadline = deadline.min(Instant::now() + HOOK_CHECK_EVERY);
+         }
++        // A throttled edit, a confirmation that runs out and a failed status
++        // send wake the actor; past times are not waited for again.
++        let now = Instant::now();
++        let status = self
++            .shown
++            .values()
++            .flat_map(|shown| {
++                [
++                    shown.next_at,
++                    shown.confirm.as_ref().map(|(_, until)| *until),
++                    shown.retry_at,
++                ]
++            })
++            .flatten()
++            .filter(|at| *at > now);
++        let deadline = status.fold(deadline, Instant::min);
+         self.streams
+             .values()
+             .flat_map(|live| {
+@@ -641,6 +746,7 @@
+                         to_agent,
+                         acks: register.verdict_ack,
+                         reads: register.transcript_reads,
++                        keys: register.console_keys,
+                     },
+                 );
+                 // A link that came back takes the answers that wait for it.
+@@ -683,6 +789,9 @@
+                         };
+                         self.on_chunk(conn, &session, &chunk);
+                     }
++                    AgentMsg::ConsoleKeyWritten { key_id, written } => {
++                        self.on_key_written(conn, &session, key_id, written);
++                    }
+                     _ => debug!(conn, "agent message not routed"),
+                 }
+             }
+@@ -830,10 +939,31 @@
+             }
+             _ => {}
+         }
++        self.track_activity(session, &post.event);
++        for ended in &followup.ended_sessions {
++            self.activity.remove(ended);
++        }
+         self.close_prompts(&followup.ended_sessions);
+         self.end_blocks(&followup.ended_sessions);
+         if let Some((session, path)) = followup.read_title {
+             self.read_title(session, path);
++        }
++    }
++
++    /// What a live top-level session does, for its status message. Events of
++    /// other sessions (nested, unknown, ended) are not kept.
++    fn track_activity(&mut self, session: &str, event: &HookEvent) {
++        if !self.registry.is_live_top_level(session) {
++            return;
++        }
++        let activity = self.activity.entry(session.to_owned()).or_default();
++        match event {
++            HookEvent::UserPromptSubmit { .. } => activity.prompt(),
++            HookEvent::Stop { .. } => activity.stop(),
++            HookEvent::ToolStart { tool_use_id, line } => activity.tool_start(tool_use_id, line),
++            HookEvent::ToolEnd { tool_use_id } => activity.tool_end(tool_use_id),
++            // The numbers live in the registry (`SessionEntry::metrics`).
++            _ => {}
+         }
+     }
+ 
+@@ -1119,6 +1249,7 @@
+             } => (thread_id, message_id),
+             Control::Message(input) => return self.on_topic_message(input),
+             Control::Callback(input) => return self.on_callback(input),
++            Control::Pinned { message_id, pinned } => return self.on_pinned(message_id, pinned),
+             // Handled by `run`.
+             Control::Stop => return,
+         };
+@@ -1130,6 +1261,26 @@
+             return;
+         }
+         self.hand_off(Work::Delete, Op::Delete { message_id });
++    }
++
++    /// The service message about pinning a slot's status message goes, like
++    /// `forum_topic_edited`; other pins are the users' business.
++    fn on_pinned(&mut self, message_id: i64, pinned: i64) {
++        if self.options.can_delete && self.status_slot(pinned).is_some() {
++            self.hand_off(Work::Delete, Op::Delete { message_id });
++        }
++    }
++
++    /// The slot whose status message is `message_id`.
++    fn status_slot(&self, message_id: i64) -> Option<SlotId> {
++        self.registry
++            .slots
++            .iter()
++            .position(|slot| {
++                slot.status
++                    .is_some_and(|status| status.message_id == message_id)
++            })
++            .map(SlotId)
+     }
+ 
+     /// Keeps a topic message in its slot and hands the slot's messages to
+@@ -1873,6 +2024,19 @@
+                 read_to = lines[index - 1].end;
+                 stopped = true;
+                 break;
++            }
++            if let Some(activity) = self.activity.get_mut(session) {
++                for item in &line.items {
++                    match item {
++                        // A call that got its result is over, also when no
++                        // PostToolUse came (a denied permission fires none).
++                        StreamItem::Result { id, .. } => activity.tool_end(id),
++                        StreamItem::Note { text } if text.starts_with(status::INTERRUPT_NOTE) => {
++                            activity.interrupted_at(line.end);
++                        }
++                        _ => {}
++                    }
++                }
+             }
+             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
+                 match step {
+@@ -2480,6 +2644,9 @@
+         if let Some(session) = input.data.as_deref().and_then(buffer::parse_callback) {
+             return Some(self.press_resume(session));
+         }
++        if let Some(press) = input.data.as_deref().and_then(status::parse_callback) {
++            return Some(self.press_status(input.message_id, press));
++        }
+         let Some((behavior, request_id)) =
+             input.data.as_deref().and_then(permissions::parse_callback)
+         else {
+@@ -2533,6 +2700,380 @@
+         }
+     }
+ 
++    /// A status button. It acts only on the status message's own slot, only
++    /// for its live current session, and only through that session's bound
++    /// agent that presses keys. ⏹ asks for a second press within
++    /// [`status::CONFIRM_FOR`]; while a permission prompt of the session
++    /// waits it sends nothing.
++    fn press_status(&mut self, message_id: Option<i64>, press: Press) -> &'static str {
++        let Some(slot) = message_id.and_then(|id| self.status_slot(id)) else {
++            debug!("status button of a message that is no status message");
++            return status::ANSWER_STALE;
++        };
++        let Some((session, conn)) = self.live_agent(slot) else {
++            return status::ANSWER_OFFLINE;
++        };
++        if !self.conns.get(&conn).is_some_and(|bound| bound.keys) {
++            return status::ANSWER_NO_KEYS;
++        }
++        let now = Instant::now();
++        let waiting = self.waiting(&session);
++        let busy = self.busy(&session);
++        let shown = self.shown.entry(slot).or_default();
++        let armed = shown
++            .confirm
++            .as_ref()
++            .is_some_and(|(armed, until)| *armed == session && now < *until);
++        if waiting {
++            // Esc would answer the prompt, not stop the turn.
++            if shown.confirm.take().is_some() {
++                shown.next_at = Some(now);
++            }
++            return status::ANSWER_WAITING;
++        }
++        match press {
++            _ if !busy => status::ANSWER_IDLE,
++            Press::Confirm if armed => {
++                shown.confirm = None;
++                shown.next_at = Some(now);
++                if !self.send_key(slot, &session, conn) {
++                    return status::ANSWER_OFFLINE;
++                }
++                info!(
++                    ordinal = self.ordinal(slot),
++                    session = short(&session),
++                    "interrupt confirmed in Telegram"
++                );
++                status::ANSWER_INTERRUPTING
++            }
++            // A first press, or a second one after the wait ran out.
++            Press::Stop | Press::Confirm => {
++                shown.confirm = Some((session, now + status::CONFIRM_FOR));
++                // Shown at once, whatever the edit pace.
++                shown.next_at = Some(now);
++                status::ANSWER_CONFIRM
++            }
++        }
++    }
++
++    /// The session works: a turn or a call runs and no Esc went in yet.
++    fn busy(&self, session: &str) -> bool {
++        self.activity.get(session).is_some_and(Activity::busy)
++    }
++
++    /// A permission prompt of the session waits.
++    fn waiting(&self, session: &str) -> bool {
++        self.registry
++            .sessions
++            .get(session)
++            .is_some_and(|entry| entry.waiting)
++    }
++
++    /// Asks agent `conn` of `session` to write Esc. `false`: its queue did
++    /// not take it.
++    fn send_key(&mut self, slot: SlotId, session: &str, conn: u64) -> bool {
++        let key = ConsoleKey::Interrupt;
++        let key_id = crate::wire::random_u64();
++        let asked = self.conns.get(&conn).is_some_and(|bound| {
++            bound
++                .to_agent
++                .try_send(HubMsg::ConsoleKey { key_id, key })
++                .is_ok()
++        });
++        if !asked {
++            warn!(conn, "agent queue full or closed; console key not sent");
++            return false;
++        }
++        let now = Instant::now();
++        self.key_asks.retain(|_, ask| ask.until > now);
++        if self.key_asks.len() >= status::MAX_KEY_ASKS
++            && let Some(oldest) = self
++                .key_asks
++                .iter()
++                .min_by_key(|(_, ask)| ask.until)
++                .map(|(id, _)| *id)
++        {
++            self.key_asks.remove(&oldest);
++        }
++        self.key_asks.insert(
++            key_id,
++            KeyAsk {
++                slot,
++                session: session.to_owned(),
++                conn,
++                until: now + status::KEY_WAIT,
++            },
++        );
++        info!(
++            conn,
++            session = short(session),
++            ?key,
++            "console key sent to the session agent"
++        );
++        true
++    }
++
++    /// An agent wrote Esc, or could not. Written is not stopped: the status
++    /// shows it as sent until `Stop`, an interrupt note, the next prompt or
++    /// the session's end. A key that was not written is told in the topic.
++    /// An answer for a slot, session or connection that changed meanwhile
++    /// (the session ended, the slot got another session, the agent
++    /// reconnected) changes nothing.
++    fn on_key_written(&mut self, conn: u64, frame_session: &str, key_id: u64, written: bool) {
++        let Some(ask) = self.key_asks.remove(&key_id) else {
++            debug!(conn, "answer to a console key nothing waits for");
++            return;
++        };
++        if ask.conn != conn
++            || ask.session != frame_session
++            || self.live_agent(ask.slot) != Some((ask.session.clone(), conn))
++        {
++            debug!(
++                conn,
++                "console key answer for a session that moved on; ignored"
++            );
++            return;
++        }
++        if written {
++            info!(conn, session = short(&ask.session), "Esc written");
++            if let Some(activity) = self.activity.get_mut(&ask.session) {
++                activity.interrupt_written();
++            }
++            return;
++        }
++        warn!(conn, session = short(&ask.session), "Esc not written");
++        if let Some(thread_id) = self.registry.slot(ask.slot).and_then(|slot| slot.topic_id) {
++            self.notify(ask.slot, thread_id, status::KEY_FAILED_NOTICE);
++        }
++    }
++
++    /// Text and keyboard the status message of `slot` should show now.
++    fn status_view(
++        &self,
++        slot: SlotId,
++        session: &str,
++        now: Instant,
++    ) -> (String, serde_json::Value) {
++        let ended = self.registry.state(slot) == SlotState::Dead;
++        let waiting = self.waiting(session);
++        let activity = self.activity.get(session);
++        let metrics = self
++            .registry
++            .sessions
++            .get(session)
++            .and_then(|entry| entry.metrics.as_ref());
++        let phase = status::phase(activity, ended, waiting);
++        let keys = !ended
++            && self
++                .live_agent(slot)
++                .is_some_and(|(_, conn)| self.conns.get(&conn).is_some_and(|bound| bound.keys));
++        let confirm = self.shown.get(&slot).is_some_and(|shown| {
++            shown
++                .confirm
++                .as_ref()
++                .is_some_and(|(armed, until)| armed == session && now < *until)
++        });
++        let buttons = Buttons {
++            interrupt: keys && !waiting && self.busy(session),
++            confirm,
++        };
++        status::render(&phase, metrics, buttons)
++    }
++
++    /// Sends, pins and edits the status messages that need it: one call per
++    /// slot at a time, edits at most once per `Options::status_every`.
++    fn pump_status(&mut self) {
++        let Some(every) = self.options.status_every else {
++            return;
++        };
++        let now = Instant::now();
++        for index in 0..self.registry.slots.len() {
++            let slot = SlotId(index);
++            let entry = &self.registry.slots[index];
++            let (Some(thread_id), Some(session)) = (entry.topic_id, entry.current_session.clone())
++            else {
++                continue;
++            };
++            let message = entry.status;
++            let separated = entry.pending_separator.is_none();
++            if self.shown.get(&slot).is_some_and(|shown| shown.busy) {
++                continue;
++            }
++            let (text, keyboard) = self.status_view(slot, &session, now);
++            let live = self.registry.is_live_top_level(&session);
++            let can_pin = self.options.can_pin;
++            let shown = self.shown.entry(slot).or_default();
++            let job = match message {
++                None => {
++                    // A new message only for a live session, after its
++                    // separator, so it lands below it.
++                    if !live || !separated || shown.retry_at.is_some_and(|at| now < at) {
++                        continue;
++                    }
++                    StatusJob::Create {
++                        thread_id,
++                        text,
++                        keyboard,
++                    }
++                }
++                Some(StatusMessage {
++                    message_id,
++                    pinned: false,
++                }) if can_pin && !shown.pin_failed => StatusJob::Pin { message_id },
++                Some(StatusMessage { message_id, .. }) => {
++                    let current = Some((text.clone(), keyboard.clone()));
++                    if shown.content == current || shown.next_at.is_some_and(|at| now < at) {
++                        continue;
++                    }
++                    StatusJob::Edit {
++                        message_id,
++                        text,
++                        keyboard,
++                    }
++                }
++            };
++            shown.busy = true;
++            if matches!(job, StatusJob::Edit { .. }) {
++                shown.next_at = Some(now + every);
++            }
++            let op = match &job {
++                StatusJob::Create {
++                    thread_id,
++                    text,
++                    keyboard,
++                } => Op::Send {
++                    thread_id: Some(*thread_id),
++                    text: text.clone(),
++                    html: None,
++                    reply_markup: Some(keyboard.clone()),
++                    permission: false,
++                    reply_to: None,
++                },
++                StatusJob::Edit {
++                    message_id,
++                    text,
++                    keyboard,
++                } => Op::Edit {
++                    message_id: *message_id,
++                    text: text.clone(),
++                    reply_markup: Some(keyboard.clone()),
++                },
++                StatusJob::Pin { message_id } => Op::Pin {
++                    message_id: *message_id,
++                },
++            };
++            self.hand_off(Work::Status { slot, job }, op);
++        }
++    }
++
++    /// Telegram answered a status call.
++    fn on_status_done(&mut self, slot: SlotId, job: StatusJob, delivery: Option<Delivery>) {
++        let now = Instant::now();
++        let every = self.options.status_every.unwrap_or(STATUS_EVERY);
++        let retry_every = self.options.retry_every;
++        let ordinal = self.ordinal(slot);
++        let topic_id = self.registry.slot(slot).and_then(|slot| slot.topic_id);
++        let message = self.registry.slot(slot).and_then(|slot| slot.status);
++        let shown = self.shown.entry(slot).or_default();
++        shown.busy = false;
++        match job {
++            StatusJob::Create {
++                thread_id,
++                text,
++                keyboard,
++            } => match delivery {
++                Some(Ok(Outcome::Sent(sent))) if sent.message_id != 0 => {
++                    // A message for a topic the slot no longer has stays there.
++                    if topic_id != Some(thread_id) || message.is_some() {
++                        return;
++                    }
++                    shown.content = Some((text, keyboard));
++                    shown.next_at = Some(now + every);
++                    shown.retry_at = None;
++                    if let Some(entry) = self.registry.slot_mut(slot) {
++                        entry.status = Some(StatusMessage {
++                            message_id: sent.message_id,
++                            pinned: false,
++                        });
++                        self.registry.dirty = true;
++                    }
++                    info!(ordinal, "status message sent");
++                }
++                other => {
++                    // Known limitation: a send whose answer was lost may have
++                    // made a message; the retry makes another one.
++                    shown.retry_at = Some(now + retry_every);
++                    match other {
++                        Some(Err(error)) => {
++                            warn!(%error, ordinal, "status message not sent; retrying later");
++                        }
++                        _ => warn!(ordinal, "status message got no answer; retrying later"),
++                    }
++                }
++            },
++            StatusJob::Edit {
++                message_id,
++                text,
++                keyboard,
++            } => {
++                let applied = matches!(&delivery, Some(Ok(_)))
++                    || delivery.as_ref().is_some_and(|delivery| {
++                        telegram_error(delivery, &["message is not modified"])
++                    });
++                let gone = delivery.as_ref().is_some_and(|delivery| {
++                    telegram_error(
++                        delivery,
++                        &["message to edit not found", "message can't be edited"],
++                    )
++                });
++                if applied {
++                    shown.content = Some((text, keyboard));
++                } else if gone {
++                    // Deleted in Telegram: a new one is sent and pinned.
++                    shown.content = None;
++                    if let Some(entry) = self.registry.slot_mut(slot)
++                        && entry
++                            .status
++                            .is_some_and(|status| status.message_id == message_id)
++                    {
++                        entry.status = None;
++                        self.registry.dirty = true;
++                        info!(ordinal, "status message is gone; sending a new one");
++                    }
++                } else if let Some(Err(error)) = &delivery {
++                    debug!(%error, ordinal, "status edit failed; tried again later");
++                }
++            }
++            StatusJob::Pin { message_id } => match delivery {
++                Some(Ok(_)) => {
++                    if let Some(entry) = self.registry.slot_mut(slot)
++                        && let Some(status) = entry
++                            .status
++                            .as_mut()
++                            .filter(|status| status.message_id == message_id)
++                    {
++                        status.pinned = true;
++                        self.registry.dirty = true;
++                    }
++                }
++                other => {
++                    shown.pin_failed = true;
++                    if !self.pin_warned {
++                        self.pin_warned = true;
++                        match other {
++                            Some(Err(error)) => {
++                                warn!(%error, "cannot pin a status message; not tried again until the hub restarts");
++                            }
++                            _ => warn!(
++                                "status message pin got no answer; not tried again until the hub restarts"
++                            ),
++                        }
++                    }
++                }
++            },
++        }
++    }
++
+     /// Hands the fixed answer of a selected prompt to an agent of its
+     /// session. An agent that acknowledges verdicts decides the prompt with
+     /// its ack; for an older agent the hand-off is all there is to know.
+@@ -2691,6 +3232,7 @@
+ 
+     fn on_tick(&mut self) {
+         let now = Instant::now();
++        self.key_asks.retain(|_, ask| ask.until > now);
+         if now >= self.next_retry {
+             self.registry.retry_failed();
+             self.prompts.retry_failed_edits();
+@@ -2810,6 +3352,11 @@
+                 self.reactions = self.reactions.saturating_sub(1);
+                 self.on_reaction_done(delivery);
+             }
++            Done::Status {
++                slot,
++                job,
++                delivery,
++            } => self.on_status_done(slot, job, delivery),
+         }
+     }
+ 
+@@ -3047,6 +3594,7 @@
+         self.send_prompts();
+         self.send_prompt_edits();
+         self.pump_streams();
++        self.pump_status();
+         let view = self.registry.topic_view();
+         self.view.send_if_modified(|current| {
+             let changed = **current != view;
+@@ -3164,6 +3712,11 @@
+                     delivery,
+                 },
+                 Work::Reaction => Done::Reaction(delivery),
++                Work::Status { slot, job } => Done::Status {
++                    slot,
++                    job,
++                    delivery,
++                },
+             });
+         });
+     }
+@@ -3430,6 +3983,7 @@
+                 claude_pid,
+                 verdict_ack,
+                 transcript_reads: false,
++                console_keys: false,
+             };
+             self.agents
+                 .send(AgentEvent::Registered {
+@@ -4525,6 +5079,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: false,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         });
+@@ -5312,6 +5867,7 @@
+                 claude_pid,
+                 verdict_ack: false,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         });
+@@ -5397,6 +5953,7 @@
+                 claude_pid,
+                 verdict_ack: false,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         });
+@@ -7778,6 +8335,7 @@
+                 claude_pid: Some(pid),
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: false,
+             };
+             self.agents
+                 .send(AgentEvent::Registered {
+@@ -8066,6 +8624,7 @@
+                     claude_pid: Some(10),
+                     verdict_ack: true,
+                     transcript_reads: true,
++                    console_keys: false,
+                 },
+                 to_agent,
+             })
+@@ -8111,6 +8670,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: false,
+             },
+             to_agent,
+         });
+@@ -8149,6 +8709,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: false,
+             },
+             to_agent,
+         });
+@@ -8199,6 +8760,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: false,
+             },
+             to_agent,
+         });
+@@ -8837,4 +9399,145 @@
+         stream_texts(&rig, 100, 1).await;
+         assert_eq!(reactions(&rig.fake.ops()), [(42, "👀".to_owned())]);
+     }
++
++    fn status_options() -> Options {
++        Options {
++            status_every: Some(Duration::from_millis(20)),
++            ..stream_options()
++        }
++    }
++
++    /// The status message: the first send of the topic that carries a
++    /// keyboard.
++    fn status_id(ops: &[Op]) -> Option<i64> {
++        let sends: Vec<&Op> = ops
++            .iter()
++            .filter(|op| matches!(op, Op::Send { .. }))
++            .collect();
++        sends
++            .iter()
++            .position(|op| {
++                matches!(
++                    op,
++                    Op::Send {
++                        reply_markup: Some(_),
++                        ..
++                    }
++                )
++            })
++            .map(|index| 1000 + index as i64)
++    }
++
++    fn last_status_text(ops: &[Op]) -> Option<String> {
++        let id = status_id(ops)?;
++        edits_of(ops, id).last().map(|(text, _)| text.clone())
++    }
++
++    #[tokio::test]
++    async fn status_messages_are_off_without_status_every() {
++        let mut rig = rig(Fake::default(), options());
++        rig.hook(start(A, 10)).await;
++        rig.ops_after(1).await;
++        rig.agent_of(1, A, Some(10)).await;
++        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
++            .await;
++        let ops = settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        let ops = [ops, rig.fake.ops()].concat();
++        assert!(!ops.iter().any(|op| matches!(op, Op::Pin { .. })));
++        assert_eq!(status_id(&ops), None);
++    }
++
++    #[tokio::test]
++    async fn an_interrupt_note_in_the_stream_ends_the_turn_on_the_status_message() {
++        let dir = TempDir::new("slots-status-interrupt");
++        let path = transcript_file(&dir, A);
++        let mut rig = stream_rig(Fake::default(), status_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        let _kept = rig.reader(1, A, 10).await;
++        settled(&rig, |ops| {
++            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
++        })
++        .await;
++        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
++            .await;
++        settled(&rig, |ops| {
++            last_status_text(ops).as_deref() == Some("💭 Думает")
++        })
++        .await;
++        // Esc in the terminal: Claude Code writes its note, no Stop comes.
++        append(&path, &typed("[Request interrupted by user]"));
++        settled(&rig, |ops| {
++            last_status_text(ops).as_deref() == Some("💤 Ждёт вас")
++        })
++        .await;
++    }
++
++    #[tokio::test]
++    async fn a_call_whose_result_is_in_the_stream_no_longer_shows_as_running() {
++        let dir = TempDir::new("slots-status-result");
++        let path = transcript_file(&dir, A);
++        let mut rig = stream_rig(Fake::default(), status_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        let _kept = rig.reader(1, A, 10).await;
++        settled(&rig, |ops| {
++            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
++        })
++        .await;
++        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
++            .await;
++        rig.hook(hook(
++            A,
++            HookEvent::ToolStart {
++                tool_use_id: "toolu_9".into(),
++                line: "• Bash: deploy".into(),
++            },
++        ))
++        .await;
++        settled(&rig, |ops| {
++            last_status_text(ops).as_deref() == Some("⚙️ Bash: deploy")
++        })
++        .await;
++        // Denied in the terminal: no PostToolUse comes, but the transcript
++        // gets the call and its refused result.
++        append(&path, &tool_call("toolu_9", "deploy"));
++        append(&path, &tool_result("toolu_9", Some("denied")));
++        settled(&rig, |ops| {
++            last_status_text(ops).as_deref() == Some("💭 Думает")
++        })
++        .await;
++    }
++
++    #[tokio::test]
++    async fn a_status_button_of_an_agent_without_console_keys_sends_nothing() {
++        let mut rig = rig(Fake::default(), status_options());
++        rig.hook(start(A, 10)).await;
++        rig.ops_after(1).await;
++        rig.agent_of(1, A, Some(10)).await;
++        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
++            .await;
++        let ops = settled(&rig, |ops| {
++            last_status_text(ops).as_deref() == Some("💭 Думает")
++        })
++        .await;
++        let id = status_id(&ops).unwrap();
++        // No buttons: this agent cannot press keys.
++        assert_eq!(
++            edits_of(&ops, id)
++                .last()
++                .and_then(|(_, markup)| markup.clone()),
++            Some(permissions::no_keyboard())
++        );
++        for data in ["status:stop", "status:confirm"] {
++            rig.control.send(press("q", Some(id), data)).unwrap();
++        }
++        let ops = settled(&rig, |ops| answers(ops).len() >= 2).await;
++        assert_eq!(answers(&ops), [Some(status::ANSWER_NO_KEYS); 2]);
++        assert!(
++            !received(&mut rig, 0)
++                .await
++                .iter()
++                .any(|msg| matches!(msg, HubMsg::ConsoleKey { .. }))
++        );
++    }
+ }
+diff --git a/crates/cctg/src/hub/status.rs b/crates/cctg/src/hub/status.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/hub/status.rs
+@@ -0,0 +1,476 @@
++//! The pinned status message of a slot (TASK-029): one message per slot,
++//! pinned once, edited as the slot's current session works. Its first line is
++//! what the session does now, as an emoji and a few words; the second line
++//! the numbers of Claude Code's status line (model, effort, context and rate
++//! limit percentages). While the session works, no permission prompt of it
++//! waits and its agent can press keys in its console, the message carries ⏹
++//! (Esc, with a confirming second press). Esc at an open permission prompt
++//! answers the prompt instead of stopping the turn, so ⏹ is never offered
++//! then.
++//!
++//! This module is the pure part: what a session does ([`Activity`], from
++//! hooks, the stream and written keys), how that reads ([`render`]) and the
++//! buttons. The slots actor owns the message, its edits and the presses.
++
++use std::collections::VecDeque;
++use std::time::Duration;
++
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++
++use super::permissions;
++
++/// A first ⏹ press waits this long for the confirming second one.
++pub const CONFIRM_FOR: Duration = Duration::from_secs(10);
++/// A key the agent was asked to press and has not answered is forgotten
++/// after this.
++pub const KEY_WAIT: Duration = Duration::from_secs(30);
++/// Keys asked and not answered, at most.
++pub const MAX_KEY_ASKS: usize = 32;
++/// Tool calls shown as running at a time; an older one goes first.
++const MAX_RUNNING: usize = 16;
++/// Ended calls remembered, so a start that arrives after its end (the tool
++/// hooks run in the background) does not show a finished call.
++const MAX_FINISHED: usize = 64;
++/// The start of Claude Code's own transcript line after Esc.
++pub const INTERRUPT_NOTE: &str = "[Request interrupted by user";
++
++const STOP: &str = "status:stop";
++const CONFIRM: &str = "status:confirm";
++
++pub const ANSWER_CONFIRM: &str = "Нажмите ещё раз, чтобы прервать";
++pub const ANSWER_INTERRUPTING: &str = "Прерываю";
++pub const ANSWER_IDLE: &str = "Сейчас нечего прерывать";
++pub const ANSWER_WAITING: &str = "Сначала ответьте на запрос разрешения";
++pub const ANSWER_OFFLINE: &str = "Сессия не на связи";
++pub const ANSWER_NO_KEYS: &str = "Эта сессия не принимает клавиши из Telegram";
++pub const ANSWER_STALE: &str = "Кнопка устарела";
++pub const KEY_FAILED_NOTICE: &str = "Не получилось нажать клавишу в терминале сессии.";
++
++/// A status button.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Press {
++    /// ⏹, first press.
++    Stop,
++    /// ⏹, the confirming press.
++    Confirm,
++}
++
++/// The status button of `data`; anything else is not one.
++pub fn parse_callback(data: &str) -> Option<Press> {
++    match data {
++        STOP => Some(Press::Stop),
++        CONFIRM => Some(Press::Confirm),
++        _ => None,
++    }
++}
++
++/// Numbers from Claude Code's status line, as `cctg statusline` sent them.
++/// Kept per session in `registry.json`, so a restarted hub still shows them.
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Metrics {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub model: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub effort: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub context: Option<u32>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub five_hour: Option<u32>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub seven_day: Option<u32>,
++}
++
++impl Metrics {
++    /// `Opus · high · ctx 50% · 5h 3% · 7d 92%`, the parts that are known.
++    fn line(&self) -> String {
++        let mut parts: Vec<String> = [&self.model, &self.effort]
++            .into_iter()
++            .flatten()
++            .cloned()
++            .collect();
++        for (label, value) in [
++            ("ctx", self.context),
++            ("5h", self.five_hour),
++            ("7d", self.seven_day),
++        ] {
++            if let Some(value) = value {
++                parts.push(format!("{label} {value}%"));
++            }
++        }
++        parts.join(" · ")
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct Running {
++    id: String,
++    line: String,
++}
++
++/// What one top-level session does, as far as the hub knows.
++#[derive(Debug, Clone, Default)]
++pub struct Activity {
++    /// Between a prompt and the end of its turn (`Stop` or an interrupt).
++    turn: bool,
++    /// Tool calls of the main conversation that started and did not end,
++    /// oldest first.
++    running: Vec<Running>,
++    finished: VecDeque<String>,
++    /// Transcript bytes up to which interrupt notes were taken.
++    noted_to: u64,
++    /// Esc was written into the console during this turn. Not an end: only
++    /// `Stop`, an interrupt note, the next prompt or the session's end tell
++    /// that the turn is over.
++    interrupt_sent: bool,
++}
++
++impl Activity {
++    /// A prompt went in: a turn starts.
++    pub fn prompt(&mut self) {
++        self.turn = true;
++        self.interrupt_sent = false;
++        self.running.clear();
++    }
++
++    /// The turn ended (`Stop`, an interrupt note).
++    pub fn stop(&mut self) {
++        self.turn = false;
++        self.interrupt_sent = false;
++        self.running.clear();
++    }
++
++    /// Esc went into the console: the calls shown are no longer trusted, and
++    /// the turn is not known to be over until a real signal comes.
++    pub fn interrupt_written(&mut self) {
++        self.interrupt_sent = true;
++        self.running.clear();
++    }
++
++    pub fn tool_start(&mut self, id: &str, line: &str) {
++        if self.finished.iter().any(|done| done == id) || self.running.iter().any(|r| r.id == id) {
++            return;
++        }
++        if self.running.len() >= MAX_RUNNING {
++            self.running.remove(0);
++        }
++        self.running.push(Running {
++            id: id.to_owned(),
++            line: line.to_owned(),
++        });
++        self.turn = true;
++    }
++
++    pub fn tool_end(&mut self, id: &str) {
++        self.running.retain(|running| running.id != id);
++        if self.finished.len() >= MAX_FINISHED {
++            self.finished.pop_front();
++        }
++        self.finished.push_back(id.to_owned());
++    }
++
++    /// An interrupt note in the transcript line that ends at byte `end`. A
++    /// note read again after a stream rewind changes nothing. `true` when it
++    /// ended the turn.
++    pub fn interrupted_at(&mut self, end: u64) -> bool {
++        if end <= self.noted_to {
++            return false;
++        }
++        self.noted_to = end;
++        self.stop();
++        true
++    }
++
++    /// The session works and no Esc was written into this turn yet: a turn
++    /// or a tool call runs.
++    pub fn busy(&self) -> bool {
++        !self.interrupt_sent && (self.turn || !self.running.is_empty())
++    }
++}
++
++/// The first line of the status message.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Phase {
++    Ended,
++    /// A permission prompt waits.
++    Waiting,
++    /// Esc was written; the end of the turn is not known yet.
++    InterruptSent,
++    /// The newest running call's line and how many more run.
++    Tool {
++        line: String,
++        more: usize,
++    },
++    Thinking,
++    Idle,
++}
++
++/// What the session of a slot does: an ended session is ended, a waiting
++/// prompt comes before a written Esc, that before running calls, a running
++/// call before a bare turn.
++pub fn phase(activity: Option<&Activity>, ended: bool, waiting: bool) -> Phase {
++    if ended {
++        return Phase::Ended;
++    }
++    if waiting {
++        return Phase::Waiting;
++    }
++    let Some(activity) = activity else {
++        return Phase::Idle;
++    };
++    if activity.interrupt_sent {
++        return Phase::InterruptSent;
++    }
++    if let Some(newest) = activity.running.last() {
++        return Phase::Tool {
++            line: newest.line.clone(),
++            more: activity.running.len() - 1,
++        };
++    }
++    if activity.turn {
++        Phase::Thinking
++    } else {
++        Phase::Idle
++    }
++}
++
++/// Which buttons the message carries.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Buttons {
++    /// ⏹: the session works, no prompt waits and its agent presses keys.
++    pub interrupt: bool,
++    /// ⏹ asks for its confirming press.
++    pub confirm: bool,
++}
++
++/// The text and keyboard of the status message. The keyboard is always
++/// explicit: an empty one removes buttons an earlier edit showed.
++pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (String, Value) {
++    let head = match phase {
++        Phase::Ended => "🏁 Сессия завершена".to_owned(),
++        Phase::Waiting => "❓ Ждёт разрешения".to_owned(),
++        Phase::InterruptSent => "⏹ Esc отправлен в терминал".to_owned(),
++        Phase::Tool { line, more } => {
++            let line = line.strip_prefix("• ").unwrap_or(line);
++            let line = super::registry::cut(line, 200);
++            match more {
++                0 => format!("⚙️ {line}"),
++                more => format!("⚙️ {line} (+{more})"),
++            }
++        }
++        Phase::Thinking => "💭 Думает".to_owned(),
++        Phase::Idle => "💤 Ждёт вас".to_owned(),
++    };
++    let numbers = metrics.map(Metrics::line).unwrap_or_default();
++    let text = if numbers.is_empty() {
++        head
++    } else {
++        format!("{head}\n{numbers}")
++    };
++    let mut row = Vec::new();
++    if buttons.interrupt {
++        row.push(if buttons.confirm {
++            json!({ "text": "⏹ Точно прервать?", "callback_data": CONFIRM })
++        } else {
++            json!({ "text": "⏹ Прервать", "callback_data": STOP })
++        });
++    }
++    let keyboard = if row.is_empty() {
++        permissions::no_keyboard()
++    } else {
++        json!({ "inline_keyboard": [row] })
++    };
++    (text, keyboard)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn metrics() -> Metrics {
++        Metrics {
++            model: Some("Opus 5.5".into()),
++            effort: Some("high".into()),
++            context: Some(50),
++            five_hour: Some(3),
++            seven_day: None,
++        }
++    }
++
++    fn buttons(keyboard: &Value) -> Vec<(String, String)> {
++        keyboard["inline_keyboard"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .flat_map(|row| row.as_array().unwrap().iter())
++            .map(|button| {
++                (
++                    button["text"].as_str().unwrap().to_owned(),
++                    button["callback_data"].as_str().unwrap().to_owned(),
++                )
++            })
++            .collect()
++    }
++
++    #[test]
++    fn the_first_line_follows_what_the_session_does() {
++        let mut activity = Activity::default();
++        assert_eq!(phase(Some(&activity), false, false), Phase::Idle);
++        activity.prompt();
++        assert_eq!(phase(Some(&activity), false, false), Phase::Thinking);
++        activity.tool_start("t1", "• Bash: Run tests");
++        activity.tool_start("t2", "• Read: a.rs");
++        assert_eq!(
++            phase(Some(&activity), false, false),
++            Phase::Tool {
++                line: "• Read: a.rs".into(),
++                more: 1
++            }
++        );
++        activity.tool_end("t1");
++        assert_eq!(phase(Some(&activity), false, true), Phase::Waiting);
++        assert_eq!(phase(Some(&activity), true, true), Phase::Ended);
++        activity.tool_end("t2");
++        assert_eq!(phase(Some(&activity), false, false), Phase::Thinking);
++        activity.stop();
++        assert_eq!(phase(Some(&activity), false, false), Phase::Idle);
++        assert!(!activity.busy());
++        assert_eq!(phase(None, false, false), Phase::Idle);
++    }
++
++    #[test]
++    fn a_written_esc_is_not_the_end_of_the_turn() {
++        let mut activity = Activity::default();
++        activity.prompt();
++        activity.tool_start("t1", "• Bash: sleep");
++        activity.interrupt_written();
++        assert_eq!(phase(Some(&activity), false, false), Phase::InterruptSent);
++        assert!(!activity.busy(), "no second Esc for the same turn");
++        // A prompt that opened meanwhile still comes first.
++        assert_eq!(phase(Some(&activity), false, true), Phase::Waiting);
++        // A late start of a call from before Esc does not bring ⏹ back.
++        activity.tool_start("t2", "• Read: a.rs");
++        assert_eq!(phase(Some(&activity), false, false), Phase::InterruptSent);
++        activity.stop();
++        assert_eq!(phase(Some(&activity), false, false), Phase::Idle);
++        activity.interrupt_written();
++        activity.prompt();
++        assert_eq!(phase(Some(&activity), false, false), Phase::Thinking);
++        assert!(activity.busy());
++        activity.interrupt_written();
++        assert!(activity.interrupted_at(10));
++        assert_eq!(phase(Some(&activity), false, false), Phase::Idle);
++    }
++
++    #[test]
++    fn a_start_after_its_end_and_a_repeated_start_change_nothing() {
++        let mut activity = Activity::default();
++        activity.tool_end("t1");
++        activity.tool_start("t1", "• Read: a.rs");
++        assert!(!activity.busy(), "the end came first: nothing runs");
++        activity.tool_start("t2", "• Bash: x");
++        activity.tool_start("t2", "• Bash: x");
++        assert_eq!(activity.running.len(), 1);
++        for index in 0..MAX_RUNNING + 3 {
++            activity.tool_start(&format!("n{index}"), "• Read");
++        }
++        assert_eq!(activity.running.len(), MAX_RUNNING);
++        for index in 0..MAX_FINISHED + 3 {
++            activity.tool_end(&format!("e{index}"));
++        }
++        assert_eq!(activity.finished.len(), MAX_FINISHED);
++    }
++
++    #[test]
++    fn an_interrupt_note_ends_the_turn_once() {
++        let mut activity = Activity::default();
++        activity.prompt();
++        activity.tool_start("t1", "• Bash: sleep");
++        assert!(activity.interrupted_at(100));
++        assert!(!activity.busy());
++        activity.prompt();
++        // The same note read again after a rewind: the new turn stays.
++        assert!(!activity.interrupted_at(100));
++        assert!(activity.busy());
++        assert!(activity.interrupted_at(250));
++        assert!(!activity.busy());
++    }
++
++    #[test]
++    fn the_message_shows_the_phase_the_numbers_and_the_buttons() {
++        let (text, keyboard) = render(&Phase::Idle, Some(&metrics()), Buttons::default());
++        assert_eq!(text, "💤 Ждёт вас\nOpus 5.5 · high · ctx 50% · 5h 3%");
++        assert_eq!(keyboard, permissions::no_keyboard());
++        let (text, _) = render(&Phase::Thinking, None, Buttons::default());
++        assert_eq!(text, "💭 Думает");
++        let (text, _) = render(&Phase::Ended, Some(&Metrics::default()), Buttons::default());
++        assert_eq!(text, "🏁 Сессия завершена");
++        let (text, _) = render(&Phase::InterruptSent, None, Buttons::default());
++        assert_eq!(text, "⏹ Esc отправлен в терминал");
++        let running = Phase::Tool {
++            line: "• Bash: Run tests".into(),
++            more: 2,
++        };
++        let stop = Buttons {
++            interrupt: true,
++            confirm: false,
++        };
++        let (text, keyboard) = render(&running, None, stop);
++        assert_eq!(text, "⚙️ Bash: Run tests (+2)");
++        assert_eq!(
++            buttons(&keyboard),
++            [("⏹ Прервать".to_owned(), STOP.to_owned())]
++        );
++        let confirm = Buttons {
++            confirm: true,
++            ..stop
++        };
++        let (_, keyboard) = render(&running, None, confirm);
++        assert_eq!(
++            buttons(&keyboard),
++            [("⏹ Точно прервать?".to_owned(), CONFIRM.to_owned())]
++        );
++    }
++
++    #[test]
++    fn metrics_survive_the_registry_file_and_leave_out_what_is_unknown() {
++        let json = serde_json::to_value(metrics()).unwrap();
++        assert_eq!(
++            json,
++            json!({ "model": "Opus 5.5", "effort": "high", "context": 50, "five_hour": 3 })
++        );
++        assert_eq!(serde_json::from_value::<Metrics>(json).unwrap(), metrics());
++        assert_eq!(
++            serde_json::from_value::<Metrics>(json!({})).unwrap(),
++            Metrics::default()
++        );
++    }
++
++    #[test]
++    fn only_status_buttons_parse_and_they_fit_callback_data() {
++        assert_eq!(parse_callback(STOP), Some(Press::Stop));
++        assert_eq!(parse_callback(CONFIRM), Some(Press::Confirm));
++        for other in ["allow:abcde", "resume:x", "status:", "status:stop ", ""] {
++            assert_eq!(parse_callback(other), None, "{other}");
++        }
++        // Telegram allows 1-64 bytes of callback data.
++        for data in [STOP, CONFIRM] {
++            assert!(data.len() <= 64);
++        }
++    }
++
++    #[test]
++    fn a_long_call_line_is_cut() {
++        let long = format!("• Bash: {}", "я".repeat(5000));
++        let (text, _) = render(
++            &Phase::Tool {
++                line: long,
++                more: 0,
++            },
++            None,
++            Buttons::default(),
++        );
++        assert!(transcript::telegram_len(&text) < 300, "{}", text.len());
++    }
++}
+diff --git a/crates/cctg/src/hub/updates.rs b/crates/cctg/src/hub/updates.rs
+--- a/crates/cctg/src/hub/updates.rs
++++ b/crates/cctg/src/hub/updates.rs
+@@ -64,6 +64,8 @@
+     pub kind: ServiceKind,
+     pub message_id: i64,
+     pub thread_id: Option<i64>,
++    /// Who did it (the bot for its own topic edits and pins). Never logged.
++    pub from: Option<i64>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -72,6 +74,8 @@
+     TopicEdited,
+     TopicClosed,
+     TopicReopened,
++    /// A message was pinned: its id (TASK-029).
++    Pinned(i64),
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -98,7 +102,10 @@
+     } else if message.forum_topic_reopened.is_some() {
+         Some(ServiceKind::TopicReopened)
+     } else {
+-        None
++        message
++            .pinned_message
++            .as_ref()
++            .map(|pinned| ServiceKind::Pinned(pinned.message_id))
+     }
+ }
+ 
+@@ -114,6 +121,7 @@
+                 kind,
+                 message_id: message.message_id,
+                 thread_id: message.message_thread_id,
++                from: message.from.as_ref().map(|from| from.id),
+             });
+         }
+         let Some(from) = message.from else {
+@@ -566,6 +574,11 @@
+                 json!({}),
+                 ServiceKind::TopicReopened,
+             ),
++            (
++                "pinned_message",
++                json!({ "message_id": 42, "date": 1, "chat": { "id": CHAT, "type": "supergroup" } }),
++                ServiceKind::Pinned(42),
++            ),
+         ];
+         for (field, payload, kind) in cases {
+             // Sent by the bot (not allowlisted) and by an allowlisted admin.
+@@ -577,7 +590,8 @@
+                     Routed::Service(ServiceMessage {
+                         kind,
+                         message_id: 10,
+-                        thread_id: Some(7)
++                        thread_id: Some(7),
++                        from: Some(from),
+                     }),
+                     "{field}"
+                 );
+diff --git a/crates/cctg/src/keys.rs b/crates/cctg/src/keys.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/keys.rs
+@@ -0,0 +1,112 @@
++//! Presses a key in the console of the agent's Claude Code process
++//! (TASK-029): Esc, as when typed in the terminal.
++//!
++//! Channels have no command for it, so on Windows the agent (a child of
++//! that claude) attaches to its console and writes the key events into the
++//! console input: `FreeConsole` + `AttachConsole(claude pid)` + `CONIN$` +
++//! `WriteConsoleInputW`, then `FreeConsole` again. A console is attached per
++//! process, so one press at a time. The agent's stdio are pipes and stay
++//! untouched. Elsewhere nothing is supported yet and the agent does not
++//! announce the capability.
++//!
++//! A successful write says only that the key events are in the console
++//! input buffer (behind any input that waits there), not that Claude Code
++//! read them or that its turn ended.
++
++use crate::wire::ConsoleKey;
++
++/// Whether this build can press keys at all.
++pub const SUPPORTED: bool = cfg!(windows);
++
++/// `(virtual key, scan code, character, control key state)` of `key`.
++pub fn key_event(key: ConsoleKey) -> (u16, u16, u16, u32) {
++    match key {
++        ConsoleKey::Interrupt => (0x1B, 0x01, 0x1B, 0),
++    }
++}
++
++/// Writes `key` (down and up) into the console input of process
++/// `claude_pid`. Blocking and short; `false` when any step failed.
++#[cfg(windows)]
++pub fn press(claude_pid: u32, key: ConsoleKey) -> bool {
++    use std::sync::Mutex;
++
++    use windows_sys::Win32::Foundation::{
++        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
++    };
++    use windows_sys::Win32::Storage::FileSystem::{
++        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
++    };
++    use windows_sys::Win32::System::Console::{
++        AttachConsole, FreeConsole, INPUT_RECORD, KEY_EVENT, SetConsoleCtrlHandler,
++        WriteConsoleInputW,
++    };
++
++    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
++    let _one = ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner());
++    let (vk, scan, ch, state) = key_event(key);
++    let mut records = [INPUT_RECORD::default(), INPUT_RECORD::default()];
++    for (record, down) in records.iter_mut().zip([1, 0]) {
++        record.EventType = KEY_EVENT as u16;
++        // SAFETY: `KeyEvent` is the union member that `EventType = KEY_EVENT`
++        // selects; every field is plain data.
++        let event = unsafe { &mut record.Event.KeyEvent };
++        event.bKeyDown = down;
++        event.wRepeatCount = 1;
++        event.wVirtualKeyCode = vk;
++        event.wVirtualScanCode = scan;
++        event.uChar.UnicodeChar = ch;
++        event.dwControlKeyState = state;
++    }
++    let conin: Vec<u16> = "CONIN$\0".encode_utf16().collect();
++    // SAFETY: plain Win32 calls with valid arguments: a NUL-terminated wide
++    // string, a live array of two initialized records and its length, a
++    // handle that is closed once. While attached, Ctrl+C in that console is
++    // ignored by this process (`SetConsoleCtrlHandler(None, 1)`), so a user's
++    // Ctrl+C cannot end the agent.
++    unsafe {
++        SetConsoleCtrlHandler(None, 1);
++        FreeConsole();
++        if AttachConsole(claude_pid) == 0 {
++            return false;
++        }
++        let input = CreateFileW(
++            conin.as_ptr(),
++            GENERIC_READ | GENERIC_WRITE,
++            FILE_SHARE_READ | FILE_SHARE_WRITE,
++            std::ptr::null(),
++            OPEN_EXISTING,
++            0,
++            std::ptr::null_mut(),
++        );
++        let mut written = 0u32;
++        let ok = input != INVALID_HANDLE_VALUE
++            && WriteConsoleInputW(input, records.as_ptr(), records.len() as u32, &mut written) != 0
++            && written == records.len() as u32;
++        if input != INVALID_HANDLE_VALUE {
++            CloseHandle(input);
++        }
++        FreeConsole();
++        ok
++    }
++}
++
++#[cfg(not(windows))]
++pub fn press(_claude_pid: u32, _key: ConsoleKey) -> bool {
++    false
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_key_is_esc() {
++        assert_eq!(key_event(ConsoleKey::Interrupt), (0x1B, 0x01, 0x1B, 0));
++    }
++    // `press` itself is not called here: it detaches the calling process
++    // from its console, which would take the test runner's terminal output
++    // with it. The live probe (TASK-029 `scratch/planner/probe`) covers it.
++}
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -6,8 +6,10 @@
+ pub mod device;
+ pub mod hook;
+ pub mod hub;
++pub mod keys;
+ pub mod proctree;
+ pub mod spool;
++pub mod statusline;
+ pub mod supervise;
+ pub mod tail;
+ pub mod wire;
+diff --git a/crates/cctg/src/main.rs b/crates/cctg/src/main.rs
+--- a/crates/cctg/src/main.rs
++++ b/crates/cctg/src/main.rs
+@@ -54,6 +54,9 @@
+         /// Hook event name.
+         event: String,
+     },
++    /// Claude Code status line command of cctg sessions: sends the numbers
++    /// to the hub and prints the user's own status line.
++    Statusline,
+ }
+ 
+ #[tokio::main]
+@@ -65,11 +68,15 @@
+             eprintln!("cctg hook: bad arguments");
+             std::process::exit(0);
+         }
++        Err(_) if std::env::args().nth(1).as_deref() == Some("statusline") => {
++            eprintln!("cctg statusline: bad arguments");
++            std::process::exit(0);
++        }
+         Err(error) => error.exit(),
+     };
+     init_tracing(matches!(
+         &cli.command,
+-        Command::Hook { .. } | Command::Agent
++        Command::Hook { .. } | Command::Agent | Command::Statusline
+     ));
+     match cli.command {
+         Command::Hub {
+@@ -128,6 +135,13 @@
+             // At once: the stdin reader thread may still be blocked.
+             std::process::exit(0);
+         }
++        Command::Statusline => {
++            // Status line input carries paths and names: a fixed line only.
++            std::panic::set_hook(Box::new(|_| eprintln!("cctg statusline: internal error")));
++            let code = tokio::spawn(cctg::statusline::run()).await.unwrap_or(0);
++            // At once: the stdin reader thread may still be blocked.
++            std::process::exit(code);
++        }
+         Command::AgentInstall => {
+             let exe = std::env::current_exe()?;
+             let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
+@@ -216,5 +230,9 @@
+                 .command,
+             Command::Hook { event } if event == "SessionStart"
+         ));
++        assert!(matches!(
++            Cli::try_parse_from(["cctg", "statusline"]).unwrap().command,
++            Command::Statusline
++        ));
+     }
+ }
+diff --git a/crates/cctg/src/statusline.rs b/crates/cctg/src/statusline.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/statusline.rs
+@@ -0,0 +1,472 @@
++//! `cctg statusline`: the `statusLine` command of cctg sessions (TASK-029).
++//!
++//! Claude Code runs it with its status line JSON on stdin after every
++//! assistant message (debounced 300 ms) and shows what it prints. It sends
++//! the numbers the status message in Telegram shows (model, effort, context
++//! and rate limit percentages) to the hub as one `status_line` hook event,
++//! with a short timeout and never waiting for more than that, and prints the
++//! status line the terminal would have shown without cctg: the
++//! `statusLine.command` of the user's own settings (`$CLAUDE_CONFIG_DIR` or
++//! `~/.claude/settings.json`, read on every call), run with the same stdin
++//! through the shell Claude Code uses for it, or, without one, a short line
++//! of its own. It exits with the user's command's exit code (Claude Code
++//! blanks the line on a non-zero one, as it would without cctg), else 0;
++//! problems go to stderr as fixed text, never the input or the secret.
++
++use std::path::{Path, PathBuf};
++use std::process::Stdio;
++use std::time::Duration;
++
++use serde_json::Value;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tracing::{debug, warn};
++
++use crate::device::{self, DeviceConfig};
++use crate::hook;
++use crate::wire::{HookEvent, HookPost};
++
++/// Budget of the POST to the hub. It runs next to the user's command, but
++/// the terminal waits for this process, so a stopped hub may cost the status
++/// line this much (a closed local port on Windows is retried until the
++/// timeout). Kept well under the 150 ms the whole call may add.
++pub const POST_TIMEOUT: Duration = Duration::from_millis(80);
++/// Claude Code writes the whole input at once and closes stdin.
++const STDIN_TIMEOUT: Duration = Duration::from_millis(500);
++const MAX_INPUT: u64 = 1 << 20;
++/// Longest run of the user's own command; Claude Code cancels a status line
++/// run anyway when a newer update comes.
++const CHAIN_TIMEOUT: Duration = Duration::from_secs(10);
++/// Longest output of the user's command passed on.
++const MAX_OUTPUT: u64 = 64 << 10;
++/// Set for the user's command: a `cctg statusline` inside it neither chains
++/// again nor posts a second time.
++pub const GUARD_VAR: &str = "CCTG_STATUSLINE";
++const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
++/// Where Claude Code looks for Git Bash first (its documented override).
++const GIT_BASH_VAR: &str = "CLAUDE_CODE_GIT_BASH_PATH";
++/// Longest model and effort names sent.
++const MAX_NAME: usize = 64;
++
++/// Runs one status line call and returns the exit code: the user's command's,
++/// or 0 when cctg printed its own line. Never fails.
++pub async fn run() -> i32 {
++    let input = hook::read_stdin(MAX_INPUT, STDIN_TIMEOUT).unwrap_or_default();
++    let nested = std::env::var_os(GUARD_VAR).is_some();
++    let value: Value = serde_json::from_slice(&input).unwrap_or(Value::Null);
++    let posting =
++        (!nested)
++            .then(|| event(&value))
++            .flatten()
++            .map(|(session, cwd, transcript, event)| {
++                let config = DeviceConfig::load();
++                let post = HookPost::new(
++                    config.host.clone(),
++                    session,
++                    device::canonical_cwd(&cwd),
++                    transcript,
++                    event,
++                );
++                tokio::spawn(async move {
++                    let Ok(secret) = &config.secret else {
++                        return;
++                    };
++                    if let Err(error) =
++                        hook::post(&config.hook_addr, secret, &post, POST_TIMEOUT).await
++                    {
++                        debug!(%error, "status line numbers not delivered");
++                    }
++                })
++            });
++    let chained = match (!nested).then(user_command).flatten() {
++        Some(command) => run_chained(&command, &input).await,
++        None => None,
++    };
++    let (output, code) = chained.unwrap_or_else(|| (own_line(&value).into_bytes(), 0));
++    {
++        let mut stdout = std::io::stdout().lock();
++        let _ = std::io::Write::write_all(&mut stdout, &output);
++        let _ = std::io::Write::flush(&mut stdout);
++    }
++    if let Some(posting) = posting {
++        let _ = posting.await;
++    }
++    code
++}
++
++fn text(value: &Value, path: &[&str]) -> Option<String> {
++    let mut at = value;
++    for key in path {
++        at = at.get(key)?;
++    }
++    at.as_str()
++        .map(str::trim)
++        .filter(|text| !text.is_empty())
++        .map(|text| text.chars().take(MAX_NAME).collect())
++}
++
++/// A percentage rounded to a whole number; anything outside 0..=100 (the
++/// documented range) is dropped.
++fn percent(value: &Value, path: &[&str]) -> Option<u32> {
++    let mut at = value;
++    for key in path {
++        at = at.get(key)?;
++    }
++    let number = at.as_f64()?;
++    (0.0..=100.0)
++        .contains(&number)
++        .then(|| number.round() as u32)
++}
++
++/// The session and the `status_line` event of one status line input, or
++/// `None` without a session id.
++pub fn event(input: &Value) -> Option<(String, String, String, HookEvent)> {
++    let session = text(input, &["session_id"])?;
++    let cwd = text(input, &["workspace", "current_dir"])
++        .or_else(|| text(input, &["cwd"]))
++        .unwrap_or_default();
++    let transcript = input
++        .get("transcript_path")
++        .and_then(Value::as_str)
++        .unwrap_or_default()
++        .to_owned();
++    let event = HookEvent::StatusLine {
++        model: text(input, &["model", "display_name"]).or_else(|| text(input, &["model", "id"])),
++        effort: text(input, &["effort", "level"]),
++        context: percent(input, &["context_window", "used_percentage"]),
++        five_hour: percent(input, &["rate_limits", "five_hour", "used_percentage"]),
++        seven_day: percent(input, &["rate_limits", "seven_day", "used_percentage"]),
++    };
++    Some((session, cwd, transcript, event))
++}
++
++/// cctg's own short line: `Opus · ctx 50% · 5h 3% · 7d 92%`, the parts
++/// Claude Code gave.
++pub fn own_line(input: &Value) -> String {
++    let mut parts = Vec::new();
++    if let Some(model) =
++        text(input, &["model", "display_name"]).or_else(|| text(input, &["model", "id"]))
++    {
++        parts.push(model);
++    }
++    for (label, path) in [
++        ("ctx", &["context_window", "used_percentage"][..]),
++        ("5h", &["rate_limits", "five_hour", "used_percentage"]),
++        ("7d", &["rate_limits", "seven_day", "used_percentage"]),
++    ] {
++        if let Some(value) = percent(input, path) {
++            parts.push(format!("{label} {value}%"));
++        }
++    }
++    parts.join(" · ")
++}
++
++/// The user's own status line command from their Claude Code settings.
++fn user_command() -> Option<String> {
++    let path = settings_path(&|name| std::env::var(name).ok())?;
++    let settings = std::fs::read_to_string(path).ok()?;
++    command_of(&settings)
++}
++
++/// `$CLAUDE_CONFIG_DIR/settings.json`, else `<home>/.claude/settings.json`.
++pub fn settings_path(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
++    if let Some(dir) = var(CONFIG_DIR_VAR).filter(|dir| !dir.trim().is_empty()) {
++        return Some(Path::new(dir.trim()).join("settings.json"));
++    }
++    device::home_dir(var).map(|home| home.join(".claude").join("settings.json"))
++}
++
++/// `statusLine.command` of a settings file, when its type is `command`.
++pub fn command_of(settings: &str) -> Option<String> {
++    let settings: Value = serde_json::from_str(settings).ok()?;
++    let line = settings.get("statusLine")?;
++    if line.get("type").and_then(Value::as_str) != Some("command") {
++        return None;
++    }
++    line.get("command")
++        .and_then(Value::as_str)
++        .filter(|command| !command.trim().is_empty())
++        .map(str::to_owned)
++}
++
++/// Runs the user's command with `input` on stdin and returns what it
++/// printed, at most [`MAX_OUTPUT`], and its exit code (1 without one).
++/// `None` when it could not start or ran out of time.
++async fn run_chained(command: &str, input: &[u8]) -> Option<(Vec<u8>, i32)> {
++    let mut child = match shell(command)
++        .env(GUARD_VAR, "1")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::null())
++        .kill_on_drop(true)
++        .spawn()
++    {
++        Ok(child) => child,
++        Err(error) => {
++            warn!(kind = ?error.kind(), "own status line command did not start");
++            return None;
++        }
++    };
++    let mut stdin = child.stdin.take()?;
++    let mut stdout = child.stdout.take()?;
++    let input = input.to_vec();
++    let work = async move {
++        let feed = async move {
++            let _ = stdin.write_all(&input).await;
++            drop(stdin);
++        };
++        let mut output = Vec::new();
++        let mut limited = (&mut stdout).take(MAX_OUTPUT);
++        let read = limited.read_to_end(&mut output);
++        let _ = tokio::join!(feed, read);
++        let code = child
++            .wait()
++            .await
++            .ok()
++            .and_then(|status| status.code())
++            .unwrap_or(1);
++        (output, code)
++    };
++    match tokio::time::timeout(CHAIN_TIMEOUT, work).await {
++        Ok(output) => Some(output),
++        Err(_) => {
++            warn!("own status line command ran too long; cctg's line shown");
++            None
++        }
++    }
++}
++
++/// The shell Claude Code runs status line commands with: Git Bash on
++/// Windows when it is installed, else PowerShell; `sh` elsewhere.
++fn shell(command: &str) -> tokio::process::Command {
++    if cfg!(windows) {
++        if let Some(bash) = git_bash(&|name| std::env::var(name).ok(), &|path| path.is_file()) {
++            let mut shell = tokio::process::Command::new(bash);
++            shell.arg("-c").arg(command);
++            return shell;
++        }
++        let mut shell = tokio::process::Command::new("powershell");
++        shell.args(["-NoProfile", "-Command", command]);
++        return shell;
++    }
++    let mut shell = tokio::process::Command::new("sh");
++    shell.arg("-c").arg(command);
++    shell
++}
++
++/// Git Bash: `CLAUDE_CODE_GIT_BASH_PATH`, then `SHELL` when it names a
++/// `bash.exe` file, then `bash.exe` in `EXEPATH` (set in
++/// Git Bash sessions), then next to a `git.exe` found on `PATH`
++/// (`<git>\cmd\git.exe` or `<git>\bin\git.exe` -> `<git>\bin\bash.exe`).
++pub fn git_bash(
++    var: &impl Fn(&str) -> Option<String>,
++    is_file: &impl Fn(&Path) -> bool,
++) -> Option<PathBuf> {
++    let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
++    if let Some(path) = set(GIT_BASH_VAR).map(PathBuf::from)
++        && is_file(&path)
++    {
++        return Some(path);
++    }
++    // Claude Code's own status line runs see `SHELL` as the Windows path of
++    // the bash.exe it uses (TASK-029 probe, 2.1.281).
++    if let Some(path) = set("SHELL")
++        .map(PathBuf::from)
++        .filter(|path| path.file_name().is_some_and(|name| name == "bash.exe"))
++        && is_file(&path)
++    {
++        return Some(path);
++    }
++    if let Some(path) = set("EXEPATH").map(|dir| Path::new(&dir).join("bash.exe"))
++        && is_file(&path)
++    {
++        return Some(path);
++    }
++    let paths = set("PATH")?;
++    std::env::split_paths(&paths)
++        .filter(|dir| is_file(&dir.join("git.exe")))
++        .filter_map(|dir| dir.parent().map(|git| git.join("bin").join("bash.exe")))
++        .find(|bash| is_file(bash))
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::json;
++
++    use super::*;
++
++    /// The shape of a real status line input (Claude Code 2.1.281, values
++    /// replaced): TASK-029 `scratch/planner/statusline_input_shape.json`.
++    fn sample() -> Value {
++        json!({
++            "session_id": "5e551017-0000-4000-8000-000000000001",
++            "transcript_path": "/p/s.jsonl",
++            "cwd": "/w",
++            "effort": { "level": "medium" },
++            "model": { "id": "claude-opus-5-5[1m]", "display_name": "Opus 5.5 (1M context)" },
++            "workspace": { "current_dir": "/w/app", "project_dir": "/w", "added_dirs": [] },
++            "context_window": { "used_percentage": 50, "remaining_percentage": 50,
++                "current_usage": { "input_tokens": 2 } },
++            "rate_limits": {
++                "five_hour": { "used_percentage": 3, "resets_at": 1790273400 },
++                "seven_day": { "used_percentage": 91.6, "resets_at": 1790614800 },
++            },
++        })
++    }
++
++    #[test]
++    fn the_numbers_come_from_the_status_line_input() {
++        let (session, cwd, transcript, event) = event(&sample()).unwrap();
++        assert_eq!(session, "5e551017-0000-4000-8000-000000000001");
++        assert_eq!(cwd, "/w/app");
++        assert_eq!(transcript, "/p/s.jsonl");
++        assert_eq!(
++            event,
++            HookEvent::StatusLine {
++                model: Some("Opus 5.5 (1M context)".into()),
++                effort: Some("medium".into()),
++                context: Some(50),
++                five_hour: Some(3),
++                seven_day: Some(92),
++            }
++        );
++        assert_eq!(
++            own_line(&sample()),
++            "Opus 5.5 (1M context) · ctx 50% · 5h 3% · 7d 92%"
++        );
++    }
++
++    #[test]
++    fn missing_null_and_odd_fields_are_left_out() {
++        // Early in a session: no rate limits, a null context, no effort.
++        let early = json!({
++            "session_id": "s",
++            "model": { "id": "claude-x" },
++            "context_window": { "used_percentage": null },
++            "rate_limits": { "five_hour": { "used_percentage": "3" } },
++        });
++        let (_, cwd, _, event) = event(&early).unwrap();
++        assert_eq!(cwd, "");
++        assert_eq!(
++            event,
++            HookEvent::StatusLine {
++                model: Some("claude-x".into()),
++                effort: None,
++                context: None,
++                five_hour: None,
++                seven_day: None,
++            }
++        );
++        assert_eq!(own_line(&early), "claude-x");
++        assert!(super::event(&json!({ "model": {} })).is_none());
++        assert!(super::event(&Value::Null).is_none());
++        assert_eq!(own_line(&Value::Null), "");
++        for bad in [json!(-1), json!(100.6), json!(999), json!(f64::MAX)] {
++            let input = json!({ "session_id": "s", "context_window": { "used_percentage": bad },
++                "rate_limits": { "seven_day": { "used_percentage": bad } } });
++            assert!(
++                matches!(
++                    super::event(&input),
++                    Some((
++                        _,
++                        _,
++                        _,
++                        HookEvent::StatusLine {
++                            context: None,
++                            seven_day: None,
++                            ..
++                        }
++                    ))
++                ),
++                "{bad}"
++            );
++        }
++        let edges = json!({ "session_id": "s", "context_window": { "used_percentage": 0 },
++            "rate_limits": { "seven_day": { "used_percentage": 100 } } });
++        assert!(matches!(
++            super::event(&edges),
++            Some((
++                _,
++                _,
++                _,
++                HookEvent::StatusLine {
++                    context: Some(0),
++                    seven_day: Some(100),
++                    ..
++                }
++            ))
++        ));
++        assert!(POST_TIMEOUT <= Duration::from_millis(100));
++    }
++
++    #[test]
++    fn the_users_command_is_read_from_their_settings() {
++        assert_eq!(
++            command_of(r#"{"statusLine":{"type":"command","command":"'py' 'sl.py'"}}"#).as_deref(),
++            Some("'py' 'sl.py'")
++        );
++        for settings in [
++            r#"{"statusLine":{"type":"static","command":"x"}}"#,
++            r#"{"statusLine":{"type":"command","command":"  "}}"#,
++            r#"{"statusLine":{"command":"x"}}"#,
++            r#"{"hooks":{}}"#,
++            "not json",
++        ] {
++            assert_eq!(command_of(settings), None, "{settings}");
++        }
++        let vars = |config: Option<&str>| {
++            let config = config.map(str::to_owned);
++            move |name: &str| match name {
++                "CLAUDE_CONFIG_DIR" => config.clone(),
++                "USERPROFILE" | "HOME" => Some("/home/u".to_owned()),
++                _ => None,
++            }
++        };
++        assert_eq!(
++            settings_path(&vars(Some("/cfg"))),
++            Some(Path::new("/cfg").join("settings.json"))
++        );
++        assert_eq!(
++            settings_path(&vars(Some("  "))),
++            Some(Path::new("/home/u").join(".claude").join("settings.json"))
++        );
++    }
++
++    #[test]
++    fn git_bash_is_found_like_claude_code_finds_it() {
++        let git = Path::new("C:/Git");
++        let files = [
++            git.join("cmd").join("git.exe"),
++            git.join("bin").join("bash.exe"),
++        ];
++        let is_file = |path: &Path| files.iter().any(|file| file == path);
++        let path = std::env::join_paths([Path::new("C:/other"), &git.join("cmd")])
++            .unwrap()
++            .into_string()
++            .unwrap();
++        let vars = |override_path: Option<&str>| {
++            let (override_path, path) = (override_path.map(str::to_owned), path.clone());
++            move |name: &str| match name {
++                "CLAUDE_CODE_GIT_BASH_PATH" => override_path.clone(),
++                "PATH" => Some(path.clone()),
++                // What the Bash tool sees: an MSYS path, not a file.
++                "SHELL" => Some("/usr/bin/bash".to_owned()),
++                _ => None,
++            }
++        };
++        assert_eq!(
++            git_bash(&vars(None), &is_file),
++            Some(git.join("bin").join("bash.exe"))
++        );
++        // The override wins only when it names a file.
++        let custom = git.join("bin").join("bash.exe");
++        assert_eq!(
++            git_bash(&vars(Some(custom.to_str().unwrap())), &is_file),
++            Some(custom)
++        );
++        assert_eq!(
++            git_bash(&vars(Some("C:/missing/bash.exe")), &is_file),
++            Some(git.join("bin").join("bash.exe"))
++        );
++        assert_eq!(git_bash(&vars(None), &|_: &Path| false), None);
++    }
++}
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -13,7 +13,8 @@
+ //! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; so does a new
+ //! message type that a peer sends only after the other side announced it in
+ //! such a field (`permission_ack`, see [`Register::verdict_ack`];
+-//! `transcript_read`, see [`Register::transcript_reads`]). Any other
++//! `transcript_read`, see [`Register::transcript_reads`]; `console_key`,
++//! see [`Register::console_keys`]). Any other
+ //! new message type or a changed meaning bumps it. Errors never carry the
+ //! offending input: a line can contain the secret.
+ 
+@@ -132,6 +133,11 @@
+     /// Agents built before leave it out and are never asked.
+     #[serde(default)]
+     pub transcript_reads: bool,
++    /// The agent can press a key in the console of its Claude Code process
++    /// and answers `console_key` with `console_key_written` (TASK-029). Only
++    /// Windows agents that know their claude pid announce it.
++    #[serde(default)]
++    pub console_keys: bool,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -178,6 +184,22 @@
+         #[serde(default)]
+         reset: bool,
+     },
++    /// The answer to one `console_key`: whether the key events were written
++    /// into the console input of the agent's Claude Code process. Written
++    /// is not handled: Claude Code may not have read the key yet, and Esc
++    /// does not always end a turn (it answers an open dialog).
++    ConsoleKeyWritten {
++        key_id: u64,
++        written: bool,
++    },
++}
++
++/// A key the agent presses in its Claude Code console.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ConsoleKey {
++    /// Esc: stops the running turn.
++    Interrupt,
+ }
+ 
+ /// The stream events of one transcript line that ends at byte `end`.
+@@ -228,6 +250,7 @@
+         "permission_request",
+         "permission_ack",
+         "transcript_chunk",
++        "console_key_written",
+     ];
+ }
+ 
+@@ -278,6 +301,13 @@
+         #[serde(default)]
+         from: Option<u64>,
+     },
++    /// Sent only to an agent that registered with `console_keys`: press
++    /// `key` in the console of its Claude Code process and answer with one
++    /// `console_key_written` carrying the same `key_id`.
++    ConsoleKey {
++        key_id: u64,
++        key: ConsoleKey,
++    },
+ }
+ 
+ impl Kinds for HubMsg {
+@@ -287,6 +317,7 @@
+         "inbound",
+         "permission_verdict",
+         "transcript_read",
++        "console_key",
+     ];
+ }
+ 
+@@ -508,6 +539,27 @@
+     },
+     /// `SubagentHandback` report, taken from `PreToolUse`/`PostToolUse`.
+     SubagentHandback { agent_id: String, message: String },
++    /// A tool call of the main conversation started (`PreToolUse`, TASK-029).
++    /// `line`: its `/brief` line.
++    ToolStart { tool_use_id: String, line: String },
++    /// A tool call of the main conversation ended (`PostToolUse` or
++    /// `PostToolUseFailure`).
++    ToolEnd { tool_use_id: String },
++    /// Numbers from Claude Code's status line input (`cctg statusline`):
++    /// percentages rounded to whole numbers, each absent when Claude Code
++    /// did not give it.
++    StatusLine {
++        #[serde(default)]
++        model: Option<String>,
++        #[serde(default)]
++        effort: Option<String>,
++        #[serde(default)]
++        context: Option<u32>,
++        #[serde(default)]
++        five_hour: Option<u32>,
++        #[serde(default)]
++        seven_day: Option<u32>,
++    },
+ }
+ 
+ impl HookEvent {
+@@ -520,7 +572,18 @@
+             Self::SubagentStart { .. } => "subagent_start",
+             Self::SubagentStop { .. } => "subagent_stop",
+             Self::SubagentHandback { .. } => "subagent_handback",
++            Self::ToolStart { .. } => "tool_start",
++            Self::ToolEnd { .. } => "tool_end",
++            Self::StatusLine { .. } => "status_line",
+         }
++    }
++
++    /// Events that come many times a turn; the hub logs them at debug only.
++    pub fn is_frequent(&self) -> bool {
++        matches!(
++            self,
++            Self::ToolStart { .. } | Self::ToolEnd { .. } | Self::StatusLine { .. }
++        )
+     }
+ }
+ 
+@@ -533,6 +596,9 @@
+         "subagent_start",
+         "subagent_stop",
+         "subagent_handback",
++        "tool_start",
++        "tool_end",
++        "status_line",
+     ];
+ }
+ 
+@@ -597,6 +663,7 @@
+                 claude_pid: Some(4242),
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: true,
+             }),
+             AgentMsg::Reply {
+                 text: "multi\nline \u{2014} text".into(),
+@@ -635,6 +702,10 @@
+                 more: true,
+                 reset: false,
+             },
++            AgentMsg::ConsoleKeyWritten {
++                key_id: u64::MAX,
++                written: true,
++            },
+         ]
+     }
+ 
+@@ -668,6 +739,10 @@
+                 session_id: "s".into(),
+                 path: "/p/s.jsonl".into(),
+                 from: None,
++            },
++            HubMsg::ConsoleKey {
++                key_id: 7,
++                key: ConsoleKey::Interrupt,
+             },
+         ]
+     }
+@@ -703,6 +778,20 @@
+             HookEvent::SubagentHandback {
+                 agent_id: "a1".into(),
+                 message: "report".into(),
++            },
++            HookEvent::ToolStart {
++                tool_use_id: "toolu_1".into(),
++                line: "• Bash: run tests".into(),
++            },
++            HookEvent::ToolEnd {
++                tool_use_id: "toolu_1".into(),
++            },
++            HookEvent::StatusLine {
++                model: Some("Opus".into()),
++                effort: Some("high".into()),
++                context: Some(50),
++                five_hour: Some(3),
++                seven_day: None,
+             },
+         ]
+     }
+@@ -790,8 +879,56 @@
+                 claude_pid: None,
+                 verdict_ack: false,
+                 transcript_reads: false,
++                console_keys: false,
+             }))
+         );
++    }
++
++    #[test]
++    fn console_keys_and_status_events_stay_compatible_with_version_one_peers() {
++        // An agent before TASK-029 never announces console keys; a hub
++        // before it never sends one, so the new kinds stay behind the flag.
++        let line = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w","console_keys":true}"#;
++        assert!(matches!(
++            decode::<AgentMsg>(line),
++            Ok(AgentMsg::Register(Register {
++                console_keys: true,
++                ..
++            }))
++        ));
++        let key = encode(&HubMsg::ConsoleKey {
++            key_id: 3,
++            key: ConsoleKey::Interrupt,
++        });
++        let value: Value = serde_json::from_slice(&key).unwrap();
++        assert_eq!(value["v"], 1);
++        assert_eq!(value["key"], "interrupt");
++        // Esc is the only key.
++        for other in ["reboot", "esc"] {
++            let line = format!(r#"{{"v":1,"type":"console_key","key_id":3,"key":"{other}"}}"#);
++            assert_eq!(decode::<HubMsg>(line.as_bytes()), Err(WireError::Malformed));
++        }
++        // A status line without numbers is still one event.
++        let id = EventId::new();
++        let body = json!({ "v": 1, "event_id": id.as_str(), "host": "h", "session_id": "s",
++            "event": { "type": "status_line" } });
++        assert_eq!(
++            decode_hook(&serde_json::to_vec(&body).unwrap()).map(|post| post.event),
++            Ok(HookEvent::StatusLine {
++                model: None,
++                effort: None,
++                context: None,
++                five_hour: None,
++                seven_day: None,
++            })
++        );
++        assert!(
++            HookEvent::ToolEnd {
++                tool_use_id: "t".into()
++            }
++            .is_frequent()
++        );
++        assert!(!HookEvent::UserPromptSubmit { prompt_id: None }.is_frequent());
+     }
+ 
+     #[test]
+diff --git a/crates/cctg/tests/buffer_e2e.rs b/crates/cctg/tests/buffer_e2e.rs
+--- a/crates/cctg/tests/buffer_e2e.rs
++++ b/crates/cctg/tests/buffer_e2e.rs
+@@ -178,6 +178,7 @@
+         claude_pid: Some(11),
+         verdict_ack: true,
+         transcript_reads: false,
++        console_keys: false,
+     };
+     write
+         .write_all(&wire::encode(&AgentMsg::Register(register)))
+diff --git a/crates/cctg/tests/hook_cli.rs b/crates/cctg/tests/hook_cli.rs
+--- a/crates/cctg/tests/hook_cli.rs
++++ b/crates/cctg/tests/hook_cli.rs
+@@ -304,6 +304,8 @@
+         [
+             "PermissionRequest",
+             "PostToolUse",
++            "PostToolUseFailure",
++            "PreToolUse",
+             "SessionEnd",
+             "SessionStart",
+             "Stop",
+@@ -312,27 +314,47 @@
+             "UserPromptSubmit"
+         ]
+     );
++    // The status message (TASK-029): the status line command and the tool
++    // status hook, which runs in the background for every tool.
++    assert_eq!(
++        settings["statusLine"],
++        serde_json::json!({ "type": "command", "command": "cctg statusline" })
++    );
++    let mut tool_status = 0;
+     for (event, groups) in hooks {
+-        let groups = groups.as_array().unwrap();
+-        assert_eq!(groups.len(), 1, "{event}");
+-        let matcher = groups[0].get("matcher").and_then(|m| m.as_str());
+-        assert_eq!(
+-            matcher,
+-            (event == "PostToolUse").then_some("SubagentHandback"),
+-            "{event}"
+-        );
+-        let commands = groups[0]["hooks"].as_array().unwrap();
+-        assert_eq!(commands.len(), 1, "{event}");
+-        assert_eq!(commands[0]["type"], "command");
+-        assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
+-        // Only the waiting hook needs more than Claude Code's default time.
+-        let timeout = commands[0].get("timeout").and_then(|t| t.as_u64());
+-        assert_eq!(
+-            timeout,
+-            (event == "PermissionRequest").then_some(100),
+-            "{event}"
+-        );
+-    }
++        for group in groups.as_array().unwrap() {
++            let matcher = group.get("matcher").and_then(|m| m.as_str());
++            let commands = group["hooks"].as_array().unwrap();
++            assert_eq!(commands.len(), 1, "{event}");
++            assert_eq!(commands[0]["type"], "command");
++            let timeout = commands[0].get("timeout").and_then(|t| t.as_u64());
++            if commands[0]["command"] == "cctg hook ToolStatus" {
++                tool_status += 1;
++                assert!(
++                    ["PreToolUse", "PostToolUse", "PostToolUseFailure"].contains(&event.as_str()),
++                    "{event}"
++                );
++                assert_eq!(matcher, None, "{event}");
++                assert_eq!(commands[0]["async"], true, "{event}");
++                assert_eq!(timeout, None, "{event}");
++                continue;
++            }
++            assert_eq!(
++                matcher,
++                (event == "PostToolUse").then_some("SubagentHandback"),
++                "{event}"
++            );
++            assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
++            assert_eq!(commands[0].get("async"), None, "{event}");
++            // Only the waiting hook needs more than Claude Code's default time.
++            assert_eq!(
++                timeout,
++                (event == "PermissionRequest").then_some(100),
++                "{event}"
++            );
++        }
++    }
++    assert_eq!(tool_status, 3);
+     for needle in [
+         "CCTG_",
+         "SECRET",
+diff --git a/crates/cctg/tests/ingress_logs.rs b/crates/cctg/tests/ingress_logs.rs
+--- a/crates/cctg/tests/ingress_logs.rs
++++ b/crates/cctg/tests/ingress_logs.rs
+@@ -105,6 +105,7 @@
+         claude_pid: None,
+         verdict_ack: false,
+         transcript_reads: false,
++        console_keys: false,
+     };
+     let mut lines = wire::encode(&AgentMsg::Hello {
+         secret: secret.clone(),
+diff --git a/crates/cctg/tests/message_logs.rs b/crates/cctg/tests/message_logs.rs
+--- a/crates/cctg/tests/message_logs.rs
++++ b/crates/cctg/tests/message_logs.rs
+@@ -186,6 +186,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: false,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/permission_hook_e2e.rs b/crates/cctg/tests/permission_hook_e2e.rs
+--- a/crates/cctg/tests/permission_hook_e2e.rs
++++ b/crates/cctg/tests/permission_hook_e2e.rs
+@@ -209,6 +209,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: true,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/permission_logs.rs b/crates/cctg/tests/permission_logs.rs
+--- a/crates/cctg/tests/permission_logs.rs
++++ b/crates/cctg/tests/permission_logs.rs
+@@ -170,6 +170,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: true,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/slots_logs.rs b/crates/cctg/tests/slots_logs.rs
+--- a/crates/cctg/tests/slots_logs.rs
++++ b/crates/cctg/tests/slots_logs.rs
+@@ -132,6 +132,7 @@
+                 claude_pid: None,
+                 verdict_ack: false,
+                 transcript_reads: false,
++                console_keys: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/soak.rs b/crates/cctg/tests/soak.rs
+--- a/crates/cctg/tests/soak.rs
++++ b/crates/cctg/tests/soak.rs
+@@ -480,6 +480,7 @@
+         Op::React { message_id, emoji } => ("react", None, emoji.clone(), Some(*message_id)),
+         Op::AnswerCallback { query_id, .. } => ("callback", None, query_id.clone(), None),
+         Op::Delete { message_id } => ("delete", None, String::new(), Some(*message_id)),
++        Op::Pin { message_id } => ("pin", None, String::new(), Some(*message_id)),
+         Op::CreateTopic { name, .. } => ("create_topic", None, name.clone(), None),
+         Op::EditTopic {
+             thread_id,
+diff --git a/crates/cctg/tests/status_e2e.rs b/crates/cctg/tests/status_e2e.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/status_e2e.rs
+@@ -0,0 +1,857 @@
++//! Status message end to end (TASK-029): hook events over real HTTP to the
++//! real `serve_hooks`, an agent over a real TCP link to the real
++//! `serve_agents` (a hand-written client that announces `console_keys` and
++//! answers `console_key`), the real `Slots` actor and `Scheduler`, and a fake
++//! Telegram transport. Button presses come in as the update poll hands them
++//! over (`Control::Callback`); which updates get that far (allowlist, the
++//! bot's own pin notices) is tested in `hub::updates` and `hub::mod`.
++
++use std::collections::VecDeque;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicI64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use cctg::hook;
++use cctg::hub::api::{ApiError, ForumTopic, Message};
++use cctg::hub::ingress::{bind, serve_agents, serve_hooks};
++use cctg::hub::registry::RegistryStore;
++use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
++use cctg::hub::slots::{Control, Options, Slots};
++use cctg::hub::status;
++use cctg::hub::updates::CallbackInput;
++use cctg::wire::{
++    self, AgentMsg, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionRequest, Register, Secret,
++};
++use tokio::io::BufReader;
++use tokio::net::TcpStream;
++use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
++use tokio::sync::mpsc;
++use tokio::task::JoinHandle;
++
++const SECRET: &str = "e2e-secret-0123456789abcdef";
++const HOST: &str = "e2ebox";
++const CWD: &str = "C:/qa/status";
++const A: &str = "0a16e2e0-0000-4000-8000-000000000291";
++const B: &str = "0a16e2e0-0000-4000-8000-000000000292";
++const WAIT: Duration = Duration::from_secs(30);
++const NUMBERS: &str = "Opus 5.5 · high · ctx 50% · 5h 3% · 7d 92%";
++
++// ---------------------------------------------------------------- fake Telegram
++
++#[derive(Default)]
++struct Fake {
++    ops: Mutex<Vec<Op>>,
++    next_topic: AtomicI64,
++    next_message: AtomicI64,
++    /// The next message edits fail with these descriptions (front first).
++    edit_errors: Mutex<VecDeque<&'static str>>,
++}
++
++impl Transport for Fake {
++    async fn execute(&self, op: &Op) -> Delivery {
++        self.ops.lock().unwrap().push(op.clone());
++        match op {
++            Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
++                message_thread_id: 100 + self.next_topic.fetch_add(1, Ordering::SeqCst),
++                name: name.clone(),
++                icon_custom_emoji_id: None,
++            })),
++            Op::Send { .. } => Ok(Outcome::Sent(Message {
++                message_id: 1000 + self.next_message.fetch_add(1, Ordering::SeqCst),
++                ..Message::default()
++            })),
++            Op::Edit { .. } => match self.edit_errors.lock().unwrap().pop_front() {
++                Some(description) => Err(ApiError::Telegram {
++                    code: 400,
++                    description: description.into(),
++                }),
++                None => Ok(Outcome::Done),
++            },
++            _ => Ok(Outcome::Done),
++        }
++    }
++}
++
++impl Fake {
++    fn ops(&self) -> Vec<Op> {
++        self.ops.lock().unwrap().clone()
++    }
++}
++
++/// Status message sends: (topic, text). Permission prompts carry buttons
++/// too and are not status messages.
++fn status_sends(ops: &[Op]) -> Vec<(i64, String)> {
++    ops.iter()
++        .filter_map(|op| match op {
++            Op::Send {
++                thread_id: Some(thread),
++                text,
++                reply_markup: Some(_),
++                permission: false,
++                ..
++            } => Some((*thread, text.clone())),
++            _ => None,
++        })
++        .collect()
++}
++
++/// (message id, request id) of every permission prompt sent. Sends are
++/// numbered from 1000 in call order.
++fn prompts(ops: &[Op]) -> Vec<(i64, String)> {
++    ops.iter()
++        .filter(|op| matches!(op, Op::Send { .. }))
++        .enumerate()
++        .filter_map(|(index, op)| match op {
++            Op::Send {
++                permission: true,
++                reply_markup: Some(markup),
++                ..
++            } => {
++                let data = markup["inline_keyboard"][0][0]["callback_data"].as_str()?;
++                let id = data.strip_prefix("allow:")?.to_owned();
++                Some((1000 + index as i64, id))
++            }
++            _ => None,
++        })
++        .collect()
++}
++
++fn pins(ops: &[Op]) -> Vec<i64> {
++    ops.iter()
++        .filter_map(|op| match op {
++            Op::Pin { message_id } => Some(*message_id),
++            _ => None,
++        })
++        .collect()
++}
++
++/// Edits of `message`: text and the callback data of its buttons.
++fn edits(ops: &[Op], message: i64) -> Vec<(String, Vec<String>)> {
++    ops.iter()
++        .filter_map(|op| match op {
++            Op::Edit {
++                message_id,
++                text,
++                reply_markup,
++            } if *message_id == message => {
++                let buttons = reply_markup
++                    .as_ref()
++                    .and_then(|markup| markup["inline_keyboard"].as_array())
++                    .into_iter()
++                    .flatten()
++                    .flat_map(|row| row.as_array().into_iter().flatten())
++                    .filter_map(|button| button["callback_data"].as_str().map(str::to_owned))
++                    .collect();
++                Some((text.clone(), buttons))
++            }
++            _ => None,
++        })
++        .collect()
++}
++
++fn shown(text: &str, buttons: &[&str]) -> (String, Vec<String>) {
++    (
++        text.to_owned(),
++        buttons.iter().map(|button| (*button).to_owned()).collect(),
++    )
++}
++
++fn answers(ops: &[Op]) -> Vec<String> {
++    ops.iter()
++        .filter_map(|op| match op {
++            Op::AnswerCallback { text, .. } => Some(text.clone().unwrap_or_default()),
++            _ => None,
++        })
++        .collect()
++}
++
++fn key_failed_notices(ops: &[Op]) -> usize {
++    ops.iter()
++        .filter(|op| matches!(op, Op::Send { text, .. } if text == status::KEY_FAILED_NOTICE))
++        .count()
++}
++
++// ---------------------------------------------------------------- hub
++
++struct Hub {
++    fake: Arc<Fake>,
++    hook_addr: String,
++    agent_addr: SocketAddr,
++    control: mpsc::UnboundedSender<Control>,
++    actor: Option<JoinHandle<()>>,
++    tasks: Vec<JoinHandle<()>>,
++    state: Option<TempRoot>,
++}
++
++impl Drop for Hub {
++    fn drop(&mut self) {
++        for task in self.tasks.iter().chain(&self.actor) {
++            task.abort();
++        }
++    }
++}
++
++struct TempRoot(PathBuf);
++impl Drop for TempRoot {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++async fn start_hub(name: &str, every: Duration) -> Hub {
++    let state = std::env::temp_dir().join(format!("cctg-status-e2e-{name}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&state);
++    std::fs::create_dir_all(&state).unwrap();
++    start_hub_in(TempRoot(state), every).await
++}
++
++/// A hub on the state (`registry.json`) of `state`.
++async fn start_hub_in(state: TempRoot, every: Duration) -> Hub {
++    let fake = Arc::new(Fake::default());
++    let bucket = BucketConfig {
++        capacity: 1000,
++        refill_every: Duration::from_millis(1),
++        min_gap: Duration::ZERO,
++    };
++    let (scheduler, outbox) = Scheduler::new(fake.clone(), bucket);
++    let store = RegistryStore::open(&state.0).unwrap();
++    let registry = store.load().unwrap();
++    let options = Options {
++        grace: Duration::ZERO,
++        status_every: Some(every),
++        ..Options::default()
++    };
++    let (slots, _view) = Slots::new(registry, store, outbox, options);
++    let (agents, agents_rx) = mpsc::channel(64);
++    let (hooks, hooks_rx) = mpsc::channel(64);
++    let (control, control_rx) = mpsc::unbounded_channel();
++    let secret = Secret::parse(SECRET).unwrap();
++    let agent_listener = bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        .await
++        .unwrap();
++    let hook_listener = bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        .await
++        .unwrap();
++    let agent_addr = agent_listener.local_addr().unwrap();
++    let hook_addr = hook_listener.local_addr().unwrap().to_string();
++    let tasks = vec![
++        tokio::spawn(scheduler.run()),
++        tokio::spawn(serve_agents(agent_listener, secret.clone(), agents)),
++        tokio::spawn(serve_hooks(hook_listener, secret, hooks)),
++    ];
++    Hub {
++        fake,
++        hook_addr,
++        agent_addr,
++        control,
++        actor: Some(tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx))),
++        tasks,
++        state: Some(state),
++    }
++}
++
++impl Hub {
++    /// Sends one hook event the way `cctg hook` does.
++    async fn hook(&self, session: &str, event: HookEvent) {
++        let post = HookPost::new(
++            HOST.into(),
++            session.into(),
++            CWD.into(),
++            String::new(),
++            event,
++        );
++        let secret = Secret::parse(SECRET).unwrap();
++        hook::post(&self.hook_addr, &secret, &post, WAIT)
++            .await
++            .expect("hub took the hook event");
++    }
++
++    async fn start(&self, session: &str, pid: u32) {
++        self.hook(
++            session,
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(pid),
++                parent_claude_pid: None,
++            },
++        )
++        .await;
++    }
++
++    async fn end(&self, session: &str, pid: u32) {
++        self.hook(
++            session,
++            HookEvent::SessionEnd {
++                reason: Some("other".into()),
++                claude_pid: Some(pid),
++            },
++        )
++        .await;
++    }
++
++    async fn numbers(&self, session: &str) {
++        self.hook(
++            session,
++            HookEvent::StatusLine {
++                model: Some("Opus 5.5".into()),
++                effort: Some("high".into()),
++                context: Some(50),
++                five_hour: Some(3),
++                seven_day: Some(92),
++            },
++        )
++        .await;
++    }
++
++    fn press(&self, message_id: i64, data: &str) {
++        self.control
++            .send(Control::Callback(CallbackInput {
++                query_id: format!("q-{data}"),
++                data: Some(data.into()),
++                message_id: Some(message_id),
++            }))
++            .unwrap();
++    }
++
++    /// Waits until `ready` holds for the ops made so far.
++    async fn until(&self, what: &str, ready: impl Fn(&[Op]) -> bool) -> Vec<Op> {
++        let reached = async {
++            loop {
++                let ops = self.fake.ops();
++                if ready(&ops) {
++                    return ops;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::time::timeout(WAIT, reached)
++            .await
++            .unwrap_or_else(|_| panic!("{what}: {:#?}", self.fake.ops()))
++    }
++
++    /// Waits until the last edit of `status` is `want`.
++    async fn shows(&self, what: &str, status: i64, want: (String, Vec<String>)) {
++        self.until(what, |ops| edits(ops, status).last() == Some(&want))
++            .await;
++    }
++
++    /// The status message of topic `thread`, once pinned.
++    async fn status_message(&self, thread: i64) -> i64 {
++        let ops = self
++            .until("status message sent and pinned", |ops| {
++                status_sends(ops).iter().any(|(t, _)| *t == thread) && !pins(ops).is_empty()
++            })
++            .await;
++        // Sends are numbered from 1000 in call order.
++        let index = ops
++            .iter()
++            .filter(|op| matches!(op, Op::Send { .. }))
++            .position(|op| {
++                matches!(op, Op::Send { thread_id: Some(t), reply_markup: Some(_), permission: false, .. } if *t == thread)
++            })
++            .unwrap();
++        1000 + index as i64
++    }
++
++    /// Stops the hub the way `cctg hub` does (the actor writes the registry)
++    /// and starts a new one on the same state, with a fresh Telegram fake.
++    async fn restart(mut self, every: Duration) -> Hub {
++        self.control.send(Control::Stop).unwrap();
++        let actor = self.actor.take().unwrap();
++        tokio::time::timeout(WAIT, actor)
++            .await
++            .expect("the actor stopped")
++            .unwrap();
++        let state = self.state.take().unwrap();
++        drop(self);
++        start_hub_in(state, every).await
++    }
++}
++
++// ---------------------------------------------------------------- agent
++
++/// A session agent on a real link that presses keys (`console_keys`).
++struct Agent {
++    reader: BufReader<OwnedReadHalf>,
++    write: OwnedWriteHalf,
++}
++
++impl Agent {
++    async fn connect(hub: &Hub, session: &str, pid: u32) -> Self {
++        let stream = TcpStream::connect(hub.agent_addr).await.unwrap();
++        let (read, mut write) = stream.into_split();
++        let hello = AgentMsg::Hello {
++            secret: Secret::parse(SECRET).unwrap(),
++        };
++        wire::write_msg(&mut write, &hello).await.unwrap();
++        let register = AgentMsg::Register(Register {
++            session_id: session.into(),
++            host: HOST.into(),
++            cwd: CWD.into(),
++            claude_pid: Some(pid),
++            verdict_ack: true,
++            transcript_reads: false,
++            console_keys: true,
++        });
++        wire::write_msg(&mut write, &register).await.unwrap();
++        let mut agent = Self {
++            reader: BufReader::new(read),
++            write,
++        };
++        assert_eq!(agent.next().await, Some(HubMsg::Registered));
++        agent
++    }
++
++    /// The next hub message within `wait`, `None` when none came.
++    async fn next_within(&mut self, wait: Duration) -> Option<HubMsg> {
++        let mut line = Vec::new();
++        match tokio::time::timeout(wait, wire::read_line(&mut self.reader, &mut line)).await {
++            Ok(Ok(())) => Some(wire::decode(&line).unwrap()),
++            _ => None,
++        }
++    }
++
++    async fn next(&mut self) -> Option<HubMsg> {
++        self.next_within(WAIT).await
++    }
++
++    /// No hub message in 500 ms.
++    async fn quiet(&mut self) -> bool {
++        self.next_within(Duration::from_millis(500)).await.is_none()
++    }
++
++    /// The next console key asked for: its id.
++    async fn key(&mut self) -> u64 {
++        match self.next().await {
++            Some(HubMsg::ConsoleKey {
++                key_id,
++                key: ConsoleKey::Interrupt,
++            }) => key_id,
++            other => panic!("no console key: {other:?}"),
++        }
++    }
++
++    async fn written(&mut self, key_id: u64, written: bool) {
++        self.send(AgentMsg::ConsoleKeyWritten { key_id, written })
++            .await;
++    }
++
++    async fn send(&mut self, msg: AgentMsg) {
++        wire::write_msg(&mut self.write, &msg).await.unwrap();
++    }
++}
++
++fn tool(id: &str, line: &str) -> HookEvent {
++    HookEvent::ToolStart {
++        tool_use_id: id.into(),
++        line: line.into(),
++    }
++}
++
++// ---------------------------------------------------------------- tests
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
++    let hub = start_hub("follow", Duration::from_millis(50)).await;
++    hub.start(A, 10).await;
++    let mut agent = Agent::connect(&hub, A, 10).await;
++    let status = hub.status_message(100).await;
++    assert_eq!(
++        status_sends(&hub.fake.ops()),
++        [(100, "💤 Ждёт вас".to_owned())]
++    );
++    assert_eq!(pins(&hub.fake.ops()), [status]);
++
++    // The bot's pin notice about the status message goes; one about
++    // another message stays.
++    hub.control
++        .send(Control::Pinned {
++            message_id: 5000,
++            pinned: status,
++        })
++        .unwrap();
++    hub.control
++        .send(Control::Pinned {
++            message_id: 5001,
++            pinned: 777,
++        })
++        .unwrap();
++    let ops = hub
++        .until("pin notice deleted", |ops| {
++            ops.iter()
++                .any(|op| matches!(op, Op::Delete { message_id: 5000 }))
++        })
++        .await;
++    assert!(
++        !ops.iter()
++            .any(|op| matches!(op, Op::Delete { message_id: 5001 }))
++    );
++
++    hub.numbers(A).await;
++    hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
++        .await;
++    hub.hook(A, tool("t1", "• Bash: sleep 30")).await;
++    hub.shows(
++        "running call shown with ⏹",
++        status,
++        shown(&format!("⚙️ Bash: sleep 30\n{NUMBERS}"), &["status:stop"]),
++    )
++    .await;
++
++    // ⏹ asks first and only the second press writes Esc.
++    hub.press(status, "status:stop");
++    hub.until("confirmation shown", |ops| {
++        edits(ops, status).last().is_some_and(|(_, buttons)| {
++            buttons.first().map(String::as_str) == Some("status:confirm")
++        })
++    })
++    .await;
++    assert!(agent.quiet().await, "a first press sends nothing");
++    hub.press(status, "status:confirm");
++    let key_id = agent.key().await;
++    agent.written(key_id, true).await;
++    // Written is not stopped: the message says Esc was sent, without ⏹.
++    hub.shows(
++        "a written Esc is shown as sent",
++        status,
++        shown(&format!("⏹ Esc отправлен в терминал\n{NUMBERS}"), &[]),
++    )
++    .await;
++    hub.press(status, "status:stop");
++    hub.until("a press after Esc answered", |ops| answers(ops).len() >= 3)
++        .await;
++    assert!(agent.quiet().await, "no second Esc for the same turn");
++    // The turn's real end.
++    hub.hook(
++        A,
++        HookEvent::Stop {
++            prompt_id: None,
++            last_assistant_message: None,
++        },
++    )
++    .await;
++    hub.shows(
++        "Stop ends the turn",
++        status,
++        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
++    )
++    .await;
++    hub.press(status, "status:stop");
++    let ops = hub
++        .until("idle press answered", |ops| answers(ops).len() >= 4)
++        .await;
++    assert_eq!(
++        answers(&ops),
++        [
++            status::ANSWER_CONFIRM,
++            status::ANSWER_INTERRUPTING,
++            status::ANSWER_IDLE,
++            status::ANSWER_IDLE,
++        ]
++    );
++    assert!(agent.quiet().await);
++
++    // A key that was not written is told once in the topic.
++    hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
++        .await;
++    hub.until("thinking", |ops| {
++        edits(ops, status)
++            .last()
++            .is_some_and(|(text, _)| text.starts_with("💭 Думает"))
++    })
++    .await;
++    hub.press(status, "status:stop");
++    hub.press(status, "status:confirm");
++    let key_id = agent.key().await;
++    agent.written(key_id, false).await;
++    hub.until("failure told", |ops| key_failed_notices(ops) == 1)
++        .await;
++
++    // The end of the session: the message says so, without buttons, and a
++    // press does nothing.
++    hub.end(A, 10).await;
++    hub.shows(
++        "ended",
++        status,
++        shown(&format!("🏁 Сессия завершена\n{NUMBERS}"), &[]),
++    )
++    .await;
++    hub.press(status, "status:confirm");
++    hub.until("dead press answered", |ops| {
++        answers(ops).last().map(String::as_str) == Some(status::ANSWER_OFFLINE)
++    })
++    .await;
++    assert!(agent.quiet().await);
++    assert_eq!(pins(&hub.fake.ops()).len(), 1, "pinned once");
++    assert_eq!(
++        status_sends(&hub.fake.ops()).len(),
++        1,
++        "one message per slot"
++    );
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing() {
++    let hub = start_hub("waiting", Duration::from_millis(50)).await;
++    hub.start(A, 10).await;
++    let mut agent = Agent::connect(&hub, A, 10).await;
++    let status = hub.status_message(100).await;
++    hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
++        .await;
++    hub.hook(A, tool("t1", "• Bash: rm build")).await;
++    hub.shows(
++        "a running call offers ⏹",
++        status,
++        shown("⚙️ Bash: rm build", &["status:stop"]),
++    )
++    .await;
++    // Armed before the prompt opened.
++    hub.press(status, "status:stop");
++    hub.until("armed", |ops| answers(ops).len() == 1).await;
++    agent
++        .send(AgentMsg::PermissionRequest(PermissionRequest {
++            request_id: "qwert".into(),
++            tool_name: "Bash".into(),
++            description: "rm build".into(),
++            input_preview: "rm -rf build".into(),
++        }))
++        .await;
++    hub.shows(
++        "a waiting prompt hides ⏹",
++        status,
++        shown("❓ Ждёт разрешения", &[]),
++    )
++    .await;
++    // An old button (first or confirming press) writes nothing: Esc would
++    // answer the prompt, not stop the turn.
++    hub.press(status, "status:confirm");
++    hub.press(status, "status:stop");
++    let ops = hub
++        .until("presses answered", |ops| answers(ops).len() == 3)
++        .await;
++    assert_eq!(
++        answers(&ops)[1..],
++        [status::ANSWER_WAITING, status::ANSWER_WAITING]
++    );
++    assert!(agent.quiet().await, "no Esc while the prompt waits");
++
++    // The prompt is answered in Telegram; the call still runs: ⏹ is back and
++    // a fresh confirmation writes Esc.
++    let (prompt, request_id) = prompts(&hub.fake.ops()).pop().expect("prompt shown");
++    hub.press(prompt, &format!("allow:{request_id}"));
++    let verdict_id = match agent.next().await {
++        Some(HubMsg::PermissionVerdict {
++            verdict_id: Some(id),
++            ..
++        }) => id,
++        other => panic!("no verdict: {other:?}"),
++    };
++    agent.send(AgentMsg::PermissionAck { verdict_id }).await;
++    hub.shows(
++        "⏹ back once the prompt is answered",
++        status,
++        shown("⚙️ Bash: rm build", &["status:stop"]),
++    )
++    .await;
++    hub.press(status, "status:stop");
++    hub.press(status, "status:confirm");
++    agent.key().await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_late_key_answer_never_reaches_the_next_session_of_the_slot() {
++    let hub = start_hub("late", Duration::from_millis(50)).await;
++    hub.start(A, 10).await;
++    let mut agent_a = Agent::connect(&hub, A, 10).await;
++    let status = hub.status_message(100).await;
++    hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
++        .await;
++    hub.until("A thinks", |ops| {
++        edits(ops, status)
++            .last()
++            .is_some_and(|(text, _)| text == "💭 Думает")
++    })
++    .await;
++    hub.press(status, "status:stop");
++    hub.press(status, "status:confirm");
++    let key_id = agent_a.key().await;
++
++    // A ends before its agent answers; B takes the same slot and topic.
++    hub.end(A, 10).await;
++    hub.start(B, 11).await;
++    let _agent_b = Agent::connect(&hub, B, 11).await;
++    hub.hook(B, HookEvent::UserPromptSubmit { prompt_id: None })
++        .await;
++    hub.shows(
++        "B thinks in the same status message",
++        status,
++        shown("💭 Думает", &["status:stop"]),
++    )
++    .await;
++    // A's agent (its link still open) answers now.
++    agent_a.written(key_id, false).await;
++    tokio::time::sleep(Duration::from_millis(500)).await;
++    let ops = hub.fake.ops();
++    assert_eq!(key_failed_notices(&ops), 0, "no notice in B's topic");
++    assert_eq!(
++        edits(&ops, status).last(),
++        Some(&shown("💭 Думает", &["status:stop"])),
++        "B's turn is untouched"
++    );
++    assert_eq!(status_sends(&ops).len(), 1, "one message per slot");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_restarted_hub_keeps_its_status_message_and_the_numbers() {
++    let hub = start_hub("restart", Duration::from_millis(50)).await;
++    hub.start(A, 10).await;
++    let _agent = Agent::connect(&hub, A, 10).await;
++    let status = hub.status_message(100).await;
++    hub.numbers(A).await;
++    hub.shows(
++        "numbers shown",
++        status,
++        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
++    )
++    .await;
++    let hub = hub.restart(Duration::from_millis(50)).await;
++    // The same message is edited: no second message, no second pin, and the
++    // numbers are still there without a new status line call.
++    hub.shows(
++        "the same message after the restart",
++        status,
++        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
++    )
++    .await;
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    let ops = hub.fake.ops();
++    assert!(status_sends(&ops).is_empty(), "{ops:#?}");
++    assert!(pins(&ops).is_empty(), "{ops:#?}");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_press_reaches_only_the_agent_of_its_own_slot() {
++    let hub = start_hub("slots", Duration::from_millis(50)).await;
++    hub.start(A, 10).await;
++    let mut agent_a = Agent::connect(&hub, A, 10).await;
++    let status_a = hub.status_message(100).await;
++    hub.start(B, 11).await;
++    let mut agent_b = Agent::connect(&hub, B, 11).await;
++    let status_b = hub.status_message(101).await;
++    assert_ne!(status_a, status_b);
++    for session in [A, B] {
++        hub.hook(session, HookEvent::UserPromptSubmit { prompt_id: None })
++            .await;
++    }
++    hub.until("both think", |ops| {
++        [status_a, status_b].iter().all(|status| {
++            edits(ops, *status)
++                .last()
++                .is_some_and(|(text, _)| text.starts_with("💭"))
++        })
++    })
++    .await;
++    // A running call offers ⏹ only.
++    hub.hook(A, tool("t1", "• Bash: sleep 30")).await;
++    hub.shows(
++        "A runs its call with ⏹ only",
++        status_a,
++        shown("⚙️ Bash: sleep 30", &["status:stop"]),
++    )
++    .await;
++    // Armed on A's message; B's message is not armed by it.
++    hub.press(status_a, "status:stop");
++    hub.press(status_b, "status:confirm");
++    hub.until("B asked for its own confirmation", |ops| {
++        answers(ops).len() >= 2
++    })
++    .await;
++    assert!(agent_a.quiet().await);
++    assert!(agent_b.quiet().await);
++    hub.press(status_a, "status:confirm");
++    agent_a.key().await;
++    assert!(agent_b.quiet().await);
++    // A button of a message that is no status message does nothing.
++    hub.press(4242, "status:confirm");
++    hub.until("stale press answered", |ops| {
++        answers(ops).last().map(String::as_str) == Some(status::ANSWER_STALE)
++    })
++    .await;
++    assert!(agent_a.quiet().await && agent_b.quiet().await);
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn edits_are_paced_and_a_deleted_status_message_comes_back() {
++    let hub = start_hub("pace", Duration::from_millis(400)).await;
++    hub.start(A, 10).await;
++    let _agent = Agent::connect(&hub, A, 10).await;
++    let status = hub.status_message(100).await;
++    hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
++        .await;
++    let started = std::time::Instant::now();
++    // About 1.2 s of calls and status lines, one every 30 ms: three pacing
++    // windows.
++    for index in 0..20 {
++        tokio::time::sleep(Duration::from_millis(30)).await;
++        hub.hook(A, tool(&format!("t{index}"), &format!("• Read: f{index}")))
++            .await;
++        hub.hook(
++            A,
++            HookEvent::StatusLine {
++                model: None,
++                effort: None,
++                context: Some(index),
++                five_hour: None,
++                seven_day: None,
++            },
++        )
++        .await;
++        hub.hook(
++            A,
++            HookEvent::ToolEnd {
++                tool_use_id: format!("t{index}"),
++            },
++        )
++        .await;
++        tokio::time::sleep(Duration::from_millis(30)).await;
++    }
++    hub.hook(A, tool("last", "• Bash: build")).await;
++    let ops = hub
++        .until("the last state shown", |ops| {
++            edits(ops, status)
++                .last()
++                .is_some_and(|(text, _)| text == "⚙️ Bash: build\nctx 19%")
++        })
++        .await;
++    let windows = started.elapsed().as_millis() / 400 + 2;
++    assert!(
++        edits(&ops, status).len() as u128 <= windows,
++        "{} edits in {:?}",
++        edits(&ops, status).len(),
++        started.elapsed()
++    );
++    // Deleted in Telegram: a new message is sent and pinned.
++    hub.fake
++        .edit_errors
++        .lock()
++        .unwrap()
++        .push_back("Bad Request: message to edit not found");
++    hub.hook(
++        A,
++        HookEvent::ToolEnd {
++            tool_use_id: "last".into(),
++        },
++    )
++    .await;
++    let ops = hub
++        .until("a second status message", |ops| {
++            status_sends(ops).len() == 2 && pins(ops).len() == 2
++        })
++        .await;
++    assert_eq!(
++        status_sends(&ops)[1],
++        (100, "💭 Думает\nctx 19%".to_owned())
++    );
++}
+diff --git a/crates/cctg/tests/statusline_cli.rs b/crates/cctg/tests/statusline_cli.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/statusline_cli.rs
+@@ -0,0 +1,199 @@
++//! `cctg statusline` as Claude Code runs it (TASK-029): a process with the
++//! status line JSON on stdin, configured through `<home>/.cctg/device.env`,
++//! chaining the `statusLine.command` of `<home>/.claude/settings.json`.
++//! What it prints is what the terminal shows, so a configured command's
++//! output must pass byte for byte.
++
++use std::io::Write;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output, Stdio};
++use std::time::{Duration, Instant};
++
++use cctg::hub::ingress;
++use cctg::wire::{HookEvent, HookPost, Secret};
++use tokio::sync::mpsc;
++
++const SECRET: &str = "statusline-cli-secret-0123456789";
++
++/// A status line input with bytes a lossy pass would change: no final
++/// newline, non-ASCII text, CRLF inside a string.
++const INPUT: &str = "{\"session_id\":\"5e551017-0000-4000-8000-000000000031\",\"model\":{\"display_name\":\"Опус 5.5\"},\"effort\":{\"level\":\"high\"},\"context_window\":{\"used_percentage\":50.4},\"rate_limits\":{\"five_hour\":{\"used_percentage\":3},\"seven_day\":{\"used_percentage\":91.6}},\"note\":\"a\\r\\nb\"}";
++
++/// A home whose `.cctg/device.env` points at `addr` and whose Claude Code
++/// user settings carry `command` as the status line.
++fn home(test: &str, addr: &str, command: Option<&str>) -> PathBuf {
++    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("statusline-cli-{test}"));
++    let _ = std::fs::remove_dir_all(&home);
++    std::fs::create_dir_all(home.join(".cctg")).unwrap();
++    std::fs::create_dir_all(home.join(".claude")).unwrap();
++    std::fs::write(
++        home.join(".cctg").join("device.env"),
++        format!("CCTG_HUB_SECRET={SECRET}\nCCTG_HUB_HOOK_ADDR={addr}\nCCTG_HOST=box\n"),
++    )
++    .unwrap();
++    if let Some(command) = command {
++        let settings =
++            serde_json::json!({ "statusLine": { "type": "command", "command": command } });
++        std::fs::write(
++            home.join(".claude").join("settings.json"),
++            settings.to_string(),
++        )
++        .unwrap();
++    }
++    home
++}
++
++/// Runs `cctg statusline`; the exit code is left to the caller.
++fn run(home: &Path, extra_env: &[(&str, &str)]) -> (Output, Duration) {
++    let started = Instant::now();
++    let mut command = Command::new(env!("CARGO_BIN_EXE_cctg"));
++    command
++        .arg("statusline")
++        .env("USERPROFILE", home)
++        .env("HOME", home)
++        .env_remove("CLAUDE_CONFIG_DIR")
++        .env_remove("CCTG_STATUSLINE")
++        .env_remove("CCTG_HUB_SECRET")
++        .env_remove("CCTG_HUB_HOOK_ADDR")
++        .env_remove("CCTG_HOST")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped());
++    for (name, value) in extra_env {
++        command.env(name, value);
++    }
++    let mut child = command.spawn().expect("cctg starts");
++    let mut input = child.stdin.take().unwrap();
++    input.write_all(INPUT.as_bytes()).unwrap();
++    drop(input);
++    let output = child.wait_with_output().unwrap();
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(!stderr.contains(SECRET), "{stderr}");
++    (output, started.elapsed())
++}
++
++async fn hub() -> (String, mpsc::Receiver<HookPost>) {
++    let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        .await
++        .unwrap();
++    let addr = listener.local_addr().unwrap().to_string();
++    let (tx, rx) = mpsc::channel(16);
++    tokio::spawn(ingress::serve_hooks(
++        listener,
++        Secret::parse(SECRET).unwrap(),
++        tx,
++    ));
++    (addr, rx)
++}
++
++/// Claude Code runs status line commands through Git Bash on Windows; these
++/// tests need it (as Claude Code on Windows does).
++fn has_shell() -> bool {
++    !cfg!(windows)
++        || cctg::statusline::git_bash(&|name| std::env::var(name).ok(), &|path| path.is_file())
++            .is_some()
++}
++
++async fn in_blocking(home: PathBuf, extra_env: Vec<(&'static str, &'static str)>) -> Output {
++    tokio::task::spawn_blocking(move || run(&home, &extra_env).0)
++        .await
++        .unwrap()
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte() {
++    if !has_shell() {
++        eprintln!("no Git Bash: skipped");
++        return;
++    }
++    let (addr, mut events) = hub().await;
++    let home = home("cat", &addr, Some("cat"));
++    let output = in_blocking(home, Vec::new()).await;
++    assert_eq!(output.stdout, INPUT.as_bytes());
++    assert_eq!(output.status.code(), Some(0));
++    // The numbers went to the hub, rounded, without the input's other text.
++    let post = tokio::time::timeout(Duration::from_secs(5), events.recv())
++        .await
++        .expect("hub got the numbers")
++        .unwrap();
++    assert_eq!(post.session_id, "5e551017-0000-4000-8000-000000000031");
++    assert_eq!(
++        post.event,
++        HookEvent::StatusLine {
++            model: Some("Опус 5.5".into()),
++            effort: Some("high".into()),
++            context: Some(50),
++            five_hour: Some(3),
++            seven_day: Some(92),
++        }
++    );
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn colours_lines_a_failing_exit_and_empty_output_pass_unchanged() {
++    if !has_shell() {
++        eprintln!("no Git Bash: skipped");
++        return;
++    }
++    let (addr, _events) = hub().await;
++    let home = home("ansi", &addr, Some(r"printf 'a\033[31mb\nc'; exit 3"));
++    let output = in_blocking(home, Vec::new()).await;
++    assert_eq!(output.stdout, b"a\x1b[31mb\nc");
++    // Its exit code too: Claude Code blanks the line on a non-zero one.
++    assert_eq!(output.status.code(), Some(3));
++    // A command that prints nothing shows nothing, not cctg's line.
++    let home = self::home("empty", &addr, Some("true"));
++    let output = in_blocking(home, Vec::new()).await;
++    assert_eq!(output.stdout, b"");
++    assert_eq!(output.status.code(), Some(0));
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn without_a_command_or_inside_one_cctg_prints_its_own_line() {
++    let (addr, mut events) = hub().await;
++    let home = home("own", &addr, None);
++    let output = in_blocking(home, Vec::new()).await;
++    assert_eq!(output.status.code(), Some(0));
++    assert_eq!(
++        String::from_utf8(output.stdout).unwrap(),
++        "Опус 5.5 · ctx 50% · 5h 3% · 7d 92%"
++    );
++    tokio::time::timeout(Duration::from_secs(5), events.recv())
++        .await
++        .expect("hub got the numbers");
++    // Run from inside the user's command: no chain again, no second POST.
++    let home = self::home("nested", &addr, Some("cat"));
++    let output = in_blocking(home, vec![("CCTG_STATUSLINE", "1")]).await;
++    assert_eq!(
++        String::from_utf8(output.stdout).unwrap(),
++        "Опус 5.5 · ctx 50% · 5h 3% · 7d 92%"
++    );
++    assert!(
++        tokio::time::timeout(Duration::from_millis(500), events.recv())
++            .await
++            .is_err()
++    );
++}
++
++#[tokio::test(flavor = "multi_thread")]
++async fn a_stopped_hub_adds_well_under_150_ms() {
++    let (addr, _events) = hub().await;
++    // A port nobody listens on: on Windows a connect there lasts until the
++    // client gives up.
++    let closed = {
++        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
++        listener.local_addr().unwrap().to_string()
++    };
++    let up = home("up", &addr, None);
++    let down = home("down", &closed, None);
++    let best = |home: PathBuf| (0..5).map(|_| run(&home, &[]).1).min().unwrap();
++    let (up, down) = tokio::task::spawn_blocking(move || (best(up), best(down)))
++        .await
++        .unwrap();
++    let extra = down.saturating_sub(up);
++    assert!(
++        extra < Duration::from_millis(150),
++        "hub up {up:?}, down {down:?}"
++    );
++}
+diff --git a/crates/cctg/tests/stream_logs.rs b/crates/cctg/tests/stream_logs.rs
+--- a/crates/cctg/tests/stream_logs.rs
++++ b/crates/cctg/tests/stream_logs.rs
+@@ -153,6 +153,7 @@
+                 claude_pid: Some(10),
+                 verdict_ack: true,
+                 transcript_reads: true,
++                console_keys: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/transcript/src/lib.rs b/crates/transcript/src/lib.rs
+--- a/crates/transcript/src/lib.rs
++++ b/crates/transcript/src/lib.rs
+@@ -18,7 +18,7 @@
+     HtmlChunk, HtmlSplit, escape_html, markdown_to_html, split_markdown_for_telegram,
+ };
+ pub use render::{
+-    last_prompts, render_brief, render_brief_with_subagents, render_full,
++    call_line, last_prompts, render_brief, render_brief_with_subagents, render_full,
+     render_full_with_subagents,
+ };
+ pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
+diff --git a/crates/transcript/src/render.rs b/crates/transcript/src/render.rs
+--- a/crates/transcript/src/render.rs
++++ b/crates/transcript/src/render.rs
+@@ -306,6 +306,12 @@
+             _ => None,
+         })
+         .collect()
++}
++
++/// The `/brief` line of a tool call from its name and input alone, as the
++/// stream shows it (`• Bash: description`, `↳ Explore: description`).
++pub fn call_line(name: &str, input: &Value) -> String {
++    tool_line(name, input, None, None)
+ }
+ 
+ /// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
+diff --git a/crates/transcript/tests/stream.rs b/crates/transcript/tests/stream.rs
+--- a/crates/transcript/tests/stream.rs
++++ b/crates/transcript/tests/stream.rs
+@@ -169,3 +169,20 @@
+     let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"thinking","thinking":"x"}]}}"#;
+     assert!(stream_events(user).is_empty());
+ }
++
++#[test]
++fn a_call_line_from_hook_input_matches_the_streamed_line() {
++    // The status message shows a running call with the line the stream
++    // shows when it ends (TASK-029): from the tool name and input alone.
++    let input = serde_json::json!({ "command": "cargo test", "description": "Run the  tests\n" });
++    assert_eq!(
++        transcript::call_line("Bash", &input),
++        "• Bash: Run the tests"
++    );
++    let agent = serde_json::json!({ "subagent_type": "Explore", "description": "find it" });
++    assert_eq!(transcript::call_line("Agent", &agent), "↳ Explore: find it");
++    assert_eq!(
++        transcript::call_line("Read", &serde_json::Value::Null),
++        "• Read"
++    );
++}
+diff --git a/docs/hook-settings.json b/docs/hook-settings.json
+--- a/docs/hook-settings.json
++++ b/docs/hook-settings.json
+@@ -1,4 +1,8 @@
+ {
++  "statusLine": {
++    "type": "command",
++    "command": "cctg statusline"
++  },
+   "hooks": {
+     "SessionStart": [
+       {
+@@ -60,6 +64,17 @@
+         ]
+       }
+     ],
++    "PreToolUse": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook ToolStatus",
++            "async": true
++          }
++        ]
++      }
++    ],
+     "PostToolUse": [
+       {
+         "matcher": "SubagentHandback",
+@@ -67,6 +82,26 @@
+           {
+             "type": "command",
+             "command": "cctg hook PostToolUse"
++          }
++        ]
++      },
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook ToolStatus",
++            "async": true
++          }
++        ]
++      }
++    ],
++    "PostToolUseFailure": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook ToolStatus",
++            "async": true
+           }
+         ]
+       }
+diff --git a/docs/poc.md b/docs/poc.md
+--- a/docs/poc.md
++++ b/docs/poc.md
+@@ -4,7 +4,7 @@
+ 
+ ## Что нужно заранее
+ 
+-- Закрытая супергруппа с темами, бот в ней админ с правами "Manage Topics" и "Delete Messages".
++- Закрытая супергруппа с темами, бот в ней админ с правами "Manage Topics", "Delete Messages" и "Pin Messages" (без последнего сообщение статуса не закрепляется, hub пишет об этом при старте).
+ - Файл `.env` в корне репозитория (в git не попадает):
+ 
+   ```
+@@ -81,6 +81,7 @@
+ 
+ ```json
+ {
++  "statusLine": { "type": "command", "command": "\"<cctg>\" statusline" },
+   "hooks": {
+     "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SessionStart" }] }],
+     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SessionEnd" }] }],
+@@ -88,11 +89,20 @@
+     "Stop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook Stop" }] }],
+     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStart" }] }],
+     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStop" }] }],
+-    "PostToolUse": [{ "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] }],
++    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }],
++    "PostToolUse": [
++      { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] },
++      { "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }
++    ],
++    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }],
+     "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PermissionRequest", "timeout": 100 }] }]
+   }
+ }
+ ```
++
++`statusLine` и `ToolStatus` нужны для закреплённого сообщения статуса в теме (что делает сессия, модель, контекст и лимиты, кнопка ⏹). `ToolStatus` помечен `"async": true`: Claude Code его не ждёт, один вызов инструмента стоит два коротких процесса в фоне. `cctg statusline` на каждом вызове читает `statusLine.command` из ваших пользовательских настроек (`$CLAUDE_CONFIG_DIR/settings.json` или `~/.claude/settings.json`), запускает его с тем же stdin через Git Bash (на Windows без Git Bash через PowerShell) и печатает его вывод байт в байт, так что строка в терминале остаётся вашей; без своей команды печатается короткая строка cctg. Если в вашем `statusLine` есть `padding`, `refreshInterval` или `hideVimModeIndicator`, скопируйте их в `statusLine` этого файла: `--settings` заменяет `statusLine` целиком, и без них строка будет выглядеть или обновляться иначе. Цифры уходят в hub параллельно вашей команде с таймаутом 80 мс (при остановленном hub строка появляется на столько же позже).
++
++Кнопка ⏹ (с подтверждением вторым нажатием за 10 с) работает только на Windows: агент пишет Esc во входной буфер консоли своего claude (`WriteConsoleInputW`; проверено в обычной консоли conhost, в Windows Terminal не проверено, в mintty без консоли не работает, тогда в тему приходит одно уведомление). После этого статус показывает «⏹ Esc отправлен в терминал», а не «ждёт вас»: запись в буфер не значит, что ход остановлен. Конец хода статус узнаёт из `Stop`, заметки о прерывании в транскрипте, следующего промпта или конца сессии; прерывание во время размышления не даёт ни того, ни другого, тогда статус сменится со следующим промптом. Пока ждёт запрос разрешения, ⏹ не показывается: Esc в этот момент отвечает на запрос, а не останавливает ход, поэтому сначала нажмите Allow или Deny.
+ 
+ `PermissionRequest` ждёт ответа из Telegram до 90 с (кнопки для диалогов, которые канал не пересылает, например проверка безопасности auto mode), поэтому ему нужен свой `"timeout": 100`. Запрос, который уже пришёл через канал, хук отпускает без решения за ~1.5 с.
+ 

@@ -1,0 +1,95 @@
+{
+ "session_id": "str[36]",
+ "transcript_path": "str[90]",
+ "cwd": "str[16]",
+ "scratchpad_dir": "str[104]",
+ "prompt_id": "str[36]",
+ "effort": {
+  "level": "str[6]"
+ },
+ "session_name": "str[30]",
+ "model": {
+  "id": "str[19]",
+  "display_name": "str[21]"
+ },
+ "workspace": {
+  "current_dir": "str[16]",
+  "project_dir": "str[16]",
+  "added_dirs": "list[0]",
+  "repo": {
+   "host": "str[10]",
+   "owner": "str[10]",
+   "name": "str[12]"
+  }
+ },
+ "version": "str[7]",
+ "output_style": {
+  "name": "str[7]"
+ },
+ "cost": {
+  "total_cost_usd": 722.6131755999994,
+  "total_duration_ms": 145415431,
+  "total_api_duration_ms": 82748529,
+  "total_lines_added": 65184,
+  "total_lines_removed": 1310
+ },
+ "context_window": {
+  "total_input_tokens": 501564,
+  "total_output_tokens": 248,
+  "context_window_size": 1000000,
+  "current_usage": {
+   "input_tokens": 2,
+   "output_tokens": 248,
+   "cache_creation_input_tokens": 854,
+   "cache_read_input_tokens": 500708
+  },
+  "used_percentage": 50,
+  "remaining_percentage": 50
+ },
+ "exceeds_200k_tokens": true,
+ "prompt_cache": {
+  "warm": true,
+  "caching_observed": true,
+  "ttl": "str[2]",
+  "expires_at": 1790261738,
+  "requests": 41,
+  "misses": 0,
+  "expected_rebuilds": 0,
+  "hit_ratio": 0.9970928211180368,
+  "cache_write_tokens": 57132,
+  "miss_recache_tokens": 0,
+  "last_miss_at": null,
+  "last_miss_cause": null,
+  "miss_causes": {},
+  "recache_tokens_if_cold": 501564
+ },
+ "fast_mode": false,
+ "thinking": {
+  "enabled": true
+ },
+ "rate_limits": {
+  "five_hour": {
+   "used_percentage": 3,
+   "resets_at": 1790273400
+  },
+  "seven_day": {
+   "used_percentage": 92,
+   "resets_at": 1790614800
+  }
+ },
+ "_note": "shape of a real statusLine stdin, Claude Code 2.1.281, 2026-09-24; strings replaced by lengths",
+ "_values": {
+  "model": {
+   "id": "claude-opus-5-5[1m]",
+   "display_name": "Opus 5.5 (1M context)"
+  },
+  "effort": {
+   "level": "medium"
+  },
+  "ctx_used_percentage": 50,
+  "rate_limits_types": {
+   "five_hour": "int",
+   "seven_day": "int"
+  }
+ }
+}

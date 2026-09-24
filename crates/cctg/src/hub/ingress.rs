@@ -220,7 +220,8 @@ async fn agent_session(
                         msg @ (AgentMsg::Reply { .. }
                         | AgentMsg::PermissionRequest(_)
                         | AgentMsg::PermissionAck { .. }
-                        | AgentMsg::TranscriptChunk { .. }),
+                        | AgentMsg::TranscriptChunk { .. }
+                        | AgentMsg::ConsoleKeyWritten { .. }),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
@@ -596,16 +597,21 @@ fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost
         debug!(event = post.event.kind(), "repeated hook event dropped");
         return Status::NoContent;
     }
-    let (id, kind, session) = (
+    let (id, kind, session, frequent) = (
         post.event_id.clone(),
         post.event.kind(),
         short(&post.session_id).to_owned(),
+        post.event.is_frequent(),
     );
     match events.try_send(post) {
         Ok(()) => {
             // Remembered only once handed over, so a 503 can be re-sent.
             dedup.insert(id, now);
-            info!(event = kind, session, "hook event accepted");
+            if frequent {
+                debug!(event = kind, session, "hook event accepted");
+            } else {
+                info!(event = kind, session, "hook event accepted");
+            }
             Status::NoContent
         }
         Err(_) => Status::Unavailable,
@@ -789,6 +795,7 @@ mod tests {
             claude_pid: None,
             verdict_ack: false,
             transcript_reads: false,
+            console_keys: false,
         }
     }
 
