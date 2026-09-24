@@ -93,6 +93,7 @@ async fn html_refused_by_telegram_is_sent_again_once_as_plain_text() {
             html: Some("<b>done</b> &lt;ok&gt;".to_owned()),
             reply_markup: None,
             permission: false,
+            reply_to: None,
         })
         .await;
     let delivery = answer.await.unwrap();
