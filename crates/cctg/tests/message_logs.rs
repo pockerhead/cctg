@@ -17,7 +17,7 @@ use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Trans
 use cctg::hub::slots::{Control, Options, Slots};
 use cctg::hub::updates::{Routed, route_batch};
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, Register};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 const CHAT: i64 = -1000000000001;
@@ -59,12 +59,20 @@ impl Transport for Accepting {
 }
 
 fn topic_message(update_id: i64, text: &str) -> Control {
-    let update = json!({ "update_id": update_id, "message": {
+    topic_message_with(update_id, text, json!({}))
+}
+
+/// A topic message with `extra` fields (a reply, a quote, a forward origin).
+fn topic_message_with(update_id: i64, text: &str, extra: Value) -> Control {
+    let mut update = json!({ "update_id": update_id, "message": {
         "message_id": update_id + 10, "message_thread_id": 100, "is_topic_message": true,
         "date": 1, "text": text,
         "from": { "id": USER, "is_bot": false, "first_name": "x" },
         "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
     }});
+    if let (Some(message), Some(extra)) = (update["message"].as_object_mut(), extra.as_object()) {
+        message.extend(extra.clone());
+    }
     let allowlist: Allowlist = [USER].into_iter().collect();
     let (_, mut routed) = route_batch(vec![update], None, CHAT, &allowlist);
     match routed.remove(0) {
@@ -89,6 +97,9 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     let reply_text = format!("private reply {pid}");
     let offline_text = format!("private offline {pid}");
     let answer_text = format!("private answer {pid}");
+    let replied_text = format!("private replied {pid}");
+    let quote_text = format!("private quote {pid}");
+    let forwarded_text = format!("private forwarded {pid}");
     let state = std::env::temp_dir().join(format!("cctg-message-logs-{pid}"));
     let _ = std::fs::remove_dir_all(&state);
     std::fs::create_dir_all(&state).expect("state dir");
@@ -198,6 +209,50 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         matches!(got, Some(HubMsg::Inbound { ref content, .. }) if *content == inbound_text),
         "{got:?}"
     );
+    // A reply with a selected quote and a forward: their words reach the
+    // session, never the logs.
+    let replied = json!({
+        "message_id": 5, "message_thread_id": 100, "is_topic_message": true, "date": 1,
+        "from": { "id": 1, "is_bot": true, "first_name": "bot" },
+        "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
+        "text": replied_text,
+    });
+    control
+        .send(topic_message_with(
+            3,
+            &inbound_text,
+            json!({ "reply_to_message": replied, "quote": { "text": quote_text, "position": 0 } }),
+        ))
+        .expect("control");
+    let got = tokio::time::timeout(Duration::from_secs(30), to_agent_rx.recv())
+        .await
+        .expect("reply in time");
+    let expected = format!(
+        "> {quote_text}
+
+{inbound_text}"
+    );
+    assert!(
+        matches!(got, Some(HubMsg::Inbound { ref content, .. }) if *content == expected),
+        "{got:?}"
+    );
+    control
+        .send(topic_message_with(
+            4,
+            &forwarded_text,
+            json!({ "forward_origin": { "type": "hidden_user", "sender_user_name": "n", "date": 1 } }),
+        ))
+        .expect("control");
+    let got = tokio::time::timeout(Duration::from_secs(30), to_agent_rx.recv())
+        .await
+        .expect("forward in time");
+    assert!(
+        matches!(got, Some(HubMsg::Inbound { ref content, ref meta })
+            if *content == format!("(переслано)
+{forwarded_text}")
+                && meta.get("forwarded").map(String::as_str) == Some("true")),
+        "{got:?}"
+    );
     agents
         .send(AgentEvent::Message {
             conn: 1,
@@ -245,6 +300,9 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         reply_text.as_str(),
         answer_text.as_str(),
         offline_text.as_str(),
+        replied_text.as_str(),
+        quote_text.as_str(),
+        forwarded_text.as_str(),
         "private",
         &USER.to_string(),
     ] {

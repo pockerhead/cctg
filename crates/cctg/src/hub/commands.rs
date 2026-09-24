@@ -493,6 +493,8 @@ mod tests {
             thread_id: Some(2),
             text: Some(text.to_owned()),
             reply_to: None,
+            quote: None,
+            forwarded: false,
         };
         for text in ["/brief", "/full 2", " /brief@cctg_bot 3", "/full@other_bot"] {
             assert!(super::is_command(&input(text)), "{text}");
@@ -619,6 +621,8 @@ mod tests {
                 thread_id: THREAD,
                 text: Some((*text).to_owned()),
                 reply_to: None,
+                quote: None,
+                forwarded: false,
             })
             .unwrap();
         }

@@ -1071,6 +1071,8 @@ impl Slots {
                 thread_id,
                 text,
                 reply_to: input.reply_to,
+                quote: input.quote,
+                forwarded: input.forwarded,
             },
         );
         self.flush(slot);
@@ -1197,13 +1199,17 @@ impl Slots {
 
     /// The Inbound of a topic message for `session`: meta `chat_id`,
     /// `message_id`, `thread_id`, `reply_to_message_id` for an explicit
-    /// reply, and `target_agent` for a reply to a block of its subagent.
+    /// reply, `target_agent` for a reply to a block of its subagent and
+    /// `forwarded` for a forward; the content is [`Parked::content`].
     fn inbound(&self, session: &str, parked: &Parked) -> HubMsg {
         let mut meta = BTreeMap::from([
             ("chat_id".to_owned(), self.options.chat_id.to_string()),
             ("message_id".to_owned(), parked.message_id.to_string()),
             ("thread_id".to_owned(), parked.thread_id.to_string()),
         ]);
+        if parked.forwarded {
+            meta.insert("forwarded".to_owned(), "true".to_owned());
+        }
         if let Some(reply_to) = parked.reply_to {
             meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
             // A reply to a block of this session's subagent is for that
@@ -1216,7 +1222,7 @@ impl Slots {
             }
         }
         HubMsg::Inbound {
-            content: parked.text.clone(),
+            content: parked.content(),
             meta,
         }
     }
@@ -3169,6 +3175,8 @@ mod tests {
             thread_id,
             text: text.map(str::to_owned),
             reply_to: None,
+            quote: None,
+            forwarded: false,
         })
     }
 
@@ -3229,6 +3237,18 @@ mod tests {
                 thread_id: Some(101),
                 text: Some("again".into()),
                 reply_to: Some(40),
+                quote: Some("Удалить build/?".into()),
+                forwarded: false,
+            }))
+            .unwrap();
+        rig.control
+            .send(Control::Message(Inbound {
+                message_id: 46,
+                thread_id: Some(101),
+                text: Some("чужие слова".into()),
+                reply_to: None,
+                quote: None,
+                forwarded: true,
             }))
             .unwrap();
         // General and a topic that is no slot reach nobody and say nothing.
@@ -3256,11 +3276,25 @@ mod tests {
                     ]),
                 },
                 HubMsg::Inbound {
-                    content: "again".into(),
+                    content: "> Удалить build/?
+
+again"
+                        .into(),
                     meta: meta(&[
                         ("chat_id", "-1000000000001"),
                         ("message_id", "43"),
                         ("reply_to_message_id", "40"),
+                        ("thread_id", "101"),
+                    ]),
+                },
+                HubMsg::Inbound {
+                    content: "(переслано)
+чужие слова"
+                        .into(),
+                    meta: meta(&[
+                        ("chat_id", "-1000000000001"),
+                        ("forwarded", "true"),
+                        ("message_id", "46"),
                         ("thread_id", "101"),
                     ]),
                 },
@@ -3281,7 +3315,7 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
-        assert_eq!(after, [(42, "👀"), (43, "👀")]);
+        assert_eq!(after, [(42, "👀"), (43, "👀"), (46, "👀")]);
     }
 
     #[tokio::test]
@@ -6079,6 +6113,8 @@ mod tests {
                     thread_id: Some(100),
                     text: Some("hi".into()),
                     reply_to: Some(reply_to),
+                    quote: None,
+                    forwarded: false,
                 }))
                 .unwrap();
         }
