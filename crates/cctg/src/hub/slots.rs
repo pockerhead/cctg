@@ -98,7 +98,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
-use transcript::{HtmlChunk, SplitOptions, split_for_telegram, split_markdown_for_telegram};
+use transcript::{
+    HtmlChunk, SplitOptions, escape_html, split_for_telegram, split_markdown_for_telegram,
+};
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Parked, ResumeNote};
@@ -111,7 +113,7 @@ use super::registry::{
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
 use super::status::{self, Activity, Buttons, Press};
-use super::stream::{self, Held, Live, Step};
+use super::stream::{self, Format, Held, Live, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
 };
@@ -895,7 +897,8 @@ impl Slots {
                     AgentMsg::ConsoleCommandTyped {
                         command_id,
                         outcome,
-                    } => self.on_command_typed(conn, &session, command_id, outcome),
+                        panel,
+                    } => self.on_command_typed(conn, &session, command_id, outcome, panel),
                     AgentMsg::UpdateAnswer { update_id, outcome } => {
                         self.on_update_answer(conn, &session, update_id, outcome);
                     }
@@ -2247,9 +2250,9 @@ impl Slots {
                     Step::Send {
                         text,
                         merge,
-                        markdown,
+                        format,
                     } => {
-                        let chunks = stream_chunks(&text, markdown);
+                        let chunks = stream_chunks(&text, format);
                         let merge = merge && chunks.len() == 1;
                         for (text, html) in chunks {
                             queued += 1;
@@ -3442,16 +3445,42 @@ impl Slots {
         self.send_messages(vec![op]);
     }
 
+    /// The text of a panel a console command opened, monospace, in reply to
+    /// the command; one message, cut to the Telegram limit.
+    fn answer_panel(&mut self, thread_id: i64, message_id: i64, panel: &str) {
+        let Some(text) = split_for_telegram(panel, SplitOptions::default())
+            .chunks
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let mut op = message_op(thread_id, text);
+        if let Op::Send {
+            text,
+            html,
+            reply_to,
+            ..
+        } = &mut op
+        {
+            *html = Some(pre(text));
+            *reply_to = Some(message_id);
+        }
+        self.send_messages(vec![op]);
+    }
+
     /// An agent typed a command, or could not. Typed gets 👀 on its topic
-    /// message; the output comes with the stream. Like [`Self::on_key_written`],
-    /// an answer for a slot, session or connection that moved on changes
-    /// nothing.
+    /// message; the output comes with the stream, or as the text of the panel
+    /// the command opened, sent monospace in reply. Like
+    /// [`Self::on_key_written`], an answer for a slot, session or connection
+    /// that moved on changes nothing.
     fn on_command_typed(
         &mut self,
         conn: u64,
         frame_session: &str,
         command_id: u64,
         outcome: CommandOutcome,
+        panel: Option<String>,
     ) {
         let Some(ask) = self.command_asks.remove(&command_id) else {
             debug!(conn, "answer to a console command nothing waits for");
@@ -3474,7 +3503,12 @@ impl Slots {
             "console command answered"
         );
         match outcome {
-            CommandOutcome::Sent => self.react(ask.message_id, stream::ACCEPTED),
+            CommandOutcome::Sent => {
+                self.react(ask.message_id, stream::ACCEPTED);
+                if let Some(panel) = panel.filter(|panel| !panel.trim().is_empty()) {
+                    self.answer_panel(ask.thread_id, ask.message_id, &panel);
+                }
+            }
             CommandOutcome::Draft => {
                 self.answer_command(ask.thread_id, ask.message_id, console::DRAFT_NOTICE);
             }
@@ -4310,21 +4344,28 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
 }
 
 /// The messages of a stream line: markdown as HTML with its plain source,
-/// anything else as plain text.
-fn stream_chunks(text: &str, markdown: bool) -> Vec<(String, Option<String>)> {
-    if markdown {
-        split_markdown_for_telegram(text, SplitOptions::default())
+/// code as one `<pre>` block, plain text as is.
+fn stream_chunks(text: &str, format: Format) -> Vec<(String, Option<String>)> {
+    match format {
+        Format::Markdown => split_markdown_for_telegram(text, SplitOptions::default())
             .chunks
             .into_iter()
             .map(|chunk| (chunk.text, Some(chunk.html)))
-            .collect()
-    } else {
-        split_for_telegram(text, SplitOptions::default())
+            .collect(),
+        Format::Code | Format::Plain => split_for_telegram(text, SplitOptions::default())
             .chunks
             .into_iter()
-            .map(|text| (text, None))
-            .collect()
+            .map(|text| {
+                let html = (format == Format::Code).then(|| pre(&text));
+                (text, html)
+            })
+            .collect(),
     }
+}
+
+/// `text` as one monospace block of Telegram HTML.
+fn pre(text: &str) -> String {
+    format!("<pre>{}</pre>", escape_html(text))
 }
 
 /// A plain message without a sound.
@@ -9382,7 +9423,7 @@ again"
         assert_eq!(
             topic_html(&rig.fake.ops(), 100),
             [
-                ("> go *now*".to_owned(), None),
+                ("> go *now*".to_owned(), html("<pre>&gt; go *now*</pre>")),
                 (
                     "**Checking** `a<b`".to_owned(),
                     html("<b>Checking</b> <code>a&lt;b</code>")
@@ -10872,8 +10913,8 @@ again"
         // Neither went to the model, nor waits in the slot.
         assert!(slots.registry.slots[0].buffer.messages.is_empty());
         // Typed: 👀 on the message. A draft in the box: an answer.
-        slots.on_command_typed(1, A, typed, CommandOutcome::Sent);
-        slots.on_command_typed(1, A, drafted, CommandOutcome::Draft);
+        slots.on_command_typed(1, A, typed, CommandOutcome::Sent, None);
+        slots.on_command_typed(1, A, drafted, CommandOutcome::Draft, None);
         assert_eq!(
             command_replies(&fake, 1).await,
             [(12, console::DRAFT_NOTICE.to_owned())]
@@ -10887,7 +10928,7 @@ again"
         };
         tokio::time::timeout(WAIT, reached).await.expect("👀 on 11");
         // A late or repeated answer changes nothing.
-        slots.on_command_typed(1, A, typed, CommandOutcome::Failed);
+        slots.on_command_typed(1, A, typed, CommandOutcome::Failed, None);
         // A plain text, a path and a forwarded bang are messages for the model.
         slots.on_topic_message(topic_text(13, "hello", false));
         slots.on_topic_message(topic_text(14, "/tmp/app.log fails", false));
@@ -10902,6 +10943,37 @@ again"
             command_replies(&fake, 1).await.len(),
             1,
             "nothing more answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_panel_a_command_opened_is_answered_monospace() {
+        let dir = TempDir::new("slots-console-panel");
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        slots.on_topic_message(topic_text(31, "/cost", false));
+        let (typed, _) = command_of(from_hub.try_recv().ok());
+        slots.on_command_typed(
+            1,
+            A,
+            typed,
+            CommandOutcome::Sent,
+            Some("Total cost: $0.01\nSession <1>".into()),
+        );
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(31, "Total cost: $0.01\nSession <1>".to_owned())]
+        );
+        let html = fake.ops().into_iter().find_map(|op| match op {
+            Op::Send {
+                reply_to: Some(31),
+                html,
+                ..
+            } => html,
+            _ => None,
+        });
+        assert_eq!(
+            html.as_deref(),
+            Some("<pre>Total cost: $0.01\nSession &lt;1&gt;</pre>")
         );
     }
 

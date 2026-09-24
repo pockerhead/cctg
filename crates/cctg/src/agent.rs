@@ -373,8 +373,9 @@ pub enum Frame {
 
 /// Writes one key into the claude console; `false` when it was not written.
 pub type Presser = Arc<dyn Fn(ConsoleKey) -> bool + Send + Sync>;
-/// Types one line into the input box of the claude console ([`keys::type_line`]).
-pub type Typist = Arc<dyn Fn(&str) -> Typed + Send + Sync>;
+/// Types one line into the input box of the claude console and returns the
+/// text of a panel it opened ([`keys::type_command`]).
+pub type Typist = Arc<dyn Fn(&str) -> (Typed, Option<String>) + Send + Sync>;
 
 /// What the agent can do in its claude's console.
 #[derive(Clone)]
@@ -396,7 +397,7 @@ pub async fn run_stdio() -> i32 {
     let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
     let console = claude_pid.filter(|_| keys::SUPPORTED).map(|pid| Console {
         press: Arc::new(move |key| keys::press(pid, key)),
-        type_line: Arc::new(move |text: &str| keys::type_line(pid, text)),
+        type_line: Arc::new(move |text: &str| keys::type_command(pid, text)),
     });
     let mut worker = Worker::from_env(
         |name| std::env::var(name).ok(),
@@ -881,15 +882,15 @@ fn spawn_console(
                     AgentMsg::ConsoleKeyWritten { key_id, written }
                 }
                 ConsoleJob::Line(command_id, text) => {
-                    let typed = match console.clone().filter(|_| keys::typable(&text)) {
+                    let (typed, panel) = match console.clone().filter(|_| keys::typable(&text)) {
                         Some(console) => {
                             tokio::task::spawn_blocking(move || (console.type_line)(&text))
                                 .await
-                                .unwrap_or(Typed::Failed)
+                                .unwrap_or((Typed::Failed, None))
                         }
-                        None => Typed::Failed,
+                        None => (Typed::Failed, None),
                     };
-                    info!(?typed, "console command");
+                    info!(?typed, panel = panel.is_some(), "console command");
                     let outcome = match typed {
                         Typed::Sent => CommandOutcome::Sent,
                         Typed::Draft => CommandOutcome::Draft,
@@ -898,6 +899,7 @@ fn spawn_console(
                     AgentMsg::ConsoleCommandTyped {
                         command_id,
                         outcome,
+                        panel,
                     }
                 }
             };
@@ -1721,9 +1723,9 @@ mod tests {
             let mut seen = seen.lock().unwrap();
             seen.push(text.to_owned());
             if seen.len() == 1 {
-                Typed::Sent
+                (Typed::Sent, Some("Total cost: $0.01".to_owned()))
             } else {
-                Typed::Draft
+                (Typed::Draft, None)
             }
         });
         let console = Console {
@@ -1777,17 +1779,22 @@ mod tests {
             };
             wire::write_msg(&mut write, &command).await.unwrap();
         }
-        for (command_id, outcome) in [
-            (9, CommandOutcome::Sent),
-            (10, CommandOutcome::Draft),
+        for (command_id, outcome, panel) in [
+            (
+                9,
+                CommandOutcome::Sent,
+                Some("Total cost: $0.01".to_owned()),
+            ),
+            (10, CommandOutcome::Draft, None),
             // Two lines are never typed.
-            (11, CommandOutcome::Failed),
+            (11, CommandOutcome::Failed, None),
         ] {
             assert_eq!(
                 agent_line(&mut reader).await,
                 AgentMsg::ConsoleCommandTyped {
                     command_id,
-                    outcome
+                    outcome,
+                    panel,
                 }
             );
         }
@@ -1833,7 +1840,8 @@ mod tests {
             agent_line(&mut reader).await,
             AgentMsg::ConsoleCommandTyped {
                 command_id: 2,
-                outcome: CommandOutcome::Failed
+                outcome: CommandOutcome::Failed,
+                panel: None,
             }
         );
     }

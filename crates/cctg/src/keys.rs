@@ -3,7 +3,8 @@
 //! `/exit` for a restart ([`type_exit`], which reads the input box back
 //! first) and serves `cctg run` its own console ([`visible_lines`],
 //! [`write_text`]); since TASK-043 any one-line command from the topic
-//! ([`type_line`], the same safe typing).
+//! ([`type_line`], the same safe typing), and closes a panel such a command
+//! opened after reading it ([`type_command`]).
 //!
 //! Channels have no command for it, so on Windows the agent (a child of
 //! that claude) attaches to its console and writes the key events into the
@@ -104,6 +105,15 @@ const PROMPTS: [char; 2] = ['\u{276f}', '>'];
 #[cfg(windows)]
 const ECHO_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How long [`type_command`] watches the screen for a panel after Enter,
+/// how often, and how long a found panel gets to fill in before it is read.
+#[cfg(windows)]
+const PANEL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(windows)]
+const PANEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(windows)]
+const PANEL_SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+
 /// Longest command [`type_line`] types, in characters.
 pub const MAX_LINE_CHARS: usize = 200;
 
@@ -179,6 +189,46 @@ pub fn box_shows(lines: &[String], text: &str) -> bool {
     }
 }
 
+/// The text of the panel on `screen`: what `/cost` or `/usage` open in
+/// place of the input box (probe 2026-09-24, 2.1.282), under a top edge of
+/// `▔`. `None` while an input box is on screen or without that edge. Lines
+/// lose their common indent, runs of blank lines and the `↓` scroll mark.
+pub fn panel(screen: &[String]) -> Option<String> {
+    if input_box(screen).is_some() {
+        return None;
+    }
+    let top = screen.iter().rposition(|line| {
+        line.trim_start()
+            .chars()
+            .take_while(|&c| c == '\u{2594}')
+            .count()
+            >= 20
+    })?;
+    let lines: Vec<&str> = screen[top + 1..]
+        .iter()
+        .map(|line| line.trim_end())
+        .filter(|line| line.trim() != "\u{2193}")
+        .collect();
+    let indent = lines
+        .iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.bytes().take_while(|&b| b == b' ').count())
+        .min()
+        .unwrap_or(0);
+    let mut text = String::new();
+    for line in lines {
+        if line.is_empty() {
+            if !text.is_empty() && !text.ends_with("\n\n") {
+                text.push('\n');
+            }
+        } else {
+            text.push_str(&line[indent..]);
+            text.push('\n');
+        }
+    }
+    Some(text.trim_end().to_owned())
+}
+
 /// Types `/exit` with [`type_line`].
 pub fn type_exit(claude_pid: u32) -> Typed {
     type_line(claude_pid, "/exit")
@@ -189,12 +239,23 @@ pub fn type_exit(claude_pid: u32) -> Typed {
 /// the typed characters (Backspace deletes before the cursor, where they
 /// went). A text that is not [`typable`] is not typed. Blocking, under a
 /// second.
-#[cfg(windows)]
 pub fn type_line(claude_pid: u32, text: &str) -> Typed {
+    type_and_watch(claude_pid, text, false).0
+}
+
+/// [`type_line`], then, once sent, watches the screen for a [`panel`]; a
+/// panel that shows up is read and closed with Esc (it waits for Esc and
+/// blocks the terminal otherwise). Blocking, up to about three seconds.
+pub fn type_command(claude_pid: u32, text: &str) -> (Typed, Option<String>) {
+    type_and_watch(claude_pid, text, true)
+}
+
+#[cfg(windows)]
+fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<String>) {
     use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
 
     if !typable(text) {
-        return Typed::Failed;
+        return (Typed::Failed, None);
     }
     let _one = one_at_a_time();
     // SAFETY: plain Win32 calls without pointers; see `press`.
@@ -202,7 +263,7 @@ pub fn type_line(claude_pid: u32, text: &str) -> Typed {
         SetConsoleCtrlHandler(None, 1);
         FreeConsole();
         if AttachConsole(claude_pid) == 0 {
-            return Typed::Failed;
+            return (Typed::Failed, None);
         }
     }
     let typed = if write_text(text) {
@@ -222,16 +283,41 @@ pub fn type_line(claude_pid: u32, text: &str) -> Typed {
     } else {
         Typed::Failed
     };
+    let panel = if watch && typed == Typed::Sent {
+        close_panel()
+    } else {
+        None
+    };
     // SAFETY: no arguments.
     unsafe {
         FreeConsole();
     }
-    typed
+    (typed, panel)
 }
 
 #[cfg(not(windows))]
-pub fn type_line(_claude_pid: u32, _text: &str) -> Typed {
-    Typed::Failed
+fn type_and_watch(_claude_pid: u32, _text: &str, _watch: bool) -> (Typed, Option<String>) {
+    (Typed::Failed, None)
+}
+
+/// Waits up to [`PANEL_WAIT`] for a [`panel`] in the attached console; reads
+/// a found one after [`PANEL_SETTLE`] and presses Esc. Esc goes only to a
+/// panel on screen: without one it would interrupt a turn.
+#[cfg(windows)]
+fn close_panel() -> Option<String> {
+    let until = std::time::Instant::now() + PANEL_WAIT;
+    while std::time::Instant::now() < until {
+        std::thread::sleep(PANEL_POLL);
+        if visible_lines().as_deref().and_then(panel).is_some() {
+            std::thread::sleep(PANEL_SETTLE);
+            let text = visible_lines().as_deref().and_then(panel);
+            if text.is_some() {
+                write_text("\u{1b}");
+            }
+            return text;
+        }
+    }
+    None
 }
 
 /// One console attachment at a time in this process: [`press`] and
@@ -243,8 +329,8 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Writes `text` as key presses (down and up per character; `\r` is Enter,
-/// `\u{8}` Backspace) into the input of the console this process is
-/// attached to.
+/// `\u{8}` Backspace, `\u{1b}` Esc) into the input of the console this
+/// process is attached to.
 #[cfg(windows)]
 pub fn write_text(text: &str) -> bool {
     use windows_sys::Win32::Foundation::{
@@ -260,6 +346,7 @@ pub fn write_text(text: &str) -> bool {
         let vk = match unit {
             0x0D => 0x0D,
             0x08 => 0x08,
+            0x1B => 0x1B,
             _ => 0,
         };
         for down in [1, 0] {
@@ -447,6 +534,41 @@ mod tests {
         ] {
             assert!(!shows(lines, text), "{lines:?} {text}");
         }
+    }
+
+    #[test]
+    fn a_panel_is_read_only_without_an_input_box() {
+        // Probe 2026-09-24 (2.1.282): `/cost` open, then after Esc.
+        let top = format!(
+            "{} \u{25d0} medium \u{b7} /effort \u{2594}",
+            "\u{2594}".repeat(40)
+        );
+        let open = screen(&[
+            " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259b}\u{2588}   Claude Code v2.1.282",
+            "",
+            &top,
+            "   Settings  Status   Config   Usage   Stats",
+            "",
+            "   Session",
+            "   Total cost:            $0.0000",
+            "",
+            "",
+            "   Current session",
+            "   \u{2588}\u{2588}\u{2588}\u{258c}          7% used",
+            "",
+            "                                    \u{2193}",
+        ]);
+        assert_eq!(
+            panel(&open).as_deref(),
+            Some(
+                "Settings  Status   Config   Usage   Stats\n\nSession\nTotal cost:            \
+                 $0.0000\n\nCurrent session\n\u{2588}\u{2588}\u{2588}\u{258c}          7% used"
+            )
+        );
+        // Closed: the box is back. `/context` prints above the box: no panel.
+        let closed = screen(&[&top, "   Session", RULE, "\u{276f}", RULE]);
+        assert_eq!(panel(&closed), None);
+        assert_eq!(panel(&screen(&["   Session", "   Total cost: $0"])), None);
     }
 
     #[test]
