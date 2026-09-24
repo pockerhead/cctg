@@ -462,6 +462,77 @@ async fn e2e_order_partial_line_and_stop_after_lines() {
     hub.stop();
 }
 
+fn thinking(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[
+            {"type":"thinking","thinking":text,"signature":"sig"}]}})
+    )
+}
+fn reply_call(id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[
+            {"type":"tool_use","id":id,"name":"mcp__cctg__reply","input":{"text":"status"}}]}})
+    )
+}
+
+/// TASK-025 over a real agent link: visible thinking goes as its own 💭
+/// message in turn order, signature-only thinking and the `reply` call give
+/// nothing, and the answer still follows the turn's lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_thinking_shows_and_the_reply_call_does_not() {
+    let s = session("think", 12);
+    let (l, port) = listener().await;
+    let hub = start_hub(&s.state, l, fast_bucket(), Arc::new(Fake::default())).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    let fake = hub.fake.clone();
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+
+    s.append(&prompt("go"));
+    // The stream runs before the turn goes on (as in the order test).
+    wait_for("prompt", 20, || !fake.topic_lines().is_empty()).await;
+    s.append(&thinking("Checking cargo."));
+    s.append(&reply_call("tr"));
+    s.append(&result("tr", false));
+    s.append(&thinking(""));
+    s.append(&call("ta", "step A"));
+    s.append(&result("ta", false));
+    s.append(&thinking("Both done."));
+    s.append(&answer("DONE"));
+    hub.hooks
+        .send(s.post(HookEvent::Stop {
+            prompt_id: None,
+            last_assistant_message: Some("DONE".into()),
+        }))
+        .await
+        .unwrap();
+    wait_for("answer", 20, || {
+        fake.topic_lines().iter().any(|l| l == "DONE")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let lines = fake.topic_lines();
+    assert_eq!(
+        lines,
+        [
+            "> go".to_owned(),
+            "\u{1F4AD} Checking cargo.".to_owned(),
+            ok_line("step A"),
+            "\u{1F4AD} Both done.".to_owned(),
+            "DONE".to_owned(),
+        ]
+    );
+    assert_no_dup(&lines);
+    hub.stop();
+}
+
 /// Stream messages Telegram refuses (502) are neither lost nor overtaken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_refused_sends_lose_nothing() {

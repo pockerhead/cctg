@@ -2,12 +2,15 @@
 //!
 //! The stream shows what `/brief` shows, one message at a time: prompts typed
 //! in the terminal, the text the assistant writes before a tool call, and one
-//! line per tool call once its result is in. The final answer of a turn is not
-//! part of it: the hub sends it from the `Stop` hook. Telegram messages taken
-//! into work are reported by their `message_id`, never by their text.
+//! line per tool call once its result is in, plus the assistant's visible
+//! thinking, cut short. The final answer of a turn is not part of it: the hub
+//! sends it from the `Stop` hook. Calls of cctg's own `reply` tool are not
+//! shown. Telegram messages taken into work are reported by their
+//! `message_id`, never by their text.
 
 use serde::Deserialize;
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::render::{self, UserText};
 use crate::{Block, Role};
@@ -24,6 +27,10 @@ pub enum StreamEvent {
     /// Assistant text written before a tool call (`stop_reason: tool_use`),
     /// or Claude Code's `[Request interrupted by user...]` line.
     Note(String),
+    /// A non-empty `thinking` block of the assistant, trimmed and cut to
+    /// [`THINKING_LIMIT`] graphemes (a cut ends with `…`). Redacted and
+    /// signature-only thinking gives none.
+    Thinking(String),
     /// A tool call and its `/brief` line (`• Bash: ...`, `↳ Explore: ...`).
     Call { id: String, line: String },
     /// The result of a tool call; `error` is set for a failed call and holds
@@ -37,6 +44,27 @@ pub enum StreamEvent {
 /// The `source` of cctg's channel tags: the server name cctg is registered
 /// under (`cctg agent-install`, `docs/poc.md`).
 const SOURCE: &str = "cctg";
+/// The full name of cctg's `reply` tool under that server name. Its text
+/// goes to the topic by itself; its call line would repeat it.
+const REPLY_CALL: &str = "mcp__cctg__reply";
+/// Graphemes of one thinking block the stream shows.
+pub const THINKING_LIMIT: usize = 1000;
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawThinkingRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Value,
+    message: Option<RawThinkingMessage>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawThinkingMessage {
+    content: Value,
+}
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -58,13 +86,14 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
     if let Some(message_id) = queued_channel(line) {
         return vec![StreamEvent::Channel { message_id }];
     }
+    // A response puts its thinking before its text and tool calls.
+    let mut events = thinking(line);
     let Some(turn) = crate::parse(line).into_iter().next() else {
-        return Vec::new();
+        return events;
     };
     if turn.is_sidechain {
         return Vec::new();
     }
-    let mut events = Vec::new();
     let mut answer = false;
     for block in &turn.blocks {
         match (turn.role, block) {
@@ -98,6 +127,7 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
                     Some(_) => answer = true,
                 }
             }
+            (_, Block::ToolUse { name, .. }) if name == REPLY_CALL => {}
             (_, Block::ToolUse { id, name, input }) => events.push(StreamEvent::Call {
                 id: id.clone(),
                 line: render::tool_line(name, input, None, None),
@@ -120,6 +150,41 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
         events.push(StreamEvent::TurnEnd);
     }
     events
+}
+
+/// The non-empty `thinking` blocks of a main-transcript assistant record, in
+/// block order. `parse` drops thinking, so the record is read again here, only
+/// when it can hold some.
+fn thinking(line: &str) -> Vec<StreamEvent> {
+    if !line.contains("\"thinking\"") {
+        return Vec::new();
+    }
+    let Ok(record) = serde_json::from_str::<RawThinkingRecord>(line) else {
+        return Vec::new();
+    };
+    if record.kind != "assistant" || record.is_sidechain.as_bool().unwrap_or(false) {
+        return Vec::new();
+    }
+    let Some(Value::Array(blocks)) = record.message.map(|message| message.content) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+        .filter_map(|block| block.get("thinking").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| StreamEvent::Thinking(cut(text, THINKING_LIMIT)))
+        .collect()
+}
+
+/// `text` cut to `limit` graphemes; a cut drops trailing whitespace and ends
+/// with `…`.
+fn cut(text: &str, limit: usize) -> String {
+    match text.grapheme_indices(true).nth(limit) {
+        Some((at, _)) => format!("{}\u{2026}", text[..at].trim_end()),
+        None => text.to_owned(),
+    }
 }
 
 /// A channel message queued while a turn ran reaches Claude as a

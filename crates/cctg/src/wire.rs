@@ -200,6 +200,10 @@ pub enum StreamItem {
     Note {
         text: String,
     },
+    /// The assistant's visible thinking, already cut short by the agent.
+    Thinking {
+        text: String,
+    },
     Call {
         id: String,
         line: String,

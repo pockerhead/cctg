@@ -241,6 +241,7 @@ fn item(event: StreamEvent) -> Option<StreamItem> {
         StreamEvent::Prompt(text) => StreamItem::Prompt { text: cap(text) },
         StreamEvent::Channel { message_id } => StreamItem::Channel { message_id },
         StreamEvent::Note(text) => StreamItem::Note { text: cap(text) },
+        StreamEvent::Thinking(text) => StreamItem::Thinking { text: cap(text) },
         StreamEvent::Call { id, line } if id.len() <= MAX_ID => StreamItem::Call {
             id,
             line: cap(line),
@@ -257,7 +258,9 @@ fn item(event: StreamEvent) -> Option<StreamItem> {
 fn item_len(item: &StreamItem) -> usize {
     ITEM_OVERHEAD
         + match item {
-            StreamItem::Prompt { text } | StreamItem::Note { text } => text.len(),
+            StreamItem::Prompt { text }
+            | StreamItem::Note { text }
+            | StreamItem::Thinking { text } => text.len(),
             StreamItem::Call { id, line } => id.len() + line.len(),
             StreamItem::Result { id, error } => id.len() + error.as_ref().map_or(0, String::len),
             StreamItem::Channel { .. } | StreamItem::TurnEnd | StreamItem::Other => 0,
