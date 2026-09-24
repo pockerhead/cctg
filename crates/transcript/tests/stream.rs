@@ -212,3 +212,25 @@ fn terminal_bang_commands_and_local_command_output_stream_as_prompt_and_code() {
         ]
     );
 }
+
+#[test]
+fn a_local_command_written_as_a_system_record_streams_as_prompt_and_code() {
+    // Claude Code 2.1.282 writes `/context` and its output as `system`
+    // records with `subtype: local_command`.
+    let jsonl = concat!(
+        r#"{"type":"system","subtype":"local_command","content":"<command-name>/context</command-name>\n            <command-message>context</command-message>\n            <command-args></command-args>","isSidechain":false,"isMeta":false}"#,
+        "\n",
+        r#"{"type":"system","subtype":"local_command","content":"<local-command-stdout> \u001b[1mContext Usage\u001b[22m\n142.8k/1m tokens (14%)</local-command-stdout>","isSidechain":false,"isMeta":false}"#,
+        "\n",
+        r#"{"type":"system","subtype":"local_command","content":"<local-command-stdout>hidden</local-command-stdout>","isSidechain":true}"#,
+        "\n",
+        r#"{"type":"system","subtype":"turn_duration","content":"<local-command-stdout>no</local-command-stdout>"}"#,
+    );
+    assert_eq!(
+        events(jsonl),
+        [
+            StreamEvent::Prompt("/context".to_owned()),
+            StreamEvent::Note("```\nContext Usage\n142.8k/1m tokens (14%)\n```".to_owned()),
+        ]
+    );
+}

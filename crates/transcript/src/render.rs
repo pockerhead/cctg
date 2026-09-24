@@ -187,7 +187,7 @@ pub(crate) fn user_text<'a>(turn: &Turn, text: &'a str) -> Option<UserText<'a>> 
     channel_body(text).map(|body| UserText::Prompt(Cow::Borrowed(body)))
 }
 
-fn slash_command(text: &str) -> Option<String> {
+pub(crate) fn slash_command(text: &str) -> Option<String> {
     if !text.starts_with("<command-name>") && !text.starts_with("<command-message>") {
         return None;
     }
