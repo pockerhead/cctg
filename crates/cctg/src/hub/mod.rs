@@ -200,7 +200,8 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         can_delete,
         ..slots::Options::default()
     };
-    let (slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
+    let (mut slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
+    let permission_asks = slots.permission_asks();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     tokio::spawn(commands::serve(
         commands_rx,
@@ -215,7 +216,12 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         secret.clone(),
         agents_tx,
     ));
-    tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx));
+    tokio::spawn(ingress::serve_hooks_and_permissions(
+        hook_listener,
+        secret,
+        hooks_tx,
+        permission_asks,
+    ));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let actor = tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
 

@@ -17,6 +17,13 @@
 //! session has kept, in order, then its own event. Everything shares the one
 //! POST budget: a hub that is down costs a hook no more than before.
 //!
+//! `cctg hook PermissionRequest` is the one hook that waits: it asks the hub
+//! for an answer from Telegram ([`crate::wire::PERMISSION_PATH`]) and prints
+//! Claude Code's decision JSON on stdout when there is one. No answer (the
+//! channel relays the request, time ran out, the hub is down) prints nothing:
+//! Claude Code then shows its own dialog as usual. It is never kept in the
+//! spool: an answer that comes late is worthless.
+//!
 //! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
 
 use std::io::Read;
@@ -24,6 +31,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -31,7 +39,10 @@ use tracing::{debug, warn};
 use crate::device::{self, DeviceConfig};
 use crate::proctree::{self, Lineage};
 use crate::spool;
-use crate::wire::{HOOK_PATH, HookEvent, HookPost, Secret};
+use crate::wire::{
+    Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PermissionAnswer, PermissionPost,
+    Secret, VERSION,
+};
 
 /// Budget of the POST, connect included. `SessionEnd` hooks share 1.5 s in
 /// all, start-up and the process snapshot included; `UserPromptSubmit` and the
@@ -51,6 +62,21 @@ pub const MAX_STDIN: u64 = 8 << 20;
 /// Even fully `\u`-escaped it keeps the body under `wire::MAX_HOOK_BODY`.
 pub const MAX_TEXT: usize = 128 << 10;
 const HANDBACK_TOOL: &str = "SubagentHandback";
+pub const PERMISSION_EVENT: &str = "PermissionRequest";
+/// Connect and send of the permission request. On Windows a connect to a
+/// closed local port lasts until the timeout, so a stopped hub costs this.
+pub const PERMISSION_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Longest wait for the hub's answer, under the `"timeout": 100` the
+/// settings give this hook; the hub itself gives up after 90 s.
+pub const PERMISSION_WAIT: Duration = Duration::from_secs(97);
+/// Cap of the description and of the input preview, in bytes: Telegram
+/// shows at most 4096 characters of the prompt anyway.
+pub const MAX_PREVIEW: usize = 4 << 10;
+const MAX_TOOL_NAME: usize = 256;
+/// Longest hub answer read.
+const MAX_ANSWER: u64 = 4096;
+/// Told to Claude with a refusal.
+pub const DENY_MESSAGE: &str = "Denied by the user in Telegram";
 
 /// Runs one hook invocation. Never fails: every problem ends as one fixed
 /// line on stderr.
@@ -60,6 +86,9 @@ pub async fn run(event: &str) {
         return;
     };
     let config = DeviceConfig::load();
+    if event == PERMISSION_EVENT {
+        return permission(&input, &config).await;
+    }
     let hook_post = match build_here(event, &input, &config.host) {
         Ok(hook_post) => hook_post,
         Err(skip) => {
@@ -105,6 +134,172 @@ pub async fn run(event: &str) {
             %problem,
             "hook event not delivered and not kept"
         ),
+    }
+}
+
+/// The `PermissionRequest` hook: asks the hub and prints the decision, if
+/// any. Every failure ends quietly with no decision.
+async fn permission(input: &[u8], config: &DeviceConfig) {
+    let post = match build_permission(input, &config.host) {
+        Ok(post) => post,
+        Err(skip) => {
+            debug!(reason = skip.0, "hook event skipped");
+            return;
+        }
+    };
+    let secret = match &config.secret {
+        Ok(secret) => secret,
+        Err(problem) => {
+            warn!(%problem, "permission request not sent");
+            return;
+        }
+    };
+    let asked = ask(
+        &config.hook_addr,
+        secret,
+        &post,
+        PERMISSION_CONNECT_TIMEOUT,
+        PERMISSION_WAIT,
+    )
+    .await;
+    match asked {
+        Ok(Some(behavior)) => {
+            let mut stdout = std::io::stdout().lock();
+            let _ = std::io::Write::write_all(&mut stdout, decision_json(behavior).as_bytes());
+            let _ = std::io::Write::flush(&mut stdout);
+        }
+        Ok(None) => debug!("no decision from Telegram"),
+        Err(error) => warn!(%error, "permission request got no answer from the hub"),
+    }
+}
+
+/// Claude Code's `PermissionRequest` decision for stdout.
+pub fn decision_json(behavior: Behavior) -> String {
+    let decision = match behavior {
+        Behavior::Allow => json!({ "behavior": "allow" }),
+        Behavior::Deny => json!({ "behavior": "deny", "message": DENY_MESSAGE }),
+    };
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": PERMISSION_EVENT,
+            "decision": decision,
+        }
+    })
+    .to_string()
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PermissionInput {
+    session_id: String,
+    hook_event_name: Option<String>,
+    tool_name: String,
+    tool_input: Option<Value>,
+}
+
+/// Turns a `PermissionRequest` hook input into the hub request: the tool,
+/// its `description` when the input has one, and the rest of the input as
+/// compact JSON, both capped at [`MAX_PREVIEW`].
+pub fn build_permission(input: &[u8], host: &str) -> Result<PermissionPost, Skip> {
+    let input: PermissionInput =
+        serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
+    if input.session_id.is_empty() {
+        return Err(Skip("input has no session_id"));
+    }
+    if input
+        .hook_event_name
+        .as_deref()
+        .is_some_and(|name| name != PERMISSION_EVENT)
+    {
+        return Err(Skip("input is for another hook event"));
+    }
+    if input.tool_name.trim().is_empty() {
+        return Err(Skip("permission request without a tool name"));
+    }
+    let mut tool_input = input.tool_input.unwrap_or(Value::Null);
+    let description = tool_input
+        .as_object_mut()
+        .and_then(|fields| fields.remove("description"))
+        .and_then(|description| description.as_str().map(str::to_owned))
+        .map(|description| cap_to(description, MAX_PREVIEW))
+        .unwrap_or_default();
+    let input_preview = match tool_input {
+        Value::Null => String::new(),
+        Value::String(text) => cap_to(text, MAX_PREVIEW),
+        other => cap_to(other.to_string(), MAX_PREVIEW),
+    };
+    Ok(PermissionPost {
+        v: VERSION,
+        host: host.to_owned(),
+        session_id: input.session_id,
+        tool_name: cap_to(input.tool_name, MAX_TOOL_NAME),
+        description,
+        input_preview,
+    })
+}
+
+/// Asks the hub at `addr` for the answer to `post`: connect and send within
+/// `connect_timeout`, then wait up to `wait`. `Ok(None)`: the hub has no
+/// decision.
+pub async fn ask(
+    addr: &str,
+    secret: &Secret,
+    post: &PermissionPost,
+    connect_timeout: Duration,
+    wait: Duration,
+) -> Result<Option<Behavior>, PostError> {
+    let body = serde_json::to_vec(post).expect("permission posts always serialize");
+    let head = format!(
+        "POST {PERMISSION_PATH} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        secret.expose(),
+        body.len()
+    );
+    let io = |error: std::io::Error| PostError::Io(error.kind());
+    let send = async {
+        let mut stream = TcpStream::connect(addr).await.map_err(io)?;
+        let _ = stream.set_nodelay(true);
+        stream
+            .write_all(&[head.as_bytes(), &body].concat())
+            .await
+            .map_err(io)?;
+        Ok(stream)
+    };
+    let mut stream = tokio::time::timeout(connect_timeout, send)
+        .await
+        .unwrap_or(Err(PostError::Timeout(connect_timeout)))?;
+    let mut answer = Vec::new();
+    tokio::time::timeout(
+        wait,
+        (&mut stream).take(MAX_ANSWER).read_to_end(&mut answer),
+    )
+    .await
+    .map_err(|_| PostError::Timeout(wait))?
+    .map_err(io)?;
+    parse_answer(&answer)
+}
+
+/// `204`: no decision; `200` with a [`PermissionAnswer`] body: the decision.
+fn parse_answer(answer: &[u8]) -> Result<Option<Behavior>, PostError> {
+    let line_end = answer
+        .windows(2)
+        .position(|pair| pair == b"\r\n")
+        .ok_or(PostError::BadResponse)?
+        + 2;
+    match parse_status(&answer[..line_end]) {
+        Some(204) => Ok(None),
+        Some(200) => {
+            let body = answer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .ok_or(PostError::BadResponse)?
+                + 4;
+            let parsed: PermissionAnswer =
+                serde_json::from_slice(&answer[body..]).map_err(|_| PostError::BadResponse)?;
+            Ok(Some(parsed.behavior))
+        }
+        Some(code) => Err(PostError::Status(code)),
+        None => Err(PostError::BadResponse),
     }
 }
 
@@ -321,9 +516,13 @@ fn has_agent_files(transcript: &str, exists: &dyn Fn(&Path) -> bool) -> bool {
     exists(Path::new(transcript)) || meta.is_some_and(|meta| exists(Path::new(&meta)))
 }
 
-fn cap_text(mut text: String) -> String {
-    if text.len() > MAX_TEXT {
-        let cut = text.floor_char_boundary(MAX_TEXT - '\u{2026}'.len_utf8());
+fn cap_text(text: String) -> String {
+    cap_to(text, MAX_TEXT)
+}
+
+fn cap_to(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let cut = text.floor_char_boundary(max - '\u{2026}'.len_utf8());
         text.truncate(cut);
         text.push('\u{2026}');
     }
@@ -609,6 +808,113 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Time was left, yet the own event was not sent past the kept start.
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn permission_post() -> PermissionPost {
+        PermissionPost {
+            v: VERSION,
+            host: "box".into(),
+            session_id: sample().session_id,
+            tool_name: "Bash".into(),
+            description: String::new(),
+            input_preview: String::new(),
+        }
+    }
+
+    /// A hub whose asks are answered by `decide` (`None`: dropped).
+    async fn permission_hub(
+        decide: impl Fn(&PermissionPost) -> Option<Option<Behavior>> + Send + 'static,
+    ) -> String {
+        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (events, _events_rx) = mpsc::channel(8);
+        let (asks, mut asks_rx) = mpsc::channel::<ingress::PermissionAsk>(8);
+        tokio::spawn(async move {
+            let _events_rx = _events_rx;
+            while let Some(ask) = asks_rx.recv().await {
+                if let Some(answer) = decide(&ask.post) {
+                    let _ = ask.answer.send(answer);
+                }
+            }
+        });
+        tokio::spawn(ingress::serve_hooks_and_permissions(
+            listener,
+            secret(),
+            events,
+            asks,
+        ));
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_permission_ask_returns_the_hub_decision_or_none() {
+        let wait = Duration::from_secs(5);
+        let connect = Duration::from_secs(2);
+        for (decision, want) in [
+            (Some(Some(Behavior::Allow)), Some(Behavior::Allow)),
+            (Some(Some(Behavior::Deny)), Some(Behavior::Deny)),
+            (Some(None), None),
+            (None, None),
+        ] {
+            let addr = permission_hub(move |post| {
+                assert_eq!(post.tool_name, "Bash");
+                decision
+            })
+            .await;
+            let got = ask(&addr, &secret(), &permission_post(), connect, wait).await;
+            assert_eq!(got, Ok(want), "{decision:?}");
+        }
+        // A wrong secret is refused before the hub sees the ask.
+        let addr = permission_hub(|_| panic!("asked without the secret")).await;
+        let wrong = Secret::parse("0123456789abcdef-secreT").unwrap();
+        let got = ask(&addr, &wrong, &permission_post(), connect, wait).await;
+        assert_eq!(got, Err(PostError::Status(401)));
+    }
+
+    #[tokio::test]
+    async fn a_hub_without_the_permission_path_means_no_decision() {
+        let (addr, _events) = hub().await;
+        let got = ask(
+            &addr,
+            &secret(),
+            &permission_post(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(got, Err(PostError::Status(404)));
+    }
+
+    #[test]
+    fn permission_answers_parse_strictly() {
+        assert_eq!(
+            parse_answer(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_answer(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"behavior\":\"allow\"}"),
+            Ok(Some(Behavior::Allow))
+        );
+        for bad in [
+            &b"HTTP/1.1 200 OK\r\n\r\n{\"behavior\":\"maybe\"}"[..],
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n",
+            b"HTTP/1.1 204",
+            b"",
+        ] {
+            assert_eq!(
+                parse_answer(bad),
+                Err(PostError::BadResponse),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(
+            parse_answer(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+            Err(PostError::Status(503))
+        );
     }
 
     #[test]
@@ -1030,6 +1336,67 @@ mod build_tests {
         assert!(PROMPT_POST_TIMEOUT < POST_TIMEOUT);
         // SessionEnd: stdin wait + POST stay well inside the shared 1.5 s.
         assert!(STDIN_TIMEOUT + POST_TIMEOUT <= Duration::from_millis(800));
+    }
+
+    #[test]
+    fn permission_requests_carry_the_tool_and_a_capped_preview() {
+        let input = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "PermissionRequest",
+            "permission_mode": "auto",
+            "tool_name": "Bash",
+            "tool_input": { "command": "rm -rf \"$DIR\"/", "description": "Clean the build" },
+            "permission_suggestions": [],
+        });
+        let post = build_permission(input.to_string().as_bytes(), "box").unwrap();
+        assert_eq!(post.v, VERSION);
+        assert_eq!(post.host, "box");
+        assert_eq!(post.session_id, "s");
+        assert_eq!(post.tool_name, "Bash");
+        assert_eq!(post.description, "Clean the build");
+        assert_eq!(post.input_preview, r#"{"command":"rm -rf \"$DIR\"/"}"#);
+
+        let long = serde_json::json!({
+            "session_id": "s",
+            "tool_name": "Write",
+            "tool_input": { "content": "й".repeat(MAX_PREVIEW) },
+        });
+        let post = build_permission(long.to_string().as_bytes(), "box").unwrap();
+        assert!(post.input_preview.len() <= MAX_PREVIEW);
+        assert!(post.input_preview.ends_with('\u{2026}'));
+        assert!(post.description.is_empty());
+
+        for bad in [
+            &br#"{"tool_name":"Bash"}"#[..],
+            br#"{"session_id":"s"}"#,
+            br#"{"session_id":"s","tool_name":"  "}"#,
+            br#"{"session_id":"s","tool_name":"Bash","hook_event_name":"Stop"}"#,
+            b"not json",
+        ] {
+            assert!(build_permission(bad, "box").is_err());
+        }
+        // The other hooks still skip it.
+        with_probe(OWN, true, |probe, _| {
+            assert!(build("PermissionRequest", input.to_string().as_bytes(), probe).is_err());
+        });
+    }
+
+    #[test]
+    fn decisions_are_claude_code_permission_request_output() {
+        let allow: Value = serde_json::from_str(&decision_json(Behavior::Allow)).unwrap();
+        assert_eq!(
+            allow,
+            serde_json::json!({ "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": { "behavior": "allow" },
+            }})
+        );
+        let deny: Value = serde_json::from_str(&decision_json(Behavior::Deny)).unwrap();
+        assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert_eq!(
+            deny["hookSpecificOutput"]["decision"]["message"],
+            DENY_MESSAGE
+        );
     }
 
     #[test]

@@ -543,6 +543,36 @@ pub fn decode_hook(body: &[u8]) -> Result<HookPost, WireError> {
     serde_json::from_value(value).map_err(|_| WireError::Malformed)
 }
 
+/// Body of one `PermissionRequest` hook POST to [`PERMISSION_PATH`]. The hub
+/// holds the request open until it has an answer: `200` with a
+/// [`PermissionAnswer`] when the user decided in Telegram, `204` when it has
+/// no decision (the channel relays the same request, the wait ran out, the
+/// session ended, the hub stopped). A hub without the path answers `404`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionPost {
+    pub v: u32,
+    pub host: String,
+    pub session_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_preview: String,
+}
+
+pub const PERMISSION_PATH: &str = "/v1/permission";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionAnswer {
+    pub behavior: Behavior,
+}
+
+pub fn decode_permission(body: &[u8]) -> Result<PermissionPost, WireError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| WireError::Malformed)?;
+    check_version(&value)?;
+    serde_json::from_value(value).map_err(|_| WireError::Malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -979,6 +1009,36 @@ mod tests {
         bad_id["event_id"] = json!("session-5e551017");
         assert_eq!(decode_hook(&body(bad_id)), Err(WireError::Malformed));
         assert_eq!(decode_hook(b"{"), Err(WireError::Malformed));
+    }
+
+    #[test]
+    fn permission_posts_round_trip_and_check_the_version() {
+        let post = PermissionPost {
+            v: VERSION,
+            host: "box".into(),
+            session_id: "s".into(),
+            tool_name: "Bash".into(),
+            description: "d".into(),
+            input_preview: "{}".into(),
+        };
+        let body = serde_json::to_vec(&post).unwrap();
+        assert_eq!(decode_permission(&body), Ok(post));
+        let short = br#"{"v":1,"host":"h","session_id":"s","tool_name":"Bash"}"#;
+        assert_eq!(
+            decode_permission(short).map(|p| p.description),
+            Ok(String::new())
+        );
+        let v2 = br#"{"v":2,"host":"h","session_id":"s","tool_name":"Bash"}"#;
+        assert_eq!(decode_permission(v2), Err(WireError::Version));
+        assert_eq!(
+            decode_permission(br#"{"v":1,"host":"h"}"#),
+            Err(WireError::Malformed)
+        );
+        let answer = serde_json::to_string(&PermissionAnswer {
+            behavior: Behavior::Deny,
+        })
+        .unwrap();
+        assert_eq!(answer, r#"{"behavior":"deny"}"#);
     }
 
     #[test]
