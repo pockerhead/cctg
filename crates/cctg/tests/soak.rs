@@ -1593,7 +1593,9 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         );
         let tries: Vec<&Call> = calls
             .iter()
-            .filter(|call| call.kind == flood.kind && call.text == flood.text)
+            .filter(|call| {
+                call.kind == flood.kind && call.thread == flood.thread && call.text == flood.text
+            })
             .collect();
         assert_eq!(tries.len(), 2, "one retry, no storm: {tries:?}");
         assert_eq!(tries[1].outcome, "ok", "the retry went through");
