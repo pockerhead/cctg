@@ -5,5 +5,3 @@ TASK-017
   │   └── TASK-019   (blocked by TASK-017, TASK-018)
   └── TASK-019   (blocked by TASK-017, TASK-018)
 
-TASK-023
-
