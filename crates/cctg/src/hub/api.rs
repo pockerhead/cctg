@@ -231,6 +231,7 @@ impl BotApi {
     /// `parse_mode`: `Some("HTML")` sends `text` as Telegram HTML; `None` as plain text.
     /// `reply_to`: the message this one answers; Telegram refuses the send
     /// when that message is gone.
+    /// `notify: false` sends it with `disable_notification` (no sound).
     pub async fn send_message(
         &self,
         thread_id: Option<i64>,
@@ -238,8 +239,12 @@ impl BotApi {
         reply_markup: Option<&Value>,
         parse_mode: Option<&str>,
         reply_to: Option<i64>,
+        notify: bool,
     ) -> Result<Message, ApiError> {
         let mut body = json!({ "chat_id": self.chat_id, "text": text });
+        if !notify {
+            body["disable_notification"] = json!(true);
+        }
         if let Some(thread_id) = thread_id {
             body["message_thread_id"] = json!(thread_id);
         }
@@ -270,16 +275,21 @@ impl BotApi {
             .map(drop)
     }
 
+    /// `notify`: as in [`Self::send_message`].
     pub async fn send_document(
         &self,
         thread_id: Option<i64>,
         document: &Document,
+        notify: bool,
     ) -> Result<Message, ApiError> {
         let part = reqwest::multipart::Part::bytes(document.bytes.clone())
             .file_name(document.file_name.clone());
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", self.chat_id.to_string())
             .part("document", part);
+        if !notify {
+            form = form.text("disable_notification", "true");
+        }
         if let Some(thread_id) = thread_id {
             form = form.text("message_thread_id", thread_id.to_string());
         }

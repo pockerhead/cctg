@@ -470,6 +470,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
         Op::SendDocument {
             thread_id,
             document,
+            ..
         } => ("document", *thread_id, document.file_name.clone(), None),
         Op::Stream {
             thread_id, text, ..

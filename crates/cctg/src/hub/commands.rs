@@ -334,6 +334,7 @@ pub async fn send_text(
         reply_markup: None,
         permission: false,
         reply_to: None,
+        notify: false,
     };
     submit(outbox, op).await.map(drop)
 }
@@ -354,6 +355,7 @@ async fn send_document(
         Op::SendDocument {
             thread_id,
             document,
+            notify: false,
         },
     )
     .await
@@ -728,6 +730,7 @@ mod tests {
             Op::SendDocument {
                 thread_id,
                 document,
+                notify: false,
             } => {
                 assert_eq!(*thread_id, THREAD);
                 assert_eq!(document.bytes, want.as_bytes());

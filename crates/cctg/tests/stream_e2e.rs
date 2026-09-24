@@ -120,6 +120,22 @@ impl Fake {
         }
         out
     }
+    /// Accepted messages sent with a sound (TASK-041).
+    fn loud_texts(&self) -> Vec<String> {
+        self.recs()
+            .into_iter()
+            .filter(|r| r.accepted)
+            .filter_map(|r| match r.op {
+                Op::Send {
+                    text, notify: true, ..
+                }
+                | Op::Stream {
+                    text, notify: true, ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
     fn stream_messages(&self) -> Vec<String> {
         self.recs()
             .into_iter()
@@ -459,6 +475,9 @@ async fn e2e_order_partial_line_and_stop_after_lines() {
         ]
     );
     assert_no_dup(&lines);
+    // Only the turn answer has a sound; stream lines, the separator and
+    // the status go silently.
+    assert_eq!(fake.loud_texts(), ["FINAL ANSWER one"]);
     hub.stop();
 }
 
