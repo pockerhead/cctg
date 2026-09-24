@@ -908,6 +908,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
     let answer = |command_id, outcome| AgentMsg::ConsoleCommandTyped {
         command_id,
         outcome,
+        panel: None,
     };
     agent.send(answer(typed[0], CommandOutcome::Sent)).await;
     agent.send(answer(typed[1], CommandOutcome::Draft)).await;

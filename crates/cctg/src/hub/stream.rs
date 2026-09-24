@@ -59,12 +59,11 @@ pub const WORKING: &str = "✍";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// A topic message; `merge`: a one-line tool call that may share a
-    /// message with the next ones; `markdown`: assistant text, sent as
-    /// Telegram HTML.
+    /// message with the next ones.
     Send {
         text: String,
         merge: bool,
-        markdown: bool,
+        format: Format,
     },
     /// Mark this Telegram message ✍.
     Working(i64),
@@ -72,6 +71,16 @@ pub enum Step {
     TurnEnd,
     /// A prompt typed in the terminal starts a turn.
     NewTurn,
+}
+
+/// How a stream message is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Plain,
+    /// Assistant text, sent as Telegram HTML.
+    Markdown,
+    /// A prompt typed in the terminal: the whole message monospace.
+    Code,
 }
 
 /// Applies the items of one line to the calls still open and the receipts.
@@ -89,7 +98,7 @@ pub fn apply_line(
                 steps.push(Step::Send {
                     text: format!("> {text}"),
                     merge: false,
-                    markdown: false,
+                    format: Format::Code,
                 });
             }
             StreamItem::Note { text } => {
@@ -97,7 +106,7 @@ pub fn apply_line(
                 steps.push(Step::Send {
                     text: text.clone(),
                     merge: false,
-                    markdown: true,
+                    format: Format::Markdown,
                 });
             }
             // Its own message; under the rate limit it joins its neighbours like a tool line.
@@ -106,7 +115,7 @@ pub fn apply_line(
                 steps.push(Step::Send {
                     text: format!("{THINKING} {text}"),
                     merge: true,
-                    markdown: true,
+                    format: Format::Markdown,
                 });
             }
             StreamItem::TurnEnd => {
@@ -179,7 +188,7 @@ fn finished(call: &PendingCall) -> Step {
     Step::Send {
         text,
         merge: true,
-        markdown: false,
+        format: Format::Plain,
     }
 }
 
@@ -630,17 +639,17 @@ mod tests {
                 Step::Send {
                     text: "> go".into(),
                     merge: false,
-                    markdown: false,
+                    format: Format::Code,
                 },
                 Step::Send {
                     text: "• Bash: A ✓".into(),
                     merge: true,
-                    markdown: false,
+                    format: Format::Plain,
                 },
                 Step::Send {
                     text: "\u{1F4AD} Checking cargo.".into(),
                     merge: true,
-                    markdown: true,
+                    format: Format::Markdown,
                 },
                 Step::TurnEnd,
             ]
@@ -665,7 +674,7 @@ mod tests {
                 Step::Send {
                     text: "• Bash: B ✓".into(),
                     merge: true,
-                    markdown: false,
+                    format: Format::Plain,
                 },
                 Step::TurnEnd
             ]

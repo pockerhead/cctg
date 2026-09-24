@@ -220,9 +220,13 @@ pub enum AgentMsg {
         written: bool,
     },
     /// The answer to one `console_command`: what became of the line.
+    /// `panel`: the text of the panel the command opened (`/cost`,
+    /// `/usage`), which the agent closed again with Esc.
     ConsoleCommandTyped {
         command_id: u64,
         outcome: CommandOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        panel: Option<String>,
     },
     /// The answer to one `update`. For `reloading` and `restarting` the
     /// agent leaves: the hub stops handing it messages and answers
@@ -829,6 +833,12 @@ mod tests {
             AgentMsg::ConsoleCommandTyped {
                 command_id: u64::MAX,
                 outcome: CommandOutcome::Draft,
+                panel: None,
+            },
+            AgentMsg::ConsoleCommandTyped {
+                command_id: 1,
+                outcome: CommandOutcome::Sent,
+                panel: Some("Total cost: $0.01".into()),
             },
             AgentMsg::UpdateAnswer {
                 update_id: 9,
@@ -1056,6 +1066,7 @@ mod tests {
             Ok(AgentMsg::ConsoleCommandTyped {
                 command_id: 4,
                 outcome: CommandOutcome::Other,
+                panel: None,
             })
         );
         // A status line without numbers is still one event.
