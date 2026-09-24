@@ -7,5 +7,6 @@ pub mod device;
 pub mod hook;
 pub mod hub;
 pub mod proctree;
+pub mod spool;
 pub mod tail;
 pub mod wire;

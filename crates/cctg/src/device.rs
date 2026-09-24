@@ -13,13 +13,14 @@
 //! CCTG_HUB_HOOK_ADDR=127.0.0.1:47292   # optional, ip:port or host:port
 //! CCTG_HUB_AGENT_ADDR=127.0.0.1:47291  # optional, the hub agent listener
 //! CCTG_HOST=laptop                     # optional, defaults to the machine name
+//! CCTG_STATE_DIR=/abs/state/dir         # optional, absolute; holds the hook spool
 //! ```
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::hub::config::{DEFAULT_AGENT_LISTEN, DEFAULT_HOOK_LISTEN, SECRET_VAR};
+use crate::hub::config::{DEFAULT_AGENT_LISTEN, DEFAULT_HOOK_LISTEN, SECRET_VAR, STATE_VAR};
 use crate::wire::Secret;
 
 /// `host:port` of the hub hook endpoint.
@@ -30,6 +31,9 @@ pub const AGENT_ADDR_VAR: &str = "CCTG_HUB_AGENT_ADDR";
 pub const HOST_VAR: &str = "CCTG_HOST";
 /// Location of the device config file, relative to the home directory.
 pub const DEVICE_ENV: &str = ".cctg/device.env";
+/// Device state directory under the home directory (the hook spool lives in
+/// `<state>/spool`), unless `CCTG_STATE_DIR` names an absolute one.
+pub const DEVICE_STATE: &str = ".cctg";
 
 /// Why the config is unusable. Never carries a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,13 +62,17 @@ pub struct DeviceConfig {
     pub hook_addr: String,
     pub agent_addr: String,
     pub host: String,
+    /// Where this device keeps its state: an absolute `CCTG_STATE_DIR`, else
+    /// `<home>/.cctg`. `None` without either. A relative value is ignored: a
+    /// hook runs in the session's folder and must not write there.
+    pub state_dir: Option<PathBuf>,
 }
 
 impl DeviceConfig {
     /// Never fails: a missing or broken config is reported through `secret`,
     /// so a hook can still exit quietly.
     pub fn load() -> Self {
-        let file = home_dir(|name| std::env::var(name).ok())
+        let file = home_dir(&|name| std::env::var(name).ok())
             .map(|home| read_env_file(&home.join(DEVICE_ENV)))
             .unwrap_or(Ok(HashMap::new()));
         let (file_vars, file_ok) = match file {
@@ -88,11 +96,16 @@ impl DeviceConfig {
         };
         let hook_addr = value(HOOK_ADDR_VAR).unwrap_or_else(|| DEFAULT_HOOK_LISTEN.to_string());
         let agent_addr = value(AGENT_ADDR_VAR).unwrap_or_else(|| DEFAULT_AGENT_LISTEN.to_string());
+        let state_dir = value(STATE_VAR)
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .or_else(|| home_dir(&var).map(|home| home.join(DEVICE_STATE)));
         Self {
             secret,
             hook_addr,
             agent_addr,
             host: host_name(&value),
+            state_dir,
         }
     }
 }
@@ -107,7 +120,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn home_dir(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+fn home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["USERPROFILE", "HOME"]
     } else {
@@ -220,6 +233,22 @@ mod tests {
         assert_eq!(config.secret.as_ref().map(Secret::expose), Ok(SECRET));
         assert_eq!(config.hook_addr, "hub.tail:47292");
         assert_eq!(config.host, "laptop");
+    }
+
+    #[test]
+    fn the_state_dir_is_absolute_or_under_home() {
+        let home = if cfg!(windows) { r"C:\h" } else { "/h" };
+        let absolute = if cfg!(windows) { r"D:\state" } else { "/state" };
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let config = DeviceConfig::from_vars(vars(&[(home_var, home)]));
+        assert_eq!(config.state_dir, Some(Path::new(home).join(".cctg")));
+        let config = DeviceConfig::from_vars(vars(&[(home_var, home), (STATE_VAR, absolute)]));
+        assert_eq!(config.state_dir, Some(PathBuf::from(absolute)));
+        // A relative value would land in the session's folder: ignored.
+        let config = DeviceConfig::from_vars(vars(&[(home_var, home), (STATE_VAR, ".cctg")]));
+        assert_eq!(config.state_dir, Some(Path::new(home).join(".cctg")));
+        let config = DeviceConfig::from_vars(vars(&[(STATE_VAR, ".cctg")]));
+        assert_eq!(config.state_dir, None);
     }
 
     #[test]

@@ -24,3 +24,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+# The TASK-018 soak runs its own main: it re-executes itself as the Claude
+# Code stand-in and skips unless asked (`-- --ignored`).
+[[test]]
+name = "soak"
+harness = false

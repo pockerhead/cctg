@@ -16,6 +16,11 @@
 //! arrives, so the agent remembers recent ids across reconnects and passes
 //! each on only once.
 //!
+//! After every registration the agent sends the session starts and ends its
+//! session's hooks could not deliver ([`crate::spool`]) to the hub's hook
+//! endpoint: a session that started while the hub was down becomes known as
+//! soon as the hub is back, without waiting for its next hook.
+//!
 //! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
 //! channel from Claude Code (TASK-004), so its agent answers MCP but never
 //! connects: a nested `claude -p` cannot show up as a routable channel even
@@ -30,17 +35,21 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::channel::{self, Hub, NoHub};
 use crate::device::{self, DeviceConfig};
 use crate::proctree;
+use crate::spool;
 use crate::tail;
 use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE: usize = 256;
+/// Budget of one spool replay after a registration.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Verdict ids remembered for dropping a verdict the hub sent again.
 const RECENT_VERDICTS: usize = 256;
 
@@ -78,6 +87,49 @@ pub struct LinkConfig {
     pub secret: Secret,
     pub register: Register,
     pub backoff: Backoff,
+    /// Where the session's undelivered hook events are kept, and the hub
+    /// hook endpoint to send them to after each registration.
+    pub replay: Option<Replay>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Replay {
+    /// `<state>/spool` ([`spool::dir`]).
+    pub spool: PathBuf,
+    /// `host:port` of the hub hook endpoint.
+    pub hook_addr: String,
+}
+
+/// Sends the kept hook events of the registered session. Its own task: the
+/// link does not wait for it. At most one runs: a registration while the
+/// last replay still runs starts none. A replay of a hook at the same time
+/// only sends an event twice, and the hub keeps one.
+fn spawn_replay(config: &LinkConfig, running: &mut Option<JoinHandle<()>>) {
+    if running.as_ref().is_some_and(|task| !task.is_finished()) {
+        return;
+    }
+    let Some(replay) = config.replay.clone() else {
+        return;
+    };
+    let (session, secret) = (config.register.session_id.clone(), config.secret.clone());
+    *running = Some(tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + REPLAY_TIMEOUT;
+        match spool::replay(
+            &replay.spool,
+            &session,
+            &replay.hook_addr,
+            &secret,
+            deadline,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(sent) => info!(sent, "kept hook events delivered"),
+            Err(error) => {
+                warn!(%error, "kept hook events not delivered; the next hook tries again")
+            }
+        }
+    }));
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +170,7 @@ async fn run(
     let mut attempt = 0u32;
     let mut last_error = String::new();
     let mut verdicts = VecDeque::with_capacity(RECENT_VERDICTS);
+    let mut replaying = None;
     loop {
         if outbox.is_closed() || events.is_closed() {
             return;
@@ -127,6 +180,7 @@ async fn run(
                 attempt = 0;
                 last_error.clear();
                 info!("registered with the hub");
+                spawn_replay(&config, &mut replaying);
                 if events.send(LinkEvent::Up).await.is_err() {
                     return;
                 }
@@ -319,6 +373,10 @@ pub async fn run_stdio() {
                 secret,
                 register,
                 backoff: Backoff::default(),
+                replay: config.state_dir.as_deref().map(|state| Replay {
+                    spool: spool::dir(state),
+                    hook_addr: config.hook_addr.clone(),
+                }),
             });
             (Hub::Link(outbox), Some(events))
         }
@@ -551,6 +609,7 @@ mod tests {
             secret: Secret::parse(SECRET).unwrap(),
             register: register(),
             backoff,
+            replay: None,
         }
     }
 
@@ -678,6 +737,55 @@ mod tests {
             Some(AgentEvent::Message { msg, .. }) => assert_eq!(msg, queued),
             other => panic!("expected the queued reply, got {other:?}"),
         }
+    }
+
+    /// A registration while the last replay still waits on a silent hub
+    /// starts no second replay of the same files.
+    #[tokio::test]
+    async fn one_replay_runs_at_a_time() {
+        let dir = crate::hub::testdir::TempDir::new("agent-replay");
+        let spool_dir = dir.path().join("spool");
+        let kept = crate::wire::HookPost::new(
+            "box".into(),
+            register().session_id,
+            "/w".into(),
+            "/w/s.jsonl".into(),
+            crate::wire::HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: None,
+                parent_claude_pid: None,
+            },
+        );
+        spool::save(&spool_dir, &kept, std::time::SystemTime::now()).unwrap();
+        // The hook endpoint accepts, counts and never answers.
+        let silent = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let hook_addr = silent.local_addr().unwrap().to_string();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((stream, _)) = silent.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        let mut link = config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Backoff::default(),
+        );
+        link.replay = Some(Replay {
+            spool: spool_dir,
+            hook_addr,
+        });
+        let mut running = None;
+        spawn_replay(&link, &mut running);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        spawn_replay(&link, &mut running);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        running.take().unwrap().abort();
     }
 
     #[tokio::test]
