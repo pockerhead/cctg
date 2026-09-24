@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::wire::{
-    self, AgentMsg, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, Register, Rejection,
-    Secret, WireError,
+    self, AgentMsg, Behavior, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, PERMISSION_PATH,
+    PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
 };
 
 /// Time an agent has to send `hello` and `register`.
@@ -29,6 +29,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENTS: usize = 256;
 const MAX_HOOK_REQUESTS: usize = 64;
+/// `PermissionRequest` hooks waiting for an answer at a time; one more gets
+/// no decision at once. They do not count against [`MAX_HOOK_REQUESTS`].
+pub const MAX_PERMISSION_WAITS: usize = 16;
+/// Longest wait for the hub's answer to a `PermissionRequest` hook. The slot
+/// actor gives up earlier (`slots::HOOK_ANSWER_WAIT`); this only bounds a
+/// request the actor never answers.
+pub const PERMISSION_WAIT_CAP: Duration = Duration::from_secs(95);
 const MAX_HEAD: usize = 8 * 1024;
 const TO_AGENT_QUEUE: usize = 64;
 /// How long, and how much, a rejected peer's unread input is drained.
@@ -331,6 +338,7 @@ impl Dedup {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
+    Ok,
     NoContent,
     BadRequest,
     Unauthorized,
@@ -345,6 +353,7 @@ pub enum Status {
 impl Status {
     pub fn code(self) -> u16 {
         match self {
+            Self::Ok => 200,
             Self::NoContent => 204,
             Self::BadRequest => 400,
             Self::Unauthorized => 401,
@@ -359,6 +368,7 @@ impl Status {
 
     fn reason(self) -> &'static str {
         match self {
+            Self::Ok => "OK",
             Self::NoContent => "No Content",
             Self::BadRequest => "Bad Request",
             Self::Unauthorized => "Unauthorized",
@@ -372,11 +382,54 @@ impl Status {
     }
 }
 
+/// A `PermissionRequest` hook waiting for the hub's answer.
+#[derive(Debug)]
+pub struct PermissionAsk {
+    pub post: PermissionPost,
+    /// `Some`: the answer chosen in Telegram. `None` or dropped: no decision.
+    pub answer: oneshot::Sender<Option<Behavior>>,
+}
+
+/// Where `PermissionRequest` hooks go, and how many may wait at a time.
+struct PermissionWaits {
+    asks: mpsc::Sender<PermissionAsk>,
+    waiting: Arc<Semaphore>,
+}
+
 /// Serves `POST /v1/hook` until the task is dropped. Each accepted, new
 /// event id goes to `events` once; a repeat is answered 204 and dropped.
+/// `POST /v1/permission` is not served (404): see
+/// [`serve_hooks_and_permissions`].
 pub async fn serve_hooks(listener: TcpListener, secret: Secret, events: mpsc::Sender<HookPost>) {
+    serve(listener, secret, events, None).await;
+}
+
+/// [`serve_hooks`] plus `POST /v1/permission`: each such request goes to
+/// `asks` and is held open until the hub answers (at most
+/// [`PERMISSION_WAIT_CAP`], [`MAX_PERMISSION_WAITS`] at a time). A waiting
+/// request never holds up other hook requests.
+pub async fn serve_hooks_and_permissions(
+    listener: TcpListener,
+    secret: Secret,
+    events: mpsc::Sender<HookPost>,
+    asks: mpsc::Sender<PermissionAsk>,
+) {
+    let waits = PermissionWaits {
+        asks,
+        waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
+    };
+    serve(listener, secret, events, Some(waits)).await;
+}
+
+async fn serve(
+    listener: TcpListener,
+    secret: Secret,
+    events: mpsc::Sender<HookPost>,
+    waits: Option<PermissionWaits>,
+) {
     let secret = Arc::new(secret);
     let dedup = Arc::new(Mutex::new(Dedup::new(DEDUP_MAX, DEDUP_TTL)));
+    let waits = waits.map(Arc::new);
     let slots = Arc::new(Semaphore::new(MAX_HOOK_REQUESTS));
     let mut requests = JoinSet::new();
     loop {
@@ -394,10 +447,11 @@ pub async fn serve_hooks(listener: TcpListener, secret: Secret, events: mpsc::Se
                     warn!(%peer, "too many hook requests; refused");
                     continue;
                 };
-                let (secret, dedup, events) = (secret.clone(), dedup.clone(), events.clone());
+                let (secret, dedup, events, waits) =
+                    (secret.clone(), dedup.clone(), events.clone(), waits.clone());
                 requests.spawn(async move {
-                    hook_request(stream, peer, &secret, &dedup, &events).await;
-                    drop(permit);
+                    hook_request(stream, peer, &secret, &dedup, &events, waits.as_deref(), permit)
+                        .await;
                 });
             }
             Some(_) = requests.join_next() => {}
@@ -411,10 +465,21 @@ async fn hook_request(
     secret: &Secret,
     dedup: &Mutex<Dedup>,
     events: &mpsc::Sender<HookPost>,
+    waits: Option<&PermissionWaits>,
+    permit: OwnedSemaphorePermit,
 ) {
     let status =
         match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream, secret)).await {
-            Ok(Ok(body)) => accept_hook(&body, dedup, events),
+            Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
+            Ok(Ok((Route::Permission, body))) => match waits {
+                Some(waits) => {
+                    // A waiting hook takes one of its own places, not a
+                    // hook request place.
+                    drop(permit);
+                    return permission_request(stream, peer, &body, waits).await;
+                }
+                None => Status::NotFound,
+            },
             Ok(Err(status)) => status,
             Err(_) => {
                 warn!(%peer, "hook request timed out");
@@ -426,14 +491,93 @@ async fn hook_request(
     } else if status != Status::NoContent {
         warn!(%peer, status = status.code(), "hook request rejected");
     }
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    respond(&mut stream, status, &[]).await;
+}
+
+/// Writes the whole answer and closes the connection.
+async fn respond(stream: &mut TcpStream, status: Status, body: &[u8]) {
+    let content_type = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
+    };
+    let head = format!(
+        "HTTP/1.1 {} {}\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
         status.code(),
-        status.reason()
+        status.reason(),
+        body.len()
     );
-    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.write_all(&[head.as_bytes(), body].concat()).await;
     let _ = stream.shutdown().await;
-    linger(&mut stream).await;
+    linger(stream).await;
+}
+
+/// Hands a `PermissionRequest` hook to the hub and holds the connection
+/// until the answer: `200` with the decision, `204` without one (also when
+/// the hub gave up, stopped or too many hooks wait). A hook that goes away
+/// while waiting drops its ask, which the hub notices.
+async fn permission_request(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    body: &[u8],
+    waits: &PermissionWaits,
+) {
+    let post = match wire::decode_permission(body) {
+        Ok(post) => post,
+        Err(error) => {
+            debug!(%error, "permission hook body rejected");
+            warn!(%peer, status = Status::BadRequest.code(), "hook request rejected");
+            return respond(&mut stream, Status::BadRequest, &[]).await;
+        }
+    };
+    let session = short(&post.session_id).to_owned();
+    let Ok(_waiting) = waits.waiting.clone().try_acquire_owned() else {
+        warn!(
+            session,
+            "too many permission hooks wait; answered without a decision"
+        );
+        return respond(&mut stream, Status::NoContent, &[]).await;
+    };
+    let (answer, decided) = oneshot::channel();
+    if waits.asks.try_send(PermissionAsk { post, answer }).is_err() {
+        warn!(
+            session,
+            "hub cannot take a permission hook now; answered without a decision"
+        );
+        return respond(&mut stream, Status::NoContent, &[]).await;
+    }
+    let behavior = tokio::select! {
+        decided = decided => decided.ok().flatten(),
+        () = gone(&mut stream) => {
+            debug!(session, "permission hook went away before an answer");
+            return;
+        }
+        () = tokio::time::sleep(PERMISSION_WAIT_CAP) => None,
+    };
+    match behavior {
+        Some(behavior) => {
+            info!(session, ?behavior, "permission hook answered from Telegram");
+            let body = serde_json::to_vec(&PermissionAnswer { behavior })
+                .expect("a permission answer always serializes");
+            respond(&mut stream, Status::Ok, &body).await;
+        }
+        None => {
+            debug!(session, "permission hook answered without a decision");
+            respond(&mut stream, Status::NoContent, &[]).await;
+        }
+    }
+}
+
+/// Completes when the peer closed its side (or the connection broke). A
+/// waiting hook has sent its whole request, so any read end means it left.
+async fn gone(stream: &mut TcpStream) {
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
 }
 
 fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost>) -> Status {
@@ -468,12 +612,20 @@ fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost
     }
 }
 
+/// The two endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Hook,
+    Permission,
+}
+
 /// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
-/// and returns its body. The secret is checked before the body is read.
+/// and returns its target and body. The secret is checked before the body
+/// is read.
 async fn read_request<S: AsyncRead + Unpin>(
     stream: &mut S,
     secret: &Secret,
-) -> Result<Vec<u8>, Status> {
+) -> Result<(Route, Vec<u8>), Status> {
     let mut buf = Vec::with_capacity(1024);
     let head_end = loop {
         if let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -511,9 +663,11 @@ async fn read_request<S: AsyncRead + Unpin>(
     if method != "POST" {
         return Err(Status::MethodNotAllowed);
     }
-    if target != HOOK_PATH {
-        return Err(Status::NotFound);
-    }
+    let route = match target {
+        HOOK_PATH => Route::Hook,
+        PERMISSION_PATH => Route::Permission,
+        _ => return Err(Status::NotFound),
+    };
 
     let mut length = None;
     let mut authorized = None;
@@ -567,7 +721,7 @@ async fn read_request<S: AsyncRead + Unpin>(
         .read_exact(&mut body[received..])
         .await
         .map_err(|_| Status::BadRequest)?;
-    Ok(body)
+    Ok((route, body))
 }
 
 fn is_tchar(byte: u8) -> bool {

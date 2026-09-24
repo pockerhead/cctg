@@ -29,6 +29,15 @@
 //! its open prompts; every ended prompt loses its buttons, retried on the
 //! tick.
 //!
+//! A `PermissionRequest` hook asks too (see [`Slots::permission_asks`]):
+//! Claude Code does not relay every dialog through the channel. The ask waits
+//! [`TWIN_WINDOW`] for the channel request of the same session and tool (it
+//! may also have come just before); with one, the hook gets no decision and
+//! the channel's prompt stays the only one. Without one, the ask becomes a
+//! prompt of its own whose first press goes straight back to the waiting
+//! hook. It gets no decision when [`HOOK_ANSWER_WAIT`] runs out, the hook
+//! goes away, the session ends or the hub stops; its buttons go away then.
+//!
 //! Subagents and nested runs get no topic: each gets one collapsed block
 //! message in the topic of its parent's slot (see [`subagents`]). A typed
 //! subagent hook opens a block only once the parent's transcript shows the
@@ -47,12 +56,12 @@
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title or message text.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
@@ -60,7 +69,7 @@ use transcript::{HtmlChunk, SplitOptions, split_for_telegram, split_markdown_for
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Parked, ResumeNote};
-use super::ingress::AgentEvent;
+use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::registry::{
     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState, TopicJob,
@@ -73,7 +82,9 @@ use super::subagents::{
 };
 use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
-use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest, StreamLine};
+use crate::wire::{
+    AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest, StreamLine,
+};
 
 /// A transcript is scanned line by line for its first ai-title up to this
 /// many bytes (the same cap as `/brief`).
@@ -96,6 +107,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_QUEUE: usize = MAX_QUEUED_MESSAGES / 2;
 /// Reactions waiting for Telegram at a time; one more is skipped.
 const MAX_REACTIONS: usize = 64;
+/// How far apart a `PermissionRequest` hook and the channel request of the
+/// same session and tool may arrive, either way, to count as one request.
+pub const TWIN_WINDOW: Duration = Duration::from_millis(1500);
+/// A hook prompt nobody answered by then gives its hook no decision, before
+/// Claude Code's own ~1:44 automatic refusal and the hook's 100 s timeout.
+pub const HOOK_ANSWER_WAIT: Duration = Duration::from_secs(90);
+/// While hooks wait, the actor looks this often whether one went away.
+const HOOK_CHECK_EVERY: Duration = Duration::from_secs(1);
+/// Channel requests remembered for a hook that comes after them.
+const MAX_RELAYED: usize = 64;
 pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
 
 #[derive(Debug, Clone)]
@@ -124,6 +145,9 @@ pub struct Options {
     pub hold_answer: Duration,
     /// A stream whose message Telegram did not take reads again after this.
     pub stream_retry: Duration,
+    /// A hook prompt nobody answered by then gives its hook no decision
+    /// ([`HOOK_ANSWER_WAIT`]).
+    pub hook_answer_wait: Duration,
 }
 
 impl Default for Options {
@@ -144,6 +168,7 @@ impl Default for Options {
             // The turn's last record shows up ~0.15 s after the answer.
             hold_answer: Duration::from_secs(5),
             stream_retry: Duration::from_secs(5),
+            hook_answer_wait: HOOK_ANSWER_WAIT,
         }
     }
 }
@@ -331,6 +356,22 @@ fn first_ai_title(jsonl: impl Read, limit: u64) -> (Option<String>, u64) {
     }
 }
 
+/// A `PermissionRequest` hook waiting for its channel twin.
+struct HookAsk {
+    post: PermissionPost,
+    answer: oneshot::Sender<Option<Behavior>>,
+    /// No twin by then: the ask becomes a prompt.
+    show_at: Instant,
+    /// Gives up then (`Options::hook_answer_wait` after it came).
+    until: Instant,
+}
+
+/// The waiting hook of a hook prompt.
+struct Waiter {
+    answer: oneshot::Sender<Option<Behavior>>,
+    until: Instant,
+}
+
 /// One registered agent connection.
 struct Conn {
     /// The session it is bound to or waits for.
@@ -370,6 +411,14 @@ pub struct Slots {
     /// When a slot last got a notice of a kind.
     notices: HashMap<(SlotId, &'static str), Instant>,
     prompts: Prompts,
+    /// `PermissionRequest` hooks, see [`Slots::permission_asks`].
+    asks: Option<mpsc::Receiver<PermissionAsk>>,
+    /// Hooks waiting for their channel twin, oldest first.
+    hook_asks: Vec<HookAsk>,
+    /// Hooks waiting for a press, by the key of their prompt.
+    hook_waiters: HashMap<u64, Waiter>,
+    /// Recent channel requests: (arrival, session, tool name).
+    relayed: VecDeque<(Instant, String, String)>,
     /// Typed subagents not yet matched to an `Agent` call of their parent.
     candidates: Candidates,
     /// `Agent` calls per session transcript, read incrementally.
@@ -435,6 +484,10 @@ impl Slots {
             resume_sends: 0,
             notices: HashMap::new(),
             prompts: Prompts::default(),
+            asks: None,
+            hook_asks: Vec::new(),
+            hook_waiters: HashMap::new(),
+            relayed: VecDeque::new(),
             candidates: Candidates::default(),
             indexes: HashMap::new(),
             indexing: HashSet::new(),
@@ -454,9 +507,19 @@ impl Slots {
         (slots, view_rx)
     }
 
+    /// The channel for `PermissionRequest` hooks
+    /// ([`super::ingress::serve_hooks_and_permissions`]); call before
+    /// [`Self::run`]. Without it the actor gets no hook asks.
+    pub fn permission_asks(&mut self) -> mpsc::Sender<PermissionAsk> {
+        let (asks, asks_rx) = mpsc::channel(MAX_PERMISSION_WAITS);
+        self.asks = Some(asks_rx);
+        asks
+    }
+
     /// Runs until [`Control::Stop`]; a closed input channel is just no
     /// longer polled. On stop, hook posts and agent frames already queued are
-    /// handled and the last registry snapshot is on disk before it returns.
+    /// handled and the last registry snapshot is on disk before it returns;
+    /// waiting `PermissionRequest` hooks get no decision.
     pub async fn run(
         mut self,
         mut agents: mpsc::Receiver<AgentEvent>,
@@ -464,12 +527,20 @@ impl Slots {
         mut control: mpsc::UnboundedReceiver<Control>,
     ) {
         let mut done = self.done_rx.take().expect("run once");
+        let mut asks = self.asks.take();
         self.pump();
         loop {
             let deadline = self.next_deadline();
+            let ask = async {
+                match asks.as_mut() {
+                    Some(asks) => asks.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 Some(event) = agents.recv() => self.on_agent(event),
                 Some(post) = hooks.recv() => self.on_hook(&post),
+                Some(ask) = ask => self.on_permission_ask(ask),
                 Some(control) = control.recv() => {
                     if control == Control::Stop {
                         break;
@@ -490,6 +561,13 @@ impl Slots {
         }
         while let Ok(event) = agents.try_recv() {
             self.on_agent(event);
+        }
+        // Waiting hooks get no decision (their answers are dropped), and
+        // their prompts lose the buttons if Telegram still takes the edit.
+        drop(asks);
+        self.hook_asks.clear();
+        for key in self.hook_waiters.keys().copied().collect::<Vec<_>>() {
+            self.finish(key, State::Expired);
         }
         self.pump();
         let save_task = self.save_task.take();
@@ -512,6 +590,12 @@ impl Slots {
             .candidates
             .next_due(|session| self.indexing.contains(session))
             .map_or(deadline, |due| deadline.min(due));
+        let hooks = self.hook_asks.iter().map(|ask| ask.show_at.min(ask.until));
+        let waiters = self.hook_waiters.values().map(|waiter| waiter.until);
+        let mut deadline = hooks.chain(waiters).fold(deadline, Instant::min);
+        if !self.hook_asks.is_empty() || !self.hook_waiters.is_empty() {
+            deadline = deadline.min(Instant::now() + HOOK_CHECK_EVERY);
+        }
         self.streams
             .values()
             .flat_map(|live| {
@@ -2045,6 +2129,9 @@ impl Slots {
         );
         match self.prompts.open(prompt) {
             Opened::Added { expired, .. } => {
+                // Only a request shown now is the twin of a waiting hook; a
+                // re-sent one must not consume an unrelated hook ask.
+                self.note_relayed(&session, &request.tool_name);
                 info!(
                     conn,
                     session = short(&session),
@@ -2062,6 +2149,195 @@ impl Slots {
             ),
         }
         self.sync_waiting(&session);
+    }
+
+    /// A channel request of `session` for `tool`: a hook waiting for this
+    /// twin gets no decision; otherwise a hook that comes within
+    /// [`TWIN_WINDOW`] will find it.
+    fn note_relayed(&mut self, session: &str, tool: &str) {
+        let twin = |post: &PermissionPost| post.session_id == session && post.tool_name == tool;
+        if let Some(at) = self.hook_asks.iter().position(|ask| twin(&ask.post)) {
+            self.hook_asks.remove(at);
+            info!(
+                session = short(session),
+                "permission hook: the channel relays this request; no decision"
+            );
+            return;
+        }
+        let now = Instant::now();
+        self.forget_relayed(now);
+        if self.relayed.len() >= MAX_RELAYED {
+            self.relayed.pop_front();
+        }
+        self.relayed
+            .push_back((now, session.to_owned(), tool.to_owned()));
+    }
+
+    fn forget_relayed(&mut self, now: Instant) {
+        while self
+            .relayed
+            .front()
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) > TWIN_WINDOW)
+        {
+            self.relayed.pop_front();
+        }
+    }
+
+    /// A `PermissionRequest` hook asks. Only a live top-level session gets a
+    /// prompt (nested and headless runs have no topic of their own); one whose
+    /// channel request came within [`TWIN_WINDOW`] gets no decision at once.
+    /// Dropping `ask.answer` is the "no decision" answer.
+    fn on_permission_ask(&mut self, ask: PermissionAsk) {
+        let session = ask.post.session_id.clone();
+        if !self.registry.is_live_top_level(&session) {
+            debug!(
+                session = short(&session),
+                "permission hook of a session without a live topic; no decision"
+            );
+            return;
+        }
+        let now = Instant::now();
+        self.forget_relayed(now);
+        let tool = &ask.post.tool_name;
+        if let Some(at) = self
+            .relayed
+            .iter()
+            .position(|(_, relayed, relayed_tool)| *relayed == session && relayed_tool == tool)
+        {
+            self.relayed.remove(at);
+            info!(
+                session = short(&session),
+                "permission hook: the channel relayed this request; no decision"
+            );
+            return;
+        }
+        debug!(
+            session = short(&session),
+            "permission hook waits for its channel twin"
+        );
+        self.hook_asks.push(HookAsk {
+            post: ask.post,
+            answer: ask.answer,
+            show_at: now + TWIN_WINDOW,
+            until: now + self.options.hook_answer_wait,
+        });
+    }
+
+    /// Asks without a twin become prompts; hooks that went away, ran out of
+    /// time or belong to an ended session get no decision (their prompts lose
+    /// the buttons); a decided hook prompt sends its answer to its hook.
+    fn check_hook_asks(&mut self) {
+        let now = Instant::now();
+        for ask in std::mem::take(&mut self.hook_asks) {
+            if ask.answer.is_closed()
+                || now >= ask.until
+                || !self.registry.is_live_top_level(&ask.post.session_id)
+            {
+                continue;
+            }
+            if now >= ask.show_at {
+                self.show_hook_prompt(ask);
+            } else {
+                self.hook_asks.push(ask);
+            }
+        }
+        for key in self.hook_waiters.keys().copied().collect::<Vec<_>>() {
+            let state = self.prompts.get(key).map(|prompt| prompt.state);
+            let Some(waiter) = self.hook_waiters.get(&key) else {
+                continue;
+            };
+            let behavior = match state {
+                Some(state) if state.is_active() => {
+                    if !waiter.answer.is_closed() && now < waiter.until {
+                        continue;
+                    }
+                    self.finish(key, State::Expired);
+                    None
+                }
+                Some(State::Decided(behavior)) => Some(behavior),
+                _ => None,
+            };
+            let Some(waiter) = self.hook_waiters.remove(&key) else {
+                continue;
+            };
+            let session = self
+                .prompts
+                .get(key)
+                .map_or("", |prompt| short(&prompt.session))
+                .to_owned();
+            match behavior {
+                Some(behavior) if waiter.answer.send(Some(behavior)).is_ok() => {
+                    info!(session, ?behavior, "permission answer handed to the hook");
+                }
+                Some(_) => info!(session, "permission hook left before the answer"),
+                None => debug!(session, "permission hook gets no decision"),
+            }
+        }
+    }
+
+    /// Opens the prompt of a hook ask under a fresh request id.
+    fn show_hook_prompt(&mut self, ask: HookAsk) {
+        let HookAsk {
+            post,
+            answer,
+            until,
+            ..
+        } = ask;
+        let session = post.session_id.clone();
+        // A few tries: the id must differ from the session's active prompts.
+        for _ in 0..8 {
+            let request = PermissionRequest {
+                request_id: permissions::hook_request_id(),
+                tool_name: post.tool_name.clone(),
+                description: post.description.clone(),
+                input_preview: post.input_preview.clone(),
+            };
+            let mut prompt = Prompt::new(0, post.host.clone(), None, session.clone(), &request);
+            prompt.hook = true;
+            match self.prompts.open(prompt) {
+                Opened::Added { key, expired } => {
+                    info!(
+                        session = short(&session),
+                        "permission hook request queued for the topic"
+                    );
+                    self.hook_waiters.insert(key, Waiter { answer, until });
+                    if let Some(gone) = expired {
+                        self.expire(gone);
+                    }
+                    self.sync_waiting(&session);
+                    return;
+                }
+                Opened::Duplicate => {}
+                Opened::Full => break,
+            }
+        }
+        warn!(
+            session = short(&session),
+            "too many permission prompts wait for an answer; this hook gets no decision"
+        );
+    }
+
+    /// The first press on an open hook prompt decides it; the answer goes to
+    /// the hook on the next pump. A hook that already left gets nothing and
+    /// the prompt expires.
+    fn press_hook(&mut self, key: u64, behavior: Behavior) -> &'static str {
+        let listening = self
+            .hook_waiters
+            .get(&key)
+            .is_some_and(|waiter| !waiter.answer.is_closed());
+        if !listening {
+            self.finish(key, State::Expired);
+            return permissions::ANSWER_EXPIRED;
+        }
+        if let Some(prompt) = self.prompts.get(key) {
+            info!(
+                session = short(&prompt.session),
+                ?behavior,
+                "permission answer chosen in Telegram for a hook"
+            );
+        }
+        self.finish(key, State::Decided(behavior));
+        permissions::answer(behavior)
     }
 
     /// An open prompt the full book let go: its buttons go away. One try: a
@@ -2222,8 +2498,11 @@ impl Slots {
         else {
             return expired;
         };
+        if prompt.hook && prompt.state == State::Open {
+            return Some(self.press_hook(key, behavior));
+        }
         match prompt.state {
-            State::Closed => expired,
+            State::Closed | State::Expired => expired,
             State::Selected { .. } | State::Decided(_) => {
                 debug!(
                     session = short(&prompt.session),
@@ -2701,6 +2980,7 @@ impl Slots {
     /// buttons, hands pending topic work and prompts to the dispatch task,
     /// publishes the view and the snapshot to save.
     fn pump(&mut self) {
+        self.check_hook_asks();
         self.flush_all();
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
@@ -3043,6 +3323,7 @@ mod tests {
         view: watch::Receiver<Arc<TopicView>>,
         dir: TempDir,
         _to_agent: Vec<mpsc::Receiver<HubMsg>>,
+        asks: mpsc::Sender<PermissionAsk>,
     }
 
     fn options() -> Options {
@@ -3063,7 +3344,8 @@ mod tests {
         let registry = store.load().unwrap();
         let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
         tokio::spawn(scheduler.run());
-        let (slots, view) = Slots::new(registry, store, outbox, options);
+        let (mut slots, view) = Slots::new(registry, store, outbox, options);
+        let asks = slots.permission_asks();
         let (agents, agents_rx) = mpsc::channel(16);
         let (hooks, hooks_rx) = mpsc::channel(16);
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -3076,6 +3358,7 @@ mod tests {
             view,
             dir,
             _to_agent: Vec::new(),
+            asks,
         }
     }
 
@@ -3796,6 +4079,178 @@ again"
                 _ => None,
             })
             .collect()
+    }
+
+    /// A `PermissionRequest` hook of `session` for `tool`; the receiver gets
+    /// its answer (an error: dropped, no decision).
+    async fn hook_ask(rig: &Rig, session: &str, tool: &str) -> oneshot::Receiver<Option<Behavior>> {
+        let (answer, answered) = oneshot::channel();
+        let post = PermissionPost {
+            v: crate::wire::VERSION,
+            host: "box".into(),
+            session_id: session.into(),
+            tool_name: tool.into(),
+            description: "remove the build".into(),
+            input_preview: "{\"command\":\"rm -rf $X\"}".into(),
+        };
+        rig.asks.send(PermissionAsk { post, answer }).await.unwrap();
+        answered
+    }
+
+    async fn hook_answer(answered: oneshot::Receiver<Option<Behavior>>) -> Option<Behavior> {
+        tokio::time::timeout(WAIT, answered)
+            .await
+            .expect("hook answered in time")
+            .ok()
+            .flatten()
+    }
+
+    /// The request id on the buttons of the permission send `index`.
+    fn prompt_id(ops: &[Op], index: usize) -> String {
+        let markup = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    permission: true,
+                    reply_markup: Some(markup),
+                    ..
+                } => Some(markup),
+                _ => None,
+            })
+            .nth(index)
+            .expect("permission send");
+        let data = markup["inline_keyboard"][0][0]["callback_data"]
+            .as_str()
+            .unwrap();
+        data.strip_prefix("allow:").unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_hook_without_a_channel_twin_gets_buttons_and_the_first_press() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        let asked = std::time::Instant::now();
+        let answered = hook_ask(&rig, A, "Bash").await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        assert!(asked.elapsed() >= TWIN_WINDOW, "{:?}", asked.elapsed());
+        let (thread, text, message_id) = prompts(&ops).remove(0);
+        assert_eq!(thread, 100);
+        assert!(
+            text.starts_with("Запрос разрешения: Bash\nremove the build"),
+            "{text}"
+        );
+        settled(&rig, |ops| {
+            last_icon(ops, 100) == Some(crate::hub::registry::ICON_WAITING)
+        })
+        .await;
+        let id = prompt_id(&ops, 0);
+        rig.control
+            .send(press("q1", Some(message_id), &format!("deny:{id}")))
+            .unwrap();
+        assert_eq!(hook_answer(answered).await, Some(Behavior::Deny));
+        rig.control
+            .send(press("q2", Some(message_id), &format!("allow:{id}")))
+            .unwrap();
+        let ops = settled(&rig, |ops| {
+            answers(ops).len() == 2 && edits_of(ops, message_id).len() == 1
+        })
+        .await;
+        assert_eq!(
+            answers(&ops),
+            [
+                Some(permissions::ANSWER_DENIED),
+                Some(permissions::ANSWER_DECIDED)
+            ]
+        );
+        let edits = edits_of(&ops, message_id);
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert!(edits[0].0.ends_with(permissions::DENIED_MARK));
+        assert_eq!(edits[0].1, Some(permissions::no_keyboard()));
+        // No agent got anything: the answer went to the hook only.
+        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hook_whose_channel_twin_comes_before_or_after_gets_no_decision() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        // The channel first, then the hook.
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let started = std::time::Instant::now();
+        assert_eq!(hook_answer(hook_ask(&rig, A, "Bash").await).await, None);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        // The hook first, then the channel.
+        let started = std::time::Instant::now();
+        let answered = hook_ask(&rig, A, "Bash").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        rig.agents.send(permission(1, "bcdef", "p")).await.unwrap();
+        assert_eq!(hook_answer(answered).await, None);
+        assert!(started.elapsed() < TWIN_WINDOW, "{:?}", started.elapsed());
+        // Another tool is not a twin: it gets its own prompt.
+        let _other_tool = hook_ask(&rig, A, "Write").await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 3).await;
+        assert_eq!(
+            prompts(&ops).len(),
+            3,
+            "two channel prompts, one hook prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_prompt_ends_without_a_decision_on_time_out_gone_hook_or_session_end() {
+        let options = Options {
+            hook_answer_wait: TWIN_WINDOW + Duration::from_millis(800),
+            ..message_options()
+        };
+        let mut rig = rig(Fake::default(), options);
+        two_live_slots(&mut rig, false).await;
+        // Time runs out: no decision, the buttons go.
+        let answered = hook_ask(&rig, A, "Bash").await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let first = prompts(&ops)[0].2;
+        assert_eq!(hook_answer(answered).await, None);
+        let ops = settled(&rig, |ops| edits_of(ops, first).len() == 1).await;
+        assert_eq!(
+            edits_of(&ops, first)[0],
+            (
+                permissions::ANSWER_EXPIRED.to_owned(),
+                Some(permissions::no_keyboard())
+            )
+        );
+        // The hook went away: a press answers "expired" and closes the prompt.
+        let answered = hook_ask(&rig, A, "Bash").await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
+        let second = prompts(&ops)[1].2;
+        let id = prompt_id(&ops, 1);
+        drop(answered);
+        rig.control
+            .send(press("q1", Some(second), &format!("allow:{id}")))
+            .unwrap();
+        let ops = settled(&rig, |ops| edits_of(ops, second).len() == 1).await;
+        assert_eq!(answers(&ops), [Some(permissions::ANSWER_EXPIRED)]);
+        assert_eq!(edits_of(&ops, second)[0].0, permissions::ANSWER_EXPIRED);
+        // The session ends: no decision, the prompt is closed.
+        let answered = hook_ask(&rig, A, "Bash").await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 3).await;
+        let third = prompts(&ops)[2].2;
+        rig.hook(end(A, 10)).await;
+        assert_eq!(hook_answer(answered).await, None);
+        let ops = settled(&rig, |ops| edits_of(ops, third).len() == 1).await;
+        assert_eq!(edits_of(&ops, third)[0].0, permissions::CLOSED_TEXT);
+        // An ended session's hook gets no decision at once.
+        let started = std::time::Instant::now();
+        assert_eq!(hook_answer(hook_ask(&rig, A, "Bash").await).await, None);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_leaves_before_its_prompt_is_shown_gets_none() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        drop(hook_ask(&rig, A, "Bash").await);
+        tokio::time::sleep(TWIN_WINDOW + Duration::from_millis(500)).await;
+        assert!(prompts(&rig.fake.ops()).is_empty());
     }
 
     #[tokio::test]
@@ -7153,7 +7608,8 @@ again"
         let registry = store.load().unwrap();
         let (scheduler, outbox) = Scheduler::new(fake.clone(), FAST);
         tokio::spawn(scheduler.run());
-        let (slots, view) = Slots::new(registry, store, outbox, options);
+        let (mut slots, view) = Slots::new(registry, store, outbox, options);
+        let asks = slots.permission_asks();
         let (agents, agents_rx) = mpsc::channel(16);
         let (hooks, hooks_rx) = mpsc::channel(16);
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -7166,6 +7622,7 @@ again"
             view,
             dir,
             _to_agent: Vec::new(),
+            asks,
         }
     }
 

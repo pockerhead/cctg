@@ -88,10 +88,13 @@ cargo build --release -p cctg
     "Stop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook Stop" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStart" }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStop" }] }],
-    "PostToolUse": [{ "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] }]
+    "PostToolUse": [{ "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PermissionRequest", "timeout": 100 }] }]
   }
 }
 ```
+
+`PermissionRequest` ждёт ответа из Telegram до 90 с (кнопки для диалогов, которые канал не пересылает, например проверка безопасности auto mode), поэтому ему нужен свой `"timeout": 100`. Запрос, который уже пришёл через канал, хук отпускает без решения за ~1.5 с.
 
 Хуки из `--settings` Claude Code применяет (проверено на 2.1.280: `SessionStart` из файла, переданного `--settings`, сработал). Если в вашей версии тема не появляется при старте, положите тот же блок `hooks` в `<tmp>/cctg-poc/claude-config/settings.json`: при `CLAUDE_CONFIG_DIR` это пользовательские настройки только этого запуска.
 

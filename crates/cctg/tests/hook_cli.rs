@@ -302,6 +302,7 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
     assert_eq!(
         events,
         [
+            "PermissionRequest",
             "PostToolUse",
             "SessionEnd",
             "SessionStart",
@@ -324,6 +325,13 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
         assert_eq!(commands.len(), 1, "{event}");
         assert_eq!(commands[0]["type"], "command");
         assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
+        // Only the waiting hook needs more than Claude Code's default time.
+        let timeout = commands[0].get("timeout").and_then(|t| t.as_u64());
+        assert_eq!(
+            timeout,
+            (event == "PermissionRequest").then_some(100),
+            "{event}"
+        );
     }
     for needle in [
         "CCTG_",

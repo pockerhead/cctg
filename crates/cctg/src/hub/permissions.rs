@@ -8,7 +8,10 @@
 //!
 //! A prompt is [`State::Open`] until the first press fixes the answer
 //! ([`State::Selected`]); it is [`State::Decided`] once the agent took the
-//! verdict and [`State::Closed`] when its session ended first. An ended prompt
+//! verdict and [`State::Closed`] when its session ended first. A prompt of a
+//! `PermissionRequest` hook ([`Prompt::hook`]) has no agent: the first press
+//! decides it at once, and it is [`State::Expired`] when the hook stopped
+//! waiting first. An ended prompt
 //! owes Telegram one final edit that removes the buttons; a failed edit is
 //! tried again on the retry tick.
 //!
@@ -44,6 +47,20 @@ pub const ANSWER_DECIDED: &str = "Уже решено";
 /// Also the whole text of a prompt the full book expired.
 pub const ANSWER_EXPIRED: &str = "Запрос устарел";
 pub const ANSWER_OFFLINE: &str = "Сессия не на связи, ответьте в терминале";
+
+/// A request id for a hook prompt, in the form Claude Code uses (five
+/// lowercase letters without `l`), so the buttons parse like any other.
+pub fn hook_request_id() -> String {
+    const LETTERS: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+    let mut bits = crate::wire::random_u64();
+    (0..5)
+        .map(|_| {
+            let letter = LETTERS[(bits % LETTERS.len() as u64) as usize];
+            bits /= LETTERS.len() as u64;
+            letter as char
+        })
+        .collect()
+}
 
 pub fn callback_data(behavior: Behavior, request_id: &str) -> String {
     let action = match behavior {
@@ -125,6 +142,8 @@ pub enum State {
     Decided(Behavior),
     /// The session ended before an agent took an answer.
     Closed,
+    /// The hook of a hook prompt stopped waiting (timeout, gone) first.
+    Expired,
 }
 
 impl State {
@@ -170,6 +189,9 @@ pub struct Prompt {
     pub edit: Edit,
     /// Final edits that failed so far.
     pub edit_failures: u32,
+    /// Asked by a `PermissionRequest` hook, not relayed by an agent: the
+    /// answer goes back to the waiting hook, never to an agent.
+    pub hook: bool,
 }
 
 impl Prompt {
@@ -193,6 +215,7 @@ impl Prompt {
             waits: true,
             edit: Edit::None,
             edit_failures: 0,
+            hook: false,
         }
     }
 
@@ -201,6 +224,7 @@ impl Prompt {
         match self.state {
             State::Decided(behavior) => Some(decided_text(&self.text, behavior)),
             State::Closed => Some(CLOSED_TEXT.to_owned()),
+            State::Expired => Some(ANSWER_EXPIRED.to_owned()),
             State::Open | State::Selected { .. } => None,
         }
     }
@@ -460,6 +484,32 @@ mod tests {
             .map(|button| button["callback_data"].as_str().unwrap())
             .collect();
         assert_eq!(data, ["allow:abcde", "deny:abcde"]);
+    }
+
+    #[test]
+    fn hook_request_ids_are_valid_request_ids() {
+        for _ in 0..1000 {
+            let id = hook_request_id();
+            assert!(is_request_id(&id), "{id}");
+            assert_eq!(
+                parse_callback(&callback_data(Behavior::Deny, &id)),
+                Some((Behavior::Deny, id.as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_prompt_ends_with_the_expired_text() {
+        let mut book = Prompts::default();
+        let key = added(book.open(prompt("A", "abcde")));
+        shown(&mut book, key, 10);
+        assert!(book.finish(key, State::Expired));
+        assert!(!book.waiting("A"));
+        assert_eq!(
+            book.get(key).unwrap().final_text().as_deref(),
+            Some(ANSWER_EXPIRED)
+        );
+        assert_eq!(book.due_edits(), [key]);
     }
 
     #[test]

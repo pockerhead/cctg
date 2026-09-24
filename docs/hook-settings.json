@@ -70,6 +70,17 @@
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cctg hook PermissionRequest",
+            "timeout": 100
+          }
+        ]
+      }
     ]
   }
 }
