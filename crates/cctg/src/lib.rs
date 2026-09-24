@@ -8,5 +8,6 @@ pub mod hook;
 pub mod hub;
 pub mod proctree;
 pub mod spool;
+pub mod supervise;
 pub mod tail;
 pub mod wire;

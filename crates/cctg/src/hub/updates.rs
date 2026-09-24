@@ -4,6 +4,7 @@
 
 use std::future::Future;
 use std::io;
+use std::pin::pin;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -252,12 +253,31 @@ pub async fn poll<S: UpdateSource>(
     source: &S,
     allowlist: &Allowlist,
     store: &OffsetStore,
-    mut handle: impl FnMut(Routed),
+    handle: impl FnMut(Routed),
 ) {
+    poll_until(source, allowlist, store, handle, std::future::pending()).await;
+}
+
+/// [`poll`] until `stop` completes. It is only noticed while no batch is
+/// being handled: a batch whose offset was saved is always handed out whole,
+/// and an interrupted `getUpdates` confirms nothing, so its updates come again.
+pub async fn poll_until<S: UpdateSource>(
+    source: &S,
+    allowlist: &Allowlist,
+    store: &OffsetStore,
+    mut handle: impl FnMut(Routed),
+    stop: impl Future<Output = ()>,
+) {
+    let mut stop = pin!(stop);
     let mut offset = store.load();
     let mut backoff = Duration::from_secs(1);
     loop {
-        match source.get_updates(offset, POLL_TIMEOUT).await {
+        let result = tokio::select! {
+            biased;
+            () = &mut stop => return,
+            result = source.get_updates(offset, POLL_TIMEOUT) => result,
+        };
+        let wait = match result {
             Ok(raw) => {
                 backoff = Duration::from_secs(1);
                 let batch_len = raw.len();
@@ -270,19 +290,28 @@ pub async fn poll<S: UpdateSource>(
                     save_offset(store, next).await;
                 }
                 routed.into_iter().for_each(&mut handle);
-                if let Some(wait) = stalled_batch_backoff(batch_len, previous, next) {
+                let wait = stalled_batch_backoff(batch_len, previous, next);
+                if let Some(wait) = wait {
                     warn!(?wait, "getUpdates batch did not contain an update_id");
-                    tokio::time::sleep(wait).await;
                 }
+                wait
             }
             Err(ApiError::RetryAfter(wait)) => {
                 warn!(?wait, "getUpdates hit flood control");
-                tokio::time::sleep(wait).await;
+                Some(wait)
             }
             Err(error) => {
                 warn!(%error, ?backoff, "getUpdates failed");
-                tokio::time::sleep(backoff).await;
+                let wait = backoff;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
+                Some(wait)
+            }
+        };
+        if let Some(wait) = wait {
+            tokio::select! {
+                biased;
+                () = &mut stop => return,
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }

@@ -12,7 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "net", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "net", "process", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 transcript = { path = "../transcript" }
@@ -25,8 +25,19 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
+# The supervisor e2e test stops the supervisor with Ctrl+Break
+# (GenerateConsoleCtrlEvent).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 # The TASK-018 soak runs its own main: it re-executes itself as the Claude
 # Code stand-in and skips unless asked (`-- --ignored`).
 [[test]]
 name = "soak"
+harness = false
+
+# The TASK-026 supervisor test runs its own main: a copy of it is the
+# candidate whose hub exits at once.
+[[test]]
+name = "supervise_e2e"
 harness = false
