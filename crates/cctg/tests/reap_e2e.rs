@@ -17,6 +17,8 @@ use cctg::hub::registry::{Registry, RegistryStore, SlotId};
 use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::sync::mpsc;
 
+mod common;
+
 const SECRET: &str = "reap-e2e-secret-0123456789";
 const STAND_IN: &str = "CCTG_REAP_STAND_IN";
 const DEAD: &str = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -133,16 +135,9 @@ async fn a_start_after_a_killed_session_takes_its_topic() {
     .to_string();
     let home = root.clone();
     let output = tokio::task::spawn_blocking(move || {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        let mut child = common::cctg(&home)
             .args(["hook", "SessionStart"])
-            .env("USERPROFILE", &home)
-            .env("HOME", &home)
             .env("CLAUDE_PID", own_pid.to_string())
-            .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env_remove("CCTG_HUB_SECRET")
-            .env_remove("CCTG_HUB_HOOK_ADDR")
-            .env_remove("CCTG_HOST")
-            .env_remove("CCTG_STATE_DIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

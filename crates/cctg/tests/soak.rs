@@ -54,6 +54,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+mod common;
+
 const SECRET: &str = "soak-secret-0123456789abcdef";
 const HOST: &str = "soakbox";
 const FAKE_CHAT: i64 = -1000000000001;
@@ -839,20 +841,15 @@ impl Soak {
         std::fs::create_dir_all(&project).unwrap();
         let transcript = project.join(format!("{id}.jsonl"));
         std::fs::write(&transcript, "").unwrap();
-        let mut launcher = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        common::isolate(&mut command, &self.home);
+        let mut launcher = command
             .env(ROLE, "launch")
             .env("SOAK_SESSION", id)
             .env("SOAK_ENTRYPOINT", "cli")
             .env("SOAK_CCTG", env!("CARGO_BIN_EXE_cctg"))
             .env("SOAK_CWD", folder)
-            .env("USERPROFILE", &self.home)
-            .env("HOME", &self.home)
             .env("CLAUDE_CONFIG_DIR", &self.config_dir)
-            .env_remove("CCTG_HUB_SECRET")
-            .env_remove("CCTG_HUB_HOOK_ADDR")
-            .env_remove("CCTG_HUB_AGENT_ADDR")
-            .env_remove("CCTG_HOST")
-            .env_remove("CCTG_STATE_DIR")
             .env_remove("SOAK_SCRIPT")
             .current_dir(folder)
             .stdin(Stdio::piped())

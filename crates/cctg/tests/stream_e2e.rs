@@ -8,7 +8,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,6 +24,8 @@ use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+mod common;
 
 const SECRET: &str = "e2e-secret-0123456789abcdef";
 const HOST: &str = "e2ebox";
@@ -308,18 +310,14 @@ impl Drop for Agent {
 }
 
 fn start_agent(s: &Session, port: u16) -> Agent {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+    let mut child = common::cctg(&s.home)
         .arg("agent")
         .current_dir(&s.workdir)
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .env_remove("CCTG_HUB_HOOK_ADDR")
         .env("CCTG_HUB_SECRET", SECRET)
         .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
         .env("CCTG_HOST", HOST)
         .env("CLAUDE_CODE_SESSION_ID", &s.id)
         .env("CLAUDE_CONFIG_DIR", &s.config)
-        .env("USERPROFILE", &s.home)
-        .env("HOME", &s.home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

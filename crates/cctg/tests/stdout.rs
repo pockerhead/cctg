@@ -1,9 +1,13 @@
-use std::process::Command;
+mod common;
 
 #[test]
 fn subcommands_do_not_write_to_stdout() {
+    // Its own home and no session variables: this `cctg agent` once reached
+    // the live hub as the session that ran the tests (TASK-042).
+    let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdout-home");
+    std::fs::create_dir_all(&home).expect("temp home");
     for args in [&["agent"][..], &["hook", "SessionStart"][..]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        let output = common::cctg(&home)
             .args(args)
             .output()
             .expect("cctg should start");
@@ -26,12 +30,9 @@ fn hub_without_config_fails_on_stderr_only() {
     // Empty working directory: no ./.env, and no CCTG_* variables inherited.
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hub-no-config");
     std::fs::create_dir_all(&dir).expect("temp dir");
-    let output = Command::new(env!("CARGO_BIN_EXE_cctg"))
+    let output = common::cctg(&dir)
         .arg("hub")
         .current_dir(&dir)
-        .env_remove("CCTG_BOT_TOKEN")
-        .env_remove("CCTG_CHAT_ID")
-        .env_remove("CCTG_ALLOWED_USER_IDS")
         .output()
         .expect("cctg should start");
 
@@ -58,14 +59,11 @@ fn malformed_env_file_does_not_echo_its_contents() {
     )
     .expect("write bad.env");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_cctg"))
+    let output = common::cctg(&dir)
         .arg("hub")
         .arg("--env-file")
         .arg(&env_file)
         .current_dir(&dir)
-        .env_remove("CCTG_BOT_TOKEN")
-        .env_remove("CCTG_CHAT_ID")
-        .env_remove("CCTG_ALLOWED_USER_IDS")
         .output()
         .expect("cctg should start");
 

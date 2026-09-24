@@ -37,6 +37,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+mod common;
+
 const SECRET: &str = "supervise-e2e-secret-0123456789";
 const TOKEN: &str = "123456:supervise-e2e-token";
 const CHAT: i64 = -1000000000001;
@@ -304,13 +306,7 @@ fn free_port() -> u16 {
 /// environment this test runs in; home is `home`.
 fn clean_command(program: &Path, home: &Path) -> Command {
     let mut command = Command::new(program);
-    for (name, _) in std::env::vars_os() {
-        let name_text = name.to_string_lossy();
-        if name_text.starts_with("CCTG_") || name_text.starts_with("CLAUDE") {
-            command.env_remove(&name);
-        }
-    }
-    command.env("USERPROFILE", home).env("HOME", home);
+    common::isolate(&mut command, home);
     command
 }
 

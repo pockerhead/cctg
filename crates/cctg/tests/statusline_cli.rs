@@ -7,12 +7,14 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use cctg::hub::ingress;
 use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::sync::mpsc;
+
+mod common;
 
 const SECRET: &str = "statusline-cli-secret-0123456789";
 
@@ -47,16 +49,9 @@ fn home(test: &str, addr: &str, command: Option<&str>) -> PathBuf {
 /// Runs `cctg statusline`; the exit code is left to the caller.
 fn run(home: &Path, extra_env: &[(&str, &str)]) -> (Output, Duration) {
     let started = Instant::now();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cctg"));
+    let mut command = common::cctg(home);
     command
         .arg("statusline")
-        .env("USERPROFILE", home)
-        .env("HOME", home)
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CCTG_STATUSLINE")
-        .env_remove("CCTG_HUB_SECRET")
-        .env_remove("CCTG_HUB_HOOK_ADDR")
-        .env_remove("CCTG_HOST")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

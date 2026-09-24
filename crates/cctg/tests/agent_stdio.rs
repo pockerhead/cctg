@@ -4,10 +4,12 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+mod common;
 
 const SECRET: &str = "agent-stdio-secret-0123456789";
 
@@ -67,17 +69,11 @@ struct Run {
 fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
     let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("agent-stdio-home");
     std::fs::create_dir_all(&home).expect("home");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cctg"));
+    // Never the developer's own device config or session.
+    let mut command = common::cctg(&home);
     command
         .arg("agent")
         .current_dir(&home)
-        // Never the developer's own device config or session.
-        .env("USERPROFILE", &home)
-        .env("HOME", &home)
-        .env_remove("CCTG_HUB_SECRET")
-        .env_remove("CCTG_HUB_AGENT_ADDR")
-        .env_remove("CLAUDE_CODE_SESSION_ID")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -1,0 +1,34 @@
+//! Shared by the integration tests that start the real `cctg` binary.
+//!
+//! The tests often run inside a live Claude Code session on a machine with a
+//! live hub. A `cctg agent` that inherits that session's
+//! `CLAUDE_CODE_SESSION_ID` and reads the real `~/.cctg/device.env` registers
+//! with the live hub as the developer's session (TASK-042). Every `cctg`
+//! process of the tests is therefore started through [`cctg`] or
+//! [`isolate`]; `tests/isolation.rs` checks that.
+
+use std::path::Path;
+use std::process::Command;
+
+/// `cctg` with `home` as its home directory and no `CCTG_*` or `CLAUDE*`
+/// variable of the environment the tests run in. A test sets what it needs
+/// afterwards.
+#[allow(dead_code, reason = "not every test binary starts cctg directly")]
+pub fn cctg(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cctg"));
+    isolate(&mut command, home);
+    command
+}
+
+/// Removes every `CCTG_*` and `CLAUDE*` variable of this process from
+/// `command` and points its home at `home`, so the developer's device config
+/// and Claude Code session never reach it.
+pub fn isolate(command: &mut Command, home: &Path) {
+    for (name, _) in std::env::vars_os() {
+        let text = name.to_string_lossy();
+        if text.starts_with("CCTG_") || text.starts_with("CLAUDE") {
+            command.env_remove(&name);
+        }
+    }
+    command.env("USERPROFILE", home).env("HOME", home);
+}
