@@ -212,7 +212,8 @@ async fn agent_session(
                     Some((received_at, Ok(
                         msg @ (AgentMsg::Reply { .. }
                         | AgentMsg::PermissionRequest(_)
-                        | AgentMsg::PermissionAck { .. }),
+                        | AgentMsg::PermissionAck { .. }
+                        | AgentMsg::TranscriptChunk { .. }),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
@@ -633,6 +634,7 @@ mod tests {
             cwd: "/w".into(),
             claude_pid: None,
             verdict_ack: false,
+            transcript_reads: false,
         }
     }
 

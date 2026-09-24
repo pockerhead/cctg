@@ -1,0 +1,31 @@
+   Compiling qa2016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\round2\e2e)
+warning: unused variable: `got`
+   --> tests\qa2.rs:628:9
+    |
+628 |     let got = fake.lines(t);
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_got`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `fake` is never read
+   --> tests\qa2.rs:198:5
+    |
+197 | struct Hub {
+    |        --- field in this struct
+198 |     fake: Arc<Fake>,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qa2016-e2e` (test "qa2") generated 2 warnings (run `cargo fix --test "qa2" -p qa2016-e2e` to apply 1 suggestion)
+    Finished `test` profile [unoptimized] target(s) in 1.33s
+     Running tests\qa2.rs (C:\Users\user\AppData\Local\Temp/cctg-qa2-016-target\debug\deps\qa2-e0df049e41dee77d.exe)
+
+running 1 test
+test qa2_real_transcripts_smoke ... QA2 thinking-overlap: event=prompt record_type="user" same_record_has_thinking=false isMeta=null isSidechain=false
+QA2 real: files=80 lines=84068 prompts=1701 channel=3 notes=1936 calls=9699 results=9699 errors=323 turn_ends=2593 ids_with_2plus_turn_ends=0
+QA2 real: thinking overlaps=1
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 5.91s
+

@@ -1,0 +1,59 @@
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+   Compiling qa016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\e2e)
+    Finished `test` profile [unoptimized] target(s) in 11.80s
+     Running tests\e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-qa016-target\debug\deps\e2e-04a0d5ded83c4b35.exe)
+
+running 6 tests
+test e2e_hub_restart_neither_repeats_nor_loses ... FAILED
+test e2e_merge_under_the_limit ... FAILED
+test e2e_order_partial_line_and_stop_after_lines ... FAILED
+test e2e_reactions ... FAILED
+test e2e_refused_sends_lose_nothing ... FAILED
+test e2e_resume_at_a_torn_end_does_not_replay_history ... FAILED
+
+failures:
+
+---- e2e_hub_restart_neither_repeats_nor_loses stdout ----
+
+thread 'e2e_hub_restart_neither_repeats_nor_loses' (30476) panicked at tests\e2e.rs:353:9:
+timed out waiting for: hub 1 lines
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- e2e_merge_under_the_limit stdout ----
+
+thread 'e2e_merge_under_the_limit' (22024) panicked at tests\e2e.rs:353:9:
+timed out waiting for: separator
+
+---- e2e_order_partial_line_and_stop_after_lines stdout ----
+
+thread 'e2e_order_partial_line_and_stop_after_lines' (2108) panicked at tests\e2e.rs:353:9:
+timed out waiting for: separator
+
+---- e2e_reactions stdout ----
+
+thread 'e2e_reactions' (32252) panicked at tests\e2e.rs:353:9:
+timed out waiting for: separator
+
+---- e2e_refused_sends_lose_nothing stdout ----
+
+thread 'e2e_refused_sends_lose_nothing' (26208) panicked at tests\e2e.rs:353:9:
+timed out waiting for: separator
+
+---- e2e_resume_at_a_torn_end_does_not_replay_history stdout ----
+
+thread 'e2e_resume_at_a_torn_end_does_not_replay_history' (23092) panicked at tests\e2e.rs:353:9:
+timed out waiting for: offset set
+
+
+failures:
+    e2e_hub_restart_neither_repeats_nor_loses
+    e2e_merge_under_the_limit
+    e2e_order_partial_line_and_stop_after_lines
+    e2e_reactions
+    e2e_refused_sends_lose_nothing
+    e2e_resume_at_a_torn_end_does_not_replay_history
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 130.60s
+
+error: test failed, to rerun pass `--test e2e`

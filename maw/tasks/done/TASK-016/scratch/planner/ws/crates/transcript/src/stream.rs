@@ -1,0 +1,151 @@
+//! What one transcript line adds to the live stream of a session's topic.
+//!
+//! The stream shows what `/brief` shows, one message at a time: prompts typed
+//! in the terminal, the text the assistant writes before a tool call, and one
+//! line per tool call once its result is in. The final answer of a turn is not
+//! part of it: the hub sends it from the `Stop` hook. Telegram messages taken
+//! into work are reported by their `message_id`, never by their text.
+
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::render::{self, UserText};
+use crate::{Block, Role};
+
+/// One event of a transcript line, in the order of the line's blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    /// A prompt typed in the terminal or a slash command, shown as `/brief`
+    /// shows it (without the `> `).
+    Prompt(String),
+    /// A Telegram message went into the session: the `message_id` attribute of
+    /// its `<channel ...>` tag.
+    Channel { message_id: i64 },
+    /// Assistant text written before a tool call (`stop_reason: tool_use`).
+    Note(String),
+    /// A tool call and its `/brief` line (`• Bash: ...`, `↳ Explore: ...`).
+    Call { id: String, line: String },
+    /// The result of a tool call; `error` is set for a failed call and holds
+    /// its first line (possibly empty).
+    Result { id: String, error: Option<String> },
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawAttachmentRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    attachment: Value,
+}
+
+/// The events of one jsonl line. Anything that is not a main-transcript
+/// `user`/`assistant` record or a queued channel message gives none; a bad
+/// line gives none.
+pub fn stream_events(line: &str) -> Vec<StreamEvent> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if let Some(message_id) = queued_channel(line) {
+        return vec![StreamEvent::Channel { message_id }];
+    }
+    let Some(turn) = crate::parse(line).into_iter().next() else {
+        return Vec::new();
+    };
+    if turn.is_sidechain {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for block in &turn.blocks {
+        match (turn.role, block) {
+            (Role::User, Block::Text(text)) if turn.is_meta => {
+                if let Some(message_id) = channel_message_id(text) {
+                    events.push(StreamEvent::Channel { message_id });
+                }
+            }
+            (Role::User, Block::Text(text)) => {
+                if let Some(UserText::Prompt(prompt)) = render::user_text(&turn, text) {
+                    events.push(StreamEvent::Prompt(prompt.into_owned()));
+                }
+            }
+            (Role::Assistant, Block::Text(text)) => {
+                let text = text.trim();
+                if turn.stop_reason.as_deref() == Some("tool_use") && !text.is_empty() {
+                    events.push(StreamEvent::Note(text.to_owned()));
+                }
+            }
+            (_, Block::ToolUse { id, name, input }) => events.push(StreamEvent::Call {
+                id: id.clone(),
+                line: render::tool_line(name, input, None, None),
+            }),
+            (
+                _,
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                },
+            ) => events.push(StreamEvent::Result {
+                id: tool_use_id.clone(),
+                error: is_error.then(|| error_line(content)),
+            }),
+        }
+    }
+    events
+}
+
+/// A channel message queued while a turn ran reaches Claude as a
+/// `queued_command` attachment (the shape Claude Code uses for other queued
+/// prompts; not yet seen for a channel message).
+fn queued_channel(line: &str) -> Option<i64> {
+    let record: RawAttachmentRecord = serde_json::from_str(line).ok()?;
+    if record.kind != "attachment"
+        || record.attachment.get("type").and_then(Value::as_str) != Some("queued_command")
+    {
+        return None;
+    }
+    channel_message_id(record.attachment.get("prompt")?.as_str()?)
+}
+
+/// `message_id` of a `<channel ...>` opening tag, when it is all digits.
+fn channel_message_id(text: &str) -> Option<i64> {
+    let id = channel_attribute(text, "message_id")?;
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    id.parse().ok()
+}
+
+/// The value of attribute `name` of the `<channel ...>` tag that starts
+/// `text`. Only the opening tag is read: the message body can hold anything.
+fn channel_attribute<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = text.trim_start().strip_prefix("<channel")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    loop {
+        rest = rest.trim_start();
+        let (key, after) = rest.split_once('=')?;
+        if key.is_empty() || key.contains(['>', '<']) || key.contains(char::is_whitespace) {
+            return None;
+        }
+        let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &after[1..];
+        let (value, tail) = body.split_once(quote)?;
+        if key == name {
+            return Some(value);
+        }
+        rest = tail;
+    }
+}
+
+/// First non-empty line of a failed result, without Claude Code's
+/// `<tool_use_error>` wrapper, cut like a `/brief` summary.
+fn error_line(content: &str) -> String {
+    let text = content.trim();
+    let text = text.strip_prefix("<tool_use_error>").unwrap_or(text);
+    let text = text.strip_suffix("</tool_use_error>").unwrap_or(text);
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty());
+    render::one_line(first.unwrap_or_default())
+}

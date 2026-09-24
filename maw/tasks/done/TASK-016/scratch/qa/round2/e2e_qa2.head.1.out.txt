@@ -1,0 +1,67 @@
+   Compiling qa2016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\round2\e2e)
+warning: unused variable: `got`
+   --> tests\qa2.rs:628:9
+    |
+628 |     let got = fake.lines(t);
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_got`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `fake` is never read
+   --> tests\qa2.rs:198:5
+    |
+197 | struct Hub {
+    |        --- field in this struct
+198 |     fake: Arc<Fake>,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qa2016-e2e` (test "qa2") generated 2 warnings (run `cargo fix --test "qa2" -p qa2016-e2e` to apply 1 suggestion)
+    Finished `test` profile [unoptimized] target(s) in 1.35s
+     Running tests\qa2.rs (C:\Users\user\AppData\Local\Temp/cctg-qa2-016-target\debug\deps\qa2-b23aea9be06ca542.exe)
+
+running 7 tests
+test qa2_answer_after_a_refused_line_still_follows_its_lines ... QA2 op Stream accepted=true restart=true lines=["> gamma warm"]
+QA2 op Stream accepted=true restart=false lines=["> gamma run"]
+QA2 op Stream accepted=false restart=false lines=["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓"]
+QA2 op Stream accepted=true restart=true lines=["> gamma run"]
+QA2 op Stream accepted=false restart=false lines=["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+QA2 op Send accepted=true "GAMMA DONE"
+QA2 op Stream accepted=true restart=true lines=["> gamma run"]
+QA2 op Stream accepted=true restart=false lines=["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+
+thread 'qa2_answer_after_a_refused_line_still_follows_its_lines' (14640) panicked at tests\qa2.rs:678:5:
+assertion `left == right` failed: got ["> gamma warm", "> gamma run", "> gamma run", "GAMMA DONE", "> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+  left: ["> gamma warm", "> gamma run", "GAMMA DONE", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+ right: ["> gamma warm", "> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓", "GAMMA DONE"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test qa2_missing_and_deleted_transcript_logs_once ... QA2 log lines about transcripts:
+ WARN cctg::hub::slots: session transcript not found; the stream waits for it session="00000008"
+DEBUG cctg::hub::slots: session transcript not written yet; the stream waits for it session="00000009"
+ WARN cctg::hub::slots: session transcript not found; the stream waits for it session="00000009"
+ok
+test qa2_reactions ... ok
+test qa2_refusals_under_the_limit_keep_line_order_and_lose_nothing ... QA2 op Stream accepted=true restart=true lines=["> gamma warm"]
+QA2 op Stream accepted=true restart=false lines=["> gamma run"]
+QA2 op Stream accepted=false restart=false lines=["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓"]
+QA2 op Stream accepted=true restart=true lines=["> gamma run"]
+QA2 op Stream accepted=false restart=false lines=["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+QA2 op Send accepted=true "GAMMA DONE"
+QA2 op Stream accepted=true restart=true lines=["> gamma run"]
+QA2 op Stream accepted=true restart=false lines=["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+QA2 refusals: 21 accepted lines, 19 unique, 2 repeats (at-least-once), 5 stream messages
+ok
+test qa2_restart_with_open_calls ... ok
+test qa2_rotation_one_separator_new_offset ... ok
+test qa2_two_slots_pieces_order_and_answers ... ok
+
+failures:
+
+failures:
+    qa2_answer_after_a_refused_line_still_follows_its_lines
+
+test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.70s
+
+error: test failed, to rerun pass `--test qa2`

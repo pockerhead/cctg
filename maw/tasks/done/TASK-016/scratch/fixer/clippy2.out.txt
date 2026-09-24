@@ -1,0 +1,4 @@
+    Checking cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Checking transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+    Finished `dev` profile [unoptimized] target(s) in 8.63s
+rc=0

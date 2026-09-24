@@ -1,0 +1,7 @@
+KILLED     B1 ingress drops chunks
+KILLED     M1 None starts at len
+KILLED     M1 e2e
+KILLED     M2 every line restarts
+KILLED     M2 e2e
+KILLED     M2 4xx breaks too
+KILLED     R4 new turn clears claims

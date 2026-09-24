@@ -1,0 +1,3 @@
+    Checking transcript v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\planner\ws\crates\transcript)
+    Checking cctg v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\planner\ws\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 6.81s

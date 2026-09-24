@@ -1,0 +1,35 @@
+interactive-subagent: 33 records in 240s
+file0    0.43s lag=0.20s user         tool_result
+file0    0.43s lag=0.19s attachment   
+file0    2.92s lag=0.24s assistant    thinking
+file0    2.92s lag=0.17s assistant    tool_use
+file0    2.92s lag=0.16s user         tool_result
+file0    2.92s lag=0.15s attachment   
+file0    9.10s lag=0.13s assistant    thinking
+file0   10.07s lag=0.20s assistant    tool_use
+file0   19.70s lag=0.15s user         tool_result
+file0   19.70s lag=0.14s attachment   
+file0   22.64s lag=0.14s assistant    thinking
+file0   25.88s lag=0.11s assistant    tool_use
+file0   27.07s lag=0.15s user         tool_result
+file0   27.07s lag=0.15s attachment   
+file0   29.44s lag=0.15s assistant    thinking
+file0   33.64s lag=0.15s assistant    tool_use
+file0   34.83s lag=0.16s user         tool_result
+file0   34.83s lag=0.16s attachment   
+file0   39.69s lag=0.21s assistant    tool_use
+file0   42.30s lag=0.15s user         tool_result
+file0   42.30s lag=0.15s attachment   
+file0   49.14s lag=0.21s assistant    thinking
+file0   53.46s lag=0.11s assistant    tool_use
+file0   63.05s lag=0.28s user         tool_result
+file0   63.05s lag=0.28s attachment   
+file0   66.18s lag=0.12s assistant    thinking
+file0   69.84s lag=0.18s assistant    tool_use
+file0   82.47s lag=0.20s user         tool_result
+file0   82.47s lag=0.20s attachment   
+file0   85.18s lag=0.21s assistant    thinking
+file0   87.34s lag=0.11s assistant    tool_use
+file0   88.64s lag=0.13s user         tool_result
+file0   88.64s lag=0.13s attachment   
+user/assistant records: n=24 min=0.11 median=0.16 p90=0.21 max=0.28

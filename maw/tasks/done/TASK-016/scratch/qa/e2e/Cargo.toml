@@ -1,0 +1,19 @@
+# QA-only end-to-end harness for TASK-016. Not a workspace member.
+[package]
+name = "qa016-e2e"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+cctg = { path = "../../../../../../../crates/cctg" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
+serde_json = "1"
+tracing-subscriber = "0.3"
+tracing = "0.1"
+transcript = { path = "../../../../../../../crates/transcript" }
+
+[profile.dev]
+debug = "line-tables-only"

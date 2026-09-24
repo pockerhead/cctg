@@ -1,0 +1,2 @@
+M11 an agent without transcript reads is asked: KILLED ['test hub::slots::tests::a_reply_to_a_subagent_block_goes_to_the_parent_with_its_agent_id ... FAILED', 'test hub::slots::tests::an_agent_without_transcript_reads_is_never_asked ... FAILED']
+M19 every read writes the registry: KILLED ['test hub::slots::tests::idle_reads_do_not_rewrite_the_registry ... FAILED']

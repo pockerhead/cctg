@@ -2,11 +2,26 @@
 //!
 //! Queues, checked in this order on every pick:
 //! 1. a permission prompt from `Message` that has no older message of its topic
-//!    queued; metered.
-//! 2. `Edit` - `editMessageText` (coalesced per message) and `answerCallbackQuery`.
+//!    queued (stream lines do not count); metered.
+//! 2. `Edit` - `editMessageText` and `setMessageReaction` (both coalesced per
+//!    message) and `answerCallbackQuery`.
 //! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`.
-//! 4. `Message` - `sendMessage`, `sendDocument`; metered, one FIFO. Permission
-//!    prompts live here too, so they never overtake their own topic.
+//! 4. `Message` - `sendMessage`, `sendDocument` and transcript stream lines;
+//!    metered, one FIFO. Permission prompts live here too, so they never
+//!    overtake their own topic's ordinary messages; they do overtake its
+//!    stream lines.
+//!
+//! Stream lines marked `merge` (one tool call each) go out one per message
+//! while the group budget has room. When more messages wait than there are
+//! tokens, the head line takes the lines of its topic queued right after it
+//! (up to the first other message of that topic) into one message, in order,
+//! while it fits Telegram's limit.
+//!
+//! A stream line Telegram does not take (any error but a 4xx, which the
+//! stream skips) breaks its topic's stream: the lines of that topic queued
+//! after it, and those that come later, are answered unsent until a line
+//! marked `restart` comes. So a later line never shows before the one the
+//! stream sends again.
 //!
 //! A ready ordinary message is served after a bounded run of unmetered jobs,
 //! while a ready permission prompt always remains first.
@@ -67,6 +82,22 @@ pub enum Op {
         name: Option<String>,
         icon_custom_emoji_id: Option<String>,
     },
+    /// A message of the live transcript stream (TASK-016). `merge`: a one-line
+    /// tool call that may share a message with the lines queued after it.
+    /// `restart`: the first line of a stream (again); it ends a break of its
+    /// topic's stream.
+    Stream {
+        thread_id: i64,
+        text: String,
+        merge: bool,
+        restart: bool,
+    },
+    /// `setMessageReaction` with one emoji; a newer one for the same message
+    /// replaces a queued one.
+    React {
+        message_id: i64,
+        emoji: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,15 +111,27 @@ enum Lane {
 impl Op {
     fn lane(&self) -> Lane {
         match self {
-            Op::Send { .. } | Op::SendDocument { .. } => Lane::Message(0),
-            Op::Edit { .. } | Op::AnswerCallback { .. } => Lane::Edit,
+            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => Lane::Message(0),
+            Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit,
             Op::Delete { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => Lane::Topic,
         }
     }
 
     /// Only new messages count against the group message limit.
     fn metered(&self) -> bool {
-        matches!(self, Op::Send { .. } | Op::SendDocument { .. })
+        matches!(
+            self,
+            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. }
+        )
+    }
+
+    /// The topic of a new message.
+    fn thread(&self) -> Option<Option<i64>> {
+        match self {
+            Op::Send { thread_id, .. } | Op::SendDocument { thread_id, .. } => Some(*thread_id),
+            Op::Stream { thread_id, .. } => Some(Some(*thread_id)),
+            _ => None,
+        }
     }
 }
 
@@ -99,6 +142,10 @@ pub enum Outcome {
     Done,
     /// A newer edit of the same message replaced this one before it was sent.
     Superseded,
+    /// This stream line went out inside the message of an earlier line of its
+    /// topic, which got the actual answer. Only after that message was
+    /// accepted: when it fails, the merged lines' receivers are dropped.
+    Merged,
 }
 
 pub type Delivery = Result<Outcome, ApiError>;
@@ -156,6 +203,16 @@ impl Transport for BotApi {
                 icon_custom_emoji_id,
             } => self
                 .edit_forum_topic(*thread_id, name.as_deref(), icon_custom_emoji_id.as_deref())
+                .await
+                .map(|()| Outcome::Done),
+            Op::Stream {
+                thread_id, text, ..
+            } => self
+                .send_message(Some(*thread_id), text, None)
+                .await
+                .map(Outcome::Sent),
+            Op::React { message_id, emoji } => self
+                .set_message_reaction(*message_id, emoji)
                 .await
                 .map(|()| Outcome::Done),
         }
@@ -232,6 +289,8 @@ impl Bucket {
 struct Job {
     op: Op,
     reply: oneshot::Sender<Delivery>,
+    /// Stream lines sent inside this job's message.
+    merged: Vec<oneshot::Sender<Delivery>>,
 }
 
 /// Cloneable handle that enqueues outbound operations.
@@ -247,7 +306,14 @@ impl Outbox {
         let (reply, receiver) = oneshot::channel();
         // A send error drops the job and its reply sender, so the receiver
         // reports the stopped scheduler by itself.
-        let _ = self.tx.send(Job { op, reply }).await;
+        let _ = self
+            .tx
+            .send(Job {
+                op,
+                reply,
+                merged: Vec::new(),
+            })
+            .await;
         receiver
     }
 }
@@ -259,6 +325,8 @@ pub struct Scheduler<T> {
     bucket: Bucket,
     paused_until: Option<Instant>,
     consecutive_unmetered: usize,
+    /// Topics whose stream broke: their lines wait for a `restart` line.
+    broken: HashSet<i64>,
     edit: VecDeque<Job>,
     topic: VecDeque<Job>,
     message: VecDeque<Job>,
@@ -280,6 +348,7 @@ impl<T: Transport> Scheduler<T> {
             bucket: Bucket::new(bucket, Instant::now()),
             paused_until: None,
             consecutive_unmetered: 0,
+            broken: HashSet::new(),
             edit: VecDeque::new(),
             topic: VecDeque::new(),
             message: VecDeque::new(),
@@ -337,6 +406,7 @@ impl<T: Transport> Scheduler<T> {
                     ..
                 } => (*thread_id, *permission),
                 Op::SendDocument { thread_id, .. } => (*thread_id, false),
+                // Stream lines yield to a prompt of their own topic.
                 _ => continue,
             };
             if permission && !busy_topics.contains(&thread_id) {
@@ -348,6 +418,33 @@ impl<T: Transport> Scheduler<T> {
     }
 
     fn enqueue(&mut self, job: Job) {
+        if let Op::Stream {
+            thread_id, restart, ..
+        } = &job.op
+        {
+            if *restart {
+                self.broken.remove(thread_id);
+            } else if self.broken.contains(thread_id) {
+                // Dropped unsent: its receiver closes without an answer.
+                return;
+            }
+        }
+        if let Op::React { message_id, emoji } = &job.op
+            && let Some(queued) = self.edit.iter_mut().find(
+                |queued| matches!(queued.op, Op::React { message_id: id, .. } if id == *message_id),
+            )
+        {
+            if let Op::React {
+                emoji: queued_emoji,
+                ..
+            } = &mut queued.op
+            {
+                queued_emoji.clone_from(emoji);
+            }
+            let superseded = std::mem::replace(&mut queued.reply, job.reply);
+            let _ = superseded.send(Ok(Outcome::Superseded));
+            return;
+        }
         if let Op::Edit {
             message_id,
             text,
@@ -413,9 +510,12 @@ impl<T: Transport> Scheduler<T> {
             Lane::Message(index) => index,
             Lane::Edit | Lane::Topic => 0,
         };
-        let Some(job) = self.lane_mut(lane).remove(index) else {
+        let Some(mut job) = self.lane_mut(lane).remove(index) else {
             return;
         };
+        if matches!(lane, Lane::Message(_)) {
+            self.merge_lines(&mut job, Instant::now());
+        }
         if job.op.metered() {
             self.bucket.take(Instant::now());
             self.consecutive_unmetered = 0;
@@ -432,8 +532,88 @@ impl<T: Transport> Scheduler<T> {
                 self.lane_mut(lane).push_front(job);
             }
             result => {
+                let accepted = result.is_ok();
+                if let (Op::Stream { thread_id, .. }, Err(error)) = (&job.op, &result)
+                    && !matches!(error, ApiError::Telegram { code, .. } if (400..500).contains(code))
+                {
+                    self.break_stream(*thread_id);
+                }
                 let _ = job.reply.send(result);
+                // A refused message carried its merged lines with it: their
+                // receivers close unanswered, never `Merged`.
+                if accepted {
+                    for merged in job.merged {
+                        let _ = merged.send(Ok(Outcome::Merged));
+                    }
+                }
             }
+        }
+    }
+
+    /// Drops the queued lines of `thread_id`'s stream up to its next
+    /// `restart` line, and every later one until such a line comes.
+    fn break_stream(&mut self, thread_id: i64) {
+        self.broken.insert(thread_id);
+        let mut broken = true;
+        self.message.retain(|job| match &job.op {
+            Op::Stream {
+                thread_id: thread,
+                restart,
+                ..
+            } if *thread == thread_id => {
+                broken &= !*restart;
+                !broken
+            }
+            _ => true,
+        });
+        if !broken {
+            self.broken.remove(&thread_id);
+        }
+    }
+
+    /// Joins the stream lines of `job`'s topic queued right after it into
+    /// its text when more messages wait than the bucket has tokens.
+    fn merge_lines(&mut self, job: &mut Job, now: Instant) {
+        let Op::Stream {
+            thread_id,
+            text,
+            merge: true,
+            ..
+        } = &mut job.op
+        else {
+            return;
+        };
+        self.bucket.refill(now);
+        if (self.message.len() + 1) as f64 <= self.bucket.tokens {
+            return;
+        }
+        let mut index = 0;
+        while index < self.message.len() {
+            let queued = &self.message[index].op;
+            if queued.thread() != Some(Some(*thread_id)) {
+                index += 1;
+                continue;
+            }
+            let Op::Stream {
+                text: next,
+                merge: true,
+                ..
+            } = queued
+            else {
+                break;
+            };
+            if transcript::telegram_len(text) + 1 + transcript::telegram_len(next)
+                > transcript::TELEGRAM_TEXT_LIMIT
+            {
+                break;
+            }
+            text.push('\n');
+            text.push_str(next);
+            let Some(next) = self.message.remove(index) else {
+                break;
+            };
+            job.merged.push(next.reply);
+            job.merged.extend(next.merged);
         }
     }
 }
@@ -451,12 +631,14 @@ mod tests {
     }
 
     /// Records calls with their (paused-clock) time; answers 429 for the
-    /// first `flood` calls.
+    /// first `flood` calls and `refuse_code` for a message containing `refuse`.
     struct Fake {
         start: Instant,
         calls: Mutex<Vec<Call>>,
         flood: Mutex<VecDeque<Duration>>,
         delay: Duration,
+        refuse: Option<&'static str>,
+        refuse_code: i64,
     }
 
     impl Fake {
@@ -470,6 +652,23 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 flood: Mutex::new(flood.iter().copied().map(Duration::from_secs).collect()),
                 delay,
+                refuse: None,
+                refuse_code: 502,
+            })
+        }
+
+        fn refusing(text: &'static str) -> Arc<Self> {
+            Self::refusing_with(text, 502)
+        }
+
+        fn refusing_with(text: &'static str, code: i64) -> Arc<Self> {
+            Arc::new(Self {
+                start: Instant::now(),
+                calls: Mutex::new(Vec::new()),
+                flood: Mutex::new(VecDeque::new()),
+                delay: Duration::ZERO,
+                refuse: Some(text),
+                refuse_code: code,
             })
         }
 
@@ -491,9 +690,19 @@ mod tests {
             if let Some(wait) = flood {
                 return Err(ApiError::RetryAfter(wait));
             }
+            if let (Some(refuse), Op::Stream { text, .. }) = (self.refuse, op)
+                && text.contains(refuse)
+            {
+                return Err(ApiError::Telegram {
+                    code: self.refuse_code,
+                    description: "refused".to_owned(),
+                });
+            }
             Ok(match op {
                 Op::CreateTopic { .. } => Outcome::Topic(ForumTopic::default()),
-                Op::Send { .. } | Op::SendDocument { .. } => Outcome::Sent(Message::default()),
+                Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => {
+                    Outcome::Sent(Message::default())
+                }
                 _ => Outcome::Done,
             })
         }
@@ -849,5 +1058,261 @@ mod tests {
         drop(outbox);
         assert!(matches!(receiver.await, Ok(Ok(Outcome::Sent(_)))));
         assert!(handle.await.is_ok());
+    }
+
+    fn line(thread: i64, text: &str) -> Op {
+        Op::Stream {
+            thread_id: thread,
+            text: text.to_owned(),
+            merge: true,
+            restart: false,
+        }
+    }
+
+    fn sent_texts(fake: &Fake, thread: i64) -> Vec<String> {
+        fake.calls()
+            .iter()
+            .filter_map(|call| match &call.op {
+                Op::Stream {
+                    thread_id, text, ..
+                } if *thread_id == thread => Some(text.clone()),
+                Op::Send {
+                    thread_id: Some(t),
+                    text,
+                    ..
+                } if *t == thread => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_lines_go_one_per_message_while_the_budget_has_room() {
+        let fake = Fake::new(&[]);
+        let ops = vec![line(1, "a ✓"), line(1, "b ✓"), line(1, "c ✓")];
+        let results = run(&fake, ops).await;
+        assert!(results.iter().all(|r| matches!(r, Ok(Outcome::Sent(_)))));
+        assert_eq!(sent_texts(&fake, 1), ["a ✓", "b ✓", "c ✓"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_lines_held_back_by_the_limit_merge_in_order_without_loss() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<Op> = (0..20).map(|i| line(1, &format!("t1-{i}"))).collect();
+        ops.push(send(1, "answer"));
+        ops.extend((20..30).map(|i| line(1, &format!("t1-{i}"))));
+        ops.extend((0..5).map(|i| line(2, &format!("t2-{i}"))));
+        let count = ops.len();
+        let results = run(&fake, ops).await;
+        assert_eq!(results.len(), count, "every line got an answer");
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, Ok(Outcome::Sent(_) | Outcome::Merged)))
+        );
+        let topic: Vec<String> = sent_texts(&fake, 1);
+        assert!(topic.len() < 21, "lines were merged: {topic:?}");
+        let lines: Vec<&str> = topic.iter().flat_map(|text| text.split('\n')).collect();
+        let mut want: Vec<String> = (0..20).map(|i| format!("t1-{i}")).collect();
+        want.push("answer".to_owned());
+        want.extend((20..30).map(|i| format!("t1-{i}")));
+        assert_eq!(lines, want, "same lines, same order");
+        // Nothing merges across the ordinary message of the topic.
+        assert!(topic.contains(&"answer".to_owned()), "{topic:?}");
+        let other: Vec<&str> = sent_texts(&fake, 2)
+            .iter()
+            .flat_map(|text| text.split('\n').map(str::to_owned).collect::<Vec<_>>())
+            .map(|line| {
+                if line.starts_with("t2-") {
+                    "ok"
+                } else {
+                    "wrong"
+                }
+            })
+            .collect();
+        assert_eq!(other, ["ok"; 5]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_merged_message_answers_none_of_its_lines_as_merged() {
+        let fake = Fake::refusing("t-7\n");
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let mut receivers = Vec::new();
+        for i in 0..20 {
+            receivers.push(outbox.submit(line(1, &format!("t-{i}"))).await);
+        }
+        drop(outbox);
+        scheduler.run().await;
+        let mut answers = Vec::new();
+        for receiver in receivers {
+            answers.push(receiver.await.ok());
+        }
+        let refused = fake
+            .calls()
+            .into_iter()
+            .find_map(|call| match call.op {
+                Op::Stream { text, .. } if text.contains("t-7\n") => Some(text),
+                _ => None,
+            })
+            .expect("t-7 went out merged with the next line");
+        let first_refused = (0..20)
+            .find(|i| refused.split('\n').any(|line| line == format!("t-{i}")))
+            .expect("refused lines");
+        for (i, answer) in answers.iter().enumerate() {
+            // The refused message and every line after it (its stream broke)
+            // are answered unsent, never `Merged`.
+            match answer {
+                Some(Ok(Outcome::Sent(_) | Outcome::Merged)) => {
+                    assert!(i < first_refused, "t-{i}");
+                }
+                Some(Err(_)) | None => assert!(i >= first_refused, "t-{i}: {answer:?}"),
+                other => panic!("t-{i}: {other:?}"),
+            }
+        }
+        let last = fake.calls().last().map(|call| call.op.clone());
+        assert!(
+            matches!(&last, Some(Op::Stream { text, .. }) if *text == refused),
+            "nothing was sent after the refused message"
+        );
+    }
+
+    fn stream_op(thread: i64, text: &str, restart: bool) -> Op {
+        Op::Stream {
+            thread_id: thread,
+            text: text.to_owned(),
+            merge: false,
+            restart,
+        }
+    }
+
+    fn stream_calls(fake: &Fake, thread: i64) -> Vec<String> {
+        fake.calls()
+            .into_iter()
+            .filter_map(|call| match call.op {
+                Op::Stream {
+                    thread_id, text, ..
+                } if thread_id == thread => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_a_refused_line_its_topic_sends_nothing_until_a_restart_line() {
+        let fake = Fake::refusing("s-1");
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let handle = tokio::spawn(scheduler.run());
+        let mut early = Vec::new();
+        for op in [
+            stream_op(1, "s-0", true),
+            stream_op(1, "s-1", false),
+            stream_op(1, "s-2", false),
+            stream_op(2, "other", false),
+            stream_op(1, "s-3", false),
+        ] {
+            early.push(outbox.submit(op).await);
+        }
+        let mut answers = Vec::new();
+        for receiver in early {
+            answers.push(receiver.await.ok());
+        }
+        assert!(matches!(answers[0], Some(Ok(Outcome::Sent(_)))));
+        assert!(matches!(answers[1], Some(Err(_))), "s-1 refused");
+        assert!(answers[2].is_none(), "s-2 dropped unsent");
+        assert!(
+            matches!(answers[3], Some(Ok(Outcome::Sent(_)))),
+            "other topics go on"
+        );
+        assert!(answers[4].is_none(), "s-3 dropped unsent");
+        // Handed over after the refusal was answered, before the stream
+        // starts again: not sent either.
+        let late = outbox.submit(stream_op(1, "s-4", false)).await;
+        assert!(late.await.is_err(), "s-4 dropped unsent");
+        let again = outbox.submit(stream_op(1, "again", true)).await;
+        let next = outbox.submit(stream_op(1, "next", false)).await;
+        assert!(matches!(again.await, Ok(Ok(Outcome::Sent(_)))));
+        assert!(matches!(next.await, Ok(Ok(Outcome::Sent(_)))));
+        drop(outbox);
+        assert!(handle.await.is_ok());
+        assert_eq!(stream_calls(&fake, 1), ["s-0", "s-1", "again", "next"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_line_telegram_rejects_with_a_4xx_does_not_break_its_stream() {
+        let fake = Fake::refusing_with("s-1", 400);
+        let ops = vec![
+            stream_op(1, "s-0", true),
+            stream_op(1, "s-1", false),
+            stream_op(1, "s-2", false),
+        ];
+        let results = run(&fake, ops).await;
+        assert_eq!(results.len(), 3, "every line answered");
+        assert!(matches!(results[2], Ok(Outcome::Sent(_))));
+        assert_eq!(stream_calls(&fake, 1), ["s-0", "s-1", "s-2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_merged_message_stays_within_the_telegram_limit() {
+        let fake = Fake::new(&[]);
+        let long = "x".repeat(1500);
+        let ops: Vec<Op> = (0..12).map(|_| line(1, &long)).collect();
+        run(&fake, ops).await;
+        let topic = sent_texts(&fake, 1);
+        assert!(
+            topic
+                .iter()
+                .all(|text| transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT)
+        );
+        assert_eq!(
+            topic
+                .iter()
+                .map(|text| text.split('\n').count())
+                .sum::<usize>(),
+            12
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permission_prompt_overtakes_the_stream_lines_of_its_topic() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<Op> = (0..8)
+            .map(|i| Op::Stream {
+                thread_id: 1,
+                text: format!("s{i}"),
+                merge: false,
+                restart: false,
+            })
+            .collect();
+        ops.push(permission(1, "prompt"));
+        run(&fake, ops).await;
+        assert_eq!(texts(&fake)[0], "prompt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reactions_are_unmetered_and_the_newest_one_per_message_wins() {
+        let fake = Fake::new(&[]);
+        let react = |id: i64, emoji: &str| Op::React {
+            message_id: id,
+            emoji: emoji.to_owned(),
+        };
+        let mut ops: Vec<Op> = (0..6).map(|i| send(1, &format!("m{i}"))).collect();
+        ops.extend([react(5, "👀"), react(6, "👀"), react(5, "✍")]);
+        let results = run(&fake, ops).await;
+        assert!(matches!(results[6], Ok(Outcome::Superseded)));
+        let reacts: Vec<(i64, String, Duration)> = fake
+            .calls()
+            .iter()
+            .filter_map(|call| match &call.op {
+                Op::React { message_id, emoji } => Some((*message_id, emoji.clone(), call.at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reacts,
+            [
+                (5, "✍".to_owned(), Duration::ZERO),
+                (6, "👀".to_owned(), Duration::ZERO)
+            ]
+        );
     }
 }

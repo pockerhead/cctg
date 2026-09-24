@@ -1,0 +1,30 @@
+enqueue content (type, leading tag name) -> count
+('str', 'task-notification') 1811
+('str', 'agent-message') 314
+('str', None) 283
+('str', 'pasted_content') 7
+('str', 'channel') 6
+
+next 3 records after queue-operation remove -> count (top 15)
+131 ('queue-operation:enqueue', 'queue-operation:remove', 'queue-operation:enqueue')
+80 ('queue-operation:enqueue', 'queue-operation:dequeue', 'user(isMeta=True,origin=peer,content=str)')
+77 ('queue-operation:enqueue', 'queue-operation:dequeue', 'user(isMeta=None,origin=task-notification,content=str)')
+69 ('last-prompt', 'ai-title', 'mode')
+65 ('assistant', 'assistant', 'user(isMeta=None,origin=None,content=list)')
+63 ('user(isMeta=None,origin=None,content=list)', 'attachment:bash_output_audience_note', 'attachment:queued_command')
+52 ('assistant', 'assistant', 'assistant')
+49 ('attachment:queued_command', 'last-prompt', 'ai-title')
+43 ('attachment:queued_command', 'attachment:total_tokens_reminder', 'assistant')
+43 ('user(isMeta=None,origin=None,content=list)', 'attachment:queued_command', 'attachment:total_tokens_reminder')
+38 ('assistant', 'user(isMeta=None,origin=None,content=list)', 'attachment:queued_command')
+23 ('queue-operation:enqueue', 'queue-operation:enqueue', 'queue-operation:remove')
+23 ('queue-operation:remove', 'queue-operation:remove', 'queue-operation:remove')
+19 ('queue-operation:remove', 'queue-operation:enqueue', 'queue-operation:dequeue')
+14 ('queue-operation:enqueue', 'queue-operation:enqueue', 'queue-operation:enqueue')
+
+queued_command attachments (prompt type, leading tag, isMeta, record origin, attachment origin, commandMode) -> count
+('str', 'task-notification', None, None, None, 'task-notification') 354
+('str', None, None, None, 'human', 'prompt') 126
+('str', 'agent-message', None, None, 'peer', 'prompt') 7
+('str', 'pasted_content', None, None, 'human', 'prompt') 2
+('list', None, None, None, 'human', 'prompt') 1

@@ -1,0 +1,35 @@
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 (1M context) · Claude Max
+  ▝▝ ▝▝    ~\AppData\Local\Temp\cctg-t016-probe
+
+▎ ※ You’ve been gifted a one-time $250 credit for cloud sessions · /claim-credit
+
+> Make exactly three Bash tool calls, one per call, in order, never in parallel: sleep 3 && echo one, then sleep 3 &&
+  echo two, then echo three. Before each call write one short sentence. Then answer with the single word done.
+
+● Запускаю первую команду.
+
+● Bash(sleep 3 && echo one)
+  ⎿  one
+  ⎿  Allowed by auto mode classifier
+
+● Теперь вторая.
+
+● Bash(sleep 3 && echo two)
+  ⎿  two
+  ⎿  Allowed by auto mode classifier
+
+● И третья.
+
+● Bash(echo three)
+  ⎿  three
+  ⎿  Allowed by auto mode classifier
+
+● done
+
+✻ Crunched for 17s · done 1:54
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

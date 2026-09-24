@@ -1,0 +1,3136 @@
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -34,6 +34,7 @@
+ use crate::channel::{self, Hub, NoHub};
+ use crate::device::{self, DeviceConfig};
+ use crate::proctree;
++use crate::tail;
+ use crate::wire::{self, AgentMsg, HubMsg, Register, Rejection, Secret, WireError};
+ 
+ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+@@ -310,6 +311,7 @@
+                 // from an outer claude, or unset (TASK-004).
+                 claude_pid: proctree::current_lineage(None, None, "").claude_pid,
+                 verdict_ack: true,
++                transcript_reads: true,
+             };
+             let (outbox, events) = spawn(LinkConfig {
+                 addr: config.agent_addr.clone(),
+@@ -421,6 +423,10 @@
+     hub: Hub,
+     mut events: Option<mpsc::Receiver<LinkEvent>>,
+ ) -> std::io::Result<()> {
++    let reads = match &hub {
++        Hub::Link(outbox) => Some(outbox.clone()),
++        Hub::Off(_) => None,
++    };
+     let mut server = channel::Server::new(hub);
+     loop {
+         let lines = tokio::select! {
+@@ -430,6 +436,12 @@
+                 None => break,
+             },
+             event = recv_event(&mut events), if events.is_some() => match event {
++                Some(LinkEvent::Message(HubMsg::TranscriptRead { session_id, path, from })) => {
++                    if let Some(outbox) = &reads {
++                        spawn_read(outbox.clone(), session_id, path, from);
++                    }
++                    Vec::new()
++                }
+                 Some(event) => server.on_link(event),
+                 None => {
+                     events = None;
+@@ -443,6 +455,20 @@
+         output.flush().await?;
+     }
+     output.flush().await
++}
++
++/// Reads the asked transcript chunk off the loop and queues the answer for
++/// the hub; the hub asks again if it gets lost with the link.
++fn spawn_read(outbox: mpsc::Sender<AgentMsg>, session_id: String, path: String, from: Option<u64>) {
++    tokio::spawn(async move {
++        let chunk =
++            tokio::task::spawn_blocking(move || tail::read_chunk(&session_id, &path, from)).await;
++        if let Ok(chunk) = chunk
++            && outbox.send(chunk).await.is_err()
++        {
++            debug!("hub link gone; transcript chunk dropped");
++        }
++    });
+ }
+ 
+ async fn recv_event(events: &mut Option<mpsc::Receiver<LinkEvent>>) -> Option<LinkEvent> {
+@@ -492,6 +518,7 @@
+             cwd: "/w".into(),
+             claude_pid: None,
+             verdict_ack: true,
++            transcript_reads: true,
+         }
+     }
+ 
+@@ -1101,4 +1128,66 @@
+             .expect("loop ends");
+         assert!(done.unwrap().is_ok());
+     }
+-}
++
++    #[tokio::test]
++    async fn a_transcript_read_is_answered_over_the_link_and_never_reaches_claude() {
++        let dir = crate::hub::testdir::TempDir::new("agent-transcript-read");
++        let session = "5e551017-0000-4000-8000-000000000001";
++        let project = dir.path().join("projects").join("C--w");
++        std::fs::create_dir_all(&project).unwrap();
++        let path = project.join(format!("{session}.jsonl"));
++        std::fs::write(
++            &path,
++            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
++        )
++        .unwrap();
++        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (outbox, events) = spawn(config(addr, Backoff::default()));
++        let mut claude = claude(Hub::Link(outbox), Some(events));
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
++            .await;
++        assert_eq!(claude.recv().await["id"], 0);
++        claude
++            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
++            .await;
++        let (mut reader, mut write) = raw_hub(&listener).await;
++        wire::write_msg(
++            &mut write,
++            &HubMsg::TranscriptRead {
++                session_id: session.into(),
++                path: path.to_string_lossy().into_owned(),
++                from: Some(0),
++            },
++        )
++        .await
++        .unwrap();
++        match agent_line(&mut reader).await {
++            AgentMsg::TranscriptChunk {
++                from: 0,
++                to,
++                lines,
++                missing: false,
++                ..
++            } => {
++                assert_eq!(to, std::fs::metadata(&path).unwrap().len());
++                assert_eq!(
++                    lines[0].items,
++                    [wire::StreamItem::Prompt {
++                        text: "hello".into()
++                    }]
++                );
++            }
++            other => panic!("{other:?}"),
++        }
++        // Claude Code saw nothing of it: the next line it gets is the answer
++        // to its own request.
++        claude
++            .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
++            .await;
++        assert_eq!(claude.recv().await["id"], 5);
++    }
++}
+diff --git a/crates/cctg/src/channel.rs b/crates/cctg/src/channel.rs
+--- a/crates/cctg/src/channel.rs
++++ b/crates/cctg/src/channel.rs
+@@ -202,7 +202,10 @@
+                 );
+                 self.emit(line)
+             }
+-            LinkEvent::Message(HubMsg::Registered | HubMsg::Rejected { .. }) => Vec::new(),
++            // Transcript reads are the agent loop's, not the channel's.
++            LinkEvent::Message(
++                HubMsg::Registered | HubMsg::Rejected { .. } | HubMsg::TranscriptRead { .. },
++            ) => Vec::new(),
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/api.rs b/crates/cctg/src/hub/api.rs
+--- a/crates/cctg/src/hub/api.rs
++++ b/crates/cctg/src/hub/api.rs
+@@ -270,6 +270,19 @@
+         decode(response).await
+     }
+ 
++    /// Replaces the bot's reaction on a message with one emoji from the Bot
++    /// API list (`👀`, `✍` are in it; bots set at most one reaction).
++    pub async fn set_message_reaction(&self, message_id: i64, emoji: &str) -> Result<(), ApiError> {
++        let body = json!({
++            "chat_id": self.chat_id,
++            "message_id": message_id,
++            "reaction": [{ "type": "emoji", "emoji": emoji }],
++        });
++        self.call::<IgnoredAny>("setMessageReaction", body, None)
++            .await
++            .map(drop)
++    }
++
+     pub async fn delete_message(&self, message_id: i64) -> Result<(), ApiError> {
+         let body = json!({ "chat_id": self.chat_id, "message_id": message_id });
+         self.call::<IgnoredAny>("deleteMessage", body, None)
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -633,6 +633,7 @@
+             cwd: "/w".into(),
+             claude_pid: None,
+             verdict_ack: false,
++            transcript_reads: false,
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/mod.rs b/crates/cctg/src/hub/mod.rs
+--- a/crates/cctg/src/hub/mod.rs
++++ b/crates/cctg/src/hub/mod.rs
+@@ -10,6 +10,7 @@
+ pub mod scheduler;
+ pub mod sessions;
+ pub mod slots;
++pub mod stream;
+ pub mod subagents;
+ #[cfg(test)]
+ pub(crate) mod testdir;
+diff --git a/crates/cctg/src/hub/registry.rs b/crates/cctg/src/hub/registry.rs
+--- a/crates/cctg/src/hub/registry.rs
++++ b/crates/cctg/src/hub/registry.rs
+@@ -319,6 +319,38 @@
+     /// The `⇣ nested` block of a nested run in its parent's topic.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub block: Option<Block>,
++    /// The live transcript stream of a top-level session (TASK-016).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub stream: Option<Stream>,
++}
++
++/// What survives a restart of a session's transcript stream.
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Stream {
++    /// Transcript bytes whose stream messages Telegram has answered (the
++    /// next read after a restart starts here). `None`: nothing read yet;
++    /// the first read starts at the end of the file, so a session resumed
++    /// from before the hub knew it does not replay its history.
++    #[serde(default)]
++    pub offset: Option<u64>,
++    /// Tool calls read before `offset` whose line waits for its result.
++    #[serde(default)]
++    pub calls: Vec<PendingCall>,
++    /// Telegram messages handed to the session's agent that show 👀 and wait
++    /// for their channel record to turn ✍.
++    #[serde(default)]
++    pub receipts: Vec<i64>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct PendingCall {
++    pub id: String,
++    /// The `/brief` line of the call.
++    pub line: String,
++    /// End of the line with its result, once read; the call is forgotten
++    /// when `offset` passes it.
++    #[serde(default)]
++    pub result_end: Option<u64>,
+ }
+ 
+ /// A subagent matched to an `Agent` call of its parent: it has a block in
+@@ -736,6 +768,7 @@
+                 agent: None,
+                 waiting: false,
+                 block: None,
++                stream: None,
+             });
+         entry.kind = kind.clone();
+         entry.slot = slot;
+@@ -747,6 +780,15 @@
+         }
+         if claude_pid.is_some() {
+             entry.claude_pid = claude_pid;
++        }
++        if kind == SessionKind::TopLevel && entry.stream.is_none() {
++            // A new transcript is streamed from its first byte; any other
++            // start of a session the stream never saw begins at the end.
++            let fresh = matches!(source, Some("startup" | "clear"));
++            entry.stream = Some(Stream {
++                offset: fresh.then_some(0),
++                ..Stream::default()
++            });
+         }
+         if let SessionKind::Nested { parent: Some(_) } = &kind
+             && slot.is_some()
+@@ -2383,6 +2425,39 @@
+     }
+ 
+     #[test]
++    fn a_new_transcript_streams_from_its_start_and_a_resume_keeps_its_offset() {
++        let mut registry = Registry::default();
++        registry.apply_hook(&start("s1", "/w", Some(1), None));
++        let offset = |registry: &Registry, id: &str| {
++            registry.sessions[id]
++                .stream
++                .as_ref()
++                .map(|stream| stream.offset)
++        };
++        assert_eq!(offset(&registry, "s1"), Some(Some(0)));
++        registry
++            .sessions
++            .get_mut("s1")
++            .unwrap()
++            .stream
++            .as_mut()
++            .unwrap()
++            .offset = Some(420);
++        registry.apply_hook(&end("s1"));
++        registry.apply_hook(&start_from("s1", "/w", Some(2), None, "resume"));
++        assert_eq!(offset(&registry, "s1"), Some(Some(420)));
++        // A resume the hub never saw starts at the end of the file.
++        registry.apply_hook(&start_from("s2", "/w", Some(3), None, "resume"));
++        assert_eq!(offset(&registry, "s2"), Some(None));
++        // Nested runs are not streamed.
++        registry.apply_hook(&start("s3", "/w", Some(4), Some(3)));
++        assert_eq!(offset(&registry, "s3"), None);
++        let bytes = RegistryStore::encode(&registry);
++        let back: Registry = serde_json::from_slice(&bytes).unwrap();
++        assert_eq!(offset(&back, "s1"), Some(Some(420)));
++    }
++
++    #[test]
+     fn a_resumed_session_returns_to_its_slot() {
+         let mut registry = Registry::default();
+         let mut topic = 100;
+diff --git a/crates/cctg/src/hub/scheduler.rs b/crates/cctg/src/hub/scheduler.rs
+--- a/crates/cctg/src/hub/scheduler.rs
++++ b/crates/cctg/src/hub/scheduler.rs
+@@ -2,11 +2,20 @@
+ //!
+ //! Queues, checked in this order on every pick:
+ //! 1. a permission prompt from `Message` that has no older message of its topic
+-//!    queued; metered.
+-//! 2. `Edit` - `editMessageText` (coalesced per message) and `answerCallbackQuery`.
++//!    queued (stream lines do not count); metered.
++//! 2. `Edit` - `editMessageText` and `setMessageReaction` (both coalesced per
++//!    message) and `answerCallbackQuery`.
+ //! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`.
+-//! 4. `Message` - `sendMessage`, `sendDocument`; metered, one FIFO. Permission
+-//!    prompts live here too, so they never overtake their own topic.
++//! 4. `Message` - `sendMessage`, `sendDocument` and transcript stream lines;
++//!    metered, one FIFO. Permission prompts live here too, so they never
++//!    overtake their own topic's ordinary messages; they do overtake its
++//!    stream lines.
++//!
++//! Stream lines marked `merge` (one tool call each) go out one per message
++//! while the group budget has room. When more messages wait than there are
++//! tokens, the head line takes the lines of its topic queued right after it
++//! (up to the first other message of that topic) into one message, in order,
++//! while it fits Telegram's limit.
+ //!
+ //! A ready ordinary message is served after a bounded run of unmetered jobs,
+ //! while a ready permission prompt always remains first.
+@@ -67,6 +76,19 @@
+         name: Option<String>,
+         icon_custom_emoji_id: Option<String>,
+     },
++    /// A message of the live transcript stream (TASK-016). `merge`: a one-line
++    /// tool call that may share a message with the lines queued after it.
++    Stream {
++        thread_id: i64,
++        text: String,
++        merge: bool,
++    },
++    /// `setMessageReaction` with one emoji; a newer one for the same message
++    /// replaces a queued one.
++    React {
++        message_id: i64,
++        emoji: String,
++    },
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -80,15 +102,27 @@
+ impl Op {
+     fn lane(&self) -> Lane {
+         match self {
+-            Op::Send { .. } | Op::SendDocument { .. } => Lane::Message(0),
+-            Op::Edit { .. } | Op::AnswerCallback { .. } => Lane::Edit,
++            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => Lane::Message(0),
++            Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit,
+             Op::Delete { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => Lane::Topic,
+         }
+     }
+ 
+     /// Only new messages count against the group message limit.
+     fn metered(&self) -> bool {
+-        matches!(self, Op::Send { .. } | Op::SendDocument { .. })
++        matches!(
++            self,
++            Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. }
++        )
++    }
++
++    /// The topic of a new message.
++    fn thread(&self) -> Option<Option<i64>> {
++        match self {
++            Op::Send { thread_id, .. } | Op::SendDocument { thread_id, .. } => Some(*thread_id),
++            Op::Stream { thread_id, .. } => Some(Some(*thread_id)),
++            _ => None,
++        }
+     }
+ }
+ 
+@@ -99,6 +133,9 @@
+     Done,
+     /// A newer edit of the same message replaced this one before it was sent.
+     Superseded,
++    /// This stream line went out inside the message of an earlier line of its
++    /// topic, which got the actual answer.
++    Merged,
+ }
+ 
+ pub type Delivery = Result<Outcome, ApiError>;
+@@ -158,6 +195,16 @@
+                 .edit_forum_topic(*thread_id, name.as_deref(), icon_custom_emoji_id.as_deref())
+                 .await
+                 .map(|()| Outcome::Done),
++            Op::Stream {
++                thread_id, text, ..
++            } => self
++                .send_message(Some(*thread_id), text, None)
++                .await
++                .map(Outcome::Sent),
++            Op::React { message_id, emoji } => self
++                .set_message_reaction(*message_id, emoji)
++                .await
++                .map(|()| Outcome::Done),
+         }
+     }
+ }
+@@ -232,6 +279,8 @@
+ struct Job {
+     op: Op,
+     reply: oneshot::Sender<Delivery>,
++    /// Stream lines sent inside this job's message.
++    merged: Vec<oneshot::Sender<Delivery>>,
+ }
+ 
+ /// Cloneable handle that enqueues outbound operations.
+@@ -247,7 +296,14 @@
+         let (reply, receiver) = oneshot::channel();
+         // A send error drops the job and its reply sender, so the receiver
+         // reports the stopped scheduler by itself.
+-        let _ = self.tx.send(Job { op, reply }).await;
++        let _ = self
++            .tx
++            .send(Job {
++                op,
++                reply,
++                merged: Vec::new(),
++            })
++            .await;
+         receiver
+     }
+ }
+@@ -337,6 +393,7 @@
+                     ..
+                 } => (*thread_id, *permission),
+                 Op::SendDocument { thread_id, .. } => (*thread_id, false),
++                // Stream lines yield to a prompt of their own topic.
+                 _ => continue,
+             };
+             if permission && !busy_topics.contains(&thread_id) {
+@@ -348,6 +405,22 @@
+     }
+ 
+     fn enqueue(&mut self, job: Job) {
++        if let Op::React { message_id, emoji } = &job.op
++            && let Some(queued) = self.edit.iter_mut().find(
++                |queued| matches!(queued.op, Op::React { message_id: id, .. } if id == *message_id),
++            )
++        {
++            if let Op::React {
++                emoji: queued_emoji,
++                ..
++            } = &mut queued.op
++            {
++                queued_emoji.clone_from(emoji);
++            }
++            let superseded = std::mem::replace(&mut queued.reply, job.reply);
++            let _ = superseded.send(Ok(Outcome::Superseded));
++            return;
++        }
+         if let Op::Edit {
+             message_id,
+             text,
+@@ -413,9 +486,12 @@
+             Lane::Message(index) => index,
+             Lane::Edit | Lane::Topic => 0,
+         };
+-        let Some(job) = self.lane_mut(lane).remove(index) else {
++        let Some(mut job) = self.lane_mut(lane).remove(index) else {
+             return;
+         };
++        if matches!(lane, Lane::Message(_)) {
++            self.merge_lines(&mut job, Instant::now());
++        }
+         if job.op.metered() {
+             self.bucket.take(Instant::now());
+             self.consecutive_unmetered = 0;
+@@ -433,7 +509,55 @@
+             }
+             result => {
+                 let _ = job.reply.send(result);
+-            }
++                for merged in job.merged {
++                    let _ = merged.send(Ok(Outcome::Merged));
++                }
++            }
++        }
++    }
++
++    /// Joins the stream lines of `job`'s topic queued right after it into
++    /// its text when more messages wait than the bucket has tokens.
++    fn merge_lines(&mut self, job: &mut Job, now: Instant) {
++        let Op::Stream {
++            thread_id,
++            text,
++            merge: true,
++        } = &mut job.op
++        else {
++            return;
++        };
++        self.bucket.refill(now);
++        if (self.message.len() + 1) as f64 <= self.bucket.tokens {
++            return;
++        }
++        let mut index = 0;
++        while index < self.message.len() {
++            let queued = &self.message[index].op;
++            if queued.thread() != Some(Some(*thread_id)) {
++                index += 1;
++                continue;
++            }
++            let Op::Stream {
++                text: next,
++                merge: true,
++                ..
++            } = queued
++            else {
++                break;
++            };
++            if transcript::telegram_len(text) + 1 + transcript::telegram_len(next)
++                > transcript::TELEGRAM_TEXT_LIMIT
++            {
++                break;
++            }
++            text.push('\n');
++            text.push_str(next);
++            let Some(next) = self.message.remove(index) else {
++                break;
++            };
++            job.merged.push(next.reply);
++            job.merged.extend(next.merged);
+         }
+     }
+ }
+@@ -493,7 +617,9 @@
+             }
+             Ok(match op {
+                 Op::CreateTopic { .. } => Outcome::Topic(ForumTopic::default()),
+-                Op::Send { .. } | Op::SendDocument { .. } => Outcome::Sent(Message::default()),
++                Op::Send { .. } | Op::SendDocument { .. } | Op::Stream { .. } => {
++                    Outcome::Sent(Message::default())
++                }
+                 _ => Outcome::Done,
+             })
+         }
+@@ -850,4 +976,140 @@
+         assert!(matches!(receiver.await, Ok(Ok(Outcome::Sent(_)))));
+         assert!(handle.await.is_ok());
+     }
+-}
++
++    fn line(thread: i64, text: &str) -> Op {
++        Op::Stream {
++            thread_id: thread,
++            text: text.to_owned(),
++            merge: true,
++        }
++    }
++
++    fn sent_texts(fake: &Fake, thread: i64) -> Vec<String> {
++        fake.calls()
++            .iter()
++            .filter_map(|call| match &call.op {
++                Op::Stream {
++                    thread_id, text, ..
++                } if *thread_id == thread => Some(text.clone()),
++                Op::Send {
++                    thread_id: Some(t),
++                    text,
++                    ..
++                } if *t == thread => Some(text.clone()),
++                _ => None,
++            })
++            .collect()
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn stream_lines_go_one_per_message_while_the_budget_has_room() {
++        let fake = Fake::new(&[]);
++        let ops = vec![line(1, "a ✓"), line(1, "b ✓"), line(1, "c ✓")];
++        let results = run(&fake, ops).await;
++        assert!(results.iter().all(|r| matches!(r, Ok(Outcome::Sent(_)))));
++        assert_eq!(sent_texts(&fake, 1), ["a ✓", "b ✓", "c ✓"]);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn stream_lines_held_back_by_the_limit_merge_in_order_without_loss() {
++        let fake = Fake::new(&[]);
++        let mut ops: Vec<Op> = (0..20).map(|i| line(1, &format!("t1-{i}"))).collect();
++        ops.push(send(1, "answer"));
++        ops.extend((20..30).map(|i| line(1, &format!("t1-{i}"))));
++        ops.extend((0..5).map(|i| line(2, &format!("t2-{i}"))));
++        let count = ops.len();
++        let results = run(&fake, ops).await;
++        assert_eq!(results.len(), count, "every line got an answer");
++        assert!(
++            results
++                .iter()
++                .all(|r| matches!(r, Ok(Outcome::Sent(_) | Outcome::Merged)))
++        );
++        let topic: Vec<String> = sent_texts(&fake, 1);
++        assert!(topic.len() < 21, "lines were merged: {topic:?}");
++        let lines: Vec<&str> = topic.iter().flat_map(|text| text.split('\n')).collect();
++        let mut want: Vec<String> = (0..20).map(|i| format!("t1-{i}")).collect();
++        want.push("answer".to_owned());
++        want.extend((20..30).map(|i| format!("t1-{i}")));
++        assert_eq!(lines, want, "same lines, same order");
++        // Nothing merges across the ordinary message of the topic.
++        assert!(topic.contains(&"answer".to_owned()), "{topic:?}");
++        let other: Vec<&str> = sent_texts(&fake, 2)
++            .iter()
++            .flat_map(|text| text.split('\n').map(str::to_owned).collect::<Vec<_>>())
++            .map(|line| {
++                if line.starts_with("t2-") {
++                    "ok"
++                } else {
++                    "wrong"
++                }
++            })
++            .collect();
++        assert_eq!(other, ["ok"; 5]);
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_merged_message_stays_within_the_telegram_limit() {
++        let fake = Fake::new(&[]);
++        let long = "x".repeat(1500);
++        let ops: Vec<Op> = (0..12).map(|_| line(1, &long)).collect();
++        run(&fake, ops).await;
++        let topic = sent_texts(&fake, 1);
++        assert!(
++            topic
++                .iter()
++                .all(|text| transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT)
++        );
++        assert_eq!(
++            topic
++                .iter()
++                .map(|text| text.split('\n').count())
++                .sum::<usize>(),
++            12
++        );
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_permission_prompt_overtakes_the_stream_lines_of_its_topic() {
++        let fake = Fake::new(&[]);
++        let mut ops: Vec<Op> = (0..8)
++            .map(|i| Op::Stream {
++                thread_id: 1,
++                text: format!("s{i}"),
++                merge: false,
++            })
++            .collect();
++        ops.push(permission(1, "prompt"));
++        run(&fake, ops).await;
++        assert_eq!(texts(&fake)[0], "prompt");
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn reactions_are_unmetered_and_the_newest_one_per_message_wins() {
++        let fake = Fake::new(&[]);
++        let react = |id: i64, emoji: &str| Op::React {
++            message_id: id,
++            emoji: emoji.to_owned(),
++        };
++        let mut ops: Vec<Op> = (0..6).map(|i| send(1, &format!("m{i}"))).collect();
++        ops.extend([react(5, "👀"), react(6, "👀"), react(5, "✍")]);
++        let results = run(&fake, ops).await;
++        assert!(matches!(results[6], Ok(Outcome::Superseded)));
++        let reacts: Vec<(i64, String, Duration)> = fake
++            .calls()
++            .iter()
++            .filter_map(|call| match &call.op {
++                Op::React { message_id, emoji } => Some((*message_id, emoji.clone(), call.at)),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            reacts,
++            [
++                (5, "✍".to_owned(), Duration::ZERO),
++                (6, "👀".to_owned(), Duration::ZERO)
++            ]
++        );
++    }
++}
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -33,6 +33,14 @@
+ //! `SubagentStop`. A nested `claude -p` gets one `⇣ nested` block. A reply to
+ //! a subagent block reaches the parent's agent with meta `target_agent`.
+ //!
++//! The live transcript stream (see [`stream`]): the agent of the slot's
++//! current session reads its transcript on request and the actor turns the
++//! events into topic messages (terminal prompts, text before tool calls, one
++//! line per finished tool call) on the stream lane of the scheduler, after the
++//! session separator. A turn's answer waits for the lines read after its
++//! `Stop` (bounded by `Options::hold_answer`). A message handed to an agent
++//! gets 👀, and ✍ once its own channel record shows up in the transcript.
++//!
+ //! Logs carry short session ids, slot ordinals and fixed text; never a path,
+ //! a folder, a title or message text.
+ 
+@@ -53,12 +61,13 @@
+     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, TopicJob, TopicView,
+ };
+ use super::scheduler::{Delivery, Op, Outbox, Outcome};
++use super::stream::{self, Held, Live};
+ use super::subagents::{
+     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
+ };
+ use super::updates::{CallbackInput, Inbound};
+ use crate::channel::is_request_id;
+-use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest};
++use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest, StreamLine};
+ 
+ /// A transcript is scanned line by line for its first ai-title up to this
+ /// many bytes (the same cap as `/brief`).
+@@ -73,6 +82,8 @@
+ pub const MAX_BLOCK_JOBS: usize = 16;
+ /// Subagent files read at a time for block texts (each up to 64 MiB).
+ const MAX_BODY_READS: usize = 2;
++/// A transcript read the agent has not answered by then is asked again.
++const READ_TIMEOUT: Duration = Duration::from_secs(10);
+ pub const OFFLINE_NOTICE: &str = "Сессия этой темы не на связи, сообщение не доставлено.";
+ pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
+ 
+@@ -95,6 +106,10 @@
+     pub correlate_for: Duration,
+     /// First pause before the parent transcript is looked at again; it doubles.
+     pub recheck_after: Duration,
++    /// How often the agent of a streamed session is asked for new lines.
++    pub stream_every: Duration,
++    /// Longest wait of a turn answer for the stream lines read after its `Stop`.
++    pub hold_answer: Duration,
+ }
+ 
+ impl Default for Options {
+@@ -109,6 +124,10 @@
+             retry_every: Duration::from_secs(60),
+             correlate_for: Duration::from_secs(60),
+             recheck_after: Duration::from_secs(1),
++            // Records show up in the jsonl ~0.1-0.3 s after their timestamp
++            // (TASK-016 measurement); a read is one small link round trip.
++            stream_every: Duration::from_millis(300),
++            hold_answer: Duration::from_millis(1500),
+         }
+     }
+ }
+@@ -170,6 +189,12 @@
+         job: BlockJob,
+         delivery: Option<Delivery>,
+     },
++    /// A stream message of `session`, by its number in [`Live`].
++    Stream {
++        session: String,
++        number: u64,
++    },
++    Reaction(Option<Delivery>),
+ }
+ 
+ /// A job for the dispatch task.
+@@ -182,6 +207,8 @@
+     PromptEdit(u64),
+     Callback,
+     Block(BlockJob),
++    Stream { session: String, number: u64 },
++    Reaction,
+ }
+ 
+ fn short(session_id: &str) -> &str {
+@@ -278,6 +305,8 @@
+     to_agent: mpsc::Sender<HubMsg>,
+     /// It acknowledges permission verdicts ([`crate::wire::Register::verdict_ack`]).
+     acks: bool,
++    /// It answers transcript reads ([`crate::wire::Register::transcript_reads`]).
++    reads: bool,
+ }
+ 
+ pub struct Slots {
+@@ -312,6 +341,9 @@
+     bodies_reading: HashSet<String>,
+     /// Block jobs handed out and not answered, at most [`MAX_BLOCK_JOBS`].
+     block_jobs: usize,
++    /// Live transcript streams by session.
++    streams: HashMap<String, Live>,
++    reaction_warned: bool,
+     grace_until: Instant,
+     next_retry: Instant,
+     done_tx: mpsc::UnboundedSender<Done>,
+@@ -364,6 +396,8 @@
+             bodies_waiting: BTreeMap::new(),
+             bodies_reading: HashSet::new(),
+             block_jobs: 0,
++            streams: HashMap::new(),
++            reaction_warned: false,
+             grace_until: now + options.grace,
+             next_retry: now + options.retry_every,
+             done_tx,
+@@ -403,9 +437,21 @@
+             self.next_retry
+         };
+         // A session whose transcript is being read wakes the actor anyway.
+-        self.candidates
++        let deadline = self
++            .candidates
+             .next_due(|session| self.indexing.contains(session))
+-            .map_or(deadline, |due| deadline.min(due))
++            .map_or(deadline, |due| deadline.min(due));
++        self.streams
++            .values()
++            .flat_map(|live| {
++                let read = match live.reading {
++                    Some((_, sent)) => Some(sent + READ_TIMEOUT),
++                    None => live.next_read,
++                };
++                read.into_iter()
++                    .chain(live.held.as_ref().map(|held| held.until))
++            })
++            .fold(deadline, Instant::min)
+     }
+ 
+     fn on_agent(&mut self, event: AgentEvent) {
+@@ -439,6 +485,7 @@
+                         claude_pid: register.claude_pid,
+                         to_agent,
+                         acks: register.verdict_ack,
++                        reads: register.transcript_reads,
+                     },
+                 );
+                 // A link that came back takes the answers that wait for it.
+@@ -462,7 +509,17 @@
+                         self.on_verdict_ack(conn, &session, verdict_id);
+                     }
+                     AgentMsg::Reply { text } => self.on_reply_for(conn, &session, &text),
+-                    _ => debug!(conn, "agent message not routed yet"),
++                    AgentMsg::TranscriptChunk {
++                        session_id,
++                        from,
++                        to,
++                        lines,
++                        missing,
++                        more,
++                    } if session_id == session => {
++                        self.on_chunk(&session, from, to, &lines, missing, more);
++                    }
++                    _ => debug!(conn, "agent message not routed"),
+                 }
+             }
+             AgentEvent::Disconnected { conn } => {
+@@ -958,6 +1015,16 @@
+         if sent {
+             // Delivered: the next failure starts a new episode and is told at once.
+             self.notices.remove(&(slot, OFFLINE_NOTICE));
++            if let Some(stream) = self
++                .registry
++                .sessions
++                .get_mut(&session)
++                .and_then(|entry| entry.stream.as_mut())
++            {
++                stream::receipt(stream, input.message_id);
++                self.registry.dirty = true;
++            }
++            self.react(input.message_id, stream::ACCEPTED);
+             info!(
+                 ordinal,
+                 session = short(&session),
+@@ -1029,6 +1096,22 @@
+             );
+             return;
+         };
++        if let Some(live) = self.streams.get_mut(session) {
++            // The lines of this turn that are not read yet go first.
++            let earlier = live.held.take();
++            let after = live.requests + 1;
++            live.held = Some(Held {
++                thread_id,
++                answer: answer.to_owned(),
++                after,
++                until: Instant::now() + self.options.hold_answer,
++            });
++            live.next_read = Some(Instant::now());
++            if let Some(earlier) = earlier {
++                self.release(session, earlier);
++            }
++            return;
++        }
+         if let Some(parts) = self.send_text(thread_id, session, answer, "answer") {
+             info!(
+                 ordinal,
+@@ -1036,6 +1119,247 @@
+                 parts,
+                 "turn answer queued"
+             );
++        }
++    }
++
++    fn release(&mut self, session: &str, held: Held) {
++        if let Some(parts) = self.send_text(held.thread_id, session, &held.answer, "answer") {
++            info!(session = short(session), parts, "turn answer queued");
++        }
++    }
++
++    /// Sets the bot's reaction on a topic message; failures are only logged.
++    fn react(&self, message_id: i64, emoji: &str) {
++        self.hand_off(
++            Work::Reaction,
++            Op::React {
++                message_id,
++                emoji: emoji.to_owned(),
++            },
++        );
++    }
++
++    /// Where the stream of `session` goes, when it may go on now: the live
++    /// top-level current session of a slot whose topic exists and whose
++    /// session separator is out, with a bound agent that reads transcripts.
++    fn stream_target(&self, session: &str) -> Option<(u64, String)> {
++        let slot = self.current_slot(session)?;
++        let slot = self.registry.slot(slot)?;
++        if slot.topic_id.is_none() || slot.pending_separator.is_some() {
++            return None;
++        }
++        let entry = self.registry.sessions.get(session)?;
++        entry.stream.as_ref()?;
++        if entry.transcript_path.is_empty() {
++            return None;
++        }
++        let conn = entry.agent?;
++        let bound = self.conns.get(&conn)?;
++        (bound.reads && bound.session == session).then(|| (conn, entry.transcript_path.clone()))
++    }
++
++    /// Asks the agents of streamed sessions for new lines, releases held
++    /// answers that waited long enough and forgets the streams of sessions
++    /// that are over once nothing of theirs waits for Telegram.
++    fn pump_streams(&mut self) {
++        let now = Instant::now();
++        let mut sessions: HashSet<String> = self
++            .conns
++            .values()
++            .map(|bound| bound.session.clone())
++            .collect();
++        sessions.extend(self.streams.keys().cloned());
++        for session in sessions {
++            if self.current_slot(&session).is_none() {
++                let Some(live) = self.streams.get_mut(&session) else {
++                    continue;
++                };
++                let held = live.held.take();
++                let idle = live.unanswered() == 0;
++                if let Some(held) = held {
++                    self.release(&session, held);
++                }
++                if idle {
++                    self.streams.remove(&session);
++                }
++                continue;
++            }
++            let target = self.stream_target(&session);
++            if target.is_none() && !self.streams.contains_key(&session) {
++                continue;
++            }
++            let offset = self
++                .registry
++                .sessions
++                .get(&session)
++                .and_then(|entry| entry.stream.as_ref())
++                .and_then(|stream| stream.offset);
++            let live = self
++                .streams
++                .entry(session.clone())
++                .or_insert_with(|| Live::new(offset));
++            if let Some((_, sent)) = live.reading
++                && now >= sent + READ_TIMEOUT
++            {
++                debug!(
++                    session = short(&session),
++                    "transcript read not answered; asking again"
++                );
++                live.reading = None;
++            }
++            let released = live
++                .held
++                .as_ref()
++                .is_some_and(|held| now >= held.until || target.is_none())
++                .then(|| live.held.take())
++                .flatten();
++            if let Some(held) = released {
++                self.release(&session, held);
++            }
++            let Some((conn, path)) = target else {
++                continue;
++            };
++            let Some(live) = self.streams.get_mut(&session) else {
++                continue;
++            };
++            let due = live.next_read.is_none_or(|at| now >= at);
++            if live.reading.is_some() || !due || live.unanswered() >= stream::MAX_WAITING {
++                continue;
++            }
++            let read = HubMsg::TranscriptRead {
++                session_id: session.clone(),
++                path,
++                from: live.read_at,
++            };
++            let asked = self
++                .conns
++                .get(&conn)
++                .is_some_and(|bound| bound.to_agent.try_send(read).is_ok());
++            if asked {
++                live.requests += 1;
++                live.reading = Some((live.requests, now));
++            } else {
++                live.next_read = Some(now + self.options.stream_every);
++            }
++        }
++    }
++
++    /// One answered transcript read: its messages go to the topic in order,
++    /// its reactions out, a held answer after them.
++    fn on_chunk(
++        &mut self,
++        session: &str,
++        from: u64,
++        to: u64,
++        lines: &[StreamLine],
++        missing: bool,
++        more: bool,
++    ) {
++        let now = Instant::now();
++        let every = self.options.stream_every;
++        let thread_id = self
++            .current_slot(session)
++            .and_then(|slot| self.registry.slot(slot))
++            .and_then(|slot| slot.topic_id);
++        let Some(live) = self.streams.get_mut(session) else {
++            return;
++        };
++        let Some((number, _)) = live.reading.take() else {
++            debug!(
++                session = short(session),
++                "transcript chunk nobody asked for; dropped"
++            );
++            return;
++        };
++        live.next_read = Some(now + every);
++        let Some(thread_id) = thread_id else {
++            return;
++        };
++        if live.read_at.is_some_and(|at| at != from) || to < from {
++            debug!(
++                session = short(session),
++                "transcript chunk out of place; asking again"
++            );
++            live.next_read = Some(now);
++            return;
++        }
++        if missing {
++            if !live.missing_warned {
++                live.missing_warned = true;
++                warn!(
++                    session = short(session),
++                    "session transcript not found; the stream waits for it"
++                );
++            }
++        } else {
++            live.missing_warned = false;
++            let Some(stream) = self
++                .registry
++                .sessions
++                .get_mut(session)
++                .and_then(|entry| entry.stream.as_mut())
++            else {
++                return;
++            };
++            if stream.offset.is_none() {
++                stream.offset = Some(from);
++                self.registry.dirty = true;
++            }
++            let applied = stream::apply(stream, lines);
++            // Idle reads change nothing worth a registry write.
++            self.registry.dirty |= !lines.is_empty();
++            for out in applied.messages {
++                let split = split_for_telegram(&out.text, SplitOptions::default());
++                let merge = out.merge && split.chunks.len() == 1;
++                for text in split.chunks {
++                    let work = Work::Stream {
++                        session: session.to_owned(),
++                        number: live.sent(out.end),
++                    };
++                    let op = Op::Stream {
++                        thread_id,
++                        text,
++                        merge,
++                    };
++                    if self.dispatch.send((work, op)).is_err() {
++                        debug!("dispatch task stopped; job dropped");
++                    }
++                }
++            }
++            live.read_at = Some(to);
++            live.read_up_to(to);
++            if more {
++                live.next_read = Some(now);
++            }
++            for message_id in applied.working {
++                self.react(message_id, stream::WORKING);
++            }
++            self.stream_answered(session);
++        }
++        let Some(live) = self.streams.get_mut(session) else {
++            return;
++        };
++        if live.held.as_ref().is_some_and(|held| number >= held.after)
++            && let Some(held) = live.held.take()
++        {
++            self.release(session, held);
++        }
++    }
++
++    /// Moves the persisted offset over what Telegram has answered.
++    fn stream_answered(&mut self, session: &str) {
++        let Some(offset) = self.streams.get_mut(session).and_then(Live::advance) else {
++            return;
++        };
++        if let Some(stream) = self
++            .registry
++            .sessions
++            .get_mut(session)
++            .and_then(|entry| entry.stream.as_mut())
++            && stream.offset != Some(offset)
++        {
++            stream::answered_up_to(stream, offset);
++            self.registry.dirty = true;
+         }
+     }
+ 
+@@ -1611,6 +1935,20 @@
+                 self.start_body_reads();
+             }
+             Done::Block { job, delivery } => self.on_block_done(job, delivery),
++            Done::Stream { session, number } => {
++                if let Some(live) = self.streams.get_mut(&session) {
++                    live.answered(number);
++                    self.stream_answered(&session);
++                }
++            }
++            Done::Reaction(delivery) => match delivery {
++                Some(Err(error)) if !self.reaction_warned => {
++                    self.reaction_warned = true;
++                    warn!(%error, "cannot set a message reaction; later failures are not logged");
++                }
++                Some(Err(error)) => debug!(%error, "message reaction not set"),
++                _ => {}
++            },
+         }
+     }
+ 
+@@ -1819,6 +2157,7 @@
+         }
+         self.send_prompts();
+         self.send_prompt_edits();
++        self.pump_streams();
+         let view = self.registry.topic_view();
+         self.view.send_if_modified(|current| {
+             let changed = **current != view;
+@@ -1864,6 +2203,8 @@
+                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
+                 Work::Callback => Done::Callback(delivery),
+                 Work::Block(job) => Done::Block { job, delivery },
++                Work::Stream { session, number } => Done::Stream { session, number },
++                Work::Reaction => Done::Reaction(delivery),
+             });
+         });
+     }
+@@ -1934,6 +2275,8 @@
+         stall_sends: bool,
+         /// The next sends reach Telegram but the answer cannot be read.
+         unclear_sends: Mutex<usize>,
++        /// Every reaction is refused (no such reaction in the chat).
++        react_error: bool,
+     }
+ 
+     impl Transport for Fake {
+@@ -1972,6 +2315,7 @@
+                     }),
+                     None => Ok(Outcome::Done),
+                 },
++                Op::React { .. } if self.react_error => error("Bad Request: REACTION_INVALID"),
+                 Op::Delete { .. } => match self.delete_error {
+                     Some(description) => error(description),
+                     None => Ok(Outcome::Done),
+@@ -2107,6 +2451,7 @@
+                 cwd: CWD.into(),
+                 claude_pid,
+                 verdict_ack,
++                transcript_reads: false,
+             };
+             self.agents
+                 .send(AgentEvent::Registered {
+@@ -2254,12 +2599,16 @@
+             }
+         }
+         assert!(received(&mut rig, 0).await.is_empty(), "A got nothing");
+-        assert_eq!(
+-            rig.fake.ops().len(),
+-            before,
+-            "no notice: {:?}",
+-            rig.fake.ops()
+-        );
++        // No notice; each delivered message only gets its 👀.
++        let ops = rig.fake.ops();
++        let after: Vec<(i64, &str)> = ops[before..]
++            .iter()
++            .map(|op| match op {
++                Op::React { message_id, emoji } => (*message_id, emoji.as_str()),
++                other => panic!("unexpected {other:?}"),
++            })
++            .collect();
++        assert_eq!(after, [(42, "👀"), (43, "👀")]);
+     }
+ 
+     #[tokio::test]
+@@ -2946,6 +3295,7 @@
+                 cwd: CWD.into(),
+                 claude_pid: Some(10),
+                 verdict_ack: false,
++                transcript_reads: false,
+             },
+             to_agent,
+         });
+@@ -3732,6 +4082,7 @@
+                 cwd: CWD.into(),
+                 claude_pid,
+                 verdict_ack: false,
++                transcript_reads: false,
+             },
+             to_agent,
+         });
+@@ -3790,6 +4141,7 @@
+                 cwd: CWD.into(),
+                 claude_pid: Some(10),
+                 verdict_ack: false,
++                transcript_reads: false,
+             },
+             to_agent,
+         });
+@@ -5449,4 +5801,442 @@
+             "{ops:?}"
+         );
+     }
++
++    // ---- Live transcript stream (TASK-016) ----
++
++    const FAST: BucketConfig = BucketConfig {
++        capacity: 1000,
++        refill_every: Duration::from_millis(1),
++        min_gap: Duration::ZERO,
++    };
++
++    fn stream_options() -> Options {
++        Options {
++            chat_id: CHAT,
++            stream_every: Duration::from_millis(20),
++            hold_answer: Duration::from_millis(400),
++            ..options()
++        }
++    }
++
++    /// A rig with a scheduler that never makes the stream wait.
++    fn stream_rig(fake: Fake, options: Options, dir: TempDir) -> Rig {
++        let fake = Arc::new(fake);
++        let store = RegistryStore::open(dir.path()).unwrap();
++        let registry = store.load().unwrap();
++        let (scheduler, outbox) = Scheduler::new(fake.clone(), FAST);
++        tokio::spawn(scheduler.run());
++        let (slots, view) = Slots::new(registry, store, outbox, options);
++        let (agents, agents_rx) = mpsc::channel(16);
++        let (hooks, hooks_rx) = mpsc::channel(16);
++        let (control, control_rx) = mpsc::unbounded_channel();
++        tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
++        Rig {
++            fake,
++            agents,
++            hooks,
++            control,
++            view,
++            dir,
++            _to_agent: Vec::new(),
++        }
++    }
++
++    /// `<dir>/projects/C--w/<session>.jsonl`, created empty.
++    fn transcript_file(dir: &TempDir, session: &str) -> String {
++        let project = dir.path().join("projects").join("C--w");
++        std::fs::create_dir_all(&project).unwrap();
++        let path = project.join(format!("{session}.jsonl"));
++        std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(&path)
++            .unwrap();
++        path.to_string_lossy().into_owned()
++    }
++
++    fn append(path: &str, text: &str) {
++        use std::io::Write;
++        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
++        file.write_all(text.as_bytes()).unwrap();
++    }
++
++    fn typed(text: &str) -> String {
++        format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n")
++    }
++
++    fn channel_record(message_id: i64) -> String {
++        format!(
++            "{{\"type\":\"user\",\"isMeta\":true,\"message\":{{\"role\":\"user\",\"content\":\"<channel source=\\\"cctg\\\" message_id=\\\"{message_id}\\\">hi</channel>\"}}}}\n"
++        )
++    }
++
++    fn tool_call(id: &str, description: &str) -> String {
++        format!(
++            "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"Bash\",\"input\":{{\"command\":\"x\",\"description\":\"{description}\"}}}}]}}}}\n"
++        )
++    }
++
++    fn tool_result(id: &str, error: Option<&str>) -> String {
++        format!(
++            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{id}\",\"content\":\"{}\",\"is_error\":{}}}]}}}}\n",
++            error.unwrap_or("ok"),
++            error.is_some()
++        )
++    }
++
++    fn start_with(session: &str, pid: u32, path: &str, source: &str) -> HookPost {
++        HookPost::new(
++            "box".into(),
++            session.into(),
++            CWD.into(),
++            path.into(),
++            HookEvent::SessionStart {
++                source: Some(source.into()),
++                claude_pid: Some(pid),
++                parent_claude_pid: None,
++            },
++        )
++    }
++
++    impl Rig {
++        /// An agent that answers transcript reads from the real file, like
++        /// `cctg agent` does, and keeps what else the hub sends it.
++        async fn reader(
++            &mut self,
++            conn: u64,
++            session: &str,
++            pid: u32,
++        ) -> mpsc::UnboundedReceiver<HubMsg> {
++            let (to_agent, mut from_hub) = mpsc::channel(16);
++            let (kept, kept_rx) = mpsc::unbounded_channel();
++            let agents = self.agents.clone();
++            tokio::spawn(async move {
++                while let Some(msg) = from_hub.recv().await {
++                    let HubMsg::TranscriptRead {
++                        session_id,
++                        path,
++                        from,
++                    } = msg
++                    else {
++                        let _ = kept.send(msg);
++                        continue;
++                    };
++                    let chunk = crate::tail::read_chunk(&session_id, &path, from);
++                    let event = AgentEvent::Message {
++                        conn,
++                        received_at: StdInstant::now(),
++                        msg: chunk,
++                    };
++                    if agents.send(event).await.is_err() {
++                        return;
++                    }
++                }
++            });
++            let register = Register {
++                session_id: session.into(),
++                host: "box".into(),
++                cwd: CWD.into(),
++                claude_pid: Some(pid),
++                verdict_ack: true,
++                transcript_reads: true,
++            };
++            self.agents
++                .send(AgentEvent::Registered {
++                    conn,
++                    register,
++                    to_agent,
++                })
++                .await
++                .unwrap();
++            kept_rx
++        }
++    }
++
++    /// Texts of new messages in `thread`, in order: sends and stream lines.
++    fn topic_texts(ops: &[Op], thread: i64) -> Vec<String> {
++        ops.iter()
++            .filter_map(|op| match op {
++                Op::Send {
++                    thread_id: Some(t),
++                    text,
++                    ..
++                }
++                | Op::Stream {
++                    thread_id: t, text, ..
++                } if *t == thread => Some(text.clone()),
++                _ => None,
++            })
++            .collect()
++    }
++
++    fn reactions(ops: &[Op]) -> Vec<(i64, String)> {
++        ops.iter()
++            .filter_map(|op| match op {
++                Op::React { message_id, emoji } => Some((*message_id, emoji.clone())),
++                _ => None,
++            })
++            .collect()
++    }
++
++    async fn stream_texts(rig: &Rig, thread: i64, want: usize) -> Vec<String> {
++        let ops = settled(rig, |ops| topic_texts(ops, thread).len() >= want).await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        let _ = ops;
++        topic_texts(&rig.fake.ops(), thread)
++    }
++
++    #[tokio::test]
++    async fn appended_lines_reach_the_slot_topic_in_order_and_a_partial_line_waits() {
++        let dir = TempDir::new("slots-stream-order");
++        let path = transcript_file(&dir, A);
++        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        let _kept = rig.reader(1, A, 10).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++
++        let second = tool_call("t2", "two");
++        append(&path, &typed("go"));
++        append(&path, &tool_call("t1", "one"));
++        append(&path, &tool_result("t1", None));
++        append(&path, &second[..20]);
++        let first = stream_texts(&rig, 100, 2).await;
++        assert_eq!(first, ["> go", "• Bash: one ✓"]);
++
++        // The rest of the cut line arrives: it is read whole, never lost.
++        append(&path, &second[20..]);
++        append(&path, &tool_result("t2", Some("boom")));
++        let all = stream_texts(&rig, 100, 3).await;
++        assert_eq!(all, ["> go", "• Bash: one ✓", "• Bash: two ✗ boom"]);
++    }
++
++    #[tokio::test]
++    async fn a_restart_neither_repeats_nor_loses_stream_lines() {
++        let dir = TempDir::new("slots-stream-restart");
++        let path = transcript_file(&dir, A);
++        let state = dir.path().to_path_buf();
++        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        let _kept = rig.reader(1, A, 10).await;
++        append(&path, &tool_call("t1", "one"));
++        append(&path, &tool_result("t1", None));
++        assert_eq!(stream_texts(&rig, 100, 1).await, ["• Bash: one ✓"]);
++        let saved = async {
++            loop {
++                let text = std::fs::read_to_string(state.join("registry.json")).unwrap_or_default();
++                let offset = serde_json::from_str::<serde_json::Value>(&text)
++                    .ok()
++                    .and_then(|v| v["sessions"][A]["stream"]["offset"].as_u64());
++                if offset == Some(std::fs::metadata(&path).unwrap().len()) {
++                    return;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::time::timeout(WAIT, saved)
++            .await
++            .expect("offset saved");
++
++        // The hub goes away; the session writes on meanwhile.
++        let Rig { dir, .. } = rig;
++        append(&path, &tool_call("t2", "two"));
++        append(&path, &tool_result("t2", None));
++        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
++        let _kept = rig.reader(2, A, 10).await;
++        let after = stream_texts(&rig, 100, 1).await;
++        assert_eq!(after, ["• Bash: two ✓"]);
++    }
++
++    #[tokio::test]
++    async fn a_new_session_in_the_slot_streams_after_its_one_separator() {
++        let dir = TempDir::new("slots-stream-rotation");
++        let first = transcript_file(&dir, A);
++        let second = transcript_file(&dir, B);
++        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
++        rig.hook(start_with(A, 10, &first, "startup")).await;
++        rig.ops_after(1).await;
++        let _a = rig.reader(1, A, 10).await;
++        append(&first, &typed("from A"));
++        assert_eq!(stream_texts(&rig, 100, 1).await, ["> from A"]);
++        rig.hook(hook(
++            A,
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: Some(10),
++            },
++        ))
++        .await;
++        append(&second, &typed("from B"));
++        rig.hook(start_with(B, 11, &second, "startup")).await;
++        let _b = rig.reader(2, B, 11).await;
++        let texts = stream_texts(&rig, 100, 3).await;
++        assert_eq!(
++            texts,
++            ["> from A", "── session bbbbbbbb · new ──", "> from B"]
++        );
++        assert_eq!(count(&rig.fake.ops(), is_create), 1);
++    }
++
++    #[tokio::test]
++    async fn eyes_on_hand_off_and_writing_only_for_the_same_messages_channel_record() {
++        let dir = TempDir::new("slots-stream-reactions");
++        let path = transcript_file(&dir, A);
++        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        let mut kept = rig.reader(1, A, 10).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        rig.control.send(say(Some(100), 42, Some("hi"))).unwrap();
++        settled(&rig, |ops| reactions(ops) == [(42, "👀".to_owned())]).await;
++        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
++
++        // A prompt typed in the terminal, its UserPromptSubmit and the channel
++        // record of a message this session never got change nothing.
++        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
++            .await;
++        append(&path, &typed("typed here"));
++        append(&path, &channel_record(41));
++        stream_texts(&rig, 100, 1).await;
++        assert_eq!(reactions(&rig.fake.ops()), [(42, "👀".to_owned())]);
++
++        append(&path, &channel_record(42));
++        let ops = settled(&rig, |ops| reactions(ops).len() == 2).await;
++        assert_eq!(
++            reactions(&ops),
++            [(42, "👀".to_owned()), (42, "✍".to_owned())]
++        );
++        // Its record again (a restart re-read) marks nothing twice.
++        append(&path, &channel_record(42));
++        append(&path, &typed("later"));
++        stream_texts(&rig, 100, 2).await;
++        assert_eq!(reactions(&rig.fake.ops()).len(), 2);
++    }
++
++    #[tokio::test]
++    async fn a_refused_reaction_never_stops_routing() {
++        let dir = TempDir::new("slots-stream-reaction-error");
++        let fake = Fake {
++            react_error: true,
++            ..Fake::default()
++        };
++        let path = transcript_file(&dir, A);
++        let mut rig = stream_rig(fake, stream_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        let mut kept = rig.reader(1, A, 10).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        for id in [1, 2] {
++            rig.control.send(say(Some(100), id, Some("m"))).unwrap();
++        }
++        for _ in 0..2 {
++            let got = tokio::time::timeout(WAIT, kept.recv()).await.unwrap();
++            assert!(matches!(got, Some(HubMsg::Inbound { .. })), "{got:?}");
++        }
++        append(&path, &typed("still streaming"));
++        assert_eq!(stream_texts(&rig, 100, 1).await, ["> still streaming"]);
++    }
++
++    #[tokio::test]
++    async fn a_turn_answer_follows_the_lines_read_after_its_stop() {
++        let dir = TempDir::new("slots-stream-hold");
++        let path = transcript_file(&dir, A);
++        let options = Options {
++            // Only the read the Stop asks for can find the lines in time.
++            stream_every: Duration::from_secs(3600),
++            hold_answer: Duration::from_secs(30),
++            ..stream_options()
++        };
++        let mut rig = stream_rig(Fake::default(), options, dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        let _kept = rig.reader(1, A, 10).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        append(&path, &tool_call("t1", "last step"));
++        append(&path, &tool_result("t1", None));
++        rig.hook(stop(A, Some("done"))).await;
++        assert_eq!(
++            stream_texts(&rig, 100, 2).await,
++            ["• Bash: last step ✓", "done"]
++        );
++    }
++
++    #[tokio::test]
++    async fn a_held_answer_goes_out_when_the_agent_never_answers() {
++        let dir = TempDir::new("slots-stream-hold-timeout");
++        let path = transcript_file(&dir, A);
++        let rig = stream_rig(Fake::default(), stream_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        // Registers as a reader but never reads.
++        let (to_agent, silent) = mpsc::channel(64);
++        rig.agents
++            .send(AgentEvent::Registered {
++                conn: 1,
++                register: Register {
++                    session_id: A.into(),
++                    host: "box".into(),
++                    cwd: CWD.into(),
++                    claude_pid: Some(10),
++                    verdict_ack: true,
++                    transcript_reads: true,
++                },
++                to_agent,
++            })
++            .await
++            .unwrap();
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        let asked = std::time::Instant::now();
++        rig.hook(stop(A, Some("done anyway"))).await;
++        assert_eq!(stream_texts(&rig, 100, 1).await, ["done anyway"]);
++        assert!(asked.elapsed() >= Duration::from_millis(300), "held first");
++        drop(silent);
++    }
++
++    #[tokio::test]
++    async fn an_agent_without_transcript_reads_is_never_asked() {
++        let dir = TempDir::new("slots-stream-old-agent");
++        let path = transcript_file(&dir, A);
++        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
++        rig.hook(start_with(A, 10, &path, "startup")).await;
++        rig.ops_after(1).await;
++        rig.agent_with(1, A, Some(10), true).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        append(&path, &typed("not streamed"));
++        rig.hook(stop(A, Some("answer at once"))).await;
++        assert_eq!(stream_texts(&rig, 100, 1).await, ["answer at once"]);
++        assert!(received(&mut rig, 0).await.is_empty());
++    }
++
++    #[tokio::test]
++    async fn idle_reads_do_not_rewrite_the_registry() {
++        let dir = TempDir::new("slots-stream-idle");
++        let path = transcript_file(&dir, A);
++        let mut slots = stalled_slots(&dir, stream_options());
++        slots.on_hook(&start_with(A, 10, &path, "startup"));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        let (to_agent, mut from_hub) = mpsc::channel(4);
++        slots.on_agent(AgentEvent::Registered {
++            conn: 1,
++            register: Register {
++                session_id: A.into(),
++                host: "box".into(),
++                cwd: CWD.into(),
++                claude_pid: Some(10),
++                verdict_ack: true,
++                transcript_reads: true,
++            },
++            to_agent,
++        });
++        slots.pump();
++        assert!(matches!(
++            from_hub.try_recv(),
++            Ok(HubMsg::TranscriptRead { from: Some(0), .. })
++        ));
++        slots.registry.dirty = false;
++        slots.on_chunk(A, 0, 0, &[], false, false);
++        assert!(!slots.registry.dirty, "an empty read wrote the registry");
++    }
+ }
+diff --git a/crates/cctg/src/hub/stream.rs b/crates/cctg/src/hub/stream.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/hub/stream.rs
+@@ -0,0 +1,348 @@
++//! Hub side of the live transcript stream (TASK-016).
++//!
++//! The session's agent reads the transcript on its own device and answers
++//! each `transcript_read` with the stream events of the complete lines it
++//! found ([`crate::tail`]). Here those events become topic messages: a
++//! terminal prompt as `> text`, assistant text before a tool call as is, and
++//! one line per tool call once its result is in (`• Bash: ... ✓`,
++//! `• Edit: ... ✗ error`). The final answer of a turn comes from the `Stop`
++//! hook, never from here. A Telegram message the agent handed to Claude
++//! turns 👀 -> ✍ when its own channel record shows up.
++//!
++//! Offsets: [`Stream::offset`] in the registry is the transcript byte up to
++//! which every message is answered by Telegram, so a hub restart re-reads
++//! only what may not have arrived (at most the messages in flight come
++//! twice) and never skips what was written meanwhile. [`Live`] keeps the
++//! in-memory read position ahead of it and the messages still waiting.
++
++use std::collections::VecDeque;
++
++use tokio::time::Instant;
++
++use super::registry::{PendingCall, Stream};
++use crate::wire::{StreamItem, StreamLine};
++
++/// Tool calls waiting for their result, per session; the oldest is dropped
++/// (its result then shows nothing).
++pub const MAX_CALLS: usize = 64;
++/// Telegram messages per session that wait for ✍.
++pub const MAX_RECEIPTS: usize = 32;
++/// Stream messages of a session waiting for Telegram; no further read until
++/// fewer wait. One chunk adds at most [`crate::tail::MAX_CHUNK_LINES`] lines.
++pub const MAX_WAITING: usize = 64;
++/// Reaction for a message handed to the session's agent.
++pub const ACCEPTED: &str = "👀";
++/// Reaction for a message Claude took into work (its channel record is in the
++/// transcript). Without U+FE0F, exactly as the Bot API lists it.
++pub const WORKING: &str = "✍";
++
++/// A message for the topic from the line that ends at `end`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Out {
++    pub end: u64,
++    pub text: String,
++    /// A tool call line: may share a message with the next ones.
++    pub merge: bool,
++}
++
++/// What one chunk asks of the actor.
++#[derive(Debug, Default, PartialEq, Eq)]
++pub struct Applied {
++    pub messages: Vec<Out>,
++    /// Telegram messages to mark ✍.
++    pub working: Vec<i64>,
++}
++
++/// Applies the lines of one chunk, read in order from the stream's position,
++/// to the persisted state.
++pub fn apply(stream: &mut Stream, lines: &[StreamLine]) -> Applied {
++    let answered = stream.offset.unwrap_or(0);
++    let mut applied = Applied::default();
++    for line in lines {
++        for item in &line.items {
++            let out = |text: String, merge: bool| Out {
++                end: line.end,
++                text,
++                merge,
++            };
++            match item {
++                StreamItem::Prompt { text } => {
++                    applied.messages.push(out(format!("> {text}"), false));
++                }
++                StreamItem::Note { text } => applied.messages.push(out(text.clone(), false)),
++                StreamItem::Channel { message_id } => {
++                    if let Some(at) = stream.receipts.iter().position(|id| id == message_id) {
++                        stream.receipts.remove(at);
++                        applied.working.push(*message_id);
++                    }
++                }
++                StreamItem::Call { id, line: call } => {
++                    if !stream.calls.iter().any(|known| known.id == *id) {
++                        if stream.calls.len() >= MAX_CALLS {
++                            stream.calls.remove(0);
++                        }
++                        stream.calls.push(PendingCall {
++                            id: id.clone(),
++                            line: call.clone(),
++                            result_end: None,
++                        });
++                    }
++                }
++                StreamItem::Result { id, error } => {
++                    // A result read again after a restart counts as long as
++                    // Telegram never answered its message.
++                    let Some(call) = stream.calls.iter_mut().find(|known| {
++                        known.id == *id && known.result_end.is_none_or(|end| end > answered)
++                    }) else {
++                        continue;
++                    };
++                    call.result_end = Some(line.end);
++                    let text = match error.as_deref() {
++                        None => format!("{} ✓", call.line),
++                        Some("") => format!("{} ✗", call.line),
++                        Some(error) => format!("{} ✗ {error}", call.line),
++                    };
++                    applied.messages.push(out(text, true));
++                }
++                StreamItem::Other => {}
++            }
++        }
++    }
++    applied
++}
++
++/// A message handed to the session's agent now shows 👀 and waits for ✍.
++pub fn receipt(stream: &mut Stream, message_id: i64) {
++    if stream.receipts.contains(&message_id) {
++        return;
++    }
++    if stream.receipts.len() >= MAX_RECEIPTS {
++        stream.receipts.remove(0);
++    }
++    stream.receipts.push(message_id);
++}
++
++/// Everything up to `offset` is answered: calls whose result is before it
++/// are done.
++pub fn answered_up_to(stream: &mut Stream, offset: u64) {
++    stream.offset = Some(offset);
++    stream
++        .calls
++        .retain(|call| call.result_end.is_none_or(|end| end > offset));
++}
++
++/// A turn answer held until the stream lines before it are handed out.
++#[derive(Debug)]
++pub struct Held {
++    pub thread_id: i64,
++    pub answer: String,
++    /// Goes out after the chunk of this request number.
++    pub after: u64,
++    pub until: Instant,
++}
++
++/// In-memory stream state of one session.
++#[derive(Debug, Default)]
++pub struct Live {
++    /// Next byte to ask the agent for; ahead of `Stream::offset` while
++    /// messages wait. `None`: the end of the file.
++    pub read_at: Option<u64>,
++    /// The request in flight: its number and when it went out.
++    pub reading: Option<(u64, Instant)>,
++    /// Requests sent so far.
++    pub requests: u64,
++    /// When to ask again.
++    pub next_read: Option<Instant>,
++    pub missing_warned: bool,
++    pub held: Option<Held>,
++    /// Handed out, oldest first: (number, end, answered). A read's end is an
++    /// answered entry of its own, so lines without messages move the offset.
++    waiting: VecDeque<(u64, u64, bool)>,
++    next: u64,
++}
++
++impl Live {
++    pub fn new(read_at: Option<u64>) -> Self {
++        Self {
++            read_at,
++            ..Self::default()
++        }
++    }
++
++    /// A message of the line ending at `end` goes to Telegram; its number.
++    pub fn sent(&mut self, end: u64) -> u64 {
++        self.next += 1;
++        self.waiting.push_back((self.next, end, false));
++        self.next
++    }
++
++    /// A chunk was read up to `to`.
++    pub fn read_up_to(&mut self, to: u64) {
++        self.next += 1;
++        self.waiting.push_back((self.next, to, true));
++    }
++
++    /// Telegram answered message `number`.
++    pub fn answered(&mut self, number: u64) {
++        if let Some(entry) = self.waiting.iter_mut().find(|entry| entry.0 == number) {
++            entry.2 = true;
++        }
++    }
++
++    /// Drops the answered head; the new answered offset if it moved.
++    pub fn advance(&mut self) -> Option<u64> {
++        let mut offset = None;
++        while let Some(&(_, end, true)) = self.waiting.front() {
++            offset = Some(end);
++            self.waiting.pop_front();
++        }
++        offset
++    }
++
++    /// Messages not answered yet.
++    pub fn unanswered(&self) -> usize {
++        self.waiting.iter().filter(|entry| !entry.2).count()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn line(end: u64, items: Vec<StreamItem>) -> StreamLine {
++        StreamLine { end, items }
++    }
++
++    fn call(id: &str, line: &str) -> StreamItem {
++        StreamItem::Call {
++            id: id.into(),
++            line: line.into(),
++        }
++    }
++
++    fn result(id: &str, error: Option<&str>) -> StreamItem {
++        StreamItem::Result {
++            id: id.into(),
++            error: error.map(str::to_owned),
++        }
++    }
++
++    fn texts(applied: &Applied) -> Vec<(u64, &str, bool)> {
++        applied
++            .messages
++            .iter()
++            .map(|out| (out.end, out.text.as_str(), out.merge))
++            .collect()
++    }
++
++    #[test]
++    fn a_call_line_goes_out_with_its_result_in_call_order() {
++        let mut stream = Stream {
++            offset: Some(0),
++            ..Stream::default()
++        };
++        let first = apply(
++            &mut stream,
++            &[
++                line(10, vec![StreamItem::Prompt { text: "go".into() }]),
++                line(
++                    20,
++                    vec![StreamItem::Note {
++                        text: "Running.".into(),
++                    }],
++                ),
++                line(30, vec![call("t1", "• Bash: one")]),
++                line(40, vec![call("t2", "• Edit: f.rs")]),
++                line(50, vec![result("t1", None)]),
++            ],
++        );
++        assert_eq!(
++            texts(&first),
++            [
++                (10, "> go", false),
++                (20, "Running.", false),
++                (50, "• Bash: one ✓", true)
++            ]
++        );
++        let second = apply(
++            &mut stream,
++            &[line(
++                60,
++                vec![result("t2", Some("not found")), result("t3", None)],
++            )],
++        );
++        assert_eq!(texts(&second), [(60, "• Edit: f.rs ✗ not found", true)]);
++        answered_up_to(&mut stream, 60);
++        assert!(stream.calls.is_empty());
++    }
++
++    #[test]
++    fn a_result_read_again_after_a_restart_goes_again_only_if_unanswered() {
++        let mut stream = Stream {
++            offset: Some(0),
++            ..Stream::default()
++        };
++        apply(&mut stream, &[line(10, vec![call("t1", "• Bash: a")])]);
++        apply(&mut stream, &[line(20, vec![result("t1", None)])]);
++        // The hub died before Telegram answered: the offset stayed at 10.
++        answered_up_to(&mut stream, 10);
++        let again = apply(&mut stream, &[line(20, vec![result("t1", None)])]);
++        assert_eq!(texts(&again), [(20, "• Bash: a ✓", true)]);
++        answered_up_to(&mut stream, 20);
++        let late = apply(&mut stream, &[line(20, vec![result("t1", None)])]);
++        assert!(late.messages.is_empty());
++    }
++
++    #[test]
++    fn only_a_received_message_turns_to_working_and_only_once() {
++        let mut stream = Stream::default();
++        receipt(&mut stream, 7);
++        receipt(&mut stream, 7);
++        let applied = apply(
++            &mut stream,
++            &[line(
++                5,
++                vec![
++                    StreamItem::Channel { message_id: 8 },
++                    StreamItem::Channel { message_id: 7 },
++                    StreamItem::Channel { message_id: 7 },
++                ],
++            )],
++        );
++        assert_eq!(applied.working, [7]);
++        assert!(stream.receipts.is_empty());
++        for id in 0..(MAX_RECEIPTS as i64 + 5) {
++            receipt(&mut stream, id);
++        }
++        assert_eq!(stream.receipts.len(), MAX_RECEIPTS);
++        assert_eq!(stream.receipts[0], 5);
++    }
++
++    #[test]
++    fn the_offset_moves_only_over_answered_messages() {
++        let mut live = Live::new(Some(0));
++        let a = live.sent(10);
++        let b = live.sent(20);
++        live.read_up_to(25);
++        assert_eq!(live.unanswered(), 2);
++        live.answered(b);
++        assert_eq!(live.advance(), None);
++        live.answered(a);
++        assert_eq!(live.advance(), Some(25));
++        assert_eq!(live.unanswered(), 0);
++        // A read without messages moves it at once.
++        live.read_up_to(40);
++        assert_eq!(live.advance(), Some(40));
++    }
++
++    #[test]
++    fn pending_calls_are_bounded() {
++        let mut stream = Stream::default();
++        let lines: Vec<StreamLine> = (0..(MAX_CALLS as u64 + 3))
++            .map(|n| line(n + 1, vec![call(&format!("t{n}"), "• X")]))
++            .collect();
++        apply(&mut stream, &lines);
++        assert_eq!(stream.calls.len(), MAX_CALLS);
++        assert_eq!(stream.calls[0].id, "t3");
++    }
++}
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -7,4 +7,5 @@
+ pub mod hook;
+ pub mod hub;
+ pub mod proctree;
++pub mod tail;
+ pub mod wire;
+diff --git a/crates/cctg/src/tail.rs b/crates/cctg/src/tail.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/tail.rs
+@@ -0,0 +1,315 @@
++//! Agent side of the live transcript stream (TASK-016): one `transcript_read`
++//! from the hub becomes one `transcript_chunk`.
++//!
++//! The agent runs on the device that writes the transcript, so the hub never
++//! reads files over the network. The hub owns the offsets; the agent only
++//! reads what it is asked, complete lines only: a last line without its
++//! newline may still be being written and is left for the next read. Each
++//! line becomes its [`transcript::stream_events`]; lines without events are
++//! passed over but still move `to`.
++//!
++//! Only a path that names this kind of file is opened:
++//! `.../projects/<project>/<session_id>.jsonl`. The hub is trusted, but the
++//! link must never become a way to read other files of the device.
++
++use std::fs::File;
++use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
++use std::path::Path;
++
++use transcript::StreamEvent;
++
++use crate::wire::{AgentMsg, StreamItem, StreamLine};
++
++/// File bytes looked at for one chunk; more waits for the next read.
++pub const MAX_CHUNK_BYTES: u64 = 4 << 20;
++/// Lines with events in one chunk.
++pub const MAX_CHUNK_LINES: usize = 64;
++/// Text of one chunk's items, in bytes; with `\u` escapes the link line stays
++/// well under `wire::MAX_LINE`.
++pub const MAX_CHUNK_TEXT: usize = 128 << 10;
++/// One prompt or note; the hub splits long ones for Telegram.
++pub const MAX_ITEM_TEXT: usize = 16 << 10;
++/// A longer line is passed over whole: it is a huge tool result, never a
++/// line the stream shows.
++pub const MAX_RECORD: u64 = 64 << 20;
++
++/// Reads the chunk the hub asked for. Never fails: a file that cannot be
++/// opened is `missing`, a read error ends the chunk where it happened.
++pub fn read_chunk(session_id: &str, path: &str, from: Option<u64>) -> AgentMsg {
++    let empty = |at: u64, missing: bool| AgentMsg::TranscriptChunk {
++        session_id: session_id.to_owned(),
++        from: at,
++        to: at,
++        lines: Vec::new(),
++        missing,
++        more: false,
++    };
++    let asked = from.unwrap_or(0);
++    if !is_transcript_path(session_id, path) {
++        return empty(asked, true);
++    }
++    let Ok(mut file) = File::open(path) else {
++        return empty(asked, true);
++    };
++    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
++    // `None` starts at the end; a file that shrank is read from its end.
++    let start = from.filter(|&at| at <= len).unwrap_or(len);
++    if file.seek(SeekFrom::Start(start)).is_err() {
++        return empty(start, false);
++    }
++    let mut reader = BufReader::new(file);
++    let mut pos = start;
++    let mut lines = Vec::new();
++    let mut text = 0;
++    let mut line = Vec::new();
++    let more = loop {
++        if pos - start >= MAX_CHUNK_BYTES
++            || lines.len() >= MAX_CHUNK_LINES
++            || text >= MAX_CHUNK_TEXT
++        {
++            break pos < len;
++        }
++        line.clear();
++        let read = match (&mut reader).take(MAX_RECORD).read_until(b'\n', &mut line) {
++            Ok(0) | Err(_) => break false,
++            Ok(read) => read as u64,
++        };
++        if !line.ends_with(b"\n") {
++            if read < MAX_RECORD {
++                // Still being written: left for the next read.
++                break false;
++            }
++            match skip_line(&mut reader) {
++                Some(rest) => {
++                    pos += read + rest;
++                    continue;
++                }
++                None => break false,
++            }
++        }
++        pos += read;
++        let items: Vec<StreamItem> = transcript::stream_events(&String::from_utf8_lossy(&line))
++            .into_iter()
++            .map(item)
++            .collect();
++        if !items.is_empty() {
++            text += items.iter().map(item_len).sum::<usize>();
++            lines.push(StreamLine { end: pos, items });
++        }
++    };
++    AgentMsg::TranscriptChunk {
++        session_id: session_id.to_owned(),
++        from: start,
++        to: pos,
++        lines,
++        missing: false,
++        more,
++    }
++}
++
++/// `<...>/projects/<project>/<session_id>.jsonl` with a plain session id.
++pub fn is_transcript_path(session_id: &str, path: &str) -> bool {
++    let plain = !session_id.is_empty()
++        && session_id.len() <= 64
++        && session_id
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
++    let path = Path::new(path);
++    let named = path
++        .file_name()
++        .is_some_and(|name| *name == *format!("{session_id}.jsonl"));
++    let in_projects = path
++        .parent()
++        .and_then(Path::parent)
++        .and_then(Path::file_name)
++        .is_some_and(|name| name == "projects");
++    let plain_path = path
++        .components()
++        .all(|part| !matches!(part, std::path::Component::ParentDir));
++    plain && named && in_projects && plain_path
++}
++
++/// Discards up to and including the next newline; the bytes discarded, or
++/// `None` when the file ends first (the line is still being written).
++fn skip_line(reader: &mut impl BufRead) -> Option<u64> {
++    let mut skipped = 0;
++    loop {
++        let (found, used) = match reader.fill_buf() {
++            Ok([]) | Err(_) => return None,
++            Ok(buf) => match buf.iter().position(|&byte| byte == b'\n') {
++                Some(at) => (true, at + 1),
++                None => (false, buf.len()),
++            },
++        };
++        reader.consume(used);
++        skipped += used as u64;
++        if found {
++            return Some(skipped);
++        }
++    }
++}
++
++fn item(event: StreamEvent) -> StreamItem {
++    match event {
++        StreamEvent::Prompt(text) => StreamItem::Prompt { text: cap(text) },
++        StreamEvent::Channel { message_id } => StreamItem::Channel { message_id },
++        StreamEvent::Note(text) => StreamItem::Note { text: cap(text) },
++        StreamEvent::Call { id, line } => StreamItem::Call { id, line },
++        StreamEvent::Result { id, error } => StreamItem::Result { id, error },
++    }
++}
++
++fn item_len(item: &StreamItem) -> usize {
++    match item {
++        StreamItem::Prompt { text } | StreamItem::Note { text } => text.len(),
++        StreamItem::Call { id, line } => id.len() + line.len(),
++        StreamItem::Result { id, error } => id.len() + error.as_ref().map_or(0, String::len),
++        StreamItem::Channel { .. } | StreamItem::Other => 8,
++    }
++}
++
++/// Cuts on a char boundary and marks the cut.
++fn cap(mut text: String) -> String {
++    if text.len() > MAX_ITEM_TEXT {
++        let cut = text.floor_char_boundary(MAX_ITEM_TEXT - '\u{2026}'.len_utf8());
++        text.truncate(cut);
++        text.push('\u{2026}');
++    }
++    text
++}
++
++#[cfg(test)]
++mod tests {
++    use std::io::Write;
++
++    use super::*;
++    use crate::hub::testdir::TempDir;
++
++    const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
++
++    fn prompt(text: &str) -> String {
++        format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n")
++    }
++
++    fn transcript(dir: &TempDir) -> String {
++        let project = dir.path().join("projects").join("C--work");
++        std::fs::create_dir_all(&project).unwrap();
++        project
++            .join(format!("{SESSION}.jsonl"))
++            .to_string_lossy()
++            .into_owned()
++    }
++
++    fn append(path: &str, bytes: &str) {
++        let mut file = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(path)
++            .unwrap();
++        file.write_all(bytes.as_bytes()).unwrap();
++    }
++
++    fn texts(msg: &AgentMsg) -> (u64, u64, Vec<String>, bool, bool) {
++        let AgentMsg::TranscriptChunk {
++            from,
++            to,
++            lines,
++            missing,
++            more,
++            ..
++        } = msg
++        else {
++            panic!("{msg:?}");
++        };
++        let texts = lines
++            .iter()
++            .flat_map(|line| &line.items)
++            .map(|item| match item {
++                StreamItem::Prompt { text } => text.clone(),
++                other => format!("{other:?}"),
++            })
++            .collect();
++        (*from, *to, texts, *missing, *more)
++    }
++
++    #[test]
++    fn only_complete_lines_are_read_and_a_partial_one_waits_whole() {
++        let dir = TempDir::new("tail-partial");
++        let path = transcript(&dir);
++        let one = prompt("one");
++        let two = prompt("two");
++        append(&path, &one);
++        append(&path, &two[..10]);
++        let first = read_chunk(SESSION, &path, Some(0));
++        assert_eq!(
++            texts(&first),
++            (0, one.len() as u64, vec!["one".to_owned()], false, false)
++        );
++        append(&path, &two[10..]);
++        let second = read_chunk(SESSION, &path, Some(one.len() as u64));
++        assert_eq!(
++            texts(&second),
++            (
++                one.len() as u64,
++                (one.len() + two.len()) as u64,
++                vec!["two".to_owned()],
++                false,
++                false
++            )
++        );
++    }
++
++    #[test]
++    fn no_offset_starts_at_the_end_and_lines_without_events_still_move_on() {
++        let dir = TempDir::new("tail-end");
++        let path = transcript(&dir);
++        append(&path, &prompt("history"));
++        let end = std::fs::metadata(&path).unwrap().len();
++        assert_eq!(
++            texts(&read_chunk(SESSION, &path, None)),
++            (end, end, vec![], false, false)
++        );
++        let mode = "{\"type\":\"mode\",\"mode\":\"x\"}\n";
++        append(&path, mode);
++        assert_eq!(
++            texts(&read_chunk(SESSION, &path, Some(end))),
++            (end, end + mode.len() as u64, vec![], false, false)
++        );
++    }
++
++    #[test]
++    fn a_missing_file_or_a_foreign_path_is_missing() {
++        let dir = TempDir::new("tail-missing");
++        let path = transcript(&dir);
++        assert_eq!(
++            texts(&read_chunk(SESSION, &path, Some(5))),
++            (5, 5, vec![], true, false)
++        );
++        let secret = dir.path().join("secret.jsonl");
++        std::fs::write(&secret, prompt("private")).unwrap();
++        let foreign = secret.to_string_lossy().into_owned();
++        assert!(texts(&read_chunk(SESSION, &foreign, Some(0))).3);
++        assert!(!is_transcript_path("../x", &path));
++        assert!(!is_transcript_path(
++            SESSION,
++            &format!("/a/projects/p/../../etc/{SESSION}.jsonl")
++        ));
++        assert!(!is_transcript_path("other-session", &path));
++        assert!(is_transcript_path(SESSION, &path));
++    }
++
++    #[test]
++    fn a_long_backlog_comes_in_bounded_chunks_in_order() {
++        let dir = TempDir::new("tail-backlog");
++        let path = transcript(&dir);
++        for n in 0..(MAX_CHUNK_LINES + 3) {
++            append(&path, &prompt(&format!("p{n}")));
++        }
++        let first = texts(&read_chunk(SESSION, &path, Some(0)));
++        assert_eq!(first.2.len(), MAX_CHUNK_LINES);
++        assert!(first.4, "more");
++        let second = texts(&read_chunk(SESSION, &path, Some(first.1)));
++        assert_eq!(second.2, ["p64", "p65", "p66"]);
++        assert!(!second.4);
++    }
++}
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -12,7 +12,8 @@
+ //!
+ //! A new optional field (`#[serde(default)]`) keeps [`VERSION`]; so does a new
+ //! message type that a peer sends only after the other side announced it in
+-//! such a field (`permission_ack`, see [`Register::verdict_ack`]). Any other
++//! such a field (`permission_ack`, see [`Register::verdict_ack`];
++//! `transcript_read`, see [`Register::transcript_reads`]). Any other
+ //! new message type or a changed meaning bumps it. Errors never carry the
+ //! offending input: a line can contain the secret.
+ 
+@@ -127,6 +128,10 @@
+     /// hub then takes a verdict handed to their link as delivered.
+     #[serde(default)]
+     pub verdict_ack: bool,
++    /// The agent answers `transcript_read` with `transcript_chunk` (TASK-016).
++    /// Agents built before leave it out and are never asked.
++    #[serde(default)]
++    pub transcript_reads: bool,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+@@ -155,6 +160,54 @@
+     PermissionAck {
+         verdict_id: u64,
+     },
++    /// The answer to one `transcript_read`: the stream events of the complete
++    /// lines in `from..to`. `missing`: the file is not there (yet). `more`:
++    /// the file has complete lines past `to` that did not fit.
++    TranscriptChunk {
++        session_id: String,
++        from: u64,
++        to: u64,
++        #[serde(default)]
++        lines: Vec<StreamLine>,
++        #[serde(default)]
++        missing: bool,
++        #[serde(default)]
++        more: bool,
++    },
++}
++
++/// The stream events of one transcript line that ends at byte `end`.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct StreamLine {
++    pub end: u64,
++    pub items: Vec<StreamItem>,
++}
++
++/// [`transcript::StreamEvent`] on the wire.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++pub enum StreamItem {
++    Prompt {
++        text: String,
++    },
++    Channel {
++        message_id: i64,
++    },
++    Note {
++        text: String,
++    },
++    Call {
++        id: String,
++        line: String,
++    },
++    Result {
++        id: String,
++        #[serde(default)]
++        error: Option<String>,
++    },
++    /// A kind from a newer agent; skipped.
++    #[serde(other)]
++    Other,
+ }
+ 
+ impl Kinds for AgentMsg {
+@@ -164,6 +217,7 @@
+         "reply",
+         "permission_request",
+         "permission_ack",
++        "transcript_chunk",
+     ];
+ }
+ 
+@@ -204,11 +258,25 @@
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         verdict_id: Option<u64>,
+     },
++    /// Sent only to an agent that registered with `transcript_reads`: read
++    /// the complete lines of the transcript `path` from byte `from` (`None`:
++    /// from its current end) and answer with one `transcript_chunk`.
++    TranscriptRead {
++        session_id: String,
++        path: String,
++        #[serde(default)]
++        from: Option<u64>,
++    },
+ }
+ 
+ impl Kinds for HubMsg {
+-    const KINDS: &'static [&'static str] =
+-        &["registered", "rejected", "inbound", "permission_verdict"];
++    const KINDS: &'static [&'static str] = &[
++        "registered",
++        "rejected",
++        "inbound",
++        "permission_verdict",
++        "transcript_read",
++    ];
+ }
+ 
+ /// One agent-link line: the message plus `"v"`, newline-terminated.
+@@ -487,6 +555,7 @@
+                 cwd: "C:\\work\\app".into(),
+                 claude_pid: Some(4242),
+                 verdict_ack: true,
++                transcript_reads: true,
+             }),
+             AgentMsg::Reply {
+                 text: "multi\nline \u{2014} text".into(),
+@@ -500,6 +569,29 @@
+             AgentMsg::PermissionAck {
+                 verdict_id: u64::MAX,
+             },
++            AgentMsg::TranscriptChunk {
++                session_id: "s".into(),
++                from: 10,
++                to: 20,
++                lines: vec![StreamLine {
++                    end: 20,
++                    items: vec![
++                        StreamItem::Prompt { text: "p".into() },
++                        StreamItem::Channel { message_id: 7 },
++                        StreamItem::Note { text: "n".into() },
++                        StreamItem::Call {
++                            id: "t1".into(),
++                            line: "• Bash: x".into(),
++                        },
++                        StreamItem::Result {
++                            id: "t1".into(),
++                            error: Some("boom".into()),
++                        },
++                    ],
++                }],
++                missing: false,
++                more: true,
++            },
+         ]
+     }
+ 
+@@ -528,6 +620,11 @@
+                 request_id: "abcde".into(),
+                 behavior: Behavior::Deny,
+                 verdict_id: Some(u64::MAX),
++            },
++            HubMsg::TranscriptRead {
++                session_id: "s".into(),
++                path: "/p/s.jsonl".into(),
++                from: None,
+             },
+         ]
+     }
+@@ -649,6 +746,7 @@
+                 cwd: "/w".into(),
+                 claude_pid: None,
+                 verdict_ack: false,
++                transcript_reads: false,
+             }))
+         );
+     }
+@@ -695,6 +793,31 @@
+     }
+ 
+     #[test]
++    fn transcript_chunks_stay_readable_across_agent_versions() {
++        // A kind from a newer agent is skipped, not a broken chunk.
++        let line = br#"{"v":1,"type":"transcript_chunk","session_id":"s","from":0,"to":9,"lines":[{"end":9,"items":[{"kind":"diff","x":1},{"kind":"channel","message_id":3}]}]}"#;
++        assert_eq!(
++            decode::<AgentMsg>(line),
++            Ok(AgentMsg::TranscriptChunk {
++                session_id: "s".into(),
++                from: 0,
++                to: 9,
++                lines: vec![StreamLine {
++                    end: 9,
++                    items: vec![StreamItem::Other, StreamItem::Channel { message_id: 3 }],
++                }],
++                missing: false,
++                more: false,
++            })
++        );
++        let read = br#"{"v":1,"type":"transcript_read","session_id":"s","path":"/p"}"#;
++        assert!(matches!(
++            decode::<HubMsg>(read),
++            Ok(HubMsg::TranscriptRead { from: None, .. })
++        ));
++    }
++
++    #[test]
+     fn unknown_fields_are_ignored() {
+         let line = br#"{"v":1,"type":"registered","extra":{"a":1}}"#;
+         assert_eq!(decode::<HubMsg>(line), Ok(HubMsg::Registered));
+diff --git a/crates/cctg/tests/ingress_logs.rs b/crates/cctg/tests/ingress_logs.rs
+--- a/crates/cctg/tests/ingress_logs.rs
++++ b/crates/cctg/tests/ingress_logs.rs
+@@ -104,6 +104,7 @@
+         cwd: format!("/home/{content}"),
+         claude_pid: None,
+         verdict_ack: false,
++        transcript_reads: false,
+     };
+     let mut lines = wire::encode(&AgentMsg::Hello {
+         secret: secret.clone(),
+diff --git a/crates/cctg/tests/message_logs.rs b/crates/cctg/tests/message_logs.rs
+--- a/crates/cctg/tests/message_logs.rs
++++ b/crates/cctg/tests/message_logs.rs
+@@ -166,6 +166,7 @@
+                 cwd: r"C:\w\p".into(),
+                 claude_pid: Some(10),
+                 verdict_ack: false,
++                transcript_reads: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/permission_logs.rs b/crates/cctg/tests/permission_logs.rs
+--- a/crates/cctg/tests/permission_logs.rs
++++ b/crates/cctg/tests/permission_logs.rs
+@@ -169,6 +169,7 @@
+                 cwd: r"C:\w\p".into(),
+                 claude_pid: Some(10),
+                 verdict_ack: true,
++                transcript_reads: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/slots_logs.rs b/crates/cctg/tests/slots_logs.rs
+--- a/crates/cctg/tests/slots_logs.rs
++++ b/crates/cctg/tests/slots_logs.rs
+@@ -131,6 +131,7 @@
+                 cwd: cwd.clone(),
+                 claude_pid: None,
+                 verdict_ack: false,
++                transcript_reads: false,
+             },
+             to_agent,
+         })
+diff --git a/crates/cctg/tests/stream_logs.rs b/crates/cctg/tests/stream_logs.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/stream_logs.rs
+@@ -0,0 +1,192 @@
++//! Log capture for the live transcript stream: a transcript that is missing
++//! (not written yet, or deleted) is warned about once while the stream keeps
++//! asking, and it goes on once the file is there. Paths and message text never
++//! reach the logs. Its own test binary with a global subscriber (see
++//! `slots_logs.rs`).
++
++use std::io;
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use cctg::hub::api::{ForumTopic, Message};
++use cctg::hub::ingress::AgentEvent;
++use cctg::hub::registry::RegistryStore;
++use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
++use cctg::hub::slots::{Options, Slots};
++use cctg::wire::{HookEvent, HookPost, HubMsg, Register};
++use tokio::sync::mpsc;
++
++#[derive(Clone, Default)]
++struct Captured(Arc<Mutex<Vec<u8>>>);
++
++impl io::Write for Captured {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        if let Ok(mut out) = self.0.lock() {
++            out.extend_from_slice(buf);
++        }
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++#[derive(Default)]
++struct Recorded(Mutex<Vec<Op>>);
++
++impl Transport for Recorded {
++    async fn execute(&self, op: &Op) -> Delivery {
++        self.0.lock().expect("ops").push(op.clone());
++        match op {
++            Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
++                message_thread_id: 100,
++                name: name.clone(),
++                icon_custom_emoji_id: None,
++            })),
++            Op::Send { .. } | Op::Stream { .. } => Ok(Outcome::Sent(Message::default())),
++            _ => Ok(Outcome::Done),
++        }
++    }
++}
++
++fn streamed(fake: &Recorded) -> Vec<String> {
++    fake.0
++        .lock()
++        .expect("ops")
++        .iter()
++        .filter_map(|op| match op {
++            Op::Stream { text, .. } => Some(text.clone()),
++            _ => None,
++        })
++        .collect()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
++    let captured = Captured::default();
++    let writer = captured.clone();
++    let subscriber = tracing_subscriber::fmt()
++        .without_time()
++        .with_max_level(tracing::Level::TRACE)
++        .with_writer(move || writer.clone())
++        .finish();
++    tracing::subscriber::set_global_default(subscriber).expect("first subscriber");
++
++    let pid = std::process::id();
++    let session = "5e551017-0000-4000-8000-000000000001";
++    let state = std::env::temp_dir().join(format!("cctg-stream-logs-{pid}"));
++    let _ = std::fs::remove_dir_all(&state);
++    let project = state.join("projects").join(format!("C--private-{pid}"));
++    std::fs::create_dir_all(&project).expect("project dir");
++    let transcript = project.join(format!("{session}.jsonl"));
++    let path = transcript.display().to_string();
++
++    let fake = Arc::new(Recorded::default());
++    let bucket = BucketConfig {
++        capacity: 1000,
++        refill_every: Duration::from_millis(1),
++        min_gap: Duration::ZERO,
++    };
++    let (scheduler, outbox) = Scheduler::new(fake.clone(), bucket);
++    tokio::spawn(scheduler.run());
++    let store = RegistryStore::open(&state).expect("store");
++    let options = Options {
++        grace: Duration::ZERO,
++        stream_every: Duration::from_millis(10),
++        ..Options::default()
++    };
++    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
++    let (agents, agents_rx) = mpsc::channel(16);
++    let (hooks, hooks_rx) = mpsc::channel(16);
++    let (_control, control_rx) = mpsc::unbounded_channel();
++    tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
++
++    hooks
++        .send(HookPost::new(
++            "box".into(),
++            session.into(),
++            r"C:\w".into(),
++            path.clone(),
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(10),
++                parent_claude_pid: None,
++            },
++        ))
++        .await
++        .expect("hook");
++    let (to_agent, mut from_hub) = mpsc::channel(16);
++    let reads = agents.clone();
++    let asked = Arc::new(Mutex::new(0usize));
++    let counted = asked.clone();
++    tokio::spawn(async move {
++        while let Some(msg) = from_hub.recv().await {
++            if let HubMsg::TranscriptRead {
++                session_id,
++                path,
++                from,
++            } = msg
++            {
++                *counted.lock().expect("count") += 1;
++                let msg = cctg::tail::read_chunk(&session_id, &path, from);
++                let event = AgentEvent::Message {
++                    conn: 1,
++                    received_at: std::time::Instant::now(),
++                    msg,
++                };
++                if reads.send(event).await.is_err() {
++                    return;
++                }
++            }
++        }
++    });
++    agents
++        .send(AgentEvent::Registered {
++            conn: 1,
++            register: Register {
++                session_id: session.into(),
++                host: "box".into(),
++                cwd: r"C:\w".into(),
++                claude_pid: Some(10),
++                verdict_ack: true,
++                transcript_reads: true,
++            },
++            to_agent,
++        })
++        .await
++        .expect("agent");
++
++    // No file yet: many reads, one warning.
++    let deadline = Instant::now() + Duration::from_secs(60);
++    while *asked.lock().expect("count") < 10 {
++        assert!(Instant::now() < deadline, "the stream stopped asking");
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    let secret_text = format!("private prompt {pid}");
++    std::fs::write(
++        &transcript,
++        format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{secret_text}\"}}}}\n"),
++    )
++    .expect("transcript");
++    while streamed(&fake).is_empty() {
++        assert!(Instant::now() < deadline, "the stream never went on");
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    assert_eq!(streamed(&fake), [format!("> {secret_text}")]);
++    let _ = std::fs::remove_dir_all(&state);
++
++    let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
++        .unwrap_or_default();
++    assert_eq!(
++        logs.matches("session transcript not found").count(),
++        1,
++        "{logs}"
++    );
++    for private in [
++        secret_text.as_str(),
++        &format!("C--private-{pid}"),
++        "projects",
++    ] {
++        assert!(!logs.contains(private), "{private} in logs: {logs}");
++    }
++}
+diff --git a/crates/transcript/src/lib.rs b/crates/transcript/src/lib.rs
+--- a/crates/transcript/src/lib.rs
++++ b/crates/transcript/src/lib.rs
+@@ -10,6 +10,7 @@
+ 
+ mod render;
+ mod split;
++mod stream;
+ mod subagent;
+ 
+ pub use render::{
+@@ -17,6 +18,7 @@
+     render_full_with_subagents,
+ };
+ pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
++pub use stream::{StreamEvent, stream_events};
+ pub use subagent::{Subagent, SubagentBody, SubagentInput, SubagentMeta, parse_subagent_meta};
+ 
+ /// Author of a turn, taken from the record's top-level `type`.
+diff --git a/crates/transcript/src/render.rs b/crates/transcript/src/render.rs
+--- a/crates/transcript/src/render.rs
++++ b/crates/transcript/src/render.rs
+@@ -36,7 +36,7 @@
+ ];
+ 
+ /// A visible user text: a prompt (typed or from the channel) or a service record.
+-enum UserText<'a> {
++pub(crate) enum UserText<'a> {
+     Prompt(Cow<'a, str>),
+     Service(&'a str),
+ }
+@@ -167,7 +167,7 @@
+ 
+ /// Classifies a user text; `None` for blank text and hidden meta records. A meta `<channel>` record is
+ /// a Telegram prompt and shows its body only. A service record never changes the in-progress state.
+-fn user_text<'a>(turn: &Turn, text: &'a str) -> Option<UserText<'a>> {
++pub(crate) fn user_text<'a>(turn: &Turn, text: &'a str) -> Option<UserText<'a>> {
+     let text = text.trim();
+     if text.is_empty() {
+         return None;
+@@ -309,7 +309,7 @@
+ }
+ 
+ /// `subagent` is the known block of an `Agent` call; its type and description win over the call's.
+-fn tool_line(
++pub(crate) fn tool_line(
+     name: &str,
+     input: &Value,
+     agent_id: Option<&str>,
+diff --git a/crates/transcript/src/stream.rs b/crates/transcript/src/stream.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/transcript/src/stream.rs
+@@ -0,0 +1,151 @@
++//! What one transcript line adds to the live stream of a session's topic.
++//!
++//! The stream shows what `/brief` shows, one message at a time: prompts typed
++//! in the terminal, the text the assistant writes before a tool call, and one
++//! line per tool call once its result is in. The final answer of a turn is not
++//! part of it: the hub sends it from the `Stop` hook. Telegram messages taken
++//! into work are reported by their `message_id`, never by their text.
++
++use serde::Deserialize;
++use serde_json::Value;
++
++use crate::render::{self, UserText};
++use crate::{Block, Role};
++
++/// One event of a transcript line, in the order of the line's blocks.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum StreamEvent {
++    /// A prompt typed in the terminal or a slash command, shown as `/brief`
++    /// shows it (without the `> `).
++    Prompt(String),
++    /// A Telegram message went into the session: the `message_id` attribute of
++    /// its `<channel ...>` tag.
++    Channel { message_id: i64 },
++    /// Assistant text written before a tool call (`stop_reason: tool_use`).
++    Note(String),
++    /// A tool call and its `/brief` line (`• Bash: ...`, `↳ Explore: ...`).
++    Call { id: String, line: String },
++    /// The result of a tool call; `error` is set for a failed call and holds
++    /// its first line (possibly empty).
++    Result { id: String, error: Option<String> },
++}
++
++#[derive(Default, Deserialize)]
++#[serde(default)]
++struct RawAttachmentRecord {
++    #[serde(rename = "type")]
++    kind: String,
++    attachment: Value,
++}
++
++/// The events of one jsonl line. Anything that is not a main-transcript
++/// `user`/`assistant` record or a queued channel message gives none; a bad
++/// line gives none.
++pub fn stream_events(line: &str) -> Vec<StreamEvent> {
++    let line = line.trim();
++    if line.is_empty() {
++        return Vec::new();
++    }
++    if let Some(message_id) = queued_channel(line) {
++        return vec![StreamEvent::Channel { message_id }];
++    }
++    let Some(turn) = crate::parse(line).into_iter().next() else {
++        return Vec::new();
++    };
++    if turn.is_sidechain {
++        return Vec::new();
++    }
++    let mut events = Vec::new();
++    for block in &turn.blocks {
++        match (turn.role, block) {
++            (Role::User, Block::Text(text)) if turn.is_meta => {
++                if let Some(message_id) = channel_message_id(text) {
++                    events.push(StreamEvent::Channel { message_id });
++                }
++            }
++            (Role::User, Block::Text(text)) => {
++                if let Some(UserText::Prompt(prompt)) = render::user_text(&turn, text) {
++                    events.push(StreamEvent::Prompt(prompt.into_owned()));
++                }
++            }
++            (Role::Assistant, Block::Text(text)) => {
++                let text = text.trim();
++                if turn.stop_reason.as_deref() == Some("tool_use") && !text.is_empty() {
++                    events.push(StreamEvent::Note(text.to_owned()));
++                }
++            }
++            (_, Block::ToolUse { id, name, input }) => events.push(StreamEvent::Call {
++                id: id.clone(),
++                line: render::tool_line(name, input, None, None),
++            }),
++            (
++                _,
++                Block::ToolResult {
++                    tool_use_id,
++                    content,
++                    is_error,
++                    ..
++                },
++            ) => events.push(StreamEvent::Result {
++                id: tool_use_id.clone(),
++                error: is_error.then(|| error_line(content)),
++            }),
++        }
++    }
++    events
++}
++
++/// A channel message queued while a turn ran reaches Claude as a
++/// `queued_command` attachment (the shape Claude Code uses for other queued
++/// prompts; not yet seen for a channel message).
++fn queued_channel(line: &str) -> Option<i64> {
++    let record: RawAttachmentRecord = serde_json::from_str(line).ok()?;
++    if record.kind != "attachment"
++        || record.attachment.get("type").and_then(Value::as_str) != Some("queued_command")
++    {
++        return None;
++    }
++    channel_message_id(record.attachment.get("prompt")?.as_str()?)
++}
++
++/// `message_id` of a `<channel ...>` opening tag, when it is all digits.
++fn channel_message_id(text: &str) -> Option<i64> {
++    let id = channel_attribute(text, "message_id")?;
++    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
++        return None;
++    }
++    id.parse().ok()
++}
++
++/// The value of attribute `name` of the `<channel ...>` tag that starts
++/// `text`. Only the opening tag is read: the message body can hold anything.
++fn channel_attribute<'a>(text: &'a str, name: &str) -> Option<&'a str> {
++    let mut rest = text.trim_start().strip_prefix("<channel")?;
++    if !rest.starts_with(char::is_whitespace) {
++        return None;
++    }
++    loop {
++        rest = rest.trim_start();
++        let (key, after) = rest.split_once('=')?;
++        if key.is_empty() || key.contains(['>', '<']) || key.contains(char::is_whitespace) {
++            return None;
++        }
++        let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
++        let body = &after[1..];
++        let (value, tail) = body.split_once(quote)?;
++        if key == name {
++            return Some(value);
++        }
++        rest = tail;
++    }
++}
++
++/// First non-empty line of a failed result, without Claude Code's
++/// `<tool_use_error>` wrapper, cut like a `/brief` summary.
++fn error_line(content: &str) -> String {
++    let text = content.trim();
++    let text = text.strip_prefix("<tool_use_error>").unwrap_or(text);
++    let text = text.strip_suffix("</tool_use_error>").unwrap_or(text);
++    let first = text.lines().map(str::trim).find(|line| !line.is_empty());
++    render::one_line(first.unwrap_or_default())
++}
+diff --git a/crates/transcript/tests/fixtures/stream.jsonl b/crates/transcript/tests/fixtures/stream.jsonl
+new file mode 100644
+--- /dev/null
++++ b/crates/transcript/tests/fixtures/stream.jsonl
+@@ -0,0 +1,12 @@
++{"type":"queue-operation","operation":"enqueue","timestamp":"2026-01-01T00:00:00.500Z","sessionId":"00000000-0000-4000-8000-000000000000","content":"<channel source=\"cctg\" chat_id=\"demo\" message_id=\"11\" thread_id=\"5\">\nqueued while busy\n</channel>"}
++{"type":"queue-operation","operation":"dequeue","timestamp":"2026-01-01T00:00:00.600Z","sessionId":"00000000-0000-4000-8000-000000000000"}
++{"parentUuid":null,"isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000001","timestamp":"2026-01-01T00:00:01.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>"}}
++{"parentUuid":"00000000-0000-4000-8000-000000000001","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000002","timestamp":"2026-01-01T00:00:02.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_s2","type":"message","role":"assistant","content":[{"type":"text","text":"Editing the file now."}],"stop_reason":"tool_use","stop_sequence":null}}
++{"parentUuid":"00000000-0000-4000-8000-000000000002","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000003","timestamp":"2026-01-01T00:00:03.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_s3","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_s1","name":"Edit","input":{"file_path":"src/lib.rs","old_string":"a","new_string":"b"}}],"stop_reason":"tool_use","stop_sequence":null}}
++{"parentUuid":"00000000-0000-4000-8000-000000000003","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000004","timestamp":"2026-01-01T00:00:04.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_s1","type":"tool_result","content":"<tool_use_error>String to replace not found in file.\nString: a</tool_use_error>","is_error":true}]},"toolUseResult":"Error: String to replace not found in file."}
++{"parentUuid":"00000000-0000-4000-8000-000000000004","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000005","timestamp":"2026-01-01T00:00:05.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"attachment","attachment":{"type":"queued_command","prompt":"<channel source=\"cctg\" chat_id=\"demo\" message_id=\"12\" thread_id=\"5\">\nsecond message message_id=\"99\"\n</channel>","commandMode":"prompt","origin":{"kind":"channel"}}}
++{"parentUuid":"00000000-0000-4000-8000-000000000005","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000006","timestamp":"2026-01-01T00:00:06.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"attachment","attachment":{"type":"queued_command","prompt":"typed while busy","commandMode":"prompt","origin":{"kind":"human"}}}
++{"parentUuid":"00000000-0000-4000-8000-000000000006","isSidechain":true,"uuid":"00000000-0000-4000-8000-000000000007","timestamp":"2026-01-01T00:00:07.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_s7","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_side","name":"Bash","input":{"command":"ls","description":"side"}}],"stop_reason":"tool_use","stop_sequence":null}}
++{"parentUuid":"00000000-0000-4000-8000-000000000007","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000008","timestamp":"2026-01-01T00:00:08.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"assistant","message":{"model":"claude-opus-5-5","id":"msg_s8","type":"message","role":"assistant","content":[{"type":"text","text":"Maybe the answer."}],"stop_reason":null,"stop_sequence":null}}
++{"parentUuid":"00000000-0000-4000-8000-000000000008","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000009","timestamp":"2026-01-01T00:00:09.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"user","message":{"role":"user","content":"[Request interrupted by user]"}}
++{"parentUuid":"00000000-0000-4000-8000-000000000009","isSidechain":false,"uuid":"00000000-0000-4000-8000-000000000010","timestamp":"2026-01-01T00:00:10.000Z","userType":"redacted","entrypoint":"redacted","cwd":"C:\\work\\demo","sessionId":"00000000-0000-4000-8000-000000000000","version":"2.1.281","gitBranch":"main","type":"user","isMeta":true,"message":{"role":"user","content":"<channel source=\"cctg\" message_id=\"13x\">not a number</channel>"}}
+diff --git a/crates/transcript/tests/purity.rs b/crates/transcript/tests/purity.rs
+--- a/crates/transcript/tests/purity.rs
++++ b/crates/transcript/tests/purity.rs
+@@ -1,7 +1,8 @@
+-const SOURCES: [(&str, &str); 4] = [
++const SOURCES: [(&str, &str); 5] = [
+     ("lib.rs", include_str!("../src/lib.rs")),
+     ("render.rs", include_str!("../src/render.rs")),
+     ("split.rs", include_str!("../src/split.rs")),
++    ("stream.rs", include_str!("../src/stream.rs")),
+     ("subagent.rs", include_str!("../src/subagent.rs")),
+ ];
+ const MANIFEST: &str = include_str!("../Cargo.toml");
+diff --git a/crates/transcript/tests/stream.rs b/crates/transcript/tests/stream.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/transcript/tests/stream.rs
+@@ -0,0 +1,70 @@
++use transcript::{StreamEvent, stream_events};
++
++const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
++const STREAM: &str = include_str!("fixtures/stream.jsonl");
++
++fn events(jsonl: &str) -> Vec<StreamEvent> {
++    jsonl.lines().flat_map(stream_events).collect()
++}
++
++fn call(id: &str, line: &str) -> StreamEvent {
++    StreamEvent::Call {
++        id: id.to_owned(),
++        line: line.to_owned(),
++    }
++}
++
++fn ok(id: &str) -> StreamEvent {
++    StreamEvent::Result {
++        id: id.to_owned(),
++        error: None,
++    }
++}
++
++#[test]
++fn a_turn_streams_its_prompt_notes_and_calls_but_not_its_final_answer() {
++    assert_eq!(
++        events(FINAL_ANSWER),
++        [
++            StreamEvent::Prompt("Check the build \u{1F680} and explain.".to_owned()),
++            StreamEvent::Note("Let me run the tests first.".to_owned()),
++            call("toolu_demo31", "• Bash: Run workspace tests"),
++            ok("toolu_demo31"),
++            // A Telegram message: its id, never its text.
++            StreamEvent::Channel { message_id: 7 },
++            call("toolu_demo32", "↳ Explore: Explore crate"),
++            ok("toolu_demo32"),
++        ]
++    );
++}
++
++#[test]
++fn queued_channel_messages_errors_and_service_records() {
++    assert_eq!(
++        events(STREAM),
++        [
++            StreamEvent::Prompt("/model opus".to_owned()),
++            StreamEvent::Note("Editing the file now.".to_owned()),
++            call("toolu_s1", "• Edit: src/lib.rs"),
++            StreamEvent::Result {
++                id: "toolu_s1".to_owned(),
++                error: Some("String to replace not found in file.".to_owned()),
++            },
++            // Only the opening tag counts, not an id-looking body.
++            StreamEvent::Channel { message_id: 12 },
++            // Queue operations, a typed queued prompt, sidechain records, text
++            // with no tool call after it (the answer comes from the Stop hook)
++            // and a channel tag without a numeric id give nothing.
++            StreamEvent::Prompt("[Request interrupted by user]".to_owned()),
++        ]
++    );
++}
++
++#[test]
++fn a_partial_or_foreign_line_gives_nothing() {
++    let whole = FINAL_ANSWER.lines().nth(2).unwrap();
++    assert!(stream_events(&whole[..whole.len() / 2]).is_empty());
++    assert!(stream_events("").is_empty());
++    assert!(stream_events("{\"type\":\"mode\",\"mode\":\"x\"}").is_empty());
++    assert!(stream_events("[1,2]").is_empty());
++}

@@ -1,0 +1,12 @@
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+   Compiling qa016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\e2e)
+    Finished `test` profile [unoptimized] target(s) in 3.78s
+     Running tests\e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-qa016-target\debug\deps\e2e-5ecd94830a431119.exe)
+
+running 1 test
+real cctg channel records: 3, recognised: 3
+test real_cctg_channel_records_give_a_channel_event ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 13.76s
+

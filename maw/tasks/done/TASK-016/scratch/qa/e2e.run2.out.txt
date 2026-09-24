@@ -1,0 +1,22 @@
+   Compiling qa016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\e2e)
+    Finished `test` profile [unoptimized] target(s) in 1.27s
+     Running tests\e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-qa016-target\debug\deps\e2e-04a0d5ded83c4b35.exe)
+
+running 1 test
+test e2e_order_partial_line_and_stop_after_lines ... FAILED
+
+failures:
+
+---- e2e_order_partial_line_and_stop_after_lines stdout ----
+
+thread 'e2e_order_partial_line_and_stop_after_lines' (25588) panicked at tests\e2e.rs:355:9:
+timed out waiting for: prompt
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    e2e_order_partial_line_and_stop_after_lines
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 20.04s
+
+error: test failed, to rerun pass `--test e2e`

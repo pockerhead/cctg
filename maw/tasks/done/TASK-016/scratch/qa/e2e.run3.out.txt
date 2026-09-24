@@ -1,0 +1,28 @@
+   Compiling qa016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\e2e)
+    Finished `test` profile [unoptimized] target(s) in 1.64s
+     Running tests\e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-qa016-target\debug\deps\e2e-77e35f88764c6e62.exe)
+
+running 1 test
+test e2e_order_partial_line_and_stop_after_lines ... [2m2026-09-24T01:15:05.688609Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m forum topic created [3mordinal[0m[2m=[0m1
+[2m2026-09-24T01:15:05.706484Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent registered [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:15:05.706708Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m agent bound to its session [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:15:05.708166Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:15:15.716006Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:15:15.716981Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+
+thread 'e2e_order_partial_line_and_stop_after_lines' (36824) panicked at tests\e2e.rs:355:9:
+timed out waiting for: prompt
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[2m2026-09-24T01:15:25.709020Z[0m [34mDEBUG[0m [2mcctg::hub::ingress[0m[2m:[0m agent link ended [3mconn[0m[2m=[0m1 [3merror[0m[2m=[0mconnection error: ConnectionReset
+[2m2026-09-24T01:15:25.709064Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent disconnected [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:15:25.709190Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+FAILED
+
+failures:
+
+failures:
+    e2e_order_partial_line_and_stop_after_lines
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 20.03s
+
+error: test failed, to rerun pass `--test e2e`

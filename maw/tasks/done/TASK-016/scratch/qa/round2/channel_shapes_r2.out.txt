@@ -1,0 +1,14 @@
+jsonl files scanned: 752
+sub | type | isMeta | origin.kind | attachment.type | att.prompt type | message.content type | json path | source | message_id | count
+main | queue-operation | None | None | None | None | NoneType | .content | cctg | digits | 3
+main | user | True | channel | None | None | str | .message.content | cctg | digits | 3
+main | queue-operation | None | None | None | None | NoneType | .content | other | none | 3
+main | user | True | channel | None | None | str | .message.content | other | none | 3
+subagent | user | None | None | None | None | list | .toolUseResult.structuredPatch[].lines[] | other | none | 2
+subagent | user | None | None | None | None | list | .toolUseResult.bashEditDiff.files[].hunks[].lines[] | other | none | 1
+subagent | assistant | None | None | None | None | list | .message.content[].input.old_string | other | none | 1
+subagent | assistant | None | None | None | None | list | .message.content[].input.new_string | other | none | 1
+subagent | assistant | None | None | None | None | list | .wireToolInputs.<id>.old_string | other | none | 1
+subagent | assistant | None | None | None | None | list | .wireToolInputs.<id>.new_string | other | none | 1
+subagent | user | None | None | None | None | list | .toolUseResult.oldString | other | none | 1
+subagent | user | None | None | None | None | list | .toolUseResult.newString | other | none | 1

@@ -1,0 +1,84 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+   Compiling qa016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\e2e)
+    Finished `test` profile [unoptimized] target(s) in 3.24s
+     Running tests\e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-qa016-target\debug\deps\e2e-77e35f88764c6e62.exe)
+
+running 6 tests
+test e2e_hub_restart_neither_repeats_nor_loses ... 
+thread 'e2e_hub_restart_neither_repeats_nor_loses' (22204) panicked at tests\e2e.rs:355:9:
+timed out waiting for: hub 1 lines
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test e2e_merge_under_the_limit ... 
+thread 'e2e_merge_under_the_limit' (41292) panicked at tests\e2e.rs:355:9:
+timed out waiting for: all merged lines
+FAILED
+test e2e_order_partial_line_and_stop_after_lines ... [2m2026-09-24T01:21:58.665623Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m forum topic created [3mordinal[0m[2m=[0m1
+[2m2026-09-24T01:21:58.682315Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent registered [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:21:58.682390Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m agent bound to its session [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:21:58.683791Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:22:08.687588Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:08.688853Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+
+thread 'e2e_order_partial_line_and_stop_after_lines' (22852) panicked at tests\e2e.rs:355:9:
+timed out waiting for: prompt
+[2m2026-09-24T01:22:18.677863Z[0m [34mDEBUG[0m [2mcctg::hub::ingress[0m[2m:[0m agent link ended [3mconn[0m[2m=[0m1 [3merror[0m[2m=[0mconnection error: ConnectionReset
+[2m2026-09-24T01:22:18.677899Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent disconnected [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:18.678021Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+FAILED
+test e2e_reactions ... [2m2026-09-24T01:22:18.686255Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m forum topic created [3mordinal[0m[2m=[0m1
+[2m2026-09-24T01:22:18.704550Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent registered [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:18.704621Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m agent bound to its session [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:18.709771Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:22:28.708902Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:28.709635Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+
+thread 'e2e_reactions' (36024) panicked at tests\e2e.rs:355:9:
+timed out waiting for: stream up
+[2m2026-09-24T01:22:38.693072Z[0m [34mDEBUG[0m [2mcctg::hub::ingress[0m[2m:[0m agent link ended [3mconn[0m[2m=[0m1 [3merror[0m[2m=[0mconnection error: ConnectionReset
+[2m2026-09-24T01:22:38.693109Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent disconnected [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:38.693229Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+FAILED
+test e2e_refused_sends_lose_nothing ... [2m2026-09-24T01:22:38.700546Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m forum topic created [3mordinal[0m[2m=[0m1
+[2m2026-09-24T01:22:38.719565Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent registered [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:38.719641Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m agent bound to its session [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:38.721398Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:22:48.726760Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:48.727824Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:22:58.741694Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:22:58.742891Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+
+thread 'e2e_refused_sends_lose_nothing' (17476) panicked at tests\e2e.rs:355:9:
+timed out waiting for: every line accepted once
+[2m2026-09-24T01:23:08.713805Z[0m [34mDEBUG[0m [2mcctg::hub::ingress[0m[2m:[0m agent link ended [3mconn[0m[2m=[0m1 [3merror[0m[2m=[0mconnection error: ConnectionReset
+[2m2026-09-24T01:23:08.713838Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent disconnected [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:23:08.713945Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+FAILED
+test e2e_resume_at_a_torn_end_does_not_replay_history ... [2m2026-09-24T01:23:08.720611Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m forum topic created [3mordinal[0m[2m=[0m1
+[2m2026-09-24T01:23:08.737173Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent registered [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:23:08.737261Z[0m [32m INFO[0m [2mcctg::hub::slots[0m[2m:[0m agent bound to its session [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:23:08.738483Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:23:18.739401Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:23:18.740123Z[0m [33m WARN[0m [2mcctg::hub::ingress[0m[2m:[0m agent repeated its handshake; ignored [3mconn[0m[2m=[0m1
+[2m2026-09-24T01:23:28.748312Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+
+thread 'e2e_resume_at_a_torn_end_does_not_replay_history' (37008) panicked at tests\e2e.rs:355:9:
+timed out waiting for: offset set
+[2m2026-09-24T01:23:28.749118Z[0m [34mDEBUG[0m [2mcctg::hub::ingress[0m[2m:[0m agent link ended [3mconn[0m[2m=[0m1 [3merror[0m[2m=[0mconnection error: ConnectionReset
+[2m2026-09-24T01:23:28.749147Z[0m [32m INFO[0m [2mcctg::hub::ingress[0m[2m:[0m agent disconnected [3mconn[0m[2m=[0m1 [3msession[0m[2m=[0m"0a16e2e0"
+[2m2026-09-24T01:23:28.749240Z[0m [34mDEBUG[0m [2mcctg::hub::slots[0m[2m:[0m transcript read not answered; asking again [3msession[0m[2m=[0m"0a16e2e0"
+FAILED
+
+failures:
+
+failures:
+    e2e_hub_restart_neither_repeats_nor_loses
+    e2e_merge_under_the_limit
+    e2e_order_partial_line_and_stop_after_lines
+    e2e_reactions
+    e2e_refused_sends_lose_nothing
+    e2e_resume_at_a_torn_end_does_not_replay_history
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 170.57s
+
+error: test failed, to rerun pass `--test e2e`

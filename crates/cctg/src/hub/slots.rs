@@ -33,6 +33,14 @@
 //! `SubagentStop`. A nested `claude -p` gets one `⇣ nested` block. A reply to
 //! a subagent block reaches the parent's agent with meta `target_agent`.
 //!
+//! The live transcript stream (see [`stream`]): the agent of the slot's
+//! current session reads its transcript on request and the actor turns the
+//! events into topic messages (terminal prompts, text before tool calls, one
+//! line per finished tool call) on the stream lane of the scheduler, after the
+//! session separator. A turn's answer waits for the lines read after its
+//! `Stop` (bounded by `Options::hold_answer`). A message handed to an agent
+//! gets 👀, and ✍ once its own channel record shows up in the transcript.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title or message text.
 
@@ -53,12 +61,13 @@ use super::registry::{
     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, TopicJob, TopicView,
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
+use super::stream::{self, Held, Live, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
 };
 use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
-use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest};
+use crate::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest, StreamLine};
 
 /// A transcript is scanned line by line for its first ai-title up to this
 /// many bytes (the same cap as `/brief`).
@@ -73,6 +82,14 @@ pub const MAX_QUEUED_MESSAGES: usize = 256;
 pub const MAX_BLOCK_JOBS: usize = 16;
 /// Subagent files read at a time for block texts (each up to 64 MiB).
 const MAX_BODY_READS: usize = 2;
+/// A transcript read the agent has not answered by then is asked again.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// The stream takes no new transcript line while this many messages of any
+/// kind wait for Telegram: replies, turn answers and notices keep the rest of
+/// [`MAX_QUEUED_MESSAGES`].
+const STREAM_QUEUE: usize = MAX_QUEUED_MESSAGES / 2;
+/// Reactions waiting for Telegram at a time; one more is skipped.
+const MAX_REACTIONS: usize = 64;
 pub const OFFLINE_NOTICE: &str = "Сессия этой темы не на связи, сообщение не доставлено.";
 pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
 
@@ -95,6 +112,13 @@ pub struct Options {
     pub correlate_for: Duration,
     /// First pause before the parent transcript is looked at again; it doubles.
     pub recheck_after: Duration,
+    /// How often the agent of a streamed session is asked for new lines.
+    pub stream_every: Duration,
+    /// Longest wait of a turn answer for the end of its turn in the
+    /// transcript (the lines before it go first).
+    pub hold_answer: Duration,
+    /// A stream whose message Telegram did not take reads again after this.
+    pub stream_retry: Duration,
 }
 
 impl Default for Options {
@@ -109,6 +133,12 @@ impl Default for Options {
             retry_every: Duration::from_secs(60),
             correlate_for: Duration::from_secs(60),
             recheck_after: Duration::from_secs(1),
+            // Records show up in the jsonl ~0.1-0.3 s after their timestamp
+            // (TASK-016 measurement); a read is one small link round trip.
+            stream_every: Duration::from_millis(300),
+            // The turn's last record shows up ~0.15 s after the answer.
+            hold_answer: Duration::from_secs(5),
+            stream_retry: Duration::from_secs(5),
         }
     }
 }
@@ -170,6 +200,23 @@ enum Done {
         job: BlockJob,
         delivery: Option<Delivery>,
     },
+    /// A stream message of `session`, by its number in [`Live`].
+    Stream {
+        session: String,
+        number: u64,
+        delivery: Option<Delivery>,
+    },
+    Reaction(Option<Delivery>),
+}
+
+/// The fields of one `transcript_chunk`.
+struct Chunk<'a> {
+    from: u64,
+    to: u64,
+    lines: &'a [StreamLine],
+    missing: bool,
+    more: bool,
+    reset: bool,
 }
 
 /// A job for the dispatch task.
@@ -182,6 +229,8 @@ enum Work {
     PromptEdit(u64),
     Callback,
     Block(BlockJob),
+    Stream { session: String, number: u64 },
+    Reaction,
 }
 
 fn short(session_id: &str) -> &str {
@@ -278,6 +327,8 @@ struct Conn {
     to_agent: mpsc::Sender<HubMsg>,
     /// It acknowledges permission verdicts ([`crate::wire::Register::verdict_ack`]).
     acks: bool,
+    /// It answers transcript reads ([`crate::wire::Register::transcript_reads`]).
+    reads: bool,
 }
 
 pub struct Slots {
@@ -312,6 +363,11 @@ pub struct Slots {
     bodies_reading: HashSet<String>,
     /// Block jobs handed out and not answered, at most [`MAX_BLOCK_JOBS`].
     block_jobs: usize,
+    /// Live transcript streams by session.
+    streams: HashMap<String, Live>,
+    reaction_warned: bool,
+    /// Reactions handed out and not answered, at most [`MAX_REACTIONS`].
+    reactions: usize,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -364,6 +420,9 @@ impl Slots {
             bodies_waiting: BTreeMap::new(),
             bodies_reading: HashSet::new(),
             block_jobs: 0,
+            streams: HashMap::new(),
+            reaction_warned: false,
+            reactions: 0,
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -403,9 +462,21 @@ impl Slots {
             self.next_retry
         };
         // A session whose transcript is being read wakes the actor anyway.
-        self.candidates
+        let deadline = self
+            .candidates
             .next_due(|session| self.indexing.contains(session))
-            .map_or(deadline, |due| deadline.min(due))
+            .map_or(deadline, |due| deadline.min(due));
+        self.streams
+            .values()
+            .flat_map(|live| {
+                let read = match live.reading {
+                    Some((_, sent)) => Some(sent + READ_TIMEOUT),
+                    None => live.next_read,
+                };
+                read.into_iter()
+                    .chain(live.held.front().map(|held| held.until))
+            })
+            .fold(deadline, Instant::min)
     }
 
     fn on_agent(&mut self, event: AgentEvent) {
@@ -439,6 +510,7 @@ impl Slots {
                         claude_pid: register.claude_pid,
                         to_agent,
                         acks: register.verdict_ack,
+                        reads: register.transcript_reads,
                     },
                 );
                 // A link that came back takes the answers that wait for it.
@@ -462,7 +534,26 @@ impl Slots {
                         self.on_verdict_ack(conn, &session, verdict_id);
                     }
                     AgentMsg::Reply { text } => self.on_reply_for(conn, &session, &text),
-                    _ => debug!(conn, "agent message not routed yet"),
+                    AgentMsg::TranscriptChunk {
+                        session_id,
+                        from,
+                        to,
+                        lines,
+                        missing,
+                        more,
+                        reset,
+                    } if session_id == session => {
+                        let chunk = Chunk {
+                            from,
+                            to,
+                            lines: &lines,
+                            missing,
+                            more,
+                            reset,
+                        };
+                        self.on_chunk(conn, &session, &chunk);
+                    }
+                    _ => debug!(conn, "agent message not routed"),
                 }
             }
             AgentEvent::Disconnected { conn } => {
@@ -958,6 +1049,16 @@ impl Slots {
         if sent {
             // Delivered: the next failure starts a new episode and is told at once.
             self.notices.remove(&(slot, OFFLINE_NOTICE));
+            if let Some(stream) = self
+                .registry
+                .sessions
+                .get_mut(&session)
+                .and_then(|entry| entry.stream.as_mut())
+            {
+                stream::receipt(stream, input.message_id);
+                self.registry.dirty = true;
+            }
+            self.react(input.message_id, stream::ACCEPTED);
             info!(
                 ordinal,
                 session = short(&session),
@@ -1011,7 +1112,9 @@ impl Slots {
     /// of its session, like an agent reply, so the answer reaches Telegram
     /// whether or not the model called `reply`.
     fn on_turn_answer(&mut self, session: &str, answer: &str) {
-        if answer.trim().is_empty() {
+        // A streamed session's blank answer still takes its turn end.
+        let streamed = self.stream_target(session).is_some();
+        if answer.trim().is_empty() && !streamed {
             return;
         }
         let Some(slot) = self.current_slot(session) else {
@@ -1029,6 +1132,30 @@ impl Slots {
             );
             return;
         };
+        if let Some(live) = self.streams.get_mut(session).filter(|_| streamed) {
+            // A turn end read already: the lines before it are out.
+            let now = Instant::now();
+            if !live.claim_end(now) {
+                // The lines of this turn up to its end in the transcript go
+                // first, for at most `hold_answer`.
+                let oldest = (live.held.len() >= stream::MAX_HELD)
+                    .then(|| live.held.pop_front())
+                    .flatten();
+                live.held.push_back(Held {
+                    thread_id,
+                    answer: answer.to_owned(),
+                    until: now + self.options.hold_answer,
+                });
+                live.next_read = Some(now);
+                if let Some(oldest) = oldest {
+                    self.release(session, oldest);
+                }
+                return;
+            }
+        }
+        if answer.trim().is_empty() {
+            return;
+        }
         if let Some(parts) = self.send_text(thread_id, session, answer, "answer") {
             info!(
                 ordinal,
@@ -1036,6 +1163,395 @@ impl Slots {
                 parts,
                 "turn answer queued"
             );
+        }
+    }
+
+    fn release(&mut self, session: &str, held: Held) {
+        if held.answer.trim().is_empty() {
+            return;
+        }
+        if let Some(parts) = self.send_text(held.thread_id, session, &held.answer, "answer") {
+            info!(session = short(session), parts, "turn answer queued");
+        }
+    }
+
+    /// Sets the bot's reaction on a topic message; failures are only logged.
+    /// At most [`MAX_REACTIONS`] wait for Telegram; one more is skipped.
+    fn react(&mut self, message_id: i64, emoji: &str) {
+        if self.reactions >= MAX_REACTIONS {
+            debug!("too many reactions wait for Telegram; one skipped");
+            return;
+        }
+        self.reactions += 1;
+        self.hand_off(
+            Work::Reaction,
+            Op::React {
+                message_id,
+                emoji: emoji.to_owned(),
+            },
+        );
+    }
+
+    /// Where the stream of `session` goes, when it may go on now: the live
+    /// top-level current session of a slot whose topic exists and whose
+    /// session separator is out, with a bound agent that reads transcripts.
+    fn stream_target(&self, session: &str) -> Option<(u64, String)> {
+        let slot = self.current_slot(session)?;
+        let slot = self.registry.slot(slot)?;
+        if slot.topic_id.is_none() || slot.pending_separator.is_some() {
+            return None;
+        }
+        let entry = self.registry.sessions.get(session)?;
+        entry.stream.as_ref()?;
+        if entry.transcript_path.is_empty() {
+            return None;
+        }
+        let conn = entry.agent?;
+        let bound = self.conns.get(&conn)?;
+        (bound.reads && bound.session == session).then(|| (conn, entry.transcript_path.clone()))
+    }
+
+    /// Asks the agents of streamed sessions for new lines, releases held
+    /// answers that waited long enough or can no longer be matched, and
+    /// forgets the streams of sessions that are over once nothing of theirs
+    /// waits for Telegram.
+    fn pump_streams(&mut self) {
+        let now = Instant::now();
+        let mut sessions: HashSet<String> = self
+            .conns
+            .values()
+            .map(|bound| bound.session.clone())
+            .collect();
+        sessions.extend(self.streams.keys().cloned());
+        for session in sessions {
+            if self.current_slot(&session).is_none() {
+                let Some(live) = self.streams.get_mut(&session) else {
+                    continue;
+                };
+                let held: Vec<Held> = live.held.drain(..).collect();
+                if live.unanswered() == 0 {
+                    self.streams.remove(&session);
+                }
+                for held in held {
+                    self.release(&session, held);
+                }
+                continue;
+            }
+            let target = self.stream_target(&session);
+            if target.is_none() && !self.streams.contains_key(&session) {
+                continue;
+            }
+            let (offset, calls) = self
+                .registry
+                .sessions
+                .get(&session)
+                .and_then(|entry| entry.stream.as_ref())
+                .map(|stream| (stream.offset, stream.calls.clone()))
+                .unwrap_or_default();
+            let live = self
+                .streams
+                .entry(session.clone())
+                .or_insert_with(|| Live::new(offset, calls));
+            // A read that is late, or went to a connection that is no longer
+            // the session's, is asked again.
+            let conn = target.as_ref().map(|(conn, _)| *conn);
+            if let Some((asked, sent)) = live.reading
+                && (now >= sent + READ_TIMEOUT || conn != Some(asked))
+            {
+                debug!(
+                    session = short(&session),
+                    "transcript read not answered; asking again"
+                );
+                live.reading = None;
+            }
+            let mut released = Vec::new();
+            while live
+                .held
+                .front()
+                .is_some_and(|held| target.is_none() || now >= held.until)
+            {
+                released.extend(live.held.pop_front());
+            }
+            for held in released {
+                self.release(&session, held);
+            }
+            let Some((conn, path)) = target else {
+                continue;
+            };
+            let Some(live) = self.streams.get_mut(&session) else {
+                continue;
+            };
+            let due = live.next_read.is_none_or(|at| now >= at);
+            if live.reading.is_some()
+                || !due
+                || live.unanswered() >= stream::MAX_WAITING
+                || self.queued_messages >= STREAM_QUEUE
+            {
+                continue;
+            }
+            let read = HubMsg::TranscriptRead {
+                session_id: session.clone(),
+                path,
+                from: live.read_at,
+            };
+            let asked = self
+                .conns
+                .get(&conn)
+                .is_some_and(|bound| bound.to_agent.try_send(read).is_ok());
+            if asked {
+                live.reading = Some((conn, now));
+            } else {
+                live.next_read = Some(now + self.options.stream_every);
+            }
+        }
+    }
+
+    /// One answered transcript read: its messages go to the topic in order,
+    /// its reactions out, a held answer after the lines of its turn.
+    fn on_chunk(&mut self, conn: u64, session: &str, chunk: &Chunk<'_>) {
+        let &Chunk {
+            from,
+            to,
+            lines,
+            missing,
+            more,
+            reset,
+        } = chunk;
+        enum Action {
+            Stream(u64, Op),
+            Release,
+            React(i64),
+        }
+        let now = Instant::now();
+        let every = self.options.stream_every;
+        let hold = self.options.hold_answer;
+        let thread_id = self
+            .current_slot(session)
+            .and_then(|slot| self.registry.slot(slot))
+            .and_then(|slot| slot.topic_id);
+        let Some(live) = self.streams.get_mut(session) else {
+            return;
+        };
+        if live.reading.is_none_or(|(asked, _)| asked != conn) {
+            debug!(
+                session = short(session),
+                "transcript chunk nobody asked for; dropped"
+            );
+            return;
+        }
+        live.reading = None;
+        live.next_read = Some(now + every);
+        let Some(thread_id) = thread_id else {
+            return;
+        };
+        if live.read_at.is_some_and(|at| at != from) || to < from {
+            debug!(
+                session = short(session),
+                "transcript chunk out of place; asking again"
+            );
+            live.next_read = Some(now);
+            return;
+        }
+        if missing {
+            if !live.missing_warned {
+                live.missing_warned = true;
+                if !live.file_seen && live.read_at == Some(0) {
+                    // A new session: the file comes with its first prompt.
+                    debug!(
+                        session = short(session),
+                        "session transcript not written yet; the stream waits for it"
+                    );
+                } else {
+                    warn!(
+                        session = short(session),
+                        "session transcript not found; the stream waits for it"
+                    );
+                }
+            }
+            // No turn end can come from a file that is not there.
+            let held: Vec<Held> = live.held.drain(..).collect();
+            for held in held {
+                self.release(session, held);
+            }
+            return;
+        }
+        live.missing_warned = false;
+        live.file_seen = true;
+        if reset {
+            if !live.reset_warned {
+                live.reset_warned = true;
+                warn!(
+                    session = short(session),
+                    "session transcript was cut or replaced; the stream reads it again from its start"
+                );
+            }
+            live.read_at = Some(0);
+            live.calls.clear();
+            live.next_read = Some(now);
+            return;
+        }
+        live.reset_warned = false;
+        let Some(stream) = self
+            .registry
+            .sessions
+            .get_mut(session)
+            .and_then(|entry| entry.stream.as_mut())
+        else {
+            return;
+        };
+        if stream.offset.is_none() {
+            // The first read of a stream that starts at the end of the file.
+            stream.offset = Some(from);
+            self.registry.dirty = true;
+        }
+        let mut actions = Vec::new();
+        let mut queued = self.queued_messages;
+        let mut read_to = to;
+        let mut stopped = false;
+        // Held answers this chunk lets go; the rest of its turn ends count.
+        let mut releases = 0;
+        for (index, line) in lines.iter().enumerate() {
+            // The first line always goes (the read was asked with room); the
+            // rest wait in the file while Telegram is behind.
+            if index > 0 && (live.unanswered() >= stream::MAX_WAITING || queued >= STREAM_QUEUE) {
+                read_to = lines[index - 1].end;
+                stopped = true;
+                break;
+            }
+            for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
+                match step {
+                    Step::Send { text, merge } => {
+                        let split = split_for_telegram(&text, SplitOptions::default());
+                        let merge = merge && split.chunks.len() == 1;
+                        for text in split.chunks {
+                            queued += 1;
+                            let op = Op::Stream {
+                                thread_id,
+                                text,
+                                merge,
+                                restart: std::mem::take(&mut live.restart),
+                            };
+                            actions.push(Action::Stream(live.sent(), op));
+                        }
+                    }
+                    Step::Working(message_id) => {
+                        live.lapse_ends(now + hold);
+                        self.registry.dirty = true;
+                        actions.push(Action::React(message_id));
+                    }
+                    Step::NewTurn => live.lapse_ends(now + hold),
+                    Step::TurnEnd if live.held.len() <= releases => {
+                        live.ends_unclaimed = live
+                            .ends_unclaimed
+                            .saturating_add(1)
+                            .min(stream::MAX_HELD as u8);
+                    }
+                    Step::TurnEnd => {
+                        releases += 1;
+                        actions.push(Action::Release);
+                    }
+                }
+            }
+        }
+        live.barrier(read_to);
+        if more || stopped {
+            live.next_read = Some(now);
+        }
+        for action in actions {
+            match action {
+                Action::Stream(number, op) => {
+                    self.queued_messages += 1;
+                    self.hand_off(
+                        Work::Stream {
+                            session: session.to_owned(),
+                            number,
+                        },
+                        op,
+                    );
+                }
+                Action::Release => {
+                    let held = self
+                        .streams
+                        .get_mut(session)
+                        .and_then(|live| live.held.pop_front());
+                    if let Some(held) = held {
+                        self.release(session, held);
+                    }
+                }
+                Action::React(message_id) => self.react(message_id, stream::WORKING),
+            }
+        }
+        self.stream_answered(session);
+    }
+
+    /// Telegram answered stream message `number` of `session`.
+    fn on_stream_done(&mut self, session: &str, number: u64, delivery: Option<Delivery>) {
+        self.queued_messages = self.queued_messages.saturating_sub(1);
+        if self.queued_messages == 0 {
+            self.overflow_warned = false;
+        }
+        // A message Telegram will never take (a bad request, not a lost
+        // topic) is skipped rather than sent again for ever.
+        let skipped = matches!(
+            &delivery,
+            Some(result @ Err(ApiError::Telegram { code, .. }))
+                if (400..500).contains(code) && !topic_gone(result)
+        );
+        let accepted = skipped || matches!(delivery, Some(Ok(Outcome::Sent(_) | Outcome::Merged)));
+        let Some(live) = self.streams.get_mut(session) else {
+            return;
+        };
+        live.answered(number, accepted);
+        if !live.refused_warned && (skipped || !accepted) {
+            live.refused_warned = true;
+            if skipped {
+                warn!(
+                    session = short(session),
+                    "stream message refused by Telegram; skipped"
+                );
+            } else {
+                warn!(
+                    session = short(session),
+                    "stream message not delivered; the stream sends it again"
+                );
+            }
+        }
+        self.stream_answered(session);
+        let Some(live) = self.streams.get_mut(session) else {
+            return;
+        };
+        if live.stuck() {
+            let (offset, calls) = self
+                .registry
+                .sessions
+                .get(session)
+                .and_then(|entry| entry.stream.as_ref())
+                .map(|stream| (stream.offset, stream.calls.clone()))
+                .unwrap_or_default();
+            live.rewind(offset, calls, Instant::now() + self.options.stream_retry);
+        }
+    }
+
+    /// Moves the persisted offset and open calls to the last barrier whose
+    /// messages Telegram has all accepted.
+    fn stream_answered(&mut self, session: &str) {
+        let Some(live) = self.streams.get_mut(session) else {
+            return;
+        };
+        let Some((offset, calls)) = live.advance() else {
+            return;
+        };
+        live.refused_warned = false;
+        if let Some(stream) = self
+            .registry
+            .sessions
+            .get_mut(session)
+            .and_then(|entry| entry.stream.as_mut())
+            && (stream.offset != Some(offset) || stream.calls != calls)
+        {
+            stream.offset = Some(offset);
+            stream.calls = calls;
+            self.registry.dirty = true;
         }
     }
 
@@ -1611,6 +2127,26 @@ impl Slots {
                 self.start_body_reads();
             }
             Done::Block { job, delivery } => self.on_block_done(job, delivery),
+            Done::Stream {
+                session,
+                number,
+                delivery,
+            } => self.on_stream_done(&session, number, delivery),
+            Done::Reaction(delivery) => {
+                self.reactions = self.reactions.saturating_sub(1);
+                self.on_reaction_done(delivery);
+            }
+        }
+    }
+
+    fn on_reaction_done(&mut self, delivery: Option<Delivery>) {
+        match delivery {
+            Some(Err(error)) if !self.reaction_warned => {
+                self.reaction_warned = true;
+                warn!(%error, "cannot set a message reaction; later failures are not logged");
+            }
+            Some(Err(error)) => debug!(%error, "message reaction not set"),
+            _ => {}
         }
     }
 
@@ -1819,6 +2355,7 @@ impl Slots {
         }
         self.send_prompts();
         self.send_prompt_edits();
+        self.pump_streams();
         let view = self.registry.topic_view();
         self.view.send_if_modified(|current| {
             let changed = **current != view;
@@ -1864,6 +2401,12 @@ async fn dispatch_loop(
                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
                 Work::Callback => Done::Callback(delivery),
                 Work::Block(job) => Done::Block { job, delivery },
+                Work::Stream { session, number } => Done::Stream {
+                    session,
+                    number,
+                    delivery,
+                },
+                Work::Reaction => Done::Reaction(delivery),
             });
         });
     }
@@ -1934,6 +2477,19 @@ mod tests {
         stall_sends: bool,
         /// The next sends reach Telegram but the answer cannot be read.
         unclear_sends: Mutex<usize>,
+        /// Every reaction is refused (no such reaction in the chat).
+        react_error: bool,
+        /// The next stream messages fail with a 502.
+        stream_errors: Mutex<usize>,
+    }
+
+    impl Fake {
+        fn take_stream_error(&self) -> bool {
+            let mut left = self.stream_errors.lock().unwrap();
+            let fail = *left > 0;
+            *left = left.saturating_sub(1);
+            fail
+        }
     }
 
     impl Transport for Fake {
@@ -1972,6 +2528,11 @@ mod tests {
                     }),
                     None => Ok(Outcome::Done),
                 },
+                Op::React { .. } if self.react_error => error("Bad Request: REACTION_INVALID"),
+                Op::Stream { .. } if self.take_stream_error() => Err(ApiError::Telegram {
+                    code: 502,
+                    description: "Bad Gateway".to_owned(),
+                }),
                 Op::Delete { .. } => match self.delete_error {
                     Some(description) => error(description),
                     None => Ok(Outcome::Done),
@@ -2107,6 +2668,7 @@ mod tests {
                 cwd: CWD.into(),
                 claude_pid,
                 verdict_ack,
+                transcript_reads: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -2254,12 +2816,16 @@ mod tests {
             }
         }
         assert!(received(&mut rig, 0).await.is_empty(), "A got nothing");
-        assert_eq!(
-            rig.fake.ops().len(),
-            before,
-            "no notice: {:?}",
-            rig.fake.ops()
-        );
+        // No notice; each delivered message only gets its 👀.
+        let ops = rig.fake.ops();
+        let after: Vec<(i64, &str)> = ops[before..]
+            .iter()
+            .map(|op| match op {
+                Op::React { message_id, emoji } => (*message_id, emoji.as_str()),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(after, [(42, "👀"), (43, "👀")]);
     }
 
     #[tokio::test]
@@ -2946,6 +3512,7 @@ mod tests {
                 cwd: CWD.into(),
                 claude_pid: Some(10),
                 verdict_ack: false,
+                transcript_reads: false,
             },
             to_agent,
         });
@@ -3732,6 +4299,7 @@ mod tests {
                 cwd: CWD.into(),
                 claude_pid,
                 verdict_ack: false,
+                transcript_reads: false,
             },
             to_agent,
         });
@@ -3790,6 +4358,7 @@ mod tests {
                 cwd: CWD.into(),
                 claude_pid: Some(10),
                 verdict_ack: false,
+                transcript_reads: false,
             },
             to_agent,
         });
@@ -5448,5 +6017,890 @@ mod tests {
             )),
             "{ops:?}"
         );
+    }
+
+    // ---- Live transcript stream (TASK-016) ----
+
+    const FAST: BucketConfig = BucketConfig {
+        capacity: 1000,
+        refill_every: Duration::from_millis(1),
+        min_gap: Duration::ZERO,
+    };
+
+    fn stream_options() -> Options {
+        Options {
+            chat_id: CHAT,
+            stream_every: Duration::from_millis(20),
+            hold_answer: Duration::from_millis(400),
+            ..options()
+        }
+    }
+
+    /// A rig with a scheduler that never makes the stream wait.
+    fn stream_rig(fake: Fake, options: Options, dir: TempDir) -> Rig {
+        let fake = Arc::new(fake);
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let registry = store.load().unwrap();
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), FAST);
+        tokio::spawn(scheduler.run());
+        let (slots, view) = Slots::new(registry, store, outbox, options);
+        let (agents, agents_rx) = mpsc::channel(16);
+        let (hooks, hooks_rx) = mpsc::channel(16);
+        let (control, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
+        Rig {
+            fake,
+            agents,
+            hooks,
+            control,
+            view,
+            dir,
+            _to_agent: Vec::new(),
+        }
+    }
+
+    /// `<dir>/projects/C--w/<session>.jsonl`, created empty.
+    fn transcript_file(dir: &TempDir, session: &str) -> String {
+        let project = dir.path().join("projects").join("C--w");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{session}.jsonl"));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn append(path: &str, text: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn typed(text: &str) -> String {
+        format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n")
+    }
+
+    fn channel_record(message_id: i64) -> String {
+        format!(
+            "{{\"type\":\"user\",\"isMeta\":true,\"message\":{{\"role\":\"user\",\"content\":\"<channel source=\\\"cctg\\\" message_id=\\\"{message_id}\\\">hi</channel>\"}}}}\n"
+        )
+    }
+
+    fn tool_call(id: &str, description: &str) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"Bash\",\"input\":{{\"command\":\"x\",\"description\":\"{description}\"}}}}]}}}}\n"
+        )
+    }
+
+    fn tool_result(id: &str, error: Option<&str>) -> String {
+        format!(
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{id}\",\"content\":\"{}\",\"is_error\":{}}}]}}}}\n",
+            error.unwrap_or("ok"),
+            error.is_some()
+        )
+    }
+
+    fn start_with(session: &str, pid: u32, path: &str, source: &str) -> HookPost {
+        HookPost::new(
+            "box".into(),
+            session.into(),
+            CWD.into(),
+            path.into(),
+            HookEvent::SessionStart {
+                source: Some(source.into()),
+                claude_pid: Some(pid),
+                parent_claude_pid: None,
+            },
+        )
+    }
+
+    impl Rig {
+        /// An agent that answers transcript reads from the real file, like
+        /// `cctg agent` does, and keeps what else the hub sends it.
+        async fn reader(
+            &mut self,
+            conn: u64,
+            session: &str,
+            pid: u32,
+        ) -> mpsc::UnboundedReceiver<HubMsg> {
+            let (to_agent, mut from_hub) = mpsc::channel(16);
+            let (kept, kept_rx) = mpsc::unbounded_channel();
+            let agents = self.agents.clone();
+            let root = self.dir.path().join("projects");
+            tokio::spawn(async move {
+                while let Some(msg) = from_hub.recv().await {
+                    let HubMsg::TranscriptRead {
+                        session_id,
+                        path,
+                        from,
+                    } = msg
+                    else {
+                        let _ = kept.send(msg);
+                        continue;
+                    };
+                    let chunk = crate::tail::read_chunk(Some(&root), &session_id, &path, from);
+                    let event = AgentEvent::Message {
+                        conn,
+                        received_at: StdInstant::now(),
+                        msg: chunk,
+                    };
+                    if agents.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let register = Register {
+                session_id: session.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(pid),
+                verdict_ack: true,
+                transcript_reads: true,
+            };
+            self.agents
+                .send(AgentEvent::Registered {
+                    conn,
+                    register,
+                    to_agent,
+                })
+                .await
+                .unwrap();
+            kept_rx
+        }
+    }
+
+    /// Texts of new messages in `thread`, in order: sends and stream lines.
+    fn topic_texts(ops: &[Op], thread: i64) -> Vec<String> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(t),
+                    text,
+                    ..
+                }
+                | Op::Stream {
+                    thread_id: t, text, ..
+                } if *t == thread => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reactions(ops: &[Op]) -> Vec<(i64, String)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::React { message_id, emoji } => Some((*message_id, emoji.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn stream_texts(rig: &Rig, thread: i64, want: usize) -> Vec<String> {
+        let ops = settled(rig, |ops| topic_texts(ops, thread).len() >= want).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = ops;
+        topic_texts(&rig.fake.ops(), thread)
+    }
+
+    #[tokio::test]
+    async fn appended_lines_reach_the_slot_topic_in_order_and_a_partial_line_waits() {
+        let dir = TempDir::new("slots-stream-order");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+
+        let second = tool_call("t2", "two");
+        append(&path, &typed("go"));
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &second[..20]);
+        let first = stream_texts(&rig, 100, 2).await;
+        assert_eq!(first, ["> go", "• Bash: one ✓"]);
+
+        // The rest of the cut line arrives: it is read whole, never lost.
+        append(&path, &second[20..]);
+        append(&path, &tool_result("t2", Some("boom")));
+        let all = stream_texts(&rig, 100, 3).await;
+        assert_eq!(all, ["> go", "• Bash: one ✓", "• Bash: two ✗ boom"]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_neither_repeats_nor_loses_stream_lines() {
+        let dir = TempDir::new("slots-stream-restart");
+        let path = transcript_file(&dir, A);
+        let state = dir.path().to_path_buf();
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let _kept = rig.reader(1, A, 10).await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["• Bash: one ✓"]);
+        let saved = async {
+            loop {
+                let text = std::fs::read_to_string(state.join("registry.json")).unwrap_or_default();
+                let offset = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v["sessions"][A]["stream"]["offset"].as_u64());
+                if offset == Some(std::fs::metadata(&path).unwrap().len()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, saved)
+            .await
+            .expect("offset saved");
+
+        // The hub goes away; the session writes on meanwhile.
+        let Rig { dir, .. } = rig;
+        append(&path, &tool_call("t2", "two"));
+        append(&path, &tool_result("t2", None));
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        let _kept = rig.reader(2, A, 10).await;
+        let after = stream_texts(&rig, 100, 1).await;
+        assert_eq!(after, ["• Bash: two ✓"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_session_in_the_slot_streams_after_its_one_separator() {
+        let dir = TempDir::new("slots-stream-rotation");
+        let first = transcript_file(&dir, A);
+        let second = transcript_file(&dir, B);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &first, "startup")).await;
+        rig.ops_after(1).await;
+        let _a = rig.reader(1, A, 10).await;
+        append(&first, &typed("from A"));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["> from A"]);
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        append(&second, &typed("from B"));
+        rig.hook(start_with(B, 11, &second, "startup")).await;
+        let _b = rig.reader(2, B, 11).await;
+        let texts = stream_texts(&rig, 100, 3).await;
+        assert_eq!(
+            texts,
+            ["> from A", "── session bbbbbbbb · new ──", "> from B"]
+        );
+        assert_eq!(count(&rig.fake.ops(), is_create), 1);
+    }
+
+    #[tokio::test]
+    async fn eyes_on_hand_off_and_writing_only_for_the_same_messages_channel_record() {
+        let dir = TempDir::new("slots-stream-reactions");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let mut kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        rig.control.send(say(Some(100), 42, Some("hi"))).unwrap();
+        settled(&rig, |ops| reactions(ops) == [(42, "👀".to_owned())]).await;
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+
+        // A prompt typed in the terminal, its UserPromptSubmit and the channel
+        // record of a message this session never got change nothing.
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        append(&path, &typed("typed here"));
+        append(&path, &channel_record(41));
+        stream_texts(&rig, 100, 1).await;
+        assert_eq!(reactions(&rig.fake.ops()), [(42, "👀".to_owned())]);
+
+        append(&path, &channel_record(42));
+        let ops = settled(&rig, |ops| reactions(ops).len() == 2).await;
+        assert_eq!(
+            reactions(&ops),
+            [(42, "👀".to_owned()), (42, "✍".to_owned())]
+        );
+        // Its record again (a restart re-read) marks nothing twice.
+        append(&path, &channel_record(42));
+        append(&path, &typed("later"));
+        stream_texts(&rig, 100, 2).await;
+        assert_eq!(reactions(&rig.fake.ops()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_reaction_never_stops_routing() {
+        let dir = TempDir::new("slots-stream-reaction-error");
+        let fake = Fake {
+            react_error: true,
+            ..Fake::default()
+        };
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(fake, stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let mut kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        for id in [1, 2] {
+            rig.control.send(say(Some(100), id, Some("m"))).unwrap();
+        }
+        for _ in 0..2 {
+            let got = tokio::time::timeout(WAIT, kept.recv()).await.unwrap();
+            assert!(matches!(got, Some(HubMsg::Inbound { .. })), "{got:?}");
+        }
+        append(&path, &typed("still streaming"));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["> still streaming"]);
+    }
+
+    #[tokio::test]
+    async fn a_turn_answer_follows_the_lines_read_after_its_stop() {
+        let dir = TempDir::new("slots-stream-hold");
+        let path = transcript_file(&dir, A);
+        let options = Options {
+            // Only the read the Stop asks for can find the lines in time.
+            stream_every: Duration::from_secs(3600),
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let mut rig = stream_rig(Fake::default(), options, dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        append(&path, &tool_call("t1", "last step"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &answer_record("done"));
+        rig.hook(stop(A, Some("done"))).await;
+        assert_eq!(
+            stream_texts(&rig, 100, 2).await,
+            ["• Bash: last step ✓", "done"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_answer_goes_out_when_the_agent_never_answers() {
+        let dir = TempDir::new("slots-stream-hold-timeout");
+        let path = transcript_file(&dir, A);
+        let rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        // Registers as a reader but never reads.
+        let (to_agent, silent) = mpsc::channel(64);
+        rig.agents
+            .send(AgentEvent::Registered {
+                conn: 1,
+                register: Register {
+                    session_id: A.into(),
+                    host: "box".into(),
+                    cwd: CWD.into(),
+                    claude_pid: Some(10),
+                    verdict_ack: true,
+                    transcript_reads: true,
+                },
+                to_agent,
+            })
+            .await
+            .unwrap();
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        let asked = std::time::Instant::now();
+        rig.hook(stop(A, Some("done anyway"))).await;
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["done anyway"]);
+        assert!(asked.elapsed() >= Duration::from_millis(300), "held first");
+        drop(silent);
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_transcript_reads_is_never_asked() {
+        let dir = TempDir::new("slots-stream-old-agent");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        rig.agent_with(1, A, Some(10), true).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        append(&path, &typed("not streamed"));
+        rig.hook(stop(A, Some("answer at once"))).await;
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["answer at once"]);
+        assert!(received(&mut rig, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_reads_do_not_rewrite_the_registry() {
+        let dir = TempDir::new("slots-stream-idle");
+        let path = transcript_file(&dir, A);
+        let mut slots = stalled_slots(&dir, stream_options());
+        slots.on_hook(&start_with(A, 10, &path, "startup"));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, mut from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: true,
+                transcript_reads: true,
+            },
+            to_agent,
+        });
+        slots.pump();
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::TranscriptRead { from: Some(0), .. })
+        ));
+        slots.registry.dirty = false;
+        let empty = Chunk {
+            from: 0,
+            to: 0,
+            lines: &[],
+            missing: false,
+            more: false,
+            reset: false,
+        };
+        slots.on_chunk(1, A, &empty);
+        assert!(!slots.registry.dirty, "an empty read wrote the registry");
+    }
+
+    #[tokio::test]
+    async fn a_busy_queue_leaves_the_rest_of_a_chunk_in_the_file() {
+        let dir = TempDir::new("slots-stream-budget");
+        let path = transcript_file(&dir, A);
+        let mut slots = stalled_slots(&dir, stream_options());
+        slots.on_hook(&start_with(A, 10, &path, "startup"));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, mut from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: true,
+                transcript_reads: true,
+            },
+            to_agent,
+        });
+        slots.queued_messages = STREAM_QUEUE - 1;
+        slots.pump();
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::TranscriptRead { from: Some(0), .. })
+        ));
+        let prompt = |end: u64, text: &str| StreamLine {
+            end,
+            items: vec![crate::wire::StreamItem::Prompt { text: text.into() }],
+        };
+        let lines = [prompt(10, "one"), prompt(20, "two"), prompt(30, "three")];
+        let chunk = Chunk {
+            from: 0,
+            to: 40,
+            lines: &lines,
+            missing: false,
+            more: false,
+            reset: false,
+        };
+        slots.on_chunk(1, A, &chunk);
+        // The first line went out and counts; the rest waits in the file.
+        assert_eq!(slots.queued_messages, STREAM_QUEUE);
+        assert_eq!(slots.streams[A].read_at, Some(10));
+        slots.pump();
+        assert!(
+            from_hub.try_recv().is_err(),
+            "no read while the queue is full"
+        );
+    }
+
+    /// Slots with session A streaming through agent conn 1, its first read
+    /// (from 0) asked; nothing ever reaches Telegram.
+    fn asked_slots(dir: &TempDir) -> Slots {
+        let path = transcript_file(dir, A);
+        let mut slots = stalled_slots(dir, stream_options());
+        slots.on_hook(&start_with(A, 10, &path, "startup"));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, mut from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: true,
+                transcript_reads: true,
+            },
+            to_agent,
+        });
+        slots.pump();
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::TranscriptRead { from: Some(0), .. })
+        ));
+        slots
+    }
+
+    fn one_prompt_chunk(session: &str) -> AgentMsg {
+        AgentMsg::TranscriptChunk {
+            session_id: session.into(),
+            from: 0,
+            to: 10,
+            lines: vec![StreamLine {
+                end: 10,
+                items: vec![crate::wire::StreamItem::Prompt { text: "one".into() }],
+            }],
+            missing: false,
+            more: false,
+            reset: false,
+        }
+    }
+
+    fn stream_offset(slots: &Slots) -> Option<u64> {
+        slots.registry.sessions[A].stream.as_ref().unwrap().offset
+    }
+
+    #[tokio::test]
+    async fn a_chunk_for_another_session_on_the_connection_is_dropped() {
+        let dir = TempDir::new("slots-stream-foreign-chunk");
+        let mut slots = asked_slots(&dir);
+        let message = |msg| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg,
+        };
+        slots.on_agent(message(one_prompt_chunk(B)));
+        assert!(slots.streams[A].reading.is_some(), "the read still waits");
+        assert!(!slots.streams.contains_key(B));
+        assert_eq!(slots.queued_messages, 0);
+        assert_eq!(slots.streams[A].read_at, Some(0));
+        // The same chunk for the bound session is taken.
+        slots.on_agent(message(one_prompt_chunk(A)));
+        assert!(slots.streams[A].reading.is_none());
+        assert_eq!(slots.queued_messages, 1);
+        assert_eq!(slots.streams[A].read_at, Some(10));
+    }
+
+    #[tokio::test]
+    async fn a_stream_message_telegram_refuses_with_a_4xx_is_skipped_and_the_offset_moves() {
+        let dir = TempDir::new("slots-stream-skip-4xx");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        assert_eq!(stream_offset(&slots), Some(0));
+        slots.on_stream_done(
+            A,
+            1,
+            Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message text is empty".into(),
+            })),
+        );
+        assert_eq!(stream_offset(&slots), Some(10));
+        assert_eq!(slots.queued_messages, 0);
+        assert!(!slots.streams[A].stuck(), "skipped, not sent again");
+    }
+
+    // ---- TASK-016 review 2: ordering barrier, delivery commit, reset ----
+
+    /// The assistant text that ends a turn.
+    fn answer_record(text: &str) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+        )
+    }
+
+    fn saved_offset(dir: &std::path::Path) -> Option<u64> {
+        let text = std::fs::read_to_string(dir.join("registry.json")).unwrap_or_default();
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["sessions"][A]["stream"]["offset"].as_u64())
+    }
+
+    async fn live_stream(options: Options, fake: Fake, name: &str) -> (Rig, String) {
+        let dir = TempDir::new(name);
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(fake, options, dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        drop(rig.reader(1, A, 10).await);
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        (rig, path)
+    }
+
+    #[tokio::test]
+    async fn a_turn_answer_waits_for_its_turn_end_even_when_the_file_lags() {
+        let options = Options {
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, Fake::default(), "slots-stream-lag").await;
+        rig.hook(stop(A, Some("done"))).await;
+        // The file lags far behind the hook.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(topic_texts(&rig.fake.ops(), 100).is_empty(), "held");
+        append(&path, &tool_call("t1", "late step"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &answer_record("done"));
+        assert_eq!(
+            stream_texts(&rig, 100, 2).await,
+            ["• Bash: late step ✓", "done"]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_stop_of_a_turn_follows_its_own_tool_lines() {
+        let options = Options {
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, Fake::default(), "slots-stream-stops").await;
+        // A blocking Stop hook of the user: the turn answers twice.
+        rig.hook(stop(A, Some("first"))).await;
+        rig.hook(stop(A, Some("second"))).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &answer_record("first"));
+        append(&path, &tool_call("t2", "two"));
+        append(&path, &tool_result("t2", None));
+        append(&path, &answer_record("second"));
+        assert_eq!(
+            stream_texts(&rig, 100, 4).await,
+            ["• Bash: one ✓", "first", "• Bash: two ✓", "second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn two_turn_ends_in_one_read_serve_the_held_answer_and_the_next_stop() {
+        let options = Options {
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, Fake::default(), "slots-stream-two-ends").await;
+        rig.hook(stop(A, Some("first"))).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut lines = tool_call("t1", "one");
+        lines.push_str(&tool_result("t1", None));
+        lines.push_str(&answer_record("first"));
+        lines.push_str(&tool_call("t2", "two"));
+        lines.push_str(&tool_result("t2", None));
+        lines.push_str(&answer_record("second"));
+        append(&path, &lines);
+        assert_eq!(
+            stream_texts(&rig, 100, 3).await,
+            ["• Bash: one ✓", "first", "• Bash: two ✓"]
+        );
+        let asked = std::time::Instant::now();
+        rig.hook(stop(A, Some("second"))).await;
+        assert_eq!(stream_texts(&rig, 100, 4).await[3], "second");
+        assert!(asked.elapsed() < Duration::from_secs(10), "not held");
+    }
+
+    #[tokio::test]
+    async fn a_turn_end_read_before_its_stop_lets_the_answer_go_at_once() {
+        let options = Options {
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, Fake::default(), "slots-stream-quick").await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &answer_record("quick"));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["• Bash: one ✓"]);
+        let asked = std::time::Instant::now();
+        rig.hook(stop(A, Some("quick"))).await;
+        assert_eq!(stream_texts(&rig, 100, 2).await, ["• Bash: one ✓", "quick"]);
+        assert!(asked.elapsed() < Duration::from_secs(10), "not held");
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_comes_after_the_next_prompt_was_read_still_takes_its_turn_end() {
+        let options = Options {
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, Fake::default(), "slots-stream-late-stop").await;
+        let mut lines = tool_call("t1", "one");
+        lines.push_str(&tool_result("t1", None));
+        lines.push_str(&answer_record("late"));
+        lines.push_str(&typed("next"));
+        append(&path, &lines);
+        assert_eq!(
+            stream_texts(&rig, 100, 2).await,
+            ["• Bash: one ✓", "> next"]
+        );
+        let asked = std::time::Instant::now();
+        rig.hook(stop(A, Some("late"))).await;
+        assert_eq!(stream_texts(&rig, 100, 3).await[2], "late");
+        assert!(asked.elapsed() < Duration::from_secs(10), "not held");
+    }
+
+    #[tokio::test]
+    async fn lines_after_a_refused_stream_message_never_show_before_it() {
+        let fake = Fake {
+            stream_errors: Mutex::new(1),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_millis(200),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, fake, "slots-stream-refused-order").await;
+        let mut lines = typed("go");
+        for (id, description) in [("t1", "one"), ("t2", "two"), ("t3", "three")] {
+            lines.push_str(&tool_call(id, description));
+            lines.push_str(&tool_result(id, None));
+        }
+        append(&path, &lines);
+        // Every attempt Telegram saw: the refused one, then the stream again
+        // from it, in order. Nothing queued behind it went out in between.
+        assert_eq!(
+            stream_texts(&rig, 100, 5).await,
+            [
+                "> go",
+                "> go",
+                "• Bash: one ✓",
+                "• Bash: two ✓",
+                "• Bash: three ✓"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_stream_message_is_sent_again_before_the_offset_moves() {
+        let fake = Fake {
+            stream_errors: Mutex::new(1),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_millis(200),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, fake, "slots-stream-refused").await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        // The refused attempt, then the one Telegram takes.
+        assert_eq!(
+            stream_texts(&rig, 100, 2).await,
+            ["• Bash: one ✓", "• Bash: one ✓"]
+        );
+        let len = std::fs::metadata(&path).unwrap().len();
+        let state = rig.dir.path().to_path_buf();
+        let saved = async {
+            while saved_offset(&state) != Some(len) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, saved)
+            .await
+            .expect("offset saved");
+    }
+
+    #[tokio::test]
+    async fn a_refused_stream_message_comes_again_after_a_restart() {
+        let fake = Fake {
+            stream_errors: Mutex::new(usize::MAX),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_secs(3600),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, fake, "slots-stream-refused-restart").await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_ne!(saved_offset(rig.dir.path()), Some(len), "not committed");
+
+        let Rig { dir, .. } = rig;
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        let _kept = rig.reader(2, A, 10).await;
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["• Bash: one ✓"]);
+    }
+
+    #[tokio::test]
+    async fn a_new_agent_process_goes_on_from_the_stream_position() {
+        let (mut rig, path) = live_stream(
+            stream_options(),
+            Fake::default(),
+            "slots-stream-agent-restart",
+        )
+        .await;
+        append(&path, &typed("one"));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["> one"]);
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        append(&path, &typed("two"));
+        let back = std::time::Instant::now();
+        let _kept = rig.reader(2, A, 10).await;
+        assert_eq!(stream_texts(&rig, 100, 2).await, ["> one", "> two"]);
+        assert!(back.elapsed() < Duration::from_secs(5), "no read timeout");
+    }
+
+    #[tokio::test]
+    async fn a_clear_in_the_same_process_streams_the_new_session_after_one_separator() {
+        let dir = TempDir::new("slots-stream-clear");
+        let first = transcript_file(&dir, A);
+        let second = transcript_file(&dir, B);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &first, "startup")).await;
+        rig.ops_after(1).await;
+        let _kept = rig.reader(1, A, 10).await;
+        append(&first, &typed("from A"));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["> from A"]);
+        rig.hook(hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ))
+        .await;
+        append(&second, &typed("from B"));
+        rig.hook(start_with(B, 10, &second, "clear")).await;
+        // The same agent (conn 1) now serves B.
+        assert_eq!(
+            stream_texts(&rig, 100, 3).await,
+            ["> from A", "── session bbbbbbbb · new ──", "> from B"]
+        );
+        append(&first, &typed("late A"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(topic_texts(&rig.fake.ops(), 100).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_cut_transcript_is_read_again_from_its_start() {
+        let (rig, path) = live_stream(stream_options(), Fake::default(), "slots-stream-cut").await;
+        append(&path, &typed("before"));
+        assert_eq!(stream_texts(&rig, 100, 1).await, ["> before"]);
+        std::fs::write(&path, typed("after")).unwrap();
+        assert_eq!(stream_texts(&rig, 100, 2).await, ["> before", "> after"]);
+    }
+
+    #[tokio::test]
+    async fn a_channel_record_of_another_server_leaves_the_reaction() {
+        let (rig, path) =
+            live_stream(stream_options(), Fake::default(), "slots-stream-foreign").await;
+        rig.control.send(say(Some(100), 42, Some("hi"))).unwrap();
+        settled(&rig, |ops| reactions(ops) == [(42, "👀".to_owned())]).await;
+        append(
+            &path,
+            &channel_record(42).replace("source=\\\"cctg\\\"", "source=\\\"webhook\\\""),
+        );
+        append(&path, &typed("marker"));
+        stream_texts(&rig, 100, 1).await;
+        assert_eq!(reactions(&rig.fake.ops()), [(42, "👀".to_owned())]);
     }
 }

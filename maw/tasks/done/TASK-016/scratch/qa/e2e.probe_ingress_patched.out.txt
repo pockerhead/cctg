@@ -1,0 +1,32 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+   Compiling qa016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\e2e)
+    Finished `test` profile [unoptimized] target(s) in 3.10s
+     Running tests\e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-qa016-target\debug\deps\e2e-77e35f88764c6e62.exe)
+
+running 6 tests
+test e2e_hub_restart_neither_repeats_nor_loses ... ok
+test e2e_merge_under_the_limit ... 2 stream messages for 16 lines: ["> merge run", "• Bash: merged 00 ✓\n• Bash: merged 01 ✓\n• Bash: merged 02 ✓\n• Bash: merged 03 ✓\n• Bash: merged 04 ✓\n• Bash: merged 05 ✓\n• Bash: merged 06 ✓\n• Bash: merged 07 ✓\n• Bash: merged 08 ✓\n• Bash: merged 09 ✓\n• Bash: merged 10 ✓\n• Bash: merged 11 ✓\n• Bash: merged 12 ✓\n• Bash: merged 13 ✓\n• Bash: merged 14 ✓"]
+ok
+test e2e_order_partial_line_and_stop_after_lines ... ok
+test e2e_reactions ... ok
+test e2e_refused_sends_lose_nothing ... 
+thread 'e2e_refused_sends_lose_nothing' (3384) panicked at tests\e2e.rs:479:5:
+assertion `left == right` failed: all lines: ["• Bash: refused 2 ✓", "• Bash: refused 3 ✓", "> refuse run", "• Bash: refused 0 ✓", "• Bash: refused 1 ✓", "• Bash: refused 2 ✓", "• Bash: refused 3 ✓"]
+  left: ["• Bash: refused 2 ✓", "• Bash: refused 3 ✓", "> refuse run", "• Bash: refused 0 ✓", "• Bash: refused 1 ✓"]
+ right: ["> refuse run", "• Bash: refused 0 ✓", "• Bash: refused 1 ✓", "• Bash: refused 2 ✓", "• Bash: refused 3 ✓"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test e2e_resume_at_a_torn_end_does_not_replay_history ... 
+thread 'e2e_resume_at_a_torn_end_does_not_replay_history' (31672) panicked at tests\e2e.rs:639:5:
+history replayed after resume: ["> history 0", "> history 1", "> history 2", "> history 3", "> history 4", "> being written", "> new after resume"]
+FAILED
+
+failures:
+
+failures:
+    e2e_refused_sends_lose_nothing
+    e2e_resume_at_a_torn_end_does_not_replay_history
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.00s
+
+error: test failed, to rerun pass `--test e2e`

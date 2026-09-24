@@ -1,0 +1,2 @@
+scheduler never breaks a topic stream (M2 revert): KILLED [('qa2_refused_single_line_is_not_overtaken', 'FAILED', ['test qa2_refused_single_line_is_not_overtaken ... FAILED', 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 1.79s'])]
+restored

@@ -1,0 +1,41 @@
+run 1 rc=0 wall=15.9s file_exists=True records=38
+   2.36s  lag=1.36s  queue-operation                              stop=None
+   2.36s  lag=1.36s  queue-operation                              stop=None
+   2.36s  lag=0.12s  user         string                       stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=0.12s  attachment                                stop=None
+   2.36s  lag=   -    atis-latch                                stop=None
+   2.36s  lag=0.10s  attachment                                stop=None
+   2.36s  lag=0.10s  attachment                                stop=None
+   2.36s  lag=0.10s  attachment                                stop=None
+   2.36s  lag=0.10s  attachment                                stop=None
+   2.36s  lag=0.10s  attachment                                stop=None
+   2.36s  lag=0.10s  attachment                                stop=None
+   2.36s  lag=   -    last-prompt                               stop=None
+   2.36s  lag=   -    atis-latch                                stop=None
+   4.51s  lag=0.16s  attachment                                stop=None
+   4.51s  lag=0.16s  assistant    text                         stop=tool_use
+   4.51s  lag=0.14s  assistant    tool_use                     stop=tool_use
+   8.59s  lag=0.20s  user         tool_result                  stop=None
+   8.59s  lag=0.20s  attachment                                stop=None
+   8.59s  lag=0.20s  attachment                                stop=None
+   8.59s  lag=   -    last-prompt                               stop=None
+   8.59s  lag=   -    atis-latch                                stop=None
+   9.99s  lag=0.59s  assistant    text                         stop=tool_use
+   9.99s  lag=0.13s  assistant    tool_use                     stop=tool_use
+  13.10s  lag=0.14s  user         tool_result                  stop=None
+  13.10s  lag=0.14s  attachment                                stop=None
+  14.28s  lag=0.49s  assistant    text                         stop=tool_use
+  14.28s  lag=0.17s  assistant    tool_use                     stop=tool_use
+  14.28s  lag=0.10s  user         tool_result                  stop=None
+  14.28s  lag=0.10s  attachment                                stop=None
+  15.35s  lag=0.10s  assistant    text                         stop=end_turn
+  15.35s  lag=   -    last-prompt                               stop=None
+  15.35s  lag=   -    cost-state                                stop=None
+exit_seen=15.88s
+stdout: done

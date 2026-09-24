@@ -43,6 +43,7 @@
 - Записи `type: "user"` и `type: "assistant"`, поле `message.content` это строка (набранные промпты, многие `isMeta`) или массив блоков `text | tool_use | tool_result | thinking | image` (TASK-005). Один ответ API разбит на несколько записей `assistant` с общим `message.id`, по одному блоку в каждой. Id субагента от вызова `Agent` лежит в `toolUseResult.agentId` записи с результатом. Входящие из канала сообщения лежат как `user` с `isMeta: true`. У каждой записи `uuid`, `parentUuid`, `timestamp`, `cwd`, `sessionId`, `gitBranch`, `isSidechain` (субагенты), `isMeta` (служебные).
 - Прочие типы, которые надо игнорировать при рендере: `mode`, `permission-mode`, `file-history-snapshot`, `ai-title`, `last-prompt`, `system`, `summary`.
 - `ai-title` даёт автоназвание сессии, пригодится для заголовка в теме.
+- Когда записи видны в jsonl (замер TASK-016, 2.1.281): через 0.1-0.3 с после `timestamp`. Исключение: в интерактивной сессии запись ассистента с `tool_use` пишется только по окончании инструмента, вместе с `tool_result`; идущий вызов в файле не виден.
 
 **Hooks:** `SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit` получают в stdin JSON с `session_id`, `cwd`, `transcript_path`, `source` (`startup|resume|clear|compact|fork`). Это единственный надёжный способ узнать session id и путь транскрипта. Channel MCP-сервер сам этого не знает.
 

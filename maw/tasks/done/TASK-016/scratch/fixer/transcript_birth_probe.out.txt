@@ -1,0 +1,5 @@
+38 ('mode', 0)
+9 ('queue-operation', -2)
+7 ('queue-operation', -1)
+4 ('last-prompt', 0)
+1 ('queue-operation', 0)

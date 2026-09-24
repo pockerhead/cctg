@@ -1,0 +1,49 @@
+i3 interactive: state=prompted end_turn_seen=True records=46
+4.0s input ready -> prompt
+   5.77s lag=  -   mode                                    stop=None
+   5.77s lag=  -   permission-mode                          stop=None
+   5.77s lag=  -   atis-latch                              stop=None
+   5.88s lag=  -   file-history-snapshot                          stop=None
+   5.88s lag=0.27s user           string                   stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.27s attachment                              stop=None
+   5.88s lag=0.23s attachment                              stop=None
+   5.88s lag=0.23s attachment                              stop=None
+   5.88s lag=0.23s attachment                              stop=None
+   5.88s lag=0.22s attachment                              stop=None
+   5.88s lag=0.22s attachment                              stop=None
+   5.88s lag=0.22s attachment                              stop=None
+   5.88s lag=  -   last-prompt                             stop=None
+   5.88s lag=  -   mode                                    stop=None
+   5.88s lag=  -   permission-mode                          stop=None
+   5.88s lag=  -   atis-latch                              stop=None
+   6.64s lag=  -   ai-title                                stop=None
+   7.30s lag=0.17s attachment                              stop=None
+  13.71s lag=6.58s assistant      thinking                 stop=tool_use
+  13.71s lag=6.21s assistant      text                     stop=tool_use
+  13.71s lag=5.59s assistant      tool_use                 stop=tool_use
+  13.82s lag=0.14s user           tool_result              stop=None
+  13.82s lag=0.14s attachment                              stop=None
+  13.82s lag=  -   last-prompt                             stop=None
+  13.82s lag=  -   ai-title                                stop=None
+  13.82s lag=  -   mode                                    stop=None
+  13.82s lag=  -   permission-mode                          stop=None
+  13.82s lag=  -   atis-latch                              stop=None
+  14.91s lag=1.22s attachment                              stop=None
+  19.81s lag=5.01s assistant      text                     stop=tool_use
+  19.81s lag=4.60s assistant      tool_use                 stop=tool_use
+  19.81s lag=0.10s user           tool_result              stop=None
+  20.79s lag=1.07s attachment                              stop=None
+  22.64s lag=1.98s assistant      text                     stop=tool_use
+  22.64s lag=1.66s assistant      tool_use                 stop=tool_use
+  22.64s lag=0.19s user           tool_result              stop=None
+  23.40s lag=0.95s attachment                              stop=None
+  23.40s lag=0.15s assistant      text                     stop=end_turn
+  23.40s lag=0.13s system                                  stop=None
+user/assistant: n=12 min=0.10 median=1.98 max=6.58

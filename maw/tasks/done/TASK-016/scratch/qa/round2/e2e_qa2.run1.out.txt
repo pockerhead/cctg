@@ -1,0 +1,51 @@
+   Compiling tokio v1.53.1
+   Compiling hyper v1.11.1
+   Compiling tower v0.5.3
+   Compiling hyper-util v0.1.20
+   Compiling tokio-rustls v0.26.5
+   Compiling tower-http v0.6.11
+   Compiling hyper-rustls v0.27.10
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+   Compiling reqwest v0.13.5
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+   Compiling qa2016-e2e v0.0.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-016\scratch\qa\round2\e2e)
+warning: field `fake` is never read
+   --> tests\qa2.rs:198:5
+    |
+197 | struct Hub {
+    |        --- field in this struct
+198 |     fake: Arc<Fake>,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qa2016-e2e` (test "qa2") generated 1 warning
+    Finished `test` profile [unoptimized] target(s) in 21.04s
+     Running tests\qa2.rs (C:\Users\user\AppData\Local\Temp/cctg-qa2-016-target\debug\deps\qa2-b23aea9be06ca542.exe)
+
+running 6 tests
+test qa2_missing_and_deleted_transcript_logs_once ... QA2 log lines about transcripts:
+ WARN cctg::hub::slots: session transcript not found; the stream waits for it session="00000008"
+DEBUG cctg::hub::slots: session transcript not written yet; the stream waits for it session="00000009"
+ WARN cctg::hub::slots: session transcript not found; the stream waits for it session="00000009"
+ok
+test qa2_reactions ... ok
+test qa2_refusals_under_the_limit_keep_order_and_lose_nothing ... 
+thread 'qa2_refusals_under_the_limit_keep_order_and_lose_nothing' (33052) panicked at tests\qa2.rs:629:5:
+assertion `left == right` failed: got ["GAMMA DONE", "> gamma run", "> gamma run", "> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+  left: ["GAMMA DONE", "> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+ right: ["> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓", "GAMMA DONE"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test qa2_restart_with_open_calls ... ok
+test qa2_rotation_one_separator_new_offset ... ok
+test qa2_two_slots_pieces_order_and_answers ... ok
+
+failures:
+
+failures:
+    qa2_refusals_under_the_limit_keep_order_and_lose_nothing
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.85s
+
+error: test failed, to rerun pass `--test qa2`
