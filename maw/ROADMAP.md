@@ -4,11 +4,10 @@ TASK-019
 
 TASK-024
 
-TASK-029
-
 TASK-031
 
 TASK-032
 
-TASK-035   [waits on TASK-034 (in_progress)]
+TASK-034
+  └── TASK-035   (blocked by TASK-034)
 
