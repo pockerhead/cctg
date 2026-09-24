@@ -108,6 +108,7 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
         console_keys: false,
         console_commands: false,
         client: None,
+        files: false,
     };
     let mut lines = wire::encode(&AgentMsg::Hello {
         secret: secret.clone(),

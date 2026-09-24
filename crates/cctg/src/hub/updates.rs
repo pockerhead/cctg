@@ -10,10 +10,12 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::api::{ApiError, BotApi, Message, Update};
+use super::api::{ApiError, BotApi, FileInfo, Message, Update};
+use super::buffer::Attachment;
 use super::config::Allowlist;
 use super::offset::OffsetStore;
 use super::registry::cut;
+use crate::wire::FileKind;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(50);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -50,6 +52,76 @@ pub struct Inbound {
     pub quote: Option<String>,
     /// A forwarded message: someone else's words, not the user's.
     pub forwarded: bool,
+    /// A file the message carried and its caption (TASK-032); `text` is
+    /// then `None`. Never logged but for its kind and size.
+    pub media: Option<Media>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Media {
+    pub file: Attachment,
+    pub caption: Option<String>,
+}
+
+/// The file of a message: an animation before its `document` twin, the
+/// largest size of a photo. Stickers, video notes and other kinds are none.
+fn media(message: &mut Message) -> Option<Media> {
+    let file = |kind: FileKind, info: FileInfo| Attachment {
+        kind,
+        file_id: info.file_id,
+        name: info.file_name,
+        size: info.file_size,
+    };
+    let photo = message.media.photo.take().and_then(|sizes| {
+        sizes
+            .into_iter()
+            .max_by_key(|size| (size.width.saturating_mul(size.height), size.file_size))
+            .map(|largest| Attachment {
+                kind: FileKind::Photo,
+                file_id: largest.file_id,
+                name: None,
+                size: largest.file_size,
+            })
+    });
+    let file = message
+        .media
+        .animation
+        .take()
+        .map(|info| file(FileKind::Animation, info))
+        .or(photo)
+        .or_else(|| {
+            message
+                .media
+                .video
+                .take()
+                .map(|info| file(FileKind::Video, info))
+        })
+        .or_else(|| {
+            message
+                .media
+                .voice
+                .take()
+                .map(|info| file(FileKind::Voice, info))
+        })
+        .or_else(|| {
+            message
+                .media
+                .audio
+                .take()
+                .map(|info| file(FileKind::Audio, info))
+        })
+        .or_else(|| {
+            message
+                .media
+                .document
+                .take()
+                .map(|info| file(FileKind::Document, info))
+        })
+        .filter(|file| !file.file_id.is_empty())?;
+    Some(Media {
+        file,
+        caption: message.media.caption.take(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +184,7 @@ fn service_kind(message: &Message) -> Option<ServiceKind> {
 /// Classifies one parsed update. Service messages are recognised before the
 /// allowlist check because the bot itself is their sender.
 pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
-    if let Some(message) = update.message {
+    if let Some(mut message) = update.message {
         if message.chat.id != chat_id {
             return Routed::Ignored(Ignored::OtherChat);
         }
@@ -124,12 +196,13 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
                 from: message.from.as_ref().map(|from| from.id),
             });
         }
-        let Some(from) = message.from else {
+        let Some(from) = message.from.take() else {
             return Routed::Ignored(Ignored::NoSender);
         };
         if !allowlist.contains(from.id) {
             return Routed::Ignored(Ignored::NotAllowed);
         }
+        let media = media(&mut message);
         let thread_id = message
             .message_thread_id
             .filter(|_| message.is_topic_message);
@@ -151,6 +224,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             reply_to,
             quote,
             forwarded: message.forward_origin.is_some(),
+            media,
         });
     }
 
@@ -392,6 +466,7 @@ mod tests {
                 reply_to: None,
                 quote: None,
                 forwarded: false,
+                media: None,
             })
         );
 
@@ -536,6 +611,86 @@ mod tests {
             assert!(forwarded.forwarded, "{forwarded:?}");
             assert_eq!(forwarded.text.as_deref(), Some("чужие слова"));
         }
+    }
+
+    #[test]
+    fn a_photo_of_any_announced_dimensions_is_taken() {
+        let photo = input(json!({
+            "photo": [
+                { "file_id": "small", "file_unique_id": "u1", "width": 90, "height": 60 },
+                { "file_id": "odd", "file_unique_id": "u2", "width": u64::MAX, "height": 3 },
+            ],
+        }));
+        assert_eq!(photo.media.unwrap().file.file_id, "odd");
+    }
+
+    #[test]
+    fn a_media_message_carries_its_file_and_caption_and_no_text() {
+        let photo = input(json!({
+            "caption": "/brief",
+            "photo": [
+                { "file_id": "small", "file_unique_id": "u1", "width": 90, "height": 60, "file_size": 900 },
+                { "file_id": "large", "file_unique_id": "u2", "width": 1280, "height": 853, "file_size": 90000 },
+                { "file_id": "mid", "file_unique_id": "u3", "width": 320, "height": 213 },
+            ],
+        }));
+        // A caption is never a command: the text stays empty.
+        assert_eq!(photo.text, None);
+        let media = photo.media.unwrap();
+        assert_eq!(media.caption.as_deref(), Some("/brief"));
+        assert_eq!(
+            media.file,
+            Attachment {
+                kind: FileKind::Photo,
+                file_id: "large".into(),
+                name: None,
+                size: Some(90000),
+            }
+        );
+        let kind = |extra: Value| {
+            input(extra)
+                .media
+                .map(|media| (media.file.kind, media.file.file_id))
+        };
+        let info = |id: &str| json!({ "file_id": id, "file_unique_id": "u", "file_name": "n.bin", "file_size": 5 });
+        assert_eq!(
+            kind(json!({ "document": info("d") })),
+            Some((FileKind::Document, "d".into()))
+        );
+        assert_eq!(
+            kind(json!({ "video": info("v") })),
+            Some((FileKind::Video, "v".into()))
+        );
+        assert_eq!(
+            kind(json!({ "voice": info("o") })),
+            Some((FileKind::Voice, "o".into()))
+        );
+        assert_eq!(
+            kind(json!({ "audio": info("a") })),
+            Some((FileKind::Audio, "a".into()))
+        );
+        // Telegram fills `document` for an animation too.
+        assert_eq!(
+            kind(json!({ "animation": info("g"), "document": info("g") })),
+            Some((FileKind::Animation, "g".into()))
+        );
+        let named = input(json!({ "document": info("d") })).media.unwrap().file;
+        assert_eq!(
+            (named.name.as_deref(), named.size),
+            (Some("n.bin"), Some(5))
+        );
+        // Kinds the session does not take carry nothing.
+        for other in [
+            json!({ "sticker": { "file_id": "s" } }),
+            json!({ "video_note": { "file_id": "n" } }),
+            json!({ "location": { "latitude": 1.0, "longitude": 2.0 } }),
+            json!({ "document": { "file_unique_id": "no id" } }),
+        ] {
+            let other = input(other);
+            assert_eq!((other.text, other.media), (None, None));
+        }
+        // Text keeps its old shape.
+        assert_eq!(input(json!({ "text": "hi" })).media, None);
     }
 
     #[test]

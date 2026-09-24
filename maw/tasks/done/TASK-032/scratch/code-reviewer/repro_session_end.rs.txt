@@ -1,0 +1,34 @@
+    // Code-review repro (TASK-032): appended inside `mod tests` of
+    // crates/cctg/src/hub/slots.rs in a %TEMP% copy of 96f1e4b.
+
+    /// TASK-017 contract: an ended session's still-open link never gets
+    /// inbound; its kept messages wait for the next live session. A file
+    /// whose download was already running when the session ended is handed
+    /// to that ended agent anyway and leaves the slot (with 👀).
+    #[tokio::test]
+    async fn crev_a_file_downloading_when_its_session_ends_stays_in_the_slot() {
+        let dir = TempDir::new("crev-file-end");
+        let (mut slots, mut work, mut done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        slots.on_control(photo(2, "p", Some("look"), None));
+        slots.pump();
+        assert_eq!(slots.fetching.len(), 1, "download started");
+        // The session ends (/exit) while the file downloads; its agent's
+        // link is still open for a moment, as in production.
+        slots.on_hook(&end(A, 10));
+        // A text sent now is kept for the next session, as TASK-017 wants.
+        slots.on_control(say(Some(100), 3, Some("after")));
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        let got = arrived(&mut agent, &mut Vec::new());
+        let (_, reacted) = topic_ops(&mut work);
+        assert!(
+            got.is_empty(),
+            "the ended session's agent got {got:?}; reacted {reacted:?}; buffered {:?}",
+            buffered(&slots, 0)
+        );
+        assert_eq!(buffered(&slots, 0), [2, 3]);
+    }

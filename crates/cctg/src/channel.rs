@@ -3,7 +3,9 @@
 //!
 //! Implemented: `initialize` (channel, permission relay and tools
 //! capabilities), `notifications/initialized`, `ping`, `tools/list`,
-//! `tools/call` (`reply`), the incoming
+//! `tools/call` (`reply`, and `send_file`, whose answer the agent loop
+//! writes once the hub answered: see [`Server::take_file_calls`]), the
+//! outgoing `notifications/tools/list_changed` ([`tools_changed`]), the incoming
 //! `notifications/claude/channel/permission_request` and the outgoing
 //! `notifications/claude/channel` and `notifications/claude/channel/permission`.
 //! Every other request answers method-not-found; other notifications are
@@ -43,6 +45,11 @@ pub const MAX_HELD: usize = 64;
 /// this is a window, not a set of open requests: the oldest id falls out.
 pub const RECENT_PERMISSIONS: usize = 256;
 pub const REPLY_TOOL: &str = "reply";
+/// Sends a file of this machine to the topic (TASK-032).
+pub const SEND_FILE_TOOL: &str = "send_file";
+/// Longest `send_file` caption passed on, in bytes; the hub cuts it to what
+/// Telegram shows.
+pub const MAX_CAPTION: usize = 4 << 10;
 /// Longest reply text sent to the hub, in bytes. Even with every character
 /// `\u`-escaped the link line stays under `wire::MAX_LINE`.
 pub const MAX_REPLY: usize = 128 << 10;
@@ -58,7 +65,11 @@ need this server's `reply` tool (`mcp__<server>__reply`, normally `mcp__cctg__re
 only for compatibility, and a message sent through it repeats what the user already sees. \
 If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
-never ask for permissions through `reply`.";
+never ask for permissions through `reply`. A tag with a `file_path` attribute brings a file the user sent \
+(a photo, a document, a voice message...): it is saved on this machine at that path; open it with your \
+tools when it matters. To give the user a file of this machine, call this server's `send_file` tool \
+(normally `mcp__cctg__send_file`) with its path: pictures arrive as photos, anything else as a \
+document, 50 MB at most.";
 
 /// Why this agent has no hub link. Shown to Claude when it calls `reply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +109,16 @@ pub struct Server {
     initialized: bool,
     held: VecDeque<Vec<u8>>,
     recent_permissions: VecDeque<String>,
+    file_calls: Vec<FileCall>,
+}
+
+/// A `send_file` call waiting for the agent loop; its answer is
+/// [`tool_answer`] for `id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileCall {
+    pub id: Value,
+    pub path: String,
+    pub caption: Option<String>,
 }
 
 impl Server {
@@ -108,7 +129,14 @@ impl Server {
             initialized: false,
             held: VecDeque::new(),
             recent_permissions: VecDeque::new(),
+            file_calls: Vec::new(),
         }
+    }
+
+    /// The `send_file` calls since the last take, oldest first. Each still
+    /// needs its answer.
+    pub fn take_file_calls(&mut self) -> Vec<FileCall> {
+        std::mem::take(&mut self.file_calls)
     }
 
     /// A server for a session whose channel an earlier worker already set up
@@ -152,7 +180,7 @@ impl Server {
                 self.flush_if_ready(method)
             }
             (Some(Value::String(method)), Some(_)) if structured => match id {
-                Some(id) => vec![self.on_request(id, method, params)],
+                Some(id) => self.on_request(id, method, params).into_iter().collect(),
                 None => vec![error(&Value::Null, INVALID_REQUEST, "Invalid Request")],
             },
             _ => vec![error(
@@ -172,7 +200,7 @@ impl Server {
     /// Link state and hub messages.
     pub fn on_link(&mut self, event: LinkEvent) -> Vec<Vec<u8>> {
         match event {
-            LinkEvent::Up => {
+            LinkEvent::Up { .. } => {
                 self.hub_up = true;
                 Vec::new()
             }
@@ -209,16 +237,19 @@ impl Server {
                 );
                 self.emit(line)
             }
-            // Transcript reads, console keys and commands, and updates are
-            // the agent loop's, not the channel's.
+            // Transcript reads, console keys and commands, updates and files
+            // are the agent loop's, not the channel's.
             LinkEvent::Message(
-                HubMsg::Registered
+                HubMsg::Registered { .. }
                 | HubMsg::Rejected { .. }
                 | HubMsg::TranscriptRead { .. }
                 | HubMsg::ConsoleKey { .. }
                 | HubMsg::ConsoleCommand { .. }
                 | HubMsg::Update { .. }
-                | HubMsg::Released { .. },
+                | HubMsg::Released { .. }
+                | HubMsg::FileStart { .. }
+                | HubMsg::FileChunk(_)
+                | HubMsg::FileAnswer { .. },
             ) => Vec::new(),
         }
     }
@@ -296,19 +327,21 @@ impl Server {
         self.recent_permissions.push_back(request_id);
     }
 
-    fn on_request(&mut self, id: &Value, method: &str, params: Option<&Value>) -> Vec<u8> {
-        match method {
+    /// The answer to a request; `None` only for a `send_file` call, which
+    /// the agent loop answers later.
+    fn on_request(&mut self, id: &Value, method: &str, params: Option<&Value>) -> Option<Vec<u8>> {
+        let line = match method {
             "initialize" => {
                 let Some(asked) = params
                     .and_then(|params| params.get("protocolVersion"))
                     .and_then(Value::as_str)
                     .filter(|version| !version.is_empty())
                 else {
-                    return error(
+                    return Some(error(
                         id,
                         INVALID_PARAMS,
                         "initialize needs a protocolVersion string",
-                    );
+                    ));
                 };
                 let version = if SUPPORTED_PROTOCOLS.contains(&asked) {
                     asked
@@ -320,7 +353,9 @@ impl Server {
                     json!({
                         "protocolVersion": version,
                         "capabilities": {
-                            "tools": {},
+                            // A worker that took over after an update may
+                            // offer more tools than the one Claude Code met.
+                            "tools": { "listChanged": true },
                             "experimental": {
                                 "claude/channel": {},
                                 "claude/channel/permission": {},
@@ -335,22 +370,51 @@ impl Server {
                 )
             }
             "ping" => result(id, json!({})),
-            "tools/list" => result(id, json!({ "tools": [reply_tool()] })),
+            "tools/list" => result(id, json!({ "tools": [reply_tool(), send_file_tool()] })),
             "tools/call" => {
                 let name = params
                     .and_then(|params| params.get("name"))
                     .and_then(Value::as_str);
+                let arguments = params.and_then(|params| params.get("arguments"));
                 match name {
-                    Some(REPLY_TOOL) => {
-                        let arguments = params.and_then(|params| params.get("arguments"));
-                        result(id, self.reply(arguments))
-                    }
+                    Some(REPLY_TOOL) => result(id, self.reply(arguments)),
+                    Some(SEND_FILE_TOOL) => return self.send_file(id, arguments),
                     Some(_) => error(id, INVALID_PARAMS, "Unknown tool"),
                     None => error(id, INVALID_PARAMS, "tools/call needs a tool name"),
                 }
             }
             _ => error(id, METHOD_NOT_FOUND, "Method not found"),
+        };
+        Some(line)
+    }
+
+    /// The `send_file` tool: a well-formed call waits for the agent loop
+    /// ([`Self::take_file_calls`]); input problems and a missing hub are
+    /// answered at once as tool errors.
+    fn send_file(&mut self, id: &Value, arguments: Option<&Value>) -> Option<Vec<u8>> {
+        let answer = |text: &str| Some(tool_answer(id, text, true));
+        let path = arguments
+            .and_then(|arguments| arguments.get("path"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty());
+        let Some(path) = path else {
+            return answer("send_file needs a non-empty `path` string");
+        };
+        let caption = match arguments.and_then(|arguments| arguments.get("caption")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(caption)) if caption.trim().is_empty() => None,
+            Some(Value::String(caption)) => Some(cap(caption.clone(), MAX_CAPTION)),
+            Some(_) => return answer("`caption` must be a string"),
+        };
+        if let Hub::Off(reason) = &self.hub {
+            return answer(reason.text());
         }
+        self.file_calls.push(FileCall {
+            id: id.clone(),
+            path: path.to_owned(),
+            caption,
+        });
+        None
     }
 
     /// The `reply` tool. Input problems are tool errors (`isError`), so
@@ -391,6 +455,32 @@ fn cap(mut text: String, max: usize) -> String {
         text.push('\u{2026}');
     }
     text
+}
+
+fn send_file_tool() -> Value {
+    json!({
+        "name": SEND_FILE_TOOL,
+        "description": "Sends a file of this machine to the user's Telegram topic of this \
+            session: a JPEG, PNG or WebP picture of up to 10 MB arrives as a photo, anything \
+            else as a document; 50 MB at most. Use it when the user should get the file itself \
+            (a screenshot, a report, a build artifact), not for text: what you write reaches \
+            the topic anyway. Answers once Telegram took the file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file: an absolute path, or one relative to the session's working folder.",
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional short text shown with the file (Telegram shows at most 1024 characters).",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": false,
+        },
+    })
 }
 
 fn reply_tool() -> Value {
@@ -462,6 +552,17 @@ fn tool_result(text: &str, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
+/// The answer line of a tool call `id`.
+pub fn tool_answer(id: &Value, text: &str, is_error: bool) -> Vec<u8> {
+    result(id, tool_result(text, is_error))
+}
+
+/// Tells Claude Code to list the tools again: a worker that took over from
+/// an older one after an update may offer tools the older one did not.
+pub fn tools_changed() -> Vec<u8> {
+    notification("notifications/tools/list_changed", json!({}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,7 +613,10 @@ mod tests {
         assert_eq!(answer["id"], 0);
         let result = &answer["result"];
         assert_eq!(result["protocolVersion"], "2025-11-25");
-        assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(
+            result["capabilities"]["tools"],
+            json!({ "listChanged": true })
+        );
         assert_eq!(
             result["capabilities"]["experimental"],
             json!({ "claude/channel": {}, "claude/channel/permission": {} })
@@ -533,6 +637,8 @@ mod tests {
         assert!(instructions.contains("SendMessage"));
         assert!(instructions.contains("that subagent, running or finished"));
         assert!(instructions.contains("never ask for permissions through `reply`"));
+        assert!(instructions.contains("`file_path` attribute"));
+        assert!(instructions.contains("`mcp__cctg__send_file`"));
     }
 
     #[test]
@@ -773,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_offers_reply_only() {
+    fn tools_list_offers_reply_and_send_file() {
         let (mut server, _rx) = linked();
         init(&mut server);
         let answer = one(
@@ -781,7 +887,11 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         );
         let tools = answer["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["name"], "send_file");
+        assert_eq!(tools[1]["inputSchema"]["required"], json!(["path"]));
+        let description = tools[1]["description"].as_str().unwrap();
+        assert!(description.contains("as a photo") && description.contains("50 MB"));
         assert_eq!(tools[0]["name"], "reply");
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["text"]));
         let description = tools[0]["description"].as_str().unwrap();
@@ -809,7 +919,7 @@ mod tests {
                 text: "done ✓".into()
             }
         );
-        server.on_link(LinkEvent::Up);
+        server.on_link(LinkEvent::Up { files: true });
         let answer = one(&mut server, call);
         assert!(
             answer["result"]["content"][0]["text"]
@@ -817,6 +927,73 @@ mod tests {
                 .unwrap()
                 .starts_with("Sent")
         );
+    }
+
+    #[test]
+    fn a_send_file_call_waits_for_the_loop_and_bad_ones_are_answered_at_once() {
+        let (mut server, mut rx) = linked();
+        init(&mut server);
+        let call = |id: u32, arguments: Value| {
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"send_file","arguments":arguments}})
+                .to_string()
+        };
+        let lines = server
+            .on_line(call(4, json!({ "path": "C:/x/shot.png", "caption": "look" })).as_bytes());
+        assert!(lines.is_empty(), "answered later by the loop");
+        let blank_caption = call(5, json!({ "path": "rel.txt", "caption": "  " }));
+        assert!(server.on_line(blank_caption.as_bytes()).is_empty());
+        assert_eq!(
+            server.take_file_calls(),
+            [
+                FileCall {
+                    id: json!(4),
+                    path: "C:/x/shot.png".into(),
+                    caption: Some("look".into()),
+                },
+                FileCall {
+                    id: json!(5),
+                    path: "rel.txt".into(),
+                    caption: None,
+                },
+            ]
+        );
+        assert!(server.take_file_calls().is_empty());
+        for arguments in [
+            json!({}),
+            json!({ "path": " " }),
+            json!({ "path": 7 }),
+            json!({ "path": "a", "caption": 1 }),
+        ] {
+            let answer = one(&mut server, &call(6, arguments.clone()));
+            assert_eq!(answer["id"], 6, "{arguments}");
+            assert_eq!(answer["result"]["isError"], true, "{arguments}");
+        }
+        assert!(server.take_file_calls().is_empty());
+        assert!(rx.try_recv().is_err(), "nothing reached the hub");
+        // Without a hub it says why at once.
+        let mut off = Server::new(Hub::Off(NoHub::Headless));
+        init(&mut off);
+        let answer = one(&mut off, &call(7, json!({ "path": "a.txt" })));
+        assert_eq!(
+            answer["result"]["content"][0]["text"],
+            NoHub::Headless.text()
+        );
+        assert!(off.take_file_calls().is_empty());
+        let long = "\u{1}".repeat(MAX_CAPTION * 2);
+        assert!(
+            server
+                .on_line(call(8, json!({ "path": "a", "caption": long })).as_bytes())
+                .is_empty()
+        );
+        let capped = server.take_file_calls().remove(0).caption.unwrap();
+        assert!(capped.len() <= MAX_CAPTION && capped.ends_with('\u{2026}'));
+        let answer: Value =
+            serde_json::from_slice(&tool_answer(&json!("x"), "done", false)).unwrap();
+        assert_eq!(answer["id"], "x");
+        assert_eq!(answer["result"]["isError"], false);
+        let changed: Value = serde_json::from_slice(&tools_changed()).unwrap();
+        assert_eq!(changed["method"], "notifications/tools/list_changed");
+        assert!(changed.get("id").is_none());
     }
 
     #[test]
@@ -913,6 +1090,10 @@ mod tests {
             HubMsg::Released {
                 update_id: 1,
                 session_id: "s".into(),
+            },
+            HubMsg::FileAnswer {
+                transfer_id: 1,
+                outcome: crate::wire::FileOutcome::Sent,
             },
         ] {
             assert!(server.on_link(LinkEvent::Message(msg)).is_empty());

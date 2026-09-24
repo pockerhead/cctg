@@ -1,0 +1,146 @@
+    /// A fake Bot API server that answers its `n`-th connection with
+    /// `answers[n]` (a whole raw HTTP answer) after reading the request,
+    /// then closes it; returns its url and the request lines it saw.
+    async fn fake_server(
+        answers: Vec<Vec<u8>>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = seen.clone();
+        tokio::spawn(async move {
+            for answer in answers {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                requests.lock().unwrap().push(request.trim_end().to_owned());
+                let (mut length, mut chunked) = (0, false);
+                loop {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    let line = line.trim_end().to_ascii_lowercase();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    chunked |= line.starts_with("transfer-encoding:") && line.contains("chunked");
+                }
+                // The whole body is read before the answer (an early answer
+                // can be lost to a reset on Windows).
+                if chunked {
+                    let mut body = Vec::new();
+                    while !body.ends_with(b"0\r\n\r\n") {
+                        let mut byte = [0u8];
+                        stream.read_exact(&mut byte).await.unwrap();
+                        body.push(byte[0]);
+                    }
+                } else {
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                }
+                let mut stream = stream.into_inner();
+                stream.write_all(&answer).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        (url, seen)
+    }
+
+    fn test_api(url: &str) -> BotApi {
+        let token = super::super::config::Config::from_vars(|name| match name {
+            "CCTG_BOT_TOKEN" => Some("777:test-token".to_owned()),
+            "CCTG_CHAT_ID" => Some("-1001".to_owned()),
+            "CCTG_ALLOWED_USER_IDS" => Some("1".to_owned()),
+            _ => None,
+        })
+        .unwrap()
+        .token;
+        BotApi::with_api_url(url, &token, -1001).unwrap()
+    }
+
+    /// A raw HTTP answer with `head` lines, closing the connection.
+    fn http_answer(status: &str, head: &str, body: &[u8]) -> Vec<u8> {
+        let mut answer = format!("HTTP/1.1 {status}\r\n{head}connection: close\r\n\r\n").into_bytes();
+        answer.extend_from_slice(body);
+        answer
+    }
+
+    #[tokio::test]
+    async fn a_download_stops_at_its_limit_by_length_or_by_bytes_and_a_refusal_is_told() {
+        let (url, seen) = fake_server(vec![
+            http_answer("200 OK", "content-length: 5\r\n", b"hello"),
+            // Announced bigger than the limit: refused before any byte.
+            http_answer("200 OK", "content-length: 11\r\n", b"hello world"),
+            // No length: the bytes past the limit end it.
+            http_answer("200 OK", "", b"hello world"),
+            http_answer("404 Not Found", "content-length: 2\r\n", b"{}"),
+        ])
+        .await;
+        let api = test_api(&url);
+        assert_eq!(api.download("/photos/f.jpg", 5).await.unwrap(), b"hello");
+        assert!(api.download("photos/f.jpg", 10).await.unwrap_err().is_too_big());
+        assert!(api.download("photos/f.jpg", 10).await.unwrap_err().is_too_big());
+        let refused = api.download("photos/f.jpg", 10).await.unwrap_err();
+        assert!(
+            matches!(&refused, ApiError::Telegram { code: 404, .. }) && !refused.is_too_big(),
+            "{refused:?}"
+        );
+        assert!(!format!("{refused} {refused:?}").contains("test-token"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0], "GET /file/bot777:test-token/photos/f.jpg HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn only_a_refused_picture_goes_again_as_a_document() {
+        use crate::hub::scheduler::{Op, Transport};
+        let json = |status, body: &str| {
+            http_answer(
+                status,
+                &format!("content-length: {}\r\n", body.len()),
+                body.as_bytes(),
+            )
+        };
+        let refused = |description: &str| {
+            json(
+                "400 Bad Request",
+                &format!(r#"{{"ok":false,"error_code":400,"description":"{description}"}}"#),
+            )
+        };
+        let (url, seen) = fake_server(vec![
+            refused("Bad Request: PHOTO_INVALID_DIMENSIONS"),
+            json(
+                "200 OK",
+                r#"{"ok":true,"result":{"message_id":5,"chat":{"id":-1001}}}"#,
+            ),
+            refused("Bad Request: message thread not found"),
+        ])
+        .await;
+        let api = test_api(&url);
+        let op = Op::SendPhoto {
+            thread_id: Some(100),
+            document: Document {
+                file_name: "shot.png".into(),
+                bytes: b"\x89PNG\r\n\x1a\nbytes".to_vec(),
+                caption: None,
+            },
+            notify: false,
+        };
+        assert!(api.execute(&op).await.is_ok());
+        let gone = api.execute(&op).await.unwrap_err();
+        assert!(!gone.is_photo_refusal(), "{gone:?}");
+        let methods: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| line.split(['/', ' ']).nth(3).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(methods, ["sendPhoto", "sendDocument", "sendPhoto"]);
+    }
+

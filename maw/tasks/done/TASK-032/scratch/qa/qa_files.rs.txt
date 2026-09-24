@@ -1,0 +1,150 @@
+// QA TASK-032: adversarial probes of cctg::files, copied as
+// crates/cctg/tests/qa_files.rs into a %TEMP% copy of HEAD (deleted after).
+
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
+
+use cctg::files::{self, UploadError};
+
+/// send_file on an existing Windows named pipe: does read_upload refuse it
+/// or block forever (it runs in spawn_blocking of the one sender worker)?
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn qa_read_upload_on_a_named_pipe() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = format!(r"\\.\pipe\cctg-qa-{}", std::process::id());
+    // Several instances so both metadata() and open() can connect.
+    let _a = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)
+        .unwrap();
+    let _b = ServerOptions::new().create(&name).unwrap();
+    let _c = ServerOptions::new().create(&name).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let path = name.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(files::read_upload(Path::new(&path)));
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(result) => {
+            eprintln!("QA pipe result: {:?}", result.as_ref().map(|b| b.len()));
+            assert_eq!(result, Err(UploadError::NotFile));
+        }
+        Err(_) => panic!("QA: read_upload on a named pipe blocked for 5 s"),
+    }
+}
+
+#[test]
+fn qa_clean_name_edges() {
+    let cases = [
+        ("..", "file"),
+        ("../../etc/passwd", "passwd"),
+        (r"..\..\Windows\win.ini", "win.ini"),
+        ("C:evil.txt", "C_evil.txt"),
+        ("a.txt::$DATA", "a.txt__$DATA"),
+        (" .hidden. ", "hidden"),
+        ("x\u{202E}gpj.exe", "x_gpj.exe"),
+        ("", "file"),
+        ("/", "file"),
+        ("dir/", "file"),
+    ];
+    for (raw, want) in cases {
+        let got = files::clean_name(raw, "file");
+        eprintln!("QA clean_name({raw:?}) = {got:?}");
+        assert_eq!(got, want, "{raw:?}");
+        assert!(!got.contains(['/', '\\', ':']));
+    }
+    // Long multibyte name keeps a char boundary and the extension.
+    let long = format!("{}.pdf", "я".repeat(200));
+    let got = files::clean_name(&long, "file");
+    assert!(got.len() <= files::MAX_NAME, "{}", got.len());
+    assert!(got.ends_with(".pdf"));
+    // Long name with a long "extension" of dots-only tail.
+    let dots = format!("{}.{}", "a".repeat(200), "b".repeat(200));
+    let got = files::clean_name(&dots, "file");
+    assert!(got.len() <= files::MAX_NAME, "{}", got.len());
+    // A name that ends in dots/spaces after the cut.
+    let cut = format!("{}{}.txt", "a".repeat(110), ". . . . . . . . . . ");
+    let got = files::clean_name(&cut, "file");
+    assert!(got.len() <= files::MAX_NAME, "{}", got.len());
+    assert!(!got.starts_with('.'));
+}
+
+#[test]
+fn qa_save_never_overwrites_and_keeps_the_gitignore() {
+    let dir = std::env::temp_dir().join(format!("cctg-qa-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = SystemTime::now();
+    let a = files::save(Some(&dir), "same.txt", b"one", now).unwrap();
+    let b = files::save(Some(&dir), "same.txt", b"two", now).unwrap();
+    let c = files::save(Some(&dir), "noext", b"three", now).unwrap();
+    let d = files::save(Some(&dir), "noext", b"four", now).unwrap();
+    assert_ne!(a, b);
+    assert_ne!(c, d);
+    assert_eq!(std::fs::read(&a).unwrap(), b"one");
+    assert_eq!(std::fs::read(&b).unwrap(), b"two");
+    assert!(b.to_string_lossy().ends_with("same-2.txt"), "{}", b.display());
+    assert!(d.to_string_lossy().ends_with("noext-2"), "{}", d.display());
+    let inbox = dir.join(".cctg").join("inbox");
+    assert_eq!(
+        std::fs::read(inbox.join(".gitignore")).unwrap(),
+        b"*\n".to_vec()
+    );
+    // The inbox is a file: the fallback temp inbox takes it.
+    let blocked = dir.join("blocked");
+    std::fs::create_dir_all(&blocked).unwrap();
+    std::fs::write(blocked.join(".cctg"), b"not a dir").unwrap();
+    let e = files::save(Some(&blocked), "x.bin", b"x", now).unwrap();
+    assert!(e.starts_with(std::env::temp_dir().join("cctg-inbox")), "{}", e.display());
+    let _ = std::fs::remove_file(&e);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn qa_read_upload_edges() {
+    let dir = std::env::temp_dir().join(format!("cctg-qa-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(files::read_upload(&dir), Err(UploadError::NotFile));
+    assert_eq!(
+        files::read_upload(&dir.join("missing")),
+        Err(UploadError::NotFile)
+    );
+    let empty = dir.join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    assert_eq!(files::read_upload(&empty), Err(UploadError::Empty));
+    // Exactly 50 MiB is allowed, one byte more is not (sparse via set_len).
+    let max = dir.join("max");
+    let f = std::fs::File::create(&max).unwrap();
+    f.set_len(files::MAX_UPLOAD).unwrap();
+    drop(f);
+    assert_eq!(
+        files::read_upload(&max).map(|b| b.len() as u64),
+        Ok(files::MAX_UPLOAD)
+    );
+    let over = dir.join("over");
+    let f = std::fs::File::create(&over).unwrap();
+    f.set_len(files::MAX_UPLOAD + 1).unwrap();
+    drop(f);
+    assert_eq!(files::read_upload(&over), Err(UploadError::TooBig));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn qa_pipe_where() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = format!(r"\\.\pipe\cctg-qa2-{}", std::process::id());
+    let _a = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+    let _b = ServerOptions::new().create(&name).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let path = name.clone();
+    std::thread::spawn(move || {
+        let m = std::fs::metadata(&path);
+        let _ = tx.send(format!("{:?}", m.map(|m| (m.is_file(), m.len()))));
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+    eprintln!("QA pipe metadata: {got:?}");
+}

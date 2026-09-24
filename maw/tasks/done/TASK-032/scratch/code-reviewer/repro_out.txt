@@ -1,0 +1,24 @@
+   Compiling transcript v0.1.0 (C:\Users\user\AppData\Local\Temp\crev032\crates\transcript)
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\crev032\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 26.73s
+     Running unittests src\lib.rs (C:/Users/user/dev/cctg/target\debug\deps\cctg-7e373a1967d81231.exe)
+
+running 1 test
+test hub::slots::tests::crev_a_file_downloading_when_its_session_ends_stays_in_the_slot ... FAILED
+
+failures:
+
+---- hub::slots::tests::crev_a_file_downloading_when_its_session_ends_stays_in_the_slot stdout ----
+
+thread 'hub::slots::tests::crev_a_file_downloading_when_its_session_ends_stays_in_the_slot' (43152) panicked at crates\cctg\src\hub\slots.rs:12058:9:
+the ended session's agent got ["file photo.jpg look"]; reacted [2]; buffered [3]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    hub::slots::tests::crev_a_file_downloading_when_its_session_ends_stays_in_the_slot
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 542 filtered out; finished in 0.14s
+
+error: test failed, to rerun pass `-p cctg --lib`
+exit 101

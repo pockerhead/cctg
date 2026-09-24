@@ -1,0 +1,5 @@
+warning: in the working copy of '.cctg/notes.md', LF will be replaced by CRLF the next time Git touches it
+== planner: git status --porcelain -uall
+warning: in the working copy of '.cctg/notes.md', LF will be replaced by CRLF the next time Git touches it
+== reviewer2: git status --porcelain -uall
+?? .cctg/later.md

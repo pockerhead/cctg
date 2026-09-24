@@ -411,13 +411,14 @@ impl Agent {
             console_keys: true,
             console_commands: true,
             client: None,
+            files: false,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
         let mut agent = Self {
             reader: BufReader::new(read),
             write,
         };
-        assert_eq!(agent.next().await, Some(HubMsg::Registered));
+        assert_eq!(agent.next().await, Some(HubMsg::Registered { files: true }));
         agent
     }
 
@@ -888,6 +889,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
                 reply_to: None,
                 quote: None,
                 forwarded: false,
+                media: None,
             }))
             .unwrap();
     };

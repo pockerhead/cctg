@@ -1,0 +1,5 @@
+M19 a flood wait is not tried again: KILLED hub::fetch::tests::a_flood_wait_or_a_telegram_outage_is_tried_again
+M20 a refusal is tried again: KILLED hub::fetch::tests::a_flood_wait_or_a_telegram_outage_is_tried_again
+M21 the inbox ignore file hides all of .cctg: KILLED files::tests::a_save_never_overwrites_and_keeps_the_inbox_out_of_git, files::tests::the_inbox_ignores_only_itself, agent::tests::a_file_from_the_topic_is_saved_and_handed_to_claude_with_its_path
+M22 two largest files may wait at once: KILLED hub::slots::tests::an_accepted_file_whose_bytes_never_come_does_not_hold_the_budget, hub::slots::tests::at_most_one_file_of_the_largest_size_waits_at_a_time
+M23 photo sizes multiply without a bound: KILLED hub::updates::tests::a_photo_of_any_announced_dimensions_is_taken

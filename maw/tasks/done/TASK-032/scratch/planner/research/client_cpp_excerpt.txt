@@ -1,0 +1,3 @@
+9383:    return on_file_download(file_id, td::Status::Error(400, "Bad Request: file is too big"));
+17043:    return fail_query(400, "Bad Request: file is too big", std::move(query));
+72:  static constexpr int32 MAX_DOWNLOAD_FILE_SIZE = 20 << 20;

@@ -1,0 +1,40 @@
+   Compiling transcript v0.1.0 (C:\Users\user\AppData\Local\Temp\qa032\crates\transcript)
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\qa032\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 18.27s
+     Running tests\qa_files.rs (C:/Users/user/dev/cctg/target\debug\deps\qa_files-c2d71fe660a3d8cc.exe)
+
+running 4 tests
+QA clean_name("..") = "file"
+QA clean_name("../../etc/passwd") = "passwd"
+QA clean_name("..\\..\\Windows\\win.ini") = "win.ini"
+QA clean_name("C:evil.txt") = "C_evil.txt"
+QA clean_name("a.txt::$DATA") = "a.txt__$DATA"
+QA clean_name(" .hidden. ") = "hidden"
+QA clean_name("x\u{202e}gpj.exe") = "x_gpj.exe"
+QA clean_name("") = "file"
+QA clean_name("/") = "file"
+QA clean_name("dir/") = "file"
+test qa_clean_name_edges ... ok
+test qa_save_never_overwrites_and_keeps_the_gitignore ... ok
+test qa_read_upload_edges ... ok
+
+thread 'qa_read_upload_on_a_named_pipe' (41208) panicked at crates\cctg\tests\qa_files.rs:34:19:
+QA: read_upload on a named pipe blocked for 5 s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test qa_read_upload_on_a_named_pipe ... FAILED
+
+failures:
+
+failures:
+    qa_read_upload_on_a_named_pipe
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+error: test failed, to rerun pass `-p cctg --test qa_files`
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+thread 'qa_pipe_where' (20452) panicked at crates\cctg\tests\qa_files.rs:140:75:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+thread 'qa_pipe_where' (27456) panicked at crates\cctg\tests\qa_files.rs:140:75:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+QA pipe metadata: Ok("Ok((true, 0))")
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s

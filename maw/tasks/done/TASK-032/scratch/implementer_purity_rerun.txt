@@ -1,0 +1,11 @@
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+    Finished `test` profile [unoptimized] target(s) in 1.10s
+     Running tests\purity.rs (target\debug\deps\purity-a137238b6440e61b.exe)
+
+running 3 tests
+test library_has_only_pure_dependencies ... ok
+test every_source_file_is_scanned ... ok
+test library_source_has_no_io_or_panicking_calls ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

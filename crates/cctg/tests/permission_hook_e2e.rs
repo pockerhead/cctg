@@ -214,6 +214,7 @@ async fn hub(test: &str) -> Hub {
                 console_keys: false,
                 console_commands: false,
                 client: None,
+                files: false,
             },
             to_agent,
         })

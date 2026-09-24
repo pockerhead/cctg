@@ -1,0 +1,2 @@
+    Finished `dev` profile [unoptimized] target(s) in 0.28s
+clippy rc=0

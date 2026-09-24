@@ -1,0 +1,15 @@
+M1 a chunk out of order is taken: KILLED files::tests::an_assembly_takes_only_the_next_piece_and_never_more_than_its_size, hub::slots::tests::a_file_from_the_session_goes_to_its_topic_as_a_photo_or_a_document
+M2 a save overwrites an existing file: KILLED files::tests::a_save_never_overwrites_and_keeps_the_inbox_out_of_git
+M3 a name keeps its path parts: KILLED files::tests::names_are_cleaned_for_every_system, agent::tests::a_file_from_the_topic_is_saved_and_handed_to_claude_with_its_path, hub::slots::tests::a_file_from_the_session_goes_to_its_topic_as_a_photo_or_a_document
+M4 a kept file does not hold the messages after it: KILLED hub::slots::tests::a_file_too_big_or_not_downloaded_is_told_and_a_closed_link_keeps_it, hub::slots::tests::a_kept_file_reaches_the_agent_in_its_place_among_the_messages
+M5 a closed link loses the kept file: KILLED hub::slots::tests::a_file_too_big_or_not_downloaded_is_told_and_a_closed_link_keeps_it
+M6 an agent without files is sent the file: KILLED hub::slots::tests::an_agent_that_takes_no_files_gets_the_caption_and_the_topic_a_notice
+M7 a file announced too big is kept and fetched: KILLED hub::slots::tests::a_file_too_big_or_not_downloaded_is_told_and_a_closed_link_keeps_it
+M8 a picture goes as a document: KILLED hub::slots::tests::a_file_from_the_session_goes_to_its_topic_as_a_photo_or_a_document
+M9 no busy limit for files from sessions: KILLED hub::slots::tests::a_file_from_the_session_goes_to_its_topic_as_a_photo_or_a_document
+M10 ingress drops file offers: KILLED files_go_both_ways_and_never_reach_the_logs
+M11 a resumed worker does not ask for the tools again: KILLED a_new_binary_is_taken_without_losing_a_line
+M12 a hub without files is offered one: KILLED agent::tests::send_file_offers_the_file_and_answers_what_the_hub_did
+M13 a refused photo is not sent as a document: KILLED files_go_both_ways_and_never_reach_the_logs
+M14 a lost link keeps the unfinished file: KILLED agent::tests::a_file_from_the_topic_is_saved_and_handed_to_claude_with_its_path
+M15 the agent logs where a file went: KILLED files_go_both_ways_and_never_reach_the_logs

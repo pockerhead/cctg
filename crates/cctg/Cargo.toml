@@ -8,6 +8,9 @@ anyhow.workspace = true
 # sha256 of the cctg executable (TASK-040 build identity). Already built for
 # rustls (reqwest) with these features; no new download.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+# base64 of file chunks on the agent link (TASK-032). Already in the lock
+# file through reqwest; no new download.
+base64 = "0.23"
 clap.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true

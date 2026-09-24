@@ -1,0 +1,16 @@
+    Finished `test` profile [unoptimized] target(s) in 0.16s
+     Running tests\files_e2e.rs (target\debug\deps\files_e2e-dd811a61db51d522.exe)
+
+running 1 test
+test files_go_both_ways_and_never_reach_the_logs ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.90s
+
+     Running tests\update_e2e.rs (target\debug\deps\update_e2e-4ded2904d7a36c62.exe)
+
+running 1 test
+test a_new_binary_is_taken_without_losing_a_line ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+e2e rc=0

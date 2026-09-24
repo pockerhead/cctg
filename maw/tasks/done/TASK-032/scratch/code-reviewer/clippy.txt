@@ -1,0 +1,3 @@
+    Checking transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+    Finished `dev` profile [unoptimized] target(s) in 0.41s
+exit 0

@@ -8,8 +8,9 @@
 //! write the switch marker, answer every line Claude Code sent meanwhile,
 //! leave (`update_answer reloading`), take what was queued before `released`
 //! and exit; the shim starts the new file, whose worker registers with the
-//! new build and needs no second `initialize`. The real `~/.cctg` is never
-//! touched: home, state and config are temp dirs.
+//! new build and needs no second `initialize`; it asks Claude Code to list
+//! the tools again, and its `send_file` works through the shim (TASK-032).
+//! The real `~/.cctg` is never touched: home, state and config are temp dirs.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::ingress::{self, AgentEvent};
-use cctg::wire::{AgentMsg, HubMsg, Register, Secret, UpdateOutcome};
+use cctg::wire::{AgentMsg, FileOutcome, HubMsg, Register, Secret, UpdateOutcome};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -273,6 +274,50 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     )
     .await;
 
+    // The new worker asked Claude Code to list the tools again, and lists
+    // `send_file`, which works through the shim.
+    send(
+        &mut claude,
+        r#"{"jsonrpc":"2.0","id":120,"method":"tools/list"}"#,
+    );
+    wait_for("the tools of the new worker", answered(120)).await;
+    let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[5; 300_000]].concat();
+    std::fs::write(work.join("shot.png"), &png).unwrap();
+    send(
+        &mut claude,
+        r#"{"jsonrpc":"2.0","id":121,"method":"tools/call","params":{"name":"send_file","arguments":{"path":"shot.png"}}}"#,
+    );
+    let (transfer_id, size) = loop {
+        match message(&mut events, second).await {
+            AgentMsg::FileOffer {
+                transfer_id, size, ..
+            } => break (transfer_id, size),
+            msg => relayed.push(msg),
+        }
+    };
+    assert_eq!(size, png.len() as u64);
+    let accepted = HubMsg::FileAnswer {
+        transfer_id,
+        outcome: FileOutcome::Accepted,
+    };
+    to_second.send(accepted).await.unwrap();
+    let mut received = 0;
+    while received < size {
+        match message(&mut events, second).await {
+            AgentMsg::FileChunk(chunk) => {
+                assert_eq!(chunk.offset, received);
+                received += cctg::files::CHUNK.min((size - received) as usize) as u64;
+            }
+            msg => relayed.push(msg),
+        }
+    }
+    let sent = HubMsg::FileAnswer {
+        transfer_id,
+        outcome: FileOutcome::Sent,
+    };
+    to_second.send(sent).await.unwrap();
+    wait_for("the send_file answer", answered(121)).await;
+
     // Nothing up to date asks for nothing.
     to_second
         .send(HubMsg::Update { update_id: 8 })
@@ -302,7 +347,9 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     assert_eq!((replies, prompts), (1, 1), "each relayed once: {relayed:?}");
 
     let lines = out.lock().unwrap().clone();
-    for id in [1, 107, 100, 101, 102, 103, 104, 105, 110, 111, 112, 106] {
+    for id in [
+        1, 107, 100, 101, 102, 103, 104, 105, 110, 111, 112, 106, 120, 121,
+    ] {
         let answers = lines
             .iter()
             .filter(|line| serde_json::from_str::<Value>(line).is_ok_and(|value| value["id"] == id))
@@ -314,6 +361,26 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
         assert_eq!(value["jsonrpc"], "2.0", "{line}");
     }
     assert!(!lines.iter().any(|line| line.contains("cctg_shim")));
+    let changed = lines
+        .iter()
+        .filter(|line| line.contains("notifications/tools/list_changed"))
+        .count();
+    assert_eq!(changed, 1, "only the new worker asks:\n{lines:#?}");
+    let answer = |id: i64| {
+        lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["id"] == id)
+            .unwrap()
+    };
+    let tools: Vec<Value> = answer(120)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].clone())
+        .collect();
+    assert_eq!(tools, ["reply", "send_file"]);
+    assert_eq!(answer(121)["result"]["isError"], false, "{lines:#?}");
 
     // Claude Code closes stdin: shim and worker end.
     drop(claude);

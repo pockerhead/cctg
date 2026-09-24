@@ -1,0 +1,3 @@
+    Checking cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\t032ref\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 20.03s
+exit 0

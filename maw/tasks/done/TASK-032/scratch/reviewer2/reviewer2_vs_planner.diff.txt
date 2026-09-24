@@ -1,0 +1,564 @@
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+index 84e9abf..5fc50f8 100644
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -1129,19 +1129,27 @@ async fn hear(
+     }
+ }
+ 
+-/// An answer or a loss that came while chunks went out.
+-fn interrupted(uploads: &mut mpsc::UnboundedReceiver<Upload>, transfer_id: u64) -> Option<Heard> {
+-    while let Ok(event) = uploads.try_recv() {
+-        match event {
+-            Upload::Answer {
+-                transfer_id: id,
+-                outcome,
+-            } if id == transfer_id => return Some(Heard::Outcome(outcome)),
+-            Upload::Answer { .. } => {}
+-            Upload::Lost => return Some(Heard::Lost),
++/// Waits for room in the link queue for the next chunk ([`files::room`]);
++/// an answer to `transfer_id` or a lost link ends the wait: while the link
++/// reconnects nothing drains the queue.
++async fn room_or_heard(
++    outbox: &mpsc::Sender<AgentMsg>,
++    uploads: &mut mpsc::UnboundedReceiver<Upload>,
++    transfer_id: u64,
++) -> Option<Heard> {
++    loop {
++        tokio::select! {
++            biased;
++            event = uploads.recv() => match event {
++                Some(Upload::Answer { transfer_id: id, outcome }) if id == transfer_id => {
++                    return Some(Heard::Outcome(outcome));
++                }
++                Some(Upload::Answer { .. }) => {}
++                Some(Upload::Lost) | None => return Some(Heard::Lost),
++            },
++            ready = files::room(outbox) => return (!ready).then_some(Heard::Lost),
+         }
+     }
+-    None
+ }
+ 
+ const LOST: &str = "The link to the cctg hub dropped during the transfer; the file may not have reached Telegram. Try again.";
+@@ -1203,12 +1211,12 @@ async fn upload(
+         }
+     }
+     for chunk in files::chunks(transfer_id, &bytes) {
+-        match interrupted(uploads, transfer_id) {
++        match room_or_heard(outbox, uploads, transfer_id).await {
+             Some(Heard::Outcome(outcome)) => return refused(outcome),
+             Some(_) => return (LOST.to_owned(), true),
+             None => {}
+         }
+-        if !files::room(outbox).await || outbox.send(AgentMsg::FileChunk(chunk)).await.is_err() {
++        if outbox.send(AgentMsg::FileChunk(chunk)).await.is_err() {
+             return (LOST.to_owned(), true);
+         }
+     }
+@@ -2426,8 +2434,9 @@ mod tests {
+             .await
+             .unwrap();
+         settle(&mut claude, &mut write).await;
++        // The one saved file and the inbox's own `.gitignore`.
+         let kept: Vec<_> = std::fs::read_dir(&inbox).unwrap().flatten().collect();
+-        assert_eq!(kept.len(), 1, "{kept:?}");
++        assert_eq!(kept.len(), 2, "{kept:?}");
+     }
+ 
+     #[test]
+@@ -2573,4 +2582,38 @@ mod tests {
+             "no offer to a hub without files"
+         );
+     }
++
++    #[tokio::test]
++    async fn a_link_lost_while_chunks_wait_for_room_ends_the_upload_at_once() {
++        let dir = crate::hub::testdir::TempDir::new("agent-upload-lost");
++        let file = dir.path().join("big.bin");
++        std::fs::write(&file, vec![5u8; files::CHUNK * 8]).unwrap();
++        let call = FileCall {
++            id: serde_json::json!(1),
++            path: file.to_string_lossy().into_owned(),
++            caption: None,
++        };
++        // The link queue: the link task stops draining it while it
++        // reconnects, so chunks pile up to the sender's share.
++        let (outbox, mut link) = mpsc::channel(QUEUE);
++        let (events, mut uploads) = mpsc::unbounded_channel();
++        let sending = tokio::spawn(async move { upload(&call, &outbox, &mut uploads, None).await });
++        let Some(AgentMsg::FileOffer { transfer_id, .. }) = link.recv().await else {
++            panic!("an offer first");
++        };
++        events
++            .send(Upload::Answer {
++                transfer_id,
++                outcome: FileOutcome::Accepted,
++            })
++            .unwrap();
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        events.send(Upload::Lost).unwrap();
++        let (text, is_error) = tokio::time::timeout(Duration::from_secs(3), sending)
++            .await
++            .expect("the tool answers without waiting for the link to come back")
++            .unwrap();
++        assert_eq!((text.as_str(), is_error), (LOST, true));
++        drop(link);
++    }
+ }
+diff --git a/crates/cctg/src/files.rs b/crates/cctg/src/files.rs
+index a904ffb..bababf8 100644
+--- a/crates/cctg/src/files.rs
++++ b/crates/cctg/src/files.rs
+@@ -10,7 +10,7 @@
+ //!
+ //! The agent keeps a file from the topic with [`save`]: in
+ //! `<session folder>/.cctg/inbox/` (Claude reads it there without asking; a
+-//! `.gitignore` of its own keeps the folder out of `git status`), else in
++//! `.gitignore` of its own keeps the inbox out of `git status`), else in
+ //! `<temp>/cctg-inbox/`, as `<UTC date>-<name>` with the name cleaned by
+ //! [`clean_name`], and never over an existing file. `send_file` reads with
+ //! [`read_upload`].
+@@ -276,9 +276,7 @@ pub fn save(work: Option<&Path>, name: &str, bytes: &[u8], now: SystemTime) -> i
+ 
+ fn save_in(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+     std::fs::create_dir_all(dir)?;
+-    if let Some(cctg) = dir.parent().filter(|parent| parent.ends_with(".cctg")) {
+-        keep_out_of_git(cctg);
+-    }
++    keep_out_of_git(dir);
+     for n in 1..=MAX_COPIES {
+         let path = dir.join(numbered(name, n));
+         match OpenOptions::new().write(true).create_new(true).open(&path) {
+@@ -297,14 +295,14 @@ fn save_in(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+     Err(io::Error::from(io::ErrorKind::AlreadyExists))
+ }
+ 
+-/// A `.gitignore` of `*` in `.cctg`: git skips the folder, the user's own
+-/// `.gitignore` stays as it is. An existing one is left alone; a failure
+-/// only means the inbox shows in `git status`.
+-fn keep_out_of_git(cctg: &Path) {
++/// A `.gitignore` of `*` in the inbox: git skips the inbox and nothing
++/// else; the user's own `.gitignore` files stay as they are. An existing
++/// one is left alone; a failure only means the inbox shows in `git status`.
++fn keep_out_of_git(inbox: &Path) {
+     let _ = OpenOptions::new()
+         .write(true)
+         .create_new(true)
+-        .open(cctg.join(".gitignore"))
++        .open(inbox.join(".gitignore"))
+         .and_then(|mut file| file.write_all(b"*\n"));
+ }
+ 
+@@ -505,7 +503,7 @@ mod tests {
+         assert_eq!(second, inbox.join("2026-09-25-shot-2.png"));
+         assert_eq!(std::fs::read(&first).unwrap(), b"one");
+         assert_eq!(std::fs::read(&second).unwrap(), b"two");
+-        let ignore = dir.path().join(".cctg").join(".gitignore");
++        let ignore = inbox.join(".gitignore");
+         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
+         // An existing .gitignore is the user's: left as it is.
+         std::fs::write(&ignore, "mine\n").unwrap();
+@@ -552,4 +550,18 @@ mod tests {
+             Ok(MAX_UPLOAD)
+         );
+     }
++
++    #[test]
++    fn the_inbox_ignores_only_itself() {
++        let dir = TempDir::new("files-ignore");
++        let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
++        save(Some(dir.path()), "shot.png", b"one", now).unwrap();
++        let cctg = dir.path().join(".cctg");
++        assert_eq!(
++            std::fs::read_to_string(cctg.join("inbox").join(".gitignore")).unwrap(),
++            "*\n"
++        );
++        // Other things a project keeps in `.cctg` stay visible to git.
++        assert!(!cctg.join(".gitignore").exists());
++    }
+ }
+diff --git a/crates/cctg/src/hub/api.rs b/crates/cctg/src/hub/api.rs
+index cf4fcb7..ee166b6 100644
+--- a/crates/cctg/src/hub/api.rs
++++ b/crates/cctg/src/hub/api.rs
+@@ -127,7 +127,6 @@ pub struct MessageMedia {
+ pub struct FileInfo {
+     pub file_id: String,
+     pub file_name: Option<String>,
+-    pub mime_type: Option<String>,
+     pub file_size: Option<u64>,
+ }
+ 
+diff --git a/crates/cctg/src/hub/buffer.rs b/crates/cctg/src/hub/buffer.rs
+index 19690c1..fb9f763 100644
+--- a/crates/cctg/src/hub/buffer.rs
++++ b/crates/cctg/src/hub/buffer.rs
+@@ -60,8 +60,6 @@ pub struct Attachment {
+     /// The sender's file name; photos and voice messages have none.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub name: Option<String>,
+-    #[serde(default, skip_serializing_if = "Option::is_none")]
+-    pub mime_type: Option<String>,
+     /// As Telegram announced it; may be missing.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub size: Option<u64>,
+@@ -355,7 +353,6 @@ mod tests {
+                 kind: FileKind::Photo,
+                 file_id: "AgACAgIAAx0".into(),
+                 name: None,
+-                mime_type: None,
+                 size: Some(90_000),
+             }),
+             ..parked(3)
+diff --git a/crates/cctg/src/hub/fetch.rs b/crates/cctg/src/hub/fetch.rs
+index 12b6be5..239601a 100644
+--- a/crates/cctg/src/hub/fetch.rs
++++ b/crates/cctg/src/hub/fetch.rs
+@@ -6,14 +6,16 @@
+ //! [`Fetched`] back per job; the task never touches the registry. Downloads
+ //! do not go through the scheduler: `getFile` and the file URL are reads,
+ //! like `getUpdates`, not messages in the chat, so the group's message
+-//! budget is not theirs. Logs carry kinds and sizes, never names or bytes.
++//! budget is not theirs; a flood wait, a network error or a 5xx is tried
++//! again ([`TRIES`]). Logs carry kinds and sizes, never names or bytes.
+ 
+ use std::collections::BTreeMap;
+ use std::future::Future;
+ use std::sync::Arc;
++use std::time::Duration;
+ 
+ use tokio::sync::mpsc;
+-use tracing::{info, warn};
++use tracing::{debug, info, warn};
+ 
+ use super::api::{ApiError, BotApi, FILE_TOO_BIG};
+ use super::buffer::Attachment;
+@@ -21,6 +23,14 @@ use super::registry::SlotId;
+ use crate::files;
+ use crate::wire::HubMsg;
+ 
++/// Downloads of one file: a flood wait, a network error or a Telegram 5xx
++/// is tried again; a refusal is final.
++const TRIES: u32 = 3;
++/// Wait before trying again after a network error or a 5xx.
++const RETRY_WAIT: Duration = Duration::from_secs(2);
++/// Longest flood wait honoured (the other slots' files wait meanwhile).
++const MAX_FLOOD_WAIT: Duration = Duration::from_secs(30);
++
+ /// A downloaded file and its Telegram path (for a default name).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Download {
+@@ -105,7 +115,7 @@ async fn hand<F: Fetch>(fetch: &F, job: &Job) -> Fetched {
+         return Fetched::LinkClosed;
+     }
+     let kind = job.file.kind;
+-    let download = match fetch.fetch(&job.file.file_id, files::MAX_DOWNLOAD).await {
++    let download = match download(fetch, &job.file.file_id).await {
+         Ok(download) => download,
+         Err(error) if error.is_too_big() => {
+             info!(
+@@ -143,6 +153,29 @@ async fn hand<F: Fetch>(fetch: &F, job: &Job) -> Fetched {
+     Fetched::Handed { size }
+ }
+ 
++/// [`Fetch::fetch`] with the tries of [`TRIES`].
++async fn download<F: Fetch>(fetch: &F, file_id: &str) -> Result<Download, ApiError> {
++    let mut tried = 1;
++    loop {
++        let error = match fetch.fetch(file_id, files::MAX_DOWNLOAD).await {
++            Ok(download) => return Ok(download),
++            Err(error) => error,
++        };
++        let wait = match &error {
++            ApiError::RetryAfter(after) => (*after).min(MAX_FLOOD_WAIT),
++            ApiError::Http(_) => RETRY_WAIT,
++            ApiError::Telegram { code, .. } if *code >= 500 => RETRY_WAIT,
++            _ => return Err(error),
++        };
++        if tried == TRIES {
++            return Err(error);
++        }
++        debug!(%error, tried, "file download failed; trying again");
++        tried += 1;
++        tokio::time::sleep(wait).await;
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::sync::Mutex;
+@@ -185,7 +218,6 @@ mod tests {
+                 kind: FileKind::Voice,
+                 file_id: file_id.into(),
+                 name: None,
+-                mime_type: None,
+                 size: None,
+             },
+             content: "words".into(),
+@@ -282,4 +314,72 @@ mod tests {
+         assert!(matches!(&got[0], HubMsg::FileStart { name, .. } if name == "отчёт.pdf"));
+         assert!(matches!(handing.await.unwrap(), Fetched::Handed { .. }));
+     }
++
++    /// Fails the first `failures` downloads with `error`, then serves.
++    struct Flaky {
++        failures: Mutex<u32>,
++        error: fn() -> ApiError,
++    }
++
++    impl Fetch for Flaky {
++        async fn fetch(&self, _file_id: &str, _limit: u64) -> Result<Download, ApiError> {
++            let mut failures = self.failures.lock().unwrap();
++            if *failures > 0 {
++                *failures -= 1;
++                return Err((self.error)());
++            }
++            Ok(Download {
++                bytes: b"ok".to_vec(),
++                path: None,
++            })
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn a_flood_wait_or_a_telegram_outage_is_tried_again() {
++        // Each case its own link: nobody reads it, so a case never waits
++        // for room behind the lines of another.
++        let mut links = Vec::new();
++        let mut link = || {
++            let (to_agent, from_hub) = mpsc::channel(64);
++            links.push(from_hub);
++            to_agent
++        };
++        let flood = Flaky {
++            failures: Mutex::new(1),
++            error: || ApiError::RetryAfter(std::time::Duration::from_secs(3)),
++        };
++        assert_eq!(
++            hand(&flood, &job("f", link())).await,
++            Fetched::Handed { size: 2 }
++        );
++        let outage = Flaky {
++            failures: Mutex::new(2),
++            error: || ApiError::Telegram {
++                code: 502,
++                description: "Bad Gateway".into(),
++            },
++        };
++        assert_eq!(
++            hand(&outage, &job("f", link())).await,
++            Fetched::Handed { size: 2 }
++        );
++        // A refusal is final; so is an outage that does not end.
++        let refusal = Flaky {
++            failures: Mutex::new(1),
++            error: || ApiError::Telegram {
++                code: 400,
++                description: "Bad Request: wrong file_id".into(),
++            },
++        };
++        assert_eq!(hand(&refusal, &job("f", link())).await, Fetched::Failed);
++        let down = Flaky {
++            failures: Mutex::new(u32::MAX),
++            error: || ApiError::Telegram {
++                code: 500,
++                description: "Internal Server Error".into(),
++            },
++        };
++        assert_eq!(hand(&down, &job("f", link())).await, Fetched::Failed);
++    }
+ }
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+index 1cd4f56..7c380c9 100644
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -172,8 +172,13 @@ const HOOK_CHECK_EVERY: Duration = Duration::from_secs(1);
+ /// Channel requests remembered for a hook that comes after them.
+ const MAX_RELAYED: usize = 64;
+ /// Bytes of files from sessions held at a time, being received or waiting
+-/// for Telegram; an offer beyond gets `busy`.
+-pub const MAX_FILE_BYTES: u64 = 100 << 20;
++/// for Telegram (one file of Telegram's largest size); an offer beyond gets
++/// `busy`.
++pub const MAX_FILE_BYTES: u64 = files::MAX_UPLOAD;
++/// An accepted file from an agent that got no chunk for this long is
++/// dropped at the next offer: the agent gave up waiting for `accepted`, or
++/// the offer came late over a new link.
++pub const UPLOAD_IDLE: Duration = Duration::from_secs(60);
+ /// Files of kept messages waiting for the download task.
+ const FETCH_QUEUE: usize = 64;
+ /// Telegram shows at most this much of a caption.
+@@ -247,6 +252,8 @@ struct Upload {
+     name: String,
+     caption: Option<String>,
+     assembly: files::Assembly,
++    /// When it was accepted or its last chunk came.
++    touched: Instant,
+ }
+ 
+ impl Default for Options {
+@@ -1917,7 +1924,7 @@ impl Slots {
+     /// A `file_offer` from `conn`: accepted when its session is the live
+     /// one of a slot with a topic, the size is one Telegram takes and less
+     /// than [`MAX_FILE_BYTES`] would wait. A new offer drops an unfinished
+-    /// file of the same link.
++    /// file of the same link and any file idle for [`UPLOAD_IDLE`].
+     fn on_file_offer(
+         &mut self,
+         conn: u64,
+@@ -1934,6 +1941,20 @@ impl Slots {
+                 "an unfinished file of the agent is dropped for its next offer"
+             );
+         }
++        let now = Instant::now();
++        let idle: Vec<u64> = self
++            .uploads
++            .iter()
++            .filter(|(_, upload)| now.duration_since(upload.touched) >= UPLOAD_IDLE)
++            .map(|(&conn, _)| conn)
++            .collect();
++        for idle in idle {
++            if let Some(upload) = self.uploads.remove(&idle) {
++                self.file_bytes = self.file_bytes.saturating_sub(upload.assembly.size());
++                info!(conn = idle, "file from an agent stopped coming; dropped");
++                self.answer_file(idle, upload.transfer_id, FileOutcome::Failed);
++            }
++        }
+         let target = self
+             .live_reply_slot(conn, frame_session)
+             .filter(|(_, slot)| {
+@@ -1962,6 +1983,7 @@ impl Slots {
+                     name,
+                     caption,
+                     assembly: files::Assembly::new(size),
++                    touched: Instant::now(),
+                 },
+             );
+         }
+@@ -1980,6 +2002,7 @@ impl Slots {
+             debug!(conn, "chunk of a file not being received; dropped");
+             return;
+         };
++        upload.touched = Instant::now();
+         let broken = match upload.assembly.push(chunk) {
+             Ok(false) => return,
+             Ok(true) => None,
+@@ -11559,7 +11582,6 @@ again"
+                     kind: crate::wire::FileKind::Photo,
+                     file_id: file_id.into(),
+                     name: None,
+-                    mime_type: None,
+                     size,
+                 },
+                 caption: caption.map(str::to_owned),
+@@ -11962,4 +11984,48 @@ again"
+         assert_eq!(slots.file_bytes, 0);
+         assert!(slots.uploads.is_empty());
+     }
++
++    #[tokio::test(start_paused = true)]
++    async fn an_accepted_file_whose_bytes_never_come_does_not_hold_the_budget() {
++        let dir = TempDir::new("slots-file-idle");
++        let (mut slots, _work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
++        let mut first = connect_files(&mut slots, 1, A, Some(10), true);
++        // A second session in the same folder: slot #2 with its own topic.
++        slots.on_hook(&start(B, 12));
++        slots.registry.topic_created(SlotId(1), 101, "b", None);
++        let mut second = connect_files(&mut slots, 2, B, Some(12), true);
++        offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
++        assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
++        // Chunks that keep coming keep the file.
++        let half = UPLOAD_IDLE / 2 + Duration::from_secs(1);
++        tokio::time::advance(half).await;
++        let piece = vec![0u8; files::CHUNK];
++        send_bytes(&mut slots, 1, 1, &piece);
++        tokio::time::advance(half).await;
++        offer(&mut slots, 2, 2, "b.bin", 1);
++        assert_eq!(file_answers(&mut second), [(2, FileOutcome::Busy)]);
++        assert!(slots.uploads.contains_key(&1));
++        // Then the first agent stops sending: its share is freed and it
++        // hears that the file failed.
++        tokio::time::advance(half).await;
++        offer(&mut slots, 2, 3, "b.bin", 1);
++        assert_eq!(file_answers(&mut second), [(3, FileOutcome::Accepted)]);
++        assert_eq!(file_answers(&mut first), [(1, FileOutcome::Failed)]);
++        assert!(!slots.uploads.contains_key(&1));
++        assert_eq!(slots.file_bytes, 1);
++    }
++
++    #[tokio::test]
++    async fn at_most_one_file_of_the_largest_size_waits_at_a_time() {
++        let dir = TempDir::new("slots-file-cap");
++        let (mut slots, _work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
++        let mut first = connect_files(&mut slots, 1, A, Some(10), true);
++        slots.on_hook(&start(B, 12));
++        slots.registry.topic_created(SlotId(1), 101, "b", None);
++        let mut second = connect_files(&mut slots, 2, B, Some(12), true);
++        offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
++        assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
++        offer(&mut slots, 2, 2, "b.bin", 1);
++        assert_eq!(file_answers(&mut second), [(2, FileOutcome::Busy)]);
++    }
+ }
+diff --git a/crates/cctg/src/hub/updates.rs b/crates/cctg/src/hub/updates.rs
+index 0fa2c87..cdf1866 100644
+--- a/crates/cctg/src/hub/updates.rs
++++ b/crates/cctg/src/hub/updates.rs
+@@ -70,18 +70,16 @@ fn media(message: &mut Message) -> Option<Media> {
+         kind,
+         file_id: info.file_id,
+         name: info.file_name,
+-        mime_type: info.mime_type,
+         size: info.file_size,
+     };
+     let photo = message.media.photo.take().and_then(|sizes| {
+         sizes
+             .into_iter()
+-            .max_by_key(|size| (size.width * size.height, size.file_size))
++            .max_by_key(|size| (size.width.saturating_mul(size.height), size.file_size))
+             .map(|largest| Attachment {
+                 kind: FileKind::Photo,
+                 file_id: largest.file_id,
+                 name: None,
+-                mime_type: None,
+                 size: largest.file_size,
+             })
+     });
+@@ -615,6 +613,17 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn a_photo_of_any_announced_dimensions_is_taken() {
++        let photo = input(json!({
++            "photo": [
++                { "file_id": "small", "file_unique_id": "u1", "width": 90, "height": 60 },
++                { "file_id": "odd", "file_unique_id": "u2", "width": u64::MAX, "height": 3 },
++            ],
++        }));
++        assert_eq!(photo.media.unwrap().file.file_id, "odd");
++    }
++
+     #[test]
+     fn a_media_message_carries_its_file_and_caption_and_no_text() {
+         let photo = input(json!({
+@@ -635,7 +644,6 @@ mod tests {
+                 kind: FileKind::Photo,
+                 file_id: "large".into(),
+                 name: None,
+-                mime_type: None,
+                 size: Some(90000),
+             }
+         );
+diff --git a/crates/cctg/tests/files_e2e.rs b/crates/cctg/tests/files_e2e.rs
+index c0b6785..cf141fe 100644
+--- a/crates/cctg/tests/files_e2e.rs
++++ b/crates/cctg/tests/files_e2e.rs
+@@ -624,4 +624,6 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
+     for private in ["notes.txt", "odd.png", "big.iso", "inbox"] {
+         assert!(!logs.contains(private), "{private} in the logs:\n{logs}");
+     }
++    // Nor the bot token of the download URLs (`/file/bot<token>/...`).
++    assert!(!logs.contains("1:files"), "the token in the logs:\n{logs}");
+ }
