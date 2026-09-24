@@ -1375,6 +1375,7 @@ impl Slots {
                     html: None,
                     reply_markup,
                     permission: false,
+                    reply_to: None,
                 },
             );
         }
@@ -2079,6 +2080,7 @@ impl Slots {
                     html: Some(chunk.html),
                     reply_markup: None,
                     permission: false,
+                    reply_to: None,
                 })
                 .collect()
         };
@@ -2427,6 +2429,7 @@ impl Slots {
                 html: None,
                 reply_markup: Some(permissions::keyboard(&prompt.request_id)),
                 permission: true,
+                reply_to: None,
             };
             if let Some(prompt) = self.prompts.get_mut(key) {
                 prompt.sent = true;
@@ -2858,7 +2861,18 @@ impl Slots {
                 return;
             }
         };
-        self.registry.block_done(key, text, message_id);
+        if let Some(notice) = self.registry.block_done(key, text, message_id) {
+            // At most once: the block is marked notified whether or not
+            // this send goes through.
+            self.send_messages(vec![Op::Send {
+                thread_id: Some(notice.thread_id),
+                text: notice.text,
+                html: None,
+                reply_markup: None,
+                permission: false,
+                reply_to: Some(notice.reply_to),
+            }]);
+        }
     }
 
     fn on_prompt_edit_done(&mut self, key: u64, delivery: Option<Delivery>) {
@@ -3008,6 +3022,7 @@ impl Slots {
                     html: None,
                     reply_markup: None,
                     permission: false,
+                    reply_to: None,
                 },
             };
             self.hand_off(Work::Topic(job), op);
@@ -3114,6 +3129,7 @@ fn message_op(thread_id: i64, text: String) -> Op {
         html: None,
         reply_markup: None,
         permission: false,
+        reply_to: None,
     }
 }
 
@@ -6615,23 +6631,31 @@ again"
         ))
         .await;
         let ops = settled(&rig, |ops| {
-            count(ops, |op| matches!(op, Op::Edit { .. })) == 1
+            count(ops, |op| matches!(op, Op::Edit { .. })) == 1 && replies(ops).len() == 1
         })
         .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(rig.fake.ops().len(), ops.len());
         assert_eq!(count(&ops, is_create), 1);
+        let block = ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Edit { message_id, .. } => Some(*message_id),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(
             sent_to(&ops, 100),
-            [format!(
-                "⇣ nested bbbbbbbb\n{}",
-                crate::hub::registry::BLOCK_RUNNING
-            )]
+            [
+                format!("⇣ nested bbbbbbbb\n{}", crate::hub::registry::BLOCK_RUNNING),
+                "✓ nested bbbbbbbb закончил".to_owned(),
+            ]
         );
         assert_eq!(
-            shown(&ops).values().collect::<Vec<_>>(),
-            [&"⇣ nested bbbbbbbb\nnested answer".to_owned()]
+            replies(&ops),
+            [(100, block, "✓ nested bbbbbbbb закончил".to_owned())]
         );
+        assert_eq!(shown(&ops)[&block], "⇣ nested bbbbbbbb\nnested answer");
     }
 
     #[tokio::test]
@@ -6692,28 +6716,40 @@ again"
         rig.hook(sub_start(A, S1, "Explore")).await;
         let gone = rig.dir.path().join("agent-missing.jsonl");
         rig.hook(sub_stop(A, S1, "Explore", &gone, "Late.")).await;
-        settled(&rig, |ops| {
-            ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::Edit {
-                        message_id: 700,
-                        ..
-                    }
-                )
-            })
-        })
-        .await;
+        settled(&rig, |ops| replies(ops).len() == 2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let all = rig.fake.ops();
         assert_eq!(
             count(&all, |op| matches!(
                 op,
-                Op::Send { .. } | Op::CreateTopic { .. }
+                Op::Send { reply_to: None, .. } | Op::CreateTopic { .. }
             )),
             0
         );
         assert_eq!(shown(&all)[&700], format!("↳ Explore {S1}\nLate."));
+        // Both blocks ended after the restart: one reply each.
+        assert_eq!(
+            replies(&all),
+            [
+                (101, 701, format!("✗ Explore {} итог не получен", &S2[..8])),
+                (100, 700, format!("✓ Explore {} закончил", &S1[..8])),
+            ]
+        );
+    }
+
+    /// The "finished" replies to blocks: `(thread, reply_to, text)`.
+    fn replies(ops: &[Op]) -> Vec<(i64, i64, String)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(thread),
+                    text,
+                    reply_to: Some(reply_to),
+                    ..
+                } => Some((*thread, *reply_to, text.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A registry with A's topic (100) and the subagents `agents` of A

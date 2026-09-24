@@ -226,16 +226,22 @@ impl BotApi {
     }
 
     /// `parse_mode`: `Some("HTML")` sends `text` as Telegram HTML; `None` as plain text.
+    /// `reply_to`: the message this one answers; Telegram refuses the send
+    /// when that message is gone.
     pub async fn send_message(
         &self,
         thread_id: Option<i64>,
         text: &str,
         reply_markup: Option<&Value>,
         parse_mode: Option<&str>,
+        reply_to: Option<i64>,
     ) -> Result<Message, ApiError> {
         let mut body = json!({ "chat_id": self.chat_id, "text": text });
         if let Some(thread_id) = thread_id {
             body["message_thread_id"] = json!(thread_id);
+        }
+        if let Some(reply_to) = reply_to {
+            body["reply_parameters"] = json!({ "message_id": reply_to });
         }
         if let Some(parse_mode) = parse_mode {
             body["parse_mode"] = json!(parse_mode);

@@ -240,6 +240,21 @@ pub const MAX_BLOCK_ATTEMPTS: u32 = 5;
 /// (a reply to its block then carries no `target_agent`).
 pub const MAX_SUBAGENTS: usize = 1024;
 
+/// `<type> <short id>` of a block: the type from a subagent header
+/// `↳ <type> <id>[: <description>]`, `nested` for a nested run.
+fn block_label(key: &BlockKey, header: &str) -> String {
+    match key {
+        BlockKey::Agent(id) => {
+            let kind = header
+                .strip_prefix("↳ ")
+                .and_then(|rest| rest.split_once(&format!(" {id}")))
+                .map_or("agent", |(kind, _)| kind);
+            format!("{kind} {}", short(id))
+        }
+        BlockKey::Nested(session) => format!("nested {}", short(session)),
+    }
+}
+
 /// `⇣ nested <short id>`, the header of a nested run's block.
 pub fn nested_header(session_id: &str) -> String {
     format!("⇣ nested {}", short(session_id))
@@ -400,6 +415,9 @@ pub struct Block {
     /// A nested run's last turn answer, shown when the run ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+    /// The "finished" reply to this block was handed out; never again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notified: bool,
     #[serde(skip)]
     pub busy: bool,
     /// Waits for the retry tick.
@@ -418,6 +436,15 @@ impl Block {
             ..Self::default()
         }
     }
+}
+
+/// A short reply to a block that has just shown its final text, so the
+/// topic gets a notification (an edit gives none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockNotice {
+    pub thread_id: i64,
+    pub reply_to: i64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1228,20 +1255,47 @@ impl Registry {
         jobs
     }
 
-    /// Telegram shows `text`; `message_id` is set for a first send.
-    pub fn block_done(&mut self, key: &BlockKey, text: &str, message_id: Option<i64>) {
-        if let Some(block) = self.block_mut(key) {
-            block.busy = false;
-            block.sending = false;
-            block.attempts = 0;
-            if message_id.is_some() {
-                block.message_id = message_id;
-            }
-            if block.pending.as_deref() == Some(text) {
-                block.pending = None;
-            }
-            self.dirty = true;
+    /// Telegram shows `text`; `message_id` is set for a first send. The
+    /// first time a block shows its final text, the reply that announces it.
+    pub fn block_done(
+        &mut self,
+        key: &BlockKey,
+        text: &str,
+        message_id: Option<i64>,
+    ) -> Option<BlockNotice> {
+        let block = self.block_mut(key)?;
+        block.busy = false;
+        block.sending = false;
+        block.attempts = 0;
+        if message_id.is_some() {
+            block.message_id = message_id;
         }
+        if block.pending.as_deref() == Some(text) {
+            block.pending = None;
+        }
+        self.dirty = true;
+        let block = self.block(key)?;
+        if block.notified || block.running || block.pending.is_some() {
+            return None;
+        }
+        let (thread_id, reply_to) = (block.thread_id?, block.message_id?);
+        let lost = text
+            == format!(
+                "{}
+{BLOCK_LOST}",
+                block.header
+            );
+        let label = block_label(key, &block.header);
+        self.block_mut(key)?.notified = true;
+        Some(BlockNotice {
+            thread_id,
+            reply_to,
+            text: if lost {
+                format!("✗ {label} {BLOCK_LOST}")
+            } else {
+                format!("✓ {label} закончил")
+            },
+        })
     }
 
     /// A send or edit failed: tried again on the retry tick, given up after
@@ -1931,7 +1985,9 @@ mod tests {
                     registry.block_done(key, text, Some(*next_message));
                     *next_message += 1;
                 }
-                BlockJob::Edit { key, text, .. } => registry.block_done(key, text, None),
+                BlockJob::Edit { key, text, .. } => {
+                    registry.block_done(key, text, None);
+                }
             }
         }
         jobs
@@ -2032,6 +2088,113 @@ mod tests {
                 message_id: 501,
                 text: format!("↳ Explore a2\n{BLOCK_LOST}"),
             }]
+        );
+    }
+
+    /// [`settle_blocks`], returning the notices of the answered jobs.
+    fn settle_notices(registry: &mut Registry, next_message: &mut i64) -> Vec<BlockNotice> {
+        let mut notices = Vec::new();
+        for job in registry.block_work(usize::MAX) {
+            let notice = match &job {
+                BlockJob::Send { key, text, .. } => {
+                    *next_message += 1;
+                    registry.block_done(key, text, Some(*next_message - 1))
+                }
+                BlockJob::Edit { key, text, .. } => registry.block_done(key, text, None),
+            };
+            notices.extend(notice);
+        }
+        notices
+    }
+
+    fn notice(reply_to: i64, text: &str) -> BlockNotice {
+        BlockNotice {
+            thread_id: 100,
+            reply_to,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_finished_block_is_announced_once_by_a_reply() {
+        let dir = TempDir::new("registry-block-notice");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        let mut message = 500;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        let a1 = BlockKey::Agent("a0000000000000001".into());
+        registry.confirm_subagent(
+            "a0000000000000001",
+            A,
+            "↳ Explore a0000000000000001: look".into(),
+        );
+        // Running: no notice.
+        assert!(settle_notices(&mut registry, &mut message).is_empty());
+        registry.show_block(&a1, "↳ Explore a0000000000000001: look\ndone".into(), false);
+        assert_eq!(
+            settle_notices(&mut registry, &mut message),
+            [notice(500, "✓ Explore a0000000 закончил")]
+        );
+        // A later edit of the same block: no second notice.
+        registry.show_block(
+            &a1,
+            "↳ Explore a0000000000000001: look\nlater".into(),
+            false,
+        );
+        assert!(settle_notices(&mut registry, &mut message).is_empty());
+
+        // A nested run: once, even when it runs and ends again.
+        registry.apply_hook(&start(N, CWD, Some(20), Some(10)));
+        assert!(settle_notices(&mut registry, &mut message).is_empty());
+        let nested = BlockKey::Nested(N.to_owned());
+        registry.show_block(&nested, "⇣ nested dddddddd\nanswer".into(), false);
+        assert_eq!(
+            settle_notices(&mut registry, &mut message),
+            [notice(501, "✓ nested dddddddd закончил")]
+        );
+        registry.apply_hook(&start_from(N, CWD, Some(21), Some(10), "resume"));
+        registry.show_block(&nested, "⇣ nested dddddddd\nagain".into(), false);
+        assert!(settle_notices(&mut registry, &mut message).is_empty());
+
+        // Finished before its first send: the send itself is announced.
+        registry.confirm_subagent("a2", A, "↳ Plan a2".into());
+        registry.show_block(
+            &BlockKey::Agent("a2".into()),
+            "↳ Plan a2\ndone".into(),
+            false,
+        );
+        assert_eq!(
+            settle_notices(&mut registry, &mut message),
+            [notice(502, "✓ Plan a2 закончил")]
+        );
+
+        // A tombstone (first send without an answer) is never announced.
+        registry.confirm_subagent("a3", A, "↳ Explore a3".into());
+        let a3 = BlockKey::Agent("a3".into());
+        assert_eq!(registry.block_work(usize::MAX).len(), 1);
+        registry.block_send_unclear(&a3);
+        registry.show_block(&a3, "↳ Explore a3\ndone".into(), false);
+        assert!(settle_notices(&mut registry, &mut message).is_empty());
+
+        // a4 is shown running when the hub stops; after the restart it is
+        // lost and announced so, while a1 is not announced again.
+        registry.confirm_subagent("a4", A, "↳ Explore a4".into());
+        assert!(settle_notices(&mut registry, &mut message).is_empty());
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let mut registry = store.load().unwrap();
+        assert!(registry.subagents["a0000000000000001"].block.notified);
+        registry.show_block(
+            &a1,
+            "↳ Explore a0000000000000001: look\nagain".into(),
+            false,
+        );
+        registry.apply_hook(&end(A));
+        registry.lose_blocks(&[A.to_owned()]);
+        assert_eq!(
+            settle_notices(&mut registry, &mut message),
+            [notice(503, "✗ Explore a4 итог не получен")]
         );
     }
 

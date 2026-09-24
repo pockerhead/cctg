@@ -333,6 +333,7 @@ pub async fn send_text(
         html: None,
         reply_markup: None,
         permission: false,
+        reply_to: None,
     };
     submit(outbox, op).await.map(drop)
 }

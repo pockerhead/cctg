@@ -63,6 +63,8 @@ pub enum Op {
         /// Permission prompts jump ahead of ordinary messages of other topics,
         /// never ahead of older messages of their own topic.
         permission: bool,
+        /// The message this one answers (`reply_parameters`).
+        reply_to: Option<i64>,
     },
     SendDocument {
         thread_id: Option<i64>,
@@ -172,12 +174,19 @@ impl Transport for BotApi {
                 text,
                 html,
                 reply_markup,
+                reply_to,
                 ..
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
-                self.send_message(*thread_id, text, reply_markup.as_ref(), parse_mode)
-                    .await
-                    .map(Outcome::Sent)
+                self.send_message(
+                    *thread_id,
+                    text,
+                    reply_markup.as_ref(),
+                    parse_mode,
+                    *reply_to,
+                )
+                .await
+                .map(Outcome::Sent)
             }
             Op::SendDocument {
                 thread_id,
@@ -224,7 +233,7 @@ impl Transport for BotApi {
                 ..
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
-                self.send_message(Some(*thread_id), text, None, parse_mode)
+                self.send_message(Some(*thread_id), text, None, parse_mode, None)
                     .await
                     .map(Outcome::Sent)
             }
@@ -791,6 +800,7 @@ mod tests {
             html: None,
             reply_markup: None,
             permission: false,
+            reply_to: None,
         }
     }
 
@@ -886,6 +896,7 @@ mod tests {
             html: None,
             reply_markup: None,
             permission: true,
+            reply_to: None,
         });
         run(&fake, ops).await;
         let calls = fake.calls();
@@ -1031,6 +1042,7 @@ mod tests {
             html: None,
             reply_markup: None,
             permission: true,
+            reply_to: None,
         }
     }
 
@@ -1432,6 +1444,7 @@ mod tests {
             html: Some(html.to_owned()),
             reply_markup: None,
             permission: false,
+            reply_to: None,
         }
     }
 
