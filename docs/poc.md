@@ -80,12 +80,31 @@ claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>
 
 ### Из Git Bash
 
+В Git Bash (MSYS) пути в аргументах пишите в Windows-виде (`C:\...` или `C:/...`): их MSYS не переписывает, `server:cctg` тоже доходит как есть. Пути в стиле MSYS (`/tmp`, `/c/...`) MSYS переводит при запуске `claude`, это нормально. `MSYS_NO_PATHCONV=1` не ставьте, особенно через `export` в обёртке: переменная наследуется всеми процессами сессии, и тогда команды Bash-инструмента внутри Claude Code передают нативным программам `/c/...` без перевода (живой случай 2026-09-24: Godot записал снапшот в `C:\c\Users\...`).
+
+```
+cd <рабочая папка>
+$env:CLAUDE_CONFIG_DIR = "<tmp>\cctg-poc\claude-config"
+claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>/cctg-poc/settings.json --dangerously-load-development-channels server:cctg
+```
+
+Что даёт и чего стоит `CLAUDE_CONFIG_DIR`:
+
+- По документации (https://code.claude.com/docs/en/claude-directory) в эту папку переезжают все пути `~/.claude`. Что туда же переезжает и `.claude.json`, в документации прямо не сказано; проверено на 2.1.280: с `CLAUDE_CONFIG_DIR` Claude Code создаёт `.claude.json` внутри этой папки и не видит серверов из `~/.claude.json`.
+- В новой папке нет логина. Первый запуск попросит войти (`/login`, аккаунт claude.ai) либо возьмёт `ANTHROPIC_API_KEY` из окружения (ключ Console); каналы работают с обоими. Логин сохраняется в `claude-config/`, поэтому папку не удалять между прогонами.
+- Ваши личные настройки, память `~/.claude/CLAUDE.md`, плагины и глобальные хуки в этой сессии не действуют. Для проверки канала это и нужно.
+- Транскрипт сессии ляжет в `claude-config/projects/`. `/brief` в теме слота берёт путь транскрипта из хука, поэтому работает без настройки.
+
+Без `CLAUDE_CONFIG_DIR` рецепт тоже работает, но Claude Code запишет в ваш `~/.claude.json` ключ `projects[<рабочая папка>]` (доверие папке) и сохранит транскрипт в `~/.claude/projects/`. Тогда берите одну и ту же рабочую папку на все прогоны, чтобы ключ был один.
+
+### Из Git Bash
+
 В Git Bash (MSYS) перед командой нужен `MSYS_NO_PATHCONV=1`. Без него MSYS переписывает аргументы, похожие на пути: `server:cctg` и пути к файлам доходят до Claude Code искажёнными, канал не регистрируется и диалог про development channels не появляется. С `MSYS_NO_PATHCONV=1` пути пишите в виде `C:/...`: `/tmp`, `/c/...` и `$TMP` в стиле MSYS дойдут до Claude Code как есть и не откроются.
 
 ```
 cd <рабочая папка>
 export CLAUDE_CONFIG_DIR="<tmp>/cctg-poc/claude-config"
-MSYS_NO_PATHCONV=1 claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>/cctg-poc/settings.json --dangerously-load-development-channels server:cctg
+claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>/cctg-poc/settings.json --dangerously-load-development-channels server:cctg
 ```
 
 Чтобы не набирать это каждый раз, положите в папку из `PATH` (например `~/bin`) скрипт `claude-cctg`:
@@ -94,7 +113,6 @@ MSYS_NO_PATHCONV=1 claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-conf
 #!/usr/bin/env bash
 # claude-cctg: Claude Code with the cctg channel for this run only.
 export CLAUDE_CONFIG_DIR="<tmp>/cctg-poc/claude-config"
-export MSYS_NO_PATHCONV=1
 exec claude \
   --mcp-config "<tmp>/cctg-poc/mcp.json" --strict-mcp-config \
   --settings "<tmp>/cctg-poc/settings.json" \
