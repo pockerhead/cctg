@@ -55,7 +55,7 @@ use std::time::{Duration, Instant as StdInstant};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
-use transcript::{SplitOptions, split_for_telegram};
+use transcript::{HtmlChunk, SplitOptions, split_for_telegram, split_markdown_for_telegram};
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Parked, ResumeNote};
@@ -1249,6 +1249,7 @@ impl Slots {
                 Op::Send {
                     thread_id: Some(thread_id),
                     text: buffer::resume_text(&session),
+                    html: None,
                     reply_markup,
                     permission: false,
                 },
@@ -1751,14 +1752,19 @@ impl Slots {
             }
             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
                 match step {
-                    Step::Send { text, merge } => {
-                        let split = split_for_telegram(&text, SplitOptions::default());
-                        let merge = merge && split.chunks.len() == 1;
-                        for text in split.chunks {
+                    Step::Send {
+                        text,
+                        merge,
+                        markdown,
+                    } => {
+                        let chunks = stream_chunks(&text, markdown);
+                        let merge = merge && chunks.len() == 1;
+                        for (text, html) in chunks {
                             queued += 1;
                             let op = Op::Stream {
                                 thread_id,
                                 text,
+                                html,
                                 merge,
                                 restart: std::mem::take(&mut live.restart),
                             };
@@ -1930,7 +1936,7 @@ impl Slots {
         text: &str,
         kind: &str,
     ) -> Option<usize> {
-        let split = split_for_telegram(text, SplitOptions::default());
+        let split = split_markdown_for_telegram(text, SplitOptions::default());
         let ops: Vec<Op> = if split.prefer_file {
             vec![Op::SendDocument {
                 thread_id: Some(thread_id),
@@ -1944,7 +1950,13 @@ impl Slots {
             split
                 .chunks
                 .into_iter()
-                .map(|chunk| message_op(thread_id, chunk))
+                .map(|chunk| Op::Send {
+                    thread_id: Some(thread_id),
+                    text: chunk.text,
+                    html: Some(chunk.html),
+                    reply_markup: None,
+                    permission: false,
+                })
                 .collect()
         };
         let parts = ops.len();
@@ -2097,6 +2109,7 @@ impl Slots {
             let op = Op::Send {
                 thread_id: Some(thread_id),
                 text: prompt.text.clone(),
+                html: None,
                 reply_markup: Some(permissions::keyboard(&prompt.request_id)),
                 permission: true,
             };
@@ -2673,6 +2686,7 @@ impl Slots {
                 } => Op::Send {
                     thread_id: Some(*thread_id),
                     text: text.clone(),
+                    html: None,
                     reply_markup: None,
                     permission: false,
                 },
@@ -2728,7 +2742,7 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         live.answered_outside(&held);
         return Ok(Vec::new());
     }
-    let split = split_for_telegram(&held.answer, SplitOptions::default());
+    let split = split_markdown_for_telegram(&held.answer, SplitOptions::default());
     if split.prefer_file || split.chunks.len() > room {
         live.answered_outside(&held);
         return Err(held);
@@ -2739,15 +2753,16 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         live.answered_outside(&held);
         return Ok(Vec::new());
     };
-    let op = |live: &mut Live, text| Op::Stream {
+    let op = |live: &mut Live, chunk: HtmlChunk| Op::Stream {
         thread_id,
-        text,
+        text: chunk.text,
+        html: Some(chunk.html),
         merge: false,
         restart: std::mem::take(&mut live.restart),
     };
     let mut ops = Vec::with_capacity(chunks.len() + 1);
-    for text in chunks {
-        let message = op(live, text);
+    for chunk in chunks {
+        let message = op(live, chunk);
         ops.push((live.sent(), message));
     }
     let message = op(live, last);
@@ -2755,10 +2770,29 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
     Ok(ops)
 }
 
+/// The messages of a stream line: markdown as HTML with its plain source,
+/// anything else as plain text.
+fn stream_chunks(text: &str, markdown: bool) -> Vec<(String, Option<String>)> {
+    if markdown {
+        split_markdown_for_telegram(text, SplitOptions::default())
+            .chunks
+            .into_iter()
+            .map(|chunk| (chunk.text, Some(chunk.html)))
+            .collect()
+    } else {
+        split_for_telegram(text, SplitOptions::default())
+            .chunks
+            .into_iter()
+            .map(|text| (text, None))
+            .collect()
+    }
+}
+
 fn message_op(thread_id: i64, text: String) -> Op {
     Op::Send {
         thread_id: Some(thread_id),
         text,
+        html: None,
         reply_markup: None,
         permission: false,
     }
@@ -3446,6 +3480,44 @@ mod tests {
                 last_assistant_message: answer.map(str::to_owned),
             },
         )
+    }
+
+    /// Text and HTML of the new messages in `thread`, in order.
+    fn topic_html(ops: &[Op], thread: i64) -> Vec<(String, Option<String>)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(t),
+                    text,
+                    html,
+                    ..
+                }
+                | Op::Stream {
+                    thread_id: t,
+                    text,
+                    html,
+                    ..
+                } if *t == thread => Some((text.clone(), html.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// TASK-027: turn answers and replies go as Telegram HTML with their
+    /// markdown source as the plain fallback.
+    #[tokio::test]
+    async fn turn_answers_and_replies_go_as_html_with_their_source() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        rig.hook(stop(B, Some("# Done\n**all** <ok>"))).await;
+        let ops = settled(&rig, |ops| topic_html(ops, 101).len() == 1).await;
+        assert_eq!(
+            topic_html(&ops, 101),
+            [(
+                "# Done\n**all** <ok>".to_owned(),
+                Some("<b>Done</b>\n<b>all</b> &lt;ok&gt;".to_owned())
+            )]
+        );
     }
 
     #[tokio::test]
@@ -7372,6 +7444,45 @@ mod tests {
             stream_texts(&rig, 100, 2).await,
             ["• Bash: last step ✓", "done"]
         );
+    }
+
+    /// TASK-027: assistant text in the stream and the streamed answer go as
+    /// HTML; prompts and tool lines stay plain.
+    #[tokio::test]
+    async fn stream_text_and_answer_go_as_html_and_tool_lines_stay_plain() {
+        let dir = TempDir::new("slots-stream-html");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        append(&path, &typed("go *now*"));
+        append(&path, &note_record("**Checking** `a<b`"));
+        append(&path, &tool_call("t1", "x <y>"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &answer_record("_done_"));
+        rig.hook(stop(A, Some("_done_"))).await;
+        stream_texts(&rig, 100, 4).await;
+        let html = |text: &str| Some(text.to_owned());
+        assert_eq!(
+            topic_html(&rig.fake.ops(), 100),
+            [
+                ("> go *now*".to_owned(), None),
+                (
+                    "**Checking** `a<b`".to_owned(),
+                    html("<b>Checking</b> <code>a&lt;b</code>")
+                ),
+                ("• Bash: x <y> ✓".to_owned(), None),
+                ("_done_".to_owned(), html("<i>done</i>")),
+            ]
+        );
+    }
+
+    fn note_record(text: &str) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}\n"
+        )
     }
 
     #[tokio::test]
