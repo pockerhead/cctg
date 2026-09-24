@@ -1,0 +1,14 @@
+FMT_OK
+    Checking cctg v0.1.0 (C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-017\scratch\reviewer2\ws\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 7.11s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 9.73s
+test result: FAILED. 293 passed; 1 failed; 1 ignored; 0 measured; 96 filtered out; finished in 61.36s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 9.74s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.06s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.32s
+test result: FAILED. 293 passed; 1 failed; 1 ignored; 0 measured; 96 filtered out; finished in 61.20s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 9.67s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 9.72s
+test result: FAILED. 293 passed; 1 failed; 1 ignored; 0 measured; 96 filtered out; finished in 61.20s
+test result: ok. 294 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 9.94s
+done

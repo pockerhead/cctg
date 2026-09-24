@@ -1,0 +1,21 @@
+round 1 proc 1: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.73s
+round 1 proc 2: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.46s
+round 1 proc 3: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.73s
+round 2 proc 1: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.24s
+round 2 proc 2: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.26s
+round 2 proc 3: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.33s
+round 3 proc 1: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.22s
+round 3 proc 2: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.24s
+round 3 proc 3: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.31s
+round 4 proc 1: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.68s
+round 4 proc 2: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.51s
+round 4 proc 3: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 10.54s
+round 5 proc 1: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.05s
+round 5 proc 2: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.17s
+round 5 proc 3: test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.12s
+round 6 proc 1 (after workspace run): test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.57s
+round 6 proc 2 (after workspace run): test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.65s
+round 6 proc 3 (after workspace run): test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.56s
+round 7 proc 1 (after workspace run): test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.45s
+round 7 proc 2 (after workspace run): test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.42s
+round 7 proc 3 (after workspace run): test result: ok. 297 passed; 0 failed; 1 ignored; 0 measured; 96 filtered out; finished in 11.47s

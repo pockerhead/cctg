@@ -1,0 +1,595 @@
+//! QA (TASK-017), independent of the author's buffer_e2e: the real
+//! `serve_agents` TCP server, the real `Slots` actor and `Scheduler`, a fake
+//! Telegram transport, raw wire peers in place of `cctg agent`, and Telegram
+//! updates routed through the real `updates::route_batch` allowlist gate.
+//!
+//! One slot lives through: a dead period with 52 messages (51st/52nd drop the
+//! oldest, one overflow warning), subagent and nested runs that must not
+//! revive it, Resume presses (allowlisted, stranger), a hub restart from the
+//! saved registry, revival by resume, a second dead period (51 messages, one
+//! more warning) revived by a new session taking the slot, and a third one
+//! revived by `/clear`.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::buffer::{
+    ANSWER_ALIVE, ANSWER_UNAVAILABLE, OVERFLOW_NOTICE, QUEUED_NOTICE, RESUMED_TEXT,
+};
+use cctg::hub::config::Allowlist;
+use cctg::hub::ingress::serve_agents;
+use cctg::hub::permissions::ANSWER_EXPIRED;
+use cctg::hub::registry::{ICON_DEAD, RegistryStore};
+use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
+use cctg::hub::slots::{Control, Options, Slots};
+use cctg::hub::updates::{Routed, route_batch};
+use cctg::wire::{self, AgentMsg, HookEvent, HookPost, HubMsg, Register, Secret};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+const SECRET: &str = "qa-buffer-e2e-secret-0123456789";
+const A: &str = "a0000000-0000-4000-8000-00000000000a";
+const B: &str = "b0000000-0000-4000-8000-00000000000b";
+const C: &str = "c0000000-0000-4000-8000-00000000000c";
+const P: &str = "f0000000-0000-4000-8000-00000000000f";
+const N: &str = "e0000000-0000-4000-8000-00000000000e";
+const CWD: &str = r"C:\w\p";
+const OTHER_CWD: &str = r"C:\w\q";
+const CHAT: i64 = -1000000000001;
+/// A made-up allowlisted user id, distinctive enough to grep for.
+const USER: i64 = 7_654_321_987;
+const STRANGER: i64 = 5_555_000_111;
+const WAIT: Duration = Duration::from_secs(30);
+
+struct Fake {
+    state: Mutex<(Vec<Op>, i64, i64)>,
+}
+
+impl Fake {
+    fn new(first_message: i64, first_topic: i64) -> Self {
+        Self {
+            state: Mutex::new((Vec::new(), first_message, first_topic)),
+        }
+    }
+    fn ops(&self) -> Vec<Op> {
+        self.state.lock().unwrap().0.clone()
+    }
+}
+
+impl Transport for Fake {
+    async fn execute(&self, op: &Op) -> Delivery {
+        let mut state = self.state.lock().unwrap();
+        state.0.push(op.clone());
+        match op {
+            Op::CreateTopic { name, .. } => {
+                let id = state.2;
+                state.2 += 1;
+                Ok(Outcome::Topic(ForumTopic {
+                    message_thread_id: id,
+                    name: name.clone(),
+                    icon_custom_emoji_id: None,
+                }))
+            }
+            Op::Send { .. } => {
+                let id = state.1;
+                state.1 += 1;
+                Ok(Outcome::Sent(Message {
+                    message_id: id,
+                    ..Message::default()
+                }))
+            }
+            _ => Ok(Outcome::Done),
+        }
+    }
+}
+
+struct Hub {
+    fake: Arc<Fake>,
+    control: mpsc::UnboundedSender<Control>,
+    hooks: mpsc::Sender<HookPost>,
+    addr: std::net::SocketAddr,
+    tasks: Vec<JoinHandle<()>>,
+    allow: Allowlist,
+    update_id: i64,
+}
+
+async fn start_hub(state: &Path, first_message: i64, first_topic: i64) -> Hub {
+    let fake = Arc::new(Fake::new(first_message, first_topic));
+    let (scheduler, outbox) = Scheduler::new(
+        fake.clone(),
+        BucketConfig {
+            capacity: 1000,
+            refill_every: Duration::from_millis(1),
+            min_gap: Duration::ZERO,
+        },
+    );
+    let mut tasks = vec![tokio::spawn(scheduler.run())];
+    let store = RegistryStore::open(state).expect("store");
+    let options = Options {
+        grace: Duration::ZERO,
+        chat_id: CHAT,
+        ..Options::default()
+    };
+    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let (agents, agents_rx) = mpsc::channel(64);
+    let (hooks, hooks_rx) = mpsc::channel(64);
+    let (control, control_rx) = mpsc::unbounded_channel();
+    tasks.push(tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx)));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tasks.push(tokio::spawn(async move {
+        let _ = serve_agents(listener, Secret::parse(SECRET).expect("secret"), agents).await;
+    }));
+    Hub {
+        fake,
+        control,
+        hooks,
+        addr,
+        tasks,
+        allow: [USER].into_iter().collect(),
+        update_id: 1,
+    }
+}
+
+impl Hub {
+    fn stop(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+
+    async fn hook(&self, session: &str, cwd: &str, event: HookEvent) {
+        self.hooks
+            .send(HookPost::new(
+                "box".into(),
+                session.into(),
+                cwd.into(),
+                String::new(),
+                event,
+            ))
+            .await
+            .expect("hook");
+    }
+
+    async fn start(&self, session: &str, cwd: &str, source: &str, pid: u32, parent: Option<u32>) {
+        self.hook(
+            session,
+            cwd,
+            HookEvent::SessionStart {
+                source: Some(source.into()),
+                claude_pid: Some(pid),
+                parent_claude_pid: parent,
+            },
+        )
+        .await;
+    }
+
+    async fn end(&self, session: &str, cwd: &str, reason: Option<&str>, pid: u32) {
+        self.hook(
+            session,
+            cwd,
+            HookEvent::SessionEnd {
+                reason: reason.map(str::to_owned),
+                claude_pid: Some(pid),
+            },
+        )
+        .await;
+    }
+
+    /// Feeds raw Bot API updates through the real allowlist gate, then
+    /// routes them like `hub::route_inbound` (no commands are used here).
+    fn updates(&mut self, raw: Vec<Value>) {
+        let (_, routed) = route_batch(raw, None, CHAT, &self.allow);
+        for item in routed {
+            match item {
+                Routed::Input(input) => self.control.send(Control::Message(input)).unwrap(),
+                Routed::Callback(input) => self.control.send(Control::Callback(input)).unwrap(),
+                Routed::Service(_) | Routed::Ignored(_) => {}
+            }
+        }
+    }
+
+    fn say(&mut self, thread: i64, message_id: i64) {
+        self.update_id += 1;
+        let raw = json!({
+            "update_id": self.update_id,
+            "message": {
+                "message_id": message_id,
+                "message_thread_id": thread,
+                "is_topic_message": true,
+                "from": { "id": USER, "is_bot": false },
+                "chat": { "id": CHAT },
+                "text": format!("m{message_id}"),
+                "reply_to_message": { "message_id": thread },
+            }
+        });
+        self.updates(vec![raw]);
+    }
+
+    fn press(&mut self, from: i64, query: &str, data: &str, message_id: i64) {
+        self.update_id += 1;
+        let raw = json!({
+            "update_id": self.update_id,
+            "callback_query": {
+                "id": query,
+                "from": { "id": from, "is_bot": false },
+                "data": data,
+                "message": { "message_id": message_id, "chat": { "id": CHAT } },
+            }
+        });
+        self.updates(vec![raw]);
+    }
+
+    fn count(&self, pick: impl Fn(&Op) -> bool) -> usize {
+        self.fake.ops().iter().filter(|op| pick(op)).count()
+    }
+}
+
+fn is_text(op: &Op, want: &str) -> bool {
+    matches!(op, Op::Send { text, .. } if text == want)
+}
+
+fn is_resume_button(op: &Op) -> bool {
+    matches!(op, Op::Send { reply_markup: Some(markup), .. }
+        if markup["inline_keyboard"][0][0]["callback_data"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("resume:")))
+}
+
+fn answer_of(ops: &[Op], query: &str) -> Option<Option<String>> {
+    ops.iter().find_map(|op| match op {
+        Op::AnswerCallback { query_id, text } if query_id == query => Some(text.clone()),
+        _ => None,
+    })
+}
+
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let reached = async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, reached)
+        .await
+        .unwrap_or_else(|_| panic!("{what} in time"));
+}
+
+fn registry(state: &Path) -> Value {
+    std::fs::read(state.join("registry.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn kept_ids(state: &Path, slot: usize) -> Vec<i64> {
+    registry(state)["slots"][slot]["buffer"]["messages"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|m| m["message_id"].as_i64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ended(state: &Path, session: &str) -> Option<bool> {
+    registry(state)["sessions"][session]["ended"].as_bool()
+}
+
+struct Peer {
+    reader: BufReader<OwnedReadHalf>,
+    _write: OwnedWriteHalf,
+}
+
+impl Peer {
+    async fn connect(hub: &Hub, session: &str, cwd: &str, pid: u32) -> Self {
+        let (read, mut write) = TcpStream::connect(hub.addr)
+            .await
+            .expect("connect")
+            .into_split();
+        write
+            .write_all(&wire::encode(&AgentMsg::Hello {
+                secret: Secret::parse(SECRET).unwrap(),
+            }))
+            .await
+            .unwrap();
+        write
+            .write_all(&wire::encode(&AgentMsg::Register(Register {
+                session_id: session.into(),
+                host: "box".into(),
+                cwd: cwd.into(),
+                claude_pid: Some(pid),
+                verdict_ack: true,
+                transcript_reads: false,
+            })))
+            .await
+            .unwrap();
+        let mut peer = Self {
+            reader: BufReader::new(read),
+            _write: write,
+        };
+        assert_eq!(peer.next(WAIT).await, Some(HubMsg::Registered));
+        peer
+    }
+
+    async fn next(&mut self, within: Duration) -> Option<HubMsg> {
+        let mut line = Vec::new();
+        match tokio::time::timeout(within, self.reader.read_until(b'\n', &mut line)).await {
+            Ok(Ok(n)) if n > 0 => Some(wire::decode::<HubMsg>(&line).expect("hub message")),
+            _ => None,
+        }
+    }
+
+    /// The next `count` inbound message ids, in arrival order.
+    async fn inbound(&mut self, count: usize) -> Vec<i64> {
+        let mut ids = Vec::new();
+        while ids.len() < count {
+            match self.next(WAIT).await {
+                Some(HubMsg::Inbound { meta, content }) => {
+                    let id: i64 = meta["message_id"].parse().unwrap();
+                    assert_eq!(content, format!("m{id}"));
+                    ids.push(id);
+                }
+                Some(_) => {}
+                None => panic!("only {ids:?} arrived"),
+            }
+        }
+        ids
+    }
+
+    /// Nothing inbound within `ms`.
+    async fn quiet(&mut self, ms: u64) -> Vec<i64> {
+        let mut extra = Vec::new();
+        while let Some(msg) = self.next(Duration::from_millis(ms)).await {
+            if let HubMsg::Inbound { meta, .. } = msg {
+                extra.push(meta["message_id"].parse().unwrap());
+            }
+        }
+        extra
+    }
+}
+
+fn state_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cctg-qa-buffer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_dead_slot_buffer_end_to_end() {
+    let state = state_dir();
+
+    // ---------------------------------------------------------- run 1
+    let mut hub = start_hub(&state, 1000, 100).await;
+    hub.start(A, CWD, "startup", 10, None).await;
+    until("topic of A", || {
+        hub.count(|op| matches!(op, Op::CreateTopic { .. })) == 1
+    })
+    .await;
+    let mut a1 = Peer::connect(&hub, A, CWD, 10).await;
+    // A live parent elsewhere, for nested runs.
+    hub.start(P, OTHER_CWD, "startup", 30, None).await;
+    until("topic of P", || {
+        hub.count(|op| matches!(op, Op::CreateTopic { .. })) == 2
+    })
+    .await;
+    // Sanity: a live message goes straight to the live agent.
+    hub.say(100, 1);
+    assert_eq!(a1.inbound(1).await, [1]);
+
+    hub.end(A, CWD, None, 10).await;
+    until("A ended", || ended(&state, A) == Some(true)).await;
+    let before_dead = hub.fake.ops().len();
+
+    // Subagent of the dead session and nested runs: none may revive the slot.
+    hub.hook(
+        A,
+        CWD,
+        HookEvent::SubagentStart {
+            agent_id: "a13bc9".into(),
+            agent_type: "Explore".into(),
+        },
+    )
+    .await;
+    hub.start(N, CWD, "startup", 32, Some(30)).await; // nested new run in A's folder
+    hub.start(A, CWD, "resume", 31, Some(30)).await; // nested `claude -p --resume A`
+    let mut nested = Peer::connect(&hub, N, CWD, 32).await;
+
+    for id in 2..=53 {
+        hub.say(100, id);
+    }
+    until("50 kept, Resume button with an id", || {
+        let reg = registry(&state);
+        kept_ids(&state, 0) == (4..=53).collect::<Vec<_>>()
+            && reg["slots"][0]["buffer"]["resume"]["message_id"].as_i64().is_some()
+    })
+    .await;
+    hub.end(A, CWD, None, 31).await; // end of the nested resume: ignored
+    hub.hook(
+        N,
+        CWD,
+        HookEvent::SessionEnd {
+            reason: None,
+            claude_pid: Some(32),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a1.quiet(300).await, Vec::<i64>::new(), "old run's agent");
+    assert_eq!(nested.quiet(100).await, Vec::<i64>::new(), "nested agent");
+    assert_eq!(kept_ids(&state, 0), (4..=53).collect::<Vec<_>>());
+    assert_eq!(ended(&state, A), Some(true), "nested resume revived A");
+    assert_eq!(registry(&state)["slots"][0]["current_session"], A);
+
+    let dead_ops: Vec<Op> = hub.fake.ops()[before_dead..].to_vec();
+    let count = |pick: &dyn Fn(&Op) -> bool| dead_ops.iter().filter(|op| pick(op)).count();
+    assert_eq!(count(&|op| is_text(op, OVERFLOW_NOTICE)), 1, "{dead_ops:#?}");
+    assert_eq!(count(&|op| is_text(op, QUEUED_NOTICE)), 0);
+    assert_eq!(count(&is_resume_button), 1);
+    assert_eq!(count(&|op| matches!(op, Op::Delete { .. })), 0);
+    assert!(
+        hub.fake.ops().iter().any(|op| matches!(op,
+            Op::EditTopic { thread_id: 100, icon_custom_emoji_id: Some(icon), .. } if icon == ICON_DEAD)),
+        "dead icon"
+    );
+    // Every button fits 64 bytes.
+    for op in hub.fake.ops() {
+        if let Op::Send {
+            reply_markup: Some(markup),
+            ..
+        } = op
+        {
+            let data = markup["inline_keyboard"][0][0]["callback_data"]
+                .as_str()
+                .unwrap();
+            assert!(data.len() <= 64, "{data}");
+            assert_eq!(data, format!("resume:{A}"));
+        }
+    }
+    let button_id = registry(&state)["slots"][0]["buffer"]["resume"]["message_id"]
+        .as_i64()
+        .unwrap();
+
+    // Presses: allowlisted records the wish, a stranger's press never reaches the hub.
+    hub.press(STRANGER, "q-stranger", &format!("resume:{A}"), button_id);
+    hub.press(USER, "q-dead", &format!("resume:{A}"), button_id);
+    hub.press(USER, "q-garbage", "resume:../../x", button_id);
+    until("answer to the press", || {
+        answer_of(&hub.fake.ops(), "q-garbage").is_some()
+    })
+    .await;
+    let ops = hub.fake.ops();
+    assert_eq!(answer_of(&ops, "q-stranger"), None);
+    assert_eq!(
+        answer_of(&ops, "q-dead"),
+        Some(Some(ANSWER_UNAVAILABLE.to_owned()))
+    );
+    until("resume_asked saved", || {
+        registry(&state)["slots"][0]["buffer"]["resume_asked"] == true
+    })
+    .await;
+    let reg_text = std::fs::read_to_string(state.join("registry.json")).unwrap();
+    assert!(!reg_text.contains(&USER.to_string()), "user id in registry");
+    assert!(!reg_text.contains(&STRANGER.to_string()));
+
+    // ---------------------------------------------------------- restart
+    let run1_ops = hub.fake.ops();
+    hub.stop();
+    drop(a1);
+    drop(nested);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut hub = start_hub(&state, 2000, 900).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hub.count(is_resume_button), 0, "second button after restart");
+    assert_eq!(hub.count(|op| matches!(op, Op::CreateTopic { .. })), 0);
+    assert_eq!(kept_ids(&state, 0), (4..=53).collect::<Vec<_>>());
+
+    // Revival by resume: the new run's agent links after its SessionStart.
+    hub.start(A, CWD, "resume", 12, None).await;
+    until("A live", || ended(&state, A) == Some(false)).await;
+    let mut a2 = Peer::connect(&hub, A, CWD, 12).await;
+    assert_eq!(a2.inbound(50).await, (4..=53).collect::<Vec<_>>());
+    assert_eq!(a2.quiet(500).await, Vec::<i64>::new(), "duplicates");
+    until("button of run 1 edited away", || {
+        hub.fake.ops().iter().any(|op| matches!(op,
+            Op::Edit { message_id, text, .. } if *message_id == button_id && text == RESUMED_TEXT))
+    })
+    .await;
+    until("buffer idle on disk", || {
+        registry(&state)["slots"][0].get("buffer").is_none()
+    })
+    .await;
+    hub.press(USER, "q-alive", &format!("resume:{A}"), button_id);
+    until("answer alive", || {
+        answer_of(&hub.fake.ops(), "q-alive").is_some()
+    })
+    .await;
+    assert_eq!(
+        answer_of(&hub.fake.ops(), "q-alive"),
+        Some(Some(ANSWER_ALIVE.to_owned()))
+    );
+
+    // Second dead period: 51 messages, one more warning; a new session takes the slot.
+    let before = hub.fake.ops().len();
+    hub.end(A, CWD, None, 12).await;
+    until("A ended again", || ended(&state, A) == Some(true)).await;
+    for id in 60..=110 {
+        hub.say(100, id);
+    }
+    until("second period kept with a button", || {
+        kept_ids(&state, 0) == (61..=110).collect::<Vec<_>>()
+            && registry(&state)["slots"][0]["buffer"]["resume"]["message_id"]
+                .as_i64()
+                .is_some()
+    })
+    .await;
+    let period2: Vec<Op> = hub.fake.ops()[before..].to_vec();
+    assert_eq!(
+        period2
+            .iter()
+            .filter(|op| is_text(op, OVERFLOW_NOTICE))
+            .count(),
+        1
+    );
+    assert_eq!(period2.iter().filter(|op| is_resume_button(op)).count(), 1);
+    let button2 = registry(&state)["slots"][0]["buffer"]["resume"]["message_id"]
+        .as_i64()
+        .unwrap();
+    hub.start(B, CWD, "startup", 40, None).await;
+    until("B in slot 0", || {
+        registry(&state)["slots"][0]["current_session"] == B
+    })
+    .await;
+    let mut b = Peer::connect(&hub, B, CWD, 40).await;
+    assert_eq!(b.inbound(50).await, (61..=110).collect::<Vec<_>>());
+    assert_eq!(b.quiet(300).await, Vec::<i64>::new());
+    assert_eq!(a2.quiet(100).await, Vec::<i64>::new(), "ended A's agent");
+    until("button 2 edited away", || {
+        hub.fake.ops().iter().any(|op| matches!(op,
+            Op::Edit { message_id, text, .. } if *message_id == button2 && text == RESUMED_TEXT))
+    })
+    .await;
+    assert_eq!(hub.count(|op| matches!(op, Op::CreateTopic { .. })), 0);
+    hub.press(USER, "q-old-a", &format!("resume:{A}"), button_id);
+    until("answer old", || {
+        answer_of(&hub.fake.ops(), "q-old-a").is_some()
+    })
+    .await;
+    assert_eq!(
+        answer_of(&hub.fake.ops(), "q-old-a"),
+        Some(Some(ANSWER_EXPIRED.to_owned()))
+    );
+
+    // Third period: /clear inside the same claude process (pid 40).
+    hub.end(B, CWD, Some("clear"), 40).await;
+    until("B ended", || ended(&state, B) == Some(true)).await;
+    hub.say(100, 120);
+    hub.say(100, 121);
+    until("third period kept", || kept_ids(&state, 0) == [120, 121]).await;
+    hub.start(C, CWD, "clear", 40, None).await;
+    assert_eq!(b.inbound(2).await, [120, 121]);
+    assert_eq!(b.quiet(300).await, Vec::<i64>::new());
+    until("C current, buffer idle", || {
+        let reg = registry(&state);
+        reg["slots"][0]["current_session"] == C && reg["slots"][0].get("buffer").is_none()
+    })
+    .await;
+    // Live again: a new message goes straight through.
+    hub.say(100, 130);
+    assert_eq!(b.inbound(1).await, [130]);
+
+    let all: Vec<Op> = run1_ops.into_iter().chain(hub.fake.ops()).collect();
+    assert_eq!(all.iter().filter(|op| is_text(op, OVERFLOW_NOTICE)).count(), 2);
+    let reg_text = std::fs::read_to_string(state.join("registry.json")).unwrap();
+    assert!(!reg_text.contains(&USER.to_string()));
+    assert_eq!(registry(&state)["slots"].as_array().unwrap().len(), 2);
+    hub.stop();
+    let _ = std::fs::remove_dir_all(&state);
+}

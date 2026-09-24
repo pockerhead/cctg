@@ -1,0 +1,5 @@
+# PCTX proposals — TASK-017
+
+- 2026-09-24 (planner): hub domain, after TASK-017 lands: add an implementation note. "TASK-017 (`hub/buffer.rs` + slots + registry): every allowlisted text topic message is parked in `Slot.buffer` (registry.json, skipped when idle) and flushed at once and in every pump to `live_agent(slot)` (live top-level current session with a bound agent), oldest first; a message leaves the buffer when the link queue took it (at-least-once across a hub crash). 50 per slot, the 51st drops the oldest, one overflow notice per offline period; a running session without an agent gets one queued notice per period (OFFLINE_NOTICE is gone); a dead slot with kept messages gets one Resume message per period (`resume:<session id>`, resolved by session state; a press sets `buffer.resume_asked`, starting a session is TASK-019), edited to no buttons when the period ends. Nested runs, subagents and headless runs never revive a slot." Why: TASK-018+ and TASK-019 build on this contract and should not re-derive it.
+
+> RESOLVED: folded into domains/hub.md (with the reviewer-2 SessionEnd rule and the fixer's period binding) on 2026-09-24.

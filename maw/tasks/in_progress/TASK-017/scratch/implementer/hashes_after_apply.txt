@@ -1,0 +1,7 @@
+OK crates/cctg/src/hub/buffer.rs
+OK crates/cctg/src/hub/mod.rs
+OK crates/cctg/src/hub/registry.rs
+OK crates/cctg/src/hub/slots.rs
+OK crates/cctg/tests/buffer_e2e.rs
+OK crates/cctg/tests/message_logs.rs
+OK crates/cctg/tests/overflow_logs.rs

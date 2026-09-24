@@ -1,0 +1,14 @@
+import datetime, io, json, os
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'log.jsonl')
+ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+base = dict(stage='plan-reviewer-2', provider='claude', model='opus', effort='medium')
+S, B, R = 'crates/cctg/src/hub/slots.rs', 'crates/cctg/src/hub/buffer.rs', 'crates/cctg/src/hub/registry.rs'
+entries = [
+ ('dead_end', "Tried PLAN_V2 finding 1 (offer the Resume button on every SessionEnd of a slot's current top-level session, skipping reason clear/resume, flush_all over non-idle buffers to close empty periods). It reproduced (an empty dead slot had no button) but the fix put one extra Telegram message after every session exit and broke 6 existing TASK-011/014/015/016/022 tests that assert exact op streams (a_late_reply_cannot_cross_into_a_reused_slot, a_failed_separator_is_sent_again, one_slot_lives_through_hook_agent_end_and_the_next_session, a_new_session_in_the_slot_streams_after_its_one_separator, only_a_live_top_level_current_session_with_a_topic_sends_its_answer, a_block_confirmed_after_its_session_ended_is_marked_lost). Reverted: until TASK-019 the button only says starting from Telegram is not available, so posting it on every exit is noise; kept the planner's rule (first kept message in a dead slot). Attempt kept as scratch/reviewer2/slots_fix1_attempt.rs.", [S]),
+ ('decision', "A SessionEnd applied by the registry now clears SessionEntry.agent, so a resumed session's kept messages are never flushed into the still-open link of its earlier run (found as a 2-in-12 flake of a_dead_slot_shows_one_resume_button_that_records_the_wish; up to 50 kept messages would be lost). Alternative: compare the agent's claude_pid with the session's in live_agent (tried: broke stream_e2e::e2e_reactions because agent and hook derive the pid independently, a mismatch would silence inbound forever).", [R, S]),
+ ('decision', "Rejected PLAN_V2 findings 2,3,5,6 as costing more than they save: Resume press stays resolved by the full session id (a UUID never collides; an old button of the same session means the same wish; a foreign one gets ANSWER_EXPIRED), the end-of-period keyboard edit stays one try like the TASK-014 expired-prompt edit (a stale button is still answered correctly), flush_all per pump is O(slots) like topic_work, and the push+pop live path never writes message text to disk because the snapshot is taken after the turn. Alternative: period tokens + durable Due/InFlight/Failed edit state + round-robin retry cursor + direct fast path (PLAN_V2).", [S, B]),
+]
+with io.open(LOG, 'a', encoding='utf-8', newline='\n') as f:
+    for kind, body, refs in entries:
+        f.write(json.dumps(dict(ts=ts, **base, kind=kind, body=body, refs=refs), ensure_ascii=False) + '\n')
+print('appended', len(entries), ts)

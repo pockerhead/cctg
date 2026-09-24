@@ -1,0 +1,18 @@
+import datetime, io, json, os
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'log.jsonl')
+ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+base = dict(stage='planner', provider='claude', model='opus', effort='medium')
+S, R, B = 'crates/cctg/src/hub/slots.rs', 'crates/cctg/src/hub/registry.rs', 'crates/cctg/src/hub/buffer.rs'
+entries = [
+ ('decision', "A kept message leaves the slot buffer when the agent link queue accepted it (try_send Ok), the same point at which TASK-021 counts a live message as delivered; the removal is saved with the next registry snapshot. Residuals: a link that dies between queue and socket loses it (as today), a hub crash between hand-off and the save re-delivers it after restart (at-least-once across a crash). Alternative: an inbound_ack capability like TASK-014 verdict_ack (wire + agent change, and still no exactly-once without agent-side dedup by message_id).", [S, B]),
+ ('decision', "Every allowlisted text topic message is parked in its slot buffer and the buffer is flushed at once; the live path is a buffer of one, so order holds when older messages still wait and a full or closed link queue keeps the message instead of losing it. Alternative: send directly and park only on failure (two paths, a new message could overtake kept ones).", [S]),
+ ('decision', "A slot whose session is running but has no bound agent (hub restart, reconnect, headless top-level run) buffers too, with one QUEUED_NOTICE per offline period; OFFLINE_NOTICE is removed because nothing uses it any more. Alternative: keep the per-minute offline notice for such slots and buffer only dead ones (messages sent during the post-restart reconnect window would be lost).", [S, B]),
+ ('decision', "Revival = flush_all in every pump: any slot with kept messages whose live_agent() (live top-level current session with a bound, connected agent) exists gets them. Nested runs and subagents can never be a slot's current session and headless runs have no hub link, so they never revive; the agent binding after SessionStart is covered because the flush waits for the bound agent. Alternative: flush on SessionStart (agent not bound yet) or only from the Resume path.", [S]),
+ ('decision', "Resume button callback_data is resume:<full session id> (43 bytes for a UUID; ids that would pass 64 bytes or are not [A-Za-z0-9-] get no button), resolved by session state, not by message id, so a press works also when the send answer was lost or the hub restarted. A press on the dead current session of its slot sets buffer.resume_asked (persisted) and answers that starting from Telegram is not available yet. Alternative: resume:<slot index> or a message_id lookup like permission prompts.", [B, S]),
+ ('decision', "The Resume message is sent by a pump reconciler (dead slot, kept messages, no note yet) at most once per offline period, counted against MAX_QUEUED_MESSAGES; at the end of the period it is edited to RESUMED_TEXT with an empty keyboard (one try). A lost send is not retried in that period. Alternative: retry refused sends on the tick like blocks (more state for a rare case).", [S, B]),
+ ('decision', "The buffer lives in Slot.buffer inside registry.json (serde default, skipped when idle, so older and idle files are unchanged; registry VERSION stays 1) with the pure logic in a new hub/buffer.rs. Alternative: a separate buffer file (second atomic save, two files to reconcile on start).", [R, B]),
+]
+with io.open(LOG, 'a', encoding='utf-8', newline='\n') as f:
+    for kind, body, refs in entries:
+        f.write(json.dumps(dict(ts=ts, **base, kind=kind, body=body, refs=refs), ensure_ascii=False) + '\n')
+print('appended', len(entries), ts)

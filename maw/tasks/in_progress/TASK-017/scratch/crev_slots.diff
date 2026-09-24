@@ -1,0 +1,1105 @@
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+index b0b23b3..7d50cb3 100644
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -11,11 +11,14 @@
+ //! Saving goes to a separate task that writes the latest snapshot.
+ //!
+ //! Topic messages from allowlisted users go to the agent of the slot's
+-//! current session with a non-blocking `try_send`; agent replies and the
+-//! final answer of each turn (from the `Stop` hook) go back to the session's
+-//! topic through the same dispatch task. At most
++//! current session with a non-blocking `try_send`. A message no live agent
++//! can take waits in its slot (see [`buffer`], kept in `registry.json`) and
++//! goes, in order, to the first live top-level session of the slot whose
++//! agent is bound; a dead slot with waiting messages shows one Resume button.
++//! Agent replies and the final answer of each turn (from the `Stop` hook) go
++//! back to the session's topic through the same dispatch task. At most
+ //! [`MAX_QUEUED_MESSAGES`] such messages wait for Telegram at a time, and a
+-//! slot gets each kind of notice at most once per `Options::notice_every`.
++//! slot gets the text-only notice at most once per `Options::notice_every`.
+ //!
+ //! Permission requests become prompts with Allow/Deny buttons in the topic of
+ //! the requesting session's own slot (see [`permissions`]). They bypass the
+@@ -55,10 +58,12 @@ use tracing::{debug, info, warn};
+ use transcript::{SplitOptions, split_for_telegram};
+ 
+ use super::api::{ApiError, Document};
++use super::buffer::{self, Parked, ResumeNote};
+ use super::ingress::AgentEvent;
+ use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
+ use super::registry::{
+-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, TopicJob, TopicView,
++    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState, TopicJob,
++    TopicView,
+ };
+ use super::scheduler::{Delivery, Op, Outbox, Outcome};
+ use super::stream::{self, Held, Live, Step};
+@@ -90,7 +95,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
+ const STREAM_QUEUE: usize = MAX_QUEUED_MESSAGES / 2;
+ /// Reactions waiting for Telegram at a time; one more is skipped.
+ const MAX_REACTIONS: usize = 64;
+-pub const OFFLINE_NOTICE: &str = "Сессия этой темы не на связи, сообщение не доставлено.";
+ pub const TEXT_ONLY_NOTICE: &str = "В сессию пока доходят только текстовые сообщения.";
+ 
+ #[derive(Debug, Clone)]
+@@ -100,8 +104,8 @@ pub struct Options {
+     pub chat_id: i64,
+     /// The bot may delete service messages (`can_delete_messages`).
+     pub can_delete: bool,
+-    /// A slot gets the same notice at most once per this long; a burst of
+-    /// messages to a dead session would eat the group's 20 messages a minute.
++    /// A slot gets the text-only notice at most once per this long; a burst
++    /// of photos would eat the group's 20 messages a minute.
+     pub notice_every: Duration,
+     /// After start, topic edits wait this long: agents are reconnecting.
+     pub grace: Duration,
+@@ -177,8 +181,15 @@ enum Done {
+         key: u64,
+         delivery: Option<Delivery>,
+     },
+-    /// A button answer or the edit of an expired prompt.
++    /// A button answer, the edit of an expired prompt or of a Resume
++    /// message whose period ended.
+     Callback(Option<Delivery>),
++    /// The Resume message of `slot`'s offline period for `session`.
++    Resume {
++        slot: SlotId,
++        session: String,
++        delivery: Option<Delivery>,
++    },
+     Title {
+         session: String,
+         path: String,
+@@ -228,6 +239,7 @@ enum Work {
+     Permission(u64),
+     PromptEdit(u64),
+     Callback,
++    Resume { slot: SlotId, session: String },
+     Block(BlockJob),
+     Stream { session: String, number: u64 },
+     Reaction,
+@@ -1000,9 +1012,9 @@ impl Slots {
+         self.hand_off(Work::Delete, Op::Delete { message_id });
+     }
+ 
+-    /// Forwards a topic message to the agent of the slot's current session,
+-    /// or tells the user it did not get there. General and topics that are
+-    /// not slots reach no agent and get no answer.
++    /// Keeps a topic message in its slot and hands the slot's messages to
++    /// the agent of its live current session, when there is one. General and
++    /// topics that are not slots reach no agent and get no answer.
+     fn on_topic_message(&mut self, input: Inbound) {
+         let Some(thread_id) = input.thread_id else {
+             debug!("message outside a topic; not forwarded");
+@@ -1012,68 +1024,319 @@ impl Slots {
+             debug!("message in a topic without a slot; not forwarded");
+             return;
+         };
+-        let ordinal = self.ordinal(slot);
+-        let Some(content) = input.text else {
++        let Some(text) = input.text else {
+             self.notify(slot, thread_id, TEXT_ONLY_NOTICE);
+             return;
+         };
++        self.park(
++            slot,
++            Parked {
++                message_id: input.message_id,
++                thread_id,
++                text,
++                reply_to: input.reply_to,
++            },
++        );
++        self.flush(slot);
++    }
++
++    /// Adds a message to the slot's buffer. A full buffer drops its oldest
++    /// message and tells the topic once per offline period; a running
++    /// session without an agent is told once per period too (a dead one
++    /// gets its Resume message from [`Self::offer_resume`]).
++    fn park(&mut self, slot: SlotId, parked: Parked) {
++        let ordinal = self.ordinal(slot);
++        let offline = self.live_agent(slot).is_none();
++        let dead = self.registry.state(slot) == SlotState::Dead;
++        let thread_id = parked.thread_id;
++        let Some(entry) = self.registry.slot_mut(slot) else {
++            return;
++        };
++        let dropped = entry.buffer.push(parked);
++        let tell_overflow = dropped && !entry.buffer.overflow_told;
++        let tell_queued = offline && !dead && !entry.buffer.queued_told;
++        self.registry.dirty = true;
++        if offline {
++            info!(
++                ordinal,
++                "message kept for the slot until a session is on line"
++            );
++        }
++        if dropped {
++            debug!(ordinal, "slot buffer full; its oldest message dropped");
++        }
++        if tell_overflow
++            && self.send_messages(vec![message_op(
++                thread_id,
++                buffer::OVERFLOW_NOTICE.to_owned(),
++            )])
++        {
++            info!(ordinal, "slot buffer full; the topic is told once");
++            if let Some(entry) = self.registry.slot_mut(slot) {
++                entry.buffer.overflow_told = true;
++            }
++        }
++        if tell_queued
++            && self.send_messages(vec![message_op(
++                thread_id,
++                buffer::QUEUED_NOTICE.to_owned(),
++            )])
++            && let Some(entry) = self.registry.slot_mut(slot)
++        {
++            entry.buffer.queued_told = true;
++        }
++    }
++
++    /// Hands the kept messages of `slot` to the agent of its live top-level
++    /// current session, oldest first, until one does not fit the link
++    /// queue (the rest wait for the next try). A message leaves the buffer
++    /// when its link queue took it. An emptied buffer ends the slot's
++    /// offline period: the Resume button goes away.
++    fn flush(&mut self, slot: SlotId) {
+         let Some((session, conn)) = self.live_agent(slot) else {
++            return;
++        };
++        let ordinal = self.ordinal(slot);
++        let mut handed = 0;
++        while let Some(parked) = self
++            .registry
++            .slot(slot)
++            .and_then(|entry| entry.buffer.messages.front())
++            .cloned()
++        {
++            let inbound = self.inbound(&session, &parked);
++            let sent = self
++                .conns
++                .get(&conn)
++                .is_some_and(|bound| bound.to_agent.try_send(inbound).is_ok());
++            if !sent {
++                debug!(
++                    ordinal,
++                    session = short(&session),
++                    "agent queue full or closed; messages stay in the slot"
++                );
++                break;
++            }
++            if let Some(entry) = self.registry.slot_mut(slot) {
++                entry.buffer.messages.pop_front();
++            }
++            self.registry.dirty = true;
++            handed += 1;
++            if let Some(stream) = self
++                .registry
++                .sessions
++                .get_mut(&session)
++                .and_then(|entry| entry.stream.as_mut())
++            {
++                stream::receipt(stream, parked.message_id);
++            }
++            self.react(parked.message_id, stream::ACCEPTED);
+             info!(
+                 ordinal,
+-                "message for a session that is not on line; not delivered"
++                session = short(&session),
++                "message forwarded to the session agent"
+             );
+-            self.notify(slot, thread_id, OFFLINE_NOTICE);
++        }
++        let Some(entry) = self.registry.slot_mut(slot) else {
+             return;
+         };
++        if !entry.buffer.messages.is_empty() || entry.buffer.is_idle() {
++            return;
++        }
++        let period = entry.buffer.resume.is_some() || entry.buffer.queued_told;
++        let note = entry.buffer.close();
++        self.registry.dirty = true;
++        if period {
++            info!(
++                ordinal,
++                session = short(&session),
++                handed,
++                "kept messages handed to the slot's session; offline period over"
++            );
++        }
++        if let Some(message_id) = note.and_then(|note| note.message_id) {
++            self.drop_resume_button(message_id);
++        }
++    }
++
++    /// The Inbound of a topic message for `session`: meta `chat_id`,
++    /// `message_id`, `thread_id`, `reply_to_message_id` for an explicit
++    /// reply, and `target_agent` for a reply to a block of its subagent.
++    fn inbound(&self, session: &str, parked: &Parked) -> HubMsg {
+         let mut meta = BTreeMap::from([
+             ("chat_id".to_owned(), self.options.chat_id.to_string()),
+-            ("message_id".to_owned(), input.message_id.to_string()),
+-            ("thread_id".to_owned(), thread_id.to_string()),
++            ("message_id".to_owned(), parked.message_id.to_string()),
++            ("thread_id".to_owned(), parked.thread_id.to_string()),
+         ]);
+-        if let Some(reply_to) = input.reply_to {
++        if let Some(reply_to) = parked.reply_to {
+             meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
+             // A reply to a block of this session's subagent is for that
+             // subagent; Claude forwards it (channel instructions).
+-            if let Some(agent_id) = self
+-                .registry
+-                .subagent_of_message(thread_id, reply_to, &session)
++            if let Some(agent_id) =
++                self.registry
++                    .subagent_of_message(parked.thread_id, reply_to, session)
+             {
+                 meta.insert("target_agent".to_owned(), agent_id.to_owned());
+             }
+         }
+-        let inbound = HubMsg::Inbound { content, meta };
+-        let sent = self
+-            .conns
+-            .get(&conn)
+-            .is_some_and(|bound| bound.to_agent.try_send(inbound).is_ok());
+-        if sent {
+-            // Delivered: the next failure starts a new episode and is told at once.
+-            self.notices.remove(&(slot, OFFLINE_NOTICE));
+-            if let Some(stream) = self
+-                .registry
+-                .sessions
+-                .get_mut(&session)
+-                .and_then(|entry| entry.stream.as_mut())
++        HubMsg::Inbound {
++            content: parked.text.clone(),
++            meta,
++        }
++    }
++
++    /// Every slot with kept messages tries its live session again: the
++    /// session or its agent may have come (back) since.
++    fn flush_all(&mut self) {
++        let waiting: Vec<SlotId> = (0..self.registry.slots.len())
++            .map(SlotId)
++            .filter(|&slot| {
++                self.registry
++                    .slot(slot)
++                    .is_some_and(|entry| !entry.buffer.messages.is_empty())
++            })
++            .collect();
++        for slot in waiting {
++            self.flush(slot);
++        }
++    }
++
++    /// A dead slot with kept messages gets one Resume message per offline
++    /// period, sent at most once (a lost one is not sent again).
++    fn offer_resume(&mut self) {
++        for index in 0..self.registry.slots.len() {
++            let slot = SlotId(index);
++            let entry = &self.registry.slots[index];
++            if entry.buffer.messages.is_empty()
++                || entry.buffer.resume.is_some()
++                || self.registry.state(slot) != SlotState::Dead
+             {
+-                stream::receipt(stream, input.message_id);
+-                self.registry.dirty = true;
++                continue;
++            }
++            let (Some(thread_id), Some(session)) = (entry.topic_id, entry.current_session.clone())
++            else {
++                continue;
++            };
++            if self.queued_messages >= MAX_QUEUED_MESSAGES {
++                return;
+             }
+-            self.react(input.message_id, stream::ACCEPTED);
++            let reply_markup = buffer::callback_data(&session).map(buffer::keyboard);
++            if reply_markup.is_none() {
++                debug!(
++                    session = short(&session),
++                    "session id too long for a Resume button"
++                );
++            }
++            self.registry.slots[index].buffer.resume = Some(ResumeNote {
++                session: session.clone(),
++                message_id: None,
++            });
++            self.registry.dirty = true;
++            self.queued_messages += 1;
+             info!(
+-                ordinal,
++                ordinal = self.ordinal(slot),
+                 session = short(&session),
+-                "message forwarded to the session agent"
++                "Resume button offered for the slot's kept messages"
+             );
+-        } else {
+-            warn!(
+-                ordinal,
+-                session = short(&session),
+-                "agent queue full or closed; not delivered"
++            self.hand_off(
++                Work::Resume {
++                    slot,
++                    session: session.clone(),
++                },
++                Op::Send {
++                    thread_id: Some(thread_id),
++                    text: buffer::resume_text(&session),
++                    reply_markup,
++                    permission: false,
++                },
+             );
+-            self.notify(slot, thread_id, OFFLINE_NOTICE);
+         }
+     }
+ 
++    /// The Resume message of a period that is over loses its button. One
++    /// try: a press on a button that stayed gets a fitting answer anyway.
++    fn drop_resume_button(&mut self, message_id: i64) {
++        self.hand_off(
++            Work::Callback,
++            Op::Edit {
++                message_id,
++                text: buffer::RESUMED_TEXT.to_owned(),
++                reply_markup: Some(permissions::no_keyboard()),
++            },
++        );
++    }
++
++    /// Telegram answered the Resume message of `slot` for `session`: its id
++    /// is kept for the edit at the end of the period, or, when that period
++    /// is over already, the button goes now.
++    fn on_resume_done(&mut self, slot: SlotId, session: &str, delivery: Option<Delivery>) {
++        self.queued_messages = self.queued_messages.saturating_sub(1);
++        if self.queued_messages == 0 {
++            self.overflow_warned = false;
++        }
++        let message_id = match &delivery {
++            Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => Some(message.message_id),
++            Some(Err(error)) => {
++                warn!(%error, "Resume message not delivered; offered again in the next offline period");
++                None
++            }
++            _ => None,
++        };
++        let Some(message_id) = message_id else {
++            return;
++        };
++        let waiting = self.registry.slot_mut(slot).and_then(|entry| {
++            entry
++                .buffer
++                .resume
++                .as_mut()
++                .filter(|note| note.session == session && note.message_id.is_none())
++        });
++        match waiting {
++            Some(note) => {
++                note.message_id = Some(message_id);
++                self.registry.dirty = true;
++            }
++            None => self.drop_resume_button(message_id),
++        }
++    }
++
++    /// A Resume press: recorded for the ended current session of its slot
++    /// (bringing it back is TASK-019), otherwise told why nothing happens.
++    fn press_resume(&mut self, session: &str) -> &'static str {
++        if self.registry.is_live_top_level(session) {
++            return buffer::ANSWER_ALIVE;
++        }
++        let slot = self
++            .registry
++            .sessions
++            .get(session)
++            .and_then(|entry| entry.slot)
++            .filter(|&slot| {
++                self.registry
++                    .slot(slot)
++                    .is_some_and(|entry| entry.current_session.as_deref() == Some(session))
++                    && self.registry.state(slot) == SlotState::Dead
++            });
++        let Some(slot) = slot else {
++            debug!("Resume button of a session that is not its slot's ended one");
++            return permissions::ANSWER_EXPIRED;
++        };
++        let ordinal = self.ordinal(slot);
++        if let Some(entry) = self.registry.slot_mut(slot)
++            && !entry.buffer.resume_asked
++        {
++            entry.buffer.resume_asked = true;
++            self.registry.dirty = true;
++        }
++        info!(
++            ordinal,
++            session = short(session),
++            "Resume asked in Telegram; starting a session from there is not available yet"
++        );
++        buffer::ANSWER_UNAVAILABLE
++    }
++
+     /// The running top-level session of `slot` and its agent connection.
+     fn live_agent(&self, slot: SlotId) -> Option<(String, u64)> {
+         let session = self.registry.slot(slot)?.current_session.as_deref()?;
+@@ -1867,6 +2130,9 @@ impl Slots {
+     /// presses only push the same verdict again. Buttons that are not
+     /// permission buttons get an empty answer.
+     fn press(&mut self, input: &CallbackInput) -> Option<&'static str> {
++        if let Some(session) = input.data.as_deref().and_then(buffer::parse_callback) {
++            return Some(self.press_resume(session));
++        }
+         let Some((behavior, request_id)) =
+             input.data.as_deref().and_then(permissions::parse_callback)
+         else {
+@@ -2179,6 +2445,11 @@ impl Slots {
+                 }
+                 self.start_body_reads();
+             }
++            Done::Resume {
++                slot,
++                session,
++                delivery,
++            } => self.on_resume_done(slot, &session, delivery),
+             Done::Block { job, delivery } => self.on_block_done(job, delivery),
+             Done::Stream {
+                 session,
+@@ -2358,9 +2629,12 @@ impl Slots {
+         }
+     }
+ 
+-    /// Hands pending topic work and prompts to the dispatch task, publishes
+-    /// the view and the snapshot to save.
++    /// Hands kept messages to sessions that can take them now, offers Resume
++    /// buttons, hands pending topic work and prompts to the dispatch task,
++    /// publishes the view and the snapshot to save.
+     fn pump(&mut self) {
++        self.flush_all();
++        self.offer_resume();
+         let edits = Instant::now() >= self.grace_until;
+         for job in self.registry.topic_work(&self.options.icons, edits) {
+             let op = match &job {
+@@ -2493,6 +2767,11 @@ async fn dispatch_loop(
+                 Work::Permission(key) => Done::Permission { key, delivery },
+                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
+                 Work::Callback => Done::Callback(delivery),
++                Work::Resume { slot, session } => Done::Resume {
++                    slot,
++                    session,
++                    delivery,
++                },
+                 Work::Block(job) => Done::Block { job, delivery },
+                 Work::Stream { session, number } => Done::Stream {
+                     session,
+@@ -2923,8 +3202,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn a_message_nobody_can_take_gets_one_notice_each() {
+-        // Every path once; the per-slot minute is its own test.
++    async fn a_message_nobody_can_take_now_is_kept_and_told_once() {
+         let options = Options {
+             notice_every: Duration::ZERO,
+             ..message_options()
+@@ -2932,23 +3210,36 @@ mod tests {
+         let mut rig = rig(Fake::default(), options);
+         rig.hook(start(A, 10)).await;
+         rig.ops_after(1).await;
+-        // A session without an agent.
++        // A running session without an agent: kept, told once per period.
+         rig.control.send(say(Some(100), 1, Some("one"))).unwrap();
+-        settled(&rig, |ops| sent_to(ops, 100).len() == 1).await;
+-        // An agent whose link queue is gone.
+-        rig.agent_of(1, A, Some(10)).await;
+-        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+-        rig._to_agent.clear();
+         rig.control.send(say(Some(100), 2, Some("two"))).unwrap();
+-        settled(&rig, |ops| sent_to(ops, 100).len() == 2).await;
++        settled(&rig, |ops| sent_to(ops, 100).len() == 1).await;
+         // A photo: only text is forwarded.
+         rig.control.send(say(Some(100), 3, None)).unwrap();
+-        settled(&rig, |ops| sent_to(ops, 100).len() == 3).await;
++        settled(&rig, |ops| sent_to(ops, 100).len() == 2).await;
+         tokio::time::sleep(Duration::from_millis(300)).await;
+         assert_eq!(
+             sent_to(&rig.fake.ops(), 100),
+-            [OFFLINE_NOTICE, OFFLINE_NOTICE, TEXT_ONLY_NOTICE]
++            [buffer::QUEUED_NOTICE, TEXT_ONLY_NOTICE]
+         );
++        // The agent comes: both messages, in order, once; no Resume button.
++        rig.agent_of(1, A, Some(10)).await;
++        let got = received(&mut rig, 0).await;
++        assert_eq!(contents(&got), ["one", "two"]);
++        // An agent whose link queue is gone: the message waits, no notice.
++        rig._to_agent.clear();
++        rig.control.send(say(Some(100), 4, Some("four"))).unwrap();
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        assert_eq!(sent_to(&rig.fake.ops(), 100).len(), 2);
++    }
++
++    fn contents(got: &[HubMsg]) -> Vec<&str> {
++        got.iter()
++            .filter_map(|msg| match msg {
++                HubMsg::Inbound { content, .. } => Some(content.as_str()),
++                _ => None,
++            })
++            .collect()
+     }
+ 
+     #[tokio::test]
+@@ -2965,7 +3256,8 @@ mod tests {
+         .await;
+         settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_DEAD)).await;
+         rig.control.send(say(Some(100), 4, Some("four"))).unwrap();
+-        settled(&rig, |ops| sent_to(ops, 100) == [OFFLINE_NOTICE]).await;
++        let resume = buffer::resume_text(A);
++        settled(&rig, |ops| sent_to(ops, 100) == [resume.as_str()]).await;
+         assert!(received(&mut rig, 0).await.is_empty());
+     }
+ 
+@@ -3491,13 +3783,13 @@ mod tests {
+             press("q2", Some(message_id), "allow:bcdef"),      // another id
+             press("q3", None, "allow:abcde"),                  // inaccessible message
+             press("q4", Some(message_id), "allow:abcdl"),      // not a request id
+-            press("q5", Some(message_id), "resume:x"),         // another button
++            press("q5", Some(message_id), "resume:x"),         // Resume of no known session
+         ] {
+             rig.control.send(control).unwrap();
+         }
+         let ops = settled(&rig, |ops| answers(ops).len() == 5).await;
+         let expired = Some(permissions::ANSWER_EXPIRED);
+-        assert_eq!(answers(&ops), [expired, expired, expired, None, None]);
++        assert_eq!(answers(&ops), [expired, expired, expired, None, expired]);
+         assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+         assert!(!ops.iter().any(|op| matches!(op, Op::Edit { .. })));
+     }
+@@ -4334,10 +4626,10 @@ mod tests {
+         };
+         let mut rig = rig(fake, message_options());
+         two_live_slots(&mut rig, false).await;
+-        rig.hook(start(B, 11)).await; // slot 101, no agent: notices
++        rig.hook(start(B, 11)).await; // slot 101, no agent: kept
+         settled(&rig, |ops| count(ops, is_create) == 2).await;
+         // Far more replies than the scheduler queue (1024) and the cap, plus
+-        // a burst to a slot without an agent (one notice): every send is
++        // a burst to a slot without an agent (kept, two notices): every send is
+         // stuck behind a send that never ends.
+         let flood = async {
+             for i in 0..1500 {
+@@ -4415,7 +4707,7 @@ mod tests {
+     }
+ 
+     #[tokio::test(start_paused = true)]
+-    async fn a_burst_to_a_dead_slot_gets_one_notice_a_minute() {
++    async fn a_burst_of_photos_gets_one_notice_a_minute() {
+         let dir = TempDir::new("slots-notice");
+         let mut slots = stalled_slots(&dir, message_options());
+         slots.on_hook(&start(A, 10));
+@@ -4423,46 +4715,245 @@ mod tests {
+         slots.registry.topic_created(SlotId(0), 100, "a", None);
+         slots.registry.topic_created(SlotId(1), 101, "b", None);
+         for i in 0..10 {
+-            slots.on_control(say(Some(100), i, Some("x")));
+-        }
+-        assert_eq!(slots.queued_messages, 1, "one offline notice for the burst");
+-        // Another kind of notice and another slot count on their own.
+-        for i in 10..15 {
+             slots.on_control(say(Some(100), i, None));
+         }
+-        assert_eq!(slots.queued_messages, 2, "one text-only notice");
+-        for i in 15..20 {
+-            slots.on_control(say(Some(101), i, Some("x")));
++        assert_eq!(
++            slots.queued_messages, 1,
++            "one text-only notice for the burst"
++        );
++        for i in 10..15 {
++            slots.on_control(say(Some(101), i, None));
+         }
+-        assert_eq!(slots.queued_messages, 3, "one notice for the other slot");
++        assert_eq!(slots.queued_messages, 2, "one notice for the other slot");
+         tokio::time::advance(Duration::from_secs(59)).await;
+-        slots.on_control(say(Some(100), 20, Some("x")));
+-        assert_eq!(slots.queued_messages, 3, "still inside the minute");
++        slots.on_control(say(Some(100), 20, None));
++        assert_eq!(slots.queued_messages, 2, "still inside the minute");
+         tokio::time::advance(Duration::from_secs(2)).await;
+-        slots.on_control(say(Some(100), 21, Some("x")));
+-        assert_eq!(slots.queued_messages, 4, "a minute later: one more");
+-        // A delivered message ends the offline episode: the next failure is
+-        // reported at once, then the minute starts again.
+-        let (to_agent, mut agent_rx) = mpsc::channel(4);
++        slots.on_control(say(Some(100), 21, None));
++        assert_eq!(slots.queued_messages, 3, "a minute later: one more");
++    }
++
++    fn buffered(slots: &Slots, slot: usize) -> Vec<i64> {
++        slots.registry.slots[slot]
++            .buffer
++            .messages
++            .iter()
++            .map(|parked| parked.message_id)
++            .collect()
++    }
++
++    fn end(session: &str, pid: u32) -> HookPost {
++        hook(
++            session,
++            HookEvent::SessionEnd {
++                reason: None,
++                claude_pid: Some(pid),
++            },
++        )
++    }
++
++    /// Like [`connect`], with a link queue that holds `capacity` messages;
++    /// returns the agent's end.
++    fn connect_queue(
++        slots: &mut Slots,
++        conn: u64,
++        session: &str,
++        claude_pid: Option<u32>,
++        capacity: usize,
++    ) -> mpsc::Receiver<HubMsg> {
++        let (to_agent, from_hub) = mpsc::channel(capacity);
+         slots.on_agent(AgentEvent::Registered {
+-            conn: 1,
++            conn,
+             register: Register {
+-                session_id: A.into(),
++                session_id: session.into(),
+                 host: "box".into(),
+                 cwd: CWD.into(),
+-                claude_pid: Some(10),
++                claude_pid,
+                 verdict_ack: false,
+                 transcript_reads: false,
+             },
+             to_agent,
+         });
+-        slots.on_control(say(Some(100), 22, Some("delivered")));
+-        assert!(matches!(agent_rx.try_recv(), Ok(HubMsg::Inbound { .. })));
+-        assert_eq!(slots.queued_messages, 4);
+-        drop(agent_rx);
+-        slots.on_control(say(Some(100), 23, Some("x")));
+-        slots.on_control(say(Some(100), 24, Some("x")));
+-        assert_eq!(slots.queued_messages, 5, "one notice for the new episode");
++        from_hub
++    }
++
++    fn drain(from_hub: &mut mpsc::Receiver<HubMsg>) -> Vec<i64> {
++        let mut ids = Vec::new();
++        while let Ok(msg) = from_hub.try_recv() {
++            if let HubMsg::Inbound { meta, .. } = msg {
++                ids.push(meta["message_id"].parse().unwrap());
++            }
++        }
++        ids
++    }
++
++    #[tokio::test]
++    async fn the_51st_message_drops_the_oldest_and_warns_once_per_period() {
++        let dir = TempDir::new("slots-buffer-cap");
++        let mut slots = stalled_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        slots.on_hook(&end(A, 10));
++        for i in 0..60 {
++            slots.on_control(say(Some(100), i, Some("x")));
++        }
++        assert_eq!(buffered(&slots, 0), (10..60).collect::<Vec<_>>());
++        assert_eq!(
++            slots.queued_messages, 1,
++            "one overflow notice, no queued one"
++        );
++        slots.pump();
++        assert_eq!(slots.queued_messages, 2, "and one Resume message");
++        slots.pump();
++        slots.on_control(say(Some(100), 60, Some("x")));
++        assert_eq!(slots.queued_messages, 2, "nothing more in the same period");
++
++        // A new session takes the slot: all 50 go in order, once.
++        slots.on_hook(&start(B, 11));
++        let mut from_hub = connect_queue(&mut slots, 1, B, Some(11), 64);
++        slots.pump();
++        assert_eq!(drain(&mut from_hub), (11..61).collect::<Vec<_>>());
++        assert!(slots.registry.slots[0].buffer.is_idle());
++        slots.pump();
++        assert!(drain(&mut from_hub).is_empty(), "never twice");
++
++        // The next dead period warns again.
++        slots.on_hook(&end(B, 11));
++        let before = slots.queued_messages;
++        for i in 100..151 {
++            slots.on_control(say(Some(100), i, Some("x")));
++        }
++        assert_eq!(slots.queued_messages, before + 1);
++    }
++
++    #[tokio::test]
++    async fn a_full_link_queue_keeps_the_rest_in_order_for_the_next_try() {
++        let dir = TempDir::new("slots-buffer-queue");
++        let mut slots = stalled_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        for i in 0..6 {
++            slots.on_control(say(Some(100), i, Some("x")));
++        }
++        let mut from_hub = connect_queue(&mut slots, 1, A, Some(10), 4);
++        slots.pump();
++        assert_eq!(drain(&mut from_hub), [0, 1, 2, 3]);
++        // A new message queues behind the kept ones, never ahead.
++        slots.on_control(say(Some(100), 6, Some("x")));
++        assert_eq!(drain(&mut from_hub), [4, 5, 6]);
++        assert!(slots.registry.slots[0].buffer.is_idle());
++    }
++
++    #[tokio::test]
++    async fn revival_by_resume_new_session_or_clear_delivers_once_in_order() {
++        for how in ["resume", "new", "clear"] {
++            let dir = TempDir::new("slots-revival");
++            let mut slots = stalled_slots(&dir, message_options());
++            slots.on_hook(&start(A, 10));
++            slots.registry.topic_created(SlotId(0), 100, "a", None);
++            let mut next = match how {
++                // `/clear` with no agent on line: the slot never looked dead.
++                "clear" => {
++                    for i in 0..3 {
++                        slots.on_control(say(Some(100), i, Some("x")));
++                    }
++                    slots.on_hook(&hook(
++                        A,
++                        HookEvent::SessionEnd {
++                            reason: Some("clear".into()),
++                            claude_pid: Some(10),
++                        },
++                    ));
++                    slots.on_hook(&hook(
++                        B,
++                        HookEvent::SessionStart {
++                            source: Some("clear".into()),
++                            claude_pid: Some(10),
++                            parent_claude_pid: None,
++                        },
++                    ));
++                    // The channel server keeps the pre-clear id (TASK-013).
++                    connect_queue(&mut slots, 1, A, Some(10), 64)
++                }
++                _ => {
++                    slots.on_hook(&end(A, 10));
++                    for i in 0..3 {
++                        slots.on_control(say(Some(100), i, Some("x")));
++                    }
++                    slots.pump();
++                    let session = if how == "resume" { A } else { B };
++                    slots.on_hook(&hook(
++                        session,
++                        HookEvent::SessionStart {
++                            source: Some(if how == "resume" { "resume" } else { "startup" }.into()),
++                            claude_pid: Some(11),
++                            parent_claude_pid: None,
++                        },
++                    ));
++                    slots.pump();
++                    // The agent registers a moment after SessionStart.
++                    assert_eq!(buffered(&slots, 0), [0, 1, 2], "{how}: waits for the agent");
++                    connect_queue(&mut slots, 1, session, Some(11), 64)
++                }
++            };
++            slots.pump();
++            assert_eq!(drain(&mut next), [0, 1, 2], "{how}");
++            slots.pump();
++            slots.on_tick();
++            slots.pump();
++            assert!(drain(&mut next).is_empty(), "{how}: once");
++            assert!(slots.registry.slots[0].buffer.is_idle(), "{how}");
++            assert_eq!(slots.registry.slots.len(), 1, "{how}: same slot");
++        }
++    }
++
++    #[tokio::test]
++    async fn nested_runs_and_subagents_never_revive_a_slot() {
++        let dir = TempDir::new("slots-no-revival");
++        let mut slots = stalled_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        slots.on_hook(&start(B, 11));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        slots.on_hook(&end(A, 10));
++        for i in 0..3 {
++            slots.on_control(say(Some(100), i, Some("x")));
++        }
++        // A nested `claude -p --resume A` inside B, with its agent linked.
++        slots.on_hook(&hook(
++            A,
++            HookEvent::SessionStart {
++                source: Some("resume".into()),
++                claude_pid: Some(20),
++                parent_claude_pid: Some(11),
++            },
++        ));
++        let mut nested_resume = connect_queue(&mut slots, 1, A, Some(20), 64);
++        // A nested run of B and its agent.
++        let nested = "cccccccc-0000-4000-8000-000000000003";
++        slots.on_hook(&hook(
++            nested,
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(21),
++                parent_claude_pid: Some(11),
++            },
++        ));
++        let mut nested_agent = connect_queue(&mut slots, 2, nested, Some(21), 64);
++        // Subagent hooks of the ended session.
++        slots.on_hook(&hook(
++            A,
++            HookEvent::SubagentStart {
++                agent_id: "a1b2c3d4e5f607182".into(),
++                agent_type: "Explore".into(),
++            },
++        ));
++        slots.pump();
++        slots.on_tick();
++        slots.pump();
++        assert!(drain(&mut nested_resume).is_empty());
++        assert!(drain(&mut nested_agent).is_empty());
++        assert_eq!(buffered(&slots, 0), [0, 1, 2]);
++        assert_eq!(slots.registry.state(SlotId(0)), SlotState::Dead);
+     }
+ 
+     #[tokio::test]
+@@ -4475,17 +4966,229 @@ mod tests {
+         let mut slots = stalled_slots(&dir, options);
+         slots.on_hook(&start(A, 10));
+         slots.registry.topic_created(SlotId(0), 100, "t", None);
++        // Photos: each asks for a text-only notice.
+         for i in 0..MAX_QUEUED_MESSAGES as i64 + 50 {
+-            slots.on_control(say(Some(100), i, Some("x")));
++            slots.on_control(say(Some(100), i, None));
+         }
+         assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+         assert!(slots.overflow_warned);
+         // An answer frees one place and the next notice takes it.
+         slots.on_done(Done::Message(None));
+-        slots.on_control(say(Some(100), 1000, Some("x")));
++        slots.on_control(say(Some(100), 1000, None));
+         assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+     }
+ 
++    #[tokio::test]
++    async fn kept_messages_never_go_to_the_agent_of_an_earlier_run() {
++        let dir = TempDir::new("slots-buffer-old-run");
++        let mut slots = stalled_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        let mut old_run = connect_queue(&mut slots, 1, A, Some(10), 64);
++        slots.on_hook(&end(A, 10));
++        for i in 0..3 {
++            slots.on_control(say(Some(100), i, Some("x")));
++        }
++        // `claude --resume A` starts before the old run's link is closed.
++        slots.on_hook(&hook(
++            A,
++            HookEvent::SessionStart {
++                source: Some("resume".into()),
++                claude_pid: Some(12),
++                parent_claude_pid: None,
++            },
++        ));
++        slots.pump();
++        slots.on_control(say(Some(100), 3, Some("x")));
++        assert!(drain(&mut old_run).is_empty(), "the old run takes nothing");
++        assert_eq!(buffered(&slots, 0), [0, 1, 2, 3]);
++        let mut new_run = connect_queue(&mut slots, 2, A, Some(12), 64);
++        slots.pump();
++        assert_eq!(drain(&mut new_run), [0, 1, 2, 3]);
++        assert!(drain(&mut old_run).is_empty());
++    }
++
++    #[tokio::test]
++    async fn only_the_slot_that_revives_gets_its_kept_messages() {
++        let dir = TempDir::new("slots-buffer-two-slots");
++        let mut slots = stalled_slots(&dir, message_options());
++        slots.on_hook(&start(A, 10));
++        slots.on_hook(&start(B, 11));
++        slots.registry.topic_created(SlotId(0), 100, "a", None);
++        slots.registry.topic_created(SlotId(1), 101, "b", None);
++        let mut agent_b = connect_queue(&mut slots, 2, B, Some(11), 64);
++        slots.on_hook(&end(A, 10));
++        for i in 0..3 {
++            slots.on_control(say(Some(100), i, Some("x")));
++        }
++        slots.on_control(say(Some(101), 10, Some("x")));
++        slots.pump();
++        assert_eq!(drain(&mut agent_b), [10], "B gets only its own topic");
++        assert_eq!(buffered(&slots, 0), [0, 1, 2]);
++        // A new session of the folder takes the free slot #1, not a new one.
++        let c = "cccccccc-0000-4000-8000-000000000003";
++        slots.on_hook(&start(c, 12));
++        let mut agent_c = connect_queue(&mut slots, 3, c, Some(12), 64);
++        slots.pump();
++        assert_eq!(drain(&mut agent_c), [0, 1, 2]);
++        assert!(drain(&mut agent_b).is_empty());
++        assert_eq!(slots.registry.slots.len(), 2);
++        assert_eq!(slots.registry.slots[0].current_session.as_deref(), Some(c));
++        assert!(slots.registry.slots[0].buffer.is_idle());
++    }
++
++    fn resume_sends(ops: &[Op]) -> Vec<(i64, Option<serde_json::Value>)> {
++        let mut message_id = 1000;
++        let mut found = Vec::new();
++        for op in ops {
++            if let Op::Send {
++                text, reply_markup, ..
++            } = op
++            {
++                if text.starts_with("Сессия ") && text.contains("claude --resume") {
++                    found.push((message_id, reply_markup.clone()));
++                }
++                message_id += 1;
++            }
++        }
++        found
++    }
++
++    #[tokio::test]
++    async fn a_dead_slot_shows_one_resume_button_that_records_the_wish() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        rig.hook(end(A, 10)).await;
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_DEAD)).await;
++        for i in 1..=3 {
++            rig.control.send(say(Some(100), i, Some("x"))).unwrap();
++        }
++        let ops = settled(&rig, |ops| resume_sends(ops).len() == 1).await;
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        let ops = rig
++            .fake
++            .ops()
++            .into_iter()
++            .skip(ops.len())
++            .collect::<Vec<_>>();
++        assert!(resume_sends(&ops).is_empty(), "one button per period");
++        let (message, markup) = resume_sends(&rig.fake.ops())[0].clone();
++        let data = markup.unwrap()["inline_keyboard"][0][0]["callback_data"]
++            .as_str()
++            .unwrap()
++            .to_owned();
++        assert_eq!(data, format!("resume:{A}"));
++        assert!(data.len() <= permissions::MAX_CALLBACK_DATA);
++        assert!(
++            !rig.fake
++                .ops()
++                .iter()
++                .any(|op| matches!(op, Op::Delete { .. })),
++            "the topic stays as it is"
++        );
++
++        rig.control.send(press("q1", Some(message), &data)).unwrap();
++        rig.control
++            .send(press("q2", Some(message), "resume:0000"))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 2).await;
++        assert_eq!(
++            answers(&ops),
++            [
++                Some(buffer::ANSWER_UNAVAILABLE),
++                Some(permissions::ANSWER_EXPIRED)
++            ]
++        );
++        let saved = || std::fs::read_to_string(rig.dir.path().join("registry.json")).unwrap();
++        let wait = async {
++            while !saved().contains("\"resume_asked\": true") {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::time::timeout(WAIT, wait).await.expect("wish saved");
++
++        // The session comes back: the messages go, the button goes.
++        rig.hook(hook(
++            A,
++            HookEvent::SessionStart {
++                source: Some("resume".into()),
++                claude_pid: Some(12),
++                parent_claude_pid: None,
++            },
++        ))
++        .await;
++        rig.agent_of(2, A, Some(12)).await;
++        let ops = settled(&rig, |ops| !edits_of(ops, message).is_empty()).await;
++        assert_eq!(
++            edits_of(&ops, message),
++            [(
++                buffer::RESUMED_TEXT.to_owned(),
++                Some(permissions::no_keyboard())
++            )]
++        );
++        let got = received(&mut rig, 1).await;
++        assert_eq!(contents(&got), ["x"; 3]);
++        rig.control.send(press("q3", Some(message), &data)).unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 3).await;
++        assert_eq!(answers(&ops)[2], Some(buffer::ANSWER_ALIVE));
++    }
++
++    #[tokio::test]
++    async fn kept_messages_survive_a_restart_and_go_out_once() {
++        // The previous run: A ended, three messages kept, the button out.
++        let dir = TempDir::new("slots-buffer-restart");
++        {
++            let mut slots = stalled_slots(&dir, message_options());
++            slots.on_hook(&start(A, 10));
++            slots.registry.topic_created(SlotId(0), 100, "a", None);
++            slots.on_hook(&end(A, 10));
++            for i in 1..=3 {
++                slots.on_control(say(Some(100), i, Some(&format!("m{i}"))));
++            }
++            slots.offer_resume();
++            if let Some(note) = slots.registry.slots[0].buffer.resume.as_mut() {
++                note.message_id = Some(900);
++            }
++            let store = RegistryStore::open(dir.path()).unwrap();
++            store.save(&RegistryStore::encode(&slots.registry)).unwrap();
++        }
++        let path = dir.path().join("registry.json");
++        let mut rig = rig_in(Fake::default(), message_options(), dir);
++        rig.hook(hook(
++            A,
++            HookEvent::SessionStart {
++                source: Some("resume".into()),
++                claude_pid: Some(12),
++                parent_claude_pid: None,
++            },
++        ))
++        .await;
++        rig.agent_of(1, A, Some(12)).await;
++        let got = received(&mut rig, 0).await;
++        assert_eq!(contents(&got), ["m1", "m2", "m3"]);
++        let ops = settled(&rig, |ops| !edits_of(ops, 900).is_empty()).await;
++        assert!(
++            resume_sends(&ops).is_empty(),
++            "the button is not offered again"
++        );
++        // What the next restart would load: nothing left to send.
++        let wait = async {
++            loop {
++                let registry: Registry =
++                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
++                if registry.slots[0].buffer.is_idle() {
++                    return;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        };
++        tokio::time::timeout(WAIT, wait)
++            .await
++            .expect("emptied buffer saved");
++        tokio::time::sleep(Duration::from_millis(200)).await;
++        assert!(received(&mut rig, 0).await.is_empty());
++    }
++
+     fn count(ops: &[Op], pred: impl Fn(&Op) -> bool) -> usize {
+         ops.iter().filter(|op| pred(op)).count()
+     }

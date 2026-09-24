@@ -1,0 +1,9 @@
+{
+  "session_id": "d8c72910-ea17-4d68-9c75-57e097fafeea",
+  "transcript_path": "~\\.claude\\projects\\~enc-dev-cctg\\d8c72910-ea17-4d68-9c75-57e097fafeea.jsonl",
+  "cwd": "~\\dev\\cctg",
+  "prompt_id": "4cc17910-4a0d-426b-bd04-33b2aa0e54ec",
+  "agent_id": "a8c1bff86acd31609",
+  "agent_type": "Explore",
+  "hook_event_name": "SubagentStart"
+}

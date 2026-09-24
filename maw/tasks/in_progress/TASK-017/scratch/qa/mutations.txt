@@ -1,0 +1,16 @@
+== M1 overflow warned on every drop
+1
+thread 'qa_dead_slot_buffer_end_to_end' (32284) panicked at crates\cctg\tests\qa_buffer_e2e.rs:433:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+== M2 Resume button offered every pump
+1
+thread 'qa_dead_slot_buffer_end_to_end' (34992) panicked at crates\cctg\tests\qa_buffer_e2e.rs:260:29:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.10s
+== M3 full buffer drops the newest
+1
+thread 'qa_dead_slot_buffer_end_to_end' (25684) panicked at crates\cctg\tests\qa_buffer_e2e.rs:260:29:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.07s
+== M4 handed message stays in buffer (duplicates)
+1
+thread 'qa_dead_slot_buffer_end_to_end' (38160) panicked at crates\cctg\tests\qa_buffer_e2e.rs:425:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
