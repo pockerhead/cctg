@@ -47,6 +47,8 @@ pub const MAX_WAITING: usize = 64;
 /// Turn answers of a session held for their transcript turn end; the oldest
 /// goes when one more comes.
 pub const MAX_HELD: usize = 8;
+/// Mark of a thinking message in the topic.
+pub const THINKING: &str = "\u{1F4AD}";
 /// Reaction for a message handed to the session's agent.
 pub const ACCEPTED: &str = "👀";
 /// Reaction for a message Claude took into work (its channel record is in the
@@ -89,6 +91,14 @@ pub fn apply_line(
                 steps.push(Step::Send {
                     text: text.clone(),
                     merge: false,
+                });
+            }
+            // Its own message; under the rate limit it joins its neighbours like a tool line.
+            StreamItem::Thinking { text } => {
+                flush(calls, &mut steps);
+                steps.push(Step::Send {
+                    text: format!("{THINKING} {text}"),
+                    merge: true,
                 });
             }
             StreamItem::TurnEnd => {
@@ -579,6 +589,46 @@ mod tests {
             second
                 .iter()
                 .all(|step| matches!(step, Step::Send { merge: true, .. }))
+        );
+        assert!(calls.is_empty());
+    }
+
+    /// TASK-025: thinking is its own message, marked, after the finished
+    /// calls before it; like a tool line it may join neighbours under the limit.
+    #[test]
+    fn thinking_goes_as_its_own_message_in_turn_order() {
+        let mut calls = Vec::new();
+        let steps = run(
+            &mut calls,
+            &[
+                vec![StreamItem::Prompt { text: "go".into() }],
+                vec![call("a", "• Bash: A")],
+                vec![result("a", None)],
+                vec![call("b", "• Bash: B")],
+                vec![StreamItem::Thinking {
+                    text: "Checking cargo.".into(),
+                }],
+                vec![StreamItem::TurnEnd],
+            ],
+        );
+        assert_eq!(
+            steps,
+            [
+                Step::NewTurn,
+                Step::Send {
+                    text: "> go".into(),
+                    merge: false
+                },
+                Step::Send {
+                    text: "• Bash: A ✓".into(),
+                    merge: true
+                },
+                Step::Send {
+                    text: "\u{1F4AD} Checking cargo.".into(),
+                    merge: true
+                },
+                Step::TurnEnd,
+            ]
         );
         assert!(calls.is_empty());
     }

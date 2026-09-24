@@ -1,7 +1,8 @@
-use transcript::{StreamEvent, stream_events};
+use transcript::{StreamEvent, THINKING_LIMIT, parse, render_brief, render_full, stream_events};
 
 const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
 const STREAM: &str = include_str!("fixtures/stream.jsonl");
+const STREAM_THINKING: &str = include_str!("fixtures/stream_thinking.jsonl");
 
 fn events(jsonl: &str) -> Vec<StreamEvent> {
     jsonl.lines().flat_map(stream_events).collect()
@@ -30,8 +31,9 @@ fn a_turn_streams_its_prompt_notes_and_calls_but_not_its_final_answer() {
             StreamEvent::Note("Let me run the tests first.".to_owned()),
             call("toolu_demo31", "• Bash: Run workspace tests"),
             ok("toolu_demo31"),
-            // The final text only marks the end of the turn (thinking of the
-            // same response does not).
+            // Thinking of the answering response is shown; only the final
+            // text marks the end of the turn.
+            StreamEvent::Thinking("SECRET-THINKING-MARKER final".to_owned()),
             StreamEvent::TurnEnd,
             // A Telegram message: its id, never its text.
             StreamEvent::Channel { message_id: 7 },
@@ -102,4 +104,68 @@ fn a_partial_or_foreign_line_gives_nothing() {
     assert!(stream_events("").is_empty());
     assert!(stream_events("{\"type\":\"mode\",\"mode\":\"x\"}").is_empty());
     assert!(stream_events("[1,2]").is_empty());
+}
+
+/// TASK-025: visible thinking goes in turn order, trimmed and cut short;
+/// empty (signature-only), redacted and sidechain thinking give nothing; a
+/// call of cctg's own `reply` tool gives no line.
+#[test]
+fn thinking_streams_in_order_and_the_reply_call_does_not() {
+    let long = "мысль ".repeat(300);
+    let long = long.trim_end();
+    assert!(STREAM_THINKING.contains(long));
+    assert!(long.chars().count() > THINKING_LIMIT);
+    let cut: String = long.chars().take(THINKING_LIMIT).collect();
+    let cut = format!("{}\u{2026}", cut.trim_end());
+    assert_eq!(
+        events(STREAM_THINKING),
+        [
+            StreamEvent::Prompt("Which cargo processes are running?".to_owned()),
+            StreamEvent::Thinking("Проверю, какие процессы cargo запущены.".to_owned()),
+            StreamEvent::Note("Sending a status.".to_owned()),
+            // No call line for `mcp__cctg__reply`; its result names a call
+            // the hub never saw and shows nothing.
+            ok("toolu_reply1"),
+            call("toolu_bash1", "• Bash: List cargo processes"),
+            ok("toolu_bash1"),
+            StreamEvent::Thinking(cut.clone()),
+            StreamEvent::TurnEnd,
+        ]
+    );
+    assert_eq!(cut.chars().count(), THINKING_LIMIT + 1, "{cut}");
+    // Another server's reply tool is a call like any other.
+    let foreign = r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t","name":"mcp__plugin_telegram_telegram__reply","input":{}}]}}"#;
+    assert!(matches!(
+        stream_events(foreign).as_slice(),
+        [StreamEvent::Call { .. }]
+    ));
+    // `/brief` and `/full` never show thinking.
+    let turns = parse(STREAM_THINKING);
+    for shown in [render_brief(&turns), render_full(&turns)] {
+        assert!(!shown.contains("процессы cargo"), "{shown}");
+        assert!(!shown.contains("мысль"), "{shown}");
+    }
+}
+
+#[test]
+fn a_thinking_cut_never_splits_a_grapheme() {
+    // A family emoji: one grapheme of five code points.
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    let text = family.repeat(THINKING_LIMIT + 5);
+    let line = format!(
+        r#"{{"type":"assistant","message":{{"role":"assistant","stop_reason":"tool_use","content":[{{"type":"thinking","thinking":"{text}","signature":"s"}}]}}}}"#
+    );
+    assert_eq!(
+        stream_events(&line),
+        [StreamEvent::Thinking(format!(
+            "{}\u{2026}",
+            family.repeat(THINKING_LIMIT)
+        ))]
+    );
+    // Whitespace-only thinking and a user record holding a thinking block
+    // give nothing.
+    let blank = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"  \n ","signature":"s"}]}}"#;
+    assert!(stream_events(blank).is_empty());
+    let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"thinking","thinking":"x"}]}}"#;
+    assert!(stream_events(user).is_empty());
 }

@@ -51,12 +51,11 @@ pub const MAX_REPLY: usize = 128 << 10;
 pub const MAX_PERMISSION_FIELD: usize = 32 << 10;
 
 pub const INSTRUCTIONS: &str = "Messages from the user's Telegram topic for this session arrive as \
-<channel source=\"cctg\" ...>. The user reads Telegram, not this terminal. The final answer \
-of each turn goes to the Telegram topic automatically: just answer normally and do not repeat \
-it through `reply`. Use this server's `reply` tool only for extra messages while you work \
-(for example progress on a long task), in plain text. Its full name is `mcp__<server>__reply`, \
-where <server> is the name this MCP server is registered under (normally `mcp__cctg__reply`). \
-It may be a deferred tool: if it is not in your tool list, find and load it with ToolSearch. \
+<channel source=\"cctg\" ...>. The user reads Telegram, not this terminal, and everything you do \
+here shows up in the Telegram topic automatically: the text you write, your visible thinking, one \
+line per tool call and the final answer of each turn. Just work and answer normally. You do not \
+need this server's `reply` tool (`mcp__<server>__reply`, normally `mcp__cctg__reply`): it is kept \
+only for compatibility, and a message sent through it repeats what the user already sees. \
 If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
 never ask for permissions through `reply`.";
@@ -382,9 +381,9 @@ fn cap(mut text: String, max: usize) -> String {
 fn reply_tool() -> Value {
     json!({
         "name": REPLY_TOOL,
-        "description": "Send a message to the Telegram topic of this Claude Code session. \
-            The final answer of each turn is sent there automatically; use this only for \
-            extra messages while you work.",
+        "description": "Not needed: everything this Claude Code session writes, its tool \
+            calls and the final answer of each turn reach its Telegram topic automatically. \
+            Kept for compatibility; sends one more plain-text message to that topic.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -507,10 +506,14 @@ mod tests {
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("`mcp__<server>__reply`"));
         assert!(instructions.contains("`mcp__cctg__reply`"));
-        assert!(instructions.contains("deferred tool"));
-        assert!(instructions.contains("ToolSearch"));
-        assert!(instructions.contains("goes to the Telegram topic automatically"));
-        assert!(instructions.contains("only for extra messages"));
+        assert!(instructions.contains("shows up in the Telegram topic automatically"));
+        assert!(instructions.contains("visible thinking"));
+        assert!(instructions.contains("one line per tool call"));
+        assert!(instructions.contains("You do not need this server's `reply` tool"));
+        assert!(instructions.contains("kept only for compatibility"));
+        // TASK-025: `reply` is no longer offered for progress messages.
+        assert!(!instructions.contains("only for extra messages"));
+        assert!(!instructions.contains("ToolSearch"));
         assert!(!instructions.contains("answer each such message with"));
         assert!(instructions.contains("SendMessage"));
         assert!(instructions.contains("that subagent, running or finished"));
@@ -766,6 +769,10 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "reply");
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["text"]));
+        let description = tools[0]["description"].as_str().unwrap();
+        assert!(description.starts_with("Not needed:"));
+        assert!(description.contains("automatically"));
+        assert!(description.contains("Kept for compatibility"));
     }
 
     #[test]
