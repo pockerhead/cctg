@@ -97,8 +97,9 @@ pub fn press(_claude_pid: u32, _key: ConsoleKey) -> bool {
     false
 }
 
-/// The prompt glyph of Claude Code's input box.
-const PROMPT: char = '\u{276f}';
+/// The prompt glyphs of Claude Code's input box: `❯`, or `>` in consoles
+/// that make it fall back to ASCII (seen live in cmd.exe, 2026-09-24).
+const PROMPTS: [char; 2] = ['\u{276f}', '>'];
 /// How long typed keys get before the screen is read back.
 #[cfg(windows)]
 const ECHO_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
@@ -169,7 +170,7 @@ pub fn box_shows(lines: &[String], text: &str) -> bool {
         return false;
     };
     let text = text.trim();
-    if line.strip_prefix(PROMPT).map(str::trim) == Some(text) {
+    if line.strip_prefix(PROMPTS).map(str::trim) == Some(text) {
         return true;
     }
     match (text.strip_prefix('!'), line.strip_prefix('!')) {
@@ -402,6 +403,8 @@ mod tests {
         assert_eq!(found, ["❯\u{a0}/exit"]);
         assert!(box_shows(&found, "/exit"));
         assert!(box_shows(&screen(&["❯ /exit  "]), "/exit"));
+        assert!(box_shows(&screen(&["> /cost"]), "/cost"));
+        assert!(box_shows(&screen(&[">\u{a0}/exit"]), "/exit"));
         // A draft before or after the cursor (P2 safe_draft), a second
         // line, an empty box, no prompt glyph: no exit.
         for lines in [
