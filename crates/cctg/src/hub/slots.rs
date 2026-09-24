@@ -78,6 +78,14 @@
 //! answer finds a turn begun meanwhile is not released: no `/exit` goes into
 //! a turn; the press is asked again after it.
 //!
+//! Console commands (TASK-043, see [`console`]): a topic message that starts
+//! with `!` or with a slash command the hub does not serve goes, instead of
+//! the slot's buffer, to the agent of the slot's live session to be typed
+//! into its claude console, only when that agent announced
+//! `console_commands` and no turn runs and no permission prompt waits;
+//! otherwise, and when the agent answers that a draft was in the way or
+//! typing failed, the message gets a short answer. A typed command gets 👀.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title or message text.
 
@@ -94,6 +102,7 @@ use transcript::{HtmlChunk, SplitOptions, split_for_telegram, split_markdown_for
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Parked, ResumeNote};
+use super::console;
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::registry::{
@@ -109,8 +118,8 @@ use super::subagents::{
 use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
 use crate::wire::{
-    AgentMsg, Behavior, Client, ConsoleKey, HookEvent, HookPost, HubMsg, PermissionPost,
-    PermissionRequest, StreamItem, StreamLine, UpdateOutcome,
+    AgentMsg, Behavior, Client, CommandOutcome, ConsoleKey, HookEvent, HookPost, HubMsg,
+    PermissionPost, PermissionRequest, StreamItem, StreamLine, UpdateOutcome,
 };
 
 /// A transcript is scanned line by line for its first ai-title up to this
@@ -357,6 +366,17 @@ struct KeyAsk {
     until: Instant,
 }
 
+/// A command an agent was asked to type, like [`KeyAsk`], plus the topic
+/// message it came from.
+struct CommandAsk {
+    slot: SlotId,
+    session: String,
+    conn: u64,
+    thread_id: i64,
+    message_id: i64,
+    until: Instant,
+}
+
 /// The fields of one `transcript_chunk`.
 struct Chunk<'a> {
     from: u64,
@@ -497,6 +517,8 @@ struct Conn {
     reads: bool,
     /// It presses console keys ([`crate::wire::Register::console_keys`]).
     keys: bool,
+    /// It types console commands ([`crate::wire::Register::console_commands`]).
+    commands: bool,
     /// Its build and update abilities ([`crate::wire::Register::client`]).
     client: Option<Client>,
     /// It is leaving after an update answer: bound to nothing, never
@@ -578,6 +600,8 @@ pub struct Slots {
     shown: HashMap<SlotId, Shown>,
     /// Keys agents were asked to press, by key id.
     key_asks: HashMap<u64, KeyAsk>,
+    /// Commands agents were asked to type, by command id.
+    command_asks: HashMap<u64, CommandAsk>,
     /// Update presses by session.
     updates: HashMap<String, UpdateAsk>,
     pin_warned: bool,
@@ -645,6 +669,7 @@ impl Slots {
             activity: HashMap::new(),
             shown: HashMap::new(),
             key_asks: HashMap::new(),
+            command_asks: HashMap::new(),
             updates: HashMap::new(),
             pin_warned: false,
             grace_until: now + options.grace,
@@ -819,6 +844,7 @@ impl Slots {
                         acks: register.verdict_ack,
                         reads: register.transcript_reads,
                         keys: register.console_keys,
+                        commands: register.console_commands,
                         client: register.client,
                         leaving: false,
                     },
@@ -866,6 +892,10 @@ impl Slots {
                     AgentMsg::ConsoleKeyWritten { key_id, written } => {
                         self.on_key_written(conn, &session, key_id, written);
                     }
+                    AgentMsg::ConsoleCommandTyped {
+                        command_id,
+                        outcome,
+                    } => self.on_command_typed(conn, &session, command_id, outcome),
                     AgentMsg::UpdateAnswer { update_id, outcome } => {
                         self.on_update_answer(conn, &session, update_id, outcome);
                     }
@@ -1464,6 +1494,13 @@ impl Slots {
             self.notify(slot, thread_id, TEXT_ONLY_NOTICE);
             return;
         };
+        // A forward is someone else's words, never a command.
+        if !input.forwarded
+            && let Some(command) = console::classify(&text)
+        {
+            self.on_console_command(slot, thread_id, input.message_id, command);
+            return;
+        }
         self.park(
             slot,
             Parked {
@@ -3325,6 +3362,128 @@ impl Slots {
         }
     }
 
+    /// A console command from topic message `message_id`: asks the agent of
+    /// the slot's live session to type it, or answers why not.
+    fn on_console_command(
+        &mut self,
+        slot: SlotId,
+        thread_id: i64,
+        message_id: i64,
+        command: Result<String, console::Invalid>,
+    ) {
+        let ordinal = self.ordinal(slot);
+        let refusal = match (command, self.live_agent(slot)) {
+            (Err(console::Invalid), _) => console::INVALID_NOTICE,
+            (Ok(_), None) => console::OFFLINE_NOTICE,
+            (Ok(_), Some((_, conn)))
+                if !self.conns.get(&conn).is_some_and(|bound| bound.commands) =>
+            {
+                console::NO_CONSOLE_NOTICE
+            }
+            (Ok(_), Some((session, _))) if self.waiting(&session) => console::WAITING_NOTICE,
+            (Ok(_), Some((session, _))) if self.busy(&session) => console::BUSY_NOTICE,
+            (Ok(text), Some((session, conn))) => {
+                let command_id = crate::wire::random_u64();
+                let asked = self.conns.get(&conn).is_some_and(|bound| {
+                    bound
+                        .to_agent
+                        .try_send(HubMsg::ConsoleCommand { command_id, text })
+                        .is_ok()
+                });
+                if asked {
+                    self.remember_command(
+                        command_id,
+                        CommandAsk {
+                            slot,
+                            session: session.clone(),
+                            conn,
+                            thread_id,
+                            message_id,
+                            until: Instant::now() + console::COMMAND_WAIT,
+                        },
+                    );
+                    info!(
+                        ordinal,
+                        conn,
+                        session = short(&session),
+                        "console command sent to the session agent"
+                    );
+                    return;
+                }
+                warn!(conn, "agent queue full or closed; console command not sent");
+                console::FAILED_NOTICE
+            }
+        };
+        info!(ordinal, "console command refused");
+        self.answer_command(thread_id, message_id, refusal);
+    }
+
+    fn remember_command(&mut self, command_id: u64, ask: CommandAsk) {
+        let now = Instant::now();
+        self.command_asks.retain(|_, ask| ask.until > now);
+        if self.command_asks.len() >= console::MAX_COMMAND_ASKS
+            && let Some(oldest) = self
+                .command_asks
+                .iter()
+                .min_by_key(|(_, ask)| ask.until)
+                .map(|(id, _)| *id)
+        {
+            self.command_asks.remove(&oldest);
+        }
+        self.command_asks.insert(command_id, ask);
+    }
+
+    /// An answer to the topic message `message_id` of a console command.
+    fn answer_command(&mut self, thread_id: i64, message_id: i64, text: &str) {
+        let mut op = message_op(thread_id, text.to_owned());
+        if let Op::Send { reply_to, .. } = &mut op {
+            *reply_to = Some(message_id);
+        }
+        self.send_messages(vec![op]);
+    }
+
+    /// An agent typed a command, or could not. Typed gets 👀 on its topic
+    /// message; the output comes with the stream. Like [`Self::on_key_written`],
+    /// an answer for a slot, session or connection that moved on changes
+    /// nothing.
+    fn on_command_typed(
+        &mut self,
+        conn: u64,
+        frame_session: &str,
+        command_id: u64,
+        outcome: CommandOutcome,
+    ) {
+        let Some(ask) = self.command_asks.remove(&command_id) else {
+            debug!(conn, "answer to a console command nothing waits for");
+            return;
+        };
+        if ask.conn != conn
+            || ask.session != frame_session
+            || self.live_agent(ask.slot) != Some((ask.session.clone(), conn))
+        {
+            debug!(
+                conn,
+                "console command answer for a session that moved on; ignored"
+            );
+            return;
+        }
+        info!(
+            conn,
+            session = short(&ask.session),
+            ?outcome,
+            "console command answered"
+        );
+        match outcome {
+            CommandOutcome::Sent => self.react(ask.message_id, stream::ACCEPTED),
+            CommandOutcome::Draft => {
+                self.answer_command(ask.thread_id, ask.message_id, console::DRAFT_NOTICE);
+            }
+            CommandOutcome::Failed | CommandOutcome::Other => {
+                self.answer_command(ask.thread_id, ask.message_id, console::FAILED_NOTICE);
+            }
+        }
+    }
+
     /// Text and keyboard the status message of `slot` should show now.
     fn status_view(
         &self,
@@ -3725,6 +3884,7 @@ impl Slots {
     fn on_tick(&mut self) {
         let now = Instant::now();
         self.key_asks.retain(|_, ask| ask.until > now);
+        self.command_asks.retain(|_, ask| ask.until > now);
         if now >= self.next_retry {
             self.registry.retry_failed();
             self.prompts.retry_failed_edits();
@@ -4483,6 +4643,7 @@ mod tests {
                 verdict_ack,
                 transcript_reads: false,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             };
             self.agents
@@ -5704,6 +5865,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -6493,6 +6655,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -6580,6 +6743,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -8964,6 +9128,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             };
             self.agents
@@ -9254,6 +9419,7 @@ again"
                     verdict_ack: true,
                     transcript_reads: true,
                     console_keys: false,
+                    console_commands: false,
                     client: None,
                 },
                 to_agent,
@@ -9301,6 +9467,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -9341,6 +9508,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -9393,6 +9561,7 @@ again"
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -10191,6 +10360,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: true,
+                console_commands: false,
                 client: None,
             },
             to_agent,
@@ -10349,6 +10519,7 @@ again"
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: true,
+                console_commands: false,
                 client,
             },
             to_agent,
@@ -10612,5 +10783,175 @@ again"
         assert_eq!(slots.press_update(A), status::ANSWER_CURRENT);
         let (text, _) = slots.status_view(SlotId(0), A, Instant::now());
         assert!(!text.contains(status::OUTDATED_LINE));
+    }
+
+    /// A live session A in slot 0 with topic 100 and an agent (conn 1) that
+    /// types console commands when `commands`.
+    fn console_slots(dir: &TempDir, commands: bool) -> (Arc<Fake>, Slots, mpsc::Receiver<HubMsg>) {
+        let (fake, mut slots) = live_slots(dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, from_hub) = mpsc::channel(8);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: false,
+                transcript_reads: false,
+                console_keys: true,
+                console_commands: commands,
+                client: None,
+            },
+            to_agent,
+        });
+        (fake, slots, from_hub)
+    }
+
+    fn topic_text(message_id: i64, text: &str, forwarded: bool) -> Inbound {
+        Inbound {
+            message_id,
+            thread_id: Some(100),
+            text: Some(text.into()),
+            reply_to: None,
+            quote: None,
+            forwarded,
+        }
+    }
+
+    /// The answers the hub sent as replies to topic messages, once `count`
+    /// are out: `(replied message, text)`.
+    async fn command_replies(fake: &Fake, count: usize) -> Vec<(i64, String)> {
+        let replied = || {
+            fake.ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    Op::Send {
+                        reply_to: Some(to),
+                        text,
+                        ..
+                    } => Some((to, text)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let reached = async {
+            loop {
+                let got = replied();
+                if got.len() >= count {
+                    return got;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        match tokio::time::timeout(WAIT, reached).await {
+            Ok(got) => got,
+            Err(_) => panic!("replies never came: {:?}", fake.ops()),
+        }
+    }
+
+    fn command_of(msg: Option<HubMsg>) -> (u64, String) {
+        match msg {
+            Some(HubMsg::ConsoleCommand { command_id, text }) => (command_id, text),
+            other => panic!("no console command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bang_and_slash_commands_go_to_the_console_and_are_answered() {
+        let dir = TempDir::new("slots-console-commands");
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        slots.on_topic_message(topic_text(11, "!echo hi", false));
+        let (typed, text) = command_of(from_hub.try_recv().ok());
+        assert_eq!(text, "!echo hi");
+        slots.on_topic_message(topic_text(12, "/compact@cctg_bot keep it", false));
+        let (drafted, text) = command_of(from_hub.try_recv().ok());
+        assert_eq!(text, "/compact keep it");
+        // Neither went to the model, nor waits in the slot.
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+        // Typed: 👀 on the message. A draft in the box: an answer.
+        slots.on_command_typed(1, A, typed, CommandOutcome::Sent);
+        slots.on_command_typed(1, A, drafted, CommandOutcome::Draft);
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(12, console::DRAFT_NOTICE.to_owned())]
+        );
+        let reached = async {
+            while !fake.ops().iter().any(
+                |op| matches!(op, Op::React { message_id: 11, emoji } if emoji == stream::ACCEPTED),
+            ) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, reached).await.expect("👀 on 11");
+        // A late or repeated answer changes nothing.
+        slots.on_command_typed(1, A, typed, CommandOutcome::Failed);
+        // A plain text, a path and a forwarded bang are messages for the model.
+        slots.on_topic_message(topic_text(13, "hello", false));
+        slots.on_topic_message(topic_text(14, "/tmp/app.log fails", false));
+        slots.on_topic_message(topic_text(15, "!echo hi", true));
+        for want in ["hello", "/tmp/app.log fails", "!echo hi"] {
+            match from_hub.try_recv() {
+                Ok(HubMsg::Inbound { content, .. }) => assert!(content.contains(want), "{content}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            command_replies(&fake, 1).await.len(),
+            1,
+            "nothing more answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_console_command_is_refused_in_a_turn_at_a_prompt_or_when_it_is_not_one_line() {
+        let dir = TempDir::new("slots-console-refused");
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        slots.on_topic_message(topic_text(21, "!ls", false));
+        slots.on_hook(&stop(A, None));
+        slots.on_agent(permission(1, "abcde", "p"));
+        slots.on_topic_message(topic_text(22, "/model", false));
+        slots.on_topic_message(topic_text(23, "!echo a\nb", false));
+        slots.on_topic_message(topic_text(24, "/compact \u{1b}[A", false));
+        let mut got = command_replies(&fake, 4).await;
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                (21, console::BUSY_NOTICE.to_owned()),
+                (22, console::WAITING_NOTICE.to_owned()),
+                (23, console::INVALID_NOTICE.to_owned()),
+                (24, console::INVALID_NOTICE.to_owned()),
+            ]
+        );
+        while let Ok(msg) = from_hub.try_recv() {
+            assert!(
+                !matches!(msg, HubMsg::ConsoleCommand { .. } | HubMsg::Inbound { .. }),
+                "{msg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_console_command_needs_a_live_agent_that_types() {
+        let dir = TempDir::new("slots-console-no-agent");
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, false);
+        slots.on_topic_message(topic_text(31, "!echo hi", false));
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(31, console::NO_CONSOLE_NOTICE.to_owned())]
+        );
+        assert!(from_hub.try_recv().is_err());
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        slots.on_topic_message(topic_text(32, "/compact", false));
+        assert_eq!(
+            command_replies(&fake, 2).await[1],
+            (32, console::OFFLINE_NOTICE.to_owned())
+        );
+        // Not kept for a later session either.
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
     }
 }

@@ -2,7 +2,8 @@
 //! (TASK-029): Esc, as when typed in the terminal. Since TASK-040 also types
 //! `/exit` for a restart ([`type_exit`], which reads the input box back
 //! first) and serves `cctg run` its own console ([`visible_lines`],
-//! [`write_text`]).
+//! [`write_text`]); since TASK-043 any one-line command from the topic
+//! ([`type_line`], the same safe typing).
 //!
 //! Channels have no command for it, so on Windows the agent (a child of
 //! that claude) attaches to its console and writes the key events into the
@@ -102,14 +103,31 @@ const PROMPT: char = '\u{276f}';
 #[cfg(windows)]
 const ECHO_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// What [`type_exit`] did.
+/// Longest command [`type_line`] types, in characters.
+pub const MAX_LINE_CHARS: usize = 200;
+
+/// Whether [`type_line`] may type `text`: one non-blank line of at most
+/// [`MAX_LINE_CHARS`] characters without control characters (a newline
+/// would submit early, Esc or Backspace would edit the box), line or
+/// paragraph separators, or characters outside the Basic Multilingual Plane
+/// (one key event per character, so the typed text can be erased again one
+/// Backspace per character).
+pub fn typable(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text.chars().count() <= MAX_LINE_CHARS
+        && text.chars().all(|c| {
+            !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}') && u32::from(c) <= 0xFFFF
+        })
+}
+
+/// What [`type_line`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitTyped {
-    /// `/exit` and Enter went in.
+pub enum Typed {
+    /// The text and Enter went in.
     Sent,
-    /// The input box held other text: the typed `/exit` was erased again
-    /// and nothing was sent (probe TASK-040 P2: a draft plus `/exit` is
-    /// submitted as a prompt).
+    /// The input box showed something else, a draft of the user's: the typed
+    /// text was erased again and nothing was sent (probe TASK-040 P2: a
+    /// draft plus `/exit` is submitted as a prompt).
     Draft,
     /// A console step failed or the box was not found; the typed text, if
     /// any, was erased.
@@ -141,50 +159,67 @@ pub fn input_box(screen: &[String]) -> Option<Vec<String>> {
     )
 }
 
-/// The box shows exactly the typed `/exit` and nothing else. Claude Code
+/// The box shows exactly the typed `text` and nothing else. Claude Code
 /// puts a no-break space after the prompt glyph (probe TASK-040 P2), which
-/// `str::trim` removes like any Unicode space.
-pub fn box_is_exit(lines: &[String]) -> bool {
-    match lines {
-        [line] => line.strip_prefix(PROMPT).map(str::trim) == Some("/exit"),
+/// `str::trim` removes like any Unicode space. A `!` typed into an empty box
+/// switches Claude Code to bash mode, which may show the `!` in place of the
+/// glyph: for a text that starts with `!` that form counts too.
+pub fn box_shows(lines: &[String], text: &str) -> bool {
+    let [line] = lines else {
+        return false;
+    };
+    let text = text.trim();
+    if line.strip_prefix(PROMPT).map(str::trim) == Some(text) {
+        return true;
+    }
+    match (text.strip_prefix('!'), line.strip_prefix('!')) {
+        (Some(command), Some(shown)) => shown.trim() == command.trim(),
         _ => false,
     }
 }
 
-/// Types `/exit` into the console of `claude_pid`, reads the input box back
-/// and presses Enter only when it holds nothing but `/exit`; otherwise erases
-/// the five typed characters (Backspace deletes before the cursor, where
-/// they went). Blocking, under a second.
+/// Types `/exit` with [`type_line`].
+pub fn type_exit(claude_pid: u32) -> Typed {
+    type_line(claude_pid, "/exit")
+}
+
+/// Types `text` into the console of `claude_pid`, reads the input box back
+/// and presses Enter only when it shows nothing but `text`; otherwise erases
+/// the typed characters (Backspace deletes before the cursor, where they
+/// went). A text that is not [`typable`] is not typed. Blocking, under a
+/// second.
 #[cfg(windows)]
-pub fn type_exit(claude_pid: u32) -> ExitTyped {
+pub fn type_line(claude_pid: u32, text: &str) -> Typed {
     use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
 
+    if !typable(text) {
+        return Typed::Failed;
+    }
     let _one = one_at_a_time();
     // SAFETY: plain Win32 calls without pointers; see `press`.
     unsafe {
         SetConsoleCtrlHandler(None, 1);
         FreeConsole();
         if AttachConsole(claude_pid) == 0 {
-            return ExitTyped::Failed;
+            return Typed::Failed;
         }
     }
-    let typed = if write_text("/exit") {
+    let typed = if write_text(text) {
         std::thread::sleep(ECHO_WAIT);
-        let exit = visible_lines()
+        let shown = visible_lines()
             .and_then(|screen| input_box(&screen))
-            .is_some_and(|lines| box_is_exit(&lines));
-        if exit && write_text("\r") {
-            ExitTyped::Sent
+            .map(|lines| box_shows(&lines, text));
+        if shown == Some(true) && write_text("\r") {
+            Typed::Sent
         } else {
-            write_text("\u{8}\u{8}\u{8}\u{8}\u{8}");
-            if exit {
-                ExitTyped::Failed
-            } else {
-                ExitTyped::Draft
+            write_text(&"\u{8}".repeat(text.chars().count()));
+            match shown {
+                Some(false) => Typed::Draft,
+                _ => Typed::Failed,
             }
         }
     } else {
-        ExitTyped::Failed
+        Typed::Failed
     };
     // SAFETY: no arguments.
     unsafe {
@@ -194,12 +229,12 @@ pub fn type_exit(claude_pid: u32) -> ExitTyped {
 }
 
 #[cfg(not(windows))]
-pub fn type_exit(_claude_pid: u32) -> ExitTyped {
-    ExitTyped::Failed
+pub fn type_line(_claude_pid: u32, _text: &str) -> Typed {
+    Typed::Failed
 }
 
 /// One console attachment at a time in this process: [`press`] and
-/// [`type_exit`] both detach from and attach to a console.
+/// [`type_line`] both detach from and attach to a console.
 #[cfg(windows)]
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -365,8 +400,8 @@ mod tests {
         ]);
         let found = input_box(&idle).unwrap();
         assert_eq!(found, ["❯\u{a0}/exit"]);
-        assert!(box_is_exit(&found));
-        assert!(box_is_exit(&screen(&["❯ /exit  "])));
+        assert!(box_shows(&found, "/exit"));
+        assert!(box_shows(&screen(&["❯ /exit  "]), "/exit"));
         // A draft before or after the cursor (P2 safe_draft), a second
         // line, an empty box, no prompt glyph: no exit.
         for lines in [
@@ -377,7 +412,7 @@ mod tests {
             &[],
             &["/exit"],
         ] {
-            assert!(!box_is_exit(&screen(lines)), "{lines:?}");
+            assert!(!box_shows(&screen(lines), "/exit"), "{lines:?}");
         }
         assert_eq!(input_box(&screen(&[RULE, "❯ x"])), None);
         assert_eq!(
@@ -385,6 +420,52 @@ mod tests {
             None,
             "short rules are not rules"
         );
+    }
+
+    #[test]
+    fn any_typed_line_is_checked_and_a_bang_may_become_the_prompt() {
+        let shows = |lines: &[&str], text: &str| box_shows(&screen(lines), text);
+        assert!(shows(
+            &["❯\u{a0}/compact keep the plan"],
+            "/compact keep the plan"
+        ));
+        assert!(shows(&["❯\u{a0}!echo hi"], "!echo hi"));
+        // Bash mode: the `!` stands where the glyph was.
+        assert!(shows(&["!\u{a0}echo hi"], "!echo hi"));
+        assert!(shows(&["! echo hi"], "! echo hi"));
+        for (lines, text) in [
+            (&["❯\u{a0}draft!echo hi"][..], "!echo hi"),
+            (&["! draft!echo hi"], "!echo hi"),
+            // A box already in bash mode takes the typed `!` as text.
+            (&["! !echo hi"], "!echo hi"),
+            (&["! echo hi"], "/echo hi"),
+            (&["❯\u{a0}/compact", "  more"], "/compact"),
+            (&["❯"], "/compact"),
+        ] {
+            assert!(!shows(lines, text), "{lines:?} {text}");
+        }
+    }
+
+    #[test]
+    fn only_one_short_plain_line_is_typable() {
+        assert!(typable("!echo hi"));
+        assert!(typable("/model sonnet"));
+        assert!(typable("!echo привет"));
+        assert!(typable(&"x".repeat(MAX_LINE_CHARS)));
+        for text in [
+            "",
+            "   ",
+            "!echo a\nb",
+            "!echo a\rb",
+            "/x\u{1b}[A",
+            "/x\u{8}",
+            "/x\ty",
+            "/x\u{2028}y",
+            "!echo \u{1F600}",
+        ] {
+            assert!(!typable(text), "{text:?}");
+        }
+        assert!(!typable(&"x".repeat(MAX_LINE_CHARS + 1)));
     }
 
     // `press` itself is not called here: it detaches the calling process

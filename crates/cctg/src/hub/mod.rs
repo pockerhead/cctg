@@ -4,6 +4,7 @@ pub mod api;
 pub mod buffer;
 pub mod commands;
 pub mod config;
+pub mod console;
 pub mod ingress;
 pub mod offset;
 pub mod permissions;

@@ -6,7 +6,9 @@
 //! thinking, cut short. The final answer of a turn is not part of it: the hub
 //! sends it from the `Stop` hook. Calls of cctg's own `reply` tool are not
 //! shown. Telegram messages taken into work are reported by their
-//! `message_id`, never by their text.
+//! `message_id`, never by their text. A `!` command typed in the terminal
+//! shows as a prompt `! command`, and its output, like the output of a local
+//! slash command (`/cost`, `/model`), as a short code block (TASK-043).
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -49,6 +51,9 @@ const SOURCE: &str = "cctg";
 const REPLY_CALL: &str = "mcp__cctg__reply";
 /// Graphemes of one thinking block the stream shows.
 pub const THINKING_LIMIT: usize = 1000;
+/// Lines and graphemes of one command output the stream shows.
+pub const OUTPUT_LINES: usize = 20;
+pub const OUTPUT_LIMIT: usize = 1500;
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -103,6 +108,10 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
                 }
             }
             (Role::User, Block::Text(text)) => {
+                if let Some(event) = console_record(text) {
+                    events.extend(event);
+                    continue;
+                }
                 match render::user_text(&turn, text) {
                     // Claude Code's own line after Esc: not a prompt, and no
                     // new turn starts with it.
@@ -176,6 +185,94 @@ fn thinking(line: &str) -> Vec<StreamEvent> {
         .filter(|text| !text.is_empty())
         .map(|text| StreamEvent::Thinking(cut(text, THINKING_LIMIT)))
         .collect()
+}
+
+/// Claude Code's own records of the terminal console, `None` for any other
+/// text: `<bash-input>` (a `!` command) gives a prompt `! command`;
+/// `<bash-stdout>` + `<bash-stderr>` (its output) and
+/// `<local-command-stdout>` (the output of a local slash command) give a
+/// note with the output as a code block, or nothing when it is blank.
+fn console_record(text: &str) -> Option<Option<StreamEvent>> {
+    let text = text.trim();
+    if text.starts_with("<bash-input>") {
+        let command = inside(text, "bash-input")?.trim();
+        return Some((!command.is_empty()).then(|| StreamEvent::Prompt(format!("! {command}"))));
+    }
+    let parts = if text.starts_with("<bash-stdout>") {
+        [inside(text, "bash-stdout"), inside(text, "bash-stderr")]
+    } else if text.starts_with("<local-command-stdout>") {
+        [
+            inside(text, "local-command-stdout"),
+            inside(text, "local-command-stderr"),
+        ]
+    } else {
+        return None;
+    };
+    let output = parts
+        .into_iter()
+        .flatten()
+        .map(plain)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((!output.is_empty()).then(|| StreamEvent::Note(code_block(&output))))
+}
+
+/// The text between `<name>` and the next `</name>`.
+fn inside<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let start = text.find(&open)? + open.len();
+    let len = text[start..].find(&format!("</{name}>"))?;
+    Some(&text[start..start + len])
+}
+
+/// Terminal output as plain text: ANSI escape sequences (colours) and other
+/// control characters but newlines and tabs dropped, surrounding blank space
+/// trimmed.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // CSI: `ESC [`, parameters, one final byte in `@`..=`~`.
+            '\u{1b}' if chars.peek() == Some(&'[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// `output`, cut to [`OUTPUT_LINES`] lines and [`OUTPUT_LIMIT`] graphemes, as
+/// a fenced code block whose fence is longer than any run of backticks in it.
+fn code_block(output: &str) -> String {
+    let mut lines = output.lines();
+    let mut text = lines
+        .by_ref()
+        .take(OUTPUT_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = lines.next().is_some();
+    text = cut(&text, OUTPUT_LIMIT);
+    if more && !text.ends_with('\u{2026}') {
+        text.push_str("\n\u{2026}");
+    }
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
 }
 
 /// `text` cut to `limit` graphemes; a cut drops trailing whitespace and ends

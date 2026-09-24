@@ -23,7 +23,8 @@
 //!
 //! On Windows the agent also presses Esc in its claude's console when the
 //! hub asks (`console_key`, see [`crate::keys`]) and answers whether the key
-//! events were written.
+//! events were written, and types a one-line command into its input box
+//! (`console_command`, TASK-043) and answers what became of it.
 //!
 //! Update (TASK-040): the agent runs as `cctg agent-worker` under the
 //! `cctg agent` shim ([`crate::shim`]) and registers with its build
@@ -53,15 +54,15 @@ use tokio::time::{Instant, sleep_until};
 use crate::channel::{self, Hub, NoHub};
 use crate::client;
 use crate::device::{self, DeviceConfig};
-use crate::keys::{self, ExitTyped};
+use crate::keys::{self, Typed};
 use crate::proctree;
 use crate::shim;
 use crate::spool;
 use crate::tail;
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
-    self, AgentMsg, Client, ConsoleKey, HubMsg, Register, Rejection, Secret, UpdateOutcome,
-    WireError,
+    self, AgentMsg, Client, CommandOutcome, ConsoleKey, HubMsg, Register, Rejection, Secret,
+    UpdateOutcome, WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -372,6 +373,15 @@ pub enum Frame {
 
 /// Writes one key into the claude console; `false` when it was not written.
 pub type Presser = Arc<dyn Fn(ConsoleKey) -> bool + Send + Sync>;
+/// Types one line into the input box of the claude console ([`keys::type_line`]).
+pub type Typist = Arc<dyn Fn(&str) -> Typed + Send + Sync>;
+
+/// What the agent can do in its claude's console.
+#[derive(Clone)]
+pub struct Console {
+    pub press: Presser,
+    pub type_line: Typist,
+}
 
 /// Runs the worker agent (`cctg agent-worker`, started by the shim) until
 /// stdin closes. Returns the exit code: [`shim::HANDOVER`] after handing over
@@ -384,14 +394,15 @@ pub async fn run_stdio() -> i32 {
     // claude, or unset (TASK-004). The shim between claude and this worker
     // is no claude and the walk passes it.
     let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
-    let presser: Option<Presser> = claude_pid
-        .filter(|_| keys::SUPPORTED)
-        .map(|pid| Arc::new(move |key| keys::press(pid, key)) as Presser);
+    let console = claude_pid.filter(|_| keys::SUPPORTED).map(|pid| Console {
+        press: Arc::new(move |key| keys::press(pid, key)),
+        type_line: Arc::new(move |text: &str| keys::type_line(pid, text)),
+    });
     let mut worker = Worker::from_env(
         |name| std::env::var(name).ok(),
         claude_pid,
         config.state_dir.clone(),
-        presser.is_some(),
+        console.is_some(),
     );
     // Only the `cctg run` that started this claude restarts it; an inherited
     // `CCTG_RUN` of another session's terminal does not count.
@@ -434,7 +445,8 @@ pub async fn run_stdio() -> i32 {
                 claude_pid,
                 verdict_ack: true,
                 transcript_reads: true,
-                console_keys: presser.is_some(),
+                console_keys: console.is_some(),
+                console_commands: console.is_some(),
                 client,
             };
             let (outbox, events) = spawn(LinkConfig {
@@ -463,7 +475,7 @@ pub async fn run_stdio() -> i32 {
         hub,
         events,
         projects,
-        presser,
+        console,
         worker,
     )
     .await
@@ -563,8 +575,8 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
 /// when stdin ends (the hub link stops with it) or stdout fails. Transcript
 /// reads are answered only from under `projects` ([`tail::projects_root`]).
-/// Console keys are pressed with `presser`; without one a `console_key` is
-/// answered as failed.
+/// Console keys are pressed and commands typed with `console`; without one
+/// a `console_key` or `console_command` is answered as failed.
 ///
 /// `worker` (TASK-040): the worker's place, for `update`. A resumed worker
 /// starts with the channel initialized. On `update` see [`crate::update`]:
@@ -579,13 +591,13 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     hub: Hub,
     mut events: Option<mpsc::Receiver<LinkEvent>>,
     projects: Option<PathBuf>,
-    presser: Option<Presser>,
+    console: Option<Console>,
     worker: Option<Arc<Worker>>,
 ) -> std::io::Result<Ended> {
-    let (reads, keys, outbox) = match &hub {
+    let (reads, console_jobs, outbox) = match &hub {
         Hub::Link(outbox) => (
             Some(spawn_reader(outbox.clone(), projects)),
-            Some(spawn_presser(outbox.clone(), presser)),
+            Some(spawn_console(outbox.clone(), console)),
             Some(outbox.clone()),
         ),
         Hub::Off(_) => (None, None, None),
@@ -701,19 +713,19 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                             let typed = match worker.clone() {
                                 Some(worker) => tokio::task::spawn_blocking(move || worker.restart(&session_id))
                                     .await
-                                    .unwrap_or(ExitTyped::Failed),
-                                None => ExitTyped::Failed,
+                                    .unwrap_or(Typed::Failed),
+                                None => Typed::Failed,
                             };
                             info!(?typed, "claude restart");
                             match typed {
-                                ExitTyped::Sent => {
+                                Typed::Sent => {
                                     leaving = Some(Leaving::Exiting {
                                         update_id,
                                         until: Instant::now() + EXIT_WAIT,
                                     });
                                 }
-                                ExitTyped::Draft => answer(update_id, UpdateOutcome::DraftInInput).await,
-                                ExitTyped::Failed => answer(update_id, UpdateOutcome::Failed).await,
+                                Typed::Draft => answer(update_id, UpdateOutcome::DraftInInput).await,
+                                Typed::Failed => answer(update_id, UpdateOutcome::Failed).await,
                             }
                         }
                         other => {
@@ -737,10 +749,20 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                 Some(LinkEvent::Message(HubMsg::ConsoleKey { key_id, key })) => {
                     // Presses queue up; one beyond the queue is dropped (the
                     // hub takes a missing answer as nothing done).
-                    if let Some(keys) = &keys
-                        && keys.try_send((key_id, key)).is_err()
+                    if let Some(console_jobs) = &console_jobs
+                        && console_jobs.try_send(ConsoleJob::Key(key_id, key)).is_err()
                     {
                         debug!("console key queue full; key dropped");
+                    }
+                    Vec::new()
+                }
+                Some(LinkEvent::Message(HubMsg::ConsoleCommand { command_id, text })) => {
+                    // Like keys: one beyond the queue is dropped, the hub
+                    // forgets an unanswered command.
+                    if let Some(console_jobs) = &console_jobs
+                        && console_jobs.try_send(ConsoleJob::Line(command_id, text)).is_err()
+                    {
+                        debug!("console queue full; command dropped");
                     }
                     Vec::new()
                 }
@@ -826,32 +848,60 @@ fn spawn_reader(
     requests
 }
 
-/// The one worker that presses console keys off the loop, one at a time (a
-/// console is attached per process), and answers each with
-/// `console_key_written`.
-fn spawn_presser(
+/// A key to press or a line to type, with the hub's id for the answer.
+enum ConsoleJob {
+    Key(u64, ConsoleKey),
+    Line(u64, String),
+}
+
+/// The one worker that presses console keys and types commands off the
+/// loop, one at a time (a console is attached per process), and answers
+/// each with `console_key_written` or `console_command_typed`. A line that
+/// is not [`keys::typable`] is answered as failed without typing.
+fn spawn_console(
     outbox: mpsc::Sender<AgentMsg>,
-    presser: Option<Presser>,
-) -> mpsc::Sender<(u64, ConsoleKey)> {
-    let (requests, mut pending) = mpsc::channel::<(u64, ConsoleKey)>(4);
+    console: Option<Console>,
+) -> mpsc::Sender<ConsoleJob> {
+    let (requests, mut pending) = mpsc::channel::<ConsoleJob>(4);
     tokio::spawn(async move {
-        while let Some((key_id, key)) = pending.recv().await {
-            let written = match presser.clone() {
-                Some(press) => tokio::task::spawn_blocking(move || press(key))
-                    .await
-                    .unwrap_or(false),
-                None => false,
+        while let Some(job) = pending.recv().await {
+            let answer = match job {
+                ConsoleJob::Key(key_id, key) => {
+                    let written = match console.clone() {
+                        Some(console) => tokio::task::spawn_blocking(move || (console.press)(key))
+                            .await
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if written {
+                        info!(?key, "console key written");
+                    } else {
+                        warn!(?key, "console key not written");
+                    }
+                    AgentMsg::ConsoleKeyWritten { key_id, written }
+                }
+                ConsoleJob::Line(command_id, text) => {
+                    let typed = match console.clone().filter(|_| keys::typable(&text)) {
+                        Some(console) => {
+                            tokio::task::spawn_blocking(move || (console.type_line)(&text))
+                                .await
+                                .unwrap_or(Typed::Failed)
+                        }
+                        None => Typed::Failed,
+                    };
+                    info!(?typed, "console command");
+                    let outcome = match typed {
+                        Typed::Sent => CommandOutcome::Sent,
+                        Typed::Draft => CommandOutcome::Draft,
+                        Typed::Failed => CommandOutcome::Failed,
+                    };
+                    AgentMsg::ConsoleCommandTyped {
+                        command_id,
+                        outcome,
+                    }
+                }
             };
-            if written {
-                info!(?key, "console key written");
-            } else {
-                warn!(?key, "console key not written");
-            }
-            if outbox
-                .send(AgentMsg::ConsoleKeyWritten { key_id, written })
-                .await
-                .is_err()
-            {
+            if outbox.send(answer).await.is_err() {
                 return;
             }
         }
@@ -908,6 +958,7 @@ mod tests {
             verdict_ack: true,
             transcript_reads: true,
             console_keys: false,
+            console_commands: false,
             client: None,
         }
     }
@@ -1649,7 +1700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_console_key_is_pressed_answered_and_never_reaches_claude() {
+    async fn console_keys_and_commands_are_answered_and_never_reach_claude() {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
@@ -1663,6 +1714,22 @@ mod tests {
             seen.push(key);
             seen.len() == 1
         });
+        let typed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = typed.clone();
+        // The first line goes in, the second finds a draft.
+        let typist: Typist = Arc::new(move |text: &str| {
+            let mut seen = seen.lock().unwrap();
+            seen.push(text.to_owned());
+            if seen.len() == 1 {
+                Typed::Sent
+            } else {
+                Typed::Draft
+            }
+        });
+        let console = Console {
+            press: presser,
+            type_line: typist,
+        };
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 16);
         tokio::spawn(serve_channel(
@@ -1671,7 +1738,7 @@ mod tests {
             Hub::Link(outbox),
             Some(events),
             None,
-            Some(presser),
+            Some(console),
             None,
         ));
         let mut claude = Claude {
@@ -1703,6 +1770,28 @@ mod tests {
             *pressed.lock().unwrap(),
             [ConsoleKey::Interrupt, ConsoleKey::Interrupt]
         );
+        for (command_id, text) in [(9, "!echo hi"), (10, "/compact"), (11, "!echo a\nb")] {
+            let command = HubMsg::ConsoleCommand {
+                command_id,
+                text: text.into(),
+            };
+            wire::write_msg(&mut write, &command).await.unwrap();
+        }
+        for (command_id, outcome) in [
+            (9, CommandOutcome::Sent),
+            (10, CommandOutcome::Draft),
+            // Two lines are never typed.
+            (11, CommandOutcome::Failed),
+        ] {
+            assert_eq!(
+                agent_line(&mut reader).await,
+                AgentMsg::ConsoleCommandTyped {
+                    command_id,
+                    outcome
+                }
+            );
+        }
+        assert_eq!(*typed.lock().unwrap(), ["!echo hi", "/compact"]);
         // Claude Code saw nothing of it.
         claude
             .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
@@ -1733,6 +1822,18 @@ mod tests {
             AgentMsg::ConsoleKeyWritten {
                 key_id: 1,
                 written: false
+            }
+        );
+        let command = HubMsg::ConsoleCommand {
+            command_id: 2,
+            text: "!echo hi".into(),
+        };
+        wire::write_msg(&mut write, &command).await.unwrap();
+        assert_eq!(
+            agent_line(&mut reader).await,
+            AgentMsg::ConsoleCommandTyped {
+                command_id: 2,
+                outcome: CommandOutcome::Failed
             }
         );
     }

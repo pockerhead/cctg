@@ -14,7 +14,8 @@
 //! message type that a peer sends only after the other side announced it in
 //! such a field (`permission_ack`, see [`Register::verdict_ack`];
 //! `transcript_read`, see [`Register::transcript_reads`]; `console_key`,
-//! see [`Register::console_keys`]; `update` and `released`, see
+//! see [`Register::console_keys`]; `console_command`, see
+//! [`Register::console_commands`]; `update` and `released`, see
 //! [`Client::self_update`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
@@ -139,6 +140,11 @@ pub struct Register {
     /// Windows agents that know their claude pid announce it.
     #[serde(default)]
     pub console_keys: bool,
+    /// The agent can type one line into the input box of its Claude Code
+    /// console and answers `console_command` with `console_command_typed`
+    /// (TASK-043). Only Windows agents that know their claude pid announce it.
+    #[serde(default)]
+    pub console_commands: bool,
     /// Which cctg build the agent runs and what it can do about a newer one
     /// (TASK-040). Agents built before leave it out: the hub shows them as
     /// outdated and never sends them `update`.
@@ -213,6 +219,11 @@ pub enum AgentMsg {
         key_id: u64,
         written: bool,
     },
+    /// The answer to one `console_command`: what became of the line.
+    ConsoleCommandTyped {
+        command_id: u64,
+        outcome: CommandOutcome,
+    },
     /// The answer to one `update`. For `reloading` and `restarting` the
     /// agent leaves: the hub stops handing it messages and answers
     /// `released` behind everything already queued for it.
@@ -239,6 +250,22 @@ pub enum UpdateOutcome {
     /// Already up to date: no newer binary, no restart needed.
     UpToDate,
     /// Something failed; nothing changed.
+    Failed,
+    /// An outcome of a newer agent.
+    #[serde(other)]
+    Other,
+}
+
+/// What an agent did with a `console_command`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutcome {
+    /// The line and Enter went into the console input: the box showed
+    /// exactly the line. Not that Claude Code ran it.
+    Sent,
+    /// The input box held a draft: the typed line was erased, nothing sent.
+    Draft,
+    /// Not typed, or typed and erased again for another reason.
     Failed,
     /// An outcome of a newer agent.
     #[serde(other)]
@@ -302,6 +329,7 @@ impl Kinds for AgentMsg {
         "permission_ack",
         "transcript_chunk",
         "console_key_written",
+        "console_command_typed",
         "update_answer",
     ];
 }
@@ -360,6 +388,15 @@ pub enum HubMsg {
         key_id: u64,
         key: ConsoleKey,
     },
+    /// Sent only to an agent that registered with `console_commands`: type
+    /// `text` (one line, a `!` bash command or a slash command) into the
+    /// input box of its Claude Code console, as a user at the terminal
+    /// would, and answer with one `console_command_typed` carrying the same
+    /// `command_id`.
+    ConsoleCommand {
+        command_id: u64,
+        text: String,
+    },
     /// Sent only to an agent whose [`Client::self_update`] is set, on the
     /// user's "Обновить": take a newer binary, or restart claude when
     /// needed; answered with one `update_answer`.
@@ -384,6 +421,7 @@ impl Kinds for HubMsg {
         "permission_verdict",
         "transcript_read",
         "console_key",
+        "console_command",
         "update",
         "released",
     ];
@@ -744,6 +782,7 @@ mod tests {
                 verdict_ack: true,
                 transcript_reads: true,
                 console_keys: true,
+                console_commands: true,
                 client: None,
             }),
             AgentMsg::Reply {
@@ -787,6 +826,10 @@ mod tests {
                 key_id: u64::MAX,
                 written: true,
             },
+            AgentMsg::ConsoleCommandTyped {
+                command_id: u64::MAX,
+                outcome: CommandOutcome::Draft,
+            },
             AgentMsg::UpdateAnswer {
                 update_id: 9,
                 outcome: UpdateOutcome::DraftInInput,
@@ -828,6 +871,10 @@ mod tests {
             HubMsg::ConsoleKey {
                 key_id: 7,
                 key: ConsoleKey::Interrupt,
+            },
+            HubMsg::ConsoleCommand {
+                command_id: 8,
+                text: "!echo \u{2014} hi".into(),
             },
             HubMsg::Update { update_id: 9 },
             HubMsg::Released {
@@ -970,6 +1017,7 @@ mod tests {
                 verdict_ack: false,
                 transcript_reads: false,
                 console_keys: false,
+                console_commands: false,
                 client: None,
             }))
         );
@@ -984,6 +1032,7 @@ mod tests {
             decode::<AgentMsg>(line),
             Ok(AgentMsg::Register(Register {
                 console_keys: true,
+                console_commands: false,
                 client: None,
                 ..
             }))
@@ -1000,6 +1049,15 @@ mod tests {
             let line = format!(r#"{{"v":1,"type":"console_key","key_id":3,"key":"{other}"}}"#);
             assert_eq!(decode::<HubMsg>(line.as_bytes()), Err(WireError::Malformed));
         }
+        // A command outcome of a newer agent is still an answer.
+        let typed = br#"{"v":1,"type":"console_command_typed","command_id":4,"outcome":"queued"}"#;
+        assert_eq!(
+            decode::<AgentMsg>(typed),
+            Ok(AgentMsg::ConsoleCommandTyped {
+                command_id: 4,
+                outcome: CommandOutcome::Other,
+            })
+        );
         // A status line without numbers is still one event.
         let id = EventId::new();
         let body = json!({ "v": 1, "event_id": id.as_str(), "host": "h", "session_id": "s",
@@ -1117,6 +1175,7 @@ mod tests {
             verdict_ack: true,
             transcript_reads: true,
             console_keys: true,
+            console_commands: false,
             client: Some(Client {
                 version: "0.1.0".into(),
                 build: "ab".repeat(32),

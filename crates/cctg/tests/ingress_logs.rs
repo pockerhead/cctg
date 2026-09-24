@@ -106,6 +106,7 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
         verdict_ack: false,
         transcript_reads: false,
         console_keys: false,
+        console_commands: false,
         client: None,
     };
     let mut lines = wire::encode(&AgentMsg::Hello {
