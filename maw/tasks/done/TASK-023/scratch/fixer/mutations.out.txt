@@ -1,0 +1,22 @@
+M1_no_answered_skip KILLED ['test hub::slots::tests::a_turn_end_read_again_lets_only_its_own_answer_go ... FAILED']
+M2_no_overdue KILLED ['test hub::slots::tests::an_answer_held_again_whose_turn_end_is_committed_goes_first_on_the_re_read ... FAILED']
+M3_no_room KILLED ['test hub::slots::tests::a_streamed_answer_past_the_message_cap_is_dropped_untracked ... FAILED']
+M4_no_advance_record KILLED ['test hub::slots::tests::a_turn_end_read_again_lets_only_its_own_answer_go ... FAILED']
+  File "C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-023\scratch\fixer\mutate.py", line 24
+    '            self.answered_ends.push(end);
+    ^
+SyntaxError: unterminated string literal (detected at line 24)
+  File "C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-023\scratch\fixer\mutate.py", line 24
+    '            self.answered_ends.push(end);
+    ^
+SyntaxError: unterminated string literal (detected at line 24)
+  File "C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-023\scratch\fixer\mutate.py", line 24
+    '            self.answered_ends.push(end);
+    ^
+SyntaxError: unterminated string literal (detected at line 24)
+  File "C:\Users\user\dev\cctg\maw\tasks\in_progress\TASK-023\scratch\fixer\mutate.py", line 26
+    '),
+    ^
+SyntaxError: unterminated string literal (detected at line 26)
+M5_no_answered_early KILLED ['test hub::stream::tests::an_answer_gone_by_its_timeout_keeps_its_turn_end ... FAILED']
+M6_no_rewind_retain KILLED ['test hub::stream::tests::an_answer_gone_by_its_timeout_keeps_its_turn_end ... FAILED']

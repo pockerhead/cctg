@@ -1,0 +1,241 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling syn v3.0.6
+   Compiling windows-link v0.2.1
+   Compiling windows-sys v0.61.2
+   Compiling synstructure v0.14.0
+   Compiling cfg-if v1.0.5
+   Compiling getrandom v0.4.3
+   Compiling zerofrom-derive v0.1.8
+   Compiling zerofrom v0.1.8
+   Compiling yoke-derive v0.8.3
+   Compiling stable_deref_trait v1.2.1
+   Compiling yoke v0.8.3
+   Compiling jobserver v0.1.35
+   Compiling find-msvc-tools v0.1.13
+   Compiling shlex v2.0.1
+   Compiling cc v1.4.7
+   Compiling zerovec-derive v0.11.6
+   Compiling zerovec v0.11.8
+   Compiling cmake v0.1.58
+   Compiling displaydoc v0.2.7
+   Compiling fs_extra v1.3.0
+   Compiling dunce v1.0.5
+   Compiling aws-lc-sys v0.45.0
+   Compiling bytes v1.12.1
+   Compiling pin-project-lite v0.2.17
+   Compiling once_cell v1.21.4
+   Compiling futures-core v0.3.34
+   Compiling itoa v1.0.18
+   Compiling smallvec v1.16.1
+   Compiling tinystr v0.8.4
+   Compiling litemap v0.8.3
+   Compiling aws-lc-rs v1.18.1
+   Compiling writeable v0.6.4
+   Compiling icu_locale_core v2.3.0
+   Compiling zerotrie v0.2.5
+   Compiling potential_utf v0.1.6
+   Compiling mio v1.2.3
+   Compiling socket2 v0.6.5
+   Compiling tokio-macros v2.7.2
+   Compiling utf8_iter v1.0.4
+   Compiling zeroize v1.9.0
+   Compiling icu_normalizer_data v2.3.0
+   Compiling icu_properties_data v2.3.0
+   Compiling icu_collections v2.3.0
+   Compiling tokio v1.53.1
+   Compiling icu_provider v2.3.1
+   Compiling http v1.5.0
+   Compiling http-body v1.1.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling tracing-core v0.1.36
+   Compiling futures-task v0.3.34
+   Compiling serde_core v1.0.229
+   Compiling httparse v1.10.1
+   Compiling slab v0.4.12
+   Compiling percent-encoding v2.3.2
+   Compiling untrusted v0.9.0
+   Compiling rustls v0.23.45
+   Compiling rustls-webpki v0.103.15
+   Compiling futures-util v0.3.34
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling syn v2.0.119
+   Compiling subtle v2.6.1
+   Compiling libc v0.2.189
+   Compiling tower-service v0.3.3
+   Compiling zmij v1.0.23
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling tracing-attributes v0.1.31
+   Compiling idna_adapter v1.2.2
+   Compiling futures-channel v0.3.34
+   Compiling anstyle v1.0.14
+   Compiling atomic-waker v1.1.2
+   Compiling once_cell_polyfill v1.70.2
+   Compiling serde v1.0.229
+   Compiling log v0.4.34
+   Compiling utf8parse v0.2.2
+   Compiling serde_json v1.0.151
+   Compiling unicase v2.9.0
+   Compiling mime_guess v2.0.5
+   Compiling anstyle-parse v1.0.0
+   Compiling anstyle-wincon v3.0.11
+   Compiling hyper v1.11.1
+   Compiling idna v1.1.0
+   Compiling tracing v0.1.44
+   Compiling form_urlencoded v1.2.2
+   Compiling sync_wrapper v1.0.2
+   Compiling anstyle-query v1.1.5
+   Compiling serde_derive v1.0.229
+   Compiling memchr v2.8.3
+   Compiling tower-layer v0.3.3
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling ipnet v2.12.2
+   Compiling base64 v0.22.1
+   Compiling colorchoice v1.0.5
+   Compiling anstream v1.0.0
+   Compiling hyper-util v0.1.20
+   Compiling tower v0.5.3
+   Compiling url v2.5.8
+   Compiling tokio-rustls v0.26.5
+   Compiling lazy_static v1.5.0
+   Compiling mime v0.3.17
+   Compiling thiserror v2.0.20
+   Compiling bitflags v2.13.2
+   Compiling anyhow v1.0.104
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.0
+   Compiling heck v0.5.0
+   Compiling clap_derive v4.6.4
+   Compiling clap_builder v4.6.6
+   Compiling tower-http v0.6.11
+   Compiling sharded-slab v0.1.7
+   Compiling hyper-rustls v0.27.10
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling tracing-log v0.2.0
+   Compiling http-body-util v0.1.5
+   Compiling thread_local v1.1.10
+   Compiling nu-ansi-term v0.50.3
+   Compiling thiserror-impl v2.0.20
+   Compiling base64 v0.23.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+   Compiling reqwest v0.13.5
+   Compiling tracing-subscriber v0.3.23
+   Compiling clap v4.6.6
+   Compiling dotenvy v0.15.7
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 2m 43s
+     Running unittests src\lib.rs (C:\Users\user\AppData\Local\Temp/cctg-023-fix3-target\debug\deps\cctg-153a26ffdcdb83a3.exe)
+
+running 1 test
+test hub::stream::tests::a_turn_end_read_again_by_two_rewinds_is_not_claimable ... FAILED
+
+failures:
+
+---- hub::stream::tests::a_turn_end_read_again_by_two_rewinds_is_not_claimable stdout ----
+
+thread 'hub::stream::tests::a_turn_end_read_again_by_two_rewinds_is_not_claimable' (2872) panicked at crates\cctg\src\hub\stream.rs:844:13:
+nothing to claim
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    hub::stream::tests::a_turn_end_read_again_by_two_rewinds_is_not_claimable
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 376 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p cctg --lib`
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 12.50s
+     Running tests\stream_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-023-fix3-target\debug\deps\stream_e2e-1490fcb4bb3bda80.exe)
+
+running 2 tests
+test e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early ... FAILED
+test e2e_six_turns_with_refusals_keep_every_answer_in_place ... FAILED
+
+failures:
+
+---- e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early stdout ----
+stream accepted=true restart=true ["> warm"]
+stream accepted=true restart=false ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓"]
+stream accepted=true restart=false ["ANS-1"]
+stream accepted=false restart=false ["> t2"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓"]
+stream accepted=false restart=false ["> t2"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=true restart=false ["• Bash: t2c0 ✓"]
+stream accepted=true restart=false ["ANS-2"]
+stream accepted=true restart=false ["ANS-3"]
+stream accepted=true restart=false ["> t3"]
+stream accepted=true restart=false ["• Bash: t3c0 ✓"]
+
+thread 'e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early' (40708) panicked at crates\cctg\tests\stream_e2e.rs:1008:5:
+assertion `left == right` failed: got ["> warm", "> t1", "• Bash: t1c0 ✓", "ANS-1", "> t1", "• Bash: t1c0 ✓", "> t1", "• Bash: t1c0 ✓", "> t2", "• Bash: t2c0 ✓", "ANS-2", "ANS-3", "> t3", "• Bash: t3c0 ✓"]
+  left: ["> warm", "> t1", "• Bash: t1c0 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "ANS-2", "ANS-3", "> t3", "• Bash: t3c0 ✓"]
+ right: ["> warm", "> t1", "• Bash: t1c0 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- e2e_six_turns_with_refusals_keep_every_answer_in_place stdout ----
+stream accepted=true restart=true ["> warm"]
+stream accepted=true restart=false ["> t1"]
+stream accepted=false restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=false restart=false ["ANS-1"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=false ["ANS-1"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=false restart=false ["• Bash: t2c0 ✓", "• Bash: t2c1 ✓"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=true restart=false ["• Bash: t2c0 ✓", "• Bash: t2c1 ✓"]
+stream accepted=true restart=false ["ANS-2"]
+stream accepted=true restart=false ["> t3"]
+stream accepted=true restart=false ["• Bash: t3c0 ✓"]
+stream accepted=true restart=false ["ANS-3"]
+stream accepted=true restart=false ["> t4"]
+stream accepted=true restart=false ["• Bash: t4c0 ✓"]
+stream accepted=false restart=false ["ANS-4"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=true restart=false ["• Bash: t2c0 ✓", "• Bash: t2c1 ✓"]
+stream accepted=true restart=false ["> t3"]
+stream accepted=true restart=false ["• Bash: t3c0 ✓"]
+stream accepted=true restart=false ["> t4"]
+stream accepted=true restart=false ["• Bash: t4c0 ✓"]
+stream accepted=true restart=false ["ANS-4"]
+stream accepted=true restart=false ["ANS-5"]
+stream accepted=false restart=false ["> t5"]
+stream accepted=true restart=true ["> t5"]
+stream accepted=true restart=false ["• Bash: t5c0 ✓", "• Bash: t5c1 ✓"]
+stream accepted=true restart=false ["> t6"]
+stream accepted=false restart=false ["• Bash: t6c0 ✓"]
+stream accepted=true restart=true ["> t5"]
+stream accepted=true restart=false ["• Bash: t5c0 ✓", "• Bash: t5c1 ✓"]
+stream accepted=true restart=false ["ANS-6"]
+stream accepted=true restart=false ["> t6"]
+stream accepted=true restart=false ["• Bash: t6c0 ✓"]
+
+thread 'e2e_six_turns_with_refusals_keep_every_answer_in_place' (30732) panicked at crates\cctg\tests\stream_e2e.rs:1008:5:
+assertion `left == right` failed: got ["> warm", "> t1", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "ANS-1", "> t2", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3", "> t4", "• Bash: t4c0 ✓", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "> t3", "• Bash: t3c0 ✓", "> t4", "• Bash: t4c0 ✓", "ANS-4", "ANS-5", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "> t6", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "ANS-6", "> t6", "• Bash: t6c0 ✓"]
+  left: ["> warm", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3", "> t4", "• Bash: t4c0 ✓", "ANS-4", "ANS-5", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "> t6", "ANS-6", "• Bash: t6c0 ✓"]
+ right: ["> warm", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3", "> t4", "• Bash: t4c0 ✓", "ANS-4", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "ANS-5", "> t6", "• Bash: t6c0 ✓", "ANS-6"]
+
+
+failures:
+    e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early
+    e2e_six_turns_with_refusals_keep_every_answer_in_place
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 9 filtered out; finished in 13.11s
+
+error: test failed, to rerun pass `-p cctg --test stream_e2e`

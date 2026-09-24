@@ -1,0 +1,40 @@
+   Compiling thiserror-impl v2.0.20
+   Compiling base64 v0.23.1
+   Compiling unicode-segmentation v1.13.3
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+   Compiling reqwest v0.13.5
+   Compiling tracing-subscriber v0.3.23
+   Compiling clap v4.6.6
+   Compiling dotenvy v0.15.7
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 2m 49s
+     Running tests\stream_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-023-target\debug\deps\stream_e2e-1490fcb4bb3bda80.exe)
+
+running 1 test
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... FAILED
+
+failures:
+
+---- e2e_answer_after_a_refused_line_still_follows_its_lines stdout ----
+stream accepted=true restart=true ["> gamma warm"]
+stream accepted=true restart=false ["> gamma run"]
+stream accepted=false restart=false ["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓"]
+stream accepted=true restart=true ["> gamma run"]
+stream accepted=false restart=false ["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+send accepted=true "GAMMA DONE"
+stream accepted=true restart=true ["> gamma run"]
+stream accepted=true restart=false ["• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+
+thread 'e2e_answer_after_a_refused_line_still_follows_its_lines' (39596) panicked at crates\cctg\tests\stream_e2e.rs:793:5:
+assertion `left == right` failed: got ["> gamma warm", "> gamma run", "> gamma run", "GAMMA DONE", "> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+  left: ["> gamma warm", "> gamma run", "GAMMA DONE", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓"]
+ right: ["> gamma warm", "> gamma run", "• Bash: c00 ✓", "• Bash: c01 ✓", "• Bash: c02 ✓", "• Bash: c03 ✓", "• Bash: c04 ✓", "• Bash: c05 ✓", "• Bash: c06 ✓", "• Bash: c07 ✓", "• Bash: c08 ✓", "• Bash: c09 ✓", "• Bash: c10 ✓", "• Bash: c11 ✓", "• Bash: c12 ✓", "• Bash: c13 ✓", "• Bash: c14 ✓", "• Bash: c15 ✓", "GAMMA DONE"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    e2e_answer_after_a_refused_line_still_follows_its_lines
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.81s
+
+error: test failed, to rerun pass `-p cctg --test stream_e2e`

@@ -1133,25 +1133,31 @@ impl Slots {
             return;
         };
         if let Some(live) = self.streams.get_mut(session).filter(|_| streamed) {
-            // A turn end read already: the lines before it are out.
             let now = Instant::now();
-            if !live.claim_end(now) {
-                // The lines of this turn up to its end in the transcript go
-                // first, for at most `hold_answer`.
-                let oldest = (live.held.len() >= stream::MAX_HELD)
-                    .then(|| live.held.pop_front())
-                    .flatten();
-                live.held.push_back(Held {
-                    thread_id,
-                    answer: answer.to_owned(),
-                    until: now + self.options.hold_answer,
-                });
-                live.next_read = Some(now);
-                if let Some(oldest) = oldest {
-                    self.release(session, oldest);
-                }
+            let mut held = Held {
+                thread_id,
+                answer: answer.to_owned(),
+                until: now + self.options.hold_answer,
+                end: None,
+            };
+            if let Some(end) = live.claim_end(now) {
+                // A turn end read already: the lines before it are handed
+                // out, and the answer rides the stream behind them.
+                held.end = Some(end);
+                self.release(session, held);
                 return;
             }
+            // The lines of this turn up to its end in the transcript go
+            // first, for at most `hold_answer`.
+            let oldest = (live.held.len() >= stream::MAX_HELD)
+                .then(|| live.held.pop_front())
+                .flatten();
+            live.held.push_back(held);
+            live.next_read = Some(now);
+            if let Some(oldest) = oldest {
+                self.release(session, oldest);
+            }
+            return;
         }
         if answer.trim().is_empty() {
             return;
@@ -1166,13 +1172,47 @@ impl Slots {
         }
     }
 
+    /// Sends a turn answer. A streamed session's answer rides its stream
+    /// (see [`answer_ops`]), so it never shows before a stream line queued
+    /// earlier, refused or not.
     fn release(&mut self, session: &str, held: Held) {
+        let streamed = self.stream_target(session).is_some();
+        let room = MAX_QUEUED_MESSAGES.saturating_sub(self.queued_messages);
+        let held = match self.streams.get_mut(session).filter(|_| streamed) {
+            Some(live) => match answer_ops(live, held, room) {
+                Ok(ops) => {
+                    self.stream_answer(session, ops);
+                    return;
+                }
+                Err(held) => held,
+            },
+            None => held,
+        };
         if held.answer.trim().is_empty() {
             return;
         }
         if let Some(parts) = self.send_text(held.thread_id, session, &held.answer, "answer") {
             info!(session = short(session), parts, "turn answer queued");
         }
+    }
+
+    /// Hands the stream messages of a turn answer to the dispatch task.
+    fn stream_answer(&mut self, session: &str, ops: Vec<(u64, Op)>) {
+        if ops.is_empty() {
+            return;
+        }
+        let parts = ops.len();
+        for (number, op) in ops {
+            self.queued_messages += 1;
+            self.hand_off(
+                Work::Stream {
+                    session: session.to_owned(),
+                    number,
+                },
+                op,
+            );
+        }
+        info!(session = short(session), parts, "turn answer queued");
     }
 
     /// Sets the bot's reaction on a topic message; failures are only logged.
@@ -1270,7 +1310,10 @@ impl Slots {
                 .front()
                 .is_some_and(|held| target.is_none() || now >= held.until)
             {
-                released.extend(live.held.pop_front());
+                if let Some(held) = live.held.pop_front() {
+                    live.answered_early(&held);
+                    released.push(held);
+                }
             }
             for held in released {
                 self.release(&session, held);
@@ -1319,7 +1362,8 @@ impl Slots {
         } = chunk;
         enum Action {
             Stream(u64, Op),
-            Release,
+            Answer(Vec<(u64, Op)>),
+            Release(Held),
             React(i64),
         }
         let now = Instant::now();
@@ -1406,10 +1450,18 @@ impl Slots {
         }
         let mut actions = Vec::new();
         let mut queued = self.queued_messages;
+        // Answers held again whose turn end this read starts after go first.
+        for held in live.overdue(from) {
+            match answer_ops(live, held, MAX_QUEUED_MESSAGES.saturating_sub(queued)) {
+                Ok(ops) => {
+                    queued += ops.len();
+                    actions.push(Action::Answer(ops));
+                }
+                Err(held) => actions.push(Action::Release(held)),
+            }
+        }
         let mut read_to = to;
         let mut stopped = false;
-        // Held answers this chunk lets go; the rest of its turn ends count.
-        let mut releases = 0;
         for (index, line) in lines.iter().enumerate() {
             // The first line always goes (the read was asked with room); the
             // rest wait in the file while Telegram is behind.
@@ -1440,15 +1492,18 @@ impl Slots {
                         actions.push(Action::React(message_id));
                     }
                     Step::NewTurn => live.lapse_ends(now + hold),
-                    Step::TurnEnd if live.held.len() <= releases => {
-                        live.ends_unclaimed = live
-                            .ends_unclaimed
-                            .saturating_add(1)
-                            .min(stream::MAX_HELD as u8);
-                    }
+                    // The held answer goes right after the lines of its turn.
                     Step::TurnEnd => {
-                        releases += 1;
-                        actions.push(Action::Release);
+                        if let Some(held) = live.turn_end(line.end) {
+                            let room = MAX_QUEUED_MESSAGES.saturating_sub(queued);
+                            match answer_ops(live, held, room) {
+                                Ok(ops) => {
+                                    queued += ops.len();
+                                    actions.push(Action::Answer(ops));
+                                }
+                                Err(held) => actions.push(Action::Release(held)),
+                            }
+                        }
                     }
                 }
             }
@@ -1469,15 +1524,8 @@ impl Slots {
                         op,
                     );
                 }
-                Action::Release => {
-                    let held = self
-                        .streams
-                        .get_mut(session)
-                        .and_then(|live| live.held.pop_front());
-                    if let Some(held) = held {
-                        self.release(session, held);
-                    }
-                }
+                Action::Answer(ops) => self.stream_answer(session, ops),
+                Action::Release(held) => self.release(session, held),
                 Action::React(message_id) => self.react(message_id, stream::WORKING),
             }
         }
@@ -1528,7 +1576,12 @@ impl Slots {
                 .and_then(|entry| entry.stream.as_ref())
                 .map(|stream| (stream.offset, stream.calls.clone()))
                 .unwrap_or_default();
-            live.rewind(offset, calls, Instant::now() + self.options.stream_retry);
+            live.rewind(
+                offset,
+                calls,
+                Instant::now() + self.options.stream_retry,
+                self.options.hold_answer,
+            );
         }
     }
 
@@ -2372,6 +2425,46 @@ impl Slots {
     }
 }
 
+/// The stream messages of turn answer `held`: its `split_for_telegram`
+/// chunks in order, the last one carrying the answer so a rewind can hold it
+/// again (see [`Live::rewind`]). Like stream lines they wait behind a refused
+/// line of their topic. `Err`: the answer goes outside the stream, as a file,
+/// or not at all when its messages do not fit in `room` (the messages that
+/// may still wait for Telegram, [`MAX_QUEUED_MESSAGES`]): nothing is tracked
+/// for an answer [`Slots::send_text`] then drops. Either way, and for a blank
+/// answer, its turn end counts as answered ([`Live::answered_outside`]).
+fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>, Held> {
+    if held.answer.trim().is_empty() {
+        live.answered_outside(&held);
+        return Ok(Vec::new());
+    }
+    let split = split_for_telegram(&held.answer, SplitOptions::default());
+    if split.prefer_file || split.chunks.len() > room {
+        live.answered_outside(&held);
+        return Err(held);
+    }
+    let thread_id = held.thread_id;
+    let mut chunks = split.chunks;
+    let Some(last) = chunks.pop() else {
+        live.answered_outside(&held);
+        return Ok(Vec::new());
+    };
+    let op = |live: &mut Live, text| Op::Stream {
+        thread_id,
+        text,
+        merge: false,
+        restart: std::mem::take(&mut live.restart),
+    };
+    let mut ops = Vec::with_capacity(chunks.len() + 1);
+    for text in chunks {
+        let message = op(live, text);
+        ops.push((live.sent(), message));
+    }
+    let message = op(live, last);
+    ops.push((live.sent_answer(held), message));
+    Ok(ops)
+}
+
 fn message_op(thread_id: i64, text: String) -> Op {
     Op::Send {
         thread_id: Some(thread_id),
@@ -2443,6 +2536,7 @@ async fn save_loop(store: RegistryStore, mut saves: watch::Receiver<Option<Arc<V
 mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::hub::api::{ForumTopic, Message};
@@ -6125,6 +6219,19 @@ mod tests {
             session: &str,
             pid: u32,
         ) -> mpsc::UnboundedReceiver<HubMsg> {
+            let gate = Arc::new(ReadGate::default());
+            self.gated_reader(conn, session, pid, gate).await
+        }
+
+        /// Like [`Self::reader`] until `gate.stopped` is set; then it
+        /// leaves the next read unanswered and sets `gate.parked`.
+        async fn gated_reader(
+            &mut self,
+            conn: u64,
+            session: &str,
+            pid: u32,
+            gate: Arc<ReadGate>,
+        ) -> mpsc::UnboundedReceiver<HubMsg> {
             let (to_agent, mut from_hub) = mpsc::channel(16);
             let (kept, kept_rx) = mpsc::unbounded_channel();
             let agents = self.agents.clone();
@@ -6140,6 +6247,10 @@ mod tests {
                         let _ = kept.send(msg);
                         continue;
                     };
+                    if gate.stopped.load(Ordering::SeqCst) {
+                        gate.parked.store(true, Ordering::SeqCst);
+                        continue;
+                    }
                     let chunk = crate::tail::read_chunk(Some(&root), &session_id, &path, from);
                     let event = AgentEvent::Message {
                         conn,
@@ -6169,6 +6280,12 @@ mod tests {
                 .unwrap();
             kept_rx
         }
+    }
+
+    #[derive(Default)]
+    struct ReadGate {
+        stopped: AtomicBool,
+        parked: AtomicBool,
     }
 
     /// Texts of new messages in `thread`, in order: sends and stream lines.
@@ -6585,6 +6702,263 @@ mod tests {
         assert_eq!(slots.streams[A].read_at, Some(10));
     }
 
+    /// TASK-023: an answer whose turn end was read before its `Stop` rides
+    /// the stream behind the lines of its turn; when a line before it is
+    /// refused (and the answer dropped unsent behind it), the rewind holds it
+    /// again and the re-read turn end lets it go after the lines again.
+    #[tokio::test]
+    async fn an_answer_behind_a_refused_line_is_held_again_and_follows_the_re_read_lines() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-stream-answer-refused");
+        let mut slots = asked_slots(&dir);
+        let chunk = || AgentMsg::TranscriptChunk {
+            session_id: A.into(),
+            from: 0,
+            to: 20,
+            lines: vec![
+                StreamLine {
+                    end: 10,
+                    items: vec![StreamItem::Prompt { text: "one".into() }],
+                },
+                StreamLine {
+                    end: 20,
+                    items: vec![StreamItem::TurnEnd],
+                },
+            ],
+            missing: false,
+            more: false,
+            reset: false,
+        };
+        let message = |msg| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg,
+        };
+        slots.on_agent(message(chunk()));
+        assert_eq!(slots.streams[A].ends_unclaimed, [20]);
+        slots.on_hook(&stop(A, Some("done")));
+        let live = &slots.streams[A];
+        assert!(live.ends_unclaimed.is_empty(), "the Stop took the turn end");
+        assert_eq!(live.unanswered(), 2, "the answer rides the stream");
+        assert!(live.held.is_empty());
+
+        // The line is refused; the answer behind it never left (dropped).
+        slots.on_stream_done(
+            A,
+            1,
+            Some(Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            })),
+        );
+        slots.on_stream_done(A, 2, None);
+        let live = &slots.streams[A];
+        assert_eq!(live.read_at, Some(0), "rewound");
+        let held: Vec<&str> = live.held.iter().map(|h| h.answer.as_str()).collect();
+        assert_eq!(held, ["done"], "held again, not lost");
+        assert_eq!(stream_offset(&slots), Some(0));
+
+        // The re-read: the line, then the answer at its turn end.
+        let live = slots.streams.get_mut(A).unwrap();
+        live.reading = Some((1, Instant::now()));
+        assert!(live.restart);
+        slots.on_agent(message(chunk()));
+        let live = &slots.streams[A];
+        assert!(live.held.is_empty());
+        assert_eq!(live.unanswered(), 2);
+        slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
+        slots.on_stream_done(A, 2, Some(Ok(Outcome::Sent(Message::default()))));
+        assert_eq!(stream_offset(&slots), Some(20));
+        assert!(slots.streams[A].held.is_empty());
+        assert_eq!(slots.queued_messages, 0);
+    }
+
+    /// TASK-023 review I1 (the reviewer's probe): two turns in one read,
+    /// both answers held before it. Turn 2's prompt is refused, its answer
+    /// dropped unsent behind it; the rewind re-reads turn 1's end too, whose
+    /// answer is in the topic. That end lets nothing go and is not left for
+    /// a later `Stop`: turn 2's answer goes at its own end, after `> two`.
+    #[tokio::test]
+    async fn a_turn_end_read_again_lets_only_its_own_answer_go() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-stream-answer-pairing");
+        let mut slots = asked_slots(&dir);
+        let chunk = || AgentMsg::TranscriptChunk {
+            session_id: A.into(),
+            from: 0,
+            to: 40,
+            lines: vec![
+                StreamLine {
+                    end: 10,
+                    items: vec![StreamItem::Prompt { text: "one".into() }],
+                },
+                StreamLine {
+                    end: 20,
+                    items: vec![StreamItem::TurnEnd],
+                },
+                StreamLine {
+                    end: 30,
+                    items: vec![StreamItem::Prompt { text: "two".into() }],
+                },
+                StreamLine {
+                    end: 40,
+                    items: vec![StreamItem::TurnEnd],
+                },
+            ],
+            missing: false,
+            more: false,
+            reset: false,
+        };
+        let message = |msg| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg,
+        };
+        let ok = || Some(Ok(Outcome::Sent(Message::default())));
+        slots.on_hook(&stop(A, Some("first")));
+        slots.on_hook(&stop(A, Some("second")));
+        slots.on_agent(message(chunk()));
+        // 1 "> one", 2 "first", 3 "> two", 4 "second".
+        assert_eq!(
+            slots.streams[A].answer_numbers(),
+            [(2, "first"), (4, "second")]
+        );
+        slots.on_stream_done(A, 1, ok());
+        slots.on_stream_done(A, 2, ok());
+        slots.on_stream_done(
+            A,
+            3,
+            Some(Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            })),
+        );
+        slots.on_stream_done(A, 4, None);
+        let live = &slots.streams[A];
+        assert_eq!(live.read_at, Some(0), "rewound to the start of the read");
+        let held: Vec<&str> = live.held.iter().map(|h| h.answer.as_str()).collect();
+        assert_eq!(held, ["second"]);
+
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(message(chunk()));
+        let live = &slots.streams[A];
+        // 1 "> one" again, 2 "> two", 3 "second": "first" is not sent twice
+        // and "second" follows its own lines.
+        assert_eq!(live.answer_numbers(), [(3, "second")]);
+        assert_eq!(live.unanswered(), 3);
+        assert!(live.held.is_empty());
+        assert!(
+            live.ends_unclaimed.is_empty(),
+            "no stale turn end for the next Stop: {:?}",
+            live.ends_unclaimed
+        );
+        // The next turn's answer waits for its own turn end.
+        slots.on_hook(&stop(A, Some("third")));
+        let held: Vec<&str> = slots.streams[A]
+            .held
+            .iter()
+            .map(|h| h.answer.as_str())
+            .collect();
+        assert_eq!(held, ["third"]);
+    }
+
+    /// TASK-023 review I1: an answer that claimed a turn end already behind
+    /// the committed offset, then was dropped behind a refused line, goes
+    /// first on the re-read (its lines are in the topic), not at the next
+    /// turn's end.
+    #[tokio::test]
+    async fn an_answer_held_again_whose_turn_end_is_committed_goes_first_on_the_re_read() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-stream-answer-overdue");
+        let mut slots = asked_slots(&dir);
+        let message = |msg| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg,
+        };
+        let ok = || Some(Ok(Outcome::Sent(Message::default())));
+        slots.on_agent(message(AgentMsg::TranscriptChunk {
+            session_id: A.into(),
+            from: 0,
+            to: 20,
+            lines: vec![
+                StreamLine {
+                    end: 10,
+                    items: vec![StreamItem::Prompt { text: "one".into() }],
+                },
+                StreamLine {
+                    end: 20,
+                    items: vec![StreamItem::TurnEnd],
+                },
+            ],
+            missing: false,
+            more: false,
+            reset: false,
+        }));
+        slots.on_stream_done(A, 1, ok());
+        assert_eq!(stream_offset(&slots), Some(20));
+        // The Stop comes after its turn end is committed.
+        slots.on_hook(&stop(A, Some("first")));
+        assert_eq!(slots.streams[A].answer_numbers(), [(2, "first")]);
+        let two = || AgentMsg::TranscriptChunk {
+            session_id: A.into(),
+            from: 20,
+            to: 30,
+            lines: vec![StreamLine {
+                end: 30,
+                items: vec![StreamItem::Prompt { text: "two".into() }],
+            }],
+            missing: false,
+            more: false,
+            reset: false,
+        };
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(message(two()));
+        slots.on_stream_done(
+            A,
+            2,
+            Some(Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            })),
+        );
+        slots.on_stream_done(A, 3, None);
+        let live = &slots.streams[A];
+        assert_eq!(live.read_at, Some(20));
+        assert_eq!(live.held.len(), 1);
+
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(message(two()));
+        let live = &slots.streams[A];
+        // 1 "first", 2 "> two".
+        assert_eq!(live.answer_numbers(), [(1, "first")]);
+        assert_eq!(live.unanswered(), 2);
+        assert!(live.held.is_empty());
+    }
+
+    /// TASK-023 review I2: a streamed answer counts against
+    /// [`MAX_QUEUED_MESSAGES`]; one that does not fit is dropped like a plain
+    /// one, and nothing of it stays tracked in the stream.
+    #[tokio::test]
+    async fn a_streamed_answer_past_the_message_cap_is_dropped_untracked() {
+        let dir = TempDir::new("slots-stream-answer-cap");
+        let mut slots = asked_slots(&dir);
+        slots.queued_messages = MAX_QUEUED_MESSAGES;
+        for n in 0..=stream::MAX_HELD {
+            slots.on_hook(&stop(A, Some(format!("answer {n}").as_str())));
+        }
+        // The oldest was pushed out of the held ones with no room left.
+        assert_eq!(slots.streams[A].held.len(), stream::MAX_HELD);
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+        assert_eq!(slots.streams[A].unanswered(), 0, "nothing tracked");
+        assert!(slots.overflow_warned);
+        // With room the next pushed-out answer rides the stream.
+        slots.queued_messages = 0;
+        slots.on_hook(&stop(A, Some("late")));
+        assert_eq!(slots.queued_messages, 1);
+        assert_eq!(slots.streams[A].answer_numbers(), [(1, "answer 1")]);
+    }
+
     #[tokio::test]
     async fn a_stream_message_telegram_refuses_with_a_4xx_is_skipped_and_the_offset_moves() {
         let dir = TempDir::new("slots-stream-skip-4xx");
@@ -6830,14 +7204,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_agent_process_goes_on_from_the_stream_position() {
-        let (mut rig, path) = live_stream(
-            stream_options(),
-            Fake::default(),
-            "slots-stream-agent-restart",
-        )
-        .await;
+        let dir = TempDir::new("slots-stream-agent-restart");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), stream_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let gate = Arc::new(ReadGate::default());
+        let _first = rig.gated_reader(1, A, 10, gate.clone()).await;
         append(&path, &typed("one"));
         assert_eq!(stream_texts(&rig, 100, 1).await, ["> one"]);
+        // The agent goes away while a read to it is in flight: that read
+        // must not hold the stream until its timeout.
+        gate.stopped.store(true, Ordering::SeqCst);
+        let parked = async {
+            while !gate.parked.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, parked)
+            .await
+            .expect("a read in flight");
         rig.agents
             .send(AgentEvent::Disconnected { conn: 1 })
             .await

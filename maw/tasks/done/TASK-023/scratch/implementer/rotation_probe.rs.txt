@@ -1,0 +1,36 @@
+    /// PROBE (TASK-023, not kept in the tree): a refused line of a session
+    /// that ends before its stream re-reads is never sent again.
+    #[tokio::test]
+    async fn probe_rotation_during_a_refusal_loses_the_old_lines() {
+        let dir = TempDir::new("slots-probe-rotation");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        slots.on_stream_done(
+            A,
+            1,
+            Some(Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            })),
+        );
+        assert_eq!(slots.streams[A].read_at, Some(0), "rewound, waits for its retry");
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        slots.pump();
+        eprintln!(
+            "PROBE live kept={} committed offset={:?} (line ends at 10)",
+            slots.streams.contains_key(A),
+            stream_offset(&slots)
+        );
+        assert!(!slots.streams.contains_key(A), "the stream of the ended session is gone");
+        assert_eq!(stream_offset(&slots), Some(0), "the refused line was never sent again");
+    }

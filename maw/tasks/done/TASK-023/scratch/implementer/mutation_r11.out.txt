@@ -1,0 +1,15 @@
+== R11: KILLED
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... FAILED
+thread 'hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position' (32516) panicked at crates\cctg\src\hub\slots.rs:7029:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 370 filtered out; finished in 10.59s
+error: test failed, to rerun pass `-p cctg --lib`
+== R11: KILLED
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... FAILED
+thread 'hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position' (39768) panicked at crates\cctg\src\hub\slots.rs:7029:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 370 filtered out; finished in 10.55s
+error: test failed, to rerun pass `-p cctg --lib`
+== R11: KILLED
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... FAILED
+thread 'hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position' (34668) panicked at crates\cctg\src\hub\slots.rs:7029:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 370 filtered out; finished in 10.57s
+error: test failed, to rerun pass `-p cctg --lib`

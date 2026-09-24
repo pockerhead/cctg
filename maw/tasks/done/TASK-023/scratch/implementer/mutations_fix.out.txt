@@ -1,0 +1,43 @@
+== A1-release-plain: KILLED
+test hub::slots::tests::an_answer_behind_a_refused_line_is_held_again_and_follows_the_re_read_lines ... FAILED
+thread 'hub::slots::tests::an_answer_behind_a_refused_line_is_held_again_and_follows_the_re_read_lines' (38712) panicked at crates\cctg\src\hub\slots.rs:6722:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 370 filtered out; finished in 0.01s
+error: test failed, to rerun pass `-p cctg --lib`
+== A2-no-rehold: KILLED
+test hub::slots::tests::a_nested_run_shows_one_block_and_its_answer_only_there ... ok
+test hub::slots::tests::a_nested_answer_survives_a_restart_before_its_end ... ok
+test hub::slots::tests::a_turn_answer_follows_the_lines_read_after_its_stop ... ok
+test hub::slots::tests::a_turn_end_read_before_its_stop_lets_the_answer_go_at_once ... ok
+test hub::slots::tests::the_first_press_stays_the_answer_while_the_agent_is_away ... ok
+test hub::slots::tests::a_held_answer_goes_out_when_the_agent_never_answers ... ok
+test hub::slots::tests::two_turn_ends_in_one_read_serve_the_held_answer_and_the_next_stop ... ok
+test hub::slots::tests::a_turn_boundary_stops_an_unanswered_prompt_from_holding_the_icon ... ok
+test hub::slots::tests::a_turn_answer_waits_for_its_turn_end_even_when_the_file_lags ... ok
+test hub::slots::tests::a_first_send_with_an_unclear_answer_is_not_sent_again ... ok
+test hub::slots::tests::a_turn_answer_goes_to_its_session_topic_in_split_order ... ok
+thread 'hub::slots::tests::an_answer_behind_a_refused_line_is_held_again_and_follows_the_re_read_lines' (5052) panicked at crates\cctg\src\hub\slots.rs:6738:9:
+thread 'hub::stream::tests::a_rewind_holds_again_the_answers_not_in_the_topic_before_the_held_ones' (18504) panicked at crates\cctg\src\hub\stream.rs:617:9:
+test result: FAILED. 24 passed; 2 failed; 0 ignored; 0 measured; 345 filtered out; finished in 4.23s
+error: test failed, to rerun pass `-p cctg --lib`
+== A3-chunk-release-plain: SURVIVED
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.84s
+== A4-no-rehold-e2e: KILLED
+test e2e_answer_after_a_refused_line_still_follows_its_lines has been running for over 60 seconds
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... FAILED
+thread 'e2e_answer_after_a_refused_line_still_follows_its_lines' (27468) panicked at crates\cctg\tests\stream_e2e.rs:364:9:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 60.91s
+error: test failed, to rerun pass `-p cctg --test stream_e2e`
+== A1-release-plain-e2e: SURVIVED
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.85s
+== A5-both-plain-e2e: SURVIVED
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.83s
+A3 note: equivalent mutant, Action::Release goes through release(), which is gated by answer_ops as well
+A1-e2e/A5 note: A1 only touches release() (claim/timeout paths); the e2e scenario releases at the turn end in on_chunk, which calls answer_ops directly, so A1 is not reachable there (A1 is killed by the unit test). A5 is equivalent (Release -> release() -> answer_ops).
+== A6-answer_ops-always-file: KILLED
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... FAILED
+thread 'e2e_answer_after_a_refused_line_still_follows_its_lines' (36904) panicked at crates\cctg\tests\stream_e2e.rs:793:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.84s
+error: test failed, to rerun pass `-p cctg --test stream_e2e`

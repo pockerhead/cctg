@@ -1,0 +1,5 @@
+Run in a git-archive copy of HEAD b7fd925 (+ probe_mispair.rs.txt inserted into hub/slots.rs tests), 2026-09-24:
+cargo test -j 1 -p cctg --lib -- reviewer_probe an_answer_behind a_rewind_holds a_new_agent_process --nocapture
+PROBE after re-read: held=0 ends_unclaimed=1 unanswered=3
+test hub::slots::tests::reviewer_probe_a_re_read_earlier_turn_end_takes_a_later_re_held_answer ... ok
+=> the re-held answer of turn 2 ("second") was released at turn 1's re-read TurnEnd (between "> one" and "> two"); turn 2's TurnEnd found nothing held and stays unclaimed.

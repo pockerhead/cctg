@@ -1,0 +1,3 @@
+A_answer_ungated rc=101 KILLED ['test qa_multi_turn_refusals_slow_telegram ... FAILED', 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 9.84s']
+B_no_answered_skip rc=0 SURVIVED []
+C_fifo_pairing rc=101 KILLED ['test qa_multi_turn_refusals_slow_telegram ... FAILED', 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 12.49s']

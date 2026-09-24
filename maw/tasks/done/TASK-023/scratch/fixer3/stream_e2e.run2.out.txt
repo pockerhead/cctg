@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized] target(s) in 0.17s
+     Running tests\stream_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-023-fix3-target\debug\deps\stream_e2e-1490fcb4bb3bda80.exe)
+
+running 11 tests
+test e2e_resume_at_a_torn_end_does_not_replay_history ... ok
+test e2e_refused_sends_lose_nothing ... ok
+test e2e_merge_under_the_limit ... ok
+test e2e_reactions ... ok
+test e2e_a_document_answer_read_again_does_not_let_the_next_answer_go_early ... ok
+test e2e_a_turn_end_read_again_by_two_rewinds_does_not_let_the_next_answer_go_early ... ok
+test e2e_hub_restart_neither_repeats_nor_loses ... ok
+test e2e_answer_after_a_refused_line_still_follows_its_lines ... ok
+test e2e_order_partial_line_and_stop_after_lines ... ok
+test e2e_six_turns_with_refusals_keep_every_answer_in_place ... ok
+test e2e_turns_with_refusals_under_a_slow_telegram_keep_their_answers_in_place ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.42s
+

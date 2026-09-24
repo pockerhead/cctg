@@ -1,0 +1,6 @@
+    Checking dotenvy v0.15.7
+    Checking cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 34.55s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+(clippy above: real repo, rc 0, no warnings. hook_cli settings_snippet first FAILED only because the shared CARGO_TARGET_DIR held a binary built from the git-archive copy (CARGO_MANIFEST_DIR baked to the copy without docs/); after a rebuild in the real repo: ok, line above.)
+rerun in real repo: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out

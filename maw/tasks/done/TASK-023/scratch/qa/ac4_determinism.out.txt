@@ -1,0 +1,23 @@
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.60s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.59s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.56s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.58s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.57s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.57s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.57s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.57s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.57s
+test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 374 filtered out; finished in 0.57s
+R11 rc=101 KILLED ['test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... FAILED', 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 374 filtered out; finished in 10.57s']
+R11 rc=101 KILLED ['test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... FAILED', 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 374 filtered out; finished in 10.56s']
+R11 rc=101 KILLED ['test hub::slots::tests::a_new_agent_process_goes_on_from_the_stream_position ... FAILED', 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 374 filtered out; finished in 10.58s']

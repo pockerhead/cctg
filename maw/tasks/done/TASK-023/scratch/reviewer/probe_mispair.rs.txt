@@ -1,0 +1,86 @@
+    /// Reviewer probe (TASK-023): two turns in one chunk, both answers held
+    /// before the read. Turn 2's prompt is refused, so turn 2's answer is
+    /// dropped unsent and re-held. The rewind re-reads from before turn 1's
+    /// end (whose answer was accepted): does turn 1's re-read end let turn
+    /// 2's answer go (before "> two")?
+    #[tokio::test]
+    async fn reviewer_probe_a_re_read_earlier_turn_end_takes_a_later_re_held_answer() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-stream-probe-mispair");
+        let mut slots = asked_slots(&dir);
+        let chunk = || AgentMsg::TranscriptChunk {
+            session_id: A.into(),
+            from: 0,
+            to: 40,
+            lines: vec![
+                StreamLine {
+                    end: 10,
+                    items: vec![StreamItem::Prompt { text: "one".into() }],
+                },
+                StreamLine {
+                    end: 20,
+                    items: vec![StreamItem::TurnEnd],
+                },
+                StreamLine {
+                    end: 30,
+                    items: vec![StreamItem::Prompt { text: "two".into() }],
+                },
+                StreamLine {
+                    end: 40,
+                    items: vec![StreamItem::TurnEnd],
+                },
+            ],
+            missing: false,
+            more: false,
+            reset: false,
+        };
+        let message = |msg| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg,
+        };
+        slots.on_hook(&stop(A, Some("first")));
+        slots.on_hook(&stop(A, Some("second")));
+        assert_eq!(slots.streams[A].held.len(), 2);
+        slots.on_agent(message(chunk()));
+        // Messages: 1 "> one", 2 "first", 3 "> two", 4 "second".
+        assert!(slots.streams[A].held.is_empty());
+        assert_eq!(slots.streams[A].unanswered(), 4);
+        let ok = || Some(Ok(Outcome::Sent(Message::default())));
+        slots.on_stream_done(A, 1, ok());
+        slots.on_stream_done(A, 2, ok());
+        slots.on_stream_done(
+            A,
+            3,
+            Some(Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            })),
+        );
+        slots.on_stream_done(A, 4, None);
+        let live = &slots.streams[A];
+        assert_eq!(live.read_at, Some(0), "rewound to the start of the chunk");
+        let held: Vec<&str> = live.held.iter().map(|h| h.answer.as_str()).collect();
+        assert_eq!(held, ["second"]);
+        // Re-read the same chunk.
+        let live = slots.streams.get_mut(A).unwrap();
+        live.reading = Some((1, Instant::now()));
+        slots.on_agent(message(chunk()));
+        let live = &slots.streams[A];
+        eprintln!(
+            "PROBE after re-read: held={} ends_unclaimed={} unanswered={}",
+            live.held.len(),
+            live.ends_unclaimed,
+            live.unanswered()
+        );
+        // If "second" had waited for its own turn end (line 40), turn 1's
+        // re-read end would be unclaimed (0 after turn 2's end took the
+        // answer) and "second" would be the 4th message. Observed: turn 1's
+        // end took "second" (3rd message, before "> two") and turn 2's end
+        // is left unclaimed.
+        assert_eq!(
+            live.ends_unclaimed, 1,
+            "turn 2's end found nothing held: 'second' went at turn 1's end"
+        );
+    }
+

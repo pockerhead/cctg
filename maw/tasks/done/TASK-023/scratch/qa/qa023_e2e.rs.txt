@@ -1,0 +1,600 @@
+#![allow(dead_code, unused_imports)]
+//! Live transcript stream end to end (TASK-016): the real `cctg agent`
+//! binary (its own process, `CLAUDE_CONFIG_DIR` and home in a temp dir, so no
+//! real config or `~/.cctg/device.env` is read) linked over real TCP to the
+//! real `serve_agents`, the real `Slots` actor and `Scheduler`, and a fake
+//! Telegram transport. The transcript is a temp file under
+//! `<CLAUDE_CONFIG_DIR>/projects/<folder>/<session>.jsonl` written in pieces.
+//! Adopted from the QA harness of TASK-016.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use cctg::device::canonical_cwd;
+use cctg::hub::api::{ApiError, ForumTopic, Message};
+use cctg::hub::ingress::serve_agents;
+use cctg::hub::registry::RegistryStore;
+use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
+use cctg::hub::slots::{Control, Options, Slots};
+use cctg::hub::updates::Inbound;
+use cctg::wire::{HookEvent, HookPost, Secret};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+const SECRET: &str = "e2e-secret-0123456789abcdef";
+const HOST: &str = "e2ebox";
+const THREAD: i64 = 100;
+
+// ---------------------------------------------------------------- fake Telegram
+
+#[derive(Debug, Clone)]
+struct Rec {
+    op: Op,
+    accepted: bool,
+}
+
+#[derive(Default)]
+struct Fake {
+    ops: Mutex<Vec<Rec>>,
+    /// The next this many stream sends fail with a 502.
+    refuse_streams: AtomicUsize,
+    /// A stream send containing one of these fails once with a 502 (the
+    /// entry is used up).
+    refuse_once: Mutex<Vec<String>>,
+    next_id: AtomicI64,
+}
+
+impl Transport for Fake {
+    async fn execute(&self, op: &Op) -> Delivery {
+        let id = 1000 + self.next_id.fetch_add(1, Ordering::SeqCst);
+        let result: Delivery = match op {
+            Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
+                message_thread_id: THREAD,
+                name: name.clone(),
+                icon_custom_emoji_id: None,
+            })),
+            Op::Stream { text, .. } => {
+                let refuse = self.take_refusal(text)
+                    || self
+                        .refuse_streams
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                if refuse {
+                    Err(ApiError::Telegram {
+                        code: 502,
+                        description: "Bad Gateway".into(),
+                    })
+                } else {
+                    Ok(Outcome::Sent(Message {
+                        message_id: id,
+                        ..Message::default()
+                    }))
+                }
+            }
+            Op::Send { .. } | Op::SendDocument { .. } => Ok(Outcome::Sent(Message {
+                message_id: id,
+                ..Message::default()
+            })),
+            _ => Ok(Outcome::Done),
+        };
+        self.ops.lock().unwrap().push(Rec {
+            op: op.clone(),
+            accepted: result.is_ok(),
+        });
+        result
+    }
+}
+
+impl Fake {
+    fn take_refusal(&self, text: &str) -> bool {
+        let mut once = self.refuse_once.lock().unwrap();
+        let hit = once
+            .iter()
+            .position(|needle| text.contains(needle.as_str()));
+        hit.map(|at| once.remove(at)).is_some()
+    }
+    fn recs(&self) -> Vec<Rec> {
+        self.ops.lock().unwrap().clone()
+    }
+    /// Accepted stream messages, each split into its lines (merged messages
+    /// hold several), plus accepted plain sends of the topic (answers), in
+    /// Telegram order.
+    fn topic_lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for rec in self.recs() {
+            if !rec.accepted {
+                continue;
+            }
+            match rec.op {
+                Op::Stream { text, .. } => out.extend(text.lines().map(str::to_owned)),
+                Op::SendDocument { .. } => out.push("[document]".into()),
+                Op::Send {
+                    text, thread_id, ..
+                } if thread_id == Some(THREAD) && !text.starts_with("──") => out.push(text),
+                _ => {}
+            }
+        }
+        out
+    }
+    fn stream_messages(&self) -> Vec<String> {
+        self.recs()
+            .into_iter()
+            .filter(|r| r.accepted)
+            .filter_map(|r| match r.op {
+                Op::Stream { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+    fn reactions(&self) -> Vec<(i64, String)> {
+        self.recs()
+            .into_iter()
+            .filter_map(|r| match r.op {
+                Op::React { message_id, emoji } => Some((message_id, emoji)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------- hub
+
+struct Hub {
+    fake: Arc<Fake>,
+    hooks: mpsc::Sender<HookPost>,
+    control: mpsc::UnboundedSender<Control>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Hub {
+    fn stop(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn fast_bucket() -> BucketConfig {
+    BucketConfig {
+        capacity: 1000,
+        refill_every: Duration::from_millis(1),
+        min_gap: Duration::ZERO,
+    }
+}
+
+fn options() -> Options {
+    Options {
+        grace: Duration::ZERO,
+        stream_every: Duration::from_millis(50),
+        stream_retry: Duration::from_millis(200),
+        ..Options::default()
+    }
+}
+
+async fn start_hub(
+    state: &Path,
+    listener: TcpListener,
+    bucket: BucketConfig,
+    fake: Arc<Fake>,
+) -> Hub {
+    let (scheduler, outbox) = Scheduler::new(fake.clone(), bucket);
+    let sched = tokio::spawn(scheduler.run());
+    let store = RegistryStore::open(state).expect("store");
+    let registry = store.load().expect("load registry");
+    let (slots, _view) = Slots::new(registry, store, outbox, options());
+    let (agents, agents_rx) = mpsc::channel(64);
+    let (hooks, hooks_rx) = mpsc::channel(64);
+    let (control, control_rx) = mpsc::unbounded_channel();
+    let actor = tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
+    let ingress = tokio::spawn(serve_agents(
+        listener,
+        Secret::parse(SECRET).expect("secret"),
+        agents,
+    ));
+    Hub {
+        fake,
+        hooks,
+        control,
+        tasks: vec![ingress, actor, sched],
+    }
+}
+
+// ---------------------------------------------------------------- session fixture
+
+struct Session {
+    _root: TempRoot,
+    id: String,
+    transcript: PathBuf,
+    workdir: PathBuf,
+    config: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+}
+
+struct TempRoot(PathBuf);
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn session(name: &str, n: u32) -> Session {
+    let root = std::env::temp_dir().join(format!("cctg-stream-e2e-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let config = root.join("cfg");
+    let project = config.join("projects").join("C--qa-w");
+    std::fs::create_dir_all(&project).unwrap();
+    let workdir = root.join("w");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let state = root.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let id = format!("0a16e2e0-0000-4000-8000-{n:012}");
+    let transcript = project.join(format!("{id}.jsonl"));
+    Session {
+        _root: TempRoot(root),
+        id,
+        transcript,
+        workdir,
+        config,
+        home,
+        state,
+    }
+}
+
+impl Session {
+    fn cwd(&self) -> String {
+        canonical_cwd(&self.workdir.to_string_lossy())
+    }
+    fn post(&self, event: HookEvent) -> HookPost {
+        HookPost::new(
+            HOST.into(),
+            self.id.clone(),
+            self.cwd(),
+            self.transcript.to_string_lossy().into_owned(),
+            event,
+        )
+    }
+    fn append(&self, bytes: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.transcript)
+            .unwrap();
+        file.write_all(bytes.as_bytes()).unwrap();
+        file.flush().unwrap();
+    }
+}
+
+async fn start_session(hub: &Hub, s: &Session, source: &str) {
+    hub.hooks
+        .send(s.post(HookEvent::SessionStart {
+            source: Some(source.into()),
+            claude_pid: Some(4242),
+            parent_claude_pid: None,
+        }))
+        .await
+        .unwrap();
+}
+
+/// The real `cctg agent` process of the session.
+struct Agent(Child);
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_agent(s: &Session, port: u16) -> Agent {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cctg"))
+        .arg("agent")
+        .current_dir(&s.workdir)
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("CCTG_HUB_HOOK_ADDR")
+        .env("CCTG_HUB_SECRET", SECRET)
+        .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
+        .env("CCTG_HOST", HOST)
+        .env("CLAUDE_CODE_SESSION_ID", &s.id)
+        .env("CLAUDE_CONFIG_DIR", &s.config)
+        .env("USERPROFILE", &s.home)
+        .env("HOME", &s.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cctg agent");
+    // Keep stdin open (the agent stops at EOF) and drain stdout.
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(
+        b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+    );
+    std::mem::forget(stdin);
+    let mut stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+    Agent(child)
+}
+
+// ---------------------------------------------------------------- records
+
+fn prompt(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"user","isMeta":false,"message":{"role":"user","content":text}})
+    )
+}
+fn call(id: &str, desc: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[
+            {"type":"tool_use","id":id,"name":"Bash","input":{"command":"true","description":desc}}]}})
+    )
+}
+fn result(id: &str, error: bool) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":id,"content": if error {"boom failed"} else {"ok"},"is_error":error}]}})
+    )
+}
+fn answer(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[
+            {"type":"text","text":text}]}})
+    )
+}
+fn channel(source: &str, message_id: i64) -> String {
+    let tag = format!(
+        "<channel source=\"{source}\" chat_id=\"-100\" message_id=\"{message_id}\" thread_id=\"{THREAD}\">\nhello\n</channel>"
+    );
+    format!(
+        "{}\n",
+        serde_json::json!({"type":"user","isMeta":true,"origin":{"kind":"channel"},"message":{"role":"user","content":tag}})
+    )
+}
+
+async fn wait_for(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn listener() -> (TcpListener, u16) {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    (l, port)
+}
+
+fn assert_no_dup(lines: &[String]) {
+    let mut seen = std::collections::HashSet::new();
+    for line in lines {
+        assert!(
+            seen.insert(line),
+            "duplicate topic line {line:?} in {lines:?}"
+        );
+    }
+}
+
+fn ok_line(desc: &str) -> String {
+    format!("• Bash: {desc} ✓")
+}
+
+// ---------------------------------------------------------------- QA TASK-023
+
+/// The first appearance of each line, in order.
+fn firsts(lines: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    lines
+        .iter()
+        .filter(|line| seen.insert(line.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn dump(fake: &Fake) {
+    for rec in fake.recs() {
+        match &rec.op {
+            Op::Stream { text, restart, .. } => eprintln!(
+                "stream accepted={} restart={restart} {:?}",
+                rec.accepted,
+                text.lines()
+                    .map(|l| l.chars().take(40).collect::<String>())
+                    .collect::<Vec<_>>()
+            ),
+            Op::Send { text, .. } => eprintln!("send accepted={} {text:?}", rec.accepted),
+            Op::SendDocument { .. } => eprintln!("document accepted={}", rec.accepted),
+            _ => {}
+        }
+    }
+}
+
+fn accepted_count(fake: &Fake, needle: &str) -> usize {
+    fake.recs()
+        .iter()
+        .filter(|r| r.accepted)
+        .filter(|r| matches!(&r.op, Op::Stream { text, .. } if text.contains(needle)))
+        .count()
+}
+
+async fn stop(hub: &Hub, s: &Session, text: &str) {
+    hub.hooks
+        .send(s.post(HookEvent::Stop {
+            prompt_id: None,
+            last_assistant_message: Some(text.into()),
+        }))
+        .await
+        .unwrap();
+}
+
+/// One turn: its transcript bytes and its topic lines (answer last).
+fn turn(name: &str, calls: usize, answer_text: &str) -> (String, Vec<String>) {
+    let mut bytes = prompt(name);
+    let mut lines = vec![format!("> {name}")];
+    for n in 0..calls {
+        let id = format!("{name}c{n}");
+        bytes.push_str(&call(&id, &id));
+        bytes.push_str(&result(&id, false));
+        lines.push(ok_line(&id));
+    }
+    bytes.push_str(&answer(answer_text));
+    lines.push(answer_text.to_owned());
+    (bytes, lines)
+}
+
+/// Several turns over the real agent and `serve_agents`, a slow Telegram
+/// (turn ends of two turns land in one read chunk), refusals of a tool line,
+/// of an answer and of a prompt line at different points, Stops both before
+/// and after their transcript turn ends. Every answer must show exactly once,
+/// after all lines of its own turn and before the next turn's prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_multi_turn_refusals_slow_telegram() {
+    let s = session("qa-multi", 21);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let bucket = BucketConfig {
+        capacity: 1,
+        refill_every: Duration::from_millis(250),
+        min_gap: Duration::ZERO,
+    };
+    let hub = start_hub(&s.state, l, bucket, fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec![
+        "t1c1".into(),  // a tool line of turn 1
+        "ANS-2".into(), // the answer of turn 2
+        "> t3".into(),  // the prompt line of turn 3
+        "t4c0".into(),  // a tool line of turn 4 (its answer is claimed)
+        "ANS-5".into(), // the answer of turn 5
+    ];
+    let mut want = vec!["> warm".to_owned()];
+    let (t1, w1) = turn("t1", 3, "ANS-1");
+    let (t2, w2) = turn("t2", 2, "ANS-2");
+    let (t3, w3) = turn("t3", 0, "ANS-3");
+    let (t4, w4) = turn("t4", 2, "ANS-4");
+    let (t5, w5) = turn("t5", 1, "ANS-5");
+    for w in [&w1, &w2, &w3, &w4, &w5] {
+        want.extend(w.iter().cloned());
+    }
+    // Phase A: both Stops held before their turns reach the file, then both
+    // turns in one write (two turn ends in one read chunk).
+    stop(&hub, &s, "ANS-1").await;
+    stop(&hub, &s, "ANS-2").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.append(&(t1 + &t2));
+    // Phase B: turns 3 and 4 written in one piece while Telegram is still
+    // behind; their Stops come after the file (claim path).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.append(&(t3 + &t4));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop(&hub, &s, "ANS-3").await;
+    stop(&hub, &s, "ANS-4").await;
+    // Phase C: turn 5, Stop first, file 300 ms later.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop(&hub, &s, "ANS-5").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    s.append(&t5);
+    let started = Instant::now();
+    wait_for("everything", 90, || {
+        let got = fake.topic_lines();
+        want.iter().all(|w| got.contains(w))
+    })
+    .await;
+    eprintln!("all lines after {:?}", started.elapsed());
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    dump(&fake);
+    let got = fake.topic_lines();
+    let refused = fake.recs().iter().filter(|r| !r.accepted).count();
+    assert_eq!(refused, 5, "every planned refusal happened");
+    assert_eq!(firsts(&got), want, "got {got:?}");
+    for n in 1..=5 {
+        let a = format!("ANS-{n}");
+        assert_eq!(accepted_count(&fake, &a), 1, "{a} once: {got:?}");
+    }
+    // Every appearance of an answer comes after at least one appearance of
+    // each line of its turn.
+    for w in [&w1, &w2, &w3, &w4, &w5] {
+        let ans = w.last().unwrap();
+        let at = got.iter().position(|l| l == ans).unwrap();
+        for line in &w[..w.len() - 1] {
+            assert!(got[..at].contains(line), "{ans} before {line}: {got:?}");
+        }
+    }
+    hub.stop();
+}
+
+/// Counter-example probe: turn 1's answer is long (goes as a document,
+/// outside the stream), turn 2's prompt line is refused, so the rewind reads
+/// turn 1's end again. Turn 3's Stop comes before its lines reach the file
+/// (the usual order); its answer must still wait for its own lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_document_answer_then_refusal_next_answer_waits_for_its_lines() {
+    let s = session("qa-doc", 22);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let hub = start_hub(&s.state, l, fast_bucket(), fake.clone()).await;
+    start_session(&hub, &s, "startup").await;
+    let _agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec!["> t2".into()];
+    let big: String = (0..600)
+        .map(|n| format!("big answer line {n:04} ....................\n"))
+        .collect();
+    let (t1, _) = turn("t1", 1, &big);
+    let (t2, w2) = turn("t2", 1, "ANS-2");
+    let (t3, w3) = turn("t3", 1, "ANS-3");
+    stop(&hub, &s, &big).await;
+    stop(&hub, &s, "ANS-2").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.append(&(t1 + &t2));
+    wait_for("ANS-2", 30, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-2")
+    })
+    .await;
+    // Turn 3: its Stop first, its lines 500 ms later.
+    stop(&hub, &s, "ANS-3").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    s.append(&t3);
+    wait_for("ANS-3", 30, || {
+        fake.topic_lines().iter().any(|l| l == "ANS-3")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    dump(&fake);
+    let got = fake.topic_lines();
+    let mut want = vec![
+        "> warm".to_owned(),
+        "> t1".into(),
+        ok_line("t1c0"),
+        "[document]".into(),
+    ];
+    want.extend(w2.iter().cloned());
+    want.extend(w3.iter().cloned());
+    assert_eq!(firsts(&got), want, "got {got:?}");
+    hub.stop();
+}

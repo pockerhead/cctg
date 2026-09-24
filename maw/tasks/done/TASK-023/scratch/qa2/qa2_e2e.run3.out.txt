@@ -1,0 +1,90 @@
+    Finished `test` profile [unoptimized] target(s) in 0.17s
+     Running tests\qa2_023_e2e.rs (C:\Users\user\AppData\Local\Temp/cctg-023-qa2-target\debug\deps\qa2_023_e2e-b6087dc72afde3e1.exe)
+
+running 2 tests
+test qa2_six_turns_refusals_slow_telegram ... FAILED
+test qa2_turn_end_read_again_by_two_rewinds_is_not_claimable ... FAILED
+
+failures:
+
+---- qa2_six_turns_refusals_slow_telegram stdout ----
+stream accepted=true restart=true ["> warm"]
+stream accepted=true restart=false ["> t1"]
+stream accepted=false restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=false restart=false ["ANS-1"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=false ["ANS-1"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=false restart=false ["• Bash: t2c0 ✓", "• Bash: t2c1 ✓"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=true restart=false ["• Bash: t2c0 ✓", "• Bash: t2c1 ✓"]
+stream accepted=true restart=false ["ANS-2"]
+stream accepted=true restart=false ["> t3"]
+stream accepted=true restart=false ["• Bash: t3c0 ✓"]
+stream accepted=true restart=false ["ANS-3"]
+stream accepted=true restart=false ["> t4"]
+stream accepted=true restart=false ["• Bash: t4c0 ✓"]
+stream accepted=false restart=false ["ANS-4"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓", "• Bash: t1c1 ✓"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=true restart=false ["• Bash: t2c0 ✓", "• Bash: t2c1 ✓"]
+stream accepted=true restart=false ["> t3"]
+stream accepted=true restart=false ["• Bash: t3c0 ✓"]
+stream accepted=true restart=false ["> t4"]
+stream accepted=true restart=false ["• Bash: t4c0 ✓"]
+stream accepted=true restart=false ["ANS-4"]
+stream accepted=true restart=false ["ANS-5"]
+stream accepted=false restart=false ["> t5"]
+stream accepted=true restart=true ["> t5"]
+stream accepted=true restart=false ["• Bash: t5c0 ✓", "• Bash: t5c1 ✓"]
+stream accepted=true restart=false ["> t6"]
+stream accepted=false restart=false ["• Bash: t6c0 ✓"]
+stream accepted=true restart=true ["> t5"]
+stream accepted=true restart=false ["• Bash: t5c0 ✓", "• Bash: t5c1 ✓"]
+stream accepted=true restart=false ["ANS-6"]
+stream accepted=true restart=false ["> t6"]
+stream accepted=true restart=false ["• Bash: t6c0 ✓"]
+
+thread 'qa2_six_turns_refusals_slow_telegram' (36760) panicked at crates\cctg\tests\qa2_023_e2e.rs:1010:5:
+assertion `left == right` failed: got ["> warm", "> t1", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "ANS-1", "> t2", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3", "> t4", "• Bash: t4c0 ✓", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "> t3", "• Bash: t3c0 ✓", "> t4", "• Bash: t4c0 ✓", "ANS-4", "ANS-5", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "> t6", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "ANS-6", "> t6", "• Bash: t6c0 ✓"]
+  left: ["> warm", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3", "> t4", "• Bash: t4c0 ✓", "ANS-4", "ANS-5", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "> t6", "ANS-6", "• Bash: t6c0 ✓"]
+ right: ["> warm", "> t1", "• Bash: t1c0 ✓", "• Bash: t1c1 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "• Bash: t2c1 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3", "> t4", "• Bash: t4c0 ✓", "ANS-4", "> t5", "• Bash: t5c0 ✓", "• Bash: t5c1 ✓", "ANS-5", "> t6", "• Bash: t6c0 ✓", "ANS-6"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- qa2_turn_end_read_again_by_two_rewinds_is_not_claimable stdout ----
+stream accepted=true restart=true ["> warm"]
+stream accepted=true restart=false ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓"]
+stream accepted=true restart=false ["ANS-1"]
+stream accepted=false restart=false ["> t2"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓"]
+stream accepted=false restart=false ["> t2"]
+stream accepted=true restart=true ["> t1"]
+stream accepted=true restart=false ["• Bash: t1c0 ✓"]
+stream accepted=true restart=false ["> t2"]
+stream accepted=true restart=false ["• Bash: t2c0 ✓"]
+stream accepted=true restart=false ["ANS-2"]
+stream accepted=true restart=false ["ANS-3"]
+stream accepted=true restart=false ["> t3"]
+stream accepted=true restart=false ["• Bash: t3c0 ✓"]
+
+thread 'qa2_turn_end_read_again_by_two_rewinds_is_not_claimable' (15768) panicked at crates\cctg\tests\qa2_023_e2e.rs:1010:5:
+assertion `left == right` failed: got ["> warm", "> t1", "• Bash: t1c0 ✓", "ANS-1", "> t1", "• Bash: t1c0 ✓", "> t1", "• Bash: t1c0 ✓", "> t2", "• Bash: t2c0 ✓", "ANS-2", "ANS-3", "> t3", "• Bash: t3c0 ✓"]
+  left: ["> warm", "> t1", "• Bash: t1c0 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "ANS-2", "ANS-3", "> t3", "• Bash: t3c0 ✓"]
+ right: ["> warm", "> t1", "• Bash: t1c0 ✓", "ANS-1", "> t2", "• Bash: t2c0 ✓", "ANS-2", "> t3", "• Bash: t3c0 ✓", "ANS-3"]
+
+
+failures:
+    qa2_six_turns_refusals_slow_telegram
+    qa2_turn_end_read_again_by_two_rewinds_is_not_claimable
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 9 filtered out; finished in 12.65s
+
+error: test failed, to rerun pass `-p cctg --test qa2_023_e2e`
