@@ -91,6 +91,9 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
     if let Some(message_id) = queued_channel(line) {
         return vec![StreamEvent::Channel { message_id }];
     }
+    if let Some(event) = local_command(line) {
+        return event.into_iter().collect();
+    }
     // A response puts its thinking before its text and tool calls.
     let mut events = thinking(line);
     let Some(turn) = crate::parse(line).into_iter().next() else {
@@ -185,6 +188,39 @@ fn thinking(line: &str) -> Vec<StreamEvent> {
         .filter(|text| !text.is_empty())
         .map(|text| StreamEvent::Thinking(cut(text, THINKING_LIMIT)))
         .collect()
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawSystemRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    subtype: String,
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Value,
+    content: String,
+}
+
+/// A `system` record of a local slash command (`subtype: local_command`, how
+/// Claude Code 2.1.282 writes `/context` and its output): the command gives a
+/// prompt, its output a note like [`console_record`]. `None` for any other
+/// line.
+fn local_command(line: &str) -> Option<Option<StreamEvent>> {
+    if !line.contains("\"local_command\"") {
+        return None;
+    }
+    let record = serde_json::from_str::<RawSystemRecord>(line).ok()?;
+    if record.kind != "system"
+        || record.subtype != "local_command"
+        || record.is_sidechain.as_bool().unwrap_or(false)
+    {
+        return None;
+    }
+    let content = record.content.trim();
+    if let Some(command) = render::slash_command(content) {
+        return Some(Some(StreamEvent::Prompt(command)));
+    }
+    Some(console_record(content).flatten())
 }
 
 /// Claude Code's own records of the terminal console, `None` for any other
