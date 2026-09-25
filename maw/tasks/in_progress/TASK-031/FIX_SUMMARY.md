@@ -44,3 +44,43 @@ All commands use `CARGO_TARGET_DIR=C:/Users/user/dev/cctg/target CARGO_PROFILE_D
 - ShellCheck 0.10.0 (a portable download in the session scratchpad, since deleted), `--shell=sh|dash|bash install.sh`: exit 0 all three (`scratch/fixer/shellcheck.txt`). `dash -n install.sh`: ok. `install.sh` is still index mode `100755`, `i/lf`.
 - `cargo test -j 1 --workspace --locked --no-fail-fast`: exit 0, 41 result lines, 779 passed, 0 failed, 3 ignored (`scratch/fixer/workspace_test.txt`; before: 775).
 - Not run here: Linux and macOS (CI). That covers item 7, item 8, the macOS `HOST_MARK` removal path in `install_update_and_uninstall_a_device`, and the dash and BSD tools in the new install tests.
+
+## CI run 2 fix
+
+CI run 2 (commit 289dd5b): ubuntu, windows and the image job passed. On macos-latest one test failed: `reads_e2e::a_path_the_hub_names_is_never_opened`. The log is `scratch/ci_run2_failed.log`. The failing test itself says the first brief is "нет связи с агентом" (the agent had not bound yet, which is normal), and every brief after that is "Транскрипт ... не найден".
+
+**Preflight: the claim that would break correct code.** The candidates point at "`device::canonical_cwd` on unix is wrong" or "the agent should also try the unresolved cwd spelling". Either change would break the product. Claude Code names its project folder after `realpathSync(process.cwd())` (TASK-034 `IMPL_REVIEW.md:18`, read from the binary). The agent's `canonical_cwd` is that same realpath. On unix the agent never even sees an unresolved spelling, because `getcwd` returns the physical path.
+
+**Cause (from code).** On the macOS runner, `std::env::temp_dir()` is `/var/folders/...` and `/var` is a symlink to `/private/var`. Here is what happens:
+- The test wrote the own transcript under `project_folder_name(s.workdir)`, which is `-var-folders-...-w`.
+- The agent was started with `current_dir(<root>/w)`. Its `std::env::current_dir()` (getcwd) is `/private/var/folders/.../w`, so `OwnProject.by_cwd` is only `-private-var-folders-...-w`. That folder never exists.
+- The fallback scan of the projects root finds the session id in two folders: the test's own folder and `C--another-project`. That scan gives up on an id in two folders by design (Claude Code does the same). So `folder()` is None and every read returns `missing`, which the hub shows as "не найден".
+- `a_new_sessions_folder_comes_from_the_cwd_and_is_served` passed on macOS only by luck: its id was in one folder, so the scan found it. It never went through the cwd path its name promises.
+- On Windows, `GetCurrentDirectory` keeps the spelling it was given, and `by_cwd` includes that spelling, so both tests passed there. On Linux `/tmp` is not a link.
+
+Ruled out: `proctree` without a macOS branch. Binding goes by `CLAUDE_CODE_SESSION_ID`, and the agent was bound: the "не найден" answers come from the agent. APFS case-insensitivity is not a factor either: only the `/private` prefix differs. The projects root comes from `CLAUDE_CONFIG_DIR`, which the test sets explicitly.
+
+**The product is correct on macOS.** A real Mac session writes under the realpath folder, and that is the first entry of `by_cwd`. The test was wrong.
+
+### Fixed
+- `crates/cctg/tests/reads_e2e.rs`: new `Session::claude_folder()` = `project_folder_name(canonical_cwd(workdir))`, the name Claude Code gives. Both folder-based tests use it.
+- Diagnostics on timeout: `brief_until` now takes the `Session` and panics with the sends plus `Session::report()`: the workdir, its resolved spelling, the list of project folders and the agent's stderr. The agent's stderr now goes to `<root>/agent.log` instead of `Stdio::null()`. The hub's tracing goes through `tracing_subscriber::fmt().with_test_writer()`, so it shows only in a failing test's output. No assertions on logs, so the cross-test subscriber race (hub risk lesson TASK-008) does not apply. I checked this with a temporary unreachable `wanted` (reverted): the output had the hub's INFO lines, then `cwd "...\w", resolved "...\w"; project folders [...]`, then `--- agent log --- INFO registered with the hub`. On macOS this output would have shown `/var` next to `/private/var` right away.
+- `crates/cctg/src/tail.rs`: new unit test `a_linked_cwd_is_served_from_the_resolved_folder_when_another_holds_the_id`. It runs on every OS, using a symlink on Unix and a junction on Windows (`folder_link` helper). The cwd is reached through a link, and a foreign project folder holds the same session id. The test checks:
+  - the linked spelling names a different folder than the resolved one;
+  - the agent serves Claude Code's (resolved) folder whether its cwd comes resolved (unix getcwd) or linked (Windows);
+  - the CI failure itself: with the transcript only in the linked-name folder and the cwd resolved, the read is `missing`.
+  It ran locally (not skipped).
+
+### Skipped
+- A product change (extra spellings in `OwnProject`, a unix change to `canonical_cwd`, a looser id scan). All three are wrong, see above. The scan's refusal of an id in two folders is deliberate (TASK-034 decision 12).
+- Running the reads_e2e sessions under a linked temp root on every OS. On Windows it would not reproduce the failure, because the agent keeps the given spelling. The unit test already covers the shape on Linux and Windows.
+
+### Test results
+Every command ran with `CARGO_TARGET_DIR=C:/Users/user/dev/cctg/target CARGO_PROFILE_DEV_DEBUG=0`, `-j 1`, one cargo at a time:
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy -j 1 --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo test -j 1 -p cctg --locked --test reads_e2e`: 6 passed.
+- `cargo test -j 1 -p cctg --locked --lib -- tail:: reads::`: 30 passed, including the new test.
+- `cargo test -j 1 --workspace --locked --no-fail-fast`: exit 0, 41 result lines, 780 passed, 0 failed, 3 ignored (`scratch/fixer/workspace_test_run2.txt`; before: 779).
+- Not run here: macOS. The next CI run is the check. If it fails again, the panic output now names the cwd spellings and the folders.
+- Code commit: `c25c8e5`.
