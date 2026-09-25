@@ -220,6 +220,18 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
             "expected {expected:?} in logs: {logs}"
         );
     }
+    // Four agent rejections from one address before the secret: one
+    // warning a minute, the rest at debug (TASK-035).
+    let lines_with = |level: &str, text: &str| {
+        logs.lines()
+            .filter(|line| line.contains(level) && line.contains(text))
+            .count()
+    };
+    assert_eq!(lines_with("WARN", "agent rejected"), 1, "{logs}");
+    assert_eq!(lines_with("DEBUG", "agent rejected"), 3, "{logs}");
+    // The hook's wrong secret warned; the broken heads after it did not.
+    assert_eq!(lines_with("WARN", "bad or missing secret"), 1, "{logs}");
+    assert_eq!(lines_with("DEBUG", "hook request rejected"), 2, "{logs}");
     for leaked in [real.as_str(), wrong.as_str(), content.as_str()] {
         assert!(!logs.contains(leaked), "{leaked} in logs: {logs}");
     }

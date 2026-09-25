@@ -16,7 +16,7 @@
 
 use std::fmt;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -195,6 +195,12 @@ pub fn is_loopback_addr(addr: &str) -> bool {
     })
 }
 
+/// Whether plain TCP (the secret in the clear) may go to `peer`: a
+/// loopback address only.
+fn plain_peer_allowed(peer: SocketAddr) -> bool {
+    peer.ip().to_canonical().is_loopback()
+}
+
 /// The client side of TLS 1.3 accepting only the certificate `pin`.
 pub(crate) fn pinned_config(pin: CertPin) -> Result<Arc<rustls::ClientConfig>, AddrError> {
     let provider = provider();
@@ -252,10 +258,17 @@ impl HubAddr {
     }
 
     /// TCP connect and, with TLS, the handshake. The caller bounds the time.
+    /// Plain TCP goes on only when the peer really is this machine: a name
+    /// such as `localhost` is resolved by the system and could point
+    /// elsewhere.
     pub async fn connect(&self) -> io::Result<Stream> {
         let tcp = TcpStream::connect(self.addr.as_str()).await?;
         let _ = tcp.set_nodelay(true);
         match &self.tls {
+            None if !plain_peer_allowed(tcp.peer_addr()?) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "plain TCP only to this machine",
+            )),
             None => Ok(Stream::Plain(tcp)),
             Some((connector, name)) => {
                 let tls = connector.connect(name.clone(), tcp).await?;
@@ -424,6 +437,26 @@ mod tests {
     use tokio::net::TcpListener;
 
     const FP: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn plain_tcp_goes_only_to_a_loopback_peer() {
+        for peer in [
+            "127.0.0.1:1",
+            "127.8.9.10:1",
+            "[::1]:1",
+            "[::ffff:127.0.0.1]:1",
+        ] {
+            assert!(plain_peer_allowed(peer.parse().unwrap()), "{peer}");
+        }
+        for peer in [
+            "192.0.2.1:1",
+            "[2001:db8::1]:1",
+            "[::ffff:192.0.2.1]:1",
+            "0.0.0.0:1",
+        ] {
+            assert!(!plain_peer_allowed(peer.parse().unwrap()), "{peer}");
+        }
+    }
 
     #[test]
     fn pins_parse_in_every_usual_spelling() {

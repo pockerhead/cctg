@@ -14,6 +14,8 @@
 
 services:
   hub:
+    # `latest` exists from the first release (tag v*) on; before it use
+    # `main` (docs/remote-hub.md, "Один раз в GitHub").
     image: ghcr.io/pockerhead/cctg:latest
     restart: unless-stopped
     # A small init as PID 1: SIGTERM stops the hub also before its own

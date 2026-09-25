@@ -72,14 +72,26 @@ pub fn own_build() -> Option<String> {
     })
 }
 
-/// The first 8 characters, plus `-dirty` for a build with local changes,
+/// The first 8 characters, plus `-dirty` and the first 4 of the file hash
+/// for a build with local changes (two such builds of one commit differ),
 /// for logs and messages.
 pub fn short(build: &str) -> String {
     let head = build.get(..8).unwrap_or(build);
-    if build.contains("-dirty") {
-        format!("{head}-dirty")
-    } else {
-        head.to_owned()
+    match build.split_once("-dirty") {
+        Some((_, rest)) => {
+            let hash: String = rest
+                .strip_prefix('.')
+                .unwrap_or_default()
+                .chars()
+                .take(4)
+                .collect();
+            if hash.is_empty() {
+                format!("{head}-dirty")
+            } else {
+                format!("{head}-dirty.{hash}")
+            }
+        }
+        None => head.to_owned(),
     }
 }
 
@@ -132,7 +144,9 @@ mod tests {
         let b = identity(&dirty, || Some("bb".repeat(32))).unwrap();
         assert_ne!(a, b, "two dirty builds of one commit differ");
         assert!(a.starts_with(&dirty));
-        assert_eq!(short(&a), "01234567-dirty");
+        assert_eq!(short(&a), "01234567-dirty.aaaa");
+        assert_eq!(short(&b), "01234567-dirty.bbbb", "shown apart too");
+        assert_eq!(short(&dirty), "01234567-dirty");
         assert_eq!(identity(&dirty, || None), None);
         assert_eq!(
             identity("", || Some("cc".repeat(32))),
