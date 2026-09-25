@@ -87,7 +87,12 @@
 //! within [`UPDATE_WAIT`]; the last answer ends in one notice. A press never
 //! expires while a turn runs (the topic is told once), and a restart whose
 //! answer finds a turn begun meanwhile is not released: no `/exit` goes into
-//! a turn; the press is asked again after it.
+//! a turn; the press is asked again after it. Likewise no `/exit` goes in
+//! while the terminal shows background agents or the agent view (TASK-047):
+//! the agent answers `agents_running`, the topic is told once and the press
+//! is asked again every [`UPDATE_RETRY`]. A restart that cuts off work (a
+//! turn stopped by ⏹ while the press waited, or still running) is followed
+//! by one channel message into the session once its next agent is bound.
 //!
 //! Console commands (TASK-043, see [`console`]): a topic message that starts
 //! with `!` or with a slash command the hub does not serve goes, instead of
@@ -219,6 +224,19 @@ pub const STATUS_EVERY: Duration = Duration::from_secs(5);
 pub const UPDATE_ROUNDS: u8 = 3;
 /// An update press is forgotten this long after it came.
 pub const UPDATE_WAIT: Duration = Duration::from_secs(120);
+/// A restart held back by background agents or the agent view on the
+/// terminal (TASK-047) is asked again after this.
+pub const UPDATE_RETRY: Duration = Duration::from_secs(30);
+/// The channel message a session gets from the hub once its next agent is
+/// bound, after a client restart cut off its work (TASK-047).
+pub const CONTINUE_TEXT: &str = "Клиент cctg обновлён, и сессия была перезапущена посреди работы. \
+Продолжи с того места, где остановился.";
+/// PROBE-DEPENDENT (TASK-047): the sentence of [`CONTINUE_TEXT`] about
+/// background agents the restart ended. Whether such an agent goes on from
+/// its transcript after `SendMessage` or must be started again is decided by
+/// a live probe; until then the text covers both.
+pub const CONTINUE_AGENTS_TEXT: &str =
+    "Если работали фоновые агенты, проверь их и при необходимости запусти заново.";
 
 /// A call of a session that starts or ends this long after one of its
 /// permission prompts came in means the prompt was answered in the terminal
@@ -654,6 +672,14 @@ struct UpdateAsk {
     /// A restart held back because a turn began: its agent was not released
     /// and gives the `update` up by itself; that answer is only noted.
     held: Option<(u64, u64)>,
+    /// A restart held back by background agents (TASK-047) is asked again
+    /// then.
+    retry_at: Option<Instant>,
+    /// The topic was told that the restart waits for background agents.
+    agents_told: bool,
+    /// ⏹ was written into the session's console while the press waited: a
+    /// restart cuts off that work.
+    interrupted: bool,
 }
 
 pub struct Slots {
@@ -965,6 +991,12 @@ impl Slots {
             .flatten()
             .filter(|at| *at > now);
         let deadline = status.fold(deadline, Instant::min);
+        let deadline = self
+            .updates
+            .values()
+            .filter_map(|ask| ask.retry_at)
+            .filter(|at| *at > now)
+            .fold(deadline, Instant::min);
         let deadline = self
             .reads
             .values()
@@ -4093,6 +4125,9 @@ impl Slots {
                 until: Instant::now() + UPDATE_WAIT,
                 told: false,
                 held: None,
+                retry_at: None,
+                agents_told: false,
+                interrupted: false,
             },
         );
         if self.busy(session) {
@@ -4135,7 +4170,11 @@ impl Slots {
                 self.updates.remove(&session);
                 continue;
             }
-            if ask.sent.is_some() || ask.held.is_some() || self.busy(&session) {
+            if ask.sent.is_some()
+                || ask.held.is_some()
+                || ask.retry_at.is_some_and(|at| now < at)
+                || self.busy(&session)
+            {
                 continue;
             }
             let Some(conn) = self
@@ -4216,6 +4255,36 @@ impl Slots {
             );
             return;
         }
+        if outcome == UpdateOutcome::AgentsRunning
+            && let Some(ask) = self.updates.get_mut(session).filter(|ask| {
+                ask.sent == Some((update_id, conn)) || ask.left == Some((update_id, conn))
+            })
+        {
+            // The terminal shows background agents or the agent view
+            // (TASK-047): no `/exit` now. Asked again later, like a press
+            // waiting for a turn: this round does not count, the press is
+            // kept, the topic is told once.
+            let now = Instant::now();
+            ask.sent = None;
+            ask.left = None;
+            ask.rounds = ask.rounds.saturating_sub(1);
+            ask.until = now + UPDATE_WAIT;
+            ask.retry_at = Some(now + UPDATE_RETRY);
+            let tell = !std::mem::replace(&mut ask.agents_told, true);
+            info!(
+                conn,
+                session = short(session),
+                "restart held back: background agents"
+            );
+            self.keep_agent(conn, session);
+            if tell
+                && let Some(slot) = self.current_slot(session)
+                && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+            {
+                self.notify(slot, thread_id, status::UPDATE_AGENTS_NOTICE);
+            }
+            return;
+        }
         let asked = self.updates.get(session).is_some_and(|ask| {
             ask.sent == Some((update_id, conn)) || ask.left == Some((update_id, conn))
         });
@@ -4227,6 +4296,16 @@ impl Slots {
             outcome,
             UpdateOutcome::Reloading | UpdateOutcome::Restarting
         ) {
+            if outcome == UpdateOutcome::Restarting && self.restart_cuts_work(session) {
+                if let Some(entry) = self.registry.sessions.get_mut(session) {
+                    entry.restart_interrupted = true;
+                    self.registry.dirty = true;
+                }
+                info!(
+                    session = short(session),
+                    "the restart cuts off work; the session is told after it"
+                );
+            }
             if let Some(ask) = self.updates.get_mut(session).filter(|_| asked) {
                 ask.sent = None;
                 ask.left = Some((update_id, conn));
@@ -4246,19 +4325,13 @@ impl Slots {
         if asked {
             self.updates.remove(session);
         }
-        if self.conns.get(&conn).is_some_and(|bound| bound.leaving) {
-            if let Some(bound) = self.conns.get_mut(&conn) {
-                bound.leaving = false;
-            }
-            if self.registry.agent_connected(session, conn) {
-                info!(conn, session = short(session), "leaving agent stays");
-            }
-        }
+        self.keep_agent(conn, session);
         let notice = match outcome {
             UpdateOutcome::UpToDate if self.outdated(conn) => status::NO_NEW_BUILD_NOTICE,
             UpdateOutcome::UpToDate => status::UPDATED_NOTICE,
             UpdateOutcome::NeedsManualRestart => status::MANUAL_RESTART_NOTICE,
             UpdateOutcome::DraftInInput => status::DRAFT_NOTICE,
+            UpdateOutcome::AgentsRunning => status::UPDATE_AGENTS_NOTICE,
             _ => status::UPDATE_FAILED_NOTICE,
         };
         if !asked && outcome == UpdateOutcome::UpToDate {
@@ -4273,6 +4346,79 @@ impl Slots {
             && let Some(shown) = self.shown.get_mut(&slot)
         {
             shown.next_at = Some(Instant::now());
+        }
+    }
+
+    /// A leaving agent `conn` of `session` whose update did not go through
+    /// after all is bound back; a restart it announced did not happen.
+    fn keep_agent(&mut self, conn: u64, session: &str) {
+        let Some(bound) = self.conns.get_mut(&conn).filter(|bound| bound.leaving) else {
+            return;
+        };
+        bound.leaving = false;
+        if let Some(entry) = self
+            .registry
+            .sessions
+            .get_mut(session)
+            .filter(|entry| entry.restart_interrupted)
+        {
+            entry.restart_interrupted = false;
+            self.registry.dirty = true;
+        }
+        if self.registry.agent_connected(session, conn) {
+            info!(conn, session = short(session), "leaving agent stays");
+        }
+    }
+
+    /// A restart of `session` now cuts off work: a turn or a call runs
+    /// (stopped by Esc or not), or ⏹ went in while the update press waited.
+    fn restart_cuts_work(&self, session: &str) -> bool {
+        self.updates.get(session).is_some_and(|ask| ask.interrupted)
+            || self.activity.get(session).is_some_and(Activity::working)
+    }
+
+    /// Sessions a client restart cut off get one channel message once the
+    /// agent of their next run is bound (TASK-047).
+    fn send_continuations(&mut self) {
+        let waiting: Vec<String> = self
+            .registry
+            .sessions
+            .iter()
+            .filter(|(_, entry)| entry.restart_interrupted)
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in waiting {
+            let Some(slot) = self.current_slot(&session) else {
+                continue;
+            };
+            let Some((_, conn)) = self.live_agent(slot).filter(|(live, _)| *live == session) else {
+                continue;
+            };
+            let mut meta =
+                BTreeMap::from([("chat_id".to_owned(), self.options.chat_id.to_string())]);
+            if let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) {
+                meta.insert("thread_id".to_owned(), thread_id.to_string());
+            }
+            let inbound = HubMsg::Inbound {
+                content: format!("{CONTINUE_TEXT} {CONTINUE_AGENTS_TEXT}"),
+                meta,
+            };
+            let sent = self
+                .conns
+                .get(&conn)
+                .is_some_and(|bound| bound.to_agent.try_send(inbound).is_ok());
+            if !sent {
+                continue;
+            }
+            if let Some(entry) = self.registry.sessions.get_mut(&session) {
+                entry.restart_interrupted = false;
+                self.registry.dirty = true;
+            }
+            info!(
+                conn,
+                session = short(&session),
+                "session told to go on after the restart"
+            );
         }
     }
 
@@ -4358,6 +4504,9 @@ impl Slots {
             info!(conn, session = short(&ask.session), "Esc written");
             if let Some(activity) = self.activity.get_mut(&ask.session) {
                 activity.interrupt_written();
+            }
+            if let Some(update) = self.updates.get_mut(&ask.session) {
+                update.interrupted = true;
             }
             // Shown at once, whatever the edit pace.
             if let Some(shown) = self.shown.get_mut(&ask.slot) {
@@ -4517,6 +4666,9 @@ impl Slots {
             }
             CommandOutcome::Draft => {
                 self.answer_command(ask.thread_id, ask.message_id, console::DRAFT_NOTICE);
+            }
+            CommandOutcome::AgentsRunning => {
+                self.answer_command(ask.thread_id, ask.message_id, console::AGENTS_NOTICE);
             }
             CommandOutcome::Failed | CommandOutcome::Other => {
                 self.answer_command(ask.thread_id, ask.message_id, console::FAILED_NOTICE);
@@ -5215,6 +5367,7 @@ impl Slots {
     /// publishes the snapshot to save.
     fn pump(&mut self) {
         self.check_hook_asks();
+        self.send_continuations();
         self.flush_all();
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
@@ -12504,6 +12657,177 @@ again"
             before,
             "no notice for the held round: {texts:?}"
         );
+    }
+
+    // ------------------------------------------------------------ TASK-047
+
+    fn update_of(agent: &mut mpsc::Receiver<HubMsg>) -> u64 {
+        match agent.try_recv() {
+            Ok(HubMsg::Update { update_id }) => update_id,
+            other => panic!("no update: {other:?}"),
+        }
+    }
+
+    /// The press waits for the retry time to pass.
+    fn retry_now(slots: &mut Slots) {
+        slots.updates.get_mut(A).unwrap().retry_at = Some(Instant::now());
+        slots.pump();
+    }
+
+    #[tokio::test]
+    async fn a_restart_waits_for_background_agents_tells_once_and_is_asked_again() {
+        let dir = TempDir::new("slots-update-agents");
+        let (fake, mut slots) = updating_slots(&dir);
+        let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let before = sent_texts(&fake).await.len();
+        // More answers than rounds: a wait for agents never uses one up.
+        for _ in 0..UPDATE_ROUNDS + 1 {
+            let update_id = update_of(&mut agent);
+            // The agent saw the agent list before leaving: it stays bound.
+            answer(&mut slots, 1, update_id, UpdateOutcome::AgentsRunning);
+            assert_eq!(slots.live_agent(SlotId(0)), Some((A.to_owned(), 1)));
+            assert!(agent.try_recv().is_err(), "not released");
+            slots.pump();
+            assert!(agent.try_recv().is_err(), "asked again only later");
+            retry_now(&mut slots);
+        }
+        // Found only right before `/exit`, after leaving: bound back.
+        let update_id = update_of(&mut agent);
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(agent.try_recv(), Ok(HubMsg::Released { .. })));
+        assert_eq!(slots.live_agent(SlotId(0)), None);
+        answer(&mut slots, 1, update_id, UpdateOutcome::AgentsRunning);
+        assert_eq!(slots.live_agent(SlotId(0)), Some((A.to_owned(), 1)));
+        assert!(!slots.conns[&1].leaving);
+        assert!(slots.updates.contains_key(A), "the press is kept");
+        retry_now(&mut slots);
+        let update_id = update_of(&mut agent);
+        // The agents finished: the restart goes through.
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(agent.try_recv(), Ok(HubMsg::Released { .. })));
+        let texts = sent_texts(&fake).await;
+        let told: Vec<_> = texts[before..]
+            .iter()
+            .filter(|(text, _)| text == status::UPDATE_AGENTS_NOTICE)
+            .collect();
+        assert_eq!(told.len(), 1, "told once: {texts:?}");
+        assert_eq!(texts.len(), before + 1, "nothing else: {texts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_command_refused_for_background_agents_is_answered() {
+        let dir = TempDir::new("slots-console-agents");
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        slots.on_topic_message(topic_text(41, "/compact", false));
+        let (command_id, _) = command_of(from_hub.try_recv().ok());
+        slots.on_command_typed(1, A, command_id, CommandOutcome::AgentsRunning, None);
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(41, console::AGENTS_NOTICE.to_owned())]
+        );
+    }
+
+    /// The claude of session A exits after `/exit` and `cctg run` starts it
+    /// again with `--resume`; its new agent is `conn`.
+    fn restart_run(slots: &mut Slots, old: u64, conn: u64) -> mpsc::Receiver<HubMsg> {
+        slots.on_agent(AgentEvent::Disconnected { conn: old });
+        slots.on_hook(&end(A, 10));
+        let agent = register_client(slots, conn, client(HUB_BUILD, true));
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionStart {
+                source: Some("resume".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ));
+        slots.pump();
+        agent
+    }
+
+    fn inbound_texts(agent: &mut mpsc::Receiver<HubMsg>) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(msg) = agent.try_recv() {
+            if let HubMsg::Inbound { content, .. } = msg {
+                texts.push(content);
+            }
+        }
+        texts
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_cut_off_work_tells_the_next_agent_once() {
+        let dir = TempDir::new("slots-update-continue");
+        let (_fake, mut slots) = updating_slots(&dir);
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        assert_eq!(slots.press_update(A), status::ANSWER_AFTER_TURN);
+        // ⏹ while the press waits: Esc written, the turn's end not seen yet.
+        assert!(slots.send_key(SlotId(0), A, 1));
+        let Ok(HubMsg::ConsoleKey { key_id, .. }) = first.try_recv() else {
+            panic!("no key");
+        };
+        slots.on_key_written(1, A, key_id, true);
+        // The turn's end is seen before the restart: the ⏹ during the press
+        // alone says that work was cut off.
+        slots.on_hook(&stop(A, None));
+        slots.pump();
+        let update_id = update_of(&mut first);
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(first.try_recv(), Ok(HubMsg::Released { .. })));
+        assert!(slots.registry.sessions[A].restart_interrupted);
+        // The flag lives in registry.json until the next agent took it.
+        let saved = String::from_utf8(RegistryStore::encode(&slots.registry)).unwrap();
+        assert!(saved.contains("restart_interrupted"), "{saved}");
+
+        let mut second = restart_run(&mut slots, 1, 2);
+        let texts = inbound_texts(&mut second);
+        assert_eq!(
+            texts,
+            [format!("{CONTINUE_TEXT} {CONTINUE_AGENTS_TEXT}")],
+            "one message after the restart"
+        );
+        assert!(!slots.registry.sessions[A].restart_interrupted);
+        slots.pump();
+        assert!(inbound_texts(&mut second).is_empty(), "only once");
+    }
+
+    #[tokio::test]
+    async fn an_idle_restart_and_a_refused_one_tell_the_session_nothing() {
+        let dir = TempDir::new("slots-update-no-continue");
+        let (_fake, mut slots) = updating_slots(&dir);
+        // A turn stopped by ⏹, then a restart that did not happen (a draft):
+        // the agent stays and nothing is sent.
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        assert_eq!(slots.press_update(A), status::ANSWER_AFTER_TURN);
+        assert!(slots.send_key(SlotId(0), A, 1));
+        let Ok(HubMsg::ConsoleKey { key_id, .. }) = first.try_recv() else {
+            panic!("no key");
+        };
+        slots.on_key_written(1, A, key_id, true);
+        slots.pump();
+        let update_id = update_of(&mut first);
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(first.try_recv(), Ok(HubMsg::Released { .. })));
+        answer(&mut slots, 1, update_id, UpdateOutcome::DraftInInput);
+        assert!(!slots.registry.sessions[A].restart_interrupted);
+        slots.pump();
+        assert!(inbound_texts(&mut first).is_empty());
+
+        // The turn ended; a restart in the idle session.
+        slots.on_hook(&stop(A, None));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let update_id = update_of(&mut first);
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(first.try_recv(), Ok(HubMsg::Released { .. })));
+        assert!(!slots.registry.sessions[A].restart_interrupted);
+        let mut second = restart_run(&mut slots, 1, 2);
+        slots.pump();
+        assert!(inbound_texts(&mut second).is_empty(), "idle: nothing");
     }
 
     /// TASK-042 rebinds a session to an older open link of its run when the

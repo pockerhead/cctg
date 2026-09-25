@@ -789,6 +789,18 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                             leaving = Some(Leaving::Draining { update_id });
                             vec![shim::SWITCH.to_vec()]
                         }
+                        Plan::Restart if tokio::task::spawn_blocking({
+                            let worker = worker.clone();
+                            move || worker.agents_on_screen()
+                        })
+                        .await
+                        .unwrap_or(false) => {
+                            // Looked at before leaving too (and again before
+                            // `/exit`): waiting for background agents does
+                            // not unbind the agent from the hub.
+                            answer(update_id, UpdateOutcome::AgentsRunning).await;
+                            Vec::new()
+                        }
                         Plan::Restart => {
                             answer(update_id, UpdateOutcome::Restarting).await;
                             leaving = Some(Leaving::Released {
@@ -834,6 +846,7 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                                     });
                                 }
                                 Typed::Draft => answer(update_id, UpdateOutcome::DraftInInput).await,
+                                Typed::Agents => answer(update_id, UpdateOutcome::AgentsRunning).await,
                                 Typed::Failed => answer(update_id, UpdateOutcome::Failed).await,
                             }
                         }
@@ -1440,6 +1453,7 @@ fn spawn_console(
                     let outcome = match typed {
                         Typed::Sent => CommandOutcome::Sent,
                         Typed::Draft => CommandOutcome::Draft,
+                        Typed::Agents => CommandOutcome::AgentsRunning,
                         Typed::Failed => CommandOutcome::Failed,
                     };
                     AgentMsg::ConsoleCommandTyped {

@@ -364,6 +364,10 @@ pub struct SessionEntry {
     /// runs another cctg build (TASK-040). One warning per hub build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_warned: Option<String>,
+    /// A client restart cut off this session's work: its next bound agent
+    /// gets one channel message to go on (TASK-047).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart_interrupted: bool,
 }
 
 /// What survives a restart of a session's transcript stream.
@@ -843,6 +847,7 @@ impl Registry {
                 stream: None,
                 metrics: None,
                 update_warned: None,
+                restart_interrupted: false,
             });
         entry.kind = kind.clone();
         entry.slot = slot;
