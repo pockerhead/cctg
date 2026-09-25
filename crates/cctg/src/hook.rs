@@ -47,8 +47,8 @@ use crate::proctree::{self, Lineage};
 use crate::spool;
 use crate::tls::HubAddr;
 use crate::wire::{
-    Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PermissionAnswer, PermissionPost,
-    Secret, VERSION,
+    Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PING_PATH, PermissionAnswer,
+    PermissionPost, Secret, VERSION,
 };
 
 /// Budget of the POST, connect included. `SessionEnd` hooks share 1.5 s in
@@ -661,8 +661,33 @@ pub async fn post(
     timeout: Duration,
 ) -> Result<(), PostError> {
     let body = serde_json::to_vec(post).expect("hook posts always serialize");
+    match exchange(addr, HOOK_PATH, secret, &body, timeout).await? {
+        204 => Ok(()),
+        code => Err(PostError::Status(code)),
+    }
+}
+
+/// `POST /v1/ping` (TASK-031, `cctg doctor`): `Ok` when the hub took the
+/// secret. A wrong secret gets 401; a hub older than the route answers 404
+/// before it looks at the secret.
+pub async fn ping(addr: &HubAddr, secret: &Secret, timeout: Duration) -> Result<(), PostError> {
+    match exchange(addr, PING_PATH, secret, &[], timeout).await? {
+        204 => Ok(()),
+        code => Err(PostError::Status(code)),
+    }
+}
+
+/// One request to the hub hook endpoint within `timeout`; the answer's
+/// status code.
+async fn exchange(
+    addr: &HubAddr,
+    path: &str,
+    secret: &Secret,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<u16, PostError> {
     let head = format!(
-        "POST {HOOK_PATH} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
+        "POST {path} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         secret.expose(),
         body.len()
@@ -671,7 +696,7 @@ pub async fn post(
         let io = |error: std::io::Error| PostError::Io(error.kind());
         let mut stream = addr.connect().await.map_err(io)?;
         stream
-            .write_all(&[head.as_bytes(), &body].concat())
+            .write_all(&[head.as_bytes(), body].concat())
             .await
             .map_err(io)?;
         // Over TLS the tail can still sit in the session: push it out
@@ -683,11 +708,7 @@ pub async fn post(
             .read_until(b'\n', &mut status_line)
             .await
             .map_err(io)?;
-        match parse_status(&status_line) {
-            Some(204) => Ok(()),
-            Some(code) => Err(PostError::Status(code)),
-            None => Err(PostError::BadResponse),
-        }
+        parse_status(&status_line).ok_or(PostError::BadResponse)
     };
     tokio::time::timeout(timeout, exchange)
         .await

@@ -3,8 +3,9 @@
 # client binaries (Windows x86_64, static Linux x86_64, macOS arm64) in a
 # GitHub Release. Image and binaries of one run are built with the same
 # CCTG_BUILD_ID, so a hub and a client of one commit report the same build.
-# Tag only a commit whose `ci` run is green. Only GITHUB_TOKEN; no other
-# secret. Actions are pinned to commits.
+# Tag only a commit whose `ci` run is green and whose install.sh says
+# RELEASE=<the tag>. Only GITHUB_TOKEN; no other secret. Actions are pinned
+# to commits.
 name: release
 
 on:
@@ -31,6 +32,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # install.sh of a tag installs the binaries of that tag (TASK-031):
+      # its RELEASE line must name this tag, or nothing is published.
+      - name: install.sh belongs to this tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if ! grep -qx "RELEASE=${GITHUB_REF_NAME}" install.sh; then
+            echo "::error::install.sh has no RELEASE=${GITHUB_REF_NAME}"
+            exit 1
+          fi
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:

@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
 use crate::wire::{
     self, AgentMsg, Behavior, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, PERMISSION_PATH,
-    PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
+    PING_PATH, PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
 };
 
 /// Time an agent has from its TCP connect to finish the TLS handshake (when
@@ -753,6 +753,11 @@ async fn hook_request(
     let gate = pre_auth.gate;
     let status = match read {
         Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
+        // `cctg doctor`: the secret matched; nothing else happens.
+        Ok(Ok((Route::Ping, _))) => {
+            debug!(%peer, "ping answered");
+            Status::NoContent
+        }
         Ok(Err(None)) => {
             debug!(%peer, "connection closed before its first byte");
             return;
@@ -939,11 +944,12 @@ fn other_version(version: Option<&str>) -> Option<&str> {
     )
 }
 
-/// The two endpoints.
+/// The endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Hook,
     Permission,
+    Ping,
 }
 
 /// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
@@ -994,6 +1000,7 @@ async fn read_request<S: AsyncRead + Unpin>(
     let route = match target {
         HOOK_PATH => Route::Hook,
         PERMISSION_PATH => Route::Permission,
+        PING_PATH => Route::Ping,
         _ => return Err(Some(Status::NotFound)),
     };
 
@@ -1398,6 +1405,28 @@ mod tests {
 
     fn body(post: &HookPost) -> Vec<u8> {
         serde_json::to_vec(post).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_ping_checks_the_secret_and_is_no_event() {
+        let (addr, mut events) = hooks_hub(8).await;
+        let ping = |auth: &str| {
+            format!(
+                "POST {PING_PATH} HTTP/1.1\r\nAuthorization: {auth}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes()
+        };
+        assert_eq!(
+            exchange(addr, &ping(&format!("Bearer {SECRET}"))).await,
+            204
+        );
+        assert_eq!(
+            exchange(addr, &ping("Bearer 0123456789abcdef-wrong")).await,
+            401
+        );
+        let hook = crate::tls::HubAddr::plain(addr.to_string());
+        assert_eq!(crate::hook::ping(&hook, &secret(), WAIT).await, Ok(()));
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
