@@ -160,19 +160,15 @@ pub enum Typed {
     Agents,
 }
 
-/// Whether the screen shows what a typed line would disturb (TASK-047):
-/// Claude Code's agent view (its input box offers `Message @<agent>…`, seen
-/// live 2026-09-25: typed text goes to that agent, and `/exit` would end the
-/// session with its background agents), or the agent list under the status
-/// lines with an agent other than `main` marked (`●`, selected or working)
-/// or showing a timer (`35m 15s`). Only a list that has a row of `main`
-/// alone counts: `●` also starts every tool call line of the conversation.
-/// Any other screen does not block (the behaviour before TASK-047).
+/// Whether the screen shows Claude Code's agent view (TASK-047): its input
+/// box offers `Message @<agent>…` (seen live 2026-09-25), and a typed line
+/// would go to that agent. Background agents on the main screen do not block
+/// here: `/exit` opens Claude Code's own "Background work is running" dialog,
+/// which [`type_exit`] cancels, and the hub holds updates while subagents
+/// run; the agent list's markers show the selected view, not a running
+/// agent, so they are not read.
 pub fn agents_block(screen: &[String]) -> bool {
     screen.iter().any(|line| agent_view_prompt(line))
-        || agent_list(screen)
-            .iter()
-            .any(|row| row.name != "main" && (row.marked || row.timer))
 }
 
 /// A prompt glyph followed by the agent view's placeholder `Message @<x>`.
@@ -183,84 +179,6 @@ fn agent_view_prompt(line: &str) -> bool {
         .and_then(|rest| rest.strip_prefix("Message @"))
         .and_then(|name| name.chars().next())
         .is_some_and(|first| !first.is_whitespace())
-}
-
-/// One row of Claude Code's agent list: `  ( ) main`,
-/// `  ●   maw-qa-medium   Checking… 35m 15s · ↓ 337.7k tokens`, or on the
-/// main screen `  ● main` over `  ◯ general-purpose  Append steps  4s · ↓
-/// 39.6k tokens` (probe TASK-047, 2.1.282).
-#[derive(Debug, PartialEq, Eq)]
-struct AgentRow<'a> {
-    name: &'a str,
-    /// `●`, or a filled radio `(x)` in place of `( )` or `◯`.
-    marked: bool,
-    /// A duration word (`35m`, `15s`, `1h`) after the name.
-    timer: bool,
-}
-
-fn agent_row(line: &str) -> Option<AgentRow<'_>> {
-    let line = line.trim_start();
-    let (marked, rest) = if let Some(rest) = line.strip_prefix("( )") {
-        (false, rest)
-    } else if let Some(rest) = line.strip_prefix('\u{25ef}') {
-        (false, rest)
-    } else if let Some(rest) = line.strip_prefix('\u{25cf}') {
-        (true, rest)
-    } else {
-        let mut chars = line.chars();
-        match (chars.next(), chars.next(), chars.next()) {
-            (Some('('), Some(mark), Some(')')) if !mark.is_whitespace() => (true, chars.as_str()),
-            _ => return None,
-        }
-    };
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let mut words = rest.split_whitespace();
-    let name = words.next()?;
-    let plain = name
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
-    plain.then(|| AgentRow {
-        name,
-        marked,
-        timer: words.any(duration_word),
-    })
-}
-
-/// `35m`, `15s`, `1h`, `2m30s`: digits and a unit, once or more.
-fn duration_word(word: &str) -> bool {
-    let mut digits = false;
-    let mut units = false;
-    for c in word.chars() {
-        if c.is_ascii_digit() {
-            digits = true;
-        } else if digits && matches!(c, 'h' | 'm' | 's') {
-            digits = false;
-            units = true;
-        } else {
-            return false;
-        }
-    }
-    units && !digits
-}
-
-/// The agent list on `screen`: the run of agent rows around a row of `main`
-/// alone. Empty without one.
-fn agent_list(screen: &[String]) -> Vec<AgentRow<'_>> {
-    let Some(main) = screen.iter().position(|line| {
-        agent_row(line).is_some_and(|row| row.name == "main" && line.trim_end().ends_with("main"))
-    }) else {
-        return Vec::new();
-    };
-    let first = screen[..main]
-        .iter()
-        .rposition(|line| agent_row(line).is_none())
-        .map_or(0, |index| index + 1);
-    screen[first..]
-        .iter()
-        .map_while(|line| agent_row(line))
-        .collect()
 }
 
 /// Whether `screen` shows the dialog Claude Code opens for `/exit` while
@@ -797,49 +715,31 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_view_and_working_background_agents_block_typing() {
+    fn only_the_agent_view_blocks_typing() {
         let live = agent_view();
         assert!(agents_block(&live));
-        // Each sign alone blocks: the placeholder, a marked agent, a timer.
-        let placeholder = &live[..8];
-        assert!(agents_block(placeholder));
-        let mut list: Vec<String> = live.clone();
-        list[5] = ">\u{a0}".into();
-        assert!(agents_block(&list));
-        list[9] = "  ( ) maw-qa-medium".into();
-        assert!(agents_block(&list), "the timer of the other agent");
-        list[10] = "  ( ) maw-plan-reviewer-2-medium".into();
-        assert!(!agents_block(&list), "a list of idle agents");
         for line in ["❯\u{a0}Message @general-purpose\u{2026}", "  > Message @x"] {
             assert!(agents_block(&screen(&[line])), "{line}");
         }
-        for row in ["  (\u{2022}) worker", "  \u{25cf} worker"] {
-            assert!(
-                agents_block(&screen(&["  ( ) main", row])),
-                "a marked agent: {row}"
-            );
-        }
-        assert!(agents_block(&screen(&[
-            "  \u{25cf} main",
-            "  ( ) worker   Running 2m30s",
-        ])));
+        // The agent list alone (the view closed) does not block: /exit is
+        // guarded by Claude Code's own dialog and the hub.
+        let mut list: Vec<String> = live.clone();
+        list[5] = ">\u{a0}".into();
+        assert!(!agents_block(&list));
     }
 
     #[test]
     fn a_plain_screen_does_not_block_typing() {
-        // A finished background agent: only the count in the status line.
         let idle = screen(&[
             "\u{25cf} Agent(QA pass)",
             "  \u{23bf}  Done (12 tool uses \u{b7} 40.1k tokens \u{b7} 3m 2s)",
-            "",
-            "\u{25cf} Bash(sleep 5)",
-            "  \u{23bf}  Running\u{2026} (5s)",
-            "\u{25cf} main is up to date 5s ago",
             "",
             RULE,
             "\u{276f}\u{a0}",
             RULE,
             "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} 1 agent",
+            "  \u{25cf} main",
+            "  \u{25ef} general-purpose  Append steps with sleeps          4s \u{b7} \u{2193} 39.6k tokens",
         ]);
         assert!(!agents_block(&idle));
         for lines in [
@@ -847,57 +747,10 @@ mod tests {
             &["\u{276f}\u{a0}Message me when done"],
             &["\u{276f}\u{a0}Message @"],
             &["Message @x"],
-            // Main alone selected, the others idle.
-            &["  \u{25cf} main", "  ( ) worker"],
-            // Rows without a list of main.
-            &["  \u{25cf} worker  12s", "  ( ) other  3m"],
-            &["  ( ) main  and more", "  \u{25cf} worker"],
             &[],
         ] {
             assert!(!agents_block(&screen(lines)), "{lines:?}");
         }
-        for word in ["35m", "15s", "1h", "2m30s"] {
-            assert!(duration_word(word), "{word}");
-        }
-        for word in ["m", "5", "5x", "337.7k", "s5", "5m3"] {
-            assert!(!duration_word(word), "{word}");
-        }
-    }
-
-    /// The main screen of the TASK-047 probe (2.1.282) while a background
-    /// subagent works, the prompt left out: the list's rows are `● main`
-    /// and `◯ <type>  <description>  <time> · ↓ <tokens>`.
-    fn probe_main_screen(agent_row: &str) -> Vec<String> {
-        screen(&[
-            "\u{25cf} Agent(Append steps with sleeps)",
-            "  \u{23bf}  Backgrounded agent (\u{2193} to manage \u{b7} ctrl+o to expand)",
-            "\u{25cf} launched",
-            "\u{273b} Waiting for 1 background agent to finish",
-            RULE,
-            "\u{276f}",
-            RULE,
-            "  Opus 5.5 [medium] dir:cctg-t047-probe sh:bash ctx:6%",
-            "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 1 agent",
-            "  \u{25cf} main",
-            agent_row,
-        ])
-    }
-
-    #[test]
-    fn a_working_agent_on_the_main_screen_blocks_typing() {
-        for row in [
-            // Right after the launch, and after a resume by SendMessage.
-            "  \u{25ef} general-purpose  Append steps with sleeps          4s \u{b7} \u{2193} 39.6k tokens",
-            "  \u{25ef} general-purpose  Append steps with sleeps          1s",
-        ] {
-            assert!(agents_block(&probe_main_screen(row)), "{row}");
-        }
-        assert!(
-            !agents_block(&probe_main_screen(
-                "  \u{25ef} general-purpose  Append steps with sleeps"
-            )),
-            "an agent without a timer"
-        );
     }
 
     /// The dialog `/exit` opened in the TASK-047 probe (2.1.282) while a
@@ -927,9 +780,14 @@ mod tests {
         earlier.extend(probe_exit_dialog());
         assert!(exit_dialog(&earlier));
         // Closed with Esc: the input box is back.
-        assert!(!exit_dialog(&probe_main_screen(
-            "  \u{25ef} general-purpose  x  4s"
-        )));
+        assert!(!exit_dialog(&screen(&[
+            "\u{25cf} launched",
+            RULE,
+            "\u{276f}",
+            RULE,
+            "  \u{25cf} main",
+            "  \u{25ef} general-purpose  x  4s",
+        ])));
         // The words in the conversation, above an input box.
         let quoted = screen(&[
             &"\u{2594}".repeat(40),
