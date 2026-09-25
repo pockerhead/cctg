@@ -389,7 +389,7 @@ async fn scenario() {
     }
     let exe = bin.join(format!("cctg{EXE}"));
     let original = std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap();
-    std::fs::write(&exe, &original).unwrap();
+    common::write_program(&exe, &original);
 
     let fake = Arc::new(Fake::default());
     fake.state.lock().unwrap().me_failures = 2;
@@ -461,7 +461,7 @@ async fn scenario() {
         },
     );
     cctg::hook::post(
-        &format!("127.0.0.1:{hook_port}"),
+        &cctg::tls::HubAddr::plain(format!("127.0.0.1:{hook_port}")),
         &Secret::parse(SECRET).unwrap(),
         &start,
         Duration::from_secs(5),
@@ -520,7 +520,7 @@ async fn scenario() {
     let mut good = original.clone();
     good.extend_from_slice(b"\0supervise-e2e candidate");
     let good_path = build.join(format!("good{EXE}"));
-    std::fs::write(&good_path, &good).unwrap();
+    common::write_program(&good_path, &good);
     let (ok, out) = deploy(&exe, &good_path, &home).await;
     assert!(ok && out.starts_with("deployed: cctg "), "{out}");
     assert_eq!(
@@ -550,7 +550,7 @@ async fn scenario() {
     // 4. A candidate whose hub exits at once.
     let crashing = std::fs::read(std::env::current_exe().unwrap()).unwrap();
     let crashing_path = build.join(format!("crashing{EXE}"));
-    std::fs::write(&crashing_path, &crashing).unwrap();
+    common::write_program(&crashing_path, &crashing);
     let (ok, out) = deploy(&exe, &crashing_path, &home).await;
     assert!(
         !ok && out.starts_with("rolled back: the new hub exited"),

@@ -28,7 +28,9 @@ use crate::wire::{HookEvent, HookPost};
 /// Budget of the POST to the hub. It runs next to the user's command, but
 /// the terminal waits for this process, so a stopped hub may cost the status
 /// line this much (a closed local port on Windows is retried until the
-/// timeout). Kept well under the 150 ms the whole call may add.
+/// timeout). Kept well under the 150 ms the whole call may add, also over
+/// TLS (TASK-035): a hub more than a short round trip away misses the
+/// numbers rather than slowing the status line.
 pub const POST_TIMEOUT: Duration = Duration::from_millis(80);
 /// Claude Code writes the whole input at once and closes stdin.
 const STDIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -70,9 +72,10 @@ pub async fn run() -> i32 {
                     let Ok(secret) = &config.secret else {
                         return;
                     };
-                    if let Err(error) =
-                        hook::post(&config.hook_addr, secret, &post, POST_TIMEOUT).await
-                    {
+                    let Ok(hub) = config.hub(&config.hook_addr) else {
+                        return;
+                    };
+                    if let Err(error) = hook::post(&hub, secret, &post, POST_TIMEOUT).await {
                         debug!(%error, "status line numbers not delivered");
                     }
                 })
@@ -440,6 +443,9 @@ mod tests {
         );
     }
 
+    // Git Bash is looked for on Windows only; `C:` paths do not join into a
+    // Unix PATH.
+    #[cfg(windows)]
     #[test]
     fn git_bash_is_found_like_claude_code_finds_it() {
         let git = Path::new("C:/Git");

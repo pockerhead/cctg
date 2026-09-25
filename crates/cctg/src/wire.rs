@@ -171,8 +171,10 @@ pub struct Register {
 pub struct Client {
     /// `CARGO_PKG_VERSION` of the agent.
     pub version: String,
-    /// sha256 of the agent's executable as it started, lowercase hex. Two
-    /// agents run the same build exactly when these match.
+    /// The agent's build ([`crate::client`]): the commit it was built from,
+    /// or with local changes or without git the sha256 of its executable
+    /// (TASK-035; before, always that sha256). The hub compares it with its
+    /// own, never parses it.
     pub build: String,
     /// The agent runs under the `cctg agent` shim: it answers `update` with
     /// `update_answer` and can hand over to a newer binary without Claude
@@ -719,13 +721,23 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> Result<(), WireError> {
+    read_line_max(reader, buf, MAX_LINE).await
+}
+
+/// [`read_line`] with the lower cap `max` (the hub's line before the secret
+/// is checked).
+pub async fn read_line_max<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> Result<(), WireError> {
     if buf.last() == Some(&b'\n') {
         return Ok(());
     }
-    if buf.len() >= MAX_LINE {
+    if buf.len() >= max {
         return Err(WireError::TooLong);
     }
-    let remaining = MAX_LINE - buf.len();
+    let remaining = max - buf.len();
     let read = (&mut *reader)
         .take(remaining as u64)
         .read_until(b'\n', buf)

@@ -396,6 +396,9 @@ mod tests {
         assert!(left.is_empty(), "the link goes with the shim: {left:?}");
     }
 
+    // Needs a process source (`proctree::ancestors`); macOS has none yet
+    // (TASK-044) and keeps every link.
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn only_links_of_shims_that_are_gone_are_removed() {
         let dir = TempDir::new("shim-links");

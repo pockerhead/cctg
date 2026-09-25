@@ -4,9 +4,11 @@
 //! `UserPromptSubmit` stdout would become context for Claude). Failures go to
 //! stderr as fixed texts: never the input, never the secret.
 //!
-//! Transport: plain TCP instead of `reqwest`: the body is tiny, the hub is
-//! local or on a private network, and a TLS-capable client costs start-up
-//! time the `SessionEnd` budget (1.5 s shared) cannot spare.
+//! Transport: hand-written HTTP/1.1 instead of `reqwest`: the body is tiny
+//! and a full HTTP client costs start-up time the `SessionEnd` budget (1.5 s
+//! shared) cannot spare. Plain TCP to a hub on this machine; TLS with the
+//! pinned hub certificate to any other ([`crate::tls`], TASK-035), with
+//! longer budgets for the extra round trip.
 //!
 //! [`HookPost::new`](crate::wire::HookPost::new) mints the event id; calling
 //! [`post`] again with the same value re-sends the same event, which the hub
@@ -38,12 +40,12 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use crate::device::{self, DeviceConfig};
 use crate::proctree::{self, Lineage};
 use crate::spool;
+use crate::tls::HubAddr;
 use crate::wire::{
     Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PermissionAnswer, PermissionPost,
     Secret, VERSION,
@@ -59,6 +61,11 @@ pub const POST_TIMEOUT: Duration = Duration::from_millis(500);
 /// a shorter wait there. Events with a report or lifecycle keep
 /// [`POST_TIMEOUT`], which also leaves room for a hub across Tailscale.
 pub const PROMPT_POST_TIMEOUT: Duration = Duration::from_millis(300);
+/// [`POST_TIMEOUT`] and [`PROMPT_POST_TIMEOUT`] to a hub over TLS: the
+/// handshake adds a round trip to a hub that is not on this machine. Still
+/// well under the 1.5 s `SessionEnd` budget.
+pub const TLS_POST_TIMEOUT: Duration = Duration::from_millis(900);
+pub const TLS_PROMPT_POST_TIMEOUT: Duration = Duration::from_millis(600);
 /// Claude Code writes the whole input at once and closes stdin.
 pub const STDIN_TIMEOUT: Duration = Duration::from_millis(300);
 /// Larger input is dropped, not truncated: cut JSON is not JSON.
@@ -75,6 +82,8 @@ const MAX_CALL_LINE: usize = 512;
 /// Connect and send of the permission request. On Windows a connect to a
 /// closed local port lasts until the timeout, so a stopped hub costs this.
 pub const PERMISSION_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// [`PERMISSION_CONNECT_TIMEOUT`] over TLS.
+pub const TLS_PERMISSION_CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Longest wait for the hub's answer, under the `"timeout": 100` the
 /// settings give this hook; the hub itself gives up after 90 s.
 pub const PERMISSION_WAIT: Duration = Duration::from_secs(97);
@@ -112,17 +121,16 @@ pub async fn run(event: &str) {
             return;
         }
     };
+    let hub = match config.hub(&config.hook_addr) {
+        Ok(hub) => hub,
+        Err(problem) => {
+            warn!(%problem, "hook event not sent");
+            return;
+        }
+    };
     let spool = config.state_dir.as_deref().map(spool::dir);
-    let timeout = post_timeout(&hook_post.event);
-    let Err(error) = deliver(
-        spool.as_deref(),
-        &config.hook_addr,
-        secret,
-        &hook_post,
-        timeout,
-    )
-    .await
-    else {
+    let timeout = post_timeout(&hook_post.event, hub.is_tls());
+    let Err(error) = deliver(spool.as_deref(), &hub, secret, &hook_post, timeout).await else {
         return;
     };
     let kept = match spool {
@@ -163,14 +171,19 @@ async fn permission(input: &[u8], config: &DeviceConfig) {
             return;
         }
     };
-    let asked = ask(
-        &config.hook_addr,
-        secret,
-        &post,
-        PERMISSION_CONNECT_TIMEOUT,
-        PERMISSION_WAIT,
-    )
-    .await;
+    let hub = match config.hub(&config.hook_addr) {
+        Ok(hub) => hub,
+        Err(problem) => {
+            warn!(%problem, "permission request not sent");
+            return;
+        }
+    };
+    let connect = if hub.is_tls() {
+        TLS_PERMISSION_CONNECT_TIMEOUT
+    } else {
+        PERMISSION_CONNECT_TIMEOUT
+    };
+    let asked = ask(&hub, secret, &post, connect, PERMISSION_WAIT).await;
     match asked {
         Ok(Some(behavior)) => {
             let mut stdout = std::io::stdout().lock();
@@ -247,11 +260,11 @@ pub fn build_permission(input: &[u8], host: &str) -> Result<PermissionPost, Skip
     })
 }
 
-/// Asks the hub at `addr` for the answer to `post`: connect and send within
-/// `connect_timeout`, then wait up to `wait`. `Ok(None)`: the hub has no
-/// decision.
+/// Asks the hub at `addr` for the answer to `post`: connect (and the TLS
+/// handshake) and send within `connect_timeout`, then wait up to `wait`.
+/// `Ok(None)`: the hub has no decision.
 pub async fn ask(
-    addr: &str,
+    addr: &HubAddr,
     secret: &Secret,
     post: &PermissionPost,
     connect_timeout: Duration,
@@ -266,12 +279,14 @@ pub async fn ask(
     );
     let io = |error: std::io::Error| PostError::Io(error.kind());
     let send = async {
-        let mut stream = TcpStream::connect(addr).await.map_err(io)?;
-        let _ = stream.set_nodelay(true);
+        let mut stream = addr.connect().await.map_err(io)?;
         stream
             .write_all(&[head.as_bytes(), &body].concat())
             .await
             .map_err(io)?;
+        // Over TLS the tail can still sit in the session: push it out
+        // before waiting for the answer (reading never does).
+        stream.flush().await.map_err(io)?;
         Ok(stream)
     };
     let mut stream = tokio::time::timeout(connect_timeout, send)
@@ -318,7 +333,7 @@ fn parse_answer(answer: &[u8]) -> Result<Option<Behavior>, PostError> {
 /// so the order holds).
 async fn deliver(
     spool: Option<&Path>,
-    addr: &str,
+    addr: &HubAddr,
     secret: &Secret,
     hook_post: &HookPost,
     timeout: Duration,
@@ -337,13 +352,20 @@ async fn deliver(
     post(addr, secret, hook_post, left).await
 }
 
-fn post_timeout(event: &HookEvent) -> Duration {
-    match event {
+/// The POST budget of `event`; `tls`: the hub is reached over TLS.
+pub fn post_timeout(event: &HookEvent, tls: bool) -> Duration {
+    let short = matches!(
+        event,
         HookEvent::UserPromptSubmit { .. }
-        | HookEvent::ToolStart { .. }
-        | HookEvent::ToolEnd { .. }
-        | HookEvent::StatusLine { .. } => PROMPT_POST_TIMEOUT,
-        _ => POST_TIMEOUT,
+            | HookEvent::ToolStart { .. }
+            | HookEvent::ToolEnd { .. }
+            | HookEvent::StatusLine { .. }
+    );
+    match (short, tls) {
+        (true, false) => PROMPT_POST_TIMEOUT,
+        (false, false) => POST_TIMEOUT,
+        (true, true) => TLS_PROMPT_POST_TIMEOUT,
+        (false, true) => TLS_POST_TIMEOUT,
     }
 }
 
@@ -629,10 +651,11 @@ pub enum PostError {
     BadResponse,
 }
 
-/// Sends `post` to the hub hook endpoint at `addr` (`host:port`). Everything,
-/// connect included, fits in `timeout`. `Ok` means the hub has the event.
+/// Sends `post` to the hub hook endpoint at `addr`. Everything, connect and
+/// TLS handshake included, fits in `timeout`. `Ok` means the hub has the
+/// event.
 pub async fn post(
-    addr: &str,
+    addr: &HubAddr,
     secret: &Secret,
     post: &HookPost,
     timeout: Duration,
@@ -646,12 +669,14 @@ pub async fn post(
     );
     let exchange = async {
         let io = |error: std::io::Error| PostError::Io(error.kind());
-        let mut stream = TcpStream::connect(addr).await.map_err(io)?;
-        let _ = stream.set_nodelay(true);
+        let mut stream = addr.connect().await.map_err(io)?;
         stream
             .write_all(&[head.as_bytes(), &body].concat())
             .await
             .map_err(io)?;
+        // Over TLS the tail can still sit in the session: push it out
+        // before waiting for the answer (reading never does).
+        stream.flush().await.map_err(io)?;
         let mut status_line = Vec::new();
         BufReader::new(stream)
             .take(MAX_STATUS_LINE)
@@ -727,13 +752,17 @@ mod tests {
         let sent = sample();
         let timeout = Duration::from_secs(5);
         let started = Instant::now();
-        post(&addr, &secret(), &sent, timeout).await.unwrap();
+        post(&HubAddr::plain(addr.as_str()), &secret(), &sent, timeout)
+            .await
+            .unwrap();
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "{:?}",
             started.elapsed()
         );
-        post(&addr, &secret(), &sent, timeout).await.unwrap();
+        post(&HubAddr::plain(addr.as_str()), &secret(), &sent, timeout)
+            .await
+            .unwrap();
         assert_eq!(events.recv().await, Some(sent));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(events.try_recv().is_err());
@@ -743,7 +772,13 @@ mod tests {
     async fn a_wrong_secret_is_refused() {
         let (addr, mut events) = hub().await;
         let wrong = Secret::parse("0123456789abcdef-secreT").unwrap();
-        let result = post(&addr, &wrong, &sample(), Duration::from_secs(5)).await;
+        let result = post(
+            &HubAddr::plain(addr.as_str()),
+            &wrong,
+            &sample(),
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(result, Err(PostError::Status(401)));
         assert!(events.try_recv().is_err());
     }
@@ -763,7 +798,13 @@ mod tests {
         });
         let timeout = Duration::from_millis(300);
         let started = Instant::now();
-        let result = post(&addr, &secret(), &sample(), timeout).await;
+        let result = post(
+            &HubAddr::plain(addr.as_str()),
+            &secret(),
+            &sample(),
+            timeout,
+        )
+        .await;
         assert_eq!(result, Err(PostError::Timeout(timeout)));
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -781,9 +822,14 @@ mod tests {
         drop(listener);
         let timeout = Duration::from_millis(800);
         let started = Instant::now();
-        let error = post(&addr, &secret(), &sample(), timeout)
-            .await
-            .unwrap_err();
+        let error = post(
+            &HubAddr::plain(addr.as_str()),
+            &secret(),
+            &sample(),
+            timeout,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, PostError::Io(_) | PostError::Timeout(_)),
             "{error:?}"
@@ -815,9 +861,15 @@ mod tests {
         let (addr, mut events) = hub().await;
         let own = sample();
         let timeout = Duration::from_secs(5);
-        deliver(Some(&root), &addr, &secret(), &own, timeout)
-            .await
-            .unwrap();
+        deliver(
+            Some(&root),
+            &HubAddr::plain(addr.as_str()),
+            &secret(),
+            &own,
+            timeout,
+        )
+        .await
+        .unwrap();
         assert_eq!(events.recv().await, Some(kept));
         assert_eq!(events.recv().await, Some(own));
         assert!(spool::pending(&root, &sample().session_id, SystemTime::now()).is_empty());
@@ -844,7 +896,14 @@ mod tests {
         });
         let timeout = Duration::from_millis(300);
         let started = Instant::now();
-        let result = deliver(Some(&root), &addr, &secret(), &sample(), timeout).await;
+        let result = deliver(
+            Some(&root),
+            &HubAddr::plain(addr.as_str()),
+            &secret(),
+            &sample(),
+            timeout,
+        )
+        .await;
         assert!(matches!(result, Err(PostError::Timeout(_))), "{result:?}");
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -884,7 +943,7 @@ mod tests {
         });
         let result = deliver(
             Some(&root),
-            &addr,
+            &HubAddr::plain(addr.as_str()),
             &secret(),
             &sample(),
             Duration::from_secs(5),
@@ -949,13 +1008,27 @@ mod tests {
                 decision
             })
             .await;
-            let got = ask(&addr, &secret(), &permission_post(), connect, wait).await;
+            let got = ask(
+                &HubAddr::plain(addr.as_str()),
+                &secret(),
+                &permission_post(),
+                connect,
+                wait,
+            )
+            .await;
             assert_eq!(got, Ok(want), "{decision:?}");
         }
         // A wrong secret is refused before the hub sees the ask.
         let addr = permission_hub(|_| panic!("asked without the secret")).await;
         let wrong = Secret::parse("0123456789abcdef-secreT").unwrap();
-        let got = ask(&addr, &wrong, &permission_post(), connect, wait).await;
+        let got = ask(
+            &HubAddr::plain(addr.as_str()),
+            &wrong,
+            &permission_post(),
+            connect,
+            wait,
+        )
+        .await;
         assert_eq!(got, Err(PostError::Status(401)));
     }
 
@@ -963,7 +1036,7 @@ mod tests {
     async fn a_hub_without_the_permission_path_means_no_decision() {
         let (addr, _events) = hub().await;
         let got = ask(
-            &addr,
+            &HubAddr::plain(addr.as_str()),
             &secret(),
             &permission_post(),
             Duration::from_secs(2),
@@ -1053,7 +1126,13 @@ mod tests {
             b"",
         ] {
             let addr = answering(answer).await;
-            let result = post(&addr, &secret(), &sample(), timeout).await;
+            let result = post(
+                &HubAddr::plain(addr.as_str()),
+                &secret(),
+                &sample(),
+                timeout,
+            )
+            .await;
             assert_eq!(
                 result,
                 Err(PostError::BadResponse),
@@ -1062,7 +1141,90 @@ mod tests {
             );
         }
         let addr = answering(b"HTTP/1.1 204 No Content\r\n\r\n").await;
-        assert_eq!(post(&addr, &secret(), &sample(), timeout).await, Ok(()));
+        assert_eq!(
+            post(
+                &HubAddr::plain(addr.as_str()),
+                &secret(),
+                &sample(),
+                timeout
+            )
+            .await,
+            Ok(())
+        );
+    }
+
+    /// Over TLS the request must leave the TLS buffer before the answer is
+    /// awaited: `write_all` can return with the tail still in the TLS
+    /// session when the socket is full, and reading never pushes it out. A
+    /// hub that has not read yet (a slow link, a busy hub) must still get
+    /// every byte (TASK-035 review). The sizes straddle what the socket
+    /// buffers of both ends hold before a send blocks.
+    #[tokio::test]
+    async fn a_post_over_tls_is_whole_even_when_the_hub_reads_late() {
+        use rustls::pki_types::pem::PemObject;
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+            signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let (acceptor, pin) = crate::tls::Acceptor::new(vec![cert.der().clone()], key).unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let listener = socket.listen(8).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    // Nothing is read for a while: the client's sends block.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let mut buf = Vec::new();
+                    let mut chunk = vec![0u8; 64 * 1024];
+                    let mut want = usize::MAX;
+                    while buf.len() < want {
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if want == usize::MAX
+                            && let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                            let length: usize = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("Content-Length: "))
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or(0);
+                            want = end + 4 + length;
+                        }
+                    }
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        let hub = HubAddr::pinned(&addr, pin).unwrap();
+        for kib in (64..=512).step_by(64) {
+            let mut large = sample();
+            large.event = HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: Some("x".repeat(kib * 1024)),
+            };
+            let result = post(&hub, &secret(), &large, Duration::from_secs(3)).await;
+            assert_eq!(result, Ok(()), "{kib} KiB");
+        }
     }
 }
 
@@ -1535,7 +1697,13 @@ mod build_tests {
                 } else {
                     POST_TIMEOUT
                 };
-                assert_eq!(post_timeout(&post.event), want, "{event}");
+                assert_eq!(post_timeout(&post.event, false), want, "{event}");
+                let tls = if event == "UserPromptSubmit" {
+                    TLS_PROMPT_POST_TIMEOUT
+                } else {
+                    TLS_POST_TIMEOUT
+                };
+                assert_eq!(post_timeout(&post.event, true), tls, "{event}");
             }
         });
         assert!(PROMPT_POST_TIMEOUT < POST_TIMEOUT);
@@ -1551,10 +1719,14 @@ mod build_tests {
                 seven_day: None,
             },
         ] {
-            assert_eq!(post_timeout(&event), PROMPT_POST_TIMEOUT);
+            assert_eq!(post_timeout(&event, false), PROMPT_POST_TIMEOUT);
+            assert_eq!(post_timeout(&event, true), TLS_PROMPT_POST_TIMEOUT);
         }
-        // SessionEnd: stdin wait + POST stay well inside the shared 1.5 s.
+        // SessionEnd: stdin wait + POST stay well inside the shared 1.5 s,
+        // also over TLS.
         assert!(STDIN_TIMEOUT + POST_TIMEOUT <= Duration::from_millis(800));
+        assert!(STDIN_TIMEOUT + TLS_POST_TIMEOUT <= Duration::from_millis(1200));
+        assert!(POST_TIMEOUT < TLS_POST_TIMEOUT && PROMPT_POST_TIMEOUT < TLS_PROMPT_POST_TIMEOUT);
     }
 
     #[test]

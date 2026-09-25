@@ -103,8 +103,10 @@ fn send(claude: &mut std::process::ChildStdin, line: &str) {
     claude.flush().unwrap();
 }
 
+/// The build a worker started from `path` reports: the commit when this
+/// test was built from a clean one, else from the file's hash.
 fn build_of(path: &Path) -> String {
-    cctg::client::build_of(path).unwrap()
+    cctg::client::build_id_of(path).unwrap()
 }
 
 #[tokio::test]
@@ -117,7 +119,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     }
     let exe = bin.join(format!("cctg{EXE}"));
     let original = std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap();
-    std::fs::write(&exe, &original).unwrap();
+    common::write_program(&exe, &original);
 
     let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .await
@@ -177,7 +179,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     std::fs::rename(&exe, bin.join(format!("cctg.old{EXE}"))).unwrap();
     let mut newer = original.clone();
     newer.extend_from_slice(b"\0update-e2e newer build");
-    std::fs::write(&exe, &newer).unwrap();
+    common::write_program(&exe, &newer);
 
     to_first
         .send(HubMsg::Update { update_id: 7 })

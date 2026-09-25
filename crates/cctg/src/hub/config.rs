@@ -7,6 +7,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
+use crate::tls::{CERT_VAR, KEY_VAR};
 use crate::wire::{Secret, SecretError};
 
 pub const TOKEN_VAR: &str = "CCTG_BOT_TOKEN";
@@ -54,6 +55,8 @@ pub enum ConfigError {
     ListenAddr(&'static str),
     #[error("{API_URL_VAR} must start with https://, or http:// to a loopback host")]
     ApiUrl,
+    #[error("{CERT_VAR} and {KEY_VAR} go together: set both for TLS, or neither")]
+    TlsPair,
 }
 
 /// Bot token. `Debug` never prints it.
@@ -108,6 +111,16 @@ pub struct Config {
     pub hook_listen: SocketAddr,
     /// Bot API base URL, [`super::api::TELEGRAM_API`] unless configured.
     pub api_url: String,
+    /// `CCTG_TLS_CERT` and `CCTG_TLS_KEY`: both listeners take TLS with
+    /// them ([`crate::tls`]); `None`: plain TCP.
+    pub tls: Option<TlsFiles>,
+}
+
+/// PEM files of the hub certificate and its private key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsFiles {
+    pub cert: PathBuf,
+    pub key: PathBuf,
 }
 
 impl Config {
@@ -186,6 +199,14 @@ impl Config {
         if !(api_url.starts_with("https://") || is_loopback_http(&api_url)) {
             return Err(ConfigError::ApiUrl);
         }
+        let tls = match (optional(CERT_VAR), optional(KEY_VAR)) {
+            (Some(cert), Some(key)) => Some(TlsFiles {
+                cert: PathBuf::from(cert),
+                key: PathBuf::from(key),
+            }),
+            (None, None) => None,
+            _ => return Err(ConfigError::TlsPair),
+        };
 
         Ok(Self {
             token: BotToken(token),
@@ -196,6 +217,7 @@ impl Config {
             agent_listen,
             hook_listen,
             api_url,
+            tls,
         })
     }
 }
@@ -489,6 +511,35 @@ mod tests {
             ]))
             .unwrap_err();
             assert_eq!(error, ConfigError::ListenAddr(AGENT_LISTEN_VAR), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tls_needs_both_files_or_none() {
+        let base = [
+            (TOKEN_VAR, TOKEN),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+        ];
+        assert_eq!(Config::from_vars(vars(&base)).unwrap().tls, None);
+        let both = [
+            base.as_slice(),
+            &[(CERT_VAR, " /tls/cert.pem "), (KEY_VAR, "/tls/key.pem")],
+        ]
+        .concat();
+        assert_eq!(
+            Config::from_vars(vars(&both)).unwrap().tls,
+            Some(TlsFiles {
+                cert: PathBuf::from("/tls/cert.pem"),
+                key: PathBuf::from("/tls/key.pem"),
+            })
+        );
+        for one in [(CERT_VAR, "/tls/cert.pem"), (KEY_VAR, "/tls/key.pem")] {
+            let half = [base.as_slice(), &[one]].concat();
+            assert_eq!(
+                Config::from_vars(vars(&half)).unwrap_err(),
+                ConfigError::TlsPair
+            );
         }
     }
 

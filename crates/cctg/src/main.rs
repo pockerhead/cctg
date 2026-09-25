@@ -4,7 +4,11 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "cctg", version, about = "Claude Code Telegram bridge")]
+#[command(
+    name = "cctg",
+    version = cctg::client::LONG_VERSION,
+    about = "Claude Code Telegram bridge"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -68,6 +72,10 @@ enum Command {
     /// Claude Code status line command of cctg sessions: sends the numbers
     /// to the hub and prints the user's own status line.
     Statusline,
+    /// Exit 0 when the hub on this machine takes connections on both of
+    /// its listeners (`CCTG_AGENT_LISTEN`, `CCTG_HOOK_LISTEN`), else 1: the
+    /// Docker healthcheck.
+    Health,
 }
 
 #[tokio::main]
@@ -169,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
             let code = tokio::spawn(cctg::statusline::run()).await.unwrap_or(0);
             // At once: the stdin reader thread may still be blocked.
             std::process::exit(code);
+        }
+        Command::Health => {
+            std::process::exit(if cctg::hub::healthy().await { 0 } else { 1 });
         }
         Command::AgentInstall => {
             let exe = std::env::current_exe()?;
@@ -276,6 +287,10 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["cctg", "statusline"]).unwrap().command,
             Command::Statusline
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "health"]).unwrap().command,
+            Command::Health
         ));
     }
 }
