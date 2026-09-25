@@ -10,8 +10,8 @@
 //! Nothing here logs message contents, paths or the secret: log lines carry
 //! the connection number, the peer address and fixed text only.
 
-use std::collections::{HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,12 +39,23 @@ const MAX_AGENTS: usize = 256;
 /// Agent connections that have not authenticated yet; one more is closed at
 /// once (the listeners may face the internet, TASK-035).
 const MAX_PENDING_AGENTS: usize = 16;
+/// Of those, from one peer address: one source cannot take them all.
+const MAX_PENDING_AGENTS_PER_PEER: usize = 4;
 /// Longest `hello` line: read before the secret is checked. A secret longer
 /// than about 4000 characters cannot authenticate.
 const MAX_HELLO_LINE: usize = 4 * 1024;
 /// A wrong secret is answered only after this pause (both listeners).
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(250);
 const MAX_HOOK_REQUESTS: usize = 64;
+/// Hook requests of one peer address still before their secret (the
+/// request is read whole by then: a few hundred milliseconds at most).
+const MAX_PENDING_HOOKS_PER_PEER: usize = 16;
+/// What arrives before the secret (scanners, a wrong version, a wrong
+/// secret) warns at most once per peer address in this time; the rest of
+/// it is logged at debug level.
+const NOISE_WARN_EVERY: Duration = Duration::from_secs(60);
+/// Peer addresses remembered for that; beyond them, debug only.
+const NOISE_PEERS: usize = 1024;
 /// `PermissionRequest` hooks waiting for an answer at a time; one more gets
 /// no decision at once. They do not count against [`MAX_HOOK_REQUESTS`].
 pub const MAX_PERMISSION_WAITS: usize = 16;
@@ -61,6 +72,95 @@ const LINGER_BYTES: usize = MAX_HEAD + MAX_HOOK_BODY;
 /// its timeout), so ten minutes is ample; the size cap bounds memory.
 pub const DEDUP_TTL: Duration = Duration::from_secs(10 * 60);
 pub const DEDUP_MAX: usize = 4096;
+
+/// A warning for the first pre-authentication failure of a peer address in
+/// [`NOISE_WARN_EVERY`], debug for the rest (TASK-035: listeners may face
+/// the internet, and scanners must not drown real warnings).
+macro_rules! pre_auth {
+    ($gate:expr, $peer:expr, $($arg:tt)+) => {
+        if $gate.warns($peer.ip()) {
+            warn!($($arg)+)
+        } else {
+            debug!($($arg)+)
+        }
+    };
+}
+
+/// When each peer address last got a pre-authentication warning.
+#[derive(Clone, Default)]
+struct WarnGate(Arc<Mutex<HashMap<IpAddr, Instant>>>);
+
+impl WarnGate {
+    fn warns(&self, ip: IpAddr) -> bool {
+        let Ok(mut last) = self.0.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let quiet = |at: &Instant| now.duration_since(*at) < NOISE_WARN_EVERY;
+        if last.len() >= NOISE_PEERS {
+            last.retain(|_, at| quiet(at));
+        }
+        match last.get(&ip.to_canonical()) {
+            Some(at) if quiet(at) => false,
+            _ if last.len() >= NOISE_PEERS => false,
+            _ => {
+                last.insert(ip.to_canonical(), now);
+                true
+            }
+        }
+    }
+}
+
+/// Places for connections before their secret, counted per peer address.
+#[derive(Clone)]
+struct PerPeer {
+    limit: usize,
+    taken: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl PerPeer {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            taken: Arc::default(),
+        }
+    }
+
+    /// A place for `ip`; `None` when it holds `limit` already.
+    fn take(&self, ip: IpAddr) -> Option<PeerPlace> {
+        let ip = ip.to_canonical();
+        let mut taken = self.taken.lock().ok()?;
+        let count = taken.entry(ip).or_insert(0);
+        if *count >= self.limit {
+            return None;
+        }
+        *count += 1;
+        Some(PeerPlace {
+            ip,
+            taken: self.taken.clone(),
+        })
+    }
+}
+
+/// Given back when dropped.
+struct PeerPlace {
+    ip: IpAddr,
+    taken: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for PeerPlace {
+    fn drop(&mut self) {
+        let Ok(mut taken) = self.taken.lock() else {
+            return;
+        };
+        if let Some(count) = taken.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                taken.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Binds `addr`.
 pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -170,6 +270,8 @@ pub async fn serve_agents(
     let secret = Arc::new(secret);
     let slots = Arc::new(Semaphore::new(MAX_AGENTS));
     let pending = Arc::new(Semaphore::new(MAX_PENDING_AGENTS));
+    let per_peer = PerPeer::new(MAX_PENDING_AGENTS_PER_PEER);
+    let gate = WarnGate::default();
     let next_conn = AtomicU64::new(1);
     let mut sessions = JoinSet::new();
     loop {
@@ -183,24 +285,31 @@ pub async fn serve_agents(
                         continue;
                     }
                 };
-                // Closed at once: not yet authenticated connections are few.
+                // Closed at once: not yet authenticated connections are few,
+                // and fewer from one address.
+                let Some(peer_place) = per_peer.take(peer.ip()) else {
+                    debug!(%peer, "too many unauthenticated agent connections from one address; closed");
+                    continue;
+                };
                 let Ok(unauthenticated) = pending.clone().try_acquire_owned() else {
                     debug!(%peer, "too many unauthenticated agent connections; closed");
                     continue;
                 };
                 let Ok(permit) = slots.clone().try_acquire_owned() else {
-                    warn!(%peer, "too many agent connections; refused");
+                    pre_auth!(gate, peer, %peer, "too many agent connections; refused");
                     continue;
                 };
                 let conn = next_conn.fetch_add(1, Ordering::Relaxed);
-                let (secret, events, incoming) =
-                    (secret.clone(), events.clone(), incoming.clone());
+                let (secret, events, incoming, gate) =
+                    (secret.clone(), events.clone(), incoming.clone(), gate.clone());
                 let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
                 sessions.spawn(async move {
                     if let Some(stream) = open(&incoming, stream, peer, deadline).await {
                         let handshake = Handshake {
                             deadline,
                             unauthenticated,
+                            peer_place,
+                            gate,
                         };
                         agent_session(stream, peer, conn, &secret, &events, handshake).await;
                     }
@@ -243,10 +352,13 @@ async fn linger(read: &mut (impl AsyncRead + Unpin)) {
 }
 
 /// The pre-authentication part of an agent connection: its deadline and its
-/// place among the [`MAX_PENDING_AGENTS`], given back when it ends.
+/// places among the [`MAX_PENDING_AGENTS`] and those of its peer address,
+/// given back when it ends.
 struct Handshake {
     deadline: tokio::time::Instant,
     unauthenticated: OwnedSemaphorePermit,
+    peer_place: PeerPlace,
+    gate: WarnGate,
 }
 
 async fn agent_session(
@@ -297,7 +409,7 @@ async fn agent_session(
             return;
         }
         Ok(Err(reason)) => {
-            warn!(conn, %peer, ?reason, "agent rejected");
+            pre_auth!(pre_auth.gate, peer, conn, %peer, ?reason, "agent rejected");
             if reason == Rejection::Auth {
                 // No fast guessing; the place stays taken meanwhile.
                 tokio::time::sleep(AUTH_FAIL_DELAY).await;
@@ -307,11 +419,12 @@ async fn agent_session(
             return;
         }
         Err(_) => {
-            warn!(conn, %peer, "agent handshake timed out");
+            pre_auth!(pre_auth.gate, peer, conn, %peer, "agent handshake timed out");
             return;
         }
     };
     drop(pre_auth.unauthenticated);
+    drop(pre_auth.peer_place);
 
     let session = short(&register.session_id).to_owned();
     let (to_agent, mut outbound) = mpsc::channel(TO_AGENT_QUEUE);
@@ -565,6 +678,8 @@ async fn serve(
     let dedup = Arc::new(Mutex::new(Dedup::new(DEDUP_MAX, DEDUP_TTL)));
     let waits = waits.map(Arc::new);
     let slots = Arc::new(Semaphore::new(MAX_HOOK_REQUESTS));
+    let per_peer = PerPeer::new(MAX_PENDING_HOOKS_PER_PEER);
+    let gate = WarnGate::default();
     let mut requests = JoinSet::new();
     loop {
         tokio::select! {
@@ -577,8 +692,12 @@ async fn serve(
                         continue;
                     }
                 };
+                let Some(peer_place) = per_peer.take(peer.ip()) else {
+                    debug!(%peer, "too many hook requests from one address; closed");
+                    continue;
+                };
                 let Ok(permit) = slots.clone().try_acquire_owned() else {
-                    warn!(%peer, "too many hook requests; refused");
+                    pre_auth!(gate, peer, %peer, "too many hook requests; refused");
                     continue;
                 };
                 let (secret, dedup, events, waits, incoming) = (
@@ -588,19 +707,32 @@ async fn serve(
                     waits.clone(),
                     incoming.clone(),
                 );
+                let pre_auth = PreAuth {
+                    peer_place,
+                    gate: gate.clone(),
+                };
                 let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
                 requests.spawn(async move {
                     let Some(stream) = open(&incoming, stream, peer, deadline).await else {
                         return;
                     };
                     let waits = waits.as_deref();
-                    hook_request(stream, peer, &secret, &dedup, &events, waits, permit, deadline)
-                        .await;
+                    hook_request(
+                        stream, peer, &secret, &dedup, &events, waits, permit, pre_auth, deadline,
+                    )
+                    .await;
                 });
             }
             Some(_) = requests.join_next() => {}
         }
     }
+}
+
+/// A hook request's place among those of its peer address, held until the
+/// request is read, and where its early failures are logged.
+struct PreAuth {
+    peer_place: PeerPlace,
+    gate: WarnGate,
 }
 
 /// `deadline`: the whole request is in by then, TLS handshake included.
@@ -613,9 +745,13 @@ async fn hook_request(
     events: &mpsc::Sender<HookPost>,
     waits: Option<&PermissionWaits>,
     permit: OwnedSemaphorePermit,
+    pre_auth: PreAuth,
     deadline: tokio::time::Instant,
 ) {
-    let status = match tokio::time::timeout_at(deadline, read_request(&mut stream, secret)).await {
+    let read = tokio::time::timeout_at(deadline, read_request(&mut stream, secret)).await;
+    drop(pre_auth.peer_place);
+    let gate = pre_auth.gate;
+    let status = match read {
         Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
         Ok(Err(None)) => {
             debug!(%peer, "connection closed before its first byte");
@@ -630,17 +766,23 @@ async fn hook_request(
             }
             None => Status::NotFound,
         },
-        Ok(Err(Some(status))) => status,
+        Ok(Err(Some(status))) => {
+            if status == Status::Unauthorized {
+                pre_auth!(gate, peer, %peer, "hook request rejected: bad or missing secret");
+                // No fast guessing; the request place stays taken meanwhile.
+                tokio::time::sleep(AUTH_FAIL_DELAY).await;
+            } else {
+                pre_auth!(gate, peer, %peer, status = status.code(), "hook request rejected");
+            }
+            respond(&mut stream, status, &[]).await;
+            return;
+        }
         Err(_) => {
-            warn!(%peer, "hook request timed out");
+            pre_auth!(gate, peer, %peer, "hook request timed out");
             return;
         }
     };
-    if status == Status::Unauthorized {
-        warn!(%peer, "hook request rejected: bad or missing secret");
-        // No fast guessing; the request place stays taken meanwhile.
-        tokio::time::sleep(AUTH_FAIL_DELAY).await;
-    } else if status != Status::NoContent {
+    if status != Status::NoContent {
         warn!(%peer, status = status.code(), "hook request rejected");
     }
     respond(&mut stream, status, &[]).await;
@@ -1765,24 +1907,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unauthenticated_agents_beyond_the_cap_are_closed_at_once() {
-        let (addr, mut events, _hub) = agents_hub().await;
-        let mut idle = Vec::new();
-        for _ in 0..MAX_PENDING_AGENTS {
-            idle.push(TcpStream::connect(addr).await.unwrap());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let mut extra = TcpStream::connect(addr).await.unwrap();
+    /// Connects from `source` (port 0) to `addr`.
+    async fn connect_from(source: IpAddr, addr: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::new(source, 0)).unwrap();
+        socket.connect(addr).await.unwrap()
+    }
+
+    /// Closed by the hub at once, not at a deadline, without an answer.
+    async fn closed_at_once(mut stream: TcpStream) {
         let mut buf = [0u8; 16];
-        let read = tokio::time::timeout(Duration::from_secs(1), extra.read(&mut buf))
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
             .await
             .expect("closed at once, not at the deadline");
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    }
 
-        // The places come back when those connections go.
-        drop(idle);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    async fn registers(addr: SocketAddr, events: &mut mpsc::Receiver<AgentEvent>) {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
@@ -1791,6 +1932,95 @@ mod tests {
             within(events.recv()).await,
             Some(AgentEvent::Registered { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_agents_of_one_address_beyond_its_cap_are_closed_at_once() {
+        let (addr, mut events, _hub) = agents_hub().await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_AGENTS_PER_PEER {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        closed_at_once(TcpStream::connect(addr).await.unwrap()).await;
+
+        // The places come back when those connections go.
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        registers(addr, &mut events).await;
+    }
+
+    /// Several loopback source addresses: macOS has only 127.0.0.1.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn unauthenticated_agents_beyond_the_cap_are_closed_at_once() {
+        let (addr, mut events, _hub) = agents_hub().await;
+        let sources = (2..).map(|last| IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)));
+        let mut idle = Vec::new();
+        for source in sources.take(MAX_PENDING_AGENTS / MAX_PENDING_AGENTS_PER_PEER) {
+            for _ in 0..MAX_PENDING_AGENTS_PER_PEER {
+                idle.push(connect_from(source, addr).await);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A fresh address, still under its own cap: the global one closes it.
+        closed_at_once(connect_from(Ipv4Addr::new(127, 0, 0, 99).into(), addr).await).await;
+
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        registers(addr, &mut events).await;
+    }
+
+    #[tokio::test]
+    async fn pending_hook_requests_of_one_address_beyond_its_cap_are_closed_at_once() {
+        let (addr, mut events) = hooks_hub(4).await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_HOOKS_PER_PEER {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        closed_at_once(TcpStream::connect(addr).await.unwrap()).await;
+
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let body = serde_json::to_vec(&post(start())).unwrap();
+        let auth = format!("Bearer {SECRET}");
+        assert_eq!(exchange(addr, &request(Some(&auth), &body)).await, 204);
+        assert!(within(events.recv()).await.is_some());
+    }
+
+    #[test]
+    fn places_per_address_are_counted_and_given_back() {
+        let places = PerPeer::new(2);
+        let a: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        let b: IpAddr = Ipv4Addr::new(192, 0, 2, 2).into();
+        let first = places.take(a).unwrap();
+        let _second = places.take(a).unwrap();
+        assert!(places.take(a).is_none(), "a third from one address");
+        // The same address written as IPv4-mapped IPv6 counts as the same.
+        let mapped: IpAddr = Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped().into();
+        assert!(places.take(mapped).is_none());
+        assert!(places.take(b).is_some(), "another address");
+        drop(first);
+        assert!(places.take(a).is_some(), "given back");
+    }
+
+    #[test]
+    fn an_address_warns_at_most_once_a_minute() {
+        let gate = WarnGate::default();
+        let a: IpAddr = Ipv4Addr::new(192, 0, 2, 1).into();
+        assert!(gate.warns(a));
+        assert!(!gate.warns(a), "the second within a minute is debug");
+        assert!(
+            gate.warns(Ipv4Addr::new(192, 0, 2, 2).into()),
+            "another address"
+        );
+        // Too many addresses at once: the rest stays at debug.
+        let gate = WarnGate::default();
+        for n in 0..NOISE_PEERS as u32 {
+            assert!(gate.warns(IpAddr::V4((0x0a00_0000 + n).into())));
+        }
+        assert!(!gate.warns(Ipv4Addr::new(192, 0, 2, 3).into()));
     }
 
     #[tokio::test]

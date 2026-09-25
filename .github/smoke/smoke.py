@@ -21,12 +21,14 @@ Test values only; nothing here is a real secret. Exits non-zero on failure.
 """
 import json
 import os
+import queue
 import shutil
 import socket
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -37,12 +39,18 @@ SECRET = "smoke-secret-0123456789abcdef"
 TOKEN = "123456:smoke-token-value"
 SESSION = "5e550000-0000-4000-8000-0000000d0035"
 AGENT_PORT, HOOK_PORT, CONTROL_PORT = 47391, 47392, 18081
+# Every command and every read has a limit: a stuck step fails with its
+# name instead of hanging the job until the workflow timeout.
+COMMAND_TIMEOUT = 300
 
 
-def run(*args, check=True, **kwargs):
+def run(*args, check=True, timeout=COMMAND_TIMEOUT, **kwargs):
     print("$", " ".join(str(a) for a in args), flush=True)
-    return subprocess.run([str(a) for a in args], check=check, text=True,
-                          capture_output=True, **kwargs)
+    try:
+        return subprocess.run([str(a) for a in args], check=check, text=True,
+                              capture_output=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"FAIL: timed out after {timeout} s: {' '.join(str(a) for a in args)}")
 
 
 def compose(image, *args, check=True):
@@ -93,8 +101,11 @@ def hook(exe, home, work):
     payload = json.dumps({"session_id": SESSION, "cwd": str(work),
                           "transcript_path": str(work / f"{SESSION}.jsonl"),
                           "hook_event_name": "SessionStart", "source": "startup"})
-    out = subprocess.run([str(exe), "hook", "SessionStart"], input=payload, text=True,
-                         capture_output=True, env=client_env(home), cwd=work, timeout=30)
+    try:
+        out = subprocess.run([str(exe), "hook", "SessionStart"], input=payload, text=True,
+                             capture_output=True, env=client_env(home), cwd=work, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise SystemExit("FAIL: cctg hook did not exit within 30 s")
     assert out.returncode == 0 and out.stdout == "", out
     return out.stderr
 
@@ -123,9 +134,26 @@ def raw_register(build):
                    "client": {"version": "0.1.0", "build": build, "self_update": False}}
             tls.sendall((json.dumps({"v": 1, "type": "hello", "secret": SECRET}) + "\n"
                          + json.dumps(reg) + "\n").encode())
-            answer = tls.recv(4096).decode()
+            try:
+                answer = tls.recv(4096).decode()
+            except socket.timeout:
+                raise SystemExit("FAIL: the hub did not answer a raw registration within 10 s")
             assert "registered" in answer, answer
             time.sleep(1)
+
+
+def lines_of(stream):
+    # A reader thread: the main thread waits on the queue with a timeout,
+    # never on a readline that may not return.
+    lines = queue.Queue()
+
+    def pump():
+        for line in stream:
+            lines.put(line)
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    return lines
 
 
 def main():
@@ -181,6 +209,7 @@ def main():
                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                                  env=dict(client_env(good), CLAUDE_CODE_SESSION_ID=SESSION,
                                           CLAUDE_CONFIG_DIR=str(good / "claude")))
+        agent_out = lines_of(agent.stdout)
         try:
             agent.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
                               '{"protocolVersion":"2025-11-25","capabilities":{}}}\n'
@@ -191,10 +220,15 @@ def main():
             control("/control/push", {"thread_id": 101, "text": "over-tls-from-docker"})
             deadline = time.time() + 30
             got = False
-            while time.time() < deadline and not got:
-                line = agent.stdout.readline()
+            while not got:
+                left = deadline - time.time()
+                try:
+                    line = agent_out.get(timeout=max(left, 0))
+                except queue.Empty:
+                    raise SystemExit("FAIL: the message did not reach the agent within 30 s")
+                if line is None:
+                    raise SystemExit("FAIL: the agent closed its stdout before the message")
                 got = "notifications/claude/channel" in line and "over-tls-from-docker" in line
-            assert got, "the message did not reach the agent"
             print("agent ok", flush=True)
             logs = compose(image, "logs", "hub").stdout
             assert "agent runs another cctg build" not in logs, "same commit called another build"
@@ -205,7 +239,7 @@ def main():
             assert logs.count("agent runs another cctg build") == 1, logs
         finally:
             agent.kill()
-            agent.wait()
+            agent.wait(timeout=30)
 
         # 6. Logs.
         logs = compose(image, "logs", "hub").stdout
