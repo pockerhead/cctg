@@ -451,6 +451,11 @@ pub enum UpdateOutcome {
     NeedsManualRestart,
     /// The terminal input holds unsent text; `/exit` was not sent.
     DraftInInput,
+    /// A restart is needed, but Claude Code's agent view is open or a
+    /// background agent runs ([`crate::keys::agents_block`]): `/exit` was
+    /// not sent and the agent stays; the hub asks again later (TASK-047).
+    /// Hubs before it read [`Self::Other`], a failure.
+    AgentsRunning,
     /// Already up to date: no newer binary, no restart needed.
     UpToDate,
     /// Something failed; nothing changed.
@@ -469,6 +474,9 @@ pub enum CommandOutcome {
     Sent,
     /// The input box held a draft: the typed line was erased, nothing sent.
     Draft,
+    /// Claude Code's agent view is open or a background agent runs: nothing
+    /// typed (TASK-047). Hubs before it read [`Self::Other`], a failure.
+    AgentsRunning,
     /// Not typed, or typed and erased again for another reason.
     Failed,
     /// An outcome of a newer agent.
@@ -1103,6 +1111,15 @@ mod tests {
                 update_id: 9,
                 outcome: UpdateOutcome::DraftInInput,
             },
+            AgentMsg::UpdateAnswer {
+                update_id: 10,
+                outcome: UpdateOutcome::AgentsRunning,
+            },
+            AgentMsg::ConsoleCommandTyped {
+                command_id: 2,
+                outcome: CommandOutcome::AgentsRunning,
+                panel: None,
+            },
             AgentMsg::FileOffer {
                 transfer_id: u64::MAX,
                 name: "\u{448}\u{43e}\u{442} \"1\".png".into(),
@@ -1304,6 +1321,25 @@ mod tests {
         }
         for msg in hub_samples() {
             assert_eq!(decode::<HubMsg>(&encode(&msg)), Ok(msg));
+        }
+    }
+
+    /// TASK-047: the new outcomes are plain names, which a hub before them
+    /// reads as `other` (see the `teleported` and `queued` cases).
+    #[test]
+    fn background_agent_outcomes_have_their_own_names() {
+        let update = encode(&AgentMsg::UpdateAnswer {
+            update_id: 1,
+            outcome: UpdateOutcome::AgentsRunning,
+        });
+        let command = encode(&AgentMsg::ConsoleCommandTyped {
+            command_id: 1,
+            outcome: CommandOutcome::AgentsRunning,
+            panel: None,
+        });
+        for line in [update, command] {
+            let value: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(value["outcome"], "agents_running");
         }
     }
 

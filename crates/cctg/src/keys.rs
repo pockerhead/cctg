@@ -4,7 +4,9 @@
 //! first) and serves `cctg run` its own console ([`visible_lines`],
 //! [`write_text`]); since TASK-043 any one-line command from the topic
 //! ([`type_line`], the same safe typing), and closes a panel such a command
-//! opened after reading it ([`type_command`]).
+//! opened after reading it ([`type_command`]). Since TASK-047 nothing is
+//! typed while the screen shows Claude Code's agent view or a running
+//! background agent ([`agents_block`]).
 //!
 //! Channels have no command for it, so on Windows the agent (a child of
 //! that claude) attaches to its console and writes the key events into the
@@ -143,6 +145,108 @@ pub enum Typed {
     /// A console step failed or the box was not found; the typed text, if
     /// any, was erased.
     Failed,
+    /// The screen showed the agent view or a running background agent
+    /// ([`agents_block`]): nothing was typed.
+    Agents,
+}
+
+/// Whether the screen shows what a typed line would disturb (TASK-047):
+/// Claude Code's agent view (its input box offers `Message @<agent>…`, seen
+/// live 2026-09-25: typed text goes to that agent, and `/exit` would end the
+/// session with its background agents), or the agent list under the status
+/// lines with an agent other than `main` marked (`●`, selected or working)
+/// or showing a timer (`35m 15s`). Only a list that has a row of `main`
+/// alone counts: `●` also starts every tool call line of the conversation.
+/// Any other screen does not block (the behaviour before TASK-047).
+pub fn agents_block(screen: &[String]) -> bool {
+    screen.iter().any(|line| agent_view_prompt(line))
+        || agent_list(screen)
+            .iter()
+            .any(|row| row.name != "main" && (row.marked || row.timer))
+}
+
+/// A prompt glyph followed by the agent view's placeholder `Message @<x>`.
+fn agent_view_prompt(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(PROMPTS)
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix("Message @"))
+        .and_then(|name| name.chars().next())
+        .is_some_and(|first| !first.is_whitespace())
+}
+
+/// One row of Claude Code's agent list: `  ( ) main`,
+/// `  ●   maw-qa-medium   Checking… 35m 15s · ↓ 337.7k tokens`.
+#[derive(Debug, PartialEq, Eq)]
+struct AgentRow<'a> {
+    name: &'a str,
+    /// `●`, or a filled radio `(x)` in place of `( )`.
+    marked: bool,
+    /// A duration word (`35m`, `15s`, `1h`) after the name.
+    timer: bool,
+}
+
+fn agent_row(line: &str) -> Option<AgentRow<'_>> {
+    let line = line.trim_start();
+    let (marked, rest) = if let Some(rest) = line.strip_prefix("( )") {
+        (false, rest)
+    } else if let Some(rest) = line.strip_prefix('\u{25cf}') {
+        (true, rest)
+    } else {
+        let mut chars = line.chars();
+        match (chars.next(), chars.next(), chars.next()) {
+            (Some('('), Some(mark), Some(')')) if !mark.is_whitespace() => (true, chars.as_str()),
+            _ => return None,
+        }
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut words = rest.split_whitespace();
+    let name = words.next()?;
+    let plain = name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    plain.then(|| AgentRow {
+        name,
+        marked,
+        timer: words.any(duration_word),
+    })
+}
+
+/// `35m`, `15s`, `1h`, `2m30s`: digits and a unit, once or more.
+fn duration_word(word: &str) -> bool {
+    let mut digits = false;
+    let mut units = false;
+    for c in word.chars() {
+        if c.is_ascii_digit() {
+            digits = true;
+        } else if digits && matches!(c, 'h' | 'm' | 's') {
+            digits = false;
+            units = true;
+        } else {
+            return false;
+        }
+    }
+    units && !digits
+}
+
+/// The agent list on `screen`: the run of agent rows around a row of `main`
+/// alone. Empty without one.
+fn agent_list(screen: &[String]) -> Vec<AgentRow<'_>> {
+    let Some(main) = screen.iter().position(|line| {
+        agent_row(line).is_some_and(|row| row.name == "main" && line.trim_end().ends_with("main"))
+    }) else {
+        return Vec::new();
+    };
+    let first = screen[..main]
+        .iter()
+        .rposition(|line| agent_row(line).is_none())
+        .map_or(0, |index| index + 1);
+    screen[first..]
+        .iter()
+        .map_while(|line| agent_row(line))
+        .collect()
 }
 
 /// The lines strictly between the last two rule lines (`─` only, 20 or more)
@@ -266,7 +370,10 @@ fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<St
             return (Typed::Failed, None);
         }
     }
-    let typed = if write_text(text) {
+    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+    let typed = if agents {
+        Typed::Agents
+    } else if write_text(text) {
         std::thread::sleep(ECHO_WAIT);
         let shown = visible_lines()
             .and_then(|screen| input_box(&screen))
@@ -298,6 +405,34 @@ fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<St
 #[cfg(not(windows))]
 fn type_and_watch(_claude_pid: u32, _text: &str, _watch: bool) -> (Typed, Option<String>) {
     (Typed::Failed, None)
+}
+
+/// Reads the console of `claude_pid` and says whether it shows
+/// [`agents_block`]; `false` when it cannot be read. Blocking and short.
+#[cfg(windows)]
+pub fn agents_on_screen(claude_pid: u32) -> bool {
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
+
+    let _one = one_at_a_time();
+    // SAFETY: plain Win32 calls without pointers; see `press`.
+    unsafe {
+        SetConsoleCtrlHandler(None, 1);
+        FreeConsole();
+        if AttachConsole(claude_pid) == 0 {
+            return false;
+        }
+    }
+    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+    // SAFETY: no arguments.
+    unsafe {
+        FreeConsole();
+    }
+    agents
+}
+
+#[cfg(not(windows))]
+pub fn agents_on_screen(_claude_pid: u32) -> bool {
+    false
 }
 
 /// Waits up to [`PANEL_WAIT`] for a [`panel`] in the attached console; reads
@@ -569,6 +704,92 @@ mod tests {
         let closed = screen(&[&top, "   Session", RULE, "\u{276f}", RULE]);
         assert_eq!(panel(&closed), None);
         assert_eq!(panel(&screen(&["   Session", "   Total cost: $0"])), None);
+    }
+
+    /// The live case of TASK-047 (2026-09-25), without the user's text: the
+    /// view of subagent `maw-qa-medium` open, two background agents working.
+    fn agent_view() -> Vec<String> {
+        screen(&[
+            " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{258c}   Claude Code v2.1.282",
+            "",
+            "\u{25cf} Agent(QA pass)",
+            "  \u{23bf}  Backgrounded agent",
+            "",
+            ">\u{a0}Message @maw-qa-medium\u{2026}",
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} 2 agents",
+            "",
+            "  ( ) main",
+            "  \u{25cf}   maw-qa-medium               Checking git stat\u{2026} 35m 15s \u{b7} \u{2193} 337.7k tokens",
+            "  ( ) maw-plan-reviewer-2-medium  Reading hold_fire\u{2026}  6m 10s \u{b7} \u{2193} 189.0k tokens",
+        ])
+    }
+
+    #[test]
+    fn the_agent_view_and_working_background_agents_block_typing() {
+        let live = agent_view();
+        assert!(agents_block(&live));
+        // Each sign alone blocks: the placeholder, a marked agent, a timer.
+        let placeholder = &live[..8];
+        assert!(agents_block(placeholder));
+        let mut list: Vec<String> = live.clone();
+        list[5] = ">\u{a0}".into();
+        assert!(agents_block(&list));
+        list[9] = "  ( ) maw-qa-medium".into();
+        assert!(agents_block(&list), "the timer of the other agent");
+        list[10] = "  ( ) maw-plan-reviewer-2-medium".into();
+        assert!(!agents_block(&list), "a list of idle agents");
+        for line in ["❯\u{a0}Message @general-purpose\u{2026}", "  > Message @x"] {
+            assert!(agents_block(&screen(&[line])), "{line}");
+        }
+        for row in ["  (\u{2022}) worker", "  \u{25cf} worker"] {
+            assert!(
+                agents_block(&screen(&["  ( ) main", row])),
+                "a marked agent: {row}"
+            );
+        }
+        assert!(agents_block(&screen(&[
+            "  \u{25cf} main",
+            "  ( ) worker   Running 2m30s",
+        ])));
+    }
+
+    #[test]
+    fn a_plain_screen_does_not_block_typing() {
+        // A finished background agent: only the count in the status line.
+        let idle = screen(&[
+            "\u{25cf} Agent(QA pass)",
+            "  \u{23bf}  Done (12 tool uses \u{b7} 40.1k tokens \u{b7} 3m 2s)",
+            "",
+            "\u{25cf} Bash(sleep 5)",
+            "  \u{23bf}  Running\u{2026} (5s)",
+            "\u{25cf} main is up to date 5s ago",
+            "",
+            RULE,
+            "\u{276f}\u{a0}",
+            RULE,
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} 1 agent",
+        ]);
+        assert!(!agents_block(&idle));
+        for lines in [
+            &["\u{276f}\u{a0}/exit"][..],
+            &["\u{276f}\u{a0}Message me when done"],
+            &["\u{276f}\u{a0}Message @"],
+            &["Message @x"],
+            // Main alone selected, the others idle.
+            &["  \u{25cf} main", "  ( ) worker"],
+            // Rows without a list of main.
+            &["  \u{25cf} worker  12s", "  ( ) other  3m"],
+            &["  ( ) main  and more", "  \u{25cf} worker"],
+            &[],
+        ] {
+            assert!(!agents_block(&screen(lines)), "{lines:?}");
+        }
+        for word in ["35m", "15s", "1h", "2m30s"] {
+            assert!(duration_word(word), "{word}");
+        }
+        for word in ["m", "5", "5x", "337.7k", "s5", "5m3"] {
+            assert!(!duration_word(word), "{word}");
+        }
     }
 
     #[test]

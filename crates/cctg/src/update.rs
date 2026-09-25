@@ -14,6 +14,10 @@
 //!   knowledge of claude's options lives here, in the updatable worker;
 //!   `cctg run` only runs what the request says;
 //! - otherwise answers that it is up to date.
+//!
+//! A restart waits while the claude console shows the agent view or a
+//! working background agent (TASK-047): `/exit` would end them with the
+//! session. The worker then answers `agents_running` and the hub asks again.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
@@ -149,6 +153,12 @@ impl Worker {
             (true, true) => Plan::Restart,
             (true, false) => Plan::ManualRestart,
         }
+    }
+
+    /// The claude console shows the agent view or a working background
+    /// agent ([`keys::agents_on_screen`], TASK-047): no restart now. Blocking.
+    pub fn agents_on_screen(&self) -> bool {
+        self.keys && self.claude_pid.is_some_and(keys::agents_on_screen)
     }
 
     /// Writes the request for `cctg run` and types `/exit`. The request is
