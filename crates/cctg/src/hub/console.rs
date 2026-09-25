@@ -15,8 +15,10 @@
 //! queue would have to outlive the turn and keep its place among the
 //! messages waiting in the slot, for a command the user can simply send
 //! again), when the slot has no live session with an agent that types
-//! ([`crate::wire::Register::console_commands`]), and when the text is not
-//! one short plain line ([`crate::keys::typable`]).
+//! ([`crate::wire::Register::console_commands`]), when the text is not
+//! one short plain line ([`crate::keys::typable`]), and when the agent finds
+//! the terminal showing the agent view or a working background agent
+//! (TASK-047).
 
 use std::time::Duration;
 
@@ -39,6 +41,9 @@ pub const WAITING_NOTICE: &str =
 pub const DRAFT_NOTICE: &str =
     "В поле ввода терминала есть неотправленный текст: команда не набрана.";
 pub const FAILED_NOTICE: &str = "Не получилось набрать команду в терминале сессии.";
+/// The terminal shows the agent view or a working background agent
+/// ([`crate::keys::agents_block`], TASK-047).
+pub const AGENTS_NOTICE: &str = "В терминале открыт вид субагента или работают фоновые агенты: команда не набрана. Повторите, когда они закончат (или вернитесь к main в терминале).";
 
 /// A console command whose text cannot be typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

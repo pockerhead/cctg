@@ -65,6 +65,11 @@ pub const NO_NEW_BUILD_NOTICE: &str = "На машине этой сессии �
 pub const MANUAL_RESTART_NOTICE: &str = "Нужен перезапуск claude, а сессия запущена не через cctg run (claude-cctg). Выйдите из claude и запустите claude-cctg --resume с id этой сессии.";
 pub const DRAFT_NOTICE: &str = "В поле ввода терминала есть неотправленный текст, поэтому /exit не отправлен. Отправьте или сотрите его и нажмите «Обновить» ещё раз.";
 pub const UPDATE_WAITS_NOTICE: &str = "⏳ Обновление клиента ждёт конца хода и продолжится само, когда он закончится (⏹ прервёт ход).";
+/// An update waits for background agents (TASK-047): the terminal shows the
+/// agent view or a working one (asked again after
+/// [`super::slots::UPDATE_RETRY`]), or the hub saw a subagent start and not
+/// stop yet.
+pub const UPDATE_AGENTS_NOTICE: &str = "⏳ Обновление клиента ждёт: работают фоновые агенты или в терминале открыт вид субагента. Продолжится само, когда агенты закончат; вид субагента закройте (вернитесь к main).";
 pub const UPDATE_FAILED_NOTICE: &str =
     "Обновить клиент не получилось; подробности в debug-логе claude этой сессии.";
 
@@ -235,7 +240,13 @@ impl Activity {
     /// The session works and no Esc was written into this turn yet: a turn
     /// or a tool call runs.
     pub fn busy(&self) -> bool {
-        !self.interrupt_sent && (self.turn || !self.running.is_empty())
+        !self.interrupt_sent && self.working()
+    }
+
+    /// A turn or a call runs, stopped by Esc or not: a restart now cuts it
+    /// off (TASK-047).
+    pub fn working(&self) -> bool {
+        self.turn || !self.running.is_empty()
     }
 }
 

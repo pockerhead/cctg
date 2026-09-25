@@ -4,7 +4,11 @@
 //! first) and serves `cctg run` its own console ([`visible_lines`],
 //! [`write_text`]); since TASK-043 any one-line command from the topic
 //! ([`type_line`], the same safe typing), and closes a panel such a command
-//! opened after reading it ([`type_command`]).
+//! opened after reading it ([`type_command`]). Since TASK-047 nothing is
+//! typed while the screen shows Claude Code's agent view or a running
+//! background agent ([`agents_block`]), and a `/exit` that opens Claude
+//! Code's "Background work is running" dialog is cancelled with Esc
+//! ([`exit_dialog`]).
 //!
 //! Channels have no command for it, so on Windows the agent (a child of
 //! that claude) attaches to its console and writes the key events into the
@@ -114,6 +118,13 @@ const PANEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(windows)]
 const PANEL_SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
 
+/// How long [`type_exit`] watches the screen for [`exit_dialog`] after
+/// Enter, and how many Esc it presses at most to close a found one.
+#[cfg(windows)]
+const EXIT_DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(windows)]
+const EXIT_DIALOG_ESCAPES: usize = 3;
+
 /// Longest command [`type_line`] types, in characters.
 pub const MAX_LINE_CHARS: usize = 200;
 
@@ -143,6 +154,59 @@ pub enum Typed {
     /// A console step failed or the box was not found; the typed text, if
     /// any, was erased.
     Failed,
+    /// The screen showed the agent view or a running background agent
+    /// ([`agents_block`]): nothing was typed. Or `/exit` opened
+    /// [`exit_dialog`], which was closed again with Esc: claude stays.
+    Agents,
+}
+
+/// Whether the screen shows Claude Code's agent view (TASK-047): its input
+/// box offers `Message @<agent>…` (seen live 2026-09-25), and a typed line
+/// would go to that agent. Background agents on the main screen do not block
+/// here: `/exit` opens Claude Code's own "Background work is running" dialog,
+/// which [`type_exit`] cancels, and the hub holds updates while subagents
+/// run; the agent list's markers show the selected view, not a running
+/// agent, so they are not read.
+pub fn agents_block(screen: &[String]) -> bool {
+    // Only the input box: an earlier prompt "Message @…" in the history
+    // above must not block (QA TASK-047).
+    input_box(screen).is_some_and(|lines| lines.iter().any(|line| agent_view_prompt(line)))
+}
+
+/// A prompt glyph followed by the agent view's placeholder `Message @<x>`.
+fn agent_view_prompt(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(PROMPTS)
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix("Message @"))
+        .and_then(|name| name.chars().next())
+        .is_some_and(|first| !first.is_whitespace())
+}
+
+/// Whether `screen` shows the dialog Claude Code opens for `/exit` while
+/// background work runs (probe TASK-047, 2.1.282): a [`panel`] headed
+/// "Background work is running" offering "1. Exit and stop tasks" (selected),
+/// "2. Move to background and exit", "3. Stay"; Enter would stop the
+/// subagents. Only a panel counts (under the last `▔` edge, no input box
+/// after it): the same words in the conversation above do not.
+pub fn exit_dialog(screen: &[String]) -> bool {
+    let Some(top) = screen.iter().rposition(|line| panel_edge(line)) else {
+        return false;
+    };
+    let below = &screen[top..];
+    input_box(below).is_none()
+        && below
+            .iter()
+            .any(|line| line.trim() == "Background work is running")
+}
+
+/// The top edge of a [`panel`]: 20 or more `▔` at the start of the line.
+fn panel_edge(line: &str) -> bool {
+    line.trim_start()
+        .chars()
+        .take_while(|&c| c == '\u{2594}')
+        .count()
+        >= 20
 }
 
 /// The lines strictly between the last two rule lines (`─` only, 20 or more)
@@ -197,13 +261,7 @@ pub fn panel(screen: &[String]) -> Option<String> {
     if input_box(screen).is_some() {
         return None;
     }
-    let top = screen.iter().rposition(|line| {
-        line.trim_start()
-            .chars()
-            .take_while(|&c| c == '\u{2594}')
-            .count()
-            >= 20
-    })?;
+    let top = screen.iter().rposition(|line| panel_edge(line))?;
     let lines: Vec<&str> = screen[top + 1..]
         .iter()
         .map(|line| line.trim_end())
@@ -229,9 +287,19 @@ pub fn panel(screen: &[String]) -> Option<String> {
     Some(text.trim_end().to_owned())
 }
 
-/// Types `/exit` with [`type_line`].
+/// Types `/exit` with [`type_line`]. When it opens [`exit_dialog`], the
+/// dialog is closed with Esc (never an option picked) and the answer is
+/// [`Typed::Agents`]; [`Typed::Failed`] when it stays open.
 pub fn type_exit(claude_pid: u32) -> Typed {
-    type_line(claude_pid, "/exit")
+    type_and_watch(claude_pid, "/exit", After::ExitDialog).0
+}
+
+/// What [`type_and_watch`] looks for once the line went in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum After {
+    Nothing,
+    Panel,
+    ExitDialog,
 }
 
 /// Types `text` into the console of `claude_pid`, reads the input box back
@@ -240,18 +308,18 @@ pub fn type_exit(claude_pid: u32) -> Typed {
 /// went). A text that is not [`typable`] is not typed. Blocking, under a
 /// second.
 pub fn type_line(claude_pid: u32, text: &str) -> Typed {
-    type_and_watch(claude_pid, text, false).0
+    type_and_watch(claude_pid, text, After::Nothing).0
 }
 
 /// [`type_line`], then, once sent, watches the screen for a [`panel`]; a
 /// panel that shows up is read and closed with Esc (it waits for Esc and
 /// blocks the terminal otherwise). Blocking, up to about three seconds.
 pub fn type_command(claude_pid: u32, text: &str) -> (Typed, Option<String>) {
-    type_and_watch(claude_pid, text, true)
+    type_and_watch(claude_pid, text, After::Panel)
 }
 
 #[cfg(windows)]
-fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<String>) {
+fn type_and_watch(claude_pid: u32, text: &str, after: After) -> (Typed, Option<String>) {
     use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
 
     if !typable(text) {
@@ -266,7 +334,10 @@ fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<St
             return (Typed::Failed, None);
         }
     }
-    let typed = if write_text(text) {
+    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+    let typed = if agents {
+        Typed::Agents
+    } else if write_text(text) {
         std::thread::sleep(ECHO_WAIT);
         let shown = visible_lines()
             .and_then(|screen| input_box(&screen))
@@ -283,10 +354,10 @@ fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<St
     } else {
         Typed::Failed
     };
-    let panel = if watch && typed == Typed::Sent {
-        close_panel()
-    } else {
-        None
+    let (typed, panel) = match (typed, after) {
+        (Typed::Sent, After::Panel) => (typed, close_panel()),
+        (Typed::Sent, After::ExitDialog) => (cancel_exit_dialog(), None),
+        _ => (typed, None),
     };
     // SAFETY: no arguments.
     unsafe {
@@ -296,8 +367,36 @@ fn type_and_watch(claude_pid: u32, text: &str, watch: bool) -> (Typed, Option<St
 }
 
 #[cfg(not(windows))]
-fn type_and_watch(_claude_pid: u32, _text: &str, _watch: bool) -> (Typed, Option<String>) {
+fn type_and_watch(_claude_pid: u32, _text: &str, _after: After) -> (Typed, Option<String>) {
     (Typed::Failed, None)
+}
+
+/// Reads the console of `claude_pid` and says whether it shows
+/// [`agents_block`]; `false` when it cannot be read. Blocking and short.
+#[cfg(windows)]
+pub fn agents_on_screen(claude_pid: u32) -> bool {
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
+
+    let _one = one_at_a_time();
+    // SAFETY: plain Win32 calls without pointers; see `press`.
+    unsafe {
+        SetConsoleCtrlHandler(None, 1);
+        FreeConsole();
+        if AttachConsole(claude_pid) == 0 {
+            return false;
+        }
+    }
+    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+    // SAFETY: no arguments.
+    unsafe {
+        FreeConsole();
+    }
+    agents
+}
+
+#[cfg(not(windows))]
+pub fn agents_on_screen(_claude_pid: u32) -> bool {
+    false
 }
 
 /// Waits up to [`PANEL_WAIT`] for a [`panel`] in the attached console; reads
@@ -318,6 +417,34 @@ fn close_panel() -> Option<String> {
         }
     }
     None
+}
+
+/// Watches the attached console up to [`EXIT_DIALOG_WAIT`] after `/exit`
+/// for [`exit_dialog`]. Without one claude is exiting: [`Typed::Sent`]. A
+/// found one gets Esc (cancel, claude stays), again while it is still shown,
+/// at most [`EXIT_DIALOG_ESCAPES`] times: [`Typed::Agents`] once it is
+/// gone, [`Typed::Failed`] when it stays.
+#[cfg(windows)]
+fn cancel_exit_dialog() -> Typed {
+    let shown = || visible_lines().is_some_and(|screen| exit_dialog(&screen));
+    let until = std::time::Instant::now() + EXIT_DIALOG_WAIT;
+    loop {
+        std::thread::sleep(PANEL_POLL);
+        if shown() {
+            break;
+        }
+        if std::time::Instant::now() >= until {
+            return Typed::Sent;
+        }
+    }
+    for _ in 0..EXIT_DIALOG_ESCAPES {
+        write_text("\u{1b}");
+        std::thread::sleep(ECHO_WAIT);
+        if !shown() {
+            return Typed::Agents;
+        }
+    }
+    Typed::Failed
 }
 
 /// One console attachment at a time in this process: [`press`] and
@@ -569,6 +696,123 @@ mod tests {
         let closed = screen(&[&top, "   Session", RULE, "\u{276f}", RULE]);
         assert_eq!(panel(&closed), None);
         assert_eq!(panel(&screen(&["   Session", "   Total cost: $0"])), None);
+    }
+
+    /// The live case of TASK-047 (2026-09-25), without the user's text: the
+    /// view of subagent `maw-qa-medium` open, two background agents working.
+    fn agent_view() -> Vec<String> {
+        screen(&[
+            " \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259c}\u{258c}   Claude Code v2.1.282",
+            "",
+            "\u{25cf} Agent(QA pass)",
+            "  \u{23bf}  Backgrounded agent",
+            "",
+            RULE,
+            ">\u{a0}Message @maw-qa-medium\u{2026}",
+            RULE,
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} 2 agents",
+            "",
+            "  ( ) main",
+            "  \u{25cf}   maw-qa-medium               Checking git stat\u{2026} 35m 15s \u{b7} \u{2193} 337.7k tokens",
+            "  ( ) maw-plan-reviewer-2-medium  Reading hold_fire\u{2026}  6m 10s \u{b7} \u{2193} 189.0k tokens",
+        ])
+    }
+
+    #[test]
+    fn only_the_agent_view_blocks_typing() {
+        let live = agent_view();
+        assert!(agents_block(&live));
+        for line in ["❯\u{a0}Message @general-purpose\u{2026}", "  > Message @x"] {
+            assert!(agents_block(&screen(&[RULE, line, RULE])), "{line}");
+        }
+        // The agent list alone (the view closed) does not block: /exit is
+        // guarded by Claude Code's own dialog and the hub.
+        let mut list: Vec<String> = live.clone();
+        list[6] = ">\u{a0}".into();
+        assert!(!agents_block(&list));
+        // An earlier prompt in the history does not block, the box does.
+        let history = screen(&[
+            "\u{276f} Message @bob about the build",
+            RULE,
+            "\u{276f}\u{a0}",
+            RULE,
+        ]);
+        assert!(!agents_block(&history));
+    }
+
+    #[test]
+    fn a_plain_screen_does_not_block_typing() {
+        let idle = screen(&[
+            "\u{25cf} Agent(QA pass)",
+            "  \u{23bf}  Done (12 tool uses \u{b7} 40.1k tokens \u{b7} 3m 2s)",
+            "",
+            RULE,
+            "\u{276f}\u{a0}",
+            RULE,
+            "  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} 1 agent",
+            "  \u{25cf} main",
+            "  \u{25ef} general-purpose  Append steps with sleeps          4s \u{b7} \u{2193} 39.6k tokens",
+        ]);
+        assert!(!agents_block(&idle));
+        for lines in [
+            &["\u{276f}\u{a0}/exit"][..],
+            &["\u{276f}\u{a0}Message me when done"],
+            &["\u{276f}\u{a0}Message @"],
+            &["Message @x"],
+            &[],
+        ] {
+            assert!(!agents_block(&screen(lines)), "{lines:?}");
+        }
+    }
+
+    /// The dialog `/exit` opened in the TASK-047 probe (2.1.282) while a
+    /// background subagent worked.
+    fn probe_exit_dialog() -> Vec<String> {
+        screen(&[
+            "\u{25cf} Agent(Append steps with sleeps)",
+            "  \u{23bf}  Backgrounded agent (\u{2193} to manage \u{b7} ctrl+o to expand)",
+            "\u{25cf} launched",
+            "\u{273b} Waiting for 1 background agent to finish",
+            &"\u{2594}".repeat(120),
+            "   Background work is running",
+            "   The following will stop when you exit:",
+            "   subagent \u{b7} Append steps with sleeps",
+            "   \u{276f} 1. Exit and stop tasks",
+            "     2. Move to background and exit",
+            "     3. Stay",
+            "   Enter to confirm \u{b7} Esc to cancel",
+        ])
+    }
+
+    #[test]
+    fn the_exit_dialog_is_seen_only_as_a_panel() {
+        assert!(exit_dialog(&probe_exit_dialog()));
+        // Rules of an earlier box above the dialog do not hide it.
+        let mut earlier = screen(&[RULE, "\u{276f} earlier", RULE]);
+        earlier.extend(probe_exit_dialog());
+        assert!(exit_dialog(&earlier));
+        // Closed with Esc: the input box is back.
+        assert!(!exit_dialog(&screen(&[
+            "\u{25cf} launched",
+            RULE,
+            "\u{276f}",
+            RULE,
+            "  \u{25cf} main",
+            "  \u{25ef} general-purpose  x  4s",
+        ])));
+        // The words in the conversation, above an input box.
+        let quoted = screen(&[
+            &"\u{2594}".repeat(40),
+            "   Background work is running",
+            RULE,
+            "\u{276f}",
+            RULE,
+        ]);
+        assert!(!exit_dialog(&quoted));
+        assert!(!exit_dialog(&screen(&["   Background work is running"])));
+        // Another panel (`/cost`).
+        let cost = screen(&[&"\u{2594}".repeat(40), "   Session", "   Total cost: $0"]);
+        assert!(!exit_dialog(&cost));
     }
 
     #[test]
