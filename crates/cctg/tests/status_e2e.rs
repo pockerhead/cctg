@@ -418,13 +418,20 @@ impl Agent {
             client: None,
             files: false,
             session_reads: false,
+            heartbeat: false,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
         let mut agent = Self {
             reader: BufReader::new(read),
             write,
         };
-        assert_eq!(agent.next().await, Some(HubMsg::Registered { files: true }));
+        assert_eq!(
+            agent.next().await,
+            Some(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         agent
     }
 

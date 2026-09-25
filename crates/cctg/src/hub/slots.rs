@@ -5956,6 +5956,7 @@ mod tests {
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -7183,6 +7184,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -7975,6 +7977,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -8065,6 +8068,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -9089,6 +9093,7 @@ again"
             client: None,
             files: false,
             session_reads: true,
+            heartbeat: false,
         }
     }
 
@@ -11114,6 +11119,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -11407,6 +11413,7 @@ again"
                     client: None,
                     files: false,
                     session_reads: false,
+                    heartbeat: false,
                 },
                 to_agent,
             })
@@ -11457,6 +11464,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -11500,6 +11508,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -11555,6 +11564,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -12356,6 +12366,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -12517,6 +12528,7 @@ again"
                 client,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -13110,6 +13122,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });
@@ -13360,6 +13373,7 @@ again"
                 client: None,
                 files,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         });

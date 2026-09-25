@@ -137,6 +137,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 client: None,
                 files: false,
                 session_reads: true,
+                heartbeat: false,
             },
             to_agent,
         })
@@ -196,6 +197,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         })
