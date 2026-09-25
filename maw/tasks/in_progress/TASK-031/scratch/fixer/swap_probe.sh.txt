@@ -1,0 +1,39 @@
+# TASK-031 fixer probe (Git Bash on Windows): the binary swap of install.sh
+# when the new file cannot be renamed into place (held open without
+# FILE_SHARE_DELETE, like a scanner). Runs install.sh's own swap block
+# (lines from `if [ "$os" = windows ] ...` through move_in) in a temp dir.
+# Run: bash maw/tasks/in_progress/TASK-031/scratch/fixer/swap_probe.sh.txt
+set -u
+W=$(mktemp -d)
+repo=$(cd "$(dirname "$0")/../../../../../.." && pwd)
+start=$(grep -n 'if \[ "$os" = windows \] && \[ -e "$exe" \]; then' "$repo/install.sh" | cut -d: -f1)
+end=$(awk -v s="$start" 'NR > s && /^move_in\(\) \{/ { m = 1 } m && /^}/ { print NR; exit }' "$repo/install.sh")
+{
+    echo 'say() { printf "%s\n" "cctg-install: $*"; }'
+    echo 'die() { printf "%s\n" "cctg-install: error: $*" >&2; exit 1; }'
+    echo 'swap() {'
+    # install_binary's own closing brace ends swap().
+    sed -n "${start},${end}p" "$repo/install.sh"
+} > "$W/swap.sh"
+echo 'swap' >> "$W/swap.sh"
+
+run_case() {
+    bin_dir=$W/bin-$1
+    mkdir -p "$bin_dir"
+    printf old > "$bin_dir/cctg.exe"
+    printf new > "$bin_dir/cctg.install.exe"
+    if [ "$1" = held ]; then
+        powershell -NoProfile -Command "\$f=[IO.File]::Open('$(cygpath -w "$bin_dir/cctg.install.exe")','Open','Read','None'); Set-Content '$(cygpath -w "$W/held")' x; Start-Sleep 8; \$f.Close()" &
+        # Until the file is really held (MSYS cat still reads it; mv fails).
+        i=0
+        while [ ! -e "$W/held" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+        echo "held after $i tries"
+    fi
+    ( os=windows exe=$bin_dir/cctg.exe new=$bin_dir/cctg.install.exe
+      . "$W/swap.sh" )
+    echo "case=$1 exit=$? cctg.exe=$(cat "$bin_dir/cctg.exe" 2>/dev/null || echo MISSING) files=$(ls "$bin_dir" | tr '\n' ' ')"
+    wait
+}
+run_case free
+run_case held
+rm -rf "$W"
