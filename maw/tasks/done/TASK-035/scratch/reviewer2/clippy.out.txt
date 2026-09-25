@@ -1,0 +1,4 @@
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-035-rev2\crates\cctg)
+    Checking transcript v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-035-rev2\crates\transcript)
+    Finished `dev` profile [unoptimized] target(s) in 24.92s
+clippy exit 0

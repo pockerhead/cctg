@@ -1,0 +1,4 @@
+    Blocking waiting for file lock on build directory
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-031-ref\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 1m 02s
+exit=0

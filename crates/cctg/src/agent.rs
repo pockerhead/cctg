@@ -6,7 +6,8 @@
 //! from one place, a line at a time. stdout carries JSON-RPC and nothing else;
 //! logs go to stderr. The process ends when stdin closes.
 //!
-//! Hub link: connect, authenticate, register, and on any loss reconnect with
+//! Hub link: connect (TLS to a hub on another machine, [`crate::tls`]),
+//! authenticate, register, and on any loss reconnect with
 //! backoff and register again. Only the agent reconnects; the hub just
 //! accepts. Messages queued while the link is down wait in the outbox and go
 //! out after the next registration. A message whose write failed is lost.
@@ -54,9 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -73,6 +72,7 @@ use crate::reads;
 use crate::shim;
 use crate::spool;
 use crate::tail;
+use crate::tls::{HubAddr, ReadTask, Stream};
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
     self, AgentMsg, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome, HubMsg,
@@ -116,8 +116,8 @@ impl Backoff {
 
 #[derive(Debug, Clone)]
 pub struct LinkConfig {
-    /// `host:port` of the hub agent listener.
-    pub addr: String,
+    /// The hub agent listener.
+    pub addr: HubAddr,
     pub secret: Secret,
     pub register: Register,
     pub backoff: Backoff,
@@ -130,8 +130,8 @@ pub struct LinkConfig {
 pub struct Replay {
     /// `<state>/spool` ([`spool::dir`]).
     pub spool: PathBuf,
-    /// `host:port` of the hub hook endpoint.
-    pub hook_addr: String,
+    /// The hub hook endpoint.
+    pub hook_addr: HubAddr,
 }
 
 /// Sends the kept hook events of the registered session. Its own task: the
@@ -246,21 +246,23 @@ async fn run(
     }
 }
 
-async fn write_agent_msg(write: &mut OwnedWriteHalf, msg: &AgentMsg) -> Result<(), WireError> {
+type LinkRead = BufReader<ReadHalf<Stream>>;
+type LinkWrite = WriteHalf<Stream>;
+
+async fn write_agent_msg(write: &mut LinkWrite, msg: &AgentMsg) -> Result<(), WireError> {
     tokio::time::timeout(WRITE_TIMEOUT, wire::write_msg(write, msg))
         .await
         .unwrap_or(Err(WireError::Io(std::io::ErrorKind::TimedOut)))
 }
 
-async fn connect(
-    config: &LinkConfig,
-) -> Result<(BufReader<OwnedReadHalf>, OwnedWriteHalf, bool), ConnectError> {
+async fn connect(config: &LinkConfig) -> Result<(LinkRead, LinkWrite, bool), ConnectError> {
     let handshake = async {
-        let stream = TcpStream::connect(config.addr.as_str())
+        let stream = config
+            .addr
+            .connect()
             .await
             .map_err(|error| ConnectError::Io(error.kind()))?;
-        let _ = stream.set_nodelay(true);
-        let (read, mut write) = stream.into_split();
+        let (read, mut write) = tokio::io::split(stream);
         let hello = AgentMsg::Hello {
             secret: config.secret.clone(),
         };
@@ -284,14 +286,14 @@ async fn connect(
 /// `false` when the link dropped (reconnect). `verdicts`: ids of verdicts
 /// already passed on, newest last.
 async fn serve(
-    reader: BufReader<OwnedReadHalf>,
-    mut write: OwnedWriteHalf,
+    reader: LinkRead,
+    mut write: LinkWrite,
     outbox: &mut mpsc::Receiver<AgentMsg>,
     events: &mpsc::Sender<LinkEvent>,
     verdicts: &mut VecDeque<u64>,
 ) -> bool {
     let (frames_tx, mut frames) = mpsc::channel(QUEUE);
-    let reader_task = tokio::spawn(read_hub_frames(reader, frames_tx));
+    let reader_task = ReadTask::spawn(read_hub_frames(reader, frames_tx));
     let stopped = loop {
         tokio::select! {
             frame = frames.recv() => {
@@ -343,15 +345,11 @@ async fn serve(
             },
         }
     };
-    reader_task.abort();
-    let _ = reader_task.await;
+    reader_task.stop().await;
     stopped
 }
 
-async fn read_hub_frames(
-    mut reader: BufReader<OwnedReadHalf>,
-    frames: mpsc::Sender<Result<HubMsg, WireError>>,
-) {
+async fn read_hub_frames(mut reader: LinkRead, frames: mpsc::Sender<Result<HubMsg, WireError>>) {
     let mut line = Vec::new();
     loop {
         let frame = match wire::read_line(&mut reader, &mut line).await {
@@ -447,8 +445,10 @@ pub async fn run_stdio() -> i32 {
             worker.run_pid = None;
         }
     }
-    // The build is this process's own file (the shim's copy); a new build
-    // shows up in the file the copy came from.
+    // The file hash is this process's own file (the shim's copy); a new
+    // build shows up in the file the copy came from. The hub is told the
+    // build's source (TASK-035), which needs the hash only without a clean
+    // commit.
     let (exe, build) = tokio::task::spawn_blocking(|| {
         let own = std::env::current_exe().ok();
         let build = own.as_deref().and_then(|own| client::build_of(own).ok());
@@ -461,15 +461,17 @@ pub async fn run_stdio() -> i32 {
     .unwrap_or_default();
     worker.exe = exe;
     worker.build = build;
-    let client = worker.build.clone().map(|build| Client {
-        version: client::VERSION.to_owned(),
-        build,
-        self_update: worker.self_update(),
+    let client = worker.build.clone().and_then(|hash| {
+        Some(Client {
+            version: client::VERSION.to_owned(),
+            build: client::identity(client::SOURCE, || Some(hash))?,
+            self_update: worker.self_update(),
+        })
     });
     let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
-        Ok((secret, session_id)) => {
+        Ok(plan) => {
             let register = Register {
-                session_id,
+                session_id: plan.session_id,
                 host: config.host.clone(),
                 cwd: device::canonical_cwd(&current_dir()),
                 claude_pid,
@@ -482,13 +484,13 @@ pub async fn run_stdio() -> i32 {
                 session_reads: true,
             };
             let (outbox, events) = spawn(LinkConfig {
-                addr: config.agent_addr.clone(),
-                secret,
+                addr: plan.agent,
+                secret: plan.secret,
                 register,
                 backoff: Backoff::default(),
                 replay: config.state_dir.as_deref().map(|state| Replay {
                     spool: spool::dir(state),
-                    hook_addr: config.hook_addr.clone(),
+                    hook_addr: plan.hook,
                 }),
             });
             (Hub::Link(outbox), Some(events))
@@ -541,12 +543,22 @@ pub async fn run_stdio() -> i32 {
     }
 }
 
+/// How this agent talks to the hub: as which session, and where.
+#[derive(Debug)]
+pub struct LinkPlan {
+    pub secret: Secret,
+    pub session_id: String,
+    /// The agent listener and the hook endpoint (for the spool replay).
+    pub agent: HubAddr,
+    pub hook: HubAddr,
+}
+
 /// Whether this agent talks to the hub, and as which session.
 pub fn link_plan(
     session_id: Option<String>,
     entrypoint: Option<&str>,
     config: &DeviceConfig,
-) -> Result<(Secret, String), NoHub> {
+) -> Result<LinkPlan, NoHub> {
     if entrypoint == Some("sdk-cli") {
         return Err(NoHub::Headless);
     }
@@ -554,11 +566,19 @@ pub fn link_plan(
         .map(|id| id.trim().to_owned())
         .filter(|id| !id.is_empty())
         .ok_or(NoHub::NoSession)?;
-    let secret = config.secret.clone().map_err(|problem| {
+    let off = |problem| {
         warn!(%problem, "hub link off");
         NoHub::NoConfig
-    })?;
-    Ok((secret, session_id))
+    };
+    let secret = config.secret.clone().map_err(off)?;
+    let agent = config.hub(&config.agent_addr).map_err(off)?;
+    let hook = config.hub(&config.hook_addr).map_err(off)?;
+    Ok(LinkPlan {
+        secret,
+        session_id,
+        agent,
+        hook,
+    })
 }
 
 fn current_dir() -> String {
@@ -1470,6 +1490,7 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
     use super::*;
     use crate::hub::ingress::{self, AgentEvent};
@@ -1495,7 +1516,7 @@ mod tests {
 
     fn config(addr: SocketAddr, backoff: Backoff) -> LinkConfig {
         LinkConfig {
-            addr: addr.to_string(),
+            addr: HubAddr::plain(addr.to_string()),
             secret: Secret::parse(SECRET).unwrap(),
             register: register(),
             backoff,
@@ -1655,7 +1676,7 @@ mod tests {
         let silent = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
-        let hook_addr = silent.local_addr().unwrap().to_string();
+        let hook_addr = HubAddr::plain(silent.local_addr().unwrap().to_string());
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = accepted.clone();
         tokio::spawn(async move {
@@ -1803,8 +1824,9 @@ mod tests {
     #[test]
     fn link_plan_rules() {
         let session = || Some(" 5e551017-0000-4000-8000-000000000001 ".to_owned());
-        let (_, id) = link_plan(session(), Some("cli"), &device(Some(SECRET))).unwrap();
-        assert_eq!(id, "5e551017-0000-4000-8000-000000000001");
+        let plan = link_plan(session(), Some("cli"), &device(Some(SECRET))).unwrap();
+        assert_eq!(plan.session_id, "5e551017-0000-4000-8000-000000000001");
+        assert!(!plan.agent.is_tls() && !plan.hook.is_tls());
         assert!(link_plan(session(), None, &device(Some(SECRET))).is_ok());
         assert_eq!(
             link_plan(session(), Some("sdk-cli"), &device(Some(SECRET))).unwrap_err(),
@@ -1822,6 +1844,16 @@ mod tests {
         );
         assert_eq!(
             link_plan(session(), Some("cli"), &device(Some("short"))).unwrap_err(),
+            NoHub::NoConfig
+        );
+        // A hub elsewhere without a pin: no link, the secret stays here.
+        let remote = DeviceConfig::from_vars(|name| match name {
+            crate::hub::config::SECRET_VAR => Some(SECRET.to_owned()),
+            crate::device::AGENT_ADDR_VAR => Some("hub.example.org:47291".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            link_plan(session(), Some("cli"), &remote).unwrap_err(),
             NoHub::NoConfig
         );
     }

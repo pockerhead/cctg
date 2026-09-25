@@ -1,0 +1,29 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 36.24s
+     Running tests\message_logs.rs (target\debug\deps\message_logs-8bee75853c8f38f6.exe)
+
+running 1 test
+test message_logs_carry_no_text_and_no_user_id ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests\update_e2e.rs (target\debug\deps\update_e2e-7b934eae91bd7e2b.exe)
+
+running 1 test
+test a_new_binary_is_taken_without_losing_a_line ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s
+
+   Compiling transcript v0.1.0 (C:\Users\user\dev\cctg\crates\transcript)
+    Finished `test` profile [unoptimized] target(s) in 2.98s
+     Running tests\purity.rs (target\debug\deps\purity-a137238b6440e61b.exe)
+
+running 3 tests
+test library_has_only_pure_dependencies ... ok
+test every_source_file_is_scanned ... ok
+test library_source_has_no_io_or_panicking_calls ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

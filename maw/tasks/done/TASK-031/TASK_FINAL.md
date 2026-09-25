@@ -1,7 +1,7 @@
 # TASK-031: install.sh for any machine
 
 Type: feature
-Mode: brainstorm
+Mode: full
 Priority: medium
 Branch: feature/cctg-install
 Domains: hub, hooks, channel
@@ -13,8 +13,11 @@ Domains: hub, hooks, channel
 
 Дополнение пользователя 2026-09-24: вместе с установщиком написать в корне репо `README.md`, максимально простой и понятный: что это, одна картинка/схема на пару строк, установка одной командой, как подключить бота и группу, как запустить сессию, что видно в Telegram, как обновлять. Без внутренностей архитектуры (они остаются в CLAUDE.md и docs/).
 
+Решение пользователя 2026-09-25: делать сейчас, в режиме full (не brainstorm), чтобы быстро перевести hub на тестовый сервер и тестировать клиентов везде: Windows (эта машина), Linux (сервер пользователя) и macOS Apple Silicon. Установщик клиента ставит бинарник из GitHub Releases TASK-035 (windows x86_64, linux x86_64, macOS aarch64), пишет `device.env` с адресом hub, секретом и `CCTG_HUB_CERT_SHA256` (TLS pin из TASK-035), MCP-конфиг, settings с хуками и statusLine, обёртку `claude-cctg` (bash и cmd) через `cctg run`. Повторный запуск обновляет, `--uninstall` убирает только своё. Сервер: README и `docs/remote-hub.md` (TASK-035) дают путь docker compose; установщик для hub не нужен, если compose хватает.
+
 ## Acceptance criteria
 - [ ] `README.md` в корне: короткий, по шагам, без внутренностей; человек без контекста ставит и запускает по нему
-- [ ] план установки для Windows/Linux/macOS с перечнем файлов и путей
+- [ ] `install.sh` (Linux, macOS) и `install.ps1` (Windows) ставят клиента с нуля и обновляют; e2e в CI на всех трёх ОС против локального поддельного релиза (без сети к GitHub в тесте), `--uninstall` проверен
+- [ ] не трогают пользовательские `~/.claude/settings.json` и `~/.claude.json`; секрет не печатается и не попадает в логи
 - [ ] решение, как обёртка и хуки находят бинарник после обновления
 - [ ] Existing tests pass

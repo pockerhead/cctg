@@ -11,6 +11,7 @@
 //! their image path and creation time. Linux follows `/proc/<pid>/stat`
 //! upward; other systems report no chain. Nothing here spawns a process.
 
+#[cfg(any(windows, test))]
 use std::collections::HashMap;
 
 /// One process of the ancestor chain; `chain[0]` is the hook itself.
@@ -33,9 +34,13 @@ pub struct Lineage {
     pub parent_claude_pid: Option<u32>,
 }
 
-/// Longest chain followed; real chains are under 20 processes.
+/// Longest chain followed; real chains are under 20 processes. Unused on
+/// systems without a process source (macOS: TASK-044).
+#[cfg(any(windows, target_os = "linux", test))]
 const MAX_DEPTH: usize = 64;
 
+// Filled by the Windows snapshot and by tests; Linux reads /proc directly.
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone)]
 struct ProcessEntry {
     parent: u32,
@@ -46,11 +51,13 @@ struct ProcessEntry {
 
 /// Injectable process data. Windows fills this from one ToolHelp snapshot and
 /// narrow per-ancestor queries; tests build it directly without live processes.
+#[cfg(any(windows, test))]
 #[derive(Debug, Default)]
 struct ProcessTable {
     entries: HashMap<u32, ProcessEntry>,
 }
 
+#[cfg(any(windows, test))]
 impl ProcessTable {
     fn insert(&mut self, pid: u32, entry: ProcessEntry) {
         self.entries.insert(pid, entry);

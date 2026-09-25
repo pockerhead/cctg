@@ -1,0 +1,26 @@
+== planner install.sh (a53e49b), shellcheck 0.10.0 --shell=sh
+
+In C:/Users/user/AppData/Local/Temp/pl.sh line 369:
+    curl -fsSL --retry 3 $curl_proto -o "$2" "$1" || die "download failed: $1"
+                         ^---------^ SC2086 (info): Double quote to prevent globbing and word splitting.
+
+Did you mean: 
+    curl -fsSL --retry 3 "$curl_proto" -o "$2" "$1" || die "download failed: $1"
+
+
+In C:/Users/user/AppData/Local/Temp/pl.sh line 764:
+        logs=$(cd "$hub_dir" && docker compose logs --no-color --since "$started" hub 2>&1 </dev/null || true)
+                             ^-- SC2015 (info): Note that A && B || C is not if-then-else. C may run when A is true.
+
+For more information:
+  https://www.shellcheck.net/wiki/SC2015 -- Note that A && B || C is not if-t...
+  https://www.shellcheck.net/wiki/SC2086 -- Double quote to prevent globbing ...
+exit=1
+== reviewer2 install.sh --shell=sh
+exit=0
+== reviewer2 install.sh --shell=dash
+exit=0
+== reviewer2 install.sh --shell=bash
+exit=0
+== dash -n / bash --posix -n
+ok

@@ -1,0 +1,11 @@
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+# Above: 5 reruns of message_logs on the reference (031 applied), 1 FAILED.
+# Then 12 more on the reference: 11 ok, 1 FAILED.
+# Baseline without 031 (e5bcc7f + TASK-035 reviewer2 patch): 8 ok; then 20 runs: 19 ok, 1 FAILED
+# ("the kept message is saved", message_logs.rs:173). A pre-existing flake of
+# message_logs (registry.json read right after the queued notice, before the
+# saver wrote it); TASK-031 does not touch slots/registry/buffer.

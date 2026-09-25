@@ -1,0 +1,15 @@
+# PCTX_PROPOSALS — TASK-031 (planner)
+
+2026-09-25, planner. Proposals only; the project context is not edited here.
+
+1. hooks.md / channel.md, Invariants: "Installed layout (TASK-031, `install.sh`): binary `~/.cctg/bin/cctg[.exe]` (stable path, replaced in place; on Windows the running file is renamed to `cctg.old.exe` first), `~/.cctg/device.env`, `~/.cctg/claude/{mcp.json,settings.json}` passed by the wrapper `~/.local/bin/claude-cctg` (+ `.cmd` on Windows) as `cctg run -- --mcp-config M --dangerously-load-development-channels server:cctg --settings S "$@"`. `~/.claude/settings.json` and `~/.claude.json` are never written by cctg." Why: the manual PoC layout (`~/.cctg/poc`, `--debug-file` last) is no longer the reference.
+2. hub.md, Invariants (TASK-010 line): "`POST /v1/ping` on the hook listener: authenticated, no body, answers 204 and does nothing else (`cctg doctor`); a hub before TASK-031 answers 404 before checking the secret." Why: a third route on the strict HTTP endpoint.
+3. Risk lesson (general): "A shell script in the repo needs `.gitattributes` `*.sh text eol=lf`: the Windows checkout uses core.autocrlf=true and CRLF breaks `sh`. `tests/install_e2e.rs` asserts install.sh has no CR." Evidence: `git ls-files --eol` shows `w/crlf` for every text file on this machine.
+4. Risk lesson (general): "Git Bash (MSYS) rewrites arguments that look like POSIX paths for native programs: `openssl req -subj /CN=x` breaks; with `MSYS_NO_PATHCONV=1` absolute `/tmp/...` paths land in `C:\tmp`. Use relative paths and set the variable per command, never exported." Evidence: planner probe 2026-09-25 (install.sh `--hub`).
+5. Risk lesson (hooks/channel): "`DeviceConfig::load` prefers the process environment over `device.env`: a check run with `CCTG_HUB_SECRET` in its environment does not test the file. install.sh unsets it after reading." Evidence: first draft of the e2e would have passed with a broken device.env quoting in run 1.
+6. Invariant (general): "Tests that run install.sh go through `common::isolate` like every `cctg` process and put stand-ins for `claude`, `curl` (claude.ai URLs only), `powershell`, `docker` and `cargo` first on PATH; no test downloads Anthropic's installer or touches the network."
+
+2026-09-25, code-reviewer. Proposals only.
+
+7. Risk lesson (general, Windows): "In Git Bash (MSYS/Cygwin) `rm -f` and `mv -f` of a running .exe both succeed (rm moves it away and deletes it on close), so a shell 'in use?' fallback after rm never fires; the running process is unaffected." Evidence: TASK-031 code-reviewer, copies of PING.EXE running, `scratch/code-reviewer/repro_output.txt`.
+8. Risk lesson (general, Windows): "`/dev/tty` in Git Bash exists only when a Cygwin ancestor owns the console: a piped `sh` under an interactive Git Bash console gets `/dev/cons0` (prompts work), but a bash spawned by a native process with piped stdio has none, even with a console attached (tests never prompt)." Evidence: hidden-console probes, `scratch/code-reviewer/ttyprobe3.py.txt`.

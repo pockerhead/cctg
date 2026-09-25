@@ -1,0 +1,2 @@
+# Scripts run by sh must keep LF on a core.autocrlf checkout (TASK-031).
+*.sh text eol=lf

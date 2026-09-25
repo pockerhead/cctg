@@ -1,0 +1,4 @@
+case=free exit=0 cctg.exe=new files=cctg.exe cctg.old.exe 
+held after 2 tries
+cctg-install: error: could not put the new binary in place (a virus scanner holding it?); the old one is back, run this again
+case=held exit=1 cctg.exe=old files=cctg.exe cctg.install.exe 

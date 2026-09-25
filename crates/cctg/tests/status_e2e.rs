@@ -265,9 +265,14 @@ impl Hub {
             event,
         );
         let secret = Secret::parse(SECRET).unwrap();
-        hook::post(&self.hook_addr, &secret, &post, WAIT)
-            .await
-            .expect("hub took the hook event");
+        hook::post(
+            &cctg::tls::HubAddr::plain(self.hook_addr.as_str()),
+            &secret,
+            &post,
+            WAIT,
+        )
+        .await
+        .expect("hub took the hook event");
     }
 
     async fn start(&self, session: &str, pid: u32) {

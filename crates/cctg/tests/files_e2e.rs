@@ -237,7 +237,7 @@ impl Claude {
             session_reads: false,
         };
         let (outbox, events) = agent::spawn(LinkConfig {
-            addr: addr.to_string(),
+            addr: cctg::tls::HubAddr::plain(addr.to_string()),
             secret: Secret::parse(SECRET).unwrap(),
             register,
             backoff: Backoff {
@@ -321,13 +321,28 @@ async fn until(what: &str, done: impl Fn() -> bool) {
         .unwrap_or_else(|_| panic!("{what} in time"));
 }
 
-async fn hub_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> HubMsg {
+/// The next line from the hub; without one in time, the hub's log so far
+/// says why (CI on Linux).
+async fn hub_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    captured: &Captured,
+) -> HubMsg {
     let mut line = Vec::new();
     tokio::time::timeout(WAIT, reader.read_until(b'\n', &mut line))
         .await
-        .expect("a hub line in time")
+        .unwrap_or_else(|_| {
+            let logs = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+            panic!("a hub line in time; the log so far:\n{logs}")
+        })
         .unwrap();
     wire::decode::<HubMsg>(&line).unwrap()
+}
+
+/// How often the hub logged `what` so far.
+fn logged(captured: &Captured, what: &str) -> usize {
+    String::from_utf8_lossy(&captured.0.lock().unwrap())
+        .matches(what)
+        .count()
 }
 
 struct Dir(PathBuf);
@@ -411,8 +426,10 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     ));
 
     hooks.send(start(SESSION, "startup", 10)).await.unwrap();
+    // The actor's own line: Telegram having seen the call is not yet the
+    // slot knowing its topic, and a topic message before that goes nowhere.
     until("the topic", || {
-        !seen_methods(&seen, "createForumTopic").is_empty()
+        logged(&captured, "forum topic created") == 1
     })
     .await;
     let mut claude = Claude::start(addr, 10, &work).await;
@@ -569,9 +586,10 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     // as text, the topic hears why the file did not.
     hooks.send(start(OLD, "startup", 20)).await.unwrap();
     until("the second topic", || {
-        seen_methods(&seen, "createForumTopic").len() == 2
+        logged(&captured, "forum topic created") == 2
     })
     .await;
+    let bound_before = logged(&captured, "agent bound to its session");
     let (read, mut write) = TcpStream::connect(addr).await.unwrap().into_split();
     let mut reader = BufReader::new(read);
     let hello = wire::encode(&AgentMsg::Hello {
@@ -586,9 +604,16 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         .await
         .unwrap();
     assert_eq!(
-        hub_line(&mut reader).await,
+        hub_line(&mut reader, &captured).await,
         HubMsg::Registered { files: true }
     );
+    // `registered` goes out before the actor binds the agent. A topic
+    // message that overtakes the binding waits in the slot until it
+    // (slots unit test); here it comes after, the bound path.
+    until("the old agent bound", || {
+        logged(&captured, "agent bound to its session") > bound_before
+    })
+    .await;
     control
         .send(topic_message(
             6,
@@ -597,7 +622,7 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
             { "file_id": "pic", "file_unique_id": "u", "width": 10, "height": 10 } ] }),
         ))
         .unwrap();
-    match hub_line(&mut reader).await {
+    match hub_line(&mut reader, &captured).await {
         HubMsg::Inbound { content, .. } => {
             assert_eq!(content, format!("for an old agent {marker}"))
         }

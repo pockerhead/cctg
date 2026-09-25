@@ -1002,7 +1002,7 @@ impl Slots {
                         info!(
                             conn,
                             session = short(&session),
-                            agent = agent.map_or("none", crate::client::short),
+                            agent = agent.map_or_else(|| "none".to_owned(), crate::client::short),
                             hub = crate::client::short(hub),
                             "agent runs another cctg build"
                         );
@@ -4029,10 +4029,10 @@ impl Slots {
                 .conns
                 .get(&conn)
                 .and_then(|bound| bound.client.as_ref())
-                .map(|client| crate::client::short(&client.build).to_owned());
+                .map(|client| crate::client::short(&client.build));
             let op = Op::Send {
                 thread_id: Some(thread_id),
-                text: status::outdated_text(agent.as_deref(), crate::client::short(&hub)),
+                text: status::outdated_text(agent.as_deref(), &crate::client::short(&hub)),
                 html: None,
                 reply_markup: Some(keyboard),
                 permission: false,
@@ -12268,6 +12268,47 @@ again"
             .collect()
     }
 
+    /// TASK-035: a hub in a Linux container and a Windows client built from
+    /// one commit report the same build (`client::identity`); another commit
+    /// gives exactly one warning, which names both commits.
+    #[tokio::test]
+    async fn one_commit_on_two_systems_is_current_and_another_commit_is_warned_once() {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        const EARLIER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        let linux_hub = crate::client::identity(COMMIT, || Some("11".repeat(32)));
+        let windows_client = crate::client::identity(COMMIT, || Some("22".repeat(32)));
+        let dir = TempDir::new("slots-commit-build");
+        let options = Options {
+            build: linux_hub,
+            ..options()
+        };
+        let (fake, mut slots) = live_slots(&dir, options);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let windows = windows_client.clone().unwrap();
+        let _same = register_client(&mut slots, 1, client(&windows, true));
+        slots.pump();
+        slots.pump();
+        assert!(
+            sent_texts(&fake).await.is_empty(),
+            "same commit: no warning"
+        );
+        assert!(!slots.outdated(1));
+
+        let _older = register_client(&mut slots, 2, client(EARLIER, true));
+        slots.pump();
+        slots.pump();
+        let warnings = sent_texts(&fake).await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].0.contains("fedcba98") && warnings[0].0.contains("01234567"),
+            "{}",
+            warnings[0].0
+        );
+        slots.pump();
+        assert_eq!(sent_texts(&fake).await.len(), 1, "warned once");
+    }
+
     #[tokio::test]
     async fn an_outdated_client_is_warned_once_and_updates_only_on_a_press_after_the_turn() {
         let dir = TempDir::new("slots-update-flow");
@@ -12916,6 +12957,32 @@ again"
         assert_eq!(texts, [buffer::OLD_AGENT_NOTICE, buffer::OLD_AGENT_NOTICE]);
         assert_eq!(reacted, [2, 4]);
         assert!(slots.fetching.is_empty());
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// Ingress answers `registered` before this actor binds the agent, and
+    /// topic messages come over another channel: messages handled before
+    /// the binding wait in the slot and reach the agent right after it.
+    #[tokio::test]
+    async fn topic_messages_that_overtake_the_agents_registration_reach_it_after_binding() {
+        let dir = TempDir::new("slots-file-overtake");
+        let (mut slots, mut work, _done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        slots.on_control(photo(2, "p", Some("look"), None));
+        slots.on_control(say(Some(100), 3, Some("after")));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [2, 3]);
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), false);
+        slots.pump();
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["text look", "text after"]
+        );
+        let (texts, reacted) = topic_ops(&mut work);
+        assert_eq!(texts, [buffer::QUEUED_NOTICE, buffer::OLD_AGENT_NOTICE]);
+        assert_eq!(reacted, [2, 3]);
         assert!(slots.registry.slots[0].buffer.is_idle());
     }
 

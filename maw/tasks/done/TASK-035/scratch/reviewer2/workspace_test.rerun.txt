@@ -1,0 +1,2 @@
+update_e2e failed in the full run only because target/debug/cctg.exe was rebuilt at 14:33:53 by another worktree sharing the target dir (client.build 79ad9d72...-dirty vs this tree 4172ee05...-dirty).
+Rerun after touching crates/cctg/src/main.rs: cargo test -j 1 -p cctg --locked --test update_e2e -> test result: ok. 1 passed; 0 failed

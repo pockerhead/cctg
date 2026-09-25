@@ -1,0 +1,3 @@
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-035-ref\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 13.08s
+clippy exit 0

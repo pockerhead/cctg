@@ -1,0 +1,18 @@
+import subprocess, os, time
+bash = r"C:\Program Files\Git\bin\bash.exe"
+si = subprocess.STARTUPINFO()
+si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+si.wShowWindow = 0
+d = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+res = d + "/ttyprobe3.out"
+inner = f"if (: </dev/tty) 2>/dev/null; then echo inner-tty-open >&3; stty -g </dev/tty >&3 2>&3 && echo stty-ok >&3 || echo stty-fail >&3; else echo inner-no-tty >&3; fi"
+script = f"exec 3>'{res}'; tty >&3 2>&3; echo | sh -c '{inner}'; echo done >&3"
+# stdin, stdout: the hidden console, like an interactive Git Bash in a console window
+p = subprocess.Popen([bash, "-c", script],
+    creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=si)
+try:
+    p.wait(timeout=20)
+except subprocess.TimeoutExpired:
+    p.kill()
+time.sleep(0.5)
+print(open(res).read())
