@@ -4,7 +4,8 @@
 //! TCP and this test plays the slots actor and Claude Code.
 //!
 //! The copy is replaced by a different build (the same bytes plus a tail,
-//! which Windows still runs) while its worker runs; `update` makes the worker
+//! which Windows still runs, or with the baked commit rewritten when the
+//! test was built from a clean one) while its worker runs; `update` makes the worker
 //! write the switch marker, answer every line Claude Code sent meanwhile,
 //! leave (`update_answer reloading`), take what was queued before `released`
 //! and exit; the shim starts the new file, whose worker registers with the
@@ -103,8 +104,64 @@ fn send(claude: &mut std::process::ChildStdin, line: &str) {
     claude.flush().unwrap();
 }
 
+/// The build a worker started from `path` reports: the commit when this
+/// test was built from a clean one, else from the file's hash.
 fn build_of(path: &Path) -> String {
-    cctg::client::build_of(path).unwrap()
+    cctg::client::build_id_of(path).unwrap()
+}
+
+/// Writes to `path` a build other than `original` and returns the build its
+/// worker reports. Built from a clean commit, every copy reports that
+/// commit, so the copy gets it rewritten (same length, other characters);
+/// otherwise the build comes from the file hash, which a tail changes.
+fn write_newer(path: &Path, original: &[u8]) -> String {
+    let source = cctg::client::SOURCE;
+    if source.is_empty() || source.ends_with("-dirty") {
+        let mut newer = original.to_vec();
+        newer.extend_from_slice(b"\0update-e2e newer build");
+        common::write_program(path, &newer);
+        return build_of(path);
+    }
+    assert!(
+        source.len() >= 16,
+        "a build id this short cannot be rewritten"
+    );
+    let other: String = source
+        .chars()
+        .map(|c| match c {
+            '0'..='8' | 'a'..='y' | 'A'..='Y' => char::from(c as u8 + 1),
+            '9' => '0',
+            'z' => 'a',
+            'Z' => 'A',
+            c => c,
+        })
+        .collect();
+    assert_ne!(other, source);
+    let mut newer = original.to_vec();
+    let mut rewritten = 0;
+    let mut at = 0;
+    while let Some(found) = newer[at..]
+        .windows(source.len())
+        .position(|window| window == source.as_bytes())
+    {
+        let start = at + found;
+        newer[start..start + source.len()].copy_from_slice(other.as_bytes());
+        rewritten += 1;
+        at = start + source.len();
+    }
+    assert!(rewritten > 0, "the build id is in the binary");
+    common::write_program(path, &newer);
+    // The changed bytes void the linker's ad-hoc signature (Apple Silicon).
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .status()
+            .expect("codesign runs");
+        assert!(status.success(), "codesign");
+    }
+    other
 }
 
 #[tokio::test]
@@ -117,7 +174,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     }
     let exe = bin.join(format!("cctg{EXE}"));
     let original = std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap();
-    std::fs::write(&exe, &original).unwrap();
+    common::write_program(&exe, &original);
 
     let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .await
@@ -171,13 +228,13 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     let (first, register, to_first) = registered(&mut events).await;
     let client = register.client.expect("a client");
     assert!(client.self_update, "under the shim");
-    assert_eq!(client.build, build_of(&exe));
+    let first_build = build_of(&exe);
+    assert_eq!(client.build, first_build);
 
     // A different build takes the file's place; the old one keeps running.
     std::fs::rename(&exe, bin.join(format!("cctg.old{EXE}"))).unwrap();
-    let mut newer = original.clone();
-    newer.extend_from_slice(b"\0update-e2e newer build");
-    std::fs::write(&exe, &newer).unwrap();
+    let newer_build = write_newer(&exe, &original);
+    assert_ne!(newer_build, first_build, "the two files are two builds");
 
     to_first
         .send(HubMsg::Update { update_id: 7 })
@@ -241,7 +298,11 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     let (second, register, to_second) = registered(&mut events).await;
     assert_ne!(second, first);
     assert_eq!(register.session_id, SESSION);
-    assert_eq!(register.client.expect("a client").build, build_of(&exe));
+    assert_eq!(
+        register.client.expect("a client").build,
+        newer_build,
+        "the new worker runs the new file"
+    );
     to_second
         .send(HubMsg::Inbound {
             content: "after-handover".into(),

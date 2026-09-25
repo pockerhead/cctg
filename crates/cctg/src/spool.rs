@@ -242,7 +242,7 @@ pub fn pending(root: &Path, session: &str, now: SystemTime) -> Vec<(PathBuf, Hoo
 pub async fn replay(
     root: &Path,
     session: &str,
-    addr: &str,
+    addr: &crate::tls::HubAddr,
     secret: &Secret,
     deadline: Instant,
 ) -> Result<usize, PostError> {
@@ -269,6 +269,8 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     use tokio::sync::mpsc;
+
+    use crate::tls::HubAddr;
 
     use super::*;
     use crate::hub::ingress;
@@ -491,11 +493,11 @@ mod tests {
         assert!(!kept[0].0.exists(), "an expired file is deleted unsent");
     }
 
-    async fn hooks_hub(queue: usize) -> (String, mpsc::Receiver<HookPost>) {
+    async fn hooks_hub(queue: usize) -> (HubAddr, mpsc::Receiver<HookPost>) {
         let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
+        let addr = HubAddr::plain(listener.local_addr().unwrap().to_string());
         let (tx, rx) = mpsc::channel(queue);
         tokio::spawn(ingress::serve_hooks(
             listener,
@@ -566,7 +568,7 @@ mod tests {
         // No hub at all: nothing is lost.
         save(&root, &start(SESSION), SystemTime::now()).unwrap();
         let closed = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let gone = closed.local_addr().unwrap().to_string();
+        let gone = HubAddr::plain(closed.local_addr().unwrap().to_string());
         drop(closed);
         let short = Instant::now() + Duration::from_millis(300);
         assert!(replay(&root, SESSION, &gone, &secret, short).await.is_err());

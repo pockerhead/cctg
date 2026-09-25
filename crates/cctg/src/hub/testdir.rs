@@ -74,7 +74,8 @@ fn sweep_stale() {
     }
 }
 
-#[cfg(test)]
+// The one test is Windows-only (share modes); elsewhere the module is empty.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

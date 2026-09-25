@@ -1,0 +1,11 @@
+# The hub on the host network, for a proxy that listens only on the host's
+# 127.0.0.1 (TASK-035 decision 2):
+#
+#   docker compose -f compose.yml -f compose.host.yml up -d
+#
+# The listeners then bind the host's ports 47291 and 47292 directly.
+services:
+  hub:
+    network_mode: host
+    ports: !reset []
+    extra_hosts: !reset []

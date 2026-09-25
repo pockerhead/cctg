@@ -1,0 +1,38 @@
+# CI container smoke of the hub image (TASK-035), driven by smoke.py: the
+# image with a fake Bot API in the same network namespace (the hub allows
+# plain http only to a loopback Bot API). `fakebot` publishes the hub ports,
+# so a hub restart keeps them. Test values only.
+services:
+  fakebot:
+    image: python:3.12-alpine
+    command: ["python", "-u", "/fake_bot.py"]
+    volumes:
+      - ./fake_bot.py:/fake_bot.py:ro
+    ports:
+      - "127.0.0.1:47391:47291"
+      - "127.0.0.1:47392:47292"
+      - "127.0.0.1:18081:8081"
+
+  hub:
+    image: ${CCTG_SMOKE_IMAGE:-cctg:smoke}
+    network_mode: "service:fakebot"
+    depends_on: [fakebot]
+    init: true
+    env_file: smoke.env
+    environment:
+      CCTG_BOT_API_URL: http://127.0.0.1:8081
+      CCTG_TLS_CERT: /tls/cert.pem
+      CCTG_TLS_KEY: /tls/key.pem
+    volumes:
+      - state:/data
+      - ./tls:/tls:ro
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "cctg", "health"]
+      interval: 5s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+volumes:
+  state:

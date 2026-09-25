@@ -73,6 +73,8 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
                           transcript reader                          (--dangerously-load-development-channels)
 ```
 
+Установка (TASK-031): `install.sh` в корне, POSIX sh для Linux, macOS и Windows в Git Bash; скрипт тега ставит бинарник того же тега (`RELEASE=` в скрипте, `release.yml` сверяет его с тегом). Клиент: бинарник из GitHub Releases в `~/.cctg/bin`, `~/.cctg/device.env`, `~/.cctg/claude/{mcp.json,settings.json}`, обёртка `~/.local/bin/claude-cctg` (и `.cmd`), проверка `cctg doctor`; `~/.claude/settings.json` и `~/.claude.json` не трогает. `--hub`: hub в Docker на сервере. Для людей `README.md`.
+
 ### 1. `cctg hub` — один процесс на "главном" устройстве
 
 - Владеет токеном бота. Бот админ в закрытом супергруппе-форуме.
@@ -113,6 +115,7 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
 - Gate по `from.id` пользователя, не по чату. Allowlist в hub.
 - Permission relay только от allowlisted. Кнопки Allow/Deny с `request_id` в callback data.
 - Секрет hub в `.env`, не в репо. `.cctg/` в gitignore.
+- Hub на другой машине (TASK-035, `docs/remote-hub.md`): оба канала по TLS 1.3, устройство держит pin сертификата hub (`CCTG_HUB_CERT_SHA256`); без pin устройство ходит только на loopback. Сборка = коммит (`build.rs`, `CCTG_BUILD_ID` в CI и Docker), hub и клиент одного коммита на разных ОС не «устаревшие».
 
 ## Порядок разработки
 

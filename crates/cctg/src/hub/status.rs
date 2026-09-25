@@ -59,8 +59,9 @@ pub const ANSWER_CURRENT: &str = "Клиент уже обновлён";
 pub const ANSWER_OLD_CLIENT: &str =
     "Этот клиент старше обновлений из Telegram: перезапустите сессию вручную";
 pub const UPDATED_NOTICE: &str = "✅ Клиент cctg обновлён.";
-pub const NO_NEW_BUILD_NOTICE: &str =
-    "На машине этой сессии нет новой сборки cctg: сначала cctg deploy, потом «Обновить».";
+/// The client found no newer file of itself (TASK-040). The hub cannot tell
+/// whether that machine is its own, so the text covers both (TASK-035).
+pub const NO_NEW_BUILD_NOTICE: &str = "На машине этой сессии нет новой сборки cctg. Если hub на этой же машине: cctg deploy, потом «Обновить». Если нет: положите на место файла cctg этой машины сборку того же коммита, что у hub (GitHub Releases, номер сборки в предупреждении), потом «Обновить».";
 pub const MANUAL_RESTART_NOTICE: &str = "Нужен перезапуск claude, а сессия запущена не через cctg run (claude-cctg). Выйдите из claude и запустите claude-cctg --resume с id этой сессии.";
 pub const DRAFT_NOTICE: &str = "В поле ввода терминала есть неотправленный текст, поэтому /exit не отправлен. Отправьте или сотрите его и нажмите «Обновить» ещё раз.";
 pub const UPDATE_WAITS_NOTICE: &str = "⏳ Обновление клиента ждёт конца хода и продолжится само, когда он закончится (⏹ прервёт ход).";

@@ -773,6 +773,72 @@ mod tests {
         assert_eq!(texts(&read_chunk(Some(&own), SESSION, Some(0))).2, ["real"]);
     }
 
+    /// `link` -> `target`, a folder link: a symlink on Unix, a junction on
+    /// Windows. False when it cannot be made.
+    fn folder_link(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    /// The macOS shape of TASK-031 CI run 2 on any OS: the cwd is reached
+    /// through a link (there the temp dir `/var` -> `/private/var`), so the
+    /// linked spelling names another folder than Claude Code's (its
+    /// `realpathSync(process.cwd())`), and another project's folder holds
+    /// the same session id, so the id alone finds nothing. The agent serves
+    /// Claude Code's folder whether its cwd comes resolved (Unix `getcwd`)
+    /// or as given (Windows keeps the linked spelling).
+    #[test]
+    fn a_linked_cwd_is_served_from_the_resolved_folder_when_another_holds_the_id() {
+        let dir = TempDir::new("tail-own-link");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("w")).unwrap();
+        let link = dir.path().join("link");
+        if !folder_link(&link, &real) {
+            eprintln!("no folder link; skipped");
+            return;
+        }
+        let root = root(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let linked = link.join("w").to_string_lossy().into_owned();
+        let resolved = crate::device::canonical_cwd(&linked);
+        let claude = root.join(project_folder_name(&resolved));
+        assert_ne!(claude, root.join(project_folder_name(&linked)));
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join(format!("{SESSION}.jsonl")), prompt("own")).unwrap();
+        let foreign = root.join("C--another-project");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join(format!("{SESSION}.jsonl")), prompt("private")).unwrap();
+        for cwd in [&resolved, &linked] {
+            let own = OwnProject::new(root.clone(), Some(SESSION), Some(cwd)).unwrap();
+            assert_eq!(
+                texts(&read_chunk(Some(&own), SESSION, Some(0))).2,
+                ["own"],
+                "{cwd}"
+            );
+        }
+        // The CI failure itself: a transcript in a folder named after the
+        // linked spelling is not the agent's own when its cwd comes
+        // resolved, and the id in two folders finds none: "не найден".
+        std::fs::remove_file(claude.join(format!("{SESSION}.jsonl"))).unwrap();
+        let by_link = root.join(project_folder_name(&linked));
+        std::fs::create_dir_all(&by_link).unwrap();
+        std::fs::write(by_link.join(format!("{SESSION}.jsonl")), prompt("linked")).unwrap();
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(&resolved)).unwrap();
+        assert!(texts(&read_chunk(Some(&own), SESSION, Some(0))).3);
+    }
+
     #[cfg(windows)]
     #[test]
     fn the_own_folder_named_in_another_case_than_on_disk_is_served() {

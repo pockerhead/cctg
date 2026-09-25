@@ -169,8 +169,19 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     tokio::time::timeout(Duration::from_secs(30), noticed)
         .await
         .expect("queued notice in time");
-    let saved = std::fs::read_to_string(state.join("registry.json")).unwrap_or_default();
-    assert!(saved.contains(&offline_text), "the kept message is saved");
+    // The registry is written by its own save task, not before the notice.
+    let saved = async {
+        loop {
+            let saved = std::fs::read_to_string(state.join("registry.json")).unwrap_or_default();
+            if saved.contains(&offline_text) {
+                return saved;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let saved = tokio::time::timeout(Duration::from_secs(5), saved)
+        .await
+        .expect("the kept message is saved");
     assert!(
         !saved.contains(&USER.to_string()),
         "no user id in the saved buffer"

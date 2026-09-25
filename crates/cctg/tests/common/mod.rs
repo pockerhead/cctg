@@ -32,3 +32,16 @@ pub fn isolate(command: &mut Command, home: &Path) {
     }
     command.env("USERPROFILE", home).env("HOME", home);
 }
+
+/// Writes a program file that can be started: on Unix a written file has no
+/// execute bit (TASK-035, the first Linux run).
+#[allow(dead_code, reason = "not every test binary copies cctg")]
+pub fn write_program(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).expect("write the program");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the program executable");
+    }
+}

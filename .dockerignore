@@ -1,0 +1,8 @@
+# Allowlist: the image build sees the workspace sources and nothing else.
+# `.env` (bot token, hub secret), `.cctg/`, `.git/`, `target/` and `maw/`
+# never enter the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/**/target/

@@ -1,0 +1,72 @@
+# cctg hub on a server (TASK-035). One-time setup: docs/remote-hub.md.
+#
+#   docker compose up -d                       # start
+#   docker compose pull && docker compose up -d # update by hand
+#   docker compose --profile autoupdate up -d  # also start the updater
+#
+# Files next to this one: hub.env (secrets, chmod 600, never in git) and
+# tls/cert.pem + tls/key.pem (readable by uid 10001).
+#
+# Telegram only through a proxy of the host: HTTPS_PROXY in hub.env, and
+# either the host network (compose.host.yml, for a proxy on 127.0.0.1) or
+# http://host.docker.internal:<port> for a proxy that also listens on the
+# Docker bridge. docs/remote-hub.md, "Прокси".
+
+services:
+  hub:
+    # install.sh --hub sets CCTG_IMAGE_TAG in .env to its own release, so
+    # hub and clients are one version; without it `latest`. `latest` exists
+    # from the first release (tag v*) on; before it use `main`
+    # (docs/remote-hub.md, "Один раз в GitHub").
+    image: ghcr.io/pockerhead/cctg:${CCTG_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # A small init as PID 1: SIGTERM stops the hub also before its own
+    # handler is installed (start, getMe retries).
+    init: true
+    env_file: hub.env
+    environment:
+      CCTG_TLS_CERT: /tls/cert.pem
+      CCTG_TLS_KEY: /tls/key.pem
+    volumes:
+      - state:/data
+      - ./tls:/tls:ro
+    # Host port first. Another host port (docs/remote-hub.md, "Порты"):
+    # change only the left numbers, e.g. "52191:47291".
+    ports:
+      - "47291:47291"
+      - "47292:47292"
+    # The host as host.docker.internal, for a proxy on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # The hub writes registry.json on SIGTERM; give it the time.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "cctg", "health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    labels:
+      # Only containers with this label are updated by the updater below.
+      com.centurylinklabs.watchtower.enable: "true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Pulls a new `latest` (a release tag) every 10 minutes and restarts the
+  # hub on it; a hub pinned by CCTG_IMAGE_TAG stays on its release (update
+  # it with install.sh --hub of the new tag). nickfedor/watchtower: the
+  # maintained fork of the archived containrrr/watchtower. Off unless
+  # `--profile autoupdate`.
+  updater:
+    image: nickfedor/watchtower:latest
+    profiles: ["autoupdate"]
+    restart: unless-stopped
+    command: ["--label-enable", "--cleanup", "--interval", "600"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  state:
