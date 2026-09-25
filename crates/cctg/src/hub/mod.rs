@@ -133,6 +133,8 @@ fn checked_icons(lookup: Result<Vec<Sticker>, ApiError>) -> anyhow::Result<Icons
 
 /// How long a stopping hub waits for the slot actor to write the registry.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the hub asks getMe again after a network error at start.
+const START_TRIES: u64 = 3;
 
 /// Completes on Ctrl+C (Ctrl+Break on Windows, SIGTERM on Unix), or when
 /// stdin closes if `watch_stdin` (how `cctg supervise` stops its hub: it
@@ -186,10 +188,19 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         config.chat_id,
     )?);
 
-    let me = api
-        .get_me()
-        .await
-        .context("getMe failed; check CCTG_BOT_TOKEN")?;
+    // A network hiccup at start (seen live: a TLS handshake cut) must not
+    // end the hub: `cctg deploy` counts an exit in its trial as a failure.
+    let mut tries = 0;
+    let me = loop {
+        match api.get_me().await {
+            Err(ApiError::Http(error)) if tries < START_TRIES => {
+                tries += 1;
+                warn!(%error, tries, "getMe failed; trying again");
+                tokio::time::sleep(Duration::from_secs(tries)).await;
+            }
+            answer => break answer.context("getMe failed; check CCTG_BOT_TOKEN")?,
+        }
+    };
     let member = api.get_chat_member(me.id).await.context(
         "getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group",
     )?;
