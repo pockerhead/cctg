@@ -1937,6 +1937,7 @@ mod tests {
     }
 
     /// Connects from `source` (port 0) to `addr`.
+    #[cfg(not(target_os = "macos"))]
     async fn connect_from(source: IpAddr, addr: SocketAddr) -> TcpStream {
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.bind(SocketAddr::new(source, 0)).unwrap();

@@ -12960,6 +12960,32 @@ again"
         assert!(slots.registry.slots[0].buffer.is_idle());
     }
 
+    /// Ingress answers `registered` before this actor binds the agent, and
+    /// topic messages come over another channel: messages handled before
+    /// the binding wait in the slot and reach the agent right after it.
+    #[tokio::test]
+    async fn topic_messages_that_overtake_the_agents_registration_reach_it_after_binding() {
+        let dir = TempDir::new("slots-file-overtake");
+        let (mut slots, mut work, _done) = file_slots(
+            &dir,
+            TelegramFiles([("p".to_owned(), b"x".to_vec())].into()),
+        );
+        slots.on_control(photo(2, "p", Some("look"), None));
+        slots.on_control(say(Some(100), 3, Some("after")));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [2, 3]);
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), false);
+        slots.pump();
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["text look", "text after"]
+        );
+        let (texts, reacted) = topic_ops(&mut work);
+        assert_eq!(texts, [buffer::QUEUED_NOTICE, buffer::OLD_AGENT_NOTICE]);
+        assert_eq!(reacted, [2, 3]);
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
     #[tokio::test]
     async fn a_dead_slot_keeps_a_file_as_its_reference_and_hands_it_over_on_revival() {
         let dir = TempDir::new("slots-file-dead");

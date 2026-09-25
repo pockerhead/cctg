@@ -550,14 +550,119 @@ fn install_update_and_uninstall_a_device() {
         conf.join("mcp.json"),
         conf.join("settings.json"),
         run.cctg_dir().join("device.env"),
-        run.wrapper(),
         run.wrapper().with_file_name("claude-cctg.cmd"),
+        aside.clone(),
     ] {
         assert!(!gone.exists(), "{} left: {text}", gone.display());
     }
-    assert!(aside.exists(), "a file not written by the script stays");
+    // The hand-written wrapper is back in its place.
+    assert_eq!(
+        std::fs::read_to_string(run.wrapper()).unwrap(),
+        "#!/bin/sh\necho handmade\n"
+    );
     assert!(run.cctg_dir().join("keep.txt").exists());
     untouched();
+}
+
+/// A hub that drops every connection: `cctg doctor` fails at once.
+fn closed_hub() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || for _ in listener.incoming() {});
+    addr
+}
+
+#[test]
+fn uninstall_keeps_what_the_script_did_not_write() {
+    let root = Root::new("foreign");
+    let dist = root.dir("dist");
+    release(&dist, &this_build());
+    let (base, _) = serve(dist);
+    let hub = closed_hub();
+    let mut run = Run::new(&root);
+    run.env("CCTG_INSTALL_BASE_URL", &base)
+        .env("CCTG_HUB_SECRET", SECRET);
+    run.fake_program("claude", FAKE_CLAUDE);
+    let mine = "# my notes\nCCTG_HOST=my-laptop\nCCTG_STATE_DIR=/somewhere\n";
+    std::fs::create_dir_all(run.cctg_dir()).unwrap();
+    std::fs::write(run.cctg_dir().join("device.env"), mine).unwrap();
+    // The certificate pin as openssl prints it.
+    let bytes: Vec<u8> = (0..32u8).map(|n| n.wrapping_mul(37) ^ 0xa5).collect();
+    let colons: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    let pin: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let fingerprint = format!("sha256 Fingerprint={}", colons.join(":"));
+    let (output, text) = run.install(&[
+        "--yes",
+        "--agent-addr",
+        &hub,
+        "--hook-addr",
+        &hub,
+        "--pin",
+        &fingerprint,
+    ]);
+    assert!(output.status.success(), "{text}");
+    let env = std::fs::read_to_string(run.cctg_dir().join("device.env")).unwrap();
+    assert!(env.starts_with(mine), "{env}");
+    assert!(
+        env.contains(&format!("CCTG_HUB_CERT_SHA256='{pin}'\n")),
+        "{env}"
+    );
+
+    // What cctg leaves next to the binary while it runs.
+    let bin = run.cctg_dir().join("bin");
+    let workers = bin.join("cctg-workers");
+    std::fs::create_dir_all(&workers).unwrap();
+    let leftovers = [
+        workers.join(format!("cctg-1{EXE}")),
+        bin.join("cctg.old.exe.1700000000"),
+        bin.join(format!("cctg.install{EXE}")),
+    ];
+    for file in &leftovers {
+        std::fs::write(file, b"x").unwrap();
+    }
+    let (output, text) = run.install(&["--uninstall"]);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(run.cctg_dir().join("device.env")).unwrap(),
+        mine,
+        "{text}"
+    );
+    assert!(!bin.exists(), "{text}");
+    // Claude Code's installer shares ~/.local/bin.
+    assert!(run.wrapper().parent().unwrap().is_dir());
+}
+
+#[test]
+fn missing_or_bad_settings_without_a_terminal_write_nothing() {
+    let root = Root::new("refused");
+    let mut run = Run::new(&root);
+    // Nothing may be downloaded.
+    run.env("CCTG_INSTALL_BASE_URL", "http://127.0.0.1:9/");
+    let empty = root.0.join("empty-secret.txt");
+    std::fs::write(&empty, "\nthe secret on line two\n").unwrap();
+    let empty = empty.to_string_lossy().into_owned();
+    let local = ["--agent-addr", "127.0.0.1:9", "--hook-addr", "127.0.0.1:9"];
+    let cases: [(&[&str], Option<&str>, &str); 4] = [
+        (&local, None, "no hub secret"),
+        (&["--hub-host", "192.0.2.10"], Some(SECRET), "needs --pin"),
+        (
+            &["--hub-host", "192.0.2.10", "--pin", "0123abcd"],
+            Some(SECRET),
+            "not a sha256 fingerprint",
+        ),
+        (&["--secret-file", &empty], None, "is empty"),
+    ];
+    for (args, secret, error) in cases {
+        run.env.retain(|(key, _)| key != "CCTG_HUB_SECRET");
+        if let Some(secret) = secret {
+            run.env("CCTG_HUB_SECRET", secret);
+        }
+        let args = [&["--yes"], args].concat();
+        let (output, text) = run.install(&args);
+        assert!(!output.status.success(), "{args:?}: {text}");
+        assert!(text.contains(error), "{args:?}: {text}");
+        assert!(!run.cctg_dir().exists(), "{args:?} wrote: {text}");
+    }
 }
 
 #[test]
@@ -727,13 +832,18 @@ fn a_hub_is_set_up_with_docker_compose() {
         cctg::wire::Secret::parse(&secret).is_ok() && secret.len() == 48,
         "{secret}"
     );
-    assert_eq!(
-        std::fs::read_to_string(hub_dir.join(".env"))
-            .unwrap()
-            .lines()
-            .last(),
-        Some("COMPOSE_FILE=compose.yml:compose.host.yml"),
-        "a proxy on the host's loopback needs the host network"
+    let compose_env = std::fs::read_to_string(hub_dir.join(".env")).unwrap();
+    let compose_env: Vec<&str> = compose_env.lines().collect();
+    assert!(
+        compose_env.contains(&"COMPOSE_FILE=compose.yml:compose.host.yml"),
+        "a proxy on the host's loopback needs the host network: {compose_env:?}"
+    );
+    // The image of the script's own release, not `latest`.
+    let image_tag = format!("CCTG_IMAGE_TAG={}", release_tag().trim_start_matches('v'));
+    assert!(compose_env.contains(&image_tag.as_str()), "{compose_env:?}");
+    assert!(
+        compose_env.contains(&"CCTG_PUBLIC_HOST=hub.example.org"),
+        "{compose_env:?}"
     );
     assert_eq!(
         std::fs::read(hub_dir.join("compose.yml")).unwrap(),
@@ -769,21 +879,30 @@ fn a_hub_is_set_up_with_docker_compose() {
         "{calls}"
     );
 
+    // A later release changes compose.yml; the user never edited it: the
+    // script of that release updates it. The address is kept from before.
+    run.env.retain(|(key, _)| key != "CCTG_BOT_TOKEN");
+    let mut release_compose = std::fs::read(deploy.join("compose.yml")).unwrap();
+    release_compose.extend_from_slice(b"# a later release\n");
+    std::fs::write(deploy.join("compose.yml"), &release_compose).unwrap();
+    let again = ["--hub", "--yes", "--dir", &dir];
+    let (output, text) = run.install(&again);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        std::fs::read(hub_dir.join("compose.yml")).unwrap(),
+        release_compose,
+        "{text}"
+    );
+    assert!(!hub_dir.join("compose.yml.new").exists(), "{text}");
+    assert!(text.contains("--hub-host hub.example.org"), "{text}");
+
     // Again without the token: everything kept, the same pin and secret;
     // a compose.yml changed by hand (other ports) stays.
-    run.env.retain(|(key, _)| key != "CCTG_BOT_TOKEN");
     let mine = std::fs::read_to_string(hub_dir.join("compose.yml"))
         .unwrap()
         .replace("\"47291:47291\"", "\"52191:47291\"");
     std::fs::write(hub_dir.join("compose.yml"), &mine).unwrap();
-    let (output, text) = run.install(&[
-        "--hub",
-        "--yes",
-        "--dir",
-        &dir,
-        "--public-host",
-        "hub.example.org",
-    ]);
+    let (output, text) = run.install(&again);
     assert!(output.status.success(), "{text}");
     assert_eq!(
         std::fs::read_to_string(hub_dir.join("hub.env")).unwrap(),
@@ -796,7 +915,20 @@ fn a_hub_is_set_up_with_docker_compose() {
     );
     assert_eq!(
         std::fs::read(hub_dir.join("compose.yml.new")).unwrap(),
-        std::fs::read(deploy.join("compose.yml")).unwrap()
+        release_compose
+    );
+    // On the host network the published ports do not apply.
+    assert!(text.contains("--hub-host hub.example.org"), "{text}");
+    // A proxy on another machine: the bridge network, and the client line
+    // takes the host ports of compose.yml.
+    let (output, text) =
+        run.install(&[&again[..], &["--proxy", "http://proxy.example:3128"]].concat());
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains(
+            " --agent-addr hub.example.org:52191 --hook-addr hub.example.org:47292 --pin "
+        ),
+        "{text}"
     );
 
     // Stop: compose down; the secrets and the key stay for the user.
@@ -809,6 +941,64 @@ fn a_hub_is_set_up_with_docker_compose() {
     );
     assert!(!hub_dir.join("compose.yml").exists());
     assert!(hub_dir.join("hub.env").exists() && hub_dir.join("tls").join("key.pem").exists());
+}
+
+#[test]
+fn a_hub_that_does_not_start_or_has_no_address_is_an_error() {
+    let root = Root::new("hub-fails");
+    let raw = root.dir("raw");
+    let deploy = raw.join("deploy");
+    std::fs::create_dir_all(&deploy).unwrap();
+    for file in ["compose.yml", "compose.host.yml"] {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy")
+            .join(file);
+        std::fs::copy(from, deploy.join(file)).unwrap();
+    }
+    let (raw_url, _) = serve(raw);
+    let mut run = Run::new(&root);
+    // The hub's own start check fails: its log ends with "Error: ...".
+    run.fake_program(
+        "docker",
+        "#!/bin/sh\ncase \"$*\" in *' logs '*) echo 'hub-1  | Error: the bot cannot manage topics in this group';; esac\nexit 0\n",
+    );
+    let hub_dir = run.home.join("hub");
+    let dir = hub_dir.to_string_lossy().into_owned();
+    run.env("CCTG_INSTALL_RAW_URL", &raw_url)
+        .env("CCTG_BOT_TOKEN", TOKEN);
+    let args = [
+        "--hub",
+        "--yes",
+        "--dir",
+        &dir,
+        "--chat-id",
+        "-1001234567",
+        "--users",
+        "1001",
+    ];
+    // Without a terminal the devices' address must be given: nothing is
+    // started or written, and no placeholder line is printed.
+    let (output, text) = run.install(&args);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("use --public-host"), "{text}");
+    assert!(!hub_dir.exists(), "{text}");
+
+    let (output, text) = run.install(&[&args[..], &["--public-host", "hub.example.org"]].concat());
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("Error: the bot cannot manage topics")
+            && text.contains("the hub did not start"),
+        "{text}"
+    );
+    assert!(!text.contains("curl -fsSL"), "{text}");
+    // No proxy is an answer too: the question is not asked again.
+    let env = std::fs::read_to_string(hub_dir.join("hub.env")).unwrap();
+    assert!(
+        env.lines()
+            .any(|line| line == "# HTTPS_PROXY: none (install.sh --hub)")
+            && !env.contains("HTTPS_PROXY="),
+        "{env}"
+    );
 }
 
 #[test]

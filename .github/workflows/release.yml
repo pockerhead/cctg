@@ -37,7 +37,7 @@ jobs:
       - name: install.sh belongs to this tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          if ! grep -qx "RELEASE=${GITHUB_REF_NAME}" install.sh; then
+          if ! grep -qxF "RELEASE=${GITHUB_REF_NAME}" install.sh; then
             echo "::error::install.sh has no RELEASE=${GITHUB_REF_NAME}"
             exit 1
           fi
