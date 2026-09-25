@@ -227,6 +227,10 @@ impl Candidates {
         self.by_agent.remove(agent_id)
     }
 
+    pub fn contains(&self, agent_id: &str) -> bool {
+        self.by_agent.contains_key(agent_id)
+    }
+
     /// Takes the candidates of `session` whose stop came, by agent id.
     pub fn take_stopped(&mut self, session: &str) -> Vec<(String, Candidate)> {
         let mut agents: Vec<String> = self
