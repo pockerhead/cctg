@@ -34,6 +34,11 @@ RELEASE=v0.1.0
 MARK=cctg-install
 # device.env keys this script sets; other lines of the file are kept.
 MANAGED='CCTG_HUB_SECRET|CCTG_HUB_AGENT_ADDR|CCTG_HUB_HOOK_ADDR|CCTG_HUB_CERT_SHA256'
+# The other lines of device.env this script writes (--uninstall removes them).
+ENV_HEADER='# cctg device config, written by install.sh (docs/remote-hub.md)'
+HOST_MARK='# the CCTG_HOST line below: written by install.sh (macOS gives cctg no host name)'
+# hub.env: the hub runs without a proxy (so the question is not asked again).
+PROXY_NONE='# HTTPS_PROXY: none (install.sh --hub)'
 AGENT_PORT=47291
 HOOK_PORT=47292
 
@@ -168,7 +173,8 @@ The hub on a server with Docker (docs/remote-hub.md):
   --chat-id -100N       the forum group
   --users ID[,ID]       Telegram user ids allowed to use the bot
   --proxy URL           HTTPS_PROXY for the Bot API (optional)
-  --public-host HOST    how devices reach this server (for the client line)
+  --public-host HOST    how devices reach this server (for the client line;
+                        needed without a terminal, kept for the next run)
   CCTG_BOT_TOKEN        the bot token (otherwise it is asked for)
   --hub --uninstall     stop the hub; hub.env, tls/ and the state volume stay
 
@@ -312,12 +318,14 @@ read_settings() {
         [ -r "$secret_file" ] || die "cannot read $secret_file"
         IFS= read -r secret <"$secret_file" || true
         secret=$(printf '%s' "$secret" | tr -d '\r')
+        [ -n "$secret" ] || die "$secret_file is empty (the secret is its first line)"
     elif [ -z "$(old_line CCTG_HUB_SECRET)" ]; then
         interactive || die "no hub secret: set CCTG_HUB_SECRET or use --secret-file"
         read_hidden "Hub secret (CCTG_HUB_SECRET of the hub, not shown): " \
             "set CCTG_HUB_SECRET or use --secret-file"
         secret=$hidden
         hidden=
+        [ -n "$secret" ] || die "no hub secret typed"
     fi
     [ -z "$secret" ] || check_secret
 }
@@ -428,9 +436,26 @@ install_binary() {
         rm -f "$old" 2>/dev/null || true
         [ ! -e "$old" ] || old=$old.$(date +%s)
         mv -f "$exe" "$old" || die "cannot move $exe aside"
+        if ! move_in; then
+            # Never leave the configs pointing at no binary.
+            mv -f "$old" "$exe" || die "could not put the new binary in place; the old one is $old: rename it to $exe"
+            rm -f "$new" 2>/dev/null || true
+            die "could not put the new binary in place (a virus scanner holding it?); the old one is back, run this again"
+        fi
+    else
+        mv -f "$new" "$exe"
     fi
-    mv -f "$new" "$exe"
     rm -f "$bin_dir"/cctg.old.exe.* 2>/dev/null || true
+}
+
+# The new binary to its place. A virus scanner can hold a fresh file for a
+# moment: a few tries, with the waits of cctg deploy.
+move_in() {
+    for wait in 0 0.1 0.3 1; do
+        sleep "$wait"
+        mv -f "$new" "$exe" 2>/dev/null && return 0
+    done
+    return 1
 }
 
 # Writes stdin to $1 (mode $2) only when the bytes differ: an unchanged
@@ -482,9 +507,9 @@ write_device_env() {
         if [ -f "$env_file" ]; then
             grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=" "$env_file" || true
         else
-            printf '%s\n' "# cctg device config, written by install.sh (docs/remote-hub.md)"
+            printf '%s\n' "$ENV_HEADER"
         fi
-        [ -z "$host_line" ] || printf '%s\n' "$host_line"
+        [ -z "$host_line" ] || printf '%s\n' "$HOST_MARK" "$host_line"
         managed_line CCTG_HUB_SECRET "$secret"
         managed_line CCTG_HUB_AGENT_ADDR "$agent_addr"
         managed_line CCTG_HUB_HOOK_ADDR "$hook_addr"
@@ -570,21 +595,45 @@ remove() {
     fi
 }
 
+# device.env without the lines this script wrote; removed when nothing
+# else is left in it.
+strip_device_env() {
+    [ -f "$env_file" ] || return 0
+    rest=$(grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=" "$env_file" \
+        | grep -v -x -F "$ENV_HEADER" \
+        | awk -v mark="$HOST_MARK" '
+            host && index($0, "CCTG_HOST=") == 1 { host = 0; next }
+            $0 == mark { host = 1; next }
+            { host = 0; print }')
+    if printf '%s\n' "$rest" | grep -q '[^[:space:]]'; then
+        printf '%s\n' "$rest" | put "$env_file" 600
+        say "kept the lines of $env_file this script did not write"
+    else
+        remove "$env_file"
+    fi
+}
+
 uninstall_all() {
     for w in "$wrapper" "$wrapper.cmd"; do
         if [ -e "$w" ]; then
             if grep -q "$MARK" "$w" 2>/dev/null; then remove "$w"; else say "left $w (not written by this script)"; fi
         fi
+        # What was there before the first install comes back.
+        if [ ! -e "$w" ] && [ -e "$w.before-cctg-install" ]; then
+            mv -f "$w.before-cctg-install" "$w"
+            say "put back $w (it was $w.before-cctg-install)"
+        fi
     done
     remove "$conf_dir/mcp.json"
     remove "$conf_dir/settings.json"
-    remove "$env_file"
+    strip_device_env
     remove "$exe"
     # cctg-workers: the agent's links to the binary (TASK-040).
     for f in "$bin_dir"/cctg.old.exe "$bin_dir"/cctg.old.exe.* "$bin_dir/cctg.install$ext" "$bin_dir"/cctg-workers/*; do
         remove "$f"
     done
-    for d in "$conf_dir" "$bin_dir/cctg-workers" "$bin_dir" "$root" "$wrap_dir"; do
+    # ~/.local/bin stays: Claude Code's installer uses it too.
+    for d in "$conf_dir" "$bin_dir/cctg-workers" "$bin_dir" "$root"; do
         rmdir "$d" 2>/dev/null || true
     done
     if [ -d "$root" ]; then
@@ -628,10 +677,22 @@ setup_hub() {
     hub_dir=${hub_dir:-$home/cctg-hub}
     [ "$os" != windows ] || hub_dir=$(cygpath -u "$hub_dir")
     hub_env=$hub_dir/hub.env
+    # How devices reach this server, for the client line; kept in .env.
+    public_host=${public_host:-$(value_of "$hub_dir/.env" CCTG_PUBLIC_HOST)}
+    if [ -z "$public_host" ]; then
+        interactive || die "no address for the devices: use --public-host HOST (this server's name or IP)"
+        ask "How do devices reach this server (host name or IP): "
+        public_host=$answer
+    fi
+    case $public_host in
+        ''|*[!A-Za-z0-9.:_\[\]-]*) die "--public-host takes this server's host name or IP" ;;
+    esac
     mkdir -p "$hub_dir/tls"
 
-    # The compose files of the same tag as this script. One changed by hand
-    # (other ports, docs/remote-hub.md) stays; the new one goes next to it.
+    # The compose files of the same tag as this script. One the user
+    # changed (other ports, docs/remote-hub.md) stays and the new one goes
+    # next to it; one as this script last wrote it (its hash is kept) is
+    # updated.
     src=$(source_dir)
     raw=${CCTG_INSTALL_RAW_URL:-https://raw.githubusercontent.com/$REPO/$RELEASE}
     for f in compose.yml compose.host.yml; do
@@ -640,8 +701,10 @@ setup_hub() {
         else
             fetch "${raw%/}/deploy/$f" "$tmp/$f"
         fi
-        if [ ! -f "$hub_dir/$f" ] || cmp -s "$tmp/$f" "$hub_dir/$f"; then
+        if [ ! -f "$hub_dir/$f" ] || cmp -s "$tmp/$f" "$hub_dir/$f" \
+            || [ "$(sha256 "$hub_dir/$f")" = "$(cat "$hub_dir/$f.installed-sha256" 2>/dev/null)" ]; then
             put "$hub_dir/$f" 644 <"$tmp/$f"
+            sha256 "$hub_dir/$f" | put "$hub_dir/$f.installed-sha256" 644
         else
             put "$hub_dir/$f.new" 644 <"$tmp/$f"
             say "kept your changed $f; this release's one is $f.new (compare, then move it over)"
@@ -677,7 +740,11 @@ setup_hub() {
     [ -n "$token$(line_of "$hub_env" CCTG_BOT_TOKEN)" ] || die "the bot token is needed"
     [ -n "$chat_id$(line_of "$hub_env" CCTG_CHAT_ID)" ] || die "--chat-id is needed"
     [ -n "$users$(line_of "$hub_env" CCTG_ALLOWED_USER_IDS)" ] || die "--users is needed"
-    ask_kept HTTPS_PROXY "HTTPS proxy for Telegram (empty: none): " "$proxy"
+    answer=$proxy
+    if [ -z "$answer" ] && [ -z "$(line_of "$hub_env" HTTPS_PROXY)" ] \
+        && ! grep -q -x -F "$PROXY_NONE" "$hub_env" 2>/dev/null; then
+        ask "HTTPS proxy for Telegram (empty: none): "
+    fi
     proxy=$answer
     case $proxy in
         *[\ \"\'\$\#\`\\]*) die "the proxy URL has a character hub.env cannot carry" ;;
@@ -693,7 +760,8 @@ setup_hub() {
     umask 077
     {
         if [ -f "$hub_env" ]; then
-            grep -v -E "^[[:space:]]*(export[[:space:]]+)?(CCTG_BOT_TOKEN|CCTG_CHAT_ID|CCTG_ALLOWED_USER_IDS|CCTG_HUB_SECRET|HTTPS_PROXY)[[:space:]]*=" "$hub_env" || true
+            grep -v -E "^[[:space:]]*(export[[:space:]]+)?(CCTG_BOT_TOKEN|CCTG_CHAT_ID|CCTG_ALLOWED_USER_IDS|CCTG_HUB_SECRET|HTTPS_PROXY)[[:space:]]*=" "$hub_env" \
+                | grep -v -x -F "$PROXY_NONE" || true
         else
             printf '%s\n' "# cctg hub settings, written by install.sh --hub (docs/remote-hub.md). Never commit."
         fi
@@ -702,6 +770,7 @@ setup_hub() {
         hub_line CCTG_ALLOWED_USER_IDS "$users"
         hub_line CCTG_HUB_SECRET "$new_secret"
         hub_line HTTPS_PROXY "$proxy"
+        [ -n "$proxy$(line_of "$hub_env" HTTPS_PROXY)" ] || printf '%s\n' "$PROXY_NONE"
     } | put "$hub_env" 600
     umask "$old_umask"
     token=
@@ -711,8 +780,16 @@ setup_hub() {
     case $(value_of "$hub_env" HTTPS_PROXY) in
         *://127.*|*://localhost*|*@127.*|*@localhost*) compose_files=compose.yml:compose.host.yml ;;
     esac
-    printf '%s\n' "# written by install.sh --hub: the compose files of this hub" \
-        "COMPOSE_FILE=$compose_files" | put "$hub_dir/.env" 644
+    # The image of this script's release: hub and clients are one version.
+    printf '%s\n' "# written by install.sh --hub: how docker compose runs this hub" \
+        "COMPOSE_FILE=$compose_files" \
+        "CCTG_IMAGE_TAG=${RELEASE#v}" \
+        "CCTG_PUBLIC_HOST=$public_host" | put "$hub_dir/.env" 644
+    agent_port=$(device_port CCTG_AGENT_LISTEN "$AGENT_PORT")
+    hook_port=$(device_port CCTG_HOOK_LISTEN "$HOOK_PORT")
+    if [ -z "$agent_port" ] || [ -z "$hook_port" ]; then
+        die "cannot read the hub's host ports from $hub_dir/compose.yml (\"HOST:CONTAINER\" lines under ports)"
+    fi
 
     if [ ! -f "$hub_dir/tls/cert.pem" ] || [ ! -f "$hub_dir/tls/key.pem" ]; then
         say "making the hub certificate (self-signed, EC P-256, 10 years)"
@@ -740,13 +817,30 @@ setup_hub() {
     (cd "$hub_dir" && docker compose up -d --force-recreate hub </dev/null) || die "docker compose up failed"
     wait_hub
 
-    if [ -z "$public_host" ]; then
-        ask "How do devices reach this server (host name or IP): "
-        public_host=${answer:-<this-server>}
+    if [ "$agent_port:$hook_port" = "$AGENT_PORT:$HOOK_PORT" ]; then
+        where="--hub-host $public_host"
+    else
+        where="--agent-addr $public_host:$agent_port --hook-addr $public_host:$hook_port"
     fi
     say "the hub is up. On each device with Claude Code run (the line carries the hub secret: only your own machines, and clear it from chat history):"
-    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | CCTG_HUB_SECRET=$(squote "$hub_secret") sh -s -- --hub-host $public_host --pin $pin"
+    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | CCTG_HUB_SECRET=$(squote "$hub_secret") sh -s -- $where --pin $pin"
     hub_secret=
+}
+
+# device_port <hub.env key> <default>: the port devices use for one of the
+# hub's listeners. On the host network it is the listen port itself;
+# otherwise the host port compose.yml publishes it on (empty: not found).
+device_port() {
+    p=$(value_of "$hub_env" "$1")
+    p=${p##*:}
+    case $p in
+        ''|*[!0-9]*) p=$2 ;;
+    esac
+    case $compose_files in
+        *compose.host.yml) printf '%s' "$p"; return 0 ;;
+    esac
+    sed -n "s/^[[:space:]]*-[[:space:]]*[\"']\{0,1\}\([^\"':]*:\)\{0,1\}\([0-9][0-9]*\):$p\(\/tcp\)\{0,1\}[\"']\{0,1\}[[:space:]]*\$/\2/p" \
+        "$hub_dir/compose.yml" | head -n 1
 }
 
 # The hub's own start checks (bot token, group, topic rights) end in
@@ -776,6 +870,8 @@ uninstall_hub() {
     remove "$hub_dir/compose.host.yml"
     remove "$hub_dir/compose.yml.new"
     remove "$hub_dir/compose.host.yml.new"
+    remove "$hub_dir/compose.yml.installed-sha256"
+    remove "$hub_dir/compose.host.yml.installed-sha256"
     remove "$hub_dir/.env"
     say "stopped; $hub_dir keeps hub.env (token, secret) and tls/ (key), docker keeps the state volume: delete them by hand if you want"
 }
