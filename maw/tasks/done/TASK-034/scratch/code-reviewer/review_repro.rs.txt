@@ -1,0 +1,120 @@
+//! Code-review repros for TASK-034 decision 12 (temporary, not part of the repo).
+
+use std::path::{Path, PathBuf};
+
+use cctg::reads;
+use cctg::tail;
+use cctg::wire::{SessionAnswer, SessionAsk, TranscriptView};
+
+const NEW: &str = "5e551017-0000-4000-8000-0000000000aa";
+const LINE: &str = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+
+fn temp(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cctg-cr034-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn brief() -> SessionAsk {
+    SessionAsk::Render {
+        view: TranscriptView::Brief,
+        prompts: 3,
+    }
+}
+
+fn write_transcript(folder: &Path) -> String {
+    std::fs::create_dir_all(folder).unwrap();
+    let path = folder.join(format!("{NEW}.jsonl"));
+    std::fs::write(&path, LINE).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The own folder named with another case than the one on disk (the
+/// `c--`/`C--` situation): served, the canonical compare folds case.
+#[cfg(windows)]
+#[test]
+fn own_folder_in_another_case_is_served() {
+    let dir = temp("case");
+    let root = dir.join("projects");
+    let path = write_transcript(&root.join("c--users-a-proj"));
+    let project = root.join("C--Users-a-proj");
+    let got = reads::answer(Some(&project), NEW, &path, brief());
+    assert!(matches!(got[..], [SessionAnswer::Text { .. }]), "{got:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A new session started in a folder reached through a junction: Claude Code
+/// names its project folder after `realpathSync(process.cwd())`, the agent
+/// after the raw cwd; the own folder is derived once, before the transcript
+/// exists, so every read of the session's own transcript is refused.
+#[cfg(windows)]
+#[test]
+fn a_new_session_under_a_junction_is_refused_its_own_transcript() {
+    let dir = temp("junction");
+    let real = dir.join("real").join("proj");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.join("link");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(dir.join("real"))
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    assert!(made, "mklink /J");
+    let raw_cwd = link.join("proj").to_string_lossy().into_owned();
+    let real_cwd = std::fs::canonicalize(&real).unwrap();
+    let real_cwd = real_cwd.to_string_lossy();
+    let real_cwd = real_cwd.trim_start_matches(r"\\?\");
+    let root = dir.join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    // Agent start: nothing written yet.
+    let project = tail::own_project(&root, Some(NEW), Some(&raw_cwd)).unwrap();
+    // Claude Code writes the first record into its (realpath) folder.
+    let path = write_transcript(&root.join(tail::project_folder_name(real_cwd)));
+    assert_ne!(project, root.join(tail::project_folder_name(real_cwd)));
+    let got = reads::answer(Some(&project), NEW, &path, brief());
+    assert_eq!(got, [SessionAnswer::Refused]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A new session whose encoded cwd is longer than 200 characters: Claude Code
+/// cuts it to 200 plus `-<hash>`; the agent's full name never exists.
+#[test]
+fn a_new_session_with_a_long_cwd_is_refused_its_own_transcript() {
+    let dir = temp("long");
+    let root = dir.join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let cwd = format!(r"C:\work\{}", "x".repeat(220));
+    let project = tail::own_project(&root, Some(NEW), Some(&cwd)).unwrap();
+    let full = tail::project_folder_name(&cwd);
+    let claude = format!("{}-abc123", &full[..200]);
+    let path = write_transcript(&root.join(claude));
+    let got = reads::answer(Some(&project), NEW, &path, brief());
+    assert_eq!(got, [SessionAnswer::Refused]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gate canonicalizes the hub's path before checking it: a named pipe
+/// (or a UNC share) the hub names is opened by the agent.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_gate_opens_a_hub_named_pipe_before_checking() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let dir = temp("pipe");
+    let project = dir.join("projects").join("C--w");
+    std::fs::create_dir_all(&project).unwrap();
+    let name = format!("{}{}", r"\\.\pipe\cctg-cr034-", std::process::id());
+    let server = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
+    let pipe = name.clone();
+    let answers = tokio::task::spawn_blocking(move || {
+        reads::answer(Some(&project), NEW, &pipe, SessionAsk::Title { from: 0 })
+    })
+    .await
+    .unwrap();
+    let connected = tokio::time::timeout(std::time::Duration::from_secs(2), server.connect()).await;
+    eprintln!("answers {answers:?}, connect {connected:?}");
+    assert!(matches!(connected, Ok(Ok(()))), "the agent never touched the pipe");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -45,6 +45,17 @@
 //! `SubagentStop`. A nested `claude -p` gets one `⇣ nested` block. A reply to
 //! a subagent block reaches the parent's agent with meta `target_agent`.
 //!
+//! Session files (TASK-034): the hub reads none. The agent of a session
+//! reads them on request (`session_read`, see [`crate::reads`]): the
+//! ai-title for the topic name, the parent transcript's `Agent` calls, a
+//! finished subagent's files, and `/brief`/`/full` for the command worker
+//! ([`commands::TranscriptAsk`]). A read has [`Options::read_wait`] for an
+//! answer (each piece of a text starts the wait again) and fails when its
+//! agent's link closes or the agent leaves for an update. A session with no
+//! agent that reads (ended, headless, nested, an agent too old) keeps its
+//! short-id title, opens a subagent block only on its stop, from the hook
+//! data alone, and `/brief` answers why it cannot show the transcript.
+//!
 //! The live transcript stream (see [`stream`]): the agent of the slot's
 //! current session reads its transcript on request and the actor turns the
 //! events into topic messages (terminal prompts, text before tool calls, one
@@ -104,7 +115,6 @@
 //! a folder, a title, message text, a file name or a caption.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -118,13 +128,14 @@ use transcript::{
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Attachment, Parked, ResumeNote};
+use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
 use super::console;
 use super::fetch::{self, Fetch, Fetched};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::registry::{
     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
-    StatusMessage, TopicJob, TopicView, cut,
+    StatusMessage, TopicJob, cut,
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
 use super::status::{self, Activity, Buttons, Press};
@@ -137,12 +148,15 @@ use crate::channel::is_request_id;
 use crate::files;
 use crate::wire::{
     AgentMsg, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome, HookEvent,
-    HookPost, HubMsg, PermissionPost, PermissionRequest, StreamItem, StreamLine, UpdateOutcome,
+    HookPost, HubMsg, PermissionPost, PermissionRequest, SessionAnswer, SessionAsk, StreamItem,
+    StreamLine, UpdateOutcome,
 };
 
-/// A transcript is scanned line by line for its first ai-title up to this
-/// many bytes (the same cap as `/brief`).
-const TITLE_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// The longest text one session read may bring, as the agent sends at most
+/// ([`crate::reads::MAX_TEXT`]); an agent that sends more is cut off.
+const MAX_READ_TEXT: usize = crate::reads::MAX_TEXT;
+/// A session read the agent has not answered by then has failed.
+pub const READ_WAIT: Duration = Duration::from_secs(20);
 const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
 const SHORT_ID: usize = 8;
 /// Reply and turn-answer chunks and notices waiting for Telegram; beyond this
@@ -151,8 +165,18 @@ pub const MAX_QUEUED_MESSAGES: usize = 256;
 /// Block sends and edits handed to the dispatch task and not answered yet;
 /// the rest wait in the registry.
 pub const MAX_BLOCK_JOBS: usize = 16;
-/// Subagent files read at a time for block texts (each up to 64 MiB).
+/// Subagent block texts asked of agents at a time.
 const MAX_BODY_READS: usize = 2;
+/// A block text whose read was cut by a lost link or a late answer waits
+/// this long for the parent's next agent (a TASK-040 swap), then shows the
+/// hook data alone.
+const BODY_RETRY_WAIT: Duration = Duration::from_secs(60);
+/// While a block text waits for the next agent, the actor looks this often.
+const BODY_RETRY_CHECK: Duration = Duration::from_secs(1);
+/// Title reads of one agent that may fail in a row before its session's
+/// title is no longer asked of it (no transcript to find, a refusing
+/// agent); the next agent of the session is asked again.
+const MAX_TITLE_FAILURES: u32 = 4;
 /// A transcript read the agent has not answered by then is asked again.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// The stream takes no new transcript line while this many messages of any
@@ -240,6 +264,9 @@ pub struct Options {
     /// The hub's own build ([`crate::client`]); `None`: agents are never
     /// outdated.
     pub build: Option<String>,
+    /// A session read the agent has not answered by then has failed
+    /// ([`READ_WAIT`]); each piece of a text starts the wait again.
+    pub read_wait: Duration,
 }
 
 /// The kept file of a slot on its way to an agent.
@@ -293,6 +320,7 @@ impl Default for Options {
             can_pin: true,
             prompt_settle: PROMPT_SETTLE,
             build: None,
+            read_wait: READ_WAIT,
         }
     }
 }
@@ -345,23 +373,6 @@ enum Done {
         slot: SlotId,
         number: u64,
         delivery: Option<Delivery>,
-    },
-    Title {
-        session: String,
-        path: String,
-        title: Option<String>,
-        /// Bytes of `path` scanned so far.
-        scanned: u64,
-    },
-    /// `Agent` calls found in a session's transcript.
-    Index {
-        session: String,
-        scan: Scan,
-    },
-    /// The finished text of a subagent block.
-    Body {
-        agent_id: String,
-        text: String,
     },
     Block {
         job: BlockJob,
@@ -462,6 +473,38 @@ struct Chunk<'a> {
     reset: bool,
 }
 
+/// A `session_read` out to an agent (TASK-034).
+struct Pending {
+    conn: u64,
+    /// No answer by then: the read failed.
+    until: Instant,
+    purpose: Purpose,
+}
+
+/// What a session read is for.
+enum Purpose {
+    /// `/brief` or `/full`; `text` gathers the pieces.
+    Command {
+        ask: TranscriptAsk,
+        session: String,
+        text: String,
+    },
+    /// The ai-title of `session`, asked of agent `conn`.
+    Title {
+        session: String,
+        path: String,
+        conn: u64,
+    },
+    /// The `Agent` calls of `session`'s transcript from `from`.
+    Calls {
+        session: String,
+        path: String,
+        from: u64,
+    },
+    /// A finished subagent's block; `text` gathers the pieces.
+    Body { input: BodyInput, text: String },
+}
+
 /// A job for the dispatch task.
 #[derive(Debug)]
 enum Work {
@@ -538,39 +581,14 @@ fn not_modified(delivery: &Delivery) -> bool {
     telegram_error(delivery, &["topic_not_modified"])
 }
 
-/// First ai-title of the transcript after byte `from`, and the offset up to
-/// which complete lines have been scanned (the next call starts there). The
-/// title is `None` when there is none yet or the file is not on this machine.
-pub fn read_title(path: &str, from: u64) -> (Option<String>, u64) {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return (None, from);
-    };
-    if file.seek(SeekFrom::Start(from)).is_err() {
-        return (None, from);
-    }
-    let (title, scanned) = first_ai_title(file, TITLE_SCAN_BYTES.saturating_sub(from));
-    (title, from + scanned)
-}
-
-/// Streams `jsonl` line by line, at most `limit` bytes, until an ai-title.
-/// Also returns the bytes of complete lines read: a last line without its
-/// newline may still be being written and is scanned again next time.
-fn first_ai_title(jsonl: impl Read, limit: u64) -> (Option<String>, u64) {
-    let mut reader = BufReader::new(jsonl.take(limit));
-    let mut line = Vec::new();
-    let mut scanned = 0;
-    loop {
-        line.clear();
-        let read = match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return (None, scanned),
-            Ok(read) => read as u64,
-        };
-        if line.ends_with(b"\n") {
-            scanned += read;
-        }
-        if let Some(title) = transcript::ai_title(&String::from_utf8_lossy(&line)) {
-            return (Some(title), scanned);
-        }
+/// Why a session read that did not bring its text failed.
+fn failure(answer: &SessionAnswer) -> Unavailable {
+    match answer {
+        SessionAnswer::Missing => Unavailable::Missing,
+        SessionAnswer::Refused => Unavailable::Refused,
+        SessionAnswer::Unreadable => Unavailable::Unreadable,
+        SessionAnswer::TooLarge => Unavailable::TooLarge,
+        _ => Unavailable::Failed,
     }
 }
 
@@ -612,6 +630,8 @@ struct Conn {
     client: Option<Client>,
     /// It takes files ([`crate::wire::Register::files`]).
     files: bool,
+    /// It reads its session's files ([`crate::wire::Register::session_reads`]).
+    session_reads: bool,
     /// It is leaving after an update answer: bound to nothing, never
     /// rebound by its claude pid.
     leaving: bool,
@@ -643,7 +663,6 @@ pub struct Slots {
     saver: watch::Sender<Option<Arc<Vec<u8>>>>,
     /// The save task; awaited on [`Control::Stop`].
     save_task: Option<JoinHandle<()>>,
-    view: watch::Sender<Arc<TopicView>>,
     conns: HashMap<u64, Conn>,
     /// Agents of sessions no SessionStart announced yet: session -> conn.
     pending: HashMap<String, u64>,
@@ -661,6 +680,10 @@ pub struct Slots {
     prompts: Prompts,
     /// `PermissionRequest` hooks, see [`Slots::permission_asks`].
     asks: Option<mpsc::Receiver<PermissionAsk>>,
+    /// `/brief` and `/full`, see [`Slots::transcript_asks`].
+    transcript_asks: Option<mpsc::Receiver<TranscriptAsk>>,
+    /// Session reads out to agents, by read id.
+    reads: HashMap<u64, Pending>,
     /// Hooks waiting for their channel twin, oldest first.
     hook_asks: Vec<HookAsk>,
     /// Hooks waiting for a press, by the key of their prompt.
@@ -678,6 +701,14 @@ pub struct Slots {
     bodies_waiting: BTreeMap<String, BodyInput>,
     /// Agents whose files are being read, at most [`MAX_BODY_READS`].
     bodies_reading: HashSet<String>,
+    /// Block texts whose read was cut by a lost link or a late answer,
+    /// waiting until then for the parent's next agent ([`BODY_RETRY_WAIT`]).
+    bodies_parked: HashMap<String, (BodyInput, Instant)>,
+    /// Agents whose block text was asked again once already.
+    bodies_retried: HashSet<String>,
+    /// Title reads that failed in a row, by session: the agent asked, how
+    /// many ([`MAX_TITLE_FAILURES`]).
+    title_failures: HashMap<String, (u64, u32)>,
     /// Block jobs handed out and not answered, at most [`MAX_BLOCK_JOBS`].
     block_jobs: usize,
     /// Live transcript streams by session.
@@ -716,14 +747,13 @@ pub struct Slots {
 }
 
 impl Slots {
-    /// Starts the save and dispatch tasks. Returns the actor and the view
-    /// for `/brief`.
+    /// Starts the save and dispatch tasks.
     pub fn new(
         mut registry: Registry,
         store: RegistryStore,
         outbox: Outbox,
         options: Options,
-    ) -> (Self, watch::Receiver<Arc<TopicView>>) {
+    ) -> Self {
         // Blocks left running by sessions that ended meanwhile end now; a
         // result that still comes replaces the mark.
         let ended: Vec<String> = registry
@@ -735,17 +765,15 @@ impl Slots {
         registry.lose_blocks(&ended);
         let (saver, saves) = watch::channel(None);
         let save_task = tokio::spawn(save_loop(store, saves));
-        let (view, view_rx) = watch::channel(Arc::new(registry.topic_view()));
         let (done_tx, done_rx) = mpsc::unbounded_channel();
         let (dispatch, work) = mpsc::unbounded_channel();
         tokio::spawn(dispatch_loop(outbox, work, done_tx.clone()));
         let now = Instant::now();
-        let slots = Self {
+        Self {
             registry,
             dispatch,
             saver,
             save_task: Some(save_task),
-            view,
             conns: HashMap::new(),
             pending: HashMap::new(),
             reading: HashSet::new(),
@@ -757,6 +785,8 @@ impl Slots {
             notices: HashMap::new(),
             prompts: Prompts::default(),
             asks: None,
+            transcript_asks: None,
+            reads: HashMap::new(),
             hook_asks: Vec::new(),
             hook_waiters: HashMap::new(),
             relayed: VecDeque::new(),
@@ -766,6 +796,9 @@ impl Slots {
             reports: Reports::default(),
             bodies_waiting: BTreeMap::new(),
             bodies_reading: HashSet::new(),
+            bodies_parked: HashMap::new(),
+            bodies_retried: HashSet::new(),
+            title_failures: HashMap::new(),
             block_jobs: 0,
             streams: HashMap::new(),
             reaction_warned: false,
@@ -787,8 +820,7 @@ impl Slots {
             done_tx,
             done_rx: Some(done_rx),
             options,
-        };
-        (slots, view_rx)
+        }
     }
 
     /// Starts the task that downloads the files of kept messages with
@@ -820,6 +852,15 @@ impl Slots {
         asks
     }
 
+    /// The channel for `/brief` and `/full` ([`commands::Asks`]); call before
+    /// [`Self::run`]. Every ask is answered once: with the text its
+    /// session's agent rendered, or with a notice.
+    pub fn transcript_asks(&mut self) -> mpsc::Sender<TranscriptAsk> {
+        let (asks, asks_rx) = mpsc::channel(16);
+        self.transcript_asks = Some(asks_rx);
+        asks
+    }
+
     /// Runs until [`Control::Stop`]; a closed input channel is just no
     /// longer polled. On stop, hook posts and agent frames already queued are
     /// handled and the last registry snapshot is on disk before it returns;
@@ -832,6 +873,7 @@ impl Slots {
     ) {
         let mut done = self.done_rx.take().expect("run once");
         let mut asks = self.asks.take();
+        let mut transcript_asks = self.transcript_asks.take();
         self.pump();
         loop {
             let deadline = self.next_deadline();
@@ -841,10 +883,17 @@ impl Slots {
                     None => std::future::pending().await,
                 }
             };
+            let transcript_ask = async {
+                match transcript_asks.as_mut() {
+                    Some(asks) => asks.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 Some(event) = agents.recv() => self.on_agent(event),
                 Some(post) = hooks.recv() => self.on_hook(&post),
                 Some(ask) = ask => self.on_permission_ask(ask),
+                Some(ask) = transcript_ask => self.on_transcript_ask(ask),
                 Some(control) = control.recv() => {
                     if control == Control::Stop {
                         break;
@@ -916,6 +965,16 @@ impl Slots {
             .flatten()
             .filter(|at| *at > now);
         let deadline = status.fold(deadline, Instant::min);
+        let deadline = self
+            .reads
+            .values()
+            .map(|pending| pending.until)
+            .fold(deadline, Instant::min);
+        let deadline = if self.bodies_parked.is_empty() {
+            deadline
+        } else {
+            deadline.min(now + BODY_RETRY_CHECK)
+        };
         self.streams
             .values()
             .flat_map(|live| {
@@ -977,6 +1036,7 @@ impl Slots {
                         commands: register.console_commands,
                         client: register.client,
                         files: register.files,
+                        session_reads: register.session_reads,
                         leaving: false,
                     },
                 );
@@ -1038,10 +1098,14 @@ impl Slots {
                         caption,
                     } => self.on_file_offer(conn, &session, transfer_id, name, size, caption),
                     AgentMsg::FileChunk(chunk) => self.on_file_chunk(conn, &session, &chunk),
+                    AgentMsg::SessionAnswer { read_id, answer } => {
+                        self.on_session_answer(conn, read_id, answer);
+                    }
                     _ => debug!(conn, "agent message not routed"),
                 }
             }
             AgentEvent::Disconnected { conn } => {
+                self.fail_reads_of(conn);
                 if let Some(upload) = self.uploads.remove(&conn) {
                     self.file_bytes = self.file_bytes.saturating_sub(upload.assembly.size());
                     info!(conn, "agent link closed during a file; the file is dropped");
@@ -1203,6 +1267,7 @@ impl Slots {
         let session = post.session_id.as_str();
         if matches!(post.event, HookEvent::SessionEnd { .. }) {
             self.scanned.remove(session);
+            self.title_failures.remove(session);
         }
         for gone in &followup.reaped {
             info!(
@@ -1210,6 +1275,7 @@ impl Slots {
                 "session ended: its claude process is gone"
             );
             self.scanned.remove(gone);
+            self.title_failures.remove(gone);
         }
         if self.registry.sessions.contains_key(session)
             && let Some(conn) = self.pending.remove(session)
@@ -1377,6 +1443,8 @@ impl Slots {
 
     /// Reads the transcripts of sessions with a candidate due, from where
     /// the last read stopped, one read per session at a time.
+    /// Without an agent that reads the session's files, a candidate whose
+    /// stop came gets its block from the hook data alone.
     fn check_candidates(&mut self) {
         for session in self.candidates.due_sessions(Instant::now()) {
             if self.indexing.contains(&session) {
@@ -1388,6 +1456,11 @@ impl Slots {
                 .get(&session)
                 .map(|entry| entry.transcript_path.clone())
                 .unwrap_or_default();
+            let Some(conn) = self.reader(&session) else {
+                self.open_from_stops(&session);
+                self.match_candidates(&session);
+                continue;
+            };
             if path.is_empty() {
                 self.match_candidates(&session);
                 continue;
@@ -1396,15 +1469,69 @@ impl Slots {
                 .indexes
                 .get(&session)
                 .map_or(0, |index| index.resume_at(&path));
-            self.indexing.insert(session.clone());
-            let done = self.done_tx.clone();
-            tokio::spawn(async move {
-                let read_path = path.clone();
-                let scan = tokio::task::spawn_blocking(move || subagents::scan(&read_path, from))
-                    .await
-                    .unwrap_or_else(|_| Scan::nothing(path, from));
-                let _ = done.send(Done::Index { session, scan });
-            });
+            self.ask_calls(conn, &session, path, from);
+        }
+    }
+
+    /// Asks agent `conn` for the `Agent` calls of `session` from `from`.
+    fn ask_calls(&mut self, conn: u64, session: &str, path: String, from: u64) {
+        self.indexing.insert(session.to_owned());
+        let ask = SessionAsk::Calls { from };
+        let purpose = Purpose::Calls {
+            session: session.to_owned(),
+            path: path.clone(),
+            from,
+        };
+        self.ask_read(conn, session, ask, purpose);
+    }
+
+    /// `Agent` calls found in a session's transcript: they are indexed and
+    /// the session's candidates looked up.
+    fn on_scan(&mut self, session: &str, scan: Scan) {
+        self.indexing.remove(session);
+        self.indexes
+            .entry(session.to_owned())
+            .or_default()
+            .merge(scan);
+        self.match_candidates(session);
+        // Forget what no candidate and no running block needs.
+        if self.candidates.of_session(session).is_empty()
+            && !self.registry.is_live_top_level(session)
+        {
+            self.indexes.remove(session);
+        }
+    }
+
+    /// Opens the block of each candidate of `session` whose stop came, from
+    /// the hooks alone: no agent reads the parent transcript to tell a real
+    /// subagent (the hook kept only stops that left subagent files).
+    fn open_from_stops(&mut self, session: &str) {
+        for (agent_id, candidate) in self.candidates.take_stopped(session) {
+            let Some(stop) = candidate.stop else {
+                continue;
+            };
+            let header = subagents::header(&agent_id, Some(&stop.agent_type), None);
+            if !self
+                .registry
+                .confirm_subagent(&agent_id, session, header.clone())
+            {
+                continue;
+            }
+            info!(
+                agent = short(&agent_id),
+                session = short(session),
+                "subagent block opened from its stop"
+            );
+            let input = BodyInput {
+                agent_id: agent_id.clone(),
+                agent_type: Some(stop.agent_type),
+                report: self.reports.take(&agent_id),
+                last: stop.last,
+                header: Some(header),
+                ..BodyInput::default()
+            };
+            let text = subagents::body_text(&input, None, None);
+            self.finish_block(BlockKey::Agent(agent_id), text);
         }
     }
 
@@ -1494,6 +1621,8 @@ impl Slots {
             last: stop.last,
             header: Some(entry.block.header.clone()).filter(|header| !header.is_empty()),
         };
+        self.bodies_parked.remove(agent_id);
+        self.bodies_retried.remove(agent_id);
         self.bodies_waiting.insert(agent_id.to_owned(), input);
         self.start_body_reads();
     }
@@ -1501,6 +1630,8 @@ impl Slots {
     /// Starts waiting reads, at most [`MAX_BODY_READS`] at a time and one per
     /// agent. A read that ends while a newer stop of its agent waits is
     /// stale and dropped ([`Done::Body`]), so the newest stop always wins.
+    /// A handed-back report, or a parent without an agent that reads,
+    /// makes the text from the hook data alone, at once.
     fn start_body_reads(&mut self) {
         while self.bodies_reading.len() < MAX_BODY_READS {
             let Some(agent_id) = self
@@ -1514,15 +1645,45 @@ impl Slots {
             let Some(input) = self.bodies_waiting.remove(&agent_id) else {
                 return;
             };
+            let parent = self
+                .registry
+                .subagents
+                .get(&agent_id)
+                .map(|entry| entry.parent_session.clone());
+            let reader = parent
+                .as_deref()
+                .and_then(|parent| self.reader(parent))
+                .filter(|_| input.report.is_none() && !input.agent_path.is_empty());
+            let (Some(conn), Some(parent)) = (reader, parent) else {
+                let text = subagents::body_text(&input, None, None);
+                self.finish_block(BlockKey::Agent(agent_id), text);
+                continue;
+            };
             self.bodies_reading.insert(agent_id.clone());
-            let done = self.done_tx.clone();
-            tokio::spawn(async move {
-                let text = tokio::task::spawn_blocking(move || subagents::read_body(&input))
-                    .await
-                    .unwrap_or_default();
-                let _ = done.send(Done::Body { agent_id, text });
-            });
+            let ask = SessionAsk::Subagent {
+                agent_id: agent_id.clone(),
+                agent_type: input.agent_type.clone(),
+                description: input.description.clone(),
+                header: input.header.clone(),
+                last: input.last.clone(),
+            };
+            let purpose = Purpose::Body {
+                input,
+                text: String::new(),
+            };
+            self.ask_read(conn, &parent, ask, purpose);
         }
+    }
+
+    /// A subagent's block text came, from its agent or made here: shown
+    /// unless a newer stop of the same agent waits.
+    fn body_done(&mut self, agent_id: String, text: String) {
+        self.bodies_reading.remove(&agent_id);
+        self.bodies_retried.remove(&agent_id);
+        if !text.is_empty() && !self.bodies_waiting.contains_key(&agent_id) {
+            self.finish_block(BlockKey::Agent(agent_id), text);
+        }
+        self.start_body_reads();
     }
 
     /// Shows the final `text` in the block; a text too long for one
@@ -1554,7 +1715,16 @@ impl Slots {
         self.registry.show_block(&key, shown, false);
     }
 
+    /// Asks the session's agent for the first ai-title past the last scan.
+    /// Without an agent that reads, the title stays the short id.
     fn read_title(&mut self, session: String, path: String) {
+        let Some(conn) = self.reader(&session) else {
+            return;
+        };
+        let failed = self.title_failures.get(&session);
+        if failed.is_some_and(|&(asked, count)| asked == conn && count >= MAX_TITLE_FAILURES) {
+            return;
+        }
         if !self.reading.insert(session.clone()) {
             return;
         }
@@ -1563,20 +1733,318 @@ impl Slots {
             Some((scanned_path, offset)) if *scanned_path == path => *offset,
             _ => 0,
         };
-        let done = self.done_tx.clone();
-        tokio::spawn(async move {
-            let read_path = path.clone();
-            let (title, scanned) =
-                tokio::task::spawn_blocking(move || read_title(&read_path, from))
-                    .await
-                    .unwrap_or((None, from));
-            let _ = done.send(Done::Title {
+        let ask = SessionAsk::Title { from };
+        let purpose = Purpose::Title {
+            session: session.clone(),
+            path,
+            conn,
+        };
+        self.ask_read(conn, &session, ask, purpose);
+    }
+
+    fn on_title(&mut self, session: String, path: String, title: Option<String>, scanned: u64) {
+        self.reading.remove(&session);
+        self.title_failures.remove(&session);
+        match title {
+            Some(title) => {
+                self.scanned.remove(&session);
+                self.registry.set_title(&session, &title);
+            }
+            // A session that ended during the scan is not scanned again.
+            None if self
+                .registry
+                .sessions
+                .get(&session)
+                .is_some_and(|entry| !entry.ended) =>
+            {
+                self.scanned.insert(session, (path, scanned));
+            }
+            None => {}
+        }
+    }
+
+    /// The agent that reads `session`'s files: bound to it, still open, not
+    /// leaving, and it announced `session_reads`.
+    fn reader(&self, session: &str) -> Option<u64> {
+        let conn = self.registry.sessions.get(session)?.agent?;
+        let bound = self.conns.get(&conn)?;
+        (bound.session_reads && !bound.leaving && bound.session == session).then_some(conn)
+    }
+
+    /// Sends `ask` for the files of `session` to agent `conn`, which finds
+    /// them in its own project folder. A link queue that is full or gone
+    /// fails the read at once ([`Self::read_failed`]).
+    fn ask_read(&mut self, conn: u64, session: &str, ask: SessionAsk, purpose: Purpose) {
+        // Random, not counted: an agent sends answers it could not write
+        // after its next registration, maybe to a restarted hub.
+        let read_id = crate::wire::random_u64();
+        let read = HubMsg::SessionRead {
+            read_id,
+            session_id: session.to_owned(),
+            ask,
+        };
+        let sent = self
+            .conns
+            .get(&conn)
+            .is_some_and(|bound| bound.to_agent.try_send(read).is_ok());
+        if !sent {
+            self.read_failed(purpose, Unavailable::LinkLost);
+            return;
+        }
+        let until = Instant::now() + self.options.read_wait;
+        self.reads.insert(
+            read_id,
+            Pending {
+                conn,
+                until,
+                purpose,
+            },
+        );
+    }
+
+    /// One answer to session read `read_id`. Only the agent asked counts.
+    fn on_session_answer(&mut self, conn: u64, read_id: u64, answer: SessionAnswer) {
+        let Some(pending) = self.reads.get_mut(&read_id).filter(|p| p.conn == conn) else {
+            debug!(conn, "session answer nobody waits for");
+            return;
+        };
+        if let (
+            Purpose::Command { text, .. } | Purpose::Body { text, .. },
+            SessionAnswer::Text { text: piece, more },
+        ) = (&mut pending.purpose, &answer)
+        {
+            if text.len() + piece.len() > MAX_READ_TEXT {
+                if let Some(pending) = self.reads.remove(&read_id) {
+                    warn!(conn, "session read longer than allowed; dropped");
+                    self.read_failed(pending.purpose, Unavailable::TooLarge);
+                }
+                return;
+            }
+            text.push_str(piece);
+            if *more {
+                pending.until = Instant::now() + self.options.read_wait;
+                return;
+            }
+        }
+        let Some(pending) = self.reads.remove(&read_id) else {
+            return;
+        };
+        match (pending.purpose, answer) {
+            (Purpose::Command { ask, session, text }, SessionAnswer::Text { .. }) => {
+                let _ = ask
+                    .answer
+                    .send(commands::transcript_reply(&ask.command, &session, text));
+            }
+            (Purpose::Body { input, text }, SessionAnswer::Text { .. }) => {
+                self.body_done(input.agent_id, text);
+            }
+            (Purpose::Title { session, path, .. }, SessionAnswer::Title { title, scanned }) => {
+                self.on_title(session, path, title, scanned);
+            }
+            (
+                Purpose::Calls { session, path, .. },
+                SessionAnswer::Calls {
+                    offset,
+                    calls,
+                    links,
+                    more,
+                },
+            ) => {
+                let scan = Scan {
+                    path: path.clone(),
+                    offset,
+                    calls: calls
+                        .into_iter()
+                        .map(|call| {
+                            let found = AgentCall {
+                                subagent_type: call.subagent_type,
+                                description: call.description,
+                            };
+                            (call.id, found)
+                        })
+                        .collect(),
+                    links: links
+                        .into_iter()
+                        .map(|link| (link.agent_id, link.tool_use_id))
+                        .collect(),
+                };
+                match self.reader(&session).filter(|_| more) {
+                    // Lines past the batch: indexed so far, read on at once.
+                    Some(conn) => {
+                        self.indexes.entry(session.clone()).or_default().merge(scan);
+                        self.ask_calls(conn, &session, path, offset);
+                    }
+                    None => self.on_scan(&session, scan),
+                }
+            }
+            (purpose, answer) => self.read_failed(purpose, failure(&answer)),
+        }
+    }
+
+    /// A session read that brought nothing: the command gets a notice, a
+    /// title waits for its next turn (not after [`MAX_TITLE_FAILURES`] in a
+    /// row of one agent). An `Agent` call scan the agent cannot give opens
+    /// the blocks of stopped subagents from the hooks, as without an agent
+    /// that reads; a lost link or a late answer is only a miss. A block text
+    /// cut by a lost link or a late answer waits once for the parent's next
+    /// agent ([`Self::retry_bodies`]); else it comes from the hook data alone.
+    fn read_failed(&mut self, purpose: Purpose, why: Unavailable) {
+        let passing = matches!(why, Unavailable::LinkLost | Unavailable::NoAnswer);
+        match purpose {
+            Purpose::Command { ask, session, .. } => {
+                info!(session = short(&session), ?why, "transcript read failed");
+                let _ = ask.answer.send(commands::unavailable(why, &session));
+            }
+            Purpose::Title { session, conn, .. } => {
+                self.reading.remove(&session);
+                let failed = self.title_failures.entry(session).or_insert((conn, 0));
+                if failed.0 != conn {
+                    *failed = (conn, 0);
+                }
+                failed.1 += 1;
+            }
+            Purpose::Calls {
                 session,
                 path,
-                title,
-                scanned,
-            });
-        });
+                from,
+            } => {
+                if !passing {
+                    self.open_from_stops(&session);
+                }
+                self.on_scan(&session, Scan::nothing(path, from));
+            }
+            Purpose::Body { input, .. } => {
+                debug!(
+                    agent = short(&input.agent_id),
+                    ?why,
+                    "subagent files not read"
+                );
+                let agent_id = input.agent_id.clone();
+                if passing
+                    && !self.bodies_waiting.contains_key(&agent_id)
+                    && self.bodies_retried.insert(agent_id.clone())
+                {
+                    self.bodies_reading.remove(&agent_id);
+                    let until = Instant::now() + BODY_RETRY_WAIT;
+                    self.bodies_parked.insert(agent_id, (input, until));
+                    self.start_body_reads();
+                    return;
+                }
+                let text = subagents::body_text(&input, None, None);
+                self.body_done(agent_id, text);
+            }
+        }
+    }
+
+    /// Block texts parked by [`Self::read_failed`] go to the parent's agent
+    /// that reads now (the next one after a TASK-040 swap); once the parent
+    /// ended or [`BODY_RETRY_WAIT`] passed, they come from the hook data.
+    fn retry_bodies(&mut self) {
+        if self.bodies_parked.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let agents: Vec<String> = self.bodies_parked.keys().cloned().collect();
+        for agent_id in agents {
+            let parent = self
+                .registry
+                .subagents
+                .get(&agent_id)
+                .map(|entry| entry.parent_session.clone());
+            let ready = parent
+                .as_deref()
+                .is_some_and(|parent| self.reader(parent).is_some());
+            let gone = parent
+                .as_deref()
+                .is_none_or(|parent| !self.registry.is_live_top_level(parent));
+            let late = self
+                .bodies_parked
+                .get(&agent_id)
+                .is_some_and(|(_, until)| *until <= now);
+            if !(ready || gone || late) {
+                continue;
+            }
+            let Some((input, _)) = self.bodies_parked.remove(&agent_id) else {
+                continue;
+            };
+            if ready {
+                self.bodies_waiting.entry(agent_id).or_insert(input);
+            } else {
+                let text = subagents::body_text(&input, None, None);
+                self.body_done(agent_id, text);
+            }
+        }
+        self.start_body_reads();
+    }
+
+    /// The reads out to agent `conn` fail: its link closed, or it leaves.
+    fn fail_reads_of(&mut self, conn: u64) {
+        let ids: Vec<u64> = self
+            .reads
+            .iter()
+            .filter(|(_, pending)| pending.conn == conn)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(pending) = self.reads.remove(&id) {
+                self.read_failed(pending.purpose, Unavailable::LinkLost);
+            }
+        }
+    }
+
+    /// `/brief` or `/full`: the session's agent renders it, or the ask gets
+    /// the notice why it cannot.
+    fn on_transcript_ask(&mut self, ask: TranscriptAsk) {
+        let prefix = ask.command.session_prefix.as_deref();
+        let session = match commands::resolve(&self.registry, ask.thread_id, prefix) {
+            Ok(session) => session,
+            Err(notice) => {
+                let _ = ask.answer.send(Prepared::Notice(notice));
+                return;
+            }
+        };
+        let conn = match self.transcript_reader(&session) {
+            Ok(conn) => conn,
+            Err(why) => {
+                info!(session = short(&session), ?why, "transcript not available");
+                let _ = ask.answer.send(commands::unavailable(why, &session));
+                return;
+            }
+        };
+        let read = SessionAsk::Render {
+            view: ask.command.view.wire(),
+            prompts: u32::try_from(ask.command.prompts).unwrap_or(u32::MAX),
+        };
+        let purpose = Purpose::Command {
+            ask,
+            session: session.clone(),
+            text: String::new(),
+        };
+        self.ask_read(conn, &session, read, purpose);
+    }
+
+    /// The agent that renders `/brief` of `session`, or why there is none.
+    fn transcript_reader(&self, session: &str) -> Result<u64, Unavailable> {
+        let entry = self
+            .registry
+            .sessions
+            .get(session)
+            .ok_or(Unavailable::NoAgent)?;
+        if matches!(entry.kind, SessionKind::Nested { .. }) {
+            return Err(Unavailable::Nested);
+        }
+        if entry.ended {
+            return Err(Unavailable::Ended);
+        }
+        let bound = entry.agent.and_then(|conn| self.conns.get(&conn));
+        if !bound.is_some_and(|bound| !bound.leaving && bound.session == session) {
+            return Err(Unavailable::NoAgent);
+        }
+        let conn = self.reader(session).ok_or(Unavailable::OldAgent)?;
+        if entry.transcript_path.is_empty() {
+            return Err(Unavailable::NoTranscript);
+        }
+        Ok(conn)
     }
 
     fn on_control(&mut self, control: Control) {
@@ -3771,6 +4239,8 @@ impl Slots {
                 });
             }
             self.registry.agent_disconnected(session, conn);
+            // A leaving agent answers no read any more.
+            self.fail_reads_of(conn);
             return;
         }
         if asked {
@@ -4455,6 +4925,17 @@ impl Slots {
         let now = Instant::now();
         self.key_asks.retain(|_, ask| ask.until > now);
         self.command_asks.retain(|_, ask| ask.until > now);
+        let late: Vec<u64> = self
+            .reads
+            .iter()
+            .filter(|(_, pending)| pending.until <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            if let Some(pending) = self.reads.remove(&id) {
+                self.read_failed(pending.purpose, Unavailable::NoAnswer);
+            }
+        }
         if now >= self.next_retry {
             self.registry.retry_failed();
             self.prompts.retry_failed_edits();
@@ -4462,6 +4943,7 @@ impl Slots {
             self.next_retry = now + self.options.retry_every;
         }
         self.check_candidates();
+        self.retry_bodies();
     }
 
     fn ordinal(&self, slot: SlotId) -> u32 {
@@ -4515,49 +4997,6 @@ impl Slots {
                 if let Some(Err(error)) = delivery {
                     debug!(%error, "button answer or expired prompt edit failed");
                 }
-            }
-            Done::Title {
-                session,
-                path,
-                title,
-                scanned,
-            } => {
-                self.reading.remove(&session);
-                match title {
-                    Some(title) => {
-                        self.scanned.remove(&session);
-                        self.registry.set_title(&session, &title);
-                    }
-                    // A session that ended during the scan is not scanned again.
-                    None if self
-                        .registry
-                        .sessions
-                        .get(&session)
-                        .is_some_and(|entry| !entry.ended) =>
-                    {
-                        self.scanned.insert(session, (path, scanned));
-                    }
-                    None => {}
-                }
-            }
-            Done::Index { session, scan } => {
-                self.indexing.remove(&session);
-                self.indexes.entry(session.clone()).or_default().merge(scan);
-                self.match_candidates(&session);
-                // Forget what no candidate and no running block needs.
-                if self.candidates.of_session(&session).is_empty()
-                    && !self.registry.is_live_top_level(&session)
-                {
-                    self.indexes.remove(&session);
-                }
-            }
-            Done::Body { agent_id, text } => {
-                self.bodies_reading.remove(&agent_id);
-                // A newer stop of this agent waits: this text is stale.
-                if !text.is_empty() && !self.bodies_waiting.contains_key(&agent_id) {
-                    self.finish_block(BlockKey::Agent(agent_id), text);
-                }
-                self.start_body_reads();
             }
             Done::Resume {
                 slot,
@@ -4773,7 +5212,7 @@ impl Slots {
 
     /// Hands kept messages to sessions that can take them now, offers Resume
     /// buttons, hands pending topic work and prompts to the dispatch task,
-    /// publishes the view and the snapshot to save.
+    /// publishes the snapshot to save.
     fn pump(&mut self) {
         self.check_hook_asks();
         self.flush_all();
@@ -4832,14 +5271,6 @@ impl Slots {
         self.warn_outdated();
         self.pump_updates();
         self.pump_status();
-        let view = self.registry.topic_view();
-        self.view.send_if_modified(|current| {
-            let changed = **current != view;
-            if changed {
-                *current = Arc::new(view);
-            }
-            changed
-        });
         if self.registry.dirty {
             self.registry.dirty = false;
             self.saver
@@ -5149,7 +5580,6 @@ mod tests {
         agents: mpsc::Sender<AgentEvent>,
         hooks: mpsc::Sender<HookPost>,
         control: mpsc::UnboundedSender<Control>,
-        view: watch::Receiver<Arc<TopicView>>,
         dir: TempDir,
         _to_agent: Vec<mpsc::Receiver<HubMsg>>,
         asks: mpsc::Sender<PermissionAsk>,
@@ -5173,7 +5603,7 @@ mod tests {
         let registry = store.load().unwrap();
         let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
         tokio::spawn(scheduler.run());
-        let (mut slots, view) = Slots::new(registry, store, outbox, options);
+        let mut slots = Slots::new(registry, store, outbox, options);
         let asks = slots.permission_asks();
         let (agents, agents_rx) = mpsc::channel(16);
         let (hooks, hooks_rx) = mpsc::channel(16);
@@ -5184,7 +5614,6 @@ mod tests {
             agents,
             hooks,
             control,
-            view,
             dir,
             _to_agent: Vec::new(),
             asks,
@@ -5247,6 +5676,7 @@ mod tests {
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -6335,7 +6765,7 @@ again"
         };
         let (scheduler, outbox) = Scheduler::new(fake.clone(), fast);
         tokio::spawn(scheduler.run());
-        let slots = Slots::new(Registry::default(), store, outbox, options).0;
+        let slots = Slots::new(Registry::default(), store, outbox, options);
         (fake, slots)
     }
 
@@ -6473,6 +6903,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -7245,7 +7676,7 @@ again"
         });
         let (scheduler, outbox) = Scheduler::new(stalled.clone(), BucketConfig::default());
         tokio::spawn(scheduler.run());
-        let slots = Slots::new(Registry::default(), store, outbox, options).0;
+        let slots = Slots::new(Registry::default(), store, outbox, options);
         (stalled, slots)
     }
 
@@ -7264,6 +7695,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -7353,6 +7785,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -8119,7 +8552,7 @@ again"
             if name == "[box] Project · bbbbbbbb")
         );
 
-        // Saved to disk and routed for /brief.
+        // Saved to disk.
         let store = RegistryStore::open(rig.dir.path()).unwrap();
         let saved_b = async {
             loop {
@@ -8139,10 +8572,6 @@ again"
         assert_eq!(saved.slots.len(), 1);
         assert_eq!(saved.slots[0].current_session.as_deref(), Some(B));
         assert_eq!(saved.slots[0].topic_id, Some(100));
-        assert_eq!(
-            rig.view.borrow().get(&100).map(|(s, _)| s.as_str()),
-            Some(B)
-        );
     }
 
     #[tokio::test]
@@ -8328,6 +8757,171 @@ again"
         )
     }
 
+    /// Where the tests' agents find session files: `<dir>/projects`.
+    fn projects(dir: &TempDir) -> std::path::PathBuf {
+        dir.path().join("projects")
+    }
+
+    /// The tests' agents' own project folder: `<dir>/projects/C--w`.
+    fn own_project(dir: &TempDir) -> std::path::PathBuf {
+        projects(dir).join("C--w")
+    }
+
+    /// `<dir>/projects/C--w/<session>.jsonl` holding `jsonl`.
+    fn parent_file(dir: &TempDir, session: &str, jsonl: &str) -> std::path::PathBuf {
+        let project = projects(dir).join("C--w");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{session}.jsonl"));
+        std::fs::write(&path, jsonl).unwrap();
+        path
+    }
+
+    /// `<dir>/projects/C--w/<session>/subagents/agent-<agent>.jsonl`,
+    /// written when `jsonl` is given, its `.meta.json` when `meta` is.
+    fn agent_file(
+        dir: &TempDir,
+        session: &str,
+        agent: &str,
+        jsonl: Option<&str>,
+        meta: Option<&str>,
+    ) -> std::path::PathBuf {
+        let subagents = projects(dir).join("C--w").join(session).join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        if let Some(meta) = meta {
+            std::fs::write(subagents.join(format!("agent-{agent}.meta.json")), meta).unwrap();
+        }
+        let path = subagents.join(format!("agent-{agent}.jsonl"));
+        if let Some(jsonl) = jsonl {
+            std::fs::write(&path, jsonl).unwrap();
+        }
+        path
+    }
+
+    fn reads_register(session: &str, claude_pid: Option<u32>) -> Register {
+        Register {
+            session_id: session.into(),
+            host: "box".into(),
+            cwd: CWD.into(),
+            claude_pid,
+            verdict_ack: false,
+            transcript_reads: false,
+            console_keys: false,
+            console_commands: false,
+            client: None,
+            files: false,
+            session_reads: true,
+        }
+    }
+
+    impl Rig {
+        /// An agent of `session` that answers session reads from
+        /// `<dir>/projects` like `cctg agent` (TASK-034) and keeps what
+        /// else the hub sends it.
+        async fn files_agent(
+            &mut self,
+            conn: u64,
+            session: &str,
+            pid: u32,
+        ) -> mpsc::UnboundedReceiver<HubMsg> {
+            let (to_agent, mut from_hub) = mpsc::channel(16);
+            let (kept, kept_rx) = mpsc::unbounded_channel();
+            let agents = self.agents.clone();
+            let own = crate::tail::OwnProject::at(own_project(&self.dir));
+            tokio::spawn(async move {
+                while let Some(msg) = from_hub.recv().await {
+                    let HubMsg::SessionRead {
+                        read_id,
+                        session_id,
+                        ask,
+                    } = msg
+                    else {
+                        let _ = kept.send(msg);
+                        continue;
+                    };
+                    for answer in crate::reads::answer(Some(&own), &session_id, ask) {
+                        let event = AgentEvent::Message {
+                            conn,
+                            received_at: StdInstant::now(),
+                            msg: AgentMsg::SessionAnswer { read_id, answer },
+                        };
+                        if agents.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            self.agents
+                .send(AgentEvent::Registered {
+                    conn,
+                    register: reads_register(session, Some(pid)),
+                    to_agent,
+                })
+                .await
+                .unwrap();
+            kept_rx
+        }
+    }
+
+    /// A directly driven agent of `session` that reads session files; what
+    /// the hub asks it comes out of the receiver ([`answer_reads`]).
+    fn connect_reader(slots: &mut Slots, conn: u64, session: &str) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(16);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: reads_register(session, Some(10)),
+            to_agent,
+        });
+        from_hub
+    }
+
+    /// Answers the session reads waiting in `from_hub` now (not the ones
+    /// the answers bring) from `<dir>/projects`, like `cctg agent`; the
+    /// number answered.
+    fn answer_reads(
+        slots: &mut Slots,
+        conn: u64,
+        from_hub: &mut mpsc::Receiver<HubMsg>,
+        dir: &TempDir,
+    ) -> usize {
+        let mut asked = Vec::new();
+        while let Ok(msg) = from_hub.try_recv() {
+            asked.push(msg);
+        }
+        let mut answered = 0;
+        for msg in asked {
+            let HubMsg::SessionRead {
+                read_id,
+                session_id,
+                ask,
+            } = msg
+            else {
+                continue;
+            };
+            let own = crate::tail::OwnProject::at(own_project(dir));
+            for answer in crate::reads::answer(Some(&own), &session_id, ask) {
+                slots.on_agent(AgentEvent::Message {
+                    conn,
+                    received_at: StdInstant::now(),
+                    msg: AgentMsg::SessionAnswer { read_id, answer },
+                });
+            }
+            answered += 1;
+        }
+        answered
+    }
+
+    /// Waits until the topic shows the alive icon: the session's agent is
+    /// bound, so the hooks after this find it.
+    async fn bound(rig: &Rig) {
+        settled(rig, |ops| {
+            ops.iter().any(|op| {
+                matches!(op, Op::CreateTopic { icon_custom_emoji_id: Some(icon), .. }
+                    | Op::EditTopic { icon_custom_emoji_id: Some(icon), .. } if icon == ICON_ALIVE)
+            })
+        })
+        .await;
+    }
+
     /// What each message shows in the end: sends are numbered like the
     /// fake numbers them, edits replace the text.
     fn shown(ops: &[Op]) -> BTreeMap<i64, String> {
@@ -8366,35 +8960,32 @@ again"
 
     #[tokio::test]
     async fn three_explicit_subagents_make_three_blocks_and_internal_agents_none() {
-        let dir = TempDir::new("slots-subagents");
-        let parent = dir.path().join("parent.jsonl");
+        let mut rig = rig(Fake::default(), subagent_options());
         let mut lines = String::new();
         for (tool, agent, what) in [("t1", S1, "one"), ("t2", S2, "two"), ("t3", S3, "three")] {
             lines.push_str(&call_line(tool, what));
             lines.push_str(&result_line(tool, agent));
         }
-        std::fs::write(&parent, lines).unwrap();
-        let file = |agent: &str| dir.path().join(format!("agent-{agent}.jsonl"));
-        std::fs::write(file(S1), SUBAGENT_JSONL).unwrap();
-        std::fs::write(
-            dir.path().join(format!("agent-{S1}.meta.json")),
-            SUBAGENT_META,
-        )
-        .unwrap();
-        std::fs::write(file(S2), SUBAGENT_JSONL).unwrap();
+        let parent = parent_file(&rig.dir, A, &lines);
+        let file = |agent: &str, jsonl: &str, meta: Option<&str>| {
+            agent_file(&rig.dir, A, agent, Some(jsonl), meta)
+        };
+        let one = file(S1, SUBAGENT_JSONL, Some(SUBAGENT_META));
+        let two = file(S2, SUBAGENT_JSONL, None);
         // S3's file lags: it stops on the Bash tool result.
         let lagging: String = SUBAGENT_JSONL
             .lines()
             .take(6)
             .map(|l| format!("{l}\n"))
             .collect();
-        std::fs::write(file(S3), lagging).unwrap();
+        let three = file(S3, &lagging, None);
         // The `--agent` session's own agent: typed, with files, never called.
-        std::fs::write(file(INTERNAL), SUBAGENT_JSONL).unwrap();
+        let internal = file(INTERNAL, SUBAGENT_JSONL, None);
 
-        let rig = rig(Fake::default(), subagent_options());
+        let _agent = rig.files_agent(1, A, 10).await;
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         for agent in [S1, S2, S3] {
             rig.hook(sub_start(A, agent, "Explore")).await;
         }
@@ -8411,17 +9002,17 @@ again"
             },
         ))
         .await;
-        rig.hook(sub_stop(A, S1, "Explore", &file(S1), "Report handed back."))
+        rig.hook(sub_stop(A, S1, "Explore", &one, "Report handed back."))
             .await;
-        rig.hook(sub_stop(A, S2, "Explore", &file(S2), "Report handed back."))
+        rig.hook(sub_stop(A, S2, "Explore", &two, "Report handed back."))
             .await;
-        rig.hook(sub_stop(A, S3, "Explore", &file(S3), "The final answer."))
+        rig.hook(sub_stop(A, S3, "Explore", &three, "The final answer."))
             .await;
         rig.hook(sub_stop(
             A,
             INTERNAL,
             "my-agent",
-            &file(INTERNAL),
+            &internal,
             "Internal text.",
         ))
         .await;
@@ -8439,10 +9030,7 @@ again"
         assert_eq!(texts.len(), 3, "{texts:?}");
         let one = block_of(&texts, S1);
         assert_eq!(one.len(), 1);
-        assert_eq!(
-            one[0].1,
-            &format!("↳ Explore {S1}: Explore crate\n{REPORT}")
-        );
+        assert_eq!(one[0].1, &format!("↳ Explore {S1}: one\n{REPORT}"));
         let two = block_of(&texts, S2);
         assert_eq!(
             two[0].1,
@@ -8468,18 +9056,62 @@ again"
     }
 
     #[tokio::test]
+    async fn without_an_agent_that_reads_a_block_opens_on_its_stop_from_the_hooks() {
+        // An old agent (no `session_reads`) or none at all: nothing reads
+        // the parent transcript, so a block opens only on the stop.
+        let mut rig = rig(Fake::default(), subagent_options());
+        rig.agent_of(1, A, Some(10)).await;
+        rig.hook(start(A, 10)).await;
+        // The bind may land after the topic: then an icon edit follows.
+        bound(&rig).await;
+        let before = rig.fake.ops().len();
+        let path = agent_file(&rig.dir, A, S1, Some(SUBAGENT_JSONL), None);
+        rig.hook(sub_start(A, S1, "Explore")).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            rig.fake.ops().len(),
+            before,
+            "no block before the stop: {:?}",
+            rig.fake.ops()
+        );
+        rig.hook(hook(
+            A,
+            HookEvent::SubagentHandback {
+                agent_id: S2.into(),
+                message: REPORT.into(),
+            },
+        ))
+        .await;
+        rig.hook(sub_stop(A, S1, "Explore", &path, "Done.")).await;
+        rig.hook(sub_stop(A, S2, "Plan", &path, "Other.")).await;
+        let ops = settled(&rig, |ops| replies(ops).len() == 2).await;
+        let texts = shown(&ops);
+        assert_eq!(block_of(&texts, S1)[0].1, &format!("↳ Explore {S1}\nDone."));
+        assert_eq!(block_of(&texts, S2)[0].1, &format!("↳ Plan {S2}\n{REPORT}"));
+        // Its agent was never asked to read.
+        assert!(received(&mut rig, 0).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_stop_before_its_call_is_visible_still_gets_its_block() {
-        let dir = TempDir::new("slots-subagent-lag");
-        let parent = dir.path().join("parent.jsonl");
-        std::fs::write(&parent, call_line("t1", "late")).unwrap();
-        let rig = rig(Fake::default(), subagent_options());
+        let mut rig = rig(Fake::default(), subagent_options());
+        let parent = parent_file(&rig.dir, A, &call_line("t1", "late"));
+        let _agent = rig.files_agent(1, A, 10).await;
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         // No start seen (hooks installed mid-session); the stop comes first.
-        let gone = dir.path().join("agent-missing.jsonl");
+        let gone = agent_file(&rig.dir, A, S1, None, None);
         rig.hook(sub_stop(A, S1, "Explore", &gone, "Done.")).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(rig.fake.ops().len(), 1, "no block before the match");
+        assert_eq!(
+            count(&rig.fake.ops(), |op| matches!(
+                op,
+                Op::Send { .. } | Op::Edit { .. }
+            )),
+            0,
+            "no block before the match"
+        );
         // The parent transcript catches up.
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -8503,13 +9135,16 @@ again"
 
     #[tokio::test]
     async fn a_reply_to_a_subagent_block_goes_to_the_parent_with_its_agent_id() {
-        let dir = TempDir::new("slots-subagent-reply");
-        let parent = dir.path().join("parent.jsonl");
-        std::fs::write(&parent, call_line("t1", "one") + &result_line("t1", S1)).unwrap();
         let mut rig = rig(Fake::default(), subagent_options());
+        let parent = parent_file(
+            &rig.dir,
+            A,
+            &(call_line("t1", "one") + &result_line("t1", S1)),
+        );
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
-        rig.agent_of(1, A, Some(10)).await;
+        let mut agent = rig.files_agent(1, A, 10).await;
+        bound(&rig).await;
         rig.hook(sub_start(A, S1, "Explore")).await;
         // A nested run of A, with an agent of its own.
         rig.hook(hook(
@@ -8546,7 +9181,13 @@ again"
                 }))
                 .unwrap();
         }
-        let got = received(&mut rig, 0).await;
+        let mut got = Vec::new();
+        while got.len() < 3 {
+            match tokio::time::timeout(WAIT, agent.recv()).await {
+                Ok(Some(msg)) => got.push(msg),
+                other => panic!("{other:?}"),
+            }
+        }
         let metas: Vec<Option<String>> = got
             .iter()
             .map(|msg| match msg {
@@ -8557,7 +9198,7 @@ again"
         assert_eq!(metas, [Some(S1.to_owned()), None, None]);
         assert!(crate::channel::is_meta_key("target_agent"));
         // The nested run's agent is no channel: it got nothing.
-        assert!(received(&mut rig, 1).await.is_empty());
+        assert!(received(&mut rig, 0).await.is_empty());
     }
 
     #[tokio::test]
@@ -8739,8 +9380,10 @@ again"
         // TASK-011 recorded every typed hook, internal agents included.
         let dir = TempDir::new("slots-legacy-ghost");
         saved_with_subagents(&dir, &[INTERNAL], true);
-        let rig = rig_in(Fake::default(), subagent_options(), dir);
-        let gone = rig.dir.path().join("agent-missing.jsonl");
+        let mut rig = rig_in(Fake::default(), subagent_options(), dir);
+        let _agent = rig.files_agent(1, A, 10).await;
+        bound(&rig).await;
+        let gone = agent_file(&rig.dir, A, INTERNAL, None, None);
         rig.hook(sub_stop(A, INTERNAL, "my-agent", &gone, "Ghost."))
             .await;
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -8782,9 +9425,6 @@ again"
 
     #[tokio::test]
     async fn a_first_send_with_an_unclear_answer_is_not_sent_again() {
-        let dir = TempDir::new("slots-unclear-send");
-        let parent = dir.path().join("parent.jsonl");
-        std::fs::write(&parent, call_line("t1", "one") + &result_line("t1", S1)).unwrap();
         let fake = Fake {
             unclear_sends: Mutex::new(1),
             ..Fake::default()
@@ -8793,13 +9433,20 @@ again"
             retry_every: Duration::from_millis(50),
             ..subagent_options()
         };
-        let rig = rig(fake, options);
+        let mut rig = rig(fake, options);
+        let parent = parent_file(
+            &rig.dir,
+            A,
+            &(call_line("t1", "one") + &result_line("t1", S1)),
+        );
+        let _agent = rig.files_agent(1, A, 10).await;
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         rig.hook(sub_start(A, S1, "Explore")).await;
         rig.ops_after(2).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let gone = dir.path().join("agent-missing.jsonl");
+        let gone = agent_file(&rig.dir, A, S1, None, None);
         rig.hook(sub_stop(A, S1, "Explore", &gone, "Done.")).await;
         // Longer than the scheduler's 1 s gap between sends.
         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -8813,9 +9460,6 @@ again"
 
     #[tokio::test]
     async fn a_refused_first_send_is_tried_again() {
-        let dir = TempDir::new("slots-refused-send");
-        let parent = dir.path().join("parent.jsonl");
-        std::fs::write(&parent, call_line("t1", "one") + &result_line("t1", S1)).unwrap();
         let fake = Fake {
             send_errors: Mutex::new(vec!["Bad Request: not enough rights"]),
             ..Fake::default()
@@ -8824,9 +9468,16 @@ again"
             retry_every: Duration::from_millis(50),
             ..subagent_options()
         };
-        let rig = rig(fake, options);
+        let mut rig = rig(fake, options);
+        let parent = parent_file(
+            &rig.dir,
+            A,
+            &(call_line("t1", "one") + &result_line("t1", S1)),
+        );
+        let _agent = rig.files_agent(1, A, 10).await;
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         rig.hook(sub_start(A, S1, "Explore")).await;
         let ops = settled(&rig, |ops| {
             count(ops, |op| matches!(op, Op::Send { .. })) == 2
@@ -8880,17 +9531,17 @@ again"
 
     #[tokio::test]
     async fn a_huge_call_description_still_fits_one_message() {
-        let dir = TempDir::new("slots-huge-header");
-        let parent = dir.path().join("parent.jsonl");
+        let mut rig = rig(Fake::default(), subagent_options());
         let description = "описание ".repeat(2000);
-        std::fs::write(
-            &parent,
-            call_line("t1", &description) + &result_line("t1", S1),
-        )
-        .unwrap();
-        let rig = rig(Fake::default(), subagent_options());
+        let parent = parent_file(
+            &rig.dir,
+            A,
+            &(call_line("t1", &description) + &result_line("t1", S1)),
+        );
+        let _agent = rig.files_agent(1, A, 10).await;
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         rig.hook(sub_start(A, S1, "Explore")).await;
         rig.ops_after(2).await;
         rig.hook(hook(
@@ -8921,13 +9572,15 @@ again"
     }
 
     #[tokio::test]
-    async fn a_block_confirmed_after_its_session_ended_is_marked_lost() {
-        let dir = TempDir::new("slots-late-confirm");
-        let parent = dir.path().join("parent.jsonl");
-        std::fs::write(&parent, call_line("t1", "late")).unwrap();
-        let rig = rig(Fake::default(), subagent_options());
+    async fn a_subagent_of_a_session_that_ended_before_its_match_gets_no_block() {
+        // The session's agent goes with its end: nothing reads the parent
+        // transcript any more, and no stop came to build a block from.
+        let mut rig = rig(Fake::default(), subagent_options());
+        let parent = parent_file(&rig.dir, A, &call_line("t1", "late"));
+        let _agent = rig.files_agent(1, A, 10).await;
         rig.hook(start_in(A, 10, &parent)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         rig.hook(sub_start(A, S1, "Explore")).await;
         rig.hook(hook(
             A,
@@ -8945,44 +9598,19 @@ again"
         std::io::Write::write_all(&mut file, result_line("t1", S1).as_bytes()).unwrap();
         drop(file);
         tokio::time::sleep(Duration::from_millis(800)).await;
-        let texts = shown(&rig.fake.ops());
-        assert_eq!(
-            block_of(&texts, S1)[0].1,
-            &format!("↳ Explore {S1}: late\n{}", crate::hub::registry::BLOCK_LOST)
-        );
-    }
-
-    /// Feeds finished background jobs to the directly driven actor until
-    /// `ready` holds.
-    async fn drain_until(
-        slots: &mut Slots,
-        done: &mut mpsc::UnboundedReceiver<Done>,
-        ready: impl Fn(&Slots) -> bool,
-    ) {
-        let reached = async {
-            while !ready(slots) {
-                let finished = done.recv().await.expect("done channel open");
-                slots.on_done(finished);
-            }
-        };
-        tokio::time::timeout(WAIT, reached)
-            .await
-            .expect("background jobs finished in time");
+        assert!(block_of(&shown(&rig.fake.ops()), S1).is_empty());
     }
 
     #[tokio::test]
     async fn the_agent_calls_of_an_ended_session_are_forgotten() {
         let dir = TempDir::new("slots-index-end");
-        let parent = dir.path().join("parent.jsonl");
-        std::fs::write(&parent, call_line("t1", "one") + &result_line("t1", S1)).unwrap();
+        let parent = parent_file(&dir, A, &(call_line("t1", "one") + &result_line("t1", S1)));
         let mut slots = stalled_slots(&dir, subagent_options());
-        let mut done = slots.done_rx.take().unwrap();
+        let mut from_hub = connect_reader(&mut slots, 1, A);
         slots.on_hook(&start_in(A, 10, &parent));
         slots.on_hook(&sub_start(A, S1, "Explore"));
-        drain_until(&mut slots, &mut done, |slots| {
-            slots.registry.subagents.contains_key(S1)
-        })
-        .await;
+        assert_eq!(answer_reads(&mut slots, 1, &mut from_hub, &dir), 1);
+        assert!(slots.registry.subagents.contains_key(S1));
         // A live session keeps its calls for its next subagents.
         assert!(slots.indexes.contains_key(A));
         slots.on_hook(&hook(
@@ -8994,13 +9622,13 @@ again"
         ));
         assert!(slots.indexes.is_empty());
         // A stop after that still shows the header the block had.
-        let gone = dir.path().join("agent-missing.jsonl");
+        let gone = agent_file(&dir, A, S1, None, None);
         slots.on_hook(&sub_stop(A, S1, "Explore", &gone, "Late."));
         let late = format!("↳ Explore {S1}: one\nLate.");
-        drain_until(&mut slots, &mut done, |slots| {
-            slots.registry.subagents[S1].block.pending.as_deref() == Some(late.as_str())
-        })
-        .await;
+        assert_eq!(
+            slots.registry.subagents[S1].block.pending.as_deref(),
+            Some(late.as_str())
+        );
         assert!(slots.indexes.is_empty());
     }
 
@@ -9120,35 +9748,527 @@ again"
     async fn a_late_body_read_never_overwrites_a_newer_one() {
         let dir = TempDir::new("slots-body-order");
         let mut slots = stalled_slots(&dir, subagent_options());
+        let mut from_hub = connect_reader(&mut slots, 1, A);
         slots.on_hook(&start(A, 10));
         slots
             .registry
             .confirm_subagent(S1, A, format!("↳ Explore {S1}"));
-        let gone = dir.path().join("agent-missing.jsonl");
+        let gone = agent_file(&dir, A, S1, None, None);
         slots.on_hook(&sub_stop(A, S1, "Explore", &gone, "First."));
+        // The second stop waits while the first read is out.
         slots.on_hook(&sub_stop(A, S1, "Explore", &gone, "Second."));
-        let mut done = slots.done_rx.take().unwrap();
-        // Reads come back in the worst order: whatever is out, newest first.
-        loop {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let mut batch = Vec::new();
-            while let Ok(finished) = done.try_recv() {
-                batch.push(finished);
-            }
-            if batch.is_empty() {
-                break;
-            }
-            for finished in batch.into_iter().rev() {
-                slots.on_done(finished);
-                // The older stop's text is never shown, not even for a moment.
-                let pending = slots.registry.subagents[S1].block.pending.as_deref();
-                assert!(!pending.is_some_and(|text| text.ends_with("First.")));
-            }
-        }
+        assert_eq!(answer_reads(&mut slots, 1, &mut from_hub, &dir), 1);
+        // The older stop's text is never shown, not even for a moment.
+        let pending = slots.registry.subagents[S1].block.pending.clone();
+        assert!(!pending.is_some_and(|text| text.ends_with("First.")));
+        assert_eq!(answer_reads(&mut slots, 1, &mut from_hub, &dir), 1);
         assert_eq!(
             slots.registry.subagents[S1].block.pending.as_deref(),
             Some(format!("↳ Explore {S1}\nSecond.").as_str())
         );
+    }
+
+    /// `/brief` or `/full` asked of the directly driven actor.
+    fn brief(
+        slots: &mut Slots,
+        view: commands::View,
+        prompts: usize,
+        prefix: Option<&str>,
+    ) -> oneshot::Receiver<Prepared> {
+        let (answer, answered) = oneshot::channel();
+        slots.on_transcript_ask(TranscriptAsk {
+            thread_id: None,
+            command: commands::TranscriptCommand {
+                view,
+                prompts,
+                session_prefix: prefix.map(str::to_owned),
+            },
+            answer,
+        });
+        answered
+    }
+
+    fn notice(answered: &mut oneshot::Receiver<Prepared>) -> String {
+        match answered.try_recv() {
+            Ok(Prepared::Notice(text)) => text,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn brief_is_rendered_by_the_sessions_agent_or_says_why_not() {
+        use commands::View;
+        let dir = TempDir::new("slots-brief");
+        let jsonl = include_str!("../../../transcript/tests/fixtures/tool_use_result.jsonl");
+        let transcript = parent_file(&dir, A, jsonl);
+        let mut slots = stalled_slots(&dir, options());
+        assert_eq!(
+            notice(&mut brief(&mut slots, View::Brief, 3, None)),
+            "Запущенных сессий нет."
+        );
+        slots.on_hook(&start_in(A, 10, &transcript));
+        // No agent yet, then one built before TASK-034.
+        assert!(
+            notice(&mut brief(&mut slots, View::Brief, 3, None)).contains("нет связи с агентом")
+        );
+        connect(&mut slots, 1, A, Some(10));
+        assert!(notice(&mut brief(&mut slots, View::Brief, 3, None)).contains("старой версии"));
+        // An agent that reads: the reply is its rendering, exactly.
+        let mut from_hub = connect_reader(&mut slots, 2, A);
+        let mut answered = brief(&mut slots, View::Full, 2, Some("aaaa"));
+        assert_eq!(answer_reads(&mut slots, 2, &mut from_hub, &dir), 1);
+        let turns = transcript::parse(jsonl);
+        let want = transcript::render_full(transcript::last_prompts(&turns, 2));
+        match answered.try_recv() {
+            Ok(Prepared::Transcript(reply)) => {
+                assert_eq!(reply.body, want);
+                assert_eq!(reply.file_name, "full-aaaaaaaa.txt");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A text in pieces is put together; an agent that sends more than
+        // it may is cut off.
+        let mut answered = brief(&mut slots, View::Brief, 1, None);
+        let Ok(HubMsg::SessionRead { read_id, ask, .. }) = from_hub.try_recv() else {
+            panic!("a read");
+        };
+        assert_eq!(
+            ask,
+            SessionAsk::Render {
+                view: crate::wire::TranscriptView::Brief,
+                prompts: 1
+            }
+        );
+        for (text, more) in [("> one\n", true), ("two", false)] {
+            slots.on_agent(AgentEvent::Message {
+                conn: 2,
+                received_at: StdInstant::now(),
+                msg: AgentMsg::SessionAnswer {
+                    read_id,
+                    answer: SessionAnswer::Text {
+                        text: text.into(),
+                        more,
+                    },
+                },
+            });
+        }
+        match answered.try_recv() {
+            Ok(Prepared::Transcript(reply)) => assert_eq!(reply.body, "> one\ntwo"),
+            other => panic!("{other:?}"),
+        }
+        let mut answered = brief(&mut slots, View::Brief, 1, None);
+        let Ok(HubMsg::SessionRead { read_id, .. }) = from_hub.try_recv() else {
+            panic!("a read");
+        };
+        let piece = "x".repeat(crate::reads::PIECE);
+        for _ in 0..=(MAX_READ_TEXT / crate::reads::PIECE) {
+            slots.on_agent(AgentEvent::Message {
+                conn: 2,
+                received_at: StdInstant::now(),
+                msg: AgentMsg::SessionAnswer {
+                    read_id,
+                    answer: SessionAnswer::Text {
+                        text: piece.clone(),
+                        more: true,
+                    },
+                },
+            });
+        }
+        assert!(notice(&mut answered).contains("слишком большой"));
+        assert!(slots.reads.is_empty());
+        // The agent found no file.
+        let mut answered = brief(&mut slots, View::Brief, 1, None);
+        let Ok(HubMsg::SessionRead { read_id, .. }) = from_hub.try_recv() else {
+            panic!("a read");
+        };
+        slots.on_agent(AgentEvent::Message {
+            conn: 2,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::SessionAnswer {
+                read_id,
+                answer: SessionAnswer::Missing,
+            },
+        });
+        assert!(notice(&mut answered).contains("не найден"));
+        // A nested run and an ended session: no agent to ask.
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(20),
+                parent_claude_pid: Some(10),
+            },
+        ));
+        assert!(
+            notice(&mut brief(&mut slots, View::Brief, 3, Some("bbbb")))
+                .contains("вложенный запуск")
+        );
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: None,
+            },
+        ));
+        let ended = notice(&mut brief(&mut slots, View::Brief, 3, Some("aaaa")));
+        assert!(ended.ends_with(&format!("claude --resume {A}")), "{ended}");
+        assert!(from_hub.try_recv().is_err(), "nothing more was asked");
+    }
+
+    #[tokio::test]
+    async fn a_brief_read_out_when_its_agent_leaves_or_is_late_gets_a_notice() {
+        use commands::View;
+        let dir = TempDir::new("slots-brief-lost");
+        let transcript = parent_file(&dir, A, "");
+        let options = Options {
+            read_wait: Duration::from_millis(50),
+            ..options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        let _from_hub = connect_reader(&mut slots, 1, A);
+        slots.on_hook(&start_in(A, 10, &transcript));
+        let mut late = brief(&mut slots, View::Brief, 1, None);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        slots.on_tick();
+        assert!(notice(&mut late).contains("не ответил"));
+        // The agent leaves to hand over to a newer binary (TASK-040): its
+        // read fails at once.
+        let mut leaving = brief(&mut slots, View::Brief, 1, None);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::UpdateAnswer {
+                update_id: 1,
+                outcome: UpdateOutcome::Reloading,
+            },
+        });
+        assert!(notice(&mut leaving).contains("прервалась"));
+        // The next worker's link closes with a read out.
+        let _next = connect_reader(&mut slots, 2, A);
+        let mut lost = brief(&mut slots, View::Brief, 1, None);
+        slots.on_agent(AgentEvent::Disconnected { conn: 2 });
+        assert!(notice(&mut lost).contains("прервалась"));
+        assert!(slots.reads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_long_answer_keeps_its_read_alive_piece_by_piece() {
+        use commands::View;
+        let dir = TempDir::new("slots-brief-pieces");
+        let transcript = parent_file(&dir, A, "");
+        let options = Options {
+            read_wait: Duration::from_millis(1000),
+            ..options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        let mut from_hub = connect_reader(&mut slots, 1, A);
+        slots.on_hook(&start_in(A, 10, &transcript));
+        let mut answered = brief(&mut slots, View::Brief, 1, None);
+        let Ok(HubMsg::SessionRead { read_id, .. }) = from_hub.try_recv() else {
+            panic!("a read");
+        };
+        let piece = |text: &str, more| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::SessionAnswer {
+                read_id,
+                answer: SessionAnswer::Text {
+                    text: text.into(),
+                    more,
+                },
+            },
+        };
+        // Each piece comes within the wait, the whole read takes longer.
+        for text in ["> a\n", "> b\n"] {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            slots.on_agent(piece(text, true));
+            slots.on_tick();
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        slots.on_tick();
+        // Another agent's link cannot answer this read.
+        let _other = connect_reader(&mut slots, 3, B);
+        let mut forged = piece("forged", false);
+        if let AgentEvent::Message { conn, .. } = &mut forged {
+            *conn = 3;
+        }
+        slots.on_agent(forged);
+        assert!(answered.try_recv().is_err(), "another link answered");
+        slots.on_agent(piece("c", false));
+        match answered.try_recv() {
+            Ok(Prepared::Transcript(reply)) => assert_eq!(reply.body, "> a\n> b\nc"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_left_from_an_earlier_hub_run_answers_no_read() {
+        use commands::View;
+        // An agent keeps answers it could not write in its outbox and sends
+        // them after the next registration, possibly to a restarted hub.
+        let mut earlier = Vec::new();
+        for _run in 0..2 {
+            let dir = TempDir::new("slots-read-ids");
+            let transcript = parent_file(&dir, A, "");
+            let mut slots = stalled_slots(&dir, options());
+            let mut from_hub = connect_reader(&mut slots, 1, A);
+            slots.on_hook(&start_in(A, 10, &transcript));
+            let mut answered = brief(&mut slots, View::Brief, 1, None);
+            let Ok(HubMsg::SessionRead { read_id, .. }) = from_hub.try_recv() else {
+                panic!("a read");
+            };
+            for stale in &earlier {
+                slots.on_agent(AgentEvent::Message {
+                    conn: 1,
+                    received_at: StdInstant::now(),
+                    msg: AgentMsg::SessionAnswer {
+                        read_id: *stale,
+                        answer: SessionAnswer::Text {
+                            text: "stale".into(),
+                            more: false,
+                        },
+                    },
+                });
+            }
+            assert!(answered.try_recv().is_err(), "a stale answer took the read");
+            earlier.push(read_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_read_fails_on_timeout_and_on_a_lost_or_leaving_link() {
+        let dir = TempDir::new("slots-read-fail");
+        let options = Options {
+            read_wait: Duration::from_millis(50),
+            ..subagent_options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        let mut from_hub = connect_reader(&mut slots, 1, A);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .confirm_subagent(S1, A, format!("↳ Explore {S1}"));
+        let gone = agent_file(&dir, A, S1, None, None);
+        // Nobody answers: past the wait it is asked once more, then the
+        // block gets the stop's text.
+        slots.on_hook(&sub_stop(A, S1, "Explore", &gone, "Timed out."));
+        for _ in 0..2 {
+            assert!(matches!(
+                from_hub.try_recv(),
+                Ok(HubMsg::SessionRead { .. })
+            ));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            slots.on_tick();
+        }
+        assert!(slots.reads.is_empty());
+        assert!(from_hub.try_recv().is_err(), "asked a third time");
+        assert_eq!(
+            slots.registry.subagents[S1].block.pending.as_deref(),
+            Some(format!("↳ Explore {S1}\nTimed out.").as_str())
+        );
+        // A read out when the link closes fails at once and waits for the
+        // next agent, which is asked again.
+        slots.on_hook(&sub_stop(A, S1, "Explore", &gone, "Link lost."));
+        assert_eq!(slots.reads.len(), 1);
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        assert!(slots.reads.is_empty());
+        slots.on_tick();
+        assert!(slots.bodies_parked.contains_key(S1));
+        let mut next = connect_reader(&mut slots, 2, A);
+        slots.on_tick();
+        assert_eq!(answer_reads(&mut slots, 2, &mut next, &dir), 1);
+        assert_eq!(
+            slots.registry.subagents[S1].block.pending.as_deref(),
+            Some(format!("↳ Explore {S1}\nLink lost.").as_str())
+        );
+        // A late answer of the closed link is dropped.
+        let before = slots.registry.subagents[S1].block.pending.clone();
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::SessionAnswer {
+                read_id: 2,
+                answer: SessionAnswer::Text {
+                    text: "stale".into(),
+                    more: false,
+                },
+            },
+        });
+        assert_eq!(slots.registry.subagents[S1].block.pending, before);
+    }
+
+    #[tokio::test]
+    async fn a_block_read_cut_by_a_worker_swap_is_read_by_the_next_agent() {
+        let dir = TempDir::new("slots-body-retry");
+        let mut slots = stalled_slots(&dir, subagent_options());
+        let _first = connect_reader(&mut slots, 1, A);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .confirm_subagent(S1, A, format!("↳ Explore {S1}"));
+        let path = agent_file(&dir, A, S1, Some(SUBAGENT_JSONL), Some(SUBAGENT_META));
+        slots.on_hook(&sub_stop(A, S1, "Explore", &path, "Report handed back."));
+        assert_eq!(slots.reads.len(), 1);
+        // The agent leaves for a newer binary (TASK-040): the read is cut and
+        // the block waits instead of settling for the stop's text.
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::UpdateAnswer {
+                update_id: 1,
+                outcome: UpdateOutcome::Reloading,
+            },
+        });
+        slots.on_tick();
+        assert!(slots.bodies_parked.contains_key(S1));
+        let running = slots.registry.subagents[S1].block.pending.clone();
+        assert!(
+            running
+                .as_deref()
+                .is_none_or(|text| text.ends_with("в работе…")),
+            "{running:?}"
+        );
+        // The next worker reads the subagent's files.
+        let mut next = connect_reader(&mut slots, 2, A);
+        slots.on_tick();
+        assert_eq!(answer_reads(&mut slots, 2, &mut next, &dir), 1);
+        let text = slots.registry.subagents[S1].block.pending.clone().unwrap();
+        assert!(
+            text.contains("• Bash: List source files") && text.ends_with("Report handed back."),
+            "{text}"
+        );
+        // Only once: a read cut again settles for the stop's text.
+        slots.on_hook(&sub_stop(A, S1, "Explore", &path, "Again."));
+        assert_eq!(slots.reads.len(), 1);
+        slots.on_agent(AgentEvent::Disconnected { conn: 2 });
+        let _third = connect_reader(&mut slots, 3, A);
+        slots.on_tick();
+        assert_eq!(slots.reads.len(), 1, "asked of the third agent");
+        slots.on_agent(AgentEvent::Disconnected { conn: 3 });
+        assert!(slots.bodies_parked.is_empty());
+        let text = slots.registry.subagents[S1].block.pending.clone().unwrap();
+        assert!(
+            text.ends_with("\nAgain.") && !text.contains("• Bash"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_waiting_for_the_next_agent_of_an_ended_session_gets_the_stop_text() {
+        let dir = TempDir::new("slots-body-retry-ended");
+        let mut slots = stalled_slots(&dir, subagent_options());
+        let _first = connect_reader(&mut slots, 1, A);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .confirm_subagent(S1, A, format!("↳ Explore {S1}"));
+        let path = agent_file(&dir, A, S1, Some(SUBAGENT_JSONL), None);
+        slots.on_hook(&sub_stop(A, S1, "Explore", &path, "Stopped."));
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        assert!(slots.bodies_parked.contains_key(S1));
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: None,
+            },
+        ));
+        slots.on_tick();
+        assert!(slots.bodies_parked.is_empty());
+        let block = &slots.registry.subagents[S1].block;
+        assert!(
+            block
+                .pending
+                .as_deref()
+                .is_some_and(|text| text.ends_with("Stopped.") && !text.contains("• Bash")),
+            "{block:?}"
+        );
+    }
+
+    /// An agent that reads but finds no parent transcript (`missing`: its
+    /// folder is not the transcript's, or Claude Code keeps none) or serves
+    /// nothing (`refused`): a subagent's block still opens on its stop, as
+    /// without an agent that reads.
+    #[tokio::test]
+    async fn an_agent_that_cannot_give_the_calls_still_gets_a_block_on_the_stop() {
+        for (name, folder) in [("missing", Some("C--not-mine")), ("refused", None)] {
+            let rig = rig(Fake::default(), subagent_options());
+            let parent = parent_file(
+                &rig.dir,
+                A,
+                &(call_line("t1", "one") + &result_line("t1", S1)),
+            );
+            let (to_agent, mut from_hub) = mpsc::channel(16);
+            let agents = rig.agents.clone();
+            let own =
+                folder.map(|folder| crate::tail::OwnProject::at(projects(&rig.dir).join(folder)));
+            tokio::spawn(async move {
+                while let Some(msg) = from_hub.recv().await {
+                    if let HubMsg::SessionRead {
+                        read_id,
+                        session_id,
+                        ask,
+                    } = msg
+                    {
+                        for answer in crate::reads::answer(own.as_ref(), &session_id, ask) {
+                            let _ = agents
+                                .send(AgentEvent::Message {
+                                    conn: 1,
+                                    received_at: StdInstant::now(),
+                                    msg: AgentMsg::SessionAnswer { read_id, answer },
+                                })
+                                .await;
+                        }
+                    }
+                }
+            });
+            rig.agents
+                .send(AgentEvent::Registered {
+                    conn: 1,
+                    register: reads_register(A, Some(10)),
+                    to_agent,
+                })
+                .await
+                .unwrap();
+            rig.hook(start_in(A, 10, &parent)).await;
+            rig.ops_after(1).await;
+            bound(&rig).await;
+            let path = agent_file(&rig.dir, A, S1, Some(SUBAGENT_JSONL), None);
+            rig.hook(sub_start(A, S1, "Explore")).await;
+            rig.hook(sub_stop(A, S1, "Explore", &path, "Done.")).await;
+            let ops = settled(&rig, |ops| !block_of(&shown(ops), S1).is_empty()).await;
+            let texts = shown(&ops);
+            let block = block_of(&texts, S1);
+            assert_eq!(block.len(), 1, "{name}: {texts:?}");
+            assert!(block[0].1.ends_with("\nDone."), "{name}: {}", block[0].1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_title_that_cannot_be_read_is_asked_of_one_agent_only_a_few_times() {
+        let dir = TempDir::new("slots-title-backoff");
+        // No transcript in the agents' folder: every title read is missing.
+        let transcript = projects(&dir).join("C--w").join(format!("{A}.jsonl"));
+        let mut slots = stalled_slots(&dir, options());
+        let mut first = connect_reader(&mut slots, 1, A);
+        slots.on_hook(&start_in(A, 10, &transcript));
+        let prompt = || hook(A, HookEvent::UserPromptSubmit { prompt_id: None });
+        let mut asked = 0;
+        for _ in 0..(MAX_TITLE_FAILURES + 3) {
+            slots.on_hook(&prompt());
+            asked += answer_reads(&mut slots, 1, &mut first, &dir);
+        }
+        assert_eq!(asked, MAX_TITLE_FAILURES as usize);
+        // The session's next agent is asked again.
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        let mut next = connect_reader(&mut slots, 2, A);
+        slots.on_hook(&prompt());
+        assert_eq!(answer_reads(&mut slots, 2, &mut next, &dir), 1);
+        // A title found clears the count.
+        parent_file(&dir, A, "{\"type\":\"ai-title\",\"aiTitle\":\"Found\"}\n");
+        slots.on_hook(&prompt());
+        assert_eq!(answer_reads(&mut slots, 2, &mut next, &dir), 1);
+        assert!(!slots.title_failures.contains_key(A));
     }
 
     #[tokio::test]
@@ -9255,54 +10375,6 @@ again"
         );
     }
 
-    #[test]
-    fn the_ai_title_is_found_past_the_head_of_a_long_transcript() {
-        let filler = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"x\"}}\n";
-        let mut jsonl = filler.repeat(5 * 1024 * 1024 / filler.len() + 1);
-        assert!(jsonl.len() > 5 * 1024 * 1024);
-        jsonl.push_str("{\"type\":\"ai-title\",\"aiTitle\":\"Late title\"}\n");
-        let dir = TempDir::new("slots-title");
-        let path = dir.path().join("long.jsonl");
-        std::fs::write(&path, &jsonl).unwrap();
-        assert_eq!(
-            read_title(&path.display().to_string(), 0),
-            (Some("Late title".to_owned()), jsonl.len() as u64)
-        );
-        // Past the cap: not read.
-        assert_eq!(
-            first_ai_title(jsonl.as_bytes(), (jsonl.len() - 10) as u64).0,
-            None
-        );
-        assert_eq!(
-            read_title(&dir.path().join("none.jsonl").display().to_string(), 7),
-            (None, 7)
-        );
-    }
-
-    #[test]
-    fn a_title_scan_goes_on_from_where_the_last_one_stopped() {
-        let dir = TempDir::new("slots-title-tail");
-        let path = dir.path().join("t.jsonl");
-        let path_text = path.display().to_string();
-        let head = "{\"type\":\"ai-title\",\"aiTitle\":\"Head\"}\n{\"type\":\"user\"}\n";
-        std::fs::write(&path, head).unwrap();
-        // Scanning from the end of what was read skips the head entirely.
-        let end = head.len() as u64;
-        assert_eq!(read_title(&path_text, end), (None, end));
-
-        // A line still being written is not counted as scanned.
-        let partial = "{\"type\":\"ai-ti";
-        std::fs::write(&path, format!("{head}{partial}")).unwrap();
-        assert_eq!(read_title(&path_text, end), (None, end));
-
-        let tail = format!("{partial}tle\",\"aiTitle\":\"Tail\"}}\n");
-        std::fs::write(&path, format!("{head}{tail}")).unwrap();
-        assert_eq!(
-            read_title(&path_text, end),
-            (Some("Tail".to_owned()), end + tail.len() as u64)
-        );
-    }
-
     #[tokio::test]
     async fn a_stopped_scheduler_is_retried_on_the_tick_not_in_a_loop() {
         let dir = TempDir::new("slots-stopped");
@@ -9310,7 +10382,7 @@ again"
         let (scheduler, outbox) =
             Scheduler::new(Arc::new(Fake::default()), BucketConfig::default());
         drop(scheduler); // every submit now comes back without an answer
-        let (mut slots, _view) = Slots::new(Registry::default(), store, outbox, options());
+        let mut slots = Slots::new(Registry::default(), store, outbox, options());
         let mut done = slots.done_rx.take().unwrap();
         slots.on_hook(&start(A, 10));
         slots.pump();
@@ -9337,7 +10409,7 @@ again"
         let store = RegistryStore::open(dir.path()).unwrap();
         let (_scheduler, outbox) =
             Scheduler::new(Arc::new(Fake::default()), BucketConfig::default());
-        let (mut slots, _view) = Slots::new(Registry::default(), store, outbox, options());
+        let mut slots = Slots::new(Registry::default(), store, outbox, options());
         slots.on_hook(&start(A, 10));
         slots.on_hook(&hook(
             A,
@@ -9346,25 +10418,19 @@ again"
                 claude_pid: None,
             },
         ));
-        slots.on_done(Done::Title {
-            session: A.into(),
-            path: "t.jsonl".into(),
-            title: None,
-            scanned: 10,
-        });
+        slots.on_title(A.into(), "t.jsonl".into(), None, 10);
         assert!(slots.scanned.is_empty());
     }
 
     #[tokio::test]
     async fn a_title_less_transcript_is_scanned_only_past_the_last_scan() {
-        let rig = rig(Fake::default(), options());
-        let transcript = rig.dir.path().join("t.jsonl");
+        let mut rig = rig(Fake::default(), options());
         let head = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n";
-        std::fs::write(&transcript, head).unwrap();
-        let mut first = start(A, 10);
-        first.transcript_path = transcript.display().to_string();
-        rig.hook(first).await;
+        let transcript = parent_file(&rig.dir, A, head);
+        let _agent = rig.files_agent(1, A, 10).await;
+        rig.hook(start_in(A, 10, &transcript)).await;
         rig.ops_after(1).await;
+        bound(&rig).await;
         let stop = || {
             hook(
                 A,
@@ -9398,16 +10464,44 @@ again"
 
     #[tokio::test]
     async fn the_ai_title_replaces_the_short_id() {
-        let rig = rig(Fake::default(), options());
-        let transcript = rig.dir.path().join("t.jsonl");
-        std::fs::write(
-            &transcript,
+        let mut rig = rig(Fake::default(), options());
+        let transcript = parent_file(
+            &rig.dir,
+            A,
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n{\"type\":\"ai-title\",\"aiTitle\":\"Slot registry\"}\n",
-        )
-        .unwrap();
-        let mut first = start(A, 10);
-        first.transcript_path = transcript.display().to_string();
-        rig.hook(first).await;
+        );
+        rig.hook(start_in(A, 10, &transcript)).await;
+        rig.ops_after(1).await;
+        let _agent = rig.files_agent(1, A, 10).await;
+        rig.ops_after(2).await; // the alive icon
+        rig.hook(hook(
+            A,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        ))
+        .await;
+        let ops = rig.ops_after(3).await;
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert!(
+            matches!(ops.last().unwrap(), Op::EditTopic { name: Some(name), icon_custom_emoji_id: None, .. }
+            if name == "[box] Project · Slot registry"),
+            "{ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_agent_that_reads_the_title_stays_the_short_id() {
+        let mut rig = rig(Fake::default(), options());
+        let transcript = parent_file(
+            &rig.dir,
+            A,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"Slot registry\"}\n",
+        );
+        // An agent before TASK-034: it reads no files.
+        rig.agent_of(1, A, Some(10)).await;
+        rig.hook(start_in(A, 10, &transcript)).await;
         rig.ops_after(1).await;
         rig.hook(hook(
             A,
@@ -9417,13 +10511,16 @@ again"
             },
         ))
         .await;
-        let ops = rig.ops_after(2).await;
-        assert_eq!(ops.len(), 2, "{ops:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            matches!(ops.last().unwrap(), Op::EditTopic { name: Some(name), icon_custom_emoji_id: None, .. }
-            if name == "[box] Project · Slot registry"),
-            "{ops:?}"
+            !rig.fake
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::EditTopic { name: Some(_), .. })),
+            "{:?}",
+            rig.fake.ops()
         );
+        assert!(received(&mut rig, 0).await.is_empty(), "never asked");
     }
 
     fn sends(ops: &[Op]) -> Vec<&str> {
@@ -9602,7 +10699,7 @@ again"
         let registry = store.load().unwrap();
         let (scheduler, outbox) = Scheduler::new(fake.clone(), FAST);
         tokio::spawn(scheduler.run());
-        let (mut slots, view) = Slots::new(registry, store, outbox, options);
+        let mut slots = Slots::new(registry, store, outbox, options);
         let asks = slots.permission_asks();
         let (agents, agents_rx) = mpsc::channel(16);
         let (hooks, hooks_rx) = mpsc::channel(16);
@@ -9613,7 +10710,6 @@ again"
             agents,
             hooks,
             control,
-            view,
             dir,
             _to_agent: Vec::new(),
             asks,
@@ -9702,13 +10798,11 @@ again"
             let (to_agent, mut from_hub) = mpsc::channel(16);
             let (kept, kept_rx) = mpsc::unbounded_channel();
             let agents = self.agents.clone();
-            let root = self.dir.path().join("projects");
+            let root = crate::tail::OwnProject::at(self.dir.path().join("projects").join("C--w"));
             tokio::spawn(async move {
                 while let Some(msg) = from_hub.recv().await {
                     let HubMsg::TranscriptRead {
-                        session_id,
-                        path,
-                        from,
+                        session_id, from, ..
                     } = msg
                     else {
                         let _ = kept.send(msg);
@@ -9718,7 +10812,7 @@ again"
                         gate.parked.store(true, Ordering::SeqCst);
                         continue;
                     }
-                    let chunk = crate::tail::read_chunk(Some(&root), &session_id, &path, from);
+                    let chunk = crate::tail::read_chunk(Some(&root), &session_id, from);
                     let event = AgentEvent::Message {
                         conn,
                         received_at: StdInstant::now(),
@@ -9740,6 +10834,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -10032,6 +11127,7 @@ again"
                     console_commands: false,
                     client: None,
                     files: false,
+                    session_reads: false,
                 },
                 to_agent,
             })
@@ -10081,6 +11177,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -10123,6 +11220,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -10177,6 +11275,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -10977,6 +12076,7 @@ again"
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -11137,6 +12237,7 @@ again"
                 console_commands: false,
                 client,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -11421,6 +12522,7 @@ again"
                 console_commands: commands,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         });
@@ -11670,6 +12772,7 @@ again"
                 console_commands: false,
                 client: None,
                 files,
+                session_reads: false,
             },
             to_agent,
         });

@@ -1,0 +1,48 @@
+
+    #[tokio::test]
+    async fn review_a_refusing_reader_still_gets_a_block_on_the_stop() {
+        // An agent that reads but whose own folder is not the transcript's
+        // (decision 12 derivation missed): every read answers `refused`.
+        let mut rig = rig(Fake::default(), subagent_options());
+        let parent = parent_file(
+            &rig.dir,
+            A,
+            &(call_line("t1", "one") + &result_line("t1", S1)),
+        );
+        let (to_agent, mut from_hub) = mpsc::channel(16);
+        let agents = rig.agents.clone();
+        let project = projects(&rig.dir).join("C--not-mine");
+        tokio::spawn(async move {
+            while let Some(msg) = from_hub.recv().await {
+                if let HubMsg::SessionRead { read_id, session_id, path, ask } = msg {
+                    for answer in crate::reads::answer(Some(&project), &session_id, &path, ask) {
+                        let _ = agents
+                            .send(AgentEvent::Message {
+                                conn: 1,
+                                received_at: StdInstant::now(),
+                                msg: AgentMsg::SessionAnswer { read_id, answer },
+                            })
+                            .await;
+                    }
+                }
+            }
+        });
+        rig.agents
+            .send(AgentEvent::Registered {
+                conn: 1,
+                register: reads_register(A, Some(10)),
+                to_agent,
+            })
+            .await
+            .unwrap();
+        rig.hook(start_in(A, 10, &parent)).await;
+        rig.ops_after(1).await;
+        bound(&rig).await;
+        let path = agent_file(&rig.dir, A, S1, Some(SUBAGENT_JSONL), None);
+        rig.hook(sub_start(A, S1, "Explore")).await;
+        rig.hook(sub_stop(A, S1, "Explore", &path, "Done.")).await;
+        // Well past the 400 ms window opened by the stop.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let texts = shown(&rig.fake.ops());
+        assert!(!block_of(&texts, S1).is_empty(), "no block at all: {texts:?}");
+    }

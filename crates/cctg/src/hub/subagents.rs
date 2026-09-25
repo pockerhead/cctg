@@ -8,26 +8,19 @@
 //! the hooks by seconds, so a candidate is looked up again after a pause that
 //! doubles, until a window ends; its stop opens the window again.
 //!
-//! [`scan`] and [`read_body`] block on file IO and run on `spawn_blocking`;
-//! everything else is pure. Texts never reach the logs.
+//! The hub reads no file: the `Agent` calls of the parent transcript and
+//! the files of a finished subagent are read by the session's agent
+//! ([`crate::reads`], TASK-034). Everything here is pure. Texts never reach
+//! the logs.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::time::Duration;
 
-use serde_json::Value;
 use tokio::time::Instant;
-use transcript::{
-    Block, Subagent, SubagentInput, TELEGRAM_TEXT_LIMIT, parse, parse_subagent_meta, telegram_len,
-};
+use transcript::{Subagent, SubagentInput, TELEGRAM_TEXT_LIMIT, parse_subagent_meta, telegram_len};
 
 use super::registry::cut;
 
-/// A parent transcript is indexed up to this many bytes (the `/brief` cap).
-pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
-/// A subagent transcript is read up to this many bytes for its block.
-pub const MAX_AGENT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_META_BYTES: u64 = 64 * 1024;
 /// Candidates waiting for their `Agent` call; beyond this the one whose
 /// window ends first is dropped.
 pub const MAX_CANDIDATES: usize = 256;
@@ -35,12 +28,8 @@ pub const MAX_CANDIDATES: usize = 256;
 pub const MAX_REPORTS: usize = 256;
 /// `Agent` calls and results one session index keeps; the oldest go first.
 pub const MAX_INDEX_ENTRIES: usize = 1024;
-/// A call's `subagent_type` and `description` are kept up to this many
-/// UTF-16 units (the header shows 120 characters).
-const MAX_CALL_FIELD: usize = 256;
 /// The pause before a lookup at most doubles this many times.
 const MAX_DOUBLINGS: u32 = 4;
-const AGENT_TOOL: &str = "Agent";
 /// Ends a block text that was cut; the whole text follows as a file.
 pub const CUT_NOTE: &str = "\n(полный текст в файле ниже)";
 /// Ends a nested run's block when it gave no answer.
@@ -63,7 +52,8 @@ pub struct AgentCall {
     pub description: Option<String>,
 }
 
-/// What one read of a parent transcript found after its start offset.
+/// What one read of a parent transcript found after its start offset
+/// (the agent's `calls` answers).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scan {
     pub path: String,
@@ -81,64 +71,6 @@ impl Scan {
             path,
             offset,
             ..Self::default()
-        }
-    }
-}
-
-/// Reads the complete lines of `path` after byte `from`. A missing file or a
-/// read error finds nothing.
-pub fn scan(path: &str, from: u64) -> Scan {
-    let mut found = Scan::nothing(path.to_owned(), from);
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return found;
-    };
-    if file.seek(SeekFrom::Start(from)).is_err() {
-        return found;
-    }
-    scan_lines(file, MAX_TRANSCRIPT_BYTES.saturating_sub(from), &mut found);
-    found
-}
-
-/// A last line without its newline may still be being written: it is left
-/// for the next scan.
-fn scan_lines(jsonl: impl Read, limit: u64, found: &mut Scan) {
-    let mut reader = BufReader::new(jsonl.take(limit));
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) if !line.ends_with(b"\n") => return,
-            Ok(read) => found.offset += read as u64,
-        }
-        let text = String::from_utf8_lossy(&line);
-        if !text.contains("\"Agent\"") && !text.contains("agentId") {
-            continue;
-        }
-        for turn in parse(&text) {
-            for block in turn.blocks {
-                match block {
-                    Block::ToolUse { id, name, input } if name == AGENT_TOOL => {
-                        let field = |key: &str| {
-                            input
-                                .get(key)
-                                .and_then(Value::as_str)
-                                .map(|text| cut(text, MAX_CALL_FIELD))
-                        };
-                        let call = AgentCall {
-                            subagent_type: field("subagent_type"),
-                            description: field("description"),
-                        };
-                        found.calls.push((id, call));
-                    }
-                    Block::ToolResult {
-                        tool_use_id,
-                        agent_id: Some(agent_id),
-                        ..
-                    } if !agent_id.is_empty() => found.links.push((agent_id, tool_use_id)),
-                    _ => {}
-                }
-            }
         }
     }
 }
@@ -295,6 +227,21 @@ impl Candidates {
         self.by_agent.remove(agent_id)
     }
 
+    /// Takes the candidates of `session` whose stop came, by agent id.
+    pub fn take_stopped(&mut self, session: &str) -> Vec<(String, Candidate)> {
+        let mut agents: Vec<String> = self
+            .by_agent
+            .iter()
+            .filter(|(_, candidate)| candidate.session == session && candidate.stop.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        agents.sort();
+        agents
+            .into_iter()
+            .filter_map(|id| self.by_agent.remove(&id).map(|candidate| (id, candidate)))
+            .collect()
+    }
+
     /// A lookup did not find the call. `true`: the window is over and the
     /// candidate is dropped; otherwise the pause doubles, never past the
     /// window's end, where one last lookup happens.
@@ -374,6 +321,7 @@ pub struct BodyInput {
     pub agent_id: String,
     pub agent_type: Option<String>,
     pub description: Option<String>,
+    /// `agent-<id>.jsonl` on the session's machine; only its agent opens it.
     pub agent_path: String,
     pub report: Option<String>,
     pub last: Option<String>,
@@ -382,18 +330,9 @@ pub struct BodyInput {
     pub header: Option<String>,
 }
 
-/// The finished block: reads `agent-<id>.jsonl` and its `.meta.json`, then
-/// the library picks the body (report, finished transcript, last message).
-pub fn read_body(input: &BodyInput) -> String {
-    let transcript = read_capped(&input.agent_path, MAX_AGENT_BYTES);
-    let meta = input
-        .agent_path
-        .strip_suffix(".jsonl")
-        .and_then(|stem| read_capped(&format!("{stem}.meta.json"), MAX_META_BYTES));
-    body_text(input, meta.as_deref(), transcript.as_deref())
-}
-
-/// [`read_body`] once the files are read.
+/// The finished block text from `input` and the subagent's files as read
+/// by the agent ([`crate::reads`]); without files (no agent, a report) the
+/// hook data alone.
 pub fn body_text(input: &BodyInput, meta: Option<&str>, transcript: Option<&str>) -> String {
     let subagent = Subagent::new(SubagentInput {
         agent_id: &input.agent_id,
@@ -414,19 +353,6 @@ pub fn body_text(input: &BodyInput, meta: Option<&str>, transcript: Option<&str>
         },
         None => subagent.render(),
     }
-}
-
-fn read_capped(path: &str, cap: u64) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(cap)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The nested run's final block: its last answer, or "завершён".
@@ -451,67 +377,45 @@ pub fn fit(text: String) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
-    const PARENT: &str = include_str!("../../../transcript/tests/fixtures/final_answer.jsonl");
-    const SUBAGENT: &str =
-        include_str!("../../../transcript/tests/fixtures/subagent_handback.jsonl");
     const META: &str =
         include_str!("../../../transcript/tests/fixtures/subagent_handback.meta.json");
+    const SUBAGENT: &str =
+        include_str!("../../../transcript/tests/fixtures/subagent_handback.jsonl");
     const REPORT: &str = "Modules: lib, render, split.";
 
-    fn scan_text(text: &str) -> Scan {
-        let mut found = Scan::nothing("p".into(), 0);
-        scan_lines(text.as_bytes(), u64::MAX, &mut found);
-        found
-    }
-
-    #[test]
-    fn an_agent_call_and_its_result_link_the_agent_id() {
-        let mut index = AgentIndex::default();
-        index.merge(scan_text(PARENT));
-        assert_eq!(
-            index.call("a0000000000000002"),
-            Some(&AgentCall {
+    fn call(id: &str) -> (String, AgentCall) {
+        (
+            id.to_owned(),
+            AgentCall {
                 subagent_type: Some("Explore".into()),
-                description: Some("Explore crate".into()),
-            })
-        );
-        assert_eq!(index.call("a0000000000000009"), None);
-        assert_eq!(index.resume_at("p"), PARENT.len() as u64);
-        assert_eq!(index.resume_at("other"), 0);
+                description: Some(format!("d{id}")),
+            },
+        )
     }
 
     #[test]
-    fn a_result_without_its_call_or_a_call_without_its_result_links_nothing() {
-        let lines: Vec<&str> = PARENT.lines().collect();
-        let call_only = format!("{}\n", lines[8]);
-        let result_only = format!("{}\n", lines[9]);
-        for text in [&call_only, &result_only] {
-            let mut index = AgentIndex::default();
-            index.merge(scan_text(text));
-            assert_eq!(index.call("a0000000000000002"), None);
-        }
-        // Scanned in two passes, the pair still matches.
+    fn a_call_and_its_result_link_the_agent_id_across_scans() {
         let mut index = AgentIndex::default();
-        index.merge(scan_text(&call_only));
-        let mut second = scan_text(&result_only);
-        second.offset += call_only.len() as u64;
-        index.merge(second);
-        assert!(index.call("a0000000000000002").is_some());
-    }
-
-    #[test]
-    fn a_line_still_being_written_is_left_for_the_next_scan() {
-        let lines: Vec<&str> = PARENT.lines().collect();
-        let head = format!("{}\n{}", lines[8], &lines[9][..40]);
-        let found = scan_text(&head);
-        assert_eq!(found.offset, lines[8].len() as u64 + 1);
-        assert!(found.links.is_empty());
-    }
-
-    #[test]
-    fn a_missing_file_finds_nothing_and_keeps_the_offset() {
-        let found = scan("no/such/dir/x.jsonl", 7);
-        assert_eq!(found, Scan::nothing("no/such/dir/x.jsonl".into(), 7));
+        index.merge(Scan {
+            path: "p".into(),
+            offset: 10,
+            calls: vec![call("t1")],
+            links: Vec::new(),
+        });
+        assert_eq!(index.call("a1"), None);
+        index.merge(Scan {
+            path: "p".into(),
+            offset: 20,
+            calls: Vec::new(),
+            links: vec![("a1".into(), "t1".into())],
+        });
+        assert_eq!(index.call("a1"), Some(&call("t1").1));
+        assert_eq!(index.resume_at("p"), 20);
+        assert_eq!(index.resume_at("other"), 0);
+        // Another file starts the index over.
+        index.merge(Scan::nothing("q".into(), 5));
+        assert_eq!(index.call("a1"), None);
+        assert_eq!(index.resume_at("q"), 5);
     }
 
     #[test]
@@ -577,33 +481,19 @@ mod tests {
     }
 
     #[test]
-    fn an_index_keeps_the_newest_calls_and_short_fields() {
-        let mut text = String::new();
-        for i in 0..MAX_INDEX_ENTRIES + 5 {
-            let call = serde_json::json!({
-                "type": "assistant",
-                "message": { "role": "assistant", "content": [{
-                    "type": "tool_use", "id": format!("t{i}"), "name": "Agent",
-                    "input": { "description": "d".repeat(5000), "subagent_type": "Explore" },
-                }]},
-            });
-            let result = serde_json::json!({
-                "type": "user",
-                "message": { "role": "user", "content": [{
-                    "type": "tool_result", "tool_use_id": format!("t{i}"), "content": "ok",
-                }]},
-                "toolUseResult": { "agentId": format!("a{i}") },
-            });
-            text.push_str(&format!("{call}\n{result}\n"));
-        }
+    fn an_index_keeps_the_newest_calls() {
         let mut index = AgentIndex::default();
-        index.merge(scan_text(&text));
+        let n = MAX_INDEX_ENTRIES + 5;
+        index.merge(Scan {
+            path: "p".into(),
+            offset: 1,
+            calls: (0..n).map(|i| call(&format!("t{i}"))).collect(),
+            links: (0..n).map(|i| (format!("a{i}"), format!("t{i}"))).collect(),
+        });
         assert_eq!(index.calls.len(), MAX_INDEX_ENTRIES);
         assert_eq!(index.links.len(), MAX_INDEX_ENTRIES);
         assert_eq!(index.call("a0"), None);
-        let newest = index.call(&format!("a{}", MAX_INDEX_ENTRIES + 4)).unwrap();
-        let description = newest.description.as_deref().unwrap();
-        assert_eq!(telegram_len(description), MAX_CALL_FIELD);
+        assert!(index.call(&format!("a{}", n - 1)).is_some());
     }
 
     #[test]
@@ -664,29 +554,6 @@ mod tests {
             let text = body_text(&input(report, last), Some(META), transcript);
             assert_eq!(text, want, "{report:?} {last:?}");
         }
-    }
-
-    #[test]
-    fn the_body_is_read_from_the_subagent_files() {
-        let dir = crate::hub::testdir::TempDir::new("subagent-body");
-        let path = dir.path().join("agent-a0000000000000002.jsonl");
-        std::fs::write(&path, SUBAGENT).unwrap();
-        std::fs::write(dir.path().join("agent-a0000000000000002.meta.json"), META).unwrap();
-        let mut body = input(None, Some("Report handed back."));
-        body.agent_type = None;
-        body.description = None;
-        body.agent_path = path.to_string_lossy().into_owned();
-        let text = read_body(&body);
-        assert!(
-            text.starts_with("↳ Explore a0000000000000002: Explore crate\n"),
-            "{text}"
-        );
-        assert!(text.ends_with("Report handed back."), "{text}");
-        body.agent_path = dir.path().join("gone.jsonl").to_string_lossy().into_owned();
-        assert_eq!(
-            read_body(&body),
-            "↳ agent a0000000000000002\nReport handed back."
-        );
     }
 
     #[test]

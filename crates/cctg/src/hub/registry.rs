@@ -1665,27 +1665,7 @@ impl Registry {
             block.failed = false;
         }
     }
-
-    /// `thread_id -> (session id, transcript path)` of each slot's current session.
-    pub fn topic_view(&self) -> TopicView {
-        self.slots
-            .iter()
-            .filter_map(|slot| {
-                let thread_id = slot.topic_id?;
-                let session = slot.current_session.clone()?;
-                let path = self
-                    .sessions
-                    .get(&session)
-                    .map(|entry| entry.transcript_path.clone())
-                    .unwrap_or_default();
-                Some((thread_id, (session, path)))
-            })
-            .collect()
-    }
 }
-
-/// `thread_id -> (session id, transcript path)`, what `/brief` in a topic reads.
-pub type TopicView = BTreeMap<i64, (String, String)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotOrParent {

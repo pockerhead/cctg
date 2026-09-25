@@ -1,23 +1,26 @@
 //! `/brief [n] [session-id-prefix]` and `/full [n] [session-id-prefix]`.
 //!
 //! One worker answers commands in arrival order, so the chunks of two replies
-//! never interleave. File reading and rendering run on the blocking pool.
-//! Logs carry the view, the prompt count and the short session id; never a
-//! path or a project directory name.
+//! never interleave. The hub reads no transcript (TASK-034): the worker asks
+//! the slot actor ([`TranscriptAsk`]), which picks the session and has its
+//! agent render the text on the session's machine. A session without such an
+//! agent (ended, headless, nested, an agent too old) gets a notice that says
+//! why. Logs carry the view, the prompt count and the short session id;
+//! never a path or a project directory name.
 
-use std::io::{self, Read};
-use std::path::Path;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use transcript::{SplitOptions, split_for_telegram};
 
 use super::api::{ApiError, Document};
+use super::registry::{Registry, SessionKind};
 use super::scheduler::{Op, Outbox, Outcome};
-use super::sessions::{LocateError, TranscriptLocator};
 use super::updates::Inbound;
+use crate::wire::TranscriptView;
 
 pub const DEFAULT_BRIEF_PROMPTS: usize = 3;
 pub const DEFAULT_FULL_PROMPTS: usize = 1;
@@ -25,16 +28,18 @@ pub const MAX_PROMPTS: usize = 100;
 /// Candidates listed for an ambiguous prefix.
 const MAX_CANDIDATES: usize = 10;
 const SHORT_ID_LEN: usize = 8;
-const CANDIDATE_TITLE_BYTES: u64 = 64 * 1024;
 const DELIVERY_FAILURE_NOTICE: &str = "Не удалось отправить транскрипт.";
-/// Largest transcript `/brief` and `/full` read. Parsing needs about as much
-/// memory again; the largest real session seen was 92 MiB.
-pub const MAX_TRANSCRIPT_BYTES: u64 = 256 * 1024 * 1024;
+/// The worker's longest wait for the slot actor. The actor itself answers
+/// every ask (the agent's answer, its timeout or a lost link), so this only
+/// guards against a stopped actor.
+pub const ANSWER_WAIT: Duration = Duration::from_secs(120);
+const NO_ACTOR: &str = "Транскрипт сейчас недоступен: hub останавливается.";
 
 pub const USAGE: &str = "Использование: /brief [n] [начало id сессии] или /full [n] [начало id сессии]. \
 n: сколько последних промптов показать, от 1 до 100 (по умолчанию brief 3, full 1). \
 Если начало id состоит только из цифр, укажите n перед ним, например /brief 3 2026. \
-Без id берётся самая свежая сессия.";
+Без id в теме берётся её текущая сессия, в General самая свежая запущенная. \
+Транскрипт отдаёт агент запущенной сессии с её машины.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -47,6 +52,13 @@ impl View {
         match self {
             View::Brief => "brief",
             View::Full => "full",
+        }
+    }
+
+    pub fn wire(self) -> TranscriptView {
+        match self {
+            View::Brief => TranscriptView::Brief,
+            View::Full => TranscriptView::Full,
         }
     }
 }
@@ -166,135 +178,174 @@ fn caption(command: &TranscriptCommand, short: &str) -> String {
     )
 }
 
-/// Reads at most `limit` bytes; `None` when the file is larger. The length is
-/// checked before reading and again after, for a file that grows meanwhile.
-fn read_limited(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
-    let file = std::fs::File::open(path)?;
-    if file.metadata()?.len() > limit {
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
-    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+/// Where the worker gets a transcript: the slot actor in the hub
+/// ([`Asks`]), a fake in tests.
+pub trait TranscriptSource: Send + Sync + 'static {
+    fn prepare(
+        &self,
+        thread_id: Option<i64>,
+        command: TranscriptCommand,
+    ) -> impl Future<Output = Prepared> + Send;
 }
 
-fn relative_age(path: &Path, now: SystemTime) -> String {
-    let Some(age) = std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-    else {
-        return "возраст неизвестен".to_owned();
-    };
-    if age < Duration::from_secs(60) {
-        "только что".to_owned()
-    } else if age < Duration::from_secs(60 * 60) {
-        format!("{} мин назад", age.as_secs() / 60)
-    } else if age < Duration::from_secs(24 * 60 * 60) {
-        format!("{} ч назад", age.as_secs() / (60 * 60))
-    } else {
-        format!("{} дн назад", age.as_secs() / (24 * 60 * 60))
-    }
+/// One command for the slot actor ([`super::slots::Slots::transcript_asks`]),
+/// answered exactly once through `answer`.
+#[derive(Debug)]
+pub struct TranscriptAsk {
+    pub thread_id: Option<i64>,
+    pub command: TranscriptCommand,
+    pub answer: oneshot::Sender<Prepared>,
 }
 
-fn candidate_title(path: &Path) -> Option<String> {
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(CANDIDATE_TITLE_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    transcript::ai_title(&String::from_utf8_lossy(&bytes))
-        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
-}
+/// [`TranscriptSource`] over the slot actor's channel.
+#[derive(Debug, Clone)]
+pub struct Asks(pub mpsc::Sender<TranscriptAsk>);
 
-fn locate_notice(error: &LocateError) -> String {
-    match error {
-        LocateError::RootMissing => {
-            "Каталог проектов Claude Code не найден. Проверьте CCTG_PROJECTS_DIR.".to_owned()
+impl TranscriptSource for Asks {
+    async fn prepare(&self, thread_id: Option<i64>, command: TranscriptCommand) -> Prepared {
+        let (answer, answered) = oneshot::channel();
+        let ask = TranscriptAsk {
+            thread_id,
+            command,
+            answer,
+        };
+        if self.0.send(ask).await.is_err() {
+            return Prepared::Notice(NO_ACTOR.to_owned());
         }
-        LocateError::RootUnreadable(kind) => {
-            format!("Каталог проектов Claude Code не читается ({kind:?}).")
+        match tokio::time::timeout(ANSWER_WAIT, answered).await {
+            Ok(Ok(prepared)) => prepared,
+            _ => Prepared::Notice(NO_ACTOR.to_owned()),
         }
-        LocateError::NoSessions => "Сессий Claude Code пока нет.".to_owned(),
-        LocateError::NoMatch => "Нет сессии с таким началом id.".to_owned(),
-        LocateError::NoTranscript => {
+    }
+}
+
+/// The session a command is about: the one whose id starts with the prefix,
+/// else the current session of the slot topic it was sent in, else (General,
+/// a topic that is no slot) the newest running top-level session. `Err`:
+/// the notice for the user. Only sessions the hub knows are found.
+pub fn resolve(
+    registry: &Registry,
+    thread_id: Option<i64>,
+    prefix: Option<&str>,
+) -> Result<String, String> {
+    if let Some(prefix) = prefix {
+        let mut found: Vec<_> = registry
+            .sessions
+            .iter()
+            .filter(|(id, _)| id.starts_with(prefix))
+            .collect();
+        return match found.len() {
+            0 => Err("Нет известной hub сессии с таким началом id.".to_owned()),
+            1 => Ok(found[0].0.clone()),
+            count => {
+                found.sort_by_key(|(_, entry)| std::cmp::Reverse(entry.seen));
+                let mut text = format!("Под это начало id подходят {count} сессий, уточните:");
+                for (id, entry) in found.iter().take(MAX_CANDIDATES) {
+                    let state = if entry.ended {
+                        "завершена"
+                    } else {
+                        "идёт"
+                    };
+                    text.push_str(&format!("\n{} · {state}", short_id(id)));
+                    if let Some(title) = &entry.title {
+                        text.push_str(&format!(" · {title}"));
+                    }
+                }
+                if count > MAX_CANDIDATES {
+                    text.push_str(&format!("\n… и ещё {}", count - MAX_CANDIDATES));
+                }
+                Err(text)
+            }
+        };
+    }
+    if let Some(slot) = thread_id.and_then(|thread_id| registry.slot_by_topic(thread_id)) {
+        return registry
+            .slot(slot)
+            .and_then(|slot| slot.current_session.clone())
+            .ok_or_else(|| "В этой теме ещё не было сессии.".to_owned());
+    }
+    registry
+        .sessions
+        .iter()
+        .filter(|(_, entry)| !entry.ended && entry.kind == SessionKind::TopLevel)
+        .max_by_key(|(_, entry)| entry.seen)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| "Запущенных сессий нет.".to_owned())
+}
+
+/// Why a session's transcript cannot be had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    /// The session ended: its agent is gone.
+    Ended,
+    /// A nested run: it never has an agent of its own.
+    Nested,
+    /// Running without an agent link (no channel, headless, reconnecting).
+    NoAgent,
+    /// Its agent was built before session reads.
+    OldAgent,
+    /// No hook named its transcript yet.
+    NoTranscript,
+    /// The agent found no transcript file.
+    Missing,
+    /// The agent serves nothing: it cannot find its own project folder.
+    Refused,
+    /// The file is there but could not be read.
+    Unreadable,
+    /// Over what the agent renders or the hub takes.
+    TooLarge,
+    /// The agent did not answer in time.
+    NoAnswer,
+    /// The agent's link closed (an update, a reconnect) before the answer.
+    LinkLost,
+    /// Any other answer.
+    Failed,
+}
+
+/// The notice for a transcript of `session_id` that cannot be shown. Only
+/// the short id, never a path.
+pub fn unavailable(why: Unavailable, session_id: &str) -> Prepared {
+    let short = short_id(session_id);
+    Prepared::Notice(match why {
+        Unavailable::Ended => format!(
+            "Сессия {short} завершена. Её транскрипт лежит на машине сессии и отдаётся только её запущенным агентом; ответы сессии есть в теме. Чтобы посмотреть транскрипт, продолжите её: claude --resume {session_id}"
+        ),
+        Unavailable::Nested => format!(
+            "Сессия {short} — вложенный запуск без своего агента, её транскрипт получить не у кого."
+        ),
+        Unavailable::NoAgent => format!(
+            "У сессии {short} нет связи с агентом cctg (запущена без канала или headless), транскрипт получить не у кого."
+        ),
+        Unavailable::OldAgent => format!(
+            "Агент сессии {short} старой версии и не отдаёт транскрипт. Обновите его кнопкой ⬆️ Обновить в теме."
+        ),
+        Unavailable::NoTranscript => {
             "У сессии этой темы пока нет известного транскрипта.".to_owned()
         }
-        LocateError::Ambiguous(candidates) => {
-            let mut text = format!(
-                "Под это начало id подходят {} сессий, уточните:",
-                candidates.len()
-            );
-            let now = SystemTime::now();
-            for candidate in candidates.iter().take(MAX_CANDIDATES) {
-                text.push_str(&format!(
-                    "\n{} · {}",
-                    short_id(&candidate.session_id),
-                    relative_age(&candidate.path, now)
-                ));
-                if let Some(title) = candidate_title(&candidate.path) {
-                    text.push_str(&format!(" · {title}"));
-                }
-            }
-            if candidates.len() > MAX_CANDIDATES {
-                text.push_str(&format!("\n… и ещё {}", candidates.len() - MAX_CANDIDATES));
-            }
-            text
+        Unavailable::Missing => {
+            format!("Транскрипт сессии {short} не найден: файла нет или он ещё не записан.")
         }
-    }
+        Unavailable::Refused => format!(
+            "Агент сессии {short} не знает, где Claude Code хранит её транскрипты (нет id сессии или папки CLAUDE_CONFIG_DIR / ~/.claude на машине сессии), и транскрипты не отдаёт."
+        ),
+        Unavailable::Unreadable => format!("Транскрипт сессии {short} не читается."),
+        Unavailable::TooLarge => {
+            format!("Транскрипт сессии {short} в этом виде слишком большой; уменьшите n.")
+        }
+        Unavailable::NoAnswer => {
+            format!("Агент сессии {short} не ответил вовремя, попробуйте ещё раз.")
+        }
+        Unavailable::LinkLost => {
+            format!("Связь с агентом сессии {short} прервалась, повторите команду.")
+        }
+        Unavailable::Failed => format!("Агент сессии {short} не смог прочитать транскрипт."),
+    })
 }
 
-/// Locates, reads, parses and renders. Blocking: file IO and CPU-bound parsing.
-pub fn prepare<L: TranscriptLocator + ?Sized>(
-    locator: &L,
-    thread_id: Option<i64>,
-    command: &TranscriptCommand,
-) -> Prepared {
-    prepare_limited(locator, thread_id, command, MAX_TRANSCRIPT_BYTES)
-}
-
-fn prepare_limited<L: TranscriptLocator + ?Sized>(
-    locator: &L,
-    thread_id: Option<i64>,
-    command: &TranscriptCommand,
-    limit: u64,
-) -> Prepared {
-    let located = match locator.locate(thread_id, command.session_prefix.as_deref()) {
-        Ok(located) => located,
-        Err(error) => return Prepared::Notice(locate_notice(&error)),
-    };
-    let short = short_id(&located.session_id).to_owned();
-    let bytes = match read_limited(&located.path, limit) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            warn!(session = %short, "transcript too large to read");
-            return Prepared::Notice(format!(
-                "Транскрипт сессии {short} больше {} МБ, такие пока не показываются.",
-                limit / (1024 * 1024)
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Prepared::Notice(format!(
-                "Транскрипт сессии {short} не найден: файла нет или он ещё не записан."
-            ));
-        }
-        Err(error) => {
-            warn!(session = %short, kind = ?error.kind(), "transcript cannot be read");
-            return Prepared::Notice(format!(
-                "Транскрипт сессии {short} не читается ({:?}).",
-                error.kind()
-            ));
-        }
-    };
-    // A half-written last line or stray bytes must not fail the whole command.
-    let jsonl = String::from_utf8_lossy(&bytes);
-    let turns = transcript::parse(&jsonl);
-    let slice = transcript::last_prompts(&turns, command.prompts);
-    let body = match command.view {
-        View::Brief => transcript::render_brief(slice),
-        View::Full => transcript::render_full(slice),
-    };
+/// The reply for `body`, the agent's rendering of `command` for
+/// `session_id`, delivered exactly as rendered.
+pub fn transcript_reply(command: &TranscriptCommand, session_id: &str, body: String) -> Prepared {
+    let short = short_id(session_id).to_owned();
     if body.trim().is_empty() {
         return Prepared::Notice(format!("В сессии {short} пока нечего показывать."));
     }
@@ -419,10 +470,10 @@ pub async fn deliver(
 
 /// Answers one inbound message if it is a transcript command. Never panics and
 /// never stops the caller: every failure becomes a notice or a log line.
-pub async fn handle<L: TranscriptLocator>(
+pub async fn handle<S: TranscriptSource>(
     input: &Inbound,
     outbox: &Outbox,
-    locator: &Arc<L>,
+    source: &Arc<S>,
     bot_username: Option<&str>,
 ) {
     let Some(text) = input.text.as_deref() else {
@@ -447,14 +498,7 @@ pub async fn handle<L: TranscriptLocator>(
     };
     let view = command.view;
     let prompts = command.prompts;
-    let locator = Arc::clone(locator);
-    let prepared =
-        tokio::task::spawn_blocking(move || prepare(locator.as_ref(), thread_id, &command))
-            .await
-            .unwrap_or_else(|_| {
-                warn!(?view, "transcript preparation panicked");
-                Prepared::Notice("Не удалось подготовить транскрипт.".to_owned())
-            });
+    let prepared = source.prepare(thread_id, command).await;
     let (result, session) = match &prepared {
         Prepared::Transcript(reply) => (
             deliver(outbox, thread_id, reply).await,
@@ -477,14 +521,14 @@ pub async fn handle<L: TranscriptLocator>(
 }
 
 /// Handles commands one at a time until the sender side is dropped.
-pub async fn serve<L: TranscriptLocator>(
+pub async fn serve<S: TranscriptSource>(
     mut inbox: mpsc::UnboundedReceiver<Inbound>,
     outbox: Outbox,
-    locator: Arc<L>,
+    source: Arc<S>,
     bot_username: Option<String>,
 ) {
     while let Some(input) = inbox.recv().await {
-        handle(&input, &outbox, &locator, bot_username.as_deref()).await;
+        handle(&input, &outbox, &source, bot_username.as_deref()).await;
     }
 }
 
@@ -517,7 +561,6 @@ mod tests {
     }
 
     use std::collections::VecDeque;
-    use std::path::Path;
     use std::sync::Mutex;
 
     use transcript::{last_prompts, parse as parse_jsonl, render_brief, render_full};
@@ -525,11 +568,9 @@ mod tests {
     use super::*;
     use crate::hub::api::Message;
     use crate::hub::scheduler::{BucketConfig, Delivery, Scheduler, Transport};
-    use crate::hub::sessions::{Located, ProjectsDir};
-    use crate::hub::testdir::TempDir;
+    use crate::wire::{HookEvent, HookPost};
 
     const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
-    const PROJECT: &str = "C--proj-demo";
     const THREAD: Option<i64> = Some(7);
 
     macro_rules! fixture {
@@ -541,16 +582,6 @@ mod tests {
             ))
         };
     }
-
-    const FIXTURES: [&str; 7] = [
-        fixture!("final_answer.jsonl"),
-        fixture!("tool_use_result.jsonl"),
-        fixture!("slash_command.jsonl"),
-        fixture!("compact_summary.jsonl"),
-        fixture!("string_content.jsonl"),
-        fixture!("plain_text.jsonl"),
-        fixture!("thinking_ai_title.jsonl"),
-    ];
 
     /// Records every op; answers from a script, then `Sent`/`Done`.
     #[derive(Default)]
@@ -607,16 +638,28 @@ mod tests {
         }
     }
 
-    fn projects(jsonl: &str) -> TempDir {
-        let dir = TempDir::new("commands");
-        let project = dir.path().join(PROJECT);
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{SESSION}.jsonl")), jsonl).unwrap();
-        dir
+    /// The library output for the command, with nothing added.
+    fn expected(jsonl: &str, view: View, prompts: usize) -> String {
+        let turns = parse_jsonl(jsonl);
+        let slice = last_prompts(&turns, prompts);
+        match view {
+            View::Brief => render_brief(slice),
+            View::Full => render_full(slice),
+        }
     }
 
-    /// Runs `texts` through `serve` against `root` and a fresh scheduler.
-    async fn run(fake: &Arc<Fake>, root: &Path, texts: &[&str]) {
+    /// Renders `jsonl` like the session's agent would.
+    struct Rendered(String);
+
+    impl TranscriptSource for Rendered {
+        async fn prepare(&self, _: Option<i64>, command: TranscriptCommand) -> Prepared {
+            let body = expected(&self.0, command.view, command.prompts);
+            transcript_reply(&command, SESSION, body)
+        }
+    }
+
+    /// Runs `texts` through `serve` against `jsonl` and a fresh scheduler.
+    async fn run(fake: &Arc<Fake>, jsonl: &str, texts: &[&str]) {
         let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
         let scheduler = tokio::spawn(scheduler.run());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -633,55 +676,30 @@ mod tests {
             .unwrap();
         }
         drop(tx);
-        let locator = Arc::new(ProjectsDir::new(root.to_owned()));
-        serve(rx, outbox, locator, Some("cctg_bot".to_owned())).await;
+        let source = Arc::new(Rendered(jsonl.to_owned()));
+        serve(rx, outbox, source, Some("cctg_bot".to_owned())).await;
         scheduler.await.unwrap();
     }
 
-    /// The library output for the command, with nothing added.
-    fn expected(jsonl: &str, view: View, prompts: usize) -> String {
-        let turns = parse_jsonl(jsonl);
-        let slice = last_prompts(&turns, prompts);
-        match view {
-            View::Brief => render_brief(slice),
-            View::Full => render_full(slice),
-        }
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn replies_match_the_library_on_fixtures() {
-        for jsonl in FIXTURES {
-            let dir = projects(jsonl);
-            let fake = Arc::new(Fake::default());
-            run(
-                &fake,
-                dir.path(),
-                &["/brief", "/full 2", "/brief@cctg_bot 100 5e55"],
-            )
-            .await;
-            let want = [
-                expected(jsonl, View::Brief, DEFAULT_BRIEF_PROMPTS),
-                expected(jsonl, View::Full, 2),
-                expected(jsonl, View::Brief, 100),
-            ];
-            let mut sent = Vec::new();
-            for op in fake.ops() {
-                match op {
-                    Op::Send {
-                        thread_id, text, ..
-                    } => {
-                        assert_eq!(thread_id, THREAD);
-                        sent.push(text);
-                    }
-                    other => panic!("fixtures fit in messages, got {other:?}"),
-                }
-            }
-            let want_chunks: Vec<String> = want
-                .iter()
-                .flat_map(|text| split_for_telegram(text, SplitOptions::default()).chunks)
-                .collect();
-            assert_eq!(sent, want_chunks);
-        }
+    async fn replies_are_the_agents_rendering_exactly() {
+        let jsonl = fixture!("tool_use_result.jsonl");
+        let fake = Arc::new(Fake::default());
+        run(
+            &fake,
+            jsonl,
+            &["/brief", "/full 2", "/brief@cctg_bot 100 5e55"],
+        )
+        .await;
+        let want: Vec<String> = [
+            expected(jsonl, View::Brief, DEFAULT_BRIEF_PROMPTS),
+            expected(jsonl, View::Full, 2),
+            expected(jsonl, View::Brief, 100),
+        ]
+        .iter()
+        .flat_map(|text| split_for_telegram(text, SplitOptions::default()).chunks)
+        .collect();
+        assert_eq!(fake.texts(), want);
     }
 
     /// `exchanges` prompts, each answered with `answer_len` chars that name the exchange.
@@ -707,25 +725,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn multi_chunk_reply_keeps_order() {
         let jsonl = long_session(3, 3000);
-        let dir = projects(&jsonl);
         let fake = Arc::new(Fake::default());
-        run(&fake, dir.path(), &["/brief 3"]).await;
+        run(&fake, &jsonl, &["/brief 3"]).await;
         let sent = fake.texts();
         let want = expected(&jsonl, View::Brief, 3);
         assert!(sent.len() > 1 && sent.len() <= 4, "{} chunks", sent.len());
-        assert_eq!(
-            sent,
-            split_for_telegram(&want, SplitOptions::default()).chunks
-        );
         assert_eq!(sent.concat(), want);
     }
 
     #[tokio::test(start_paused = true)]
     async fn large_reply_goes_as_one_document() {
         let jsonl = long_session(8, 4000);
-        let dir = projects(&jsonl);
         let fake = Arc::new(Fake::default());
-        run(&fake, dir.path(), &["/full 8"]).await;
+        run(&fake, &jsonl, &["/full 8"]).await;
         let want = expected(&jsonl, View::Full, 8);
         let ops = fake.ops();
         assert_eq!(ops.len(), 1);
@@ -750,64 +762,35 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn too_long_switches_to_a_document_once() {
         let jsonl = long_session(3, 3000);
-        let dir = projects(&jsonl);
         let want = expected(&jsonl, View::Brief, 3);
         let chunks = split_for_telegram(&want, SplitOptions::default()).chunks;
         assert!(chunks.len() >= 2);
 
-        // The second chunk is rejected: the rest goes as a document.
         let fake = Fake::scripted(vec![None, Some(too_long())]);
-        run(&fake, dir.path(), &["/brief 3"]).await;
+        run(&fake, &jsonl, &["/brief 3"]).await;
         let ops = fake.ops();
         assert_eq!(ops.len(), 3, "{ops:?}");
-        assert!(matches!(&ops[0], Op::Send { text, .. } if *text == chunks[0]));
-        assert!(matches!(&ops[1], Op::Send { text, .. } if *text == chunks[1]));
         match &ops[2] {
             Op::SendDocument { document, .. } => {
-                assert_eq!(document.bytes, chunks[1..].concat().as_bytes());
-                // What the user got: the accepted chunk plus the document is
-                // the library output, nothing lost or repeated.
                 let document = String::from_utf8(document.bytes.clone()).unwrap();
                 assert_eq!(format!("{}{document}", chunks[0]), want);
             }
             other => panic!("expected a document, got {other:?}"),
         }
 
-        // Everything is rejected: one text attempt, one document, nothing more.
         let fake = Arc::new(Fake {
             always: Some((400, "Bad Request: message is too long")),
             ..Fake::default()
         });
-        run(&fake, dir.path(), &["/brief 3"]).await;
+        run(&fake, &jsonl, &["/brief 3"]).await;
         let ops = fake.ops();
         assert_eq!(ops.len(), 2, "{ops:?}");
-        assert!(matches!(ops[0], Op::Send { .. }));
         assert!(matches!(ops[1], Op::SendDocument { .. }));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn other_errors_do_not_switch_to_a_document() {
-        let jsonl = long_session(3, 3000);
-        let dir = projects(&jsonl);
-        let fake = Fake::scripted(vec![Some(ApiError::Telegram {
-            code: 400,
-            description: "Bad Request: message thread not found".to_owned(),
-        })]);
-        run(&fake, dir.path(), &["/brief 3"]).await;
-        let ops = fake.ops();
-        assert_eq!(ops.len(), 2, "{ops:?}");
-        assert!(matches!(ops[0], Op::Send { .. }));
-        assert!(matches!(
-            &ops[1],
-            Op::Send { thread_id, text, .. }
-                if *thread_id == THREAD && text == DELIVERY_FAILURE_NOTICE
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn worker_handles_the_next_command_after_failed_delivery() {
+    async fn other_errors_get_one_notice_and_the_worker_goes_on() {
         let jsonl = fixture!("final_answer.jsonl");
-        let dir = projects(jsonl);
         let fake = Fake::scripted(vec![
             Some(ApiError::Telegram {
                 code: 400,
@@ -816,216 +799,146 @@ mod tests {
             None,
             None,
         ]);
-        run(&fake, dir.path(), &["/brief", "/full 1"]).await;
+        run(&fake, jsonl, &["/brief", "/full 1", "/brief x!"]).await;
         let texts = fake.texts();
-        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(texts.len(), 4, "{texts:?}");
         assert_eq!(texts[1], DELIVERY_FAILURE_NOTICE);
         assert_eq!(texts[2], expected(jsonl, View::Full, 1));
+        assert_eq!(texts[3], USAGE);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn rejected_fallback_document_is_not_retried() {
-        let jsonl = long_session(3, 3000);
-        let dir = projects(&jsonl);
-        let fake = Fake::scripted(vec![
-            Some(too_long()),
-            Some(ApiError::Telegram {
-                code: 400,
-                description: "Bad Request: document rejected".to_owned(),
-            }),
-            None,
-        ]);
-        run(&fake, dir.path(), &["/brief 3"]).await;
-        let ops = fake.ops();
-        assert_eq!(ops.len(), 3, "{ops:?}");
-        assert!(matches!(ops[0], Op::Send { .. }));
-        assert!(matches!(ops[1], Op::SendDocument { .. }));
-        assert!(matches!(
-            &ops[2],
-            Op::Send { thread_id, text, .. }
-                if *thread_id == THREAD && text == DELIVERY_FAILURE_NOTICE
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bad_paths_get_a_notice_and_the_worker_keeps_going() {
-        let jsonl = fixture!("final_answer.jsonl");
-        let dir = projects(jsonl);
-        let session = dir.path().join(PROJECT).join(format!("{SESSION}.jsonl"));
-        // A directory named like a session is not a session.
-        let fake_dir = dir
-            .path()
-            .join(PROJECT)
-            .join("5e551017-0000-4000-8000-000000000002.jsonl");
-        std::fs::create_dir_all(&fake_dir).unwrap();
-
-        let fake = Arc::new(Fake::default());
-        run(&fake, dir.path(), &["/brief 1 ffff", "/brief", "/brief x!"]).await;
-        let sent = fake.texts();
-        assert_eq!(sent[0], "Нет сессии с таким началом id.");
-        assert_eq!(sent[1], expected(jsonl, View::Brief, DEFAULT_BRIEF_PROMPTS));
-        assert_eq!(sent[2], USAGE);
-
-        std::fs::remove_file(&session).unwrap();
-        let fake = Arc::new(Fake::default());
-        run(&fake, dir.path(), &["/brief", "/full"]).await;
-        assert_eq!(
-            fake.texts(),
-            [
-                "Сессий Claude Code пока нет.",
-                "Сессий Claude Code пока нет."
-            ]
-        );
-
-        // Only records the renderers skip: nothing to show.
-        std::fs::write(
-            &session,
-            "{\"type\":\"ai-title\",\"aiTitle\":\"t\"}
-not json
-",
-        )
-        .unwrap();
-        let fake = Arc::new(Fake::default());
-        run(&fake, dir.path(), &["/full"]).await;
-        assert_eq!(fake.texts(), ["В сессии 5e551017 пока нечего показывать."]);
-        std::fs::remove_file(&session).unwrap();
-
-        let missing = dir.path().join("absent");
-        let fake = Arc::new(Fake::default());
-        run(&fake, &missing, &["/brief"]).await;
-        assert!(fake.texts()[0].starts_with("Каталог проектов Claude Code не найден"));
-    }
-
-    /// A locator that points at a path it does not check.
-    struct Fixed(Located);
-
-    impl TranscriptLocator for Fixed {
-        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
-            Ok(self.0.clone())
-        }
-    }
-
-    #[test]
-    fn missing_and_unreadable_files_become_notices() {
-        let dir = TempDir::new("commands-unreadable");
+    #[tokio::test]
+    async fn a_stopped_actor_gives_a_notice() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
         let command = TranscriptCommand {
             view: View::Brief,
             prompts: 1,
             session_prefix: None,
         };
-        let at = |path: std::path::PathBuf| {
-            Fixed(Located {
-                session_id: SESSION.to_owned(),
-                project: PROJECT.to_owned(),
-                path,
-            })
-        };
-        let gone = prepare(&at(dir.path().join("gone.jsonl")), None, &command);
         assert_eq!(
-            gone,
-            Prepared::Notice(
-                "Транскрипт сессии 5e551017 не найден: файла нет или он ещё не записан.".to_owned()
-            )
+            Asks(tx).prepare(None, command).await,
+            Prepared::Notice(NO_ACTOR.to_owned())
         );
-        let unreadable = prepare(&at(dir.path().to_owned()), None, &command);
-        assert!(
-            matches!(&unreadable, Prepared::Notice(text) if text.starts_with("Транскрипт сессии 5e551017 не читается")),
-            "{unreadable:?}"
-        );
-        for prepared in [gone, unreadable] {
-            if let Prepared::Notice(text) = prepared {
-                assert!(!text.contains(&dir.path().display().to_string()));
-            }
-        }
+    }
+
+    fn hook(session: &str, event: HookEvent) -> HookPost {
+        HookPost::new(
+            "box".into(),
+            session.into(),
+            r"C:\w\app".into(),
+            String::new(),
+            event,
+        )
+    }
+
+    fn start(session: &str, pid: u32, parent: Option<u32>) -> HookPost {
+        hook(
+            session,
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(pid),
+                parent_claude_pid: parent,
+            },
+        )
     }
 
     #[test]
-    fn oversized_transcripts_become_a_notice() {
-        let dir = projects("");
-        let session = dir.path().join(PROJECT).join(format!("{SESSION}.jsonl"));
-        let root = ProjectsDir::new(dir.path().to_owned());
+    fn a_command_finds_its_session_in_the_registry() {
+        const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+        const B: &str = "aaaabbbb-0000-4000-8000-000000000002";
+        const N: &str = "cccccccc-0000-4000-8000-000000000003";
+        let mut registry = Registry::default();
+        assert_eq!(
+            resolve(&registry, None, None),
+            Err("Запущенных сессий нет.".to_owned())
+        );
+        registry.apply_hook(&start(A, 10, None));
+        registry.slots[0].topic_id = Some(100);
+        registry.apply_hook(&start(B, 11, None));
+        registry.apply_hook(&start(N, 12, Some(10)));
+        registry.set_title(A, "Private title");
+        // A slot topic: its current session; General: the newest running
+        // top-level one (the nested run is newer but not top-level).
+        assert_eq!(resolve(&registry, Some(100), None), Ok(A.to_owned()));
+        assert_eq!(resolve(&registry, None, None), Ok(B.to_owned()));
+        assert_eq!(resolve(&registry, Some(555), None), Ok(B.to_owned()));
+        // A prefix, anywhere, among every known session.
+        assert_eq!(
+            resolve(&registry, Some(100), Some("aaaab")),
+            Ok(B.to_owned())
+        );
+        assert_eq!(resolve(&registry, None, Some("cc")), Ok(N.to_owned()));
+        let ambiguous = resolve(&registry, None, Some("aaaa")).unwrap_err();
+        assert_eq!(
+            ambiguous,
+            "Под это начало id подходят 2 сессий, уточните:\naaaabbbb · идёт\naaaaaaaa · идёт · Private title"
+        );
+        assert_eq!(
+            resolve(&registry, None, Some("dead")),
+            Err("Нет известной hub сессии с таким началом id.".to_owned())
+        );
+        registry.apply_hook(&hook(
+            B,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: None,
+            },
+        ));
+        assert_eq!(resolve(&registry, None, None), Ok(A.to_owned()));
+    }
+
+    #[test]
+    fn the_refused_notice_names_the_missing_config_folder() {
+        // An agent refuses only when it cannot find its project folder at
+        // all; the hub never asks it for another project's transcript.
+        let Prepared::Notice(text) = unavailable(Unavailable::Refused, SESSION) else {
+            panic!();
+        };
+        assert!(
+            text.contains("CLAUDE_CONFIG_DIR") && !text.contains("не там"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn notices_name_the_short_id_only() {
+        for why in [
+            Unavailable::Nested,
+            Unavailable::NoAgent,
+            Unavailable::OldAgent,
+            Unavailable::Missing,
+            Unavailable::Refused,
+            Unavailable::Unreadable,
+            Unavailable::TooLarge,
+            Unavailable::NoAnswer,
+            Unavailable::LinkLost,
+            Unavailable::Failed,
+        ] {
+            let Prepared::Notice(text) = unavailable(why, SESSION) else {
+                panic!();
+            };
+            assert!(
+                text.contains("5e551017") && !text.contains(SESSION),
+                "{text}"
+            );
+        }
+        // Only the ended session's notice names the id to resume it.
+        let Prepared::Notice(text) = unavailable(Unavailable::Ended, SESSION) else {
+            panic!();
+        };
+        assert!(
+            text.ends_with(&format!("claude --resume {SESSION}")),
+            "{text}"
+        );
         let command = TranscriptCommand {
             view: View::Full,
             prompts: 1,
             session_prefix: None,
         };
-        let with_len = |len: u64| {
-            std::fs::File::options()
-                .write(true)
-                .open(&session)
-                .unwrap()
-                .set_len(len)
-                .unwrap();
-            prepare_limited(&root, None, &command, 16)
-        };
         assert_eq!(
-            with_len(17),
-            Prepared::Notice(
-                "Транскрипт сессии 5e551017 больше 0 МБ, такие пока не показываются.".to_owned()
-            )
-        );
-        // At the limit the file is read; zero bytes render nothing.
-        assert_eq!(
-            with_len(16),
+            transcript_reply(&command, SESSION, " \n".into()),
             Prepared::Notice("В сессии 5e551017 пока нечего показывать.".to_owned())
-        );
-        assert_eq!(read_limited(&session, 15).unwrap(), None);
-        assert_eq!(read_limited(&session, 16).unwrap(), Some(vec![0; 16]));
-    }
-
-    #[test]
-    fn ambiguous_prefix_lists_candidates() {
-        let dir = TempDir::new("ambiguous-candidates");
-        let project = "C--Users-private-name-dev";
-        let candidates: Vec<Located> = (0..12)
-            .map(|i| {
-                let path = dir.path().join(format!("candidate-{i}.jsonl"));
-                std::fs::write(
-                    &path,
-                    format!("{{\"type\":\"ai-title\",\"aiTitle\":\"Session {i}\"}}\n"),
-                )
-                .unwrap();
-                std::fs::File::options()
-                    .write(true)
-                    .open(&path)
-                    .unwrap()
-                    .set_modified(
-                        std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60),
-                    )
-                    .unwrap();
-                Located {
-                    session_id: format!("aaaa{i:04}-0000-4000-8000-000000000000"),
-                    project: project.to_owned(),
-                    path,
-                }
-            })
-            .collect();
-        let text = locate_notice(&LocateError::Ambiguous(candidates));
-        assert!(text.starts_with("Под это начало id подходят 12 сессий"));
-        assert!(
-            text.contains("\naaaa0000 · 2 ч назад · Session 0"),
-            "{text}"
-        );
-        assert!(
-            text.contains("\naaaa0009 · 2 ч назад · Session 9"),
-            "{text}"
-        );
-        assert!(!text.contains("\naaaa0010"));
-        assert!(!text.contains(project), "project directory leaked: {text}");
-        assert!(
-            !text.contains("aaaa0000-"),
-            "full session id leaked: {text}"
-        );
-        assert!(text.ends_with("… и ещё 2"));
-    }
-
-    #[test]
-    fn unreadable_projects_root_has_a_notice() {
-        assert_eq!(
-            locate_notice(&LocateError::RootUnreadable(
-                std::io::ErrorKind::PermissionDenied
-            )),
-            "Каталог проектов Claude Code не читается (PermissionDenied)."
         );
     }
 

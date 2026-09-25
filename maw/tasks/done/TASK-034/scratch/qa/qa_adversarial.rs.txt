@@ -1,0 +1,221 @@
+//! QA TASK-034: independent adversarial probes of the agent-side gate.
+//! Copied into a %TEMP% clone as crates/cctg/tests/qa_adversarial.rs.
+
+use std::path::{Path, PathBuf};
+
+use cctg::reads::answer;
+use cctg::tail::{OwnProject, project_folder_name};
+use cctg::wire::{SessionAnswer, SessionAsk, TranscriptView};
+
+const S1: &str = "9a000000-0000-4000-8000-000000000001";
+const S2: &str = "9a000000-0000-4000-8000-000000000002";
+const S3: &str = "9a000000-0000-4000-8000-000000000003";
+const AGENT: &str = "a0000000000000002";
+const PARENT: &str = include_str!("../../transcript/tests/fixtures/final_answer.jsonl");
+const SUBAGENT: &str = include_str!("../../transcript/tests/fixtures/subagent_handback.jsonl");
+
+struct Dir(PathBuf);
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn dir(name: &str) -> Dir {
+    let path = std::env::temp_dir().join(format!("cctg-qa034-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    Dir(path)
+}
+
+fn prompt(text: &str) -> String {
+    format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n")
+}
+
+fn brief() -> SessionAsk {
+    SessionAsk::Render { view: TranscriptView::Brief, prompts: 3 }
+}
+
+fn text(answers: &[SessionAnswer]) -> Option<String> {
+    let mut out = String::new();
+    for a in answers {
+        match a {
+            SessionAnswer::Text { text, .. } => out.push_str(text),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn write(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+/// After /clear the agent's env id (S1) is stale; the folder is found via
+/// S1's transcript in a folder NOT named after the cwd, and the new id S2 in
+/// the same folder is served. A session S3 of another folder is Missing and
+/// its text never leaks; its subagent files never reach the block text.
+#[test]
+fn qa_clear_after_find_serves_new_id_and_never_foreign() {
+    let d = dir("clear");
+    let root = d.0.join("projects");
+    let own = root.join("C--resolved-elsewhere");
+    let foreign = root.join("C--other-project");
+    write(&own.join(format!("{S1}.jsonl")), &prompt("first session"));
+    write(&own.join(format!("{S2}.jsonl")), PARENT);
+    write(&foreign.join(format!("{S3}.jsonl")), &prompt("private foreign"));
+    write(
+        &foreign.join(S3).join("subagents").join(format!("agent-{AGENT}.jsonl")),
+        SUBAGENT,
+    );
+    let project = OwnProject::new(root.clone(), Some(S1), Some(r"C:\some\cwd")).unwrap();
+    let got = text(&answer(Some(&project), S2, brief())).expect("text");
+    let turns = transcript::parse(PARENT);
+    assert_eq!(got, transcript::render_brief(transcript::last_prompts(&turns, 3)));
+    assert_eq!(answer(Some(&project), S3, brief()), vec![SessionAnswer::Missing]);
+    assert!(matches!(
+        answer(Some(&project), S3, SessionAsk::Title { from: 0 }).as_slice(),
+        [SessionAnswer::Missing]
+    ));
+    let block = answer(
+        Some(&project),
+        S3,
+        SessionAsk::Subagent {
+            agent_id: AGENT.into(),
+            agent_type: None,
+            description: None,
+            header: None,
+            last: Some("stop text".into()),
+        },
+    );
+    let block = text(&block).expect("fallback text");
+    assert!(!block.contains("Bash"), "foreign subagent file was read: {block}");
+    assert!(block.contains("stop text"), "{block}");
+}
+
+/// Windows reserved device names as session / agent ids from a hub: no
+/// hang, no device, answered Missing.
+#[test]
+fn qa_reserved_device_names_are_missing() {
+    let d = dir("devices");
+    let root = d.0.join("projects");
+    let own = root.join("C--w");
+    write(&own.join(format!("{S1}.jsonl")), PARENT);
+    let project = OwnProject::new(root, Some(S1), None).unwrap();
+    for id in ["NUL", "CON", "AUX", "PRN", "COM1", "LPT1", "nul"] {
+        let started = std::time::Instant::now();
+        let got = answer(Some(&project), id, brief());
+        assert_eq!(got, vec![SessionAnswer::Missing], "{id}");
+        let got = answer(Some(&project), S1, SessionAsk::Subagent {
+            agent_id: id.into(),
+            agent_type: None,
+            description: None,
+            header: None,
+            last: Some("L".into()),
+        });
+        assert!(text(&got).is_some(), "{id}: {got:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{id} slow");
+    }
+}
+
+/// Offsets past the end and prompt counts at the edges never panic.
+#[test]
+fn qa_edge_offsets_and_prompt_counts() {
+    let d = dir("edges");
+    let root = d.0.join("projects");
+    let own = root.join("C--w");
+    write(&own.join(format!("{S1}.jsonl")), PARENT);
+    let project = OwnProject::new(root, Some(S1), None).unwrap();
+    let far = u64::MAX / 2;
+    match answer(Some(&project), S1, SessionAsk::Title { from: far }).as_slice() {
+        [SessionAnswer::Title { title: None, scanned }] => assert_eq!(*scanned, far),
+        other => panic!("{other:?}"),
+    }
+    match answer(Some(&project), S1, SessionAsk::Calls { from: u64::MAX }).as_slice() {
+        [SessionAnswer::Calls { more: false, .. }] => {}
+        other => panic!("{other:?}"),
+    }
+    let turns = transcript::parse(PARENT);
+    for (asked, used) in [(0u32, 1usize), (u32::MAX, 100)] {
+        let got = text(&answer(
+            Some(&project),
+            S1,
+            SessionAsk::Render { view: TranscriptView::Full, prompts: asked },
+        ))
+        .unwrap();
+        assert_eq!(got, transcript::render_full(transcript::last_prompts(&turns, used)));
+    }
+    assert_eq!(
+        answer(Some(&project), S1, SessionAsk::Other),
+        vec![SessionAnswer::Unsupported]
+    );
+    assert_eq!(answer(None, S1, brief()), vec![SessionAnswer::Refused]);
+}
+
+/// CLAUDE_CONFIG_DIR reached through a junction: the own folder is still
+/// served (both sides canonicalized).
+#[cfg(windows)]
+#[test]
+fn qa_config_dir_through_a_junction_is_served() {
+    let d = dir("cfgjunction");
+    let real = d.0.join("realcfg");
+    let own = real.join("projects").join("C--w");
+    write(&own.join(format!("{S1}.jsonl")), PARENT);
+    let link = d.0.join("linkcfg");
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&real)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("mklink unavailable");
+        return;
+    }
+    let project = OwnProject::new(link.join("projects"), Some(S1), None).unwrap();
+    assert!(text(&answer(Some(&project), S1, brief())).is_some());
+}
+
+/// A junction inside the own folder named like a session's subagents
+/// folder that points to another project's subagents is not followed.
+#[cfg(windows)]
+#[test]
+fn qa_subagents_junction_to_foreign_project_is_not_followed() {
+    let d = dir("subjunction");
+    let root = d.0.join("projects");
+    let own = root.join("C--w");
+    write(&own.join(format!("{S1}.jsonl")), PARENT);
+    let foreign_sub = root.join("C--other").join(S3).join("subagents");
+    write(&foreign_sub.join(format!("agent-{AGENT}.jsonl")), SUBAGENT);
+    std::fs::create_dir_all(own.join(S1)).unwrap();
+    let ok = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(own.join(S1).join("subagents"))
+        .arg(&foreign_sub)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("mklink unavailable");
+        return;
+    }
+    let project = OwnProject::new(root, Some(S1), None).unwrap();
+    let got = text(&answer(Some(&project), S1, SessionAsk::Subagent {
+        agent_id: AGENT.into(),
+        agent_type: None,
+        description: None,
+        header: None,
+        last: Some("stop text".into()),
+    }))
+    .unwrap();
+    assert!(!got.contains("Bash"), "junction followed: {got}");
+}
+
+/// Folder naming sanity against an independent computation of Claude
+/// Code's rule for a short path (no hash).
+#[test]
+fn qa_folder_name_short() {
+    assert_eq!(project_folder_name(r"C:\Users\user\dev\cctg"), "C--Users-user-dev-cctg");
+    assert_eq!(project_folder_name(r"\\srv\share\x"), "--srv-share-x");
+}

@@ -1,0 +1,60 @@
+
+/// QA TASK-034: every non-text answer an agent can give (including a kind
+/// this hub does not know, and a text answered to the wrong read id) ends
+/// the `/brief` with a notice; nothing panics and the next read still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qa_every_odd_answer_gives_a_notice() {
+    let s = session("qa-odd", 7);
+    s.write(PARENT);
+    let (listener, port) = listener().await;
+    let hub = start_hub(&s.state, listener, Duration::from_secs(20)).await;
+    let fake = hub.fake.clone();
+    let agent = RawAgent::connect(port, register(&s, true));
+    wait_for("registered", 20, || agent.kinds().contains(&"registered".to_owned())).await;
+    hub.hook(s.start(4242)).await;
+    wait_for("topic", 20, || !fake.names().is_empty()).await;
+    let mut write = agent.stream.try_clone().unwrap();
+    let reads = |lines: &Arc<Mutex<Vec<Value>>>| -> Vec<u64> {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l["type"] == "session_read" && l["ask"]["kind"] == "render")
+            .filter_map(|l| l["read_id"].as_u64())
+            .collect()
+    };
+    let cases: [(Value, &str); 6] = [
+        (json!({"kind": "refused"}), "CLAUDE_CONFIG_DIR"),
+        (json!({"kind": "missing"}), "не найден"),
+        (json!({"kind": "too_large"}), ""),
+        (json!({"kind": "unreadable"}), ""),
+        (json!({"kind": "brand_new_kind", "x": 1}), ""),
+        (json!({"kind": "title", "scanned": 0}), ""),
+    ];
+    for (n, (answer, wanted)) in cases.iter().enumerate() {
+        let before = fake.sends().len();
+        hub.command(Some(THREAD), "/brief");
+        wait_for("asked", 20, || reads(&agent.lines).len() > n).await;
+        let read_id = reads(&agent.lines)[n];
+        // A stray text for another id first: ignored.
+        let stray = json!({"v": 1, "type": "session_answer", "read_id": read_id ^ 1,
+            "answer": {"kind": "text", "text": "STRAY"}});
+        let line = json!({"v": 1, "type": "session_answer", "read_id": read_id, "answer": answer});
+        writeln!(write, "{stray}\n{line}").unwrap();
+        wait_for("notice", 20, || fake.sends().len() > before).await;
+        let got = fake.sends()[before..].join("\n");
+        eprintln!("QA case {answer} -> {got}");
+        assert!(!got.contains("STRAY"), "{got}");
+        assert!(got.contains(wanted), "{answer}: {got}");
+        assert!(got.contains(&s.id[..8]), "{answer}: {got}");
+    }
+    // Still works afterwards.
+    let before = fake.sends().len();
+    hub.command(Some(THREAD), "/brief");
+    wait_for("asked", 20, || reads(&agent.lines).len() > cases.len()).await;
+    let read_id = reads(&agent.lines)[cases.len()];
+    let line = json!({"v": 1, "type": "session_answer", "read_id": read_id,
+        "answer": {"kind": "text", "text": "fine"}});
+    writeln!(write, "{line}").unwrap();
+    wait_for("text", 20, || fake.sends()[before..].iter().any(|t| t == "fine")).await;
+}

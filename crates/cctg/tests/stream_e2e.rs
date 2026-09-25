@@ -203,7 +203,7 @@ async fn start_hub(
     let sched = tokio::spawn(scheduler.run());
     let store = RegistryStore::open(state).expect("store");
     let registry = store.load().expect("load registry");
-    let (slots, _view) = Slots::new(registry, store, outbox, options());
+    let slots = Slots::new(registry, store, outbox, options());
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
     let (control, control_rx) = mpsc::unbounded_channel();

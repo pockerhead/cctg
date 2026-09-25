@@ -6,7 +6,8 @@ TASK-024
 
 TASK-031
 
-TASK-035   [waits on TASK-034 (in_progress)]
+TASK-035
+  └── TASK-044   (blocked by TASK-035)
 
 TASK-036
 

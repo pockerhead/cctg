@@ -234,6 +234,7 @@ impl Claude {
             console_commands: false,
             client: None,
             files: true,
+            session_reads: false,
         };
         let (outbox, events) = agent::spawn(LinkConfig {
             addr: addr.to_string(),
@@ -248,7 +249,7 @@ impl Claude {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 20);
         let dirs = Dirs {
-            projects: None,
+            project: None,
             work: Some(work.to_owned()),
         };
         tokio::spawn(agent::serve_channel(
@@ -395,7 +396,7 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         chat_id: CHAT,
         ..Options::default()
     };
-    let (mut slots, _view) = Slots::new(store.load().unwrap(), store, outbox, options);
+    let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
     slots.fetch_files(api);
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);

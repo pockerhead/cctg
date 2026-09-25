@@ -84,7 +84,7 @@ async fn a_status_message_that_keeps_failing_is_warned_about_once() {
         retry_every: Duration::from_millis(50),
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
     let (_agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (_control, control_rx) = mpsc::unbounded_channel();

@@ -237,12 +237,13 @@ impl Server {
                 );
                 self.emit(line)
             }
-            // Transcript reads, console keys and commands, updates and files
-            // are the agent loop's, not the channel's.
+            // Transcript and session reads, console keys and commands,
+            // updates and files are the agent loop's, not the channel's.
             LinkEvent::Message(
                 HubMsg::Registered { .. }
                 | HubMsg::Rejected { .. }
                 | HubMsg::TranscriptRead { .. }
+                | HubMsg::SessionRead { .. }
                 | HubMsg::ConsoleKey { .. }
                 | HubMsg::ConsoleCommand { .. }
                 | HubMsg::Update { .. }

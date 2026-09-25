@@ -1,0 +1,996 @@
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+index a0754a2..1f7b7fb 100644
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -404,9 +404,9 @@ pub struct Console {
+ /// Folders of the agent.
+ #[derive(Debug, Clone, Default)]
+ pub struct Dirs {
+-    /// Transcript reads are answered only from under it
+-    /// ([`tail::projects_root`]).
+-    pub projects: Option<PathBuf>,
++    /// The agent's own project folder ([`tail::own_project`]): transcript
++    /// and session reads are answered only from it; without one, none are.
++    pub project: Option<PathBuf>,
+     /// The session's working folder: files from the topic are kept under
+     /// it ([`files::save`]) and a relative `send_file` path starts there.
+     pub work: Option<PathBuf>,
+@@ -418,6 +418,7 @@ pub struct Dirs {
+ pub async fn run_stdio() -> i32 {
+     let config = DeviceConfig::load();
+     let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
++    let own_session = session_id.clone();
+     let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
+     // Not env `CLAUDE_PID`: in an MCP server it is inherited from an outer
+     // claude, or unset (TASK-004). The shim between claude and this worker
+@@ -498,8 +499,23 @@ pub async fn run_stdio() -> i32 {
+         }
+     };
+     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
++    // Derived once: after `/clear` the env session id is stale, the folder
++    // is not (TASK-034 decision 12).
++    let project = tokio::task::spawn_blocking(move || {
++        let cwd = std::env::current_dir()
++            .ok()
++            .and_then(|dir| dir.into_os_string().into_string().ok());
++        tail::projects_root()
++            .and_then(|root| tail::own_project(&root, own_session.as_deref(), cwd.as_deref()))
++    })
++    .await
++    .ok()
++    .flatten();
++    if project.is_none() {
++        debug!("own project folder unknown; transcript reads refused");
++    }
+     let dirs = Dirs {
+-        projects: tail::projects_root(),
++        project,
+         work: std::env::current_dir().ok(),
+     };
+     let worker = Some(Arc::new(worker));
+@@ -608,8 +624,8 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
+ 
+ /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
+ /// when stdin ends (the hub link stops with it) or stdout fails. Transcript
+-/// reads are answered only from under `dirs.projects`
+-/// ([`tail::projects_root`]); files from the topic are kept under
++/// reads are answered only from `dirs.project` ([`tail::own_project`]);
++/// files from the topic are kept under
+ /// `dirs.work`. Console keys are pressed and commands typed with `console`;
+ /// without one a `console_key` or `console_command` is answered as failed.
+ ///
+@@ -633,8 +649,8 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
+ ) -> std::io::Result<Ended> {
+     let (reads, session_reads, console_jobs, outbox) = match &hub {
+         Hub::Link(outbox) => (
+-            Some(spawn_reader(outbox.clone(), dirs.projects.clone())),
+-            Some(spawn_session_reader(outbox.clone(), dirs.projects.clone())),
++            Some(spawn_reader(outbox.clone(), dirs.project.clone())),
++            Some(spawn_session_reader(outbox.clone(), dirs.project.clone())),
+             Some(spawn_console(outbox.clone(), console)),
+             Some(outbox.clone()),
+         ),
+@@ -1299,14 +1315,14 @@ type ReadRequest = (String, String, Option<u64>);
+ /// an answer gets lost with the link.
+ fn spawn_reader(
+     outbox: mpsc::Sender<AgentMsg>,
+-    projects: Option<PathBuf>,
++    project: Option<PathBuf>,
+ ) -> mpsc::Sender<ReadRequest> {
+     let (requests, mut pending) = mpsc::channel::<ReadRequest>(1);
+     tokio::spawn(async move {
+         while let Some((session_id, path, from)) = pending.recv().await {
+-            let root = projects.clone();
++            let project = project.clone();
+             let chunk = tokio::task::spawn_blocking(move || {
+-                tail::read_chunk(root.as_deref(), &session_id, &path, from)
++                tail::read_chunk(project.as_deref(), &session_id, &path, from)
+             })
+             .await;
+             if let Ok(chunk) = chunk
+@@ -1330,14 +1346,14 @@ const SESSION_READS: usize = 8;
+ /// a text, is queued for the hub in order.
+ fn spawn_session_reader(
+     outbox: mpsc::Sender<AgentMsg>,
+-    projects: Option<PathBuf>,
++    project: Option<PathBuf>,
+ ) -> mpsc::Sender<SessionRead> {
+     let (requests, mut pending) = mpsc::channel::<SessionRead>(SESSION_READS);
+     tokio::spawn(async move {
+         while let Some((read_id, session_id, path, ask)) = pending.recv().await {
+-            let root = projects.clone();
++            let project = project.clone();
+             let answers = tokio::task::spawn_blocking(move || {
+-                reads::answer(root.as_deref(), &session_id, &path, ask)
++                reads::answer(project.as_deref(), &session_id, &path, ask)
+             })
+             .await
+             .unwrap_or_default();
+@@ -1895,12 +1911,12 @@ mod tests {
+     fn claude_reading(
+         hub: Hub,
+         events: Option<mpsc::Receiver<LinkEvent>>,
+-        projects: Option<PathBuf>,
++        project: Option<PathBuf>,
+     ) -> Claude {
+         let (frames, frames_rx) = mpsc::channel(16);
+         let (ours, theirs) = tokio::io::duplex(1 << 16);
+         let dirs = Dirs {
+-            projects,
++            project,
+             work: None,
+         };
+         tokio::spawn(serve_channel(
+@@ -2156,11 +2172,7 @@ mod tests {
+             .unwrap();
+         let addr = listener.local_addr().unwrap();
+         let (outbox, events) = spawn(config(addr, Backoff::default()));
+-        let mut claude = claude_reading(
+-            Hub::Link(outbox),
+-            Some(events),
+-            Some(dir.path().join("projects")),
+-        );
++        let mut claude = claude_reading(Hub::Link(outbox), Some(events), Some(project.clone()));
+         claude
+             .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
+             .await;
+@@ -2224,11 +2236,7 @@ mod tests {
+             .unwrap();
+         let addr = listener.local_addr().unwrap();
+         let (outbox, events) = spawn(config(addr, Backoff::default()));
+-        let mut claude = claude_reading(
+-            Hub::Link(outbox),
+-            Some(events),
+-            Some(dir.path().join("projects")),
+-        );
++        let mut claude = claude_reading(Hub::Link(outbox), Some(events), Some(project.clone()));
+         claude
+             .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
+             .await;
+@@ -2469,7 +2477,7 @@ mod tests {
+         let (frames, frames_rx) = mpsc::channel(16);
+         let (ours, theirs) = tokio::io::duplex(1 << 20);
+         let dirs = Dirs {
+-            projects: None,
++            project: None,
+             work: Some(work.to_owned()),
+         };
+         tokio::spawn(serve_channel(
+diff --git a/crates/cctg/src/hub/commands.rs b/crates/cctg/src/hub/commands.rs
+index 0cbe82a..2c13159 100644
+--- a/crates/cctg/src/hub/commands.rs
++++ b/crates/cctg/src/hub/commands.rs
+@@ -288,6 +288,9 @@ pub enum Unavailable {
+     NoTranscript,
+     /// The agent found no transcript file.
+     Missing,
++    /// The agent serves only its own project folder's transcripts, and this
++    /// one is not in it (or it could not tell its folder).
++    Refused,
+     /// The file is there but could not be read.
+     Unreadable,
+     /// Over what the agent renders or the hub takes.
+@@ -323,6 +326,9 @@ pub fn unavailable(why: Unavailable, session_id: &str) -> Prepared {
+         Unavailable::Missing => {
+             format!("Транскрипт сессии {short} не найден: файла нет или он ещё не записан.")
+         }
++        Unavailable::Refused => format!(
++            "Агент сессии {short} отдаёт только транскрипты папки проекта своей сессии, а этот лежит не там (или папку проекта агент определить не смог)."
++        ),
+         Unavailable::Unreadable => format!("Транскрипт сессии {short} не читается."),
+         Unavailable::TooLarge => {
+             format!("Транскрипт сессии {short} в этом виде слишком большой; уменьшите n.")
+@@ -890,6 +896,7 @@ mod tests {
+             Unavailable::NoAgent,
+             Unavailable::OldAgent,
+             Unavailable::Missing,
++            Unavailable::Refused,
+             Unavailable::Unreadable,
+             Unavailable::TooLarge,
+             Unavailable::NoAnswer,
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+index bf7fa06..939f869 100644
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -571,6 +571,7 @@ fn not_modified(delivery: &Delivery) -> bool {
+ fn failure(answer: &SessionAnswer) -> Unavailable {
+     match answer {
+         SessionAnswer::Missing => Unavailable::Missing,
++        SessionAnswer::Refused => Unavailable::Refused,
+         SessionAnswer::Unreadable => Unavailable::Unreadable,
+         SessionAnswer::TooLarge => Unavailable::TooLarge,
+         _ => Unavailable::Failed,
+@@ -8661,6 +8662,11 @@ again"
+         dir.path().join("projects")
+     }
+ 
++    /// The tests' agents' own project folder: `<dir>/projects/C--w`.
++    fn own_project(dir: &TempDir) -> std::path::PathBuf {
++        projects(dir).join("C--w")
++    }
++
+     /// `<dir>/projects/C--w/<session>.jsonl` holding `jsonl`.
+     fn parent_file(dir: &TempDir, session: &str, jsonl: &str) -> std::path::PathBuf {
+         let project = projects(dir).join("C--w");
+@@ -8720,7 +8726,7 @@ again"
+             let (to_agent, mut from_hub) = mpsc::channel(16);
+             let (kept, kept_rx) = mpsc::unbounded_channel();
+             let agents = self.agents.clone();
+-            let root = projects(&self.dir);
++            let root = own_project(&self.dir);
+             tokio::spawn(async move {
+                 while let Some(msg) = from_hub.recv().await {
+                     let HubMsg::SessionRead {
+@@ -8793,7 +8799,7 @@ again"
+             else {
+                 continue;
+             };
+-            for answer in crate::reads::answer(Some(&projects(dir)), &session_id, &path, ask) {
++            for answer in crate::reads::answer(Some(&own_project(dir)), &session_id, &path, ask) {
+                 slots.on_agent(AgentEvent::Message {
+                     conn,
+                     received_at: StdInstant::now(),
+@@ -8957,11 +8963,18 @@ again"
+         let mut rig = rig(Fake::default(), subagent_options());
+         rig.agent_of(1, A, Some(10)).await;
+         rig.hook(start(A, 10)).await;
+-        rig.ops_after(1).await;
++        // The bind may land after the topic: then an icon edit follows.
++        bound(&rig).await;
++        let before = rig.fake.ops().len();
+         let path = agent_file(&rig.dir, A, S1, Some(SUBAGENT_JSONL), None);
+         rig.hook(sub_start(A, S1, "Explore")).await;
+         tokio::time::sleep(Duration::from_millis(600)).await;
+-        assert_eq!(rig.fake.ops().len(), 1, "no block before the stop");
++        assert_eq!(
++            rig.fake.ops().len(),
++            before,
++            "no block before the stop: {:?}",
++            rig.fake.ops()
++        );
+         rig.hook(hook(
+             A,
+             HookEvent::SubagentHandback {
+@@ -10502,7 +10515,7 @@ again"
+             let (to_agent, mut from_hub) = mpsc::channel(16);
+             let (kept, kept_rx) = mpsc::unbounded_channel();
+             let agents = self.agents.clone();
+-            let root = self.dir.path().join("projects");
++            let root = self.dir.path().join("projects").join("C--w");
+             tokio::spawn(async move {
+                 while let Some(msg) = from_hub.recv().await {
+                     let HubMsg::TranscriptRead {
+diff --git a/crates/cctg/src/reads.rs b/crates/cctg/src/reads.rs
+index 73afcca..e5c570f 100644
+--- a/crates/cctg/src/reads.rs
++++ b/crates/cctg/src/reads.rs
+@@ -4,13 +4,17 @@
+ //! the first ai-title, the `Agent` calls of the transcript, or the finished
+ //! text of a subagent block.
+ //!
+-//! Only the session's own files under the Claude projects directory of this
+-//! device are opened, checked on the canonical path (no `..`, symlink or
+-//! junction way out): its transcript `<root>/<project>/<session_id>.jsonl`
++//! Only files of the agent's own project folder are opened
++//! ([`tail::own_project`]: the `projects/<project>` folder of its claude
++//! session), checked on the canonical path (no `..`, symlink or junction way
++//! out): a transcript `<project>/<session_id>.jsonl`
+ //! ([`tail::open_transcript`]) and its subagents' `agent-<id>.jsonl` and
+-//! `agent-<id>.meta.json` in `<root>/<project>/<session_id>/subagents/`.
+-//! The hub names the session it bound the agent to; the path must be that
+-//! session's file.
++//! `agent-<id>.meta.json` in `<project>/<session_id>/subagents/`. The hub
++//! names the session it bound the agent to; the path must be that session's
++//! file. Any session id of the folder is served (after `/clear` the id
++//! changes, the folder does not); a transcript of another project folder is
++//! `refused`, and so is everything when the agent could not tell its folder
++//! (TASK-034 decision 12: a remote hub must not read other projects).
+ //!
+ //! Every answer fits in one link line: texts go in pieces of at most
+ //! [`PIECE`] bytes (six times that when every byte is escaped still stays
+@@ -26,7 +30,7 @@ use transcript::Block;
+ 
+ use crate::hub::registry::cut;
+ use crate::hub::subagents::{BodyInput, body_text, is_agent_id};
+-use crate::tail::{is_plain_session_id, open_transcript};
++use crate::tail::{Closed, is_plain_session_id, open_transcript};
+ use crate::wire::{SessionAnswer, SessionAsk, SpawnCall, SpawnLink, TranscriptView};
+ 
+ /// Largest transcript rendered, scanned for a title or for `Agent` calls
+@@ -54,21 +58,22 @@ const MAX_TITLE: usize = 1024;
+ pub const MAX_PROMPTS: u32 = 100;
+ const AGENT_TOOL: &str = "Agent";
+ 
+-/// Answers one `session_read`. Blocking: file IO and parsing. `root` is
+-/// [`crate::tail::projects_root`]; without one nothing is read.
++/// Answers one `session_read`. Blocking: file IO and parsing. `project` is
++/// the agent's own project folder ([`crate::tail::own_project`]); without
++/// one every read is `refused`.
+ pub fn answer(
+-    root: Option<&Path>,
++    project: Option<&Path>,
+     session_id: &str,
+     path: &str,
+     ask: SessionAsk,
+ ) -> Vec<SessionAnswer> {
+-    let Some(root) = root else {
+-        return vec![SessionAnswer::Missing];
++    let Some(project) = project else {
++        return vec![SessionAnswer::Refused];
+     };
+     match ask {
+-        SessionAsk::Render { view, prompts } => render(root, session_id, path, view, prompts),
+-        SessionAsk::Title { from } => vec![title(root, session_id, path, from)],
+-        SessionAsk::Calls { from } => vec![calls(root, session_id, path, from)],
++        SessionAsk::Render { view, prompts } => render(project, session_id, path, view, prompts),
++        SessionAsk::Title { from } => vec![title(project, session_id, path, from)],
++        SessionAsk::Calls { from } => vec![calls(project, session_id, path, from)],
+         SessionAsk::Subagent {
+             agent_id,
+             agent_type,
+@@ -85,12 +90,20 @@ pub fn answer(
+                 last,
+                 header,
+             };
+-            subagent(root, session_id, &input)
++            subagent(project, session_id, &input)
+         }
+         SessionAsk::Other => vec![SessionAnswer::Unsupported],
+     }
+ }
+ 
++/// The answer for a transcript the gate did not open.
++fn closed(why: Closed) -> SessionAnswer {
++    match why {
++        Closed::Missing => SessionAnswer::Missing,
++        Closed::OtherProject => SessionAnswer::Refused,
++    }
++}
++
+ /// `text` as answers of at most [`PIECE`] bytes, cut on char boundaries;
+ /// an empty text is one empty piece.
+ pub fn pieces(text: &str) -> Vec<SessionAnswer> {
+@@ -118,14 +131,15 @@ pub fn pieces(text: &str) -> Vec<SessionAnswer> {
+ }
+ 
+ fn render(
+-    root: &Path,
++    project: &Path,
+     session_id: &str,
+     path: &str,
+     view: TranscriptView,
+     prompts: u32,
+ ) -> Vec<SessionAnswer> {
+-    let Some(file) = open_transcript(root, session_id, path) else {
+-        return vec![SessionAnswer::Missing];
++    let file = match open_transcript(project, session_id, path) {
++        Ok(file) => file,
++        Err(why) => return vec![closed(why)],
+     };
+     let bytes = match read_limited(file, MAX_TRANSCRIPT_BYTES) {
+         Ok(Some(bytes)) => bytes,
+@@ -153,9 +167,10 @@ fn read_limited(file: File, limit: u64) -> io::Result<Option<Vec<u8>>> {
+     Ok((bytes.len() as u64 <= limit).then_some(bytes))
+ }
+ 
+-fn title(root: &Path, session_id: &str, path: &str, from: u64) -> SessionAnswer {
+-    let Some(mut file) = open_transcript(root, session_id, path) else {
+-        return SessionAnswer::Missing;
++fn title(project: &Path, session_id: &str, path: &str, from: u64) -> SessionAnswer {
++    let mut file = match open_transcript(project, session_id, path) {
++        Ok(file) => file,
++        Err(why) => return closed(why),
+     };
+     if file.seek(SeekFrom::Start(from)).is_err() {
+         return SessionAnswer::Title {
+@@ -192,9 +207,10 @@ fn first_ai_title(jsonl: impl Read, limit: u64) -> (Option<String>, u64) {
+     }
+ }
+ 
+-fn calls(root: &Path, session_id: &str, path: &str, from: u64) -> SessionAnswer {
+-    let Some(mut file) = open_transcript(root, session_id, path) else {
+-        return SessionAnswer::Missing;
++fn calls(project: &Path, session_id: &str, path: &str, from: u64) -> SessionAnswer {
++    let mut file = match open_transcript(project, session_id, path) {
++        Ok(file) => file,
++        Err(why) => return closed(why),
+     };
+     let mut found = SessionAnswer::Calls {
+         offset: from,
+@@ -290,36 +306,36 @@ fn scan_lines(jsonl: impl Read, limit: u64, found: &mut SessionAnswer) {
+ /// The finished block: reads `agent-<id>.jsonl` (`input.agent_path`) and
+ /// its `.meta.json`, when they are this session's, then the library picks
+ /// the body (finished transcript, last message).
+-fn subagent(root: &Path, session_id: &str, input: &BodyInput) -> Vec<SessionAnswer> {
++fn subagent(project: &Path, session_id: &str, input: &BodyInput) -> Vec<SessionAnswer> {
+     if !is_agent_id(&input.agent_id) || !is_plain_session_id(session_id) {
+         return vec![SessionAnswer::Missing];
+     }
+     let jsonl = format!("agent-{}.jsonl", input.agent_id);
+-    let transcript = open_subagent_file(root, session_id, &input.agent_path, &jsonl)
++    let transcript = open_subagent_file(project, session_id, &input.agent_path, &jsonl)
+         .and_then(|file| read_capped(file, MAX_AGENT_BYTES));
+     let meta = input.agent_path.strip_suffix(".jsonl").and_then(|stem| {
+         let name = format!("agent-{}.meta.json", input.agent_id);
+-        open_subagent_file(root, session_id, &format!("{stem}.meta.json"), &name)
++        open_subagent_file(project, session_id, &format!("{stem}.meta.json"), &name)
+             .and_then(|file| read_capped(file, MAX_META_BYTES))
+     });
+     pieces(&body_text(input, meta.as_deref(), transcript.as_deref()))
+ }
+ 
+ /// The file `name` of the session's subagents, opened only when its
+-/// canonical path is `<canonical root>/<project>/<session_id>/subagents/
+-/// <name>` and it is a file.
+-fn open_subagent_file(root: &Path, session_id: &str, path: &str, name: &str) -> Option<File> {
++/// canonical path is `<canonical project>/<session_id>/subagents/<name>` and
++/// it is a file.
++fn open_subagent_file(project: &Path, session_id: &str, path: &str, name: &str) -> Option<File> {
+     if path.is_empty() {
+         return None;
+     }
+     let path = std::fs::canonicalize(path).ok()?;
+-    let root = std::fs::canonicalize(root).ok()?;
++    let project = std::fs::canonicalize(project).ok()?;
+     let subagents = path.parent()?;
+     let session = subagents.parent()?;
+     let inside = path.file_name().is_some_and(|file| *file == *name)
+         && subagents.file_name().is_some_and(|dir| dir == "subagents")
+         && session.file_name().is_some_and(|dir| *dir == *session_id)
+-        && session.parent().and_then(Path::parent) == Some(root.as_path());
++        && session.parent() == Some(project.as_path());
+     if !inside {
+         return None;
+     }
+@@ -387,7 +403,7 @@ mod tests {
+     }
+ 
+     fn ask(dir: &TempDir, session: &str, path: &str, ask: SessionAsk) -> Vec<SessionAnswer> {
+-        answer(Some(&root(dir)), session, path, ask)
++        answer(Some(&root(dir).join("C--proj")), session, path, ask)
+     }
+ 
+     fn text(answers: &[SessionAnswer]) -> String {
+@@ -485,13 +501,9 @@ mod tests {
+         let dir = TempDir::new("reads-missing");
+         let path = transcript(&dir, SESSION, PARENT);
+         let brief = || render_ask(TranscriptView::Brief, 3);
+-        // Another session's id, a traversal id, no root.
++        // Another session's id, a traversal id.
+         assert_eq!(ask(&dir, OTHER, &path, brief()), [SessionAnswer::Missing]);
+         assert_eq!(ask(&dir, "../x", &path, brief()), [SessionAnswer::Missing]);
+-        assert_eq!(
+-            answer(None, SESSION, &path, brief()),
+-            [SessionAnswer::Missing]
+-        );
+         // The right name outside the root, and through `..`.
+         let outside = dir.path().join("elsewhere").join("C--proj");
+         std::fs::create_dir_all(&outside).unwrap();
+@@ -762,6 +774,60 @@ mod tests {
+         assert_eq!(ask(&dir, SESSION, &path, bad), [SessionAnswer::Missing]);
+     }
+ 
++    #[test]
++    fn another_project_folder_is_refused_and_any_session_of_the_own_one_is_served() {
++        let dir = TempDir::new("reads-own-project");
++        transcript(&dir, SESSION, PARENT);
++        // A session of another project, named by the hub with its real path:
++        // refused for every ask, its subagent files are not read.
++        let foreign = root(&dir).join("C--other");
++        std::fs::create_dir_all(&foreign).unwrap();
++        let foreign_path = foreign.join(format!("{OTHER}.jsonl"));
++        std::fs::write(&foreign_path, PARENT).unwrap();
++        let foreign_path = foreign_path.to_string_lossy();
++        for kind in [
++            render_ask(TranscriptView::Brief, 3),
++            SessionAsk::Title { from: 0 },
++            SessionAsk::Calls { from: 0 },
++        ] {
++            assert_eq!(
++                ask(&dir, OTHER, &foreign_path, kind),
++                [SessionAnswer::Refused]
++            );
++        }
++        let subagents = foreign.join(OTHER).join("subagents");
++        std::fs::create_dir_all(&subagents).unwrap();
++        let agent_path = subagents.join(format!("agent-{AGENT}.jsonl"));
++        std::fs::write(&agent_path, SUBAGENT).unwrap();
++        std::fs::write(subagents.join(format!("agent-{AGENT}.meta.json")), META).unwrap();
++        let last = "Report handed back.";
++        let block = SessionAsk::Subagent {
++            agent_id: AGENT.into(),
++            agent_type: None,
++            description: None,
++            header: None,
++            last: Some(last.into()),
++        };
++        assert_eq!(
++            text(&ask(&dir, OTHER, &agent_path.to_string_lossy(), block)),
++            format!(
++                "↳ agent {AGENT}
++{last}"
++            )
++        );
++        // A new session id of the own folder (after `/clear`) is served.
++        let cleared = transcript(&dir, OTHER, PARENT);
++        assert!(matches!(
++            ask(&dir, OTHER, &cleared, render_ask(TranscriptView::Brief, 3))[..],
++            [SessionAnswer::Text { .. }]
++        ));
++        // No own project folder: nothing is served.
++        assert_eq!(
++            answer(None, OTHER, &cleared, render_ask(TranscriptView::Brief, 3)),
++            [SessionAnswer::Refused]
++        );
++    }
++
+     #[cfg(windows)]
+     #[test]
+     fn case_and_separators_name_the_same_file_but_the_id_must_be_the_files() {
+diff --git a/crates/cctg/src/tail.rs b/crates/cctg/src/tail.rs
+index 5c8bdf9..fac3b9b 100644
+--- a/crates/cctg/src/tail.rs
++++ b/crates/cctg/src/tail.rs
+@@ -8,11 +8,13 @@
+ //! line becomes its [`transcript::stream_events`]; lines without events are
+ //! passed over but still move `to`.
+ //!
+-//! Only the session's own transcript under the Claude projects directory of
+-//! this device is opened: `<CLAUDE_CONFIG_DIR|~/.claude>/projects/<project>/
+-//! <session_id>.jsonl`, checked on the canonical path (no `..`, symlink or
+-//! junction way out). The hub is trusted, but the link must never become a
+-//! way to read other files of the device.
++//! Only a transcript in the agent's own project folder is opened
++//! ([`own_project`]: `<CLAUDE_CONFIG_DIR|~/.claude>/projects/<project>` of
++//! its claude session): `<project>/<session_id>.jsonl`, checked on the
++//! canonical path (no `..`, symlink or junction way out). Any session id in
++//! that folder is served (after `/clear` the id changes, the folder does
++//! not); another project's sessions never are, even when the hub names them
++//! (TASK-034 decision 12: the hub may run on another machine).
+ 
+ use std::fs::File;
+ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+@@ -60,11 +62,49 @@ pub fn projects_root() -> Option<PathBuf> {
+     home.map(|home| PathBuf::from(home).join(".claude").join("projects"))
+ }
+ 
++/// The agent's own project folder under `root` (the projects directory), for
++/// its claude session `session_id` started in `cwd`: the folder that already
++/// holds `<session_id>.jsonl` (a resumed session), else Claude Code's folder
++/// for `cwd` ([`project_folder_name`]), which a new session writes into.
++/// `None` without a session id or a cwd: then nothing is read. Derived once
++/// at start; blocking (it may list `root`).
++pub fn own_project(root: &Path, session_id: Option<&str>, cwd: Option<&str>) -> Option<PathBuf> {
++    let session_id = session_id.filter(|id| is_plain_session_id(id))?;
++    let file = format!("{session_id}.jsonl");
++    let by_cwd = cwd
++        .filter(|cwd| !cwd.is_empty())
++        .map(|cwd| root.join(project_folder_name(cwd)));
++    if let Some(project) = by_cwd.as_ref().filter(|p| p.join(&file).is_file()) {
++        return Some(project.clone());
++    }
++    let found = std::fs::read_dir(root).ok().and_then(|entries| {
++        entries
++            .flatten()
++            .map(|entry| entry.path())
++            .find(|project| project.join(&file).is_file())
++    });
++    found.or(by_cwd)
++}
++
++/// Claude Code's project folder name for a working folder: every UTF-16 unit
++/// that is not an ASCII letter or digit becomes `-` (`C:\Users\a_b` is
++/// `C--Users-a-b`; checked against this machine's folders in TASK-034).
++/// Claude Code shortens very long names its own way; such a folder is found
++/// only through its transcript ([`own_project`]), else reads fail closed.
++pub fn project_folder_name(cwd: &str) -> String {
++    cwd.encode_utf16()
++        .map(|unit| match char::from_u32(u32::from(unit)) {
++            Some(c) if c.is_ascii_alphanumeric() => c,
++            _ => '-',
++        })
++        .collect()
++}
++
+ /// Reads the chunk the hub asked for. Never fails: a file that cannot be
+-/// opened (or is not the session's transcript under `root`) is `missing`, a
+-/// read error ends the chunk where it happened.
++/// opened (or is not a transcript of the agent's own `project` folder) is
++/// `missing`, a read error ends the chunk where it happened.
+ pub fn read_chunk(
+-    root: Option<&Path>,
++    project: Option<&Path>,
+     session_id: &str,
+     path: &str,
+     from: Option<u64>,
+@@ -79,7 +119,9 @@ pub fn read_chunk(
+         more: false,
+         reset,
+     };
+-    let Some(mut file) = root.and_then(|root| open_transcript(root, session_id, path)) else {
++    let Some(mut file) =
++        project.and_then(|project| open_transcript(project, session_id, path).ok())
++    else {
+         return empty(true, false);
+     };
+     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+@@ -161,22 +203,51 @@ pub fn read_chunk(
+     }
+ }
+ 
+-/// The session's own transcript, opened only when its canonical path is
+-/// `<canonical root>/<project>/<session_id>.jsonl` and it is a file.
+-pub(crate) fn open_transcript(root: &Path, session_id: &str, path: &str) -> Option<File> {
++/// Why [`open_transcript`] opened nothing.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Closed {
++    /// No such transcript in the agent's project folder.
++    Missing,
++    /// The transcript of that id lies in another project folder of the same
++    /// projects directory: not this agent's to serve.
++    OtherProject,
++}
++
++/// A transcript of the agent's own `project` folder, opened only when its
++/// canonical path is `<canonical project>/<session_id>.jsonl` and it is a
++/// file.
++pub(crate) fn open_transcript(
++    project: &Path,
++    session_id: &str,
++    path: &str,
++) -> Result<File, Closed> {
+     if !is_plain_session_id(session_id) {
+-        return None;
++        return Err(Closed::Missing);
+     }
+     let name = format!("{session_id}.jsonl");
+-    let path = std::fs::canonicalize(path).ok()?;
+-    let root = std::fs::canonicalize(root).ok()?;
+-    let inside = path.parent().and_then(Path::parent) == Some(root.as_path())
+-        && path.file_name().is_some_and(|file| *file == *name);
+-    if !inside {
+-        return None;
++    let path = std::fs::canonicalize(path).map_err(|_| Closed::Missing)?;
++    if path.file_name().is_none_or(|file| *file != *name) {
++        return Err(Closed::Missing);
++    }
++    let folder = path.parent();
++    // The own folder does not exist before the session's first transcript.
++    let own = std::fs::canonicalize(project).ok();
++    if own.is_none() || folder != own.as_deref() {
++        let root = project
++            .parent()
++            .and_then(|root| std::fs::canonicalize(root).ok());
++        let sibling = root.is_some() && folder.and_then(Path::parent) == root.as_deref();
++        return Err(if sibling && path.is_file() {
++            Closed::OtherProject
++        } else {
++            Closed::Missing
++        });
++    }
++    let file = File::open(&path).map_err(|_| Closed::Missing)?;
++    match file.metadata() {
++        Ok(meta) if meta.is_file() => Ok(file),
++        _ => Err(Closed::Missing),
+     }
+-    let file = File::open(&path).ok()?;
+-    file.metadata().ok()?.is_file().then_some(file)
+ }
+ 
+ /// A session id that can only name one file: letters, digits and dashes.
+@@ -319,8 +390,13 @@ mod tests {
+         file.write_all(bytes.as_bytes()).unwrap();
+     }
+ 
++    /// The agent's own project folder in these tests.
++    fn project(dir: &TempDir) -> PathBuf {
++        root(dir).join("C--work")
++    }
++
+     fn read(dir: &TempDir, path: &str, from: Option<u64>) -> AgentMsg {
+-        read_chunk(Some(&root(dir)), SESSION, path, from)
++        read_chunk(Some(&project(dir)), SESSION, path, from)
+     }
+ 
+     /// (from, to, texts, missing, more, reset)
+@@ -488,24 +564,92 @@ mod tests {
+         let other_root = dir.path().join("other");
+         assert!(texts(&read_chunk(Some(&other_root), SESSION, &path, Some(0))).3);
+         assert!(texts(&read_chunk(None, SESSION, &path, Some(0))).3);
++        // The projects directory itself is no project folder.
++        assert!(texts(&read_chunk(Some(&root(&dir)), SESSION, &path, Some(0))).3);
+         // Another session's name, or a session id that is not plain.
+         assert!(
+             texts(&read_chunk(
+-                Some(&root(&dir)),
++                Some(&project(&dir)),
+                 "other-session",
+                 &path,
+                 Some(0)
+             ))
+             .3
+         );
+-        assert!(texts(&read_chunk(Some(&root(&dir)), "../x", &path, Some(0))).3);
++        assert!(texts(&read_chunk(Some(&project(&dir)), "../x", &path, Some(0))).3);
+         assert_eq!(texts(&read(&dir, &path, Some(0))).2, ["mine"]);
+     }
+ 
++    #[test]
++    fn only_transcripts_of_the_agents_own_project_folder_are_served() {
++        let dir = TempDir::new("tail-own-project");
++        let mine = transcript(&dir);
++        append(&mine, &prompt("mine"));
++        // Another project's session, named by the hub with its real path.
++        let foreign = root(&dir).join("C--other");
++        std::fs::create_dir_all(&foreign).unwrap();
++        let foreign = foreign.join(format!("{SESSION}.jsonl"));
++        std::fs::write(&foreign, prompt("private")).unwrap();
++        let foreign = foreign.to_string_lossy();
++        assert!(texts(&read(&dir, &foreign, Some(0))).3);
++        assert_eq!(
++            open_transcript(&project(&dir), SESSION, &foreign).err(),
++            Some(Closed::OtherProject)
++        );
++        // Also before the own folder exists (a new session).
++        let unborn = root(&dir).join("C--new");
++        assert_eq!(
++            open_transcript(&unborn, SESSION, &foreign).err(),
++            Some(Closed::OtherProject)
++        );
++        // A new session id in the same folder (after `/clear`) is served.
++        let cleared = "5e551017-0000-4000-8000-000000000002";
++        let next = project(&dir).join(format!("{cleared}.jsonl"));
++        std::fs::write(&next, prompt("after clear")).unwrap();
++        let got = read_chunk(
++            Some(&project(&dir)),
++            cleared,
++            &next.to_string_lossy(),
++            Some(0),
++        );
++        assert_eq!(texts(&got).2, ["after clear"]);
++    }
++
++    #[test]
++    fn the_own_project_is_the_transcripts_folder_else_the_cwds() {
++        let dir = TempDir::new("tail-own-derive");
++        let root = root(&dir);
++        std::fs::create_dir_all(&root).unwrap();
++        let cwd = r"C:\Users\a_b\my dev.x";
++        assert_eq!(project_folder_name(cwd), "C--Users-a-b-my-dev-x");
++        assert_eq!(project_folder_name("/home/я/w"), "-home---w");
++        // A new session: nothing written yet, Claude Code's folder for the cwd.
++        assert_eq!(
++            own_project(&root, Some(SESSION), Some(cwd)),
++            Some(root.join("C--Users-a-b-my-dev-x"))
++        );
++        // A resumed session: the folder its transcript is in.
++        let resumed = root.join("C--elsewhere");
++        std::fs::create_dir_all(&resumed).unwrap();
++        std::fs::write(resumed.join(format!("{SESSION}.jsonl")), "").unwrap();
++        assert_eq!(own_project(&root, Some(SESSION), Some(cwd)), Some(resumed));
++        assert_eq!(
++            own_project(&root, Some(SESSION), None),
++            Some(root.join("C--elsewhere"))
++        );
++        // Nothing to derive it from: no reads at all.
++        let fresh = "5e551017-0000-4000-8000-000000000009";
++        assert_eq!(own_project(&root, Some(fresh), None), None);
++        assert_eq!(own_project(&root, Some(fresh), Some("")), None);
++        assert_eq!(own_project(&root, None, Some(cwd)), None);
++        assert_eq!(own_project(&root, Some("../x"), Some(cwd)), None);
++    }
++
+     #[cfg(windows)]
+     #[test]
+     fn a_junction_out_of_the_projects_root_is_not_followed() {
+         let dir = TempDir::new("tail-junction");
++        transcript(&dir);
+         let outside = dir.path().join("elsewhere");
+         std::fs::create_dir_all(&outside).unwrap();
+         std::fs::write(outside.join(format!("{SESSION}.jsonl")), prompt("private")).unwrap();
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+index 3f205c1..18357e4 100644
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -338,9 +338,13 @@ pub enum SessionAnswer {
+         #[serde(default)]
+         more: bool,
+     },
+-    /// No such file of this session (not there, or not under the projects
+-    /// directory).
++    /// No such file of this session (not there, or not in the agent's own
++    /// project folder).
+     Missing,
++    /// Not the agent's to serve: the transcript is in another project folder,
++    /// or the agent could not tell its own project folder and serves nothing
++    /// (TASK-034 decision 12).
++    Refused,
+     /// The file is there but could not be read.
+     Unreadable,
+     /// Larger than the agent reads or sends.
+@@ -1126,6 +1130,10 @@ mod tests {
+                 read_id: 8,
+                 answer: SessionAnswer::Missing,
+             },
++            AgentMsg::SessionAnswer {
++                read_id: 9,
++                answer: SessionAnswer::Refused,
++            },
+         ]
+     }
+ 
+diff --git a/crates/cctg/tests/command_logs.rs b/crates/cctg/tests/command_logs.rs
+index f89bd9c..efac562 100644
+--- a/crates/cctg/tests/command_logs.rs
++++ b/crates/cctg/tests/command_logs.rs
+@@ -125,7 +125,7 @@ async fn command_logs_carry_no_paths() {
+     // The session's agent: it reads its files like `cctg agent`.
+     let (to_agent, mut from_hub) = mpsc::channel(16);
+     let answers = agents.clone();
+-    let agent_root = projects.clone();
++    let agent_root = project.clone();
+     tokio::spawn(async move {
+         while let Some(msg) = from_hub.recv().await {
+             if let HubMsg::SessionRead {
+diff --git a/crates/cctg/tests/files_e2e.rs b/crates/cctg/tests/files_e2e.rs
+index 886a19d..6937814 100644
+--- a/crates/cctg/tests/files_e2e.rs
++++ b/crates/cctg/tests/files_e2e.rs
+@@ -249,7 +249,7 @@ impl Claude {
+         let (frames, frames_rx) = mpsc::channel(16);
+         let (ours, theirs) = tokio::io::duplex(1 << 20);
+         let dirs = Dirs {
+-            projects: None,
++            project: None,
+             work: Some(work.to_owned()),
+         };
+         tokio::spawn(agent::serve_channel(
+diff --git a/crates/cctg/tests/reads_e2e.rs b/crates/cctg/tests/reads_e2e.rs
+index 06d3284..2b99009 100644
+--- a/crates/cctg/tests/reads_e2e.rs
++++ b/crates/cctg/tests/reads_e2e.rs
+@@ -7,7 +7,9 @@
+ //! them, while the hub, in this test process with another cwd, cannot open
+ //! them at all. `/brief`, `/full`, the ai-title and the subagent block still
+ //! work; an agent built before the reads, a session without an agent, an
+-//! ended one and a read whose agent goes away get notices.
++//! ended one and a read whose agent goes away get notices. The agent serves
++//! only its own project folder (decision 12): a new session's folder comes
++//! from its cwd, another project's transcript is refused.
+ 
+ use std::io::{BufRead, BufReader, Write};
+ use std::net::TcpStream;
+@@ -571,3 +573,98 @@ async fn a_read_whose_agent_goes_away_gets_a_notice_at_once() {
+     })
+     .await;
+ }
++
++/// A hook post of `s` that names `path` as its transcript.
++fn post_naming(s: &Session, path: &str, event: HookEvent) -> HookPost {
++    HookPost::new(
++        HOST.into(),
++        s.id.clone(),
++        canonical_cwd(&s.workdir.to_string_lossy()),
++        path.into(),
++        event,
++    )
++}
++
++/// Sends `/brief` to the topic until a send contains `wanted`.
++async fn brief_until(hub: &Hub, what: &str, wanted: &str) {
++    let deadline = Instant::now() + Duration::from_secs(20);
++    loop {
++        hub.command(Some(THREAD), "/brief");
++        tokio::time::sleep(Duration::from_millis(300)).await;
++        if hub.fake.sends().iter().any(|text| text.contains(wanted)) {
++            return;
++        }
++        assert!(
++            Instant::now() < deadline,
++            "timed out waiting for: {what}: {:?}",
++            hub.fake.sends()
++        );
++    }
++}
++
++/// TASK-034 decision 12: the agent serves only its own project folder. For
++/// a new session no transcript exists yet when the agent starts, so the
++/// folder comes from its cwd the way Claude Code names it; the transcript
++/// written there afterwards is served.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_new_sessions_folder_comes_from_the_cwd_and_is_served() {
++    let s = session("own", 5);
++    let folder = cctg::tail::project_folder_name(&s.workdir.to_string_lossy());
++    let path = format!("../cfg/projects/{folder}/{}.jsonl", s.id);
++    let (listener, port) = listener().await;
++    let hub = start_hub(&s.state, listener, Duration::from_secs(20)).await;
++    let _agent = start_agent(&s, port);
++    hub.hook(post_naming(
++        &s,
++        &path,
++        HookEvent::SessionStart {
++            source: Some("startup".into()),
++            claude_pid: Some(4242),
++            parent_claude_pid: None,
++        },
++    ))
++    .await;
++    // The agent answers before the transcript exists: not found.
++    brief_until(&hub, "the agent's first answer", "не найден").await;
++    let own = s.config.join("projects").join(&folder);
++    std::fs::create_dir_all(&own).unwrap();
++    std::fs::write(own.join(format!("{}.jsonl", s.id)), PARENT).unwrap();
++    assert!(!Path::new(&path).exists(), "the hub must not see {path}");
++    brief_until(&hub, "the brief", &render(PARENT, false, 3)).await;
++}
++
++/// TASK-034 decision 12: a transcript in another project folder is refused
++/// with a notice even when the hub names it for the agent's own session id.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_transcript_of_another_project_folder_is_refused() {
++    let s = session("foreign", 6);
++    let path = format!("../cfg/projects/C--another-project/{}.jsonl", s.id);
++    let (listener, port) = listener().await;
++    let hub = start_hub(&s.state, listener, Duration::from_secs(20)).await;
++    let _agent = start_agent(&s, port);
++    hub.hook(post_naming(
++        &s,
++        &path,
++        HookEvent::SessionStart {
++            source: Some("startup".into()),
++            claude_pid: Some(4242),
++            parent_claude_pid: None,
++        },
++    ))
++    .await;
++    brief_until(&hub, "the agent's first answer", "не найден").await;
++    let foreign = s.config.join("projects").join("C--another-project");
++    std::fs::create_dir_all(&foreign).unwrap();
++    std::fs::write(foreign.join(format!("{}.jsonl", s.id)), PARENT).unwrap();
++    brief_until(
++        &hub,
++        "the refusal",
++        "отдаёт только транскрипты папки проекта",
++    )
++    .await;
++    assert!(
++        !hub.fake.sends().contains(&render(PARENT, false, 3)),
++        "{:?}",
++        hub.fake.sends()
++    );
++}
+diff --git a/crates/cctg/tests/stream_logs.rs b/crates/cctg/tests/stream_logs.rs
+index fd6ca04..7d583bb 100644
+--- a/crates/cctg/tests/stream_logs.rs
++++ b/crates/cctg/tests/stream_logs.rs
+@@ -119,7 +119,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
+         .expect("hook");
+     let (to_agent, mut from_hub) = mpsc::channel(16);
+     let reads = agents.clone();
+-    let root = state.join("projects");
++    let root = project.clone();
+     let asked = Arc::new(Mutex::new(0usize));
+     let counted = asked.clone();
+     tokio::spawn(async move {
+diff --git a/docs/poc.md b/docs/poc.md
+index 128c31e..61a165b 100644
+--- a/docs/poc.md
++++ b/docs/poc.md
+@@ -125,7 +125,7 @@ claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>
+ - По документации (https://code.claude.com/docs/en/claude-directory) в эту папку переезжают все пути `~/.claude`. Что туда же переезжает и `.claude.json`, в документации прямо не сказано; проверено на 2.1.280: с `CLAUDE_CONFIG_DIR` Claude Code создаёт `.claude.json` внутри этой папки и не видит серверов из `~/.claude.json`.
+ - В новой папке нет логина. Первый запуск попросит войти (`/login`, аккаунт claude.ai) либо возьмёт `ANTHROPIC_API_KEY` из окружения (ключ Console); каналы работают с обоими. Логин сохраняется в `claude-config/`, поэтому папку не удалять между прогонами.
+ - Ваши личные настройки, память `~/.claude/CLAUDE.md`, плагины и глобальные хуки в этой сессии не действуют. Для проверки канала это и нужно.
+-- Транскрипт сессии ляжет в `claude-config/projects/`. `/brief` в теме слота читает агент сессии (путь транскрипта из хука, корень `CLAUDE_CONFIG_DIR`), hub файлы сессии не открывает, поэтому работает без настройки.
++- Транскрипт сессии ляжет в `claude-config/projects/`. `/brief` в теме слота читает агент сессии (путь транскрипта из хука; агент отдаёт только файлы папки проекта своей сессии `CLAUDE_CONFIG_DIR/projects/<папка>`), hub файлы сессии не открывает, поэтому работает без настройки.
+ 
+ Без `CLAUDE_CONFIG_DIR` рецепт тоже работает, но Claude Code запишет в ваш `~/.claude.json` ключ `projects[<рабочая папка>]` (доверие папке) и сохранит транскрипт в `~/.claude/projects/`. Тогда берите одну и ту же рабочую папку на все прогоны, чтобы ключ был один.
+ 
+@@ -144,7 +144,7 @@ claude --mcp-config <tmp>/cctg-poc/mcp.json --strict-mcp-config --settings <tmp>
+ - По документации (https://code.claude.com/docs/en/claude-directory) в эту папку переезжают все пути `~/.claude`. Что туда же переезжает и `.claude.json`, в документации прямо не сказано; проверено на 2.1.280: с `CLAUDE_CONFIG_DIR` Claude Code создаёт `.claude.json` внутри этой папки и не видит серверов из `~/.claude.json`.
+ - В новой папке нет логина. Первый запуск попросит войти (`/login`, аккаунт claude.ai) либо возьмёт `ANTHROPIC_API_KEY` из окружения (ключ Console); каналы работают с обоими. Логин сохраняется в `claude-config/`, поэтому папку не удалять между прогонами.
+ - Ваши личные настройки, память `~/.claude/CLAUDE.md`, плагины и глобальные хуки в этой сессии не действуют. Для проверки канала это и нужно.
+-- Транскрипт сессии ляжет в `claude-config/projects/`. `/brief` в теме слота читает агент сессии (путь транскрипта из хука, корень `CLAUDE_CONFIG_DIR`), hub файлы сессии не открывает, поэтому работает без настройки.
++- Транскрипт сессии ляжет в `claude-config/projects/`. `/brief` в теме слота читает агент сессии (путь транскрипта из хука; агент отдаёт только файлы папки проекта своей сессии `CLAUDE_CONFIG_DIR/projects/<папка>`), hub файлы сессии не открывает, поэтому работает без настройки.
+ 
+ Без `CLAUDE_CONFIG_DIR` рецепт тоже работает, но Claude Code запишет в ваш `~/.claude.json` ключ `projects[<рабочая папка>]` (доверие папке) и сохранит транскрипт в `~/.claude/projects/`. Тогда берите одну и ту же рабочую папку на все прогоны, чтобы ключ был один.
+ 

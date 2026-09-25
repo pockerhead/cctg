@@ -112,7 +112,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         chat_id: -1000000000001,
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -183,6 +183,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         console_commands: false,
         client: None,
         files: false,
+        session_reads: false,
     };
     write
         .write_all(&wire::encode(&AgentMsg::Register(register)))

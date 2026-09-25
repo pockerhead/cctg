@@ -13,6 +13,7 @@ Domains: hub, hooks, channel
 - Сборка сервера под Linux (статическая musl или обычная glibc в Docker multi-stage), Dockerfile и docker-compose (volume для state, `restart: unless-stopped`, env-файл с токеном), healthcheck.
 - Выкатка без ssh от оркестратора: GitHub Actions собирает образ по тегу/пушу в registry (GHCR) и бинарники клиента в Releases; на сервере образ обновляется watchtower'ом или аналогом. Описать, что пользователь делает один раз на сервере.
 - Разделение ролей в сборке: решить, остаётся ли один бинарник с подкомандами или сервер/клиент отдельными бинарями/фичами cargo (клиенту не нужен код бота и наоборот); обосновать.
+- CI гоняет весь workspace (fmt, clippy, тесты) на Linux и Windows раннерах: тесты на Linux ещё ни разу не запускались, падения там чинятся в этой задаче; Windows-only тесты помечены cfg. Управление консолью на Linux не здесь, это TASK-044.
 - Док: `docs/remote-hub.md` (развёртывание, TLS, обновление), без секретов.
 
 ## Dependencies
