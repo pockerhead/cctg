@@ -142,6 +142,19 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
         })
         .await
         .expect("agent");
+    // The agent waits for its SessionStart before the hooks come: the actor
+    // reads its channels in no fixed order, and a Stop handled before the
+    // registration finds no agent to read the title (first Linux run).
+    let registered = async {
+        while !String::from_utf8_lossy(&captured.0.lock().expect("logs"))
+            .contains("waits for its SessionStart")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), registered)
+        .await
+        .expect("the agent registered");
     let post = |event| {
         HookPost::new(
             "box".into(),
@@ -209,7 +222,10 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
         ops.iter().any(
             |op| matches!(op, Op::EditTopic { name: Some(name), .. } if name.contains(&title))
         ),
-        "the title reached the topic: {ops:?}"
+        "the title reached the topic: {ops:?}
+logs:
+{}",
+        String::from_utf8_lossy(&captured.0.lock().expect("logs"))
     );
     let _ = std::fs::remove_dir_all(&state);
 

@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use cctg::hook;
 use cctg::hub::ingress::{self, AgentEvent};
+use cctg::tls::HubAddr;
 use cctg::wire::{self, AgentMsg, HOOK_PATH, HookEvent, HookPost, Register, Secret};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -74,6 +75,21 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
     let hooks_addr = hooks.local_addr().expect("addr");
     let (hook_tx, mut hook_rx) = mpsc::channel(16);
     tokio::spawn(ingress::serve_hooks(hooks, secret.clone(), hook_tx));
+
+    // A health probe or a port scan: connect and close without a byte. Only
+    // debug lines, never a warning (TASK-035: the hub faces the internet).
+    send_and_wait(agents_addr, b"").await;
+    send_and_wait(hooks_addr, b"").await;
+    let early = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    assert_eq!(
+        early
+            .matches("connection closed before its first byte")
+            .count(),
+        2,
+        "{early}"
+    );
+    assert!(!early.contains("WARN"), "a probe warned: {early}");
 
     // Agent link: wrong secret, broken hello carrying the secret, a version
     // mismatch carrying it, an overlong line carrying it.
@@ -170,12 +186,22 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
     )
     .await;
     let timeout = Duration::from_secs(5);
-    hook::post(&hooks_addr.to_string(), &secret, &post, timeout)
-        .await
-        .expect("accepted");
-    hook::post(&hooks_addr.to_string(), &secret, &post, timeout)
-        .await
-        .expect("repeat accepted");
+    hook::post(
+        &HubAddr::plain(hooks_addr.to_string()),
+        &secret,
+        &post,
+        timeout,
+    )
+    .await
+    .expect("accepted");
+    hook::post(
+        &HubAddr::plain(hooks_addr.to_string()),
+        &secret,
+        &post,
+        timeout,
+    )
+    .await
+    .expect("repeat accepted");
     assert!(hook_rx.recv().await.is_some());
     assert!(hook_rx.try_recv().is_err(), "the repeat is dropped");
 

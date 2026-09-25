@@ -19,6 +19,7 @@ pub mod subagents;
 pub(crate) mod testdir;
 pub mod updates;
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +30,7 @@ use tracing::{info, warn};
 
 use api::{ApiError, BotApi, ChatMember, Sticker};
 use config::{AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, STATE_VAR};
+use ingress::Listener;
 use offset::OffsetStore;
 use registry::{Icons, RegistryStore};
 use scheduler::{BucketConfig, Scheduler};
@@ -131,6 +133,60 @@ fn checked_icons(lookup: Result<Vec<Sticker>, ApiError>) -> anyhow::Result<Icons
     Ok(icons)
 }
 
+/// A proxy variable of the process environment that reqwest (the Bot API
+/// client) takes on its own (TASK-035 decision 2: a server that reaches
+/// Telegram only through a local proxy). Only whether one is set.
+fn proxy_in_env() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// How long `cctg health` waits for each listener.
+const HEALTH_WAIT: Duration = Duration::from_secs(3);
+
+/// `cctg health` (the Docker healthcheck, TASK-035): both listeners of the
+/// hub on this machine take a TCP connection. Reads only
+/// `CCTG_AGENT_LISTEN` and `CCTG_HOOK_LISTEN` of the process environment
+/// (their defaults when unset), so it needs neither the token nor the env
+/// file. It closes without sending a byte, which the hub logs at debug
+/// level only, TLS or not.
+pub async fn healthy() -> bool {
+    let listen = |name: &str, default: SocketAddr| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(default)
+    };
+    for addr in [
+        listen(AGENT_LISTEN_VAR, config::DEFAULT_AGENT_LISTEN),
+        listen(HOOK_LISTEN_VAR, config::DEFAULT_HOOK_LISTEN),
+    ] {
+        let connect = tokio::net::TcpStream::connect(probe_target(addr));
+        if !matches!(tokio::time::timeout(HEALTH_WAIT, connect).await, Ok(Ok(_))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A listener on every address (`0.0.0.0`, `[::]`) is probed on loopback.
+fn probe_target(listen: SocketAddr) -> SocketAddr {
+    let ip = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, listen.port())
+}
+
 /// How long a stopping hub waits for the slot actor to write the registry.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the hub asks getMe again after a network error at start.
@@ -178,6 +234,22 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     let hook_listener = ingress::bind(config.hook_listen)
         .await
         .with_context(|| format!("cannot listen for hooks; check {HOOK_LISTEN_VAR}"))?;
+    // The error names the variable, never the file contents.
+    let acceptor = match &config.tls {
+        Some(files) => {
+            let (acceptor, pin) = crate::tls::Acceptor::from_files(&files.cert, &files.key)?;
+            // Not a secret: devices put it in CCTG_HUB_CERT_SHA256.
+            info!(sha256 = %pin, "TLS certificate loaded");
+            Some(acceptor)
+        }
+        None => None,
+    };
+    let agent_listener = Listener::new(agent_listener, acceptor.clone());
+    let hook_listener = Listener::new(hook_listener, acceptor);
+    if proxy_in_env() {
+        // Never the value: a proxy URL can carry a user and a password.
+        info!("Bot API requests go through the proxy of the environment");
+    }
     if config.api_url != api::TELEGRAM_API {
         // Never the URL: it is the base of every request URL.
         warn!("{API_URL_VAR} is set: the hub talks to another Bot API server (test only)");
@@ -214,7 +286,8 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         warn!("the bot lacks can_pin_messages; status messages will not be pinned");
     }
     let icons = checked_icons(api.get_forum_topic_icon_stickers().await)?;
-    // Agents running another build are shown as outdated (TASK-040).
+    // Agents running another build are shown as outdated (TASK-040); a
+    // build is its git commit when it has one (TASK-035).
     let build = tokio::task::spawn_blocking(crate::client::own_build)
         .await
         .ok()
@@ -224,7 +297,9 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     }
     info!(
         bot = me.username.as_deref().unwrap_or("?"),
-        build = build.as_deref().map_or("?", crate::client::short),
+        build = build
+            .as_deref()
+            .map_or_else(|| "?".to_owned(), crate::client::short),
         "hub started, polling"
     );
 
@@ -525,6 +600,15 @@ mod tests {
         assert_eq!(icons.alive.as_deref(), Some("1"));
         assert_eq!(icons.no_channel.as_deref(), Some("4"));
         assert!(checked_icons(Ok(vec![sticker("1")])).is_err());
+    }
+
+    #[test]
+    fn health_probes_a_wildcard_listener_on_loopback() {
+        let probe = |addr: &str| probe_target(addr.parse().unwrap()).to_string();
+        assert_eq!(probe("0.0.0.0:47292"), "127.0.0.1:47292");
+        assert_eq!(probe("[::]:47291"), "[::1]:47291");
+        assert_eq!(probe("100.64.0.7:5"), "100.64.0.7:5");
+        assert_eq!(probe("127.0.0.1:47292"), "127.0.0.1:47292");
     }
 
     #[test]

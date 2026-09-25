@@ -18,5 +18,6 @@ pub mod spool;
 pub mod statusline;
 pub mod supervise;
 pub mod tail;
+pub mod tls;
 pub mod update;
 pub mod wire;

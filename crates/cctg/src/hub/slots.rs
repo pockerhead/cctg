@@ -1002,7 +1002,7 @@ impl Slots {
                         info!(
                             conn,
                             session = short(&session),
-                            agent = agent.map_or("none", crate::client::short),
+                            agent = agent.map_or_else(|| "none".to_owned(), crate::client::short),
                             hub = crate::client::short(hub),
                             "agent runs another cctg build"
                         );
@@ -4029,10 +4029,10 @@ impl Slots {
                 .conns
                 .get(&conn)
                 .and_then(|bound| bound.client.as_ref())
-                .map(|client| crate::client::short(&client.build).to_owned());
+                .map(|client| crate::client::short(&client.build));
             let op = Op::Send {
                 thread_id: Some(thread_id),
-                text: status::outdated_text(agent.as_deref(), crate::client::short(&hub)),
+                text: status::outdated_text(agent.as_deref(), &crate::client::short(&hub)),
                 html: None,
                 reply_markup: Some(keyboard),
                 permission: false,
@@ -12266,6 +12266,47 @@ again"
                 _ => None,
             })
             .collect()
+    }
+
+    /// TASK-035: a hub in a Linux container and a Windows client built from
+    /// one commit report the same build (`client::identity`); another commit
+    /// gives exactly one warning, which names both commits.
+    #[tokio::test]
+    async fn one_commit_on_two_systems_is_current_and_another_commit_is_warned_once() {
+        const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+        const EARLIER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        let linux_hub = crate::client::identity(COMMIT, || Some("11".repeat(32)));
+        let windows_client = crate::client::identity(COMMIT, || Some("22".repeat(32)));
+        let dir = TempDir::new("slots-commit-build");
+        let options = Options {
+            build: linux_hub,
+            ..options()
+        };
+        let (fake, mut slots) = live_slots(&dir, options);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let windows = windows_client.clone().unwrap();
+        let _same = register_client(&mut slots, 1, client(&windows, true));
+        slots.pump();
+        slots.pump();
+        assert!(
+            sent_texts(&fake).await.is_empty(),
+            "same commit: no warning"
+        );
+        assert!(!slots.outdated(1));
+
+        let _older = register_client(&mut slots, 2, client(EARLIER, true));
+        slots.pump();
+        slots.pump();
+        let warnings = sent_texts(&fake).await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].0.contains("fedcba98") && warnings[0].0.contains("01234567"),
+            "{}",
+            warnings[0].0
+        );
+        slots.pump();
+        assert_eq!(sent_texts(&fake).await.len(), 1, "warned once");
     }
 
     #[tokio::test]

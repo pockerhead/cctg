@@ -237,7 +237,7 @@ impl Claude {
             session_reads: false,
         };
         let (outbox, events) = agent::spawn(LinkConfig {
-            addr: addr.to_string(),
+            addr: cctg::tls::HubAddr::plain(addr.to_string()),
             secret: Secret::parse(SECRET).unwrap(),
             register,
             backoff: Backoff {
@@ -328,6 +328,13 @@ async fn hub_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Hub
         .expect("a hub line in time")
         .unwrap();
     wire::decode::<HubMsg>(&line).unwrap()
+}
+
+/// How often the hub logged an agent bound to its session so far.
+fn bound_count(captured: &Captured) -> usize {
+    String::from_utf8_lossy(&captured.0.lock().unwrap())
+        .matches("agent bound to its session")
+        .count()
 }
 
 struct Dir(PathBuf);
@@ -572,6 +579,7 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         seen_methods(&seen, "createForumTopic").len() == 2
     })
     .await;
+    let bound_before = bound_count(&captured);
     let (read, mut write) = TcpStream::connect(addr).await.unwrap().into_split();
     let mut reader = BufReader::new(read);
     let hello = wire::encode(&AgentMsg::Hello {
@@ -589,6 +597,12 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         hub_line(&mut reader).await,
         HubMsg::Registered { files: true }
     );
+    // `registered` goes out before the actor binds the agent; the topic
+    // message comes over another channel and must not overtake the binding.
+    until("the old agent bound", || {
+        bound_count(&captured) > bound_before
+    })
+    .await;
     control
         .send(topic_message(
             6,

@@ -14,13 +14,18 @@
 //! CCTG_HUB_AGENT_ADDR=127.0.0.1:47291  # optional, the hub agent listener
 //! CCTG_HOST=laptop                     # optional, defaults to the machine name
 //! CCTG_STATE_DIR=/abs/state/dir         # optional, absolute; holds the hook spool
+//! CCTG_HUB_CERT_SHA256=AB:CD:...        # optional: TLS to a hub with this certificate
 //! ```
+//!
+//! Without `CCTG_HUB_CERT_SHA256` both links are plain TCP, and only to a
+//! loopback address; a hub elsewhere needs the pin ([`crate::tls`]).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::hub::config::{DEFAULT_AGENT_LISTEN, DEFAULT_HOOK_LISTEN, SECRET_VAR, STATE_VAR};
+use crate::tls::{self, CertPin, HubAddr, PIN_VAR};
 use crate::wire::Secret;
 
 /// `host:port` of the hub hook endpoint.
@@ -44,6 +49,12 @@ pub enum ConfigProblem {
     BadSecret,
     /// The device env file exists but cannot be read or parsed.
     BadFile,
+    /// `CCTG_HUB_CERT_SHA256` is set but is no sha256 fingerprint.
+    BadPin,
+    /// A hub address is not `host:port`.
+    BadAddr,
+    /// A hub address beyond loopback without `CCTG_HUB_CERT_SHA256`.
+    PlainRemote,
 }
 
 impl fmt::Display for ConfigProblem {
@@ -52,6 +63,12 @@ impl fmt::Display for ConfigProblem {
             Self::NoSecret => "CCTG_HUB_SECRET is not set (process env or ~/.cctg/device.env)",
             Self::BadSecret => "CCTG_HUB_SECRET is invalid (16+ visible ASCII characters)",
             Self::BadFile => "~/.cctg/device.env cannot be read (contents are not shown)",
+            Self::BadPin => "CCTG_HUB_CERT_SHA256 is not a sha256 fingerprint (64 hex digits)",
+            Self::BadAddr => "a CCTG_HUB_*_ADDR value is not host:port",
+            Self::PlainRemote => {
+                "the hub is not on this machine: set CCTG_HUB_CERT_SHA256 for TLS \
+                 (the secret never goes over a network in plain text)"
+            }
         })
     }
 }
@@ -66,6 +83,9 @@ pub struct DeviceConfig {
     /// `<home>/.cctg`. `None` without either. A relative value is ignored: a
     /// hook runs in the session's folder and must not write there.
     pub state_dir: Option<PathBuf>,
+    /// `CCTG_HUB_CERT_SHA256`: `None` unset (plain, loopback only),
+    /// `Some(Err)` set but unusable.
+    pub pin: Option<Result<CertPin, ConfigProblem>>,
 }
 
 impl DeviceConfig {
@@ -100,12 +120,26 @@ impl DeviceConfig {
             .map(PathBuf::from)
             .filter(|dir| dir.is_absolute())
             .or_else(|| home_dir(&var).map(|home| home.join(DEVICE_STATE)));
+        let pin = value(PIN_VAR).map(|raw| CertPin::parse(&raw).ok_or(ConfigProblem::BadPin));
         Self {
             secret,
             hook_addr,
             agent_addr,
             host: host_name(&value),
             state_dir,
+            pin,
+        }
+    }
+
+    /// How to reach the hub at `addr` (one of the two addresses): TLS with
+    /// the pin, else plain TCP to a loopback address only.
+    pub fn hub(&self, addr: &str) -> Result<HubAddr, ConfigProblem> {
+        match &self.pin {
+            Some(Ok(pin)) => HubAddr::pinned(addr, *pin).map_err(|_| ConfigProblem::BadAddr),
+            Some(Err(problem)) => Err(*problem),
+            None if tls::is_loopback_addr(addr) => Ok(HubAddr::plain(addr)),
+            None if tls::host_of(addr).is_none() => Err(ConfigProblem::BadAddr),
+            None => Err(ConfigProblem::PlainRemote),
         }
     }
 }
@@ -249,6 +283,42 @@ mod tests {
         assert_eq!(config.state_dir, Some(Path::new(home).join(".cctg")));
         let config = DeviceConfig::from_vars(vars(&[(STATE_VAR, ".cctg")]));
         assert_eq!(config.state_dir, None);
+    }
+
+    #[test]
+    fn plain_only_to_loopback_and_tls_only_with_a_valid_pin() {
+        let pin = "BA:78:16:BF:8F:01:CF:EA:41:41:40:DE:5D:AE:22:23:B0:03:61:A3:96:17:7A:9C:B4:10:FF:61:F2:00:15:AD";
+        let plain = DeviceConfig::from_vars(vars(&[]));
+        assert!(plain.pin.is_none());
+        let local = plain.hub("127.0.0.1:47292").unwrap();
+        assert!(!local.is_tls());
+        assert!(!plain.hub("localhost:47291").unwrap().is_tls());
+        for remote in ["hub.tail:47292", "100.64.0.7:47292", "203.0.113.9:47292"] {
+            assert_eq!(
+                plain.hub(remote).unwrap_err(),
+                ConfigProblem::PlainRemote,
+                "{remote}"
+            );
+        }
+        assert_eq!(plain.hub("no-port").unwrap_err(), ConfigProblem::BadAddr);
+
+        let pinned = DeviceConfig::from_vars(vars(&[(PIN_VAR, pin)]));
+        for addr in ["hub.example.org:47292", "127.0.0.1:47292", "[::1]:1"] {
+            assert!(pinned.hub(addr).unwrap().is_tls(), "{addr}");
+        }
+        assert_eq!(pinned.hub("no-port").unwrap_err(), ConfigProblem::BadAddr);
+
+        let broken = DeviceConfig::from_vars(vars(&[(PIN_VAR, "not-a-pin")]));
+        assert_eq!(
+            broken.hub("127.0.0.1:47292").unwrap_err(),
+            ConfigProblem::BadPin,
+            "a broken pin never falls back to plain"
+        );
+        assert!(!ConfigProblem::BadPin.to_string().contains("not-a-pin"));
+        assert!(
+            !ConfigProblem::PlainRemote.to_string().contains("  "),
+            "one line of plain text"
+        );
     }
 
     #[test]

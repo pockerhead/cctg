@@ -2,6 +2,11 @@
 //!
 //! Both check the shared secret before anything else and hand what they
 //! accept to the hub over bounded channels ([`AgentEvent`], [`HookPost`]).
+//! Either can take its connections over TLS ([`Listener::tls`], TASK-035):
+//! the handshake runs in the connection's own task, within its time limit,
+//! so a slow client never holds up accepting others. A connection that
+//! closes before its first byte (a health probe, a port scan) or fails its
+//! TLS handshake is logged at debug level only.
 //! Nothing here logs message contents, paths or the secret: log lines carry
 //! the connection number, the peer address and fixed text only.
 
@@ -11,23 +16,34 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
 use crate::wire::{
     self, AgentMsg, Behavior, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, PERMISSION_PATH,
     PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
 };
 
-/// Time an agent has to send `hello` and `register`.
+/// Time an agent has from its TCP connect to finish the TLS handshake (when
+/// there is one), `hello` and `register`: one deadline for all of it.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Time a hook has to deliver its whole request.
+/// Time a hook has from its TCP connect to deliver its whole request, TLS
+/// handshake included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AGENTS: usize = 256;
+/// Agent connections that have not authenticated yet; one more is closed at
+/// once (the listeners may face the internet, TASK-035).
+const MAX_PENDING_AGENTS: usize = 16;
+/// Longest `hello` line: read before the secret is checked. A secret longer
+/// than about 4000 characters cannot authenticate.
+const MAX_HELLO_LINE: usize = 4 * 1024;
+/// A wrong secret is answered only after this pause (both listeners).
+const AUTH_FAIL_DELAY: Duration = Duration::from_millis(250);
 const MAX_HOOK_REQUESTS: usize = 64;
 /// `PermissionRequest` hooks waiting for an answer at a time; one more gets
 /// no decision at once. They do not count against [`MAX_HOOK_REQUESTS`].
@@ -46,14 +62,76 @@ const LINGER_BYTES: usize = MAX_HEAD + MAX_HOOK_BODY;
 pub const DEDUP_TTL: Duration = Duration::from_secs(10 * 60);
 pub const DEDUP_MAX: usize = 4096;
 
-/// Binds `addr`. A non-loopback address was configured explicitly; say so.
+/// Binds `addr`.
 pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let listener = TcpListener::bind(addr).await?;
-    let local = listener.local_addr()?;
-    if !local.ip().is_loopback() {
-        warn!(%local, "listening beyond loopback: plain TCP, keep it on a private network");
+    TcpListener::bind(addr).await
+}
+
+/// A bound listener and how it takes connections: plain TCP (a
+/// `TcpListener` converts into that) or TLS.
+#[derive(Debug)]
+pub struct Listener {
+    tcp: TcpListener,
+    incoming: Incoming,
+}
+
+impl From<TcpListener> for Listener {
+    fn from(tcp: TcpListener) -> Self {
+        Self {
+            tcp,
+            incoming: Incoming::plain(),
+        }
     }
-    Ok(listener)
+}
+
+impl Listener {
+    pub fn tls(tcp: TcpListener, acceptor: Acceptor) -> Self {
+        Self {
+            tcp,
+            incoming: Incoming::tls(acceptor),
+        }
+    }
+
+    /// With `acceptor`: TLS; without: plain. A non-loopback plain listener
+    /// was configured explicitly; say so.
+    pub fn new(tcp: TcpListener, acceptor: Option<Acceptor>) -> Self {
+        let local = tcp.local_addr().ok();
+        match acceptor {
+            Some(acceptor) => {
+                if let Some(local) = local {
+                    info!(%local, "listening with TLS");
+                }
+                Self::tls(tcp, acceptor)
+            }
+            None => {
+                if let Some(local) = local.filter(|local| !local.ip().is_loopback()) {
+                    warn!(%local, "listening beyond loopback: plain TCP, keep it on a private network");
+                }
+                Self::from(tcp)
+            }
+        }
+    }
+}
+
+/// The TLS handshake of an accepted connection (nothing for plain), before
+/// `deadline`. `None`: it failed; logged at debug level only (port scans).
+async fn open(
+    incoming: &Incoming,
+    tcp: TcpStream,
+    peer: SocketAddr,
+    deadline: tokio::time::Instant,
+) -> Option<Stream> {
+    match tokio::time::timeout_at(deadline, incoming.accept(tcp)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(error)) => {
+            debug!(%peer, kind = ?error.kind(), "TLS handshake failed");
+            None
+        }
+        Err(_) => {
+            debug!(%peer, "TLS handshake timed out");
+            None
+        }
+    }
 }
 
 /// What the agent link hands to the hub. `conn` numbers are unique per hub run.
@@ -80,9 +158,18 @@ pub enum AgentEvent {
 
 /// Accepts agents until the task is dropped; dropping it also closes every
 /// agent connection, which is what a hub restart looks like to an agent.
-pub async fn serve_agents(listener: TcpListener, secret: Secret, events: mpsc::Sender<AgentEvent>) {
+pub async fn serve_agents(
+    listener: impl Into<Listener>,
+    secret: Secret,
+    events: mpsc::Sender<AgentEvent>,
+) {
+    let Listener {
+        tcp: listener,
+        incoming,
+    } = listener.into();
     let secret = Arc::new(secret);
     let slots = Arc::new(Semaphore::new(MAX_AGENTS));
+    let pending = Arc::new(Semaphore::new(MAX_PENDING_AGENTS));
     let next_conn = AtomicU64::new(1);
     let mut sessions = JoinSet::new();
     loop {
@@ -96,14 +183,27 @@ pub async fn serve_agents(listener: TcpListener, secret: Secret, events: mpsc::S
                         continue;
                     }
                 };
+                // Closed at once: not yet authenticated connections are few.
+                let Ok(unauthenticated) = pending.clone().try_acquire_owned() else {
+                    debug!(%peer, "too many unauthenticated agent connections; closed");
+                    continue;
+                };
                 let Ok(permit) = slots.clone().try_acquire_owned() else {
                     warn!(%peer, "too many agent connections; refused");
                     continue;
                 };
                 let conn = next_conn.fetch_add(1, Ordering::Relaxed);
-                let (secret, events) = (secret.clone(), events.clone());
+                let (secret, events, incoming) =
+                    (secret.clone(), events.clone(), incoming.clone());
+                let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
                 sessions.spawn(async move {
-                    agent_session(stream, peer, conn, &secret, &events).await;
+                    if let Some(stream) = open(&incoming, stream, peer, deadline).await {
+                        let handshake = Handshake {
+                            deadline,
+                            unauthenticated,
+                        };
+                        agent_session(stream, peer, conn, &secret, &events, handshake).await;
+                    }
                     drop(permit);
                 });
             }
@@ -142,22 +242,33 @@ async fn linger(read: &mut (impl AsyncRead + Unpin)) {
     let _ = tokio::time::timeout(LINGER, drain).await;
 }
 
+/// The pre-authentication part of an agent connection: its deadline and its
+/// place among the [`MAX_PENDING_AGENTS`], given back when it ends.
+struct Handshake {
+    deadline: tokio::time::Instant,
+    unauthenticated: OwnedSemaphorePermit,
+}
+
 async fn agent_session(
-    stream: TcpStream,
+    stream: Stream,
     peer: SocketAddr,
     conn: u64,
     secret: &Secret,
     events: &mpsc::Sender<AgentEvent>,
+    pre_auth: Handshake,
 ) {
-    let _ = stream.set_nodelay(true);
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
     let mut line = Vec::new();
 
-    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        wire::read_line(&mut reader, &mut line)
-            .await
-            .map_err(|_| Rejection::Protocol)?;
+    let handshake = tokio::time::timeout_at(pre_auth.deadline, async {
+        // Read before the secret is checked: a short line only.
+        match wire::read_line_max(&mut reader, &mut line, MAX_HELLO_LINE).await {
+            Ok(()) => {}
+            // Closed before its first byte: a probe, not an agent.
+            Err(WireError::Closed) if line.is_empty() => return Ok(None),
+            Err(_) => return Err(Rejection::Protocol),
+        }
         let authed = match wire::decode::<AgentMsg>(&line) {
             Ok(AgentMsg::Hello { secret: offered }) => secret.matches(offered.expose().as_bytes()),
             Err(WireError::Version) => return Err(Rejection::Version),
@@ -171,7 +282,7 @@ async fn agent_session(
             .await
             .map_err(|_| Rejection::Protocol)?;
         let result = match wire::decode::<AgentMsg>(&line) {
-            Ok(AgentMsg::Register(register)) => Ok(register),
+            Ok(AgentMsg::Register(register)) => Ok(Some(register)),
             Err(WireError::Version) => Err(Rejection::Version),
             _ => Err(Rejection::Protocol),
         };
@@ -180,9 +291,17 @@ async fn agent_session(
     })
     .await;
     let register = match handshake {
-        Ok(Ok(register)) => register,
+        Ok(Ok(Some(register))) => register,
+        Ok(Ok(None)) => {
+            debug!(conn, %peer, "connection closed before its first byte");
+            return;
+        }
         Ok(Err(reason)) => {
             warn!(conn, %peer, ?reason, "agent rejected");
+            if reason == Rejection::Auth {
+                // No fast guessing; the place stays taken meanwhile.
+                tokio::time::sleep(AUTH_FAIL_DELAY).await;
+            }
             reject(&mut write, reason).await;
             linger(&mut reader).await;
             return;
@@ -192,6 +311,7 @@ async fn agent_session(
             return;
         }
     };
+    drop(pre_auth.unauthenticated);
 
     let session = short(&register.session_id).to_owned();
     let (to_agent, mut outbound) = mpsc::channel(TO_AGENT_QUEUE);
@@ -211,7 +331,7 @@ async fn agent_session(
     info!(conn, session, "agent registered");
 
     let (frames_tx, mut frames) = mpsc::channel(TO_AGENT_QUEUE);
-    let reader_task = tokio::spawn(read_agent_frames(reader, frames_tx));
+    let reader_task = ReadTask::spawn(read_agent_frames(reader, frames_tx));
     let mut outbound_open = true;
     loop {
         tokio::select! {
@@ -257,14 +377,13 @@ async fn agent_session(
             },
         }
     }
-    reader_task.abort();
-    let _ = reader_task.await;
+    reader_task.stop().await;
     let _ = events.send(AgentEvent::Disconnected { conn }).await;
     info!(conn, session, "agent disconnected");
 }
 
 async fn read_agent_frames(
-    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut reader: BufReader<ReadHalf<Stream>>,
     frames: mpsc::Sender<(Instant, Result<AgentMsg, WireError>)>,
 ) {
     let mut line = Vec::new();
@@ -407,8 +526,12 @@ struct PermissionWaits {
 /// event id goes to `events` once; a repeat is answered 204 and dropped.
 /// `POST /v1/permission` is not served (404): see
 /// [`serve_hooks_and_permissions`].
-pub async fn serve_hooks(listener: TcpListener, secret: Secret, events: mpsc::Sender<HookPost>) {
-    serve(listener, secret, events, None).await;
+pub async fn serve_hooks(
+    listener: impl Into<Listener>,
+    secret: Secret,
+    events: mpsc::Sender<HookPost>,
+) {
+    serve(listener.into(), secret, events, None).await;
 }
 
 /// [`serve_hooks`] plus `POST /v1/permission`: each such request goes to
@@ -416,7 +539,7 @@ pub async fn serve_hooks(listener: TcpListener, secret: Secret, events: mpsc::Se
 /// [`PERMISSION_WAIT_CAP`], [`MAX_PERMISSION_WAITS`] at a time). A waiting
 /// request never holds up other hook requests.
 pub async fn serve_hooks_and_permissions(
-    listener: TcpListener,
+    listener: impl Into<Listener>,
     secret: Secret,
     events: mpsc::Sender<HookPost>,
     asks: mpsc::Sender<PermissionAsk>,
@@ -425,15 +548,19 @@ pub async fn serve_hooks_and_permissions(
         asks,
         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
     };
-    serve(listener, secret, events, Some(waits)).await;
+    serve(listener.into(), secret, events, Some(waits)).await;
 }
 
 async fn serve(
-    listener: TcpListener,
+    listener: Listener,
     secret: Secret,
     events: mpsc::Sender<HookPost>,
     waits: Option<PermissionWaits>,
 ) {
+    let Listener {
+        tcp: listener,
+        incoming,
+    } = listener;
     let secret = Arc::new(secret);
     let dedup = Arc::new(Mutex::new(Dedup::new(DEDUP_MAX, DEDUP_TTL)));
     let waits = waits.map(Arc::new);
@@ -454,10 +581,20 @@ async fn serve(
                     warn!(%peer, "too many hook requests; refused");
                     continue;
                 };
-                let (secret, dedup, events, waits) =
-                    (secret.clone(), dedup.clone(), events.clone(), waits.clone());
+                let (secret, dedup, events, waits, incoming) = (
+                    secret.clone(),
+                    dedup.clone(),
+                    events.clone(),
+                    waits.clone(),
+                    incoming.clone(),
+                );
+                let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
                 requests.spawn(async move {
-                    hook_request(stream, peer, &secret, &dedup, &events, waits.as_deref(), permit)
+                    let Some(stream) = open(&incoming, stream, peer, deadline).await else {
+                        return;
+                    };
+                    let waits = waits.as_deref();
+                    hook_request(stream, peer, &secret, &dedup, &events, waits, permit, deadline)
                         .await;
                 });
             }
@@ -466,35 +603,43 @@ async fn serve(
     }
 }
 
+/// `deadline`: the whole request is in by then, TLS handshake included.
+#[allow(clippy::too_many_arguments)]
 async fn hook_request(
-    mut stream: TcpStream,
+    mut stream: Stream,
     peer: SocketAddr,
     secret: &Secret,
     dedup: &Mutex<Dedup>,
     events: &mpsc::Sender<HookPost>,
     waits: Option<&PermissionWaits>,
     permit: OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
 ) {
-    let status =
-        match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream, secret)).await {
-            Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
-            Ok(Ok((Route::Permission, body))) => match waits {
-                Some(waits) => {
-                    // A waiting hook takes one of its own places, not a
-                    // hook request place.
-                    drop(permit);
-                    return permission_request(stream, peer, &body, waits).await;
-                }
-                None => Status::NotFound,
-            },
-            Ok(Err(status)) => status,
-            Err(_) => {
-                warn!(%peer, "hook request timed out");
-                return;
+    let status = match tokio::time::timeout_at(deadline, read_request(&mut stream, secret)).await {
+        Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
+        Ok(Err(None)) => {
+            debug!(%peer, "connection closed before its first byte");
+            return;
+        }
+        Ok(Ok((Route::Permission, body))) => match waits {
+            Some(waits) => {
+                // A waiting hook takes one of its own places, not a
+                // hook request place.
+                drop(permit);
+                return permission_request(stream, peer, &body, waits).await;
             }
-        };
+            None => Status::NotFound,
+        },
+        Ok(Err(Some(status))) => status,
+        Err(_) => {
+            warn!(%peer, "hook request timed out");
+            return;
+        }
+    };
     if status == Status::Unauthorized {
         warn!(%peer, "hook request rejected: bad or missing secret");
+        // No fast guessing; the request place stays taken meanwhile.
+        tokio::time::sleep(AUTH_FAIL_DELAY).await;
     } else if status != Status::NoContent {
         warn!(%peer, status = status.code(), "hook request rejected");
     }
@@ -502,7 +647,7 @@ async fn hook_request(
 }
 
 /// Writes the whole answer and closes the connection.
-async fn respond(stream: &mut TcpStream, status: Status, body: &[u8]) {
+async fn respond(stream: &mut Stream, status: Status, body: &[u8]) {
     let content_type = if body.is_empty() {
         ""
     } else {
@@ -524,7 +669,7 @@ async fn respond(stream: &mut TcpStream, status: Status, body: &[u8]) {
 /// the hub gave up, stopped or too many hooks wait). A hook that goes away
 /// while waiting drops its ask, which the hub notices.
 async fn permission_request(
-    mut stream: TcpStream,
+    mut stream: Stream,
     peer: SocketAddr,
     body: &[u8],
     waits: &PermissionWaits,
@@ -577,7 +722,7 @@ async fn permission_request(
 
 /// Completes when the peer closed its side (or the connection broke). A
 /// waiting hook has sent its whole request, so any read end means it left.
-async fn gone(stream: &mut TcpStream) {
+async fn gone(stream: &mut Stream) {
     let mut byte = [0u8; 1];
     loop {
         match stream.read(&mut byte).await {
@@ -661,21 +806,21 @@ enum Route {
 
 /// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
 /// and returns its target and body. The secret is checked before the body
-/// is read.
+/// is read. `Err(None)`: closed before its first byte, nothing to answer.
 async fn read_request<S: AsyncRead + Unpin>(
     stream: &mut S,
     secret: &Secret,
-) -> Result<(Route, Vec<u8>), Status> {
+) -> Result<(Route, Vec<u8>), Option<Status>> {
     let mut buf = Vec::with_capacity(1024);
     let head_end = loop {
         if let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
             if end > MAX_HEAD {
-                return Err(Status::HeaderTooLarge);
+                return Err(Some(Status::HeaderTooLarge));
             }
             break end;
         }
         if buf.len() >= MAX_HEAD + 4 {
-            return Err(Status::HeaderTooLarge);
+            return Err(Some(Status::HeaderTooLarge));
         }
         let mut chunk = [0u8; 1024];
         let remaining = MAX_HEAD + 4 - buf.len();
@@ -683,13 +828,14 @@ async fn read_request<S: AsyncRead + Unpin>(
         let read = stream
             .read(&mut chunk[..chunk_len])
             .await
-            .map_err(|_| Status::BadRequest)?;
+            .map_err(|_| Some(Status::BadRequest))?;
         if read == 0 {
-            return Err(Status::BadRequest);
+            // Nothing at all: a probe, not a hook.
+            return Err((!buf.is_empty()).then_some(Status::BadRequest));
         }
         buf.extend_from_slice(&chunk[..read]);
     };
-    let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| Status::BadRequest)?;
+    let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| Some(Status::BadRequest))?;
     let mut lines = head.split("\r\n");
     let mut request_line = lines.next().unwrap_or_default().split(' ');
     let (method, target, version) = (
@@ -698,44 +844,44 @@ async fn read_request<S: AsyncRead + Unpin>(
         request_line.next().unwrap_or_default(),
     );
     if request_line.next().is_some() || version != "HTTP/1.1" {
-        return Err(Status::BadRequest);
+        return Err(Some(Status::BadRequest));
     }
     if method != "POST" {
-        return Err(Status::MethodNotAllowed);
+        return Err(Some(Status::MethodNotAllowed));
     }
     let route = match target {
         HOOK_PATH => Route::Hook,
         PERMISSION_PATH => Route::Permission,
-        _ => return Err(Status::NotFound),
+        _ => return Err(Some(Status::NotFound)),
     };
 
     let mut length = None;
     let mut authorized = None;
     for line in lines {
-        let (name, value) = line.split_once(':').ok_or(Status::BadRequest)?;
+        let (name, value) = line.split_once(':').ok_or(Some(Status::BadRequest))?;
         if name.is_empty() || !name.bytes().all(is_tchar) {
-            return Err(Status::BadRequest);
+            return Err(Some(Status::BadRequest));
         }
         // RFC 9110 5.5: a bare CR, LF or NUL in a value must be rejected.
         if value
             .bytes()
             .any(|byte| byte.is_ascii_control() && byte != b'\t')
         {
-            return Err(Status::BadRequest);
+            return Err(Some(Status::BadRequest));
         }
         // RFC 9110 5.6.3: optional whitespace is SP / HTAB only.
         let value = value.trim_matches([' ', '\t']);
         if name.eq_ignore_ascii_case("content-length") {
             // RFC 9112 6.3: a repeated or invalid length is an error.
             if length.is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Status::BadRequest);
+                return Err(Some(Status::BadRequest));
             }
             length = Some(value.parse::<usize>().unwrap_or(usize::MAX));
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(Status::BadRequest);
+            return Err(Some(Status::BadRequest));
         } else if name.eq_ignore_ascii_case("authorization") {
             if authorized.is_some() {
-                return Err(Status::BadRequest);
+                return Err(Some(Status::BadRequest));
             }
             let token = value
                 .split_once(' ')
@@ -745,22 +891,22 @@ async fn read_request<S: AsyncRead + Unpin>(
         }
     }
     if authorized != Some(true) {
-        return Err(Status::Unauthorized);
+        return Err(Some(Status::Unauthorized));
     }
-    let length = length.ok_or(Status::LengthRequired)?;
+    let length = length.ok_or(Some(Status::LengthRequired))?;
     if length > MAX_HOOK_BODY {
-        return Err(Status::PayloadTooLarge);
+        return Err(Some(Status::PayloadTooLarge));
     }
     let mut body = buf.split_off(head_end + 4);
     if body.len() > length {
-        return Err(Status::BadRequest);
+        return Err(Some(Status::BadRequest));
     }
     let received = body.len();
     body.resize(length, 0);
     stream
         .read_exact(&mut body[received..])
         .await
-        .map_err(|_| Status::BadRequest)?;
+        .map_err(|_| Some(Status::BadRequest))?;
     Ok((route, body))
 }
 
@@ -1537,5 +1683,280 @@ mod tests {
         assert_eq!(short("5e551017-0000"), "5e551017");
         assert_eq!(short("abc"), "abc");
         assert_eq!(short("ééééééééé"), "éééééééé");
+    }
+
+    // ---- Before authentication (TASK-035 review: the listeners may face the
+    // internet). One deadline from the TCP connect, TLS handshake included;
+    // few unauthenticated agent connections; a short first line; a pause
+    // after a wrong secret; garbage never stops a listener.
+
+    fn tls_acceptor() -> (crate::tls::Acceptor, crate::tls::CertPin) {
+        use rustls::pki_types::pem::PemObject;
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(
+            signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        crate::tls::Acceptor::new(vec![cert.der().clone()], key).unwrap()
+    }
+
+    /// TCP connect now, the TLS handshake after `late`, then one byte of
+    /// the request every 100 ms. Returns how long after the TCP connect the
+    /// hub closed the connection.
+    async fn late_and_slow(addr: SocketAddr, pin: crate::tls::CertPin, late: Duration) -> Duration {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connected = tokio::time::Instant::now();
+        tokio::time::sleep(late).await;
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let connector = tokio_rustls::TlsConnector::from(crate::tls::pinned_config(pin).unwrap());
+        let stream = connector.connect(name, tcp).await.expect("in time");
+        let (mut read, mut write) = tokio::io::split(stream);
+        let trickle = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if write.write_all(b"P").await.is_err() || write.flush().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let closed = async {
+            let mut buf = [0u8; 256];
+            while let Ok(n) = read.read(&mut buf).await {
+                if n == 0 {
+                    return;
+                }
+            }
+        };
+        within(async {
+            tokio::select! {
+                () = trickle => {}
+                () = closed => {}
+            }
+        })
+        .await;
+        connected.elapsed()
+    }
+
+    #[tokio::test]
+    async fn the_tls_handshake_counts_against_the_pre_auth_deadline() {
+        let (acceptor, pin) = tls_acceptor();
+        let agents = bind(loopback()).await.unwrap();
+        let hooks = bind(loopback()).await.unwrap();
+        let (agents_addr, hooks_addr) = (agents.local_addr().unwrap(), hooks.local_addr().unwrap());
+        let (agent_tx, _agent_rx) = mpsc::channel(4);
+        let (hook_tx, _hook_rx) = mpsc::channel(4);
+        let agents = Listener::tls(agents, acceptor.clone());
+        let hooks = Listener::tls(hooks, acceptor);
+        tokio::spawn(serve_agents(agents, secret(), agent_tx));
+        tokio::spawn(serve_hooks(hooks, secret(), hook_tx));
+
+        let late = HANDSHAKE_TIMEOUT - Duration::from_secs(2);
+        let agent = late_and_slow(agents_addr, pin, late).await;
+        assert!(
+            agent < HANDSHAKE_TIMEOUT + Duration::from_millis(700),
+            "agent closed {agent:?} after its connect"
+        );
+        let late = REQUEST_TIMEOUT - Duration::from_secs(1);
+        let hook = late_and_slow(hooks_addr, pin, late).await;
+        assert!(
+            hook < REQUEST_TIMEOUT + Duration::from_millis(500),
+            "hook closed {hook:?} after its connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_agents_beyond_the_cap_are_closed_at_once() {
+        let (addr, mut events, _hub) = agents_hub().await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_AGENTS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(1), extra.read(&mut buf))
+            .await
+            .expect("closed at once, not at the deadline");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+        // The places come back when those connections go.
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut peer = Peer::connect(addr).await;
+        peer.send(&AgentMsg::Hello { secret: secret() }).await;
+        peer.send(&AgentMsg::Register(register())).await;
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert!(matches!(
+            within(events.recv()).await,
+            Some(AgentEvent::Registered { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_long_first_line_is_refused_before_the_secret_is_read() {
+        let (addr, mut events, _hub) = agents_hub().await;
+        let mut peer = Peer::connect(addr).await;
+        let started = Instant::now();
+        peer.raw(&vec![b'a'; MAX_HELLO_LINE + 1]).await;
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Rejected {
+                reason: Rejection::Protocol
+            })
+        );
+        assert!(started.elapsed() < HANDSHAKE_TIMEOUT, "not at the deadline");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_secret_is_answered_after_a_fixed_pause() {
+        let (addr, _events, _hub) = agents_hub().await;
+        let wrong = Secret::parse("0123456789abcdef-secreT").unwrap();
+        let mut peer = Peer::connect(addr).await;
+        let started = Instant::now();
+        peer.send(&AgentMsg::Hello { secret: wrong }).await;
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Rejected {
+                reason: Rejection::Auth
+            })
+        );
+        assert!(
+            started.elapsed() >= AUTH_FAIL_DELAY,
+            "{:?}",
+            started.elapsed()
+        );
+
+        let (hooks, _rx) = hooks_hub(4).await;
+        let started = Instant::now();
+        let raw = request(Some("Bearer 0123456789abcdef-secreT"), b"{}");
+        assert_eq!(exchange(hooks, &raw).await, 401);
+        assert!(
+            started.elapsed() >= AUTH_FAIL_DELAY,
+            "{:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        assert_eq!(exchange(hooks, &request(None, b"{}")).await, 401);
+        assert!(
+            started.elapsed() >= AUTH_FAIL_DELAY,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// xorshift64*: repeatable noise without a new dependency.
+    struct Noise(u64);
+
+    impl Noise {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let len = (self.next() as usize) % (max + 1);
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn garbage_before_auth_never_panics_or_grows() {
+        let mut noise = Noise(0x0123_4567_89ab_cdef);
+        let prefixes: [&[u8]; 5] = [
+            b"",
+            b"POST /v1/hook HTTP/1.1\r\n",
+            b"POST /v1/hook HTTP/1.1\r\nAuthorization: Bearer ",
+            b"{\"v\":1,\"type\":\"hello\",\"secret\":",
+            b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
+        ];
+        for round in 0..2000 {
+            let prefix = prefixes[round % prefixes.len()];
+            let input = [prefix, &noise.bytes(3 * 1024)].concat();
+            // Parsers of both listeners on arbitrary input: an answer, never
+            // a panic.
+            let mut reader = &input[..];
+            let _ = read_request(&mut reader, &secret()).await;
+            let _ = wire::decode::<AgentMsg>(&input);
+            let mut line = Vec::new();
+            let mut reader = BufReader::new(&input[..]);
+            let _ = wire::read_line_max(&mut reader, &mut line, MAX_HELLO_LINE).await;
+            assert!(line.len() <= MAX_HELLO_LINE);
+        }
+    }
+
+    #[tokio::test]
+    async fn garbage_and_foreign_handshakes_never_stop_a_listener() {
+        let (acceptor, pin) = tls_acceptor();
+        let (plain_agents, mut agent_events, _hub) = agents_hub().await;
+        let (plain_hooks, mut hook_events) = hooks_hub(8).await;
+        let tls_hooks = bind(loopback()).await.unwrap();
+        let tls_hooks_addr = tls_hooks.local_addr().unwrap();
+        let (hook_tx, mut tls_hook_events) = mpsc::channel(8);
+        tokio::spawn(serve_hooks(
+            Listener::tls(tls_hooks, acceptor),
+            secret(),
+            hook_tx,
+        ));
+
+        let mut noise = Noise(0xfeed_f00d_dead_beef);
+        for addr in [plain_agents, plain_hooks, tls_hooks_addr] {
+            for _ in 0..12 {
+                let payload = noise.bytes(16 * 1024);
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                let _ = stream.write_all(&payload).await;
+                let _ = stream.shutdown().await;
+                let mut sink = Vec::new();
+                let _ = within(stream.read_to_end(&mut sink)).await;
+                assert!(sink.len() < 4096, "a short answer at most");
+            }
+        }
+        // A TLS ClientHello to the plain listeners, plain text to TLS.
+        for addr in [plain_agents, plain_hooks] {
+            let tls = crate::tls::HubAddr::pinned(&addr.to_string(), pin).unwrap();
+            assert!(within(tls.connect()).await.is_err());
+        }
+        let answer = exchange_raw(
+            tls_hooks_addr,
+            &request(Some(&format!("Bearer {SECRET}")), b"{}"),
+        )
+        .await;
+        assert!(
+            !answer.starts_with(b"HTTP/"),
+            "plain text gets no HTTP answer from a TLS listener"
+        );
+
+        // Everyone real still gets through.
+        let mut peer = Peer::connect(plain_agents).await;
+        peer.send(&AgentMsg::Hello { secret: secret() }).await;
+        peer.send(&AgentMsg::Register(register())).await;
+        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert!(matches!(
+            within(agent_events.recv()).await,
+            Some(AgentEvent::Registered { .. })
+        ));
+        let sent = post(start());
+        let plain = crate::tls::HubAddr::plain(plain_hooks.to_string());
+        crate::hook::post(&plain, &secret(), &sent, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(within(hook_events.recv()).await, Some(sent));
+        let sent = post(start());
+        let tls = crate::tls::HubAddr::pinned(&tls_hooks_addr.to_string(), pin).unwrap();
+        crate::hook::post(&tls, &secret(), &sent, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(within(tls_hook_events.recv()).await, Some(sent));
+    }
+
+    async fn exchange_raw(addr: SocketAddr, raw: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let _ = stream.write_all(raw).await;
+        let mut response = Vec::new();
+        let _ = within(stream.read_to_end(&mut response)).await;
+        response
     }
 }

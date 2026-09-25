@@ -5,3 +5,5 @@ target/
 registry.json
 .claude/
 .agent/
+deploy/hub.env
+deploy/tls/
