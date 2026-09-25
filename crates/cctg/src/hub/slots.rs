@@ -90,9 +90,14 @@
 //! a turn; the press is asked again after it. Likewise no `/exit` goes in
 //! while the terminal shows background agents or the agent view (TASK-047):
 //! the agent answers `agents_running`, the topic is told once and the press
-//! is asked again every [`UPDATE_RETRY`]. A restart that cuts off work (a
-//! turn stopped by ⏹ while the press waited, or still running) is followed
-//! by one channel message into the session once its next agent is bound.
+//! is asked again every [`UPDATE_RETRY`]. The hub's own view counts too: a
+//! session with a subagent whose `SubagentStart` came and `SubagentStop` did
+//! not (and that is still a candidate or has a block, at most
+//! [`AGENT_MAX_AGE`]) gets no `update` at all, with the same notice; the
+//! press goes on after the last stop. A restart that cuts off work (a turn stopped by ⏹ while the press
+//! waited, or still running, or subagents the hub sees running) is followed
+//! by one channel message into the session once its next agent is bound
+//! ([`continue_text`], with the agent ids of those subagents).
 //!
 //! Console commands (TASK-043, see [`console`]): a topic message that starts
 //! with `!` or with a slash command the hub does not serve goes, instead of
@@ -231,12 +236,29 @@ pub const UPDATE_RETRY: Duration = Duration::from_secs(30);
 /// bound, after a client restart cut off its work (TASK-047).
 pub const CONTINUE_TEXT: &str = "Клиент cctg обновлён, и сессия была перезапущена посреди работы. \
 Продолжи с того места, где остановился.";
-/// PROBE-DEPENDENT (TASK-047): the sentence of [`CONTINUE_TEXT`] about
-/// background agents the restart ended. Whether such an agent goes on from
-/// its transcript after `SendMessage` or must be started again is decided by
-/// a live probe; until then the text covers both.
-pub const CONTINUE_AGENTS_TEXT: &str =
-    "Если работали фоновые агенты, проверь их и при необходимости запусти заново.";
+/// Follows [`CONTINUE_TEXT`] when the restart stopped background subagents,
+/// before their agent ids. Probe TASK-047 (2.1.282): after `--resume` such
+/// an agent goes on from its transcript on a `SendMessage` to its agentId;
+/// by its name it is not reachable.
+pub const CONTINUE_AGENTS_TEXT: &str = "Перезапуск остановил фоновых субагентов с agentId:";
+/// Ends the continuation after the agent ids.
+pub const CONTINUE_AGENTS_HOW: &str = "Возобнови каждого через SendMessage, указав в to его agentId \
+(не имя: по имени агент недоступен); он продолжит по своему транскрипту с места остановки.";
+/// A subagent that started and did not stop holds updates back at most this
+/// long: a lost `SubagentStop` must not hold them forever (TASK-047).
+pub const AGENT_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The channel message after a restart that cut off work or stopped the
+/// background subagents `agents` (TASK-047).
+pub fn continue_text(agents: &[String]) -> String {
+    if agents.is_empty() {
+        return CONTINUE_TEXT.to_owned();
+    }
+    format!(
+        "{CONTINUE_TEXT} {CONTINUE_AGENTS_TEXT} {}. {CONTINUE_AGENTS_HOW}",
+        agents.join(", ")
+    )
+}
 
 /// A call of a session that starts or ends this long after one of its
 /// permission prompts came in means the prompt was answered in the terminal
@@ -718,6 +740,10 @@ pub struct Slots {
     relayed: VecDeque<(Instant, String, String)>,
     /// Typed subagents not yet matched to an `Agent` call of their parent.
     candidates: Candidates,
+    /// Subagents of live top-level sessions that started and did not stop
+    /// yet: agent id -> (session, when the entry stops counting). See
+    /// [`Slots::agents_running`] (TASK-047).
+    started_agents: HashMap<String, (String, Instant)>,
     /// `Agent` calls per session transcript, read incrementally.
     indexes: HashMap<String, AgentIndex>,
     /// Sessions whose transcript is being read for `Agent` calls.
@@ -817,6 +843,7 @@ impl Slots {
             hook_waiters: HashMap::new(),
             relayed: VecDeque::new(),
             candidates: Candidates::default(),
+            started_agents: HashMap::new(),
             indexes: HashMap::new(),
             indexing: HashSet::new(),
             reports: Reports::default(),
@@ -995,6 +1022,14 @@ impl Slots {
             .updates
             .values()
             .filter_map(|ask| ask.retry_at)
+            .filter(|at| *at > now)
+            .fold(deadline, Instant::min);
+        // A press held by subagents goes on when they reach their age limit.
+        let deadline = self
+            .started_agents
+            .values()
+            .filter(|(session, _)| self.updates.contains_key(session))
+            .map(|(_, until)| *until)
             .filter(|at| *at > now)
             .fold(deadline, Instant::min);
         let deadline = self
@@ -1362,11 +1397,14 @@ impl Slots {
             _ => {}
         }
         self.track_activity(session, &post.event);
+        self.track_agents(session, &post.event);
         // Every way a session ends (its SessionEnd, `/clear`, a reused pid,
         // the reaper) drops what it did.
         let registry = &self.registry;
         self.activity
             .retain(|session, _| registry.is_live_top_level(session));
+        self.started_agents
+            .retain(|_, (session, _)| registry.is_live_top_level(session));
         self.close_prompts(&followup.ended_sessions);
         self.end_blocks(&followup.ended_sessions);
         if let Some((session, path)) = followup.read_title {
@@ -1400,6 +1438,61 @@ impl Slots {
             self.prompts.quiet_settled(session, Instant::now(), settle);
             self.sync_waiting(session);
         }
+    }
+
+    /// Typed subagents a live top-level session started and did not stop
+    /// yet, for [`Self::agents_running`] (TASK-047). Entries past
+    /// [`AGENT_MAX_AGE`] are dropped on the next start.
+    fn track_agents(&mut self, session: &str, event: &HookEvent) {
+        match event {
+            HookEvent::SubagentStart {
+                agent_id,
+                agent_type,
+            } if self.registry.is_live_top_level(session)
+                && !agent_type.trim().is_empty()
+                && subagents::is_agent_id(agent_id) =>
+            {
+                let now = Instant::now();
+                self.started_agents.retain(|_, (_, until)| now < *until);
+                self.started_agents
+                    .insert(agent_id.clone(), (session.to_owned(), now + AGENT_MAX_AGE));
+            }
+            HookEvent::SubagentStop { agent_id, .. }
+                if self
+                    .started_agents
+                    .get(agent_id)
+                    .is_some_and(|(owner, _)| owner == session) =>
+            {
+                self.started_agents.remove(agent_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// The subagents of `session` the hub sees running, by agent id: a
+    /// `SubagentStart` came and no `SubagentStop`, less than
+    /// [`AGENT_MAX_AGE`] ago, and the agent is still a candidate or was
+    /// matched to an `Agent` call of the session (Claude Code's internal
+    /// agents never are, and their stops never reach the hub).
+    fn agents_running(&self, session: &str) -> Vec<String> {
+        let now = Instant::now();
+        let mut agents: Vec<String> = self
+            .started_agents
+            .iter()
+            .filter(|(agent_id, (owner, until))| {
+                owner == session
+                    && now < *until
+                    && (self.candidates.contains(agent_id)
+                        || self
+                            .registry
+                            .subagents
+                            .get(*agent_id)
+                            .is_some_and(|entry| entry.parent_session == session))
+            })
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+        agents.sort();
+        agents
     }
 
     /// Ended nested runs show their last answer, also when the block was
@@ -4148,6 +4241,26 @@ impl Slots {
             let Some(ask) = self.updates.get(&session) else {
                 continue;
             };
+            if ask.sent.is_none() && ask.left.is_none() && !self.agents_running(&session).is_empty()
+            {
+                // Subagents run (TASK-047): no `update` goes out, as after an
+                // `agents_running` answer; the press is kept and goes on at
+                // their last stop (or at their age limit, a deadline), the
+                // topic is told once.
+                let mut tell = false;
+                if let Some(ask) = self.updates.get_mut(&session) {
+                    ask.until = now + UPDATE_WAIT;
+                    tell = !std::mem::replace(&mut ask.agents_told, true);
+                }
+                if tell
+                    && let Some(slot) = self.current_slot(&session)
+                    && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+                {
+                    info!(session = short(&session), "update held back: subagents run");
+                    self.notify(slot, thread_id, status::UPDATE_AGENTS_NOTICE);
+                }
+                continue;
+            }
             let (expired, idle, told) = (now >= ask.until, ask.sent.is_none(), ask.told);
             if expired && idle && self.busy(&session) {
                 if let Some(ask) = self.updates.get_mut(&session) {
@@ -4296,15 +4409,20 @@ impl Slots {
             outcome,
             UpdateOutcome::Reloading | UpdateOutcome::Restarting
         ) {
-            if outcome == UpdateOutcome::Restarting && self.restart_cuts_work(session) {
-                if let Some(entry) = self.registry.sessions.get_mut(session) {
-                    entry.restart_interrupted = true;
-                    self.registry.dirty = true;
-                }
+            let agents = self.agents_running(session);
+            if outcome == UpdateOutcome::Restarting
+                && (self.restart_cuts_work(session) || !agents.is_empty())
+            {
                 info!(
                     session = short(session),
+                    agents = agents.len(),
                     "the restart cuts off work; the session is told after it"
                 );
+                if let Some(entry) = self.registry.sessions.get_mut(session) {
+                    entry.restart_interrupted = true;
+                    entry.restart_agents = agents;
+                    self.registry.dirty = true;
+                }
             }
             if let Some(ask) = self.updates.get_mut(session).filter(|_| asked) {
                 ask.sent = None;
@@ -4363,6 +4481,7 @@ impl Slots {
             .filter(|entry| entry.restart_interrupted)
         {
             entry.restart_interrupted = false;
+            entry.restart_agents.clear();
             self.registry.dirty = true;
         }
         if self.registry.agent_connected(session, conn) {
@@ -4399,8 +4518,14 @@ impl Slots {
             if let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) {
                 meta.insert("thread_id".to_owned(), thread_id.to_string());
             }
+            let agents = self
+                .registry
+                .sessions
+                .get(&session)
+                .map(|entry| entry.restart_agents.as_slice())
+                .unwrap_or_default();
             let inbound = HubMsg::Inbound {
-                content: format!("{CONTINUE_TEXT} {CONTINUE_AGENTS_TEXT}"),
+                content: continue_text(agents),
                 meta,
             };
             let sent = self
@@ -4412,6 +4537,7 @@ impl Slots {
             }
             if let Some(entry) = self.registry.sessions.get_mut(&session) {
                 entry.restart_interrupted = false;
+                entry.restart_agents.clear();
                 self.registry.dirty = true;
             }
             info!(
@@ -12784,11 +12910,7 @@ again"
 
         let mut second = restart_run(&mut slots, 1, 2);
         let texts = inbound_texts(&mut second);
-        assert_eq!(
-            texts,
-            [format!("{CONTINUE_TEXT} {CONTINUE_AGENTS_TEXT}")],
-            "one message after the restart"
-        );
+        assert_eq!(texts, [CONTINUE_TEXT], "one message after the restart");
         assert!(!slots.registry.sessions[A].restart_interrupted);
         slots.pump();
         assert!(inbound_texts(&mut second).is_empty(), "only once");
@@ -12828,6 +12950,106 @@ again"
         let mut second = restart_run(&mut slots, 1, 2);
         slots.pump();
         assert!(inbound_texts(&mut second).is_empty(), "idle: nothing");
+    }
+
+    const WORKER: &str = "a2e9235bfcf0c0407";
+
+    async fn agents_notices(fake: &Fake) -> usize {
+        sent_texts(fake)
+            .await
+            .iter()
+            .filter(|(text, _)| text == status::UPDATE_AGENTS_NOTICE)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_subagent_seen_running_holds_the_update_until_it_stops() {
+        let dir = TempDir::new("slots-update-hub-agents");
+        let (fake, mut slots) = updating_slots(&dir);
+        let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        // Claude Code's internal agents (untyped) never count.
+        slots.on_hook(&sub_start(A, "b0000000000000001", " "));
+        slots.on_hook(&sub_start(A, WORKER, "general-purpose"));
+        assert_eq!(slots.agents_running(A), [WORKER]);
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        for _ in 0..3 {
+            slots.pump();
+            assert!(agent.try_recv().is_err(), "no update while it runs");
+        }
+        assert_eq!(agents_notices(&fake).await, 1, "told once");
+        let path = dir.path().join("agent-worker.jsonl");
+        slots.on_hook(&sub_stop(A, WORKER, "general-purpose", &path, "done"));
+        assert!(slots.agents_running(A).is_empty());
+        slots.pump();
+        update_of(&mut agent);
+        assert_eq!(agents_notices(&fake).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_subagent_stop_holds_the_update_only_so_long() {
+        let dir = TempDir::new("slots-update-hub-agents-stale");
+        let (_fake, mut slots) = updating_slots(&dir);
+        let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        slots.on_hook(&sub_start(A, WORKER, "general-purpose"));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        assert!(agent.try_recv().is_err());
+        // Its age limit comes: the actor wakes then, and it no longer counts.
+        let limit = Instant::now() + Duration::from_millis(50);
+        slots.started_agents.get_mut(WORKER).unwrap().1 = limit;
+        assert!(slots.next_deadline() <= limit);
+        slots.pump();
+        assert!(agent.try_recv().is_err());
+        tokio::time::sleep_until(limit).await;
+        slots.pump();
+        update_of(&mut agent);
+
+        // A start the parent transcript never confirmed (the candidate was
+        // dropped at its window's end) does not count either.
+        slots.on_hook(&sub_start(A, "a0000000000000003", "maw-qa"));
+        assert_eq!(slots.agents_running(A), ["a0000000000000003"]);
+        slots.candidates.take("a0000000000000003");
+        assert!(slots.agents_running(A).is_empty());
+        // A session's end drops its subagents.
+        slots.on_hook(&sub_start(A, "a0000000000000004", "maw-qa"));
+        slots.on_hook(&end(A, 10));
+        assert!(slots.started_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_stops_subagents_names_them_in_its_message() {
+        let dir = TempDir::new("slots-update-continue-agents");
+        let (_fake, mut slots) = updating_slots(&dir);
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let update_id = update_of(&mut first);
+        // The subagent started after the `update` went out; the session was
+        // idle otherwise.
+        slots.on_hook(&sub_start(A, WORKER, "general-purpose"));
+        answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
+        assert!(matches!(first.try_recv(), Ok(HubMsg::Released { .. })));
+        assert!(slots.registry.sessions[A].restart_interrupted);
+        assert_eq!(slots.registry.sessions[A].restart_agents, [WORKER]);
+        let saved = String::from_utf8(RegistryStore::encode(&slots.registry)).unwrap();
+        assert!(saved.contains(WORKER), "{saved}");
+
+        let mut second = restart_run(&mut slots, 1, 2);
+        let texts = inbound_texts(&mut second);
+        assert_eq!(texts, [continue_text(&[WORKER.to_owned()])]);
+        assert!(texts[0].contains(WORKER) && texts[0].contains("SendMessage"));
+        assert!(slots.registry.sessions[A].restart_agents.is_empty());
+        slots.pump();
+        assert!(inbound_texts(&mut second).is_empty(), "only once");
+    }
+
+    #[test]
+    fn the_continuation_names_stopped_subagents_only_when_there_are_some() {
+        assert_eq!(continue_text(&[]), CONTINUE_TEXT);
+        let text = continue_text(&["a1".into(), "b2".into()]);
+        assert!(text.starts_with(CONTINUE_TEXT));
+        assert!(text.contains(&format!("{CONTINUE_AGENTS_TEXT} a1, b2. ")));
+        assert!(text.ends_with(CONTINUE_AGENTS_HOW));
     }
 
     /// TASK-042 rebinds a session to an older open link of its run when the
