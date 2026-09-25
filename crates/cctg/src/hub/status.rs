@@ -65,9 +65,12 @@ pub const NO_NEW_BUILD_NOTICE: &str = "На машине этой сессии �
 pub const MANUAL_RESTART_NOTICE: &str = "Нужен перезапуск claude, а сессия запущена не через cctg run (claude-cctg). Выйдите из claude и запустите claude-cctg --resume с id этой сессии.";
 pub const DRAFT_NOTICE: &str = "В поле ввода терминала есть неотправленный текст, поэтому /exit не отправлен. Отправьте или сотрите его и нажмите «Обновить» ещё раз.";
 pub const UPDATE_WAITS_NOTICE: &str = "⏳ Обновление клиента ждёт конца хода и продолжится само, когда он закончится (⏹ прервёт ход).";
-/// A restart waits: the terminal shows the agent view or a working
-/// background agent (TASK-047); asked again after [`super::slots::UPDATE_RETRY`].
-pub const UPDATE_AGENTS_NOTICE: &str = "Перезапуск ждёт, пока закончат фоновые агенты…";
+/// An update waits for background agents (TASK-047): the terminal shows the
+/// agent view or a working one (asked again after
+/// [`super::slots::UPDATE_RETRY`]), or the hub saw a subagent start and not
+/// stop yet.
+pub const UPDATE_AGENTS_NOTICE: &str =
+    "⏳ Обновление клиента ждёт, пока закончат фоновые агенты, и продолжится само.";
 pub const UPDATE_FAILED_NOTICE: &str =
     "Обновить клиент не получилось; подробности в debug-логе claude этой сессии.";
 
