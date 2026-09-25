@@ -1,0 +1,40 @@
+=== install with an empty --secret-file
+cctg-install: building cctg with cargo
+cctg-install: installed cctg 0.1.0 (3564927943344b285b21d47503a957a47bc1b9d0)
+cctg-install: checking the hub (cctg doctor):
+cctg 0.1.0 (3564927943344b285b21d47503a957a47bc1b9d0)
+secret: CCTG_HUB_SECRET is not set (process env or ~/.cctg/device.env)
+certificate pin: none (plain TCP, a hub on this machine only)
+agent link 127.0.0.1:9: cannot connect (ConnectionRefused)
+hooks 127.0.0.1:9: not checked without a secret
+cctg-install: the hub check failed; fix device.env and run /tmp/crev031/h1/home/.cctg/bin/cctg.exe doctor again
+cctg-install: note: /tmp/crev031/h1/home/.local/bin is not in PATH; add it (Claude Code's installer uses the same folder)
+cctg-install: done: run claude-cctg in a project folder
+exit=0
+=== device.env after install
+CCTG_HOST=my-laptop
+CCTG_STATE_DIR=C:/somewhere/state
+CCTG_HUB_AGENT_ADDR='127.0.0.1:9'
+CCTG_HUB_HOOK_ADDR='127.0.0.1:9'
+=== uninstall
+cctg-install: removed /tmp/crev031/h1/home/.local/bin/claude-cctg
+cctg-install: removed /tmp/crev031/h1/home/.local/bin/claude-cctg.cmd
+cctg-install: removed /tmp/crev031/h1/home/.cctg/claude/mcp.json
+cctg-install: removed /tmp/crev031/h1/home/.cctg/claude/settings.json
+cctg-install: removed /tmp/crev031/h1/home/.cctg/device.env
+cctg-install: removed /tmp/crev031/h1/home/.cctg/bin/cctg.exe
+cctg-install: uninstalled; ~/.claude and ~/.claude.json were not touched
+exit=0
+=== left:
+ls: cannot access 'home/.cctg': No such file or directory
+
+=== MSYS rm/mv of a running exe (copies of PING.EXE running 8 s)
+rm -f x.old.exe  -> exit 0, file gone while it runs
+mv -f x.exe x.old.exe -> exit 0 while it runs
+
+=== Git Bash /dev/tty probes (hidden console, ttyprobe*.py)
+bash -c, stdin pipe, stdout file          -> no-tty   (test harness case: no prompt, no hang)
+bash -c, stdin pipe, stdout console       -> no-tty
+bash -c (console stdin) | sh -c probe     -> /dev/cons0, inner tty-open, stty -g ok (real Git Bash console: prompts work)
+
+=== shellcheck 0.10.0 (downloaded to %TEMP%, deleted): --shell=sh|dash|bash install.sh -> exit 0; dash -n ok

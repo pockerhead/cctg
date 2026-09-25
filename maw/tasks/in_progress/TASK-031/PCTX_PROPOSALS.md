@@ -8,3 +8,8 @@
 4. Risk lesson (general): "Git Bash (MSYS) rewrites arguments that look like POSIX paths for native programs: `openssl req -subj /CN=x` breaks; with `MSYS_NO_PATHCONV=1` absolute `/tmp/...` paths land in `C:\tmp`. Use relative paths and set the variable per command, never exported." Evidence: planner probe 2026-09-25 (install.sh `--hub`).
 5. Risk lesson (hooks/channel): "`DeviceConfig::load` prefers the process environment over `device.env`: a check run with `CCTG_HUB_SECRET` in its environment does not test the file. install.sh unsets it after reading." Evidence: first draft of the e2e would have passed with a broken device.env quoting in run 1.
 6. Invariant (general): "Tests that run install.sh go through `common::isolate` like every `cctg` process and put stand-ins for `claude`, `curl` (claude.ai URLs only), `powershell`, `docker` and `cargo` first on PATH; no test downloads Anthropic's installer or touches the network."
+
+2026-09-25, code-reviewer. Proposals only.
+
+7. Risk lesson (general, Windows): "In Git Bash (MSYS/Cygwin) `rm -f` and `mv -f` of a running .exe both succeed (rm moves it away and deletes it on close), so a shell 'in use?' fallback after rm never fires; the running process is unaffected." Evidence: TASK-031 code-reviewer, copies of PING.EXE running, `scratch/code-reviewer/repro_output.txt`.
+8. Risk lesson (general, Windows): "`/dev/tty` in Git Bash exists only when a Cygwin ancestor owns the console: a piped `sh` under an interactive Git Bash console gets `/dev/cons0` (prompts work), but a bash spawned by a native process with piped stdio has none, even with a console attached (tests never prompt)." Evidence: hidden-console probes, `scratch/code-reviewer/ttyprobe3.py.txt`.
