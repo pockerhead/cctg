@@ -29,6 +29,12 @@ use crate::shim;
 pub const RUN_VAR: &str = "CCTG_RUN";
 /// Set by `cctg run`: its claude arguments as a JSON array of strings.
 pub const RUN_ARGS_VAR: &str = "CCTG_RUN_ARGS";
+/// Unix seconds: a claude whose shim started earlier takes this build only
+/// with a restart. Claude Code keeps what the first worker announced at
+/// `initialize` (tools, `tools.listChanged` since TASK-032) for the whole
+/// session. Move it forward with any change that reaches Claude Code only on
+/// a restart.
+pub const RESTART_SINCE: u64 = 1_790_318_757;
 
 /// A restart request of a worker for `cctg run`: the arguments of the next
 /// claude, as [`relaunch_args`] made them.
@@ -119,7 +125,9 @@ impl Worker {
         self.run_pid.is_some() && self.keys && self.claude_pid.is_some() && self.state_dir.is_some()
     }
 
-    /// Decides; blocking (hashes the executable, looks at config files).
+    /// Decides; blocking (hashes the executable, looks at config files). A
+    /// claude started before [`RESTART_SINCE`] restarts as after a settings
+    /// change.
     pub fn plan(&self) -> Plan {
         let (Some(exe), Some(build)) = (&self.exe, &self.build) else {
             return Plan::Failed;
@@ -133,9 +141,9 @@ impl Worker {
             // Mid-deploy (renamed away, not yet back): try again later.
             Err(_) => return Plan::Failed,
         }
-        let changed = self
-            .shim_started
-            .is_some_and(|started| changed_since(&config_files(&self.run_args), started));
+        let changed = self.shim_started.is_some_and(|started| {
+            started < RESTART_SINCE || changed_since(&config_files(&self.run_args), started)
+        });
         match (changed, self.restartable()) {
             (false, _) => Plan::UpToDate,
             (true, true) => Plan::Restart,
@@ -437,6 +445,21 @@ mod tests {
         assert_eq!(w.plan(), Plan::Failed);
         w.shim = None;
         assert_eq!(w.plan(), Plan::Failed);
+    }
+
+    #[test]
+    fn a_claude_started_before_restart_since_restarts() {
+        let dir = TempDir::new("update-plan-since");
+        let exe = dir.path().join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let mut w = worker(dir.path(), &exe);
+        w.run_pid = Some(77);
+        w.shim_started = Some(RESTART_SINCE - 1);
+        assert_eq!(w.plan(), Plan::Restart);
+        w.run_pid = None;
+        assert_eq!(w.plan(), Plan::ManualRestart);
+        w.shim_started = Some(RESTART_SINCE);
+        assert_eq!(w.plan(), Plan::UpToDate);
     }
 
     #[test]
