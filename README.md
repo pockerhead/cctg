@@ -1,5 +1,9 @@
 # cctg: Claude Code в Telegram
 
+[![ci](https://github.com/pockerhead/cctg/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pockerhead/cctg/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/pockerhead/cctg)](https://github.com/pockerhead/cctg/releases/latest)
+[![image](https://img.shields.io/badge/ghcr.io-pockerhead%2Fcctg-blue?logo=docker)](https://github.com/pockerhead/cctg/pkgs/container/cctg)
+
 Сессии Claude Code на ваших машинах видны в одной закрытой Telegram-группе с темами. Каждая папка проекта получает свою тему: там видно, что делает Claude, приходят его ответы и кнопки разрешений, а ваше сообщение в теме уходит в сессию.
 
 ```
