@@ -6,9 +6,6 @@ TASK-024
 
 TASK-031
 
-TASK-035
-  └── TASK-044   (blocked by TASK-035)
-
 TASK-036
 
 TASK-037
@@ -16,4 +13,6 @@ TASK-037
 TASK-038
 
 TASK-042
+
+TASK-044   [waits on TASK-035 (in_progress)]
 
