@@ -121,7 +121,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         chat_id: CHAT,
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -190,6 +190,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         })

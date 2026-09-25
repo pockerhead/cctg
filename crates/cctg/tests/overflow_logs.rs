@@ -115,7 +115,7 @@ async fn one_overflow_warning_per_episode() {
         notice_every: Duration::ZERO,
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
     let (_agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();

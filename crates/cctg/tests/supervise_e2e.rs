@@ -414,7 +414,6 @@ async fn scenario() {
         .env("CCTG_ALLOWED_USER_IDS", USER.to_string())
         .env("CCTG_HUB_SECRET", SECRET)
         .env("CCTG_STATE_DIR", &state)
-        .env("CCTG_PROJECTS_DIR", root.0.join("projects"))
         .env("CCTG_AGENT_LISTEN", format!("127.0.0.1:{agent_port}"))
         .env("CCTG_HOOK_LISTEN", format!("127.0.0.1:{hook_port}"))
         .env("CCTG_BOT_API_URL", format!("http://127.0.0.1:{api_port}"))

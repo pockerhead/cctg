@@ -11,7 +11,6 @@ pub mod offset;
 pub mod permissions;
 pub mod registry;
 pub mod scheduler;
-pub mod sessions;
 pub mod slots;
 pub mod status;
 pub mod stream;
@@ -29,13 +28,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use api::{ApiError, BotApi, ChatMember, Sticker};
-use config::{
-    AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, PROJECTS_VAR, SECRET_VAR, STATE_VAR,
-};
+use config::{AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, STATE_VAR};
 use offset::OffsetStore;
 use registry::{Icons, RegistryStore};
 use scheduler::{BucketConfig, Scheduler};
-use sessions::{ProjectsDir, SlotLocator};
 use slots::{Control, Slots};
 use updates::{Inbound, Routed, ServiceKind};
 
@@ -164,9 +160,6 @@ async fn stop_requested(watch_stdin: bool) {
 /// batches and lets the slot actor write the registry before returning.
 pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result<()> {
     let config = Config::load(env_file)?;
-    let projects_dir = config.projects_dir.clone().with_context(|| {
-        format!("no home directory found; set {PROJECTS_VAR} to the Claude Code projects directory")
-    })?;
     let offsets = OffsetStore::open(&config.state_dir)
         .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
     let registry_store = RegistryStore::open(&config.state_dir)
@@ -235,14 +228,15 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         build,
         ..slots::Options::default()
     };
-    let (mut slots, view) = Slots::new(registry, registry_store, outbox.clone(), options);
+    let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
     let permission_asks = slots.permission_asks();
+    let transcript_asks = slots.transcript_asks();
     slots.fetch_files(api.clone());
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     tokio::spawn(commands::serve(
         commands_rx,
         outbox,
-        Arc::new(SlotLocator::new(view, ProjectsDir::new(projects_dir))),
+        Arc::new(commands::Asks(transcript_asks)),
         me.username.clone(),
     ));
     let (agents_tx, agents_rx) = mpsc::channel(256);
@@ -290,8 +284,8 @@ mod tests {
 
     use super::*;
     use api::Message;
+    use commands::{Prepared, TranscriptCommand, TranscriptSource};
     use scheduler::{Delivery, Op, Outcome, Transport};
-    use sessions::{LocateError, Located, TranscriptLocator};
     use testdir::TempDir;
     use updates::UpdateSource;
 
@@ -330,20 +324,22 @@ mod tests {
         }
     }
 
-    /// Blocks each `locate` until the test lets it through.
+    /// Holds each command until the test lets it through, like an agent
+    /// that takes its time; then renders `jsonl`.
     struct Gated {
-        gate: Mutex<std::sync::mpsc::Receiver<()>>,
-        file: std::path::PathBuf,
+        gate: tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>,
+        jsonl: String,
     }
 
-    impl TranscriptLocator for Gated {
-        fn locate(&self, _: Option<i64>, _: Option<&str>) -> Result<Located, LocateError> {
-            let _ = self.gate.lock().unwrap().recv();
-            Ok(Located {
-                session_id: SESSION.to_owned(),
-                project: "C--proj".to_owned(),
-                path: self.file.clone(),
-            })
+    impl TranscriptSource for Gated {
+        async fn prepare(&self, _: Option<i64>, command: TranscriptCommand) -> Prepared {
+            let _ = self.gate.lock().await.recv().await;
+            let turns = transcript::parse(&self.jsonl);
+            let body = match command.view {
+                commands::View::Brief => transcript::render_brief(&turns),
+                commands::View::Full => transcript::render_full(&turns),
+            };
+            commands::transcript_reply(&command, SESSION, body)
         }
     }
 
@@ -362,22 +358,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slow_command_does_not_hold_up_polling() {
         let dir = TempDir::new("hub-slow-command");
-        let file = dir.path().join(format!("{SESSION}.jsonl"));
-        std::fs::write(
-            &file,
-            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
-        )
-        .unwrap();
-        let (open_gate, gate) = std::sync::mpsc::channel();
+        let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+        let (open_gate, gate) = mpsc::unbounded_channel();
         let sent = Arc::new(Sent::default());
         let (scheduler, outbox) = Scheduler::new(sent.clone(), BucketConfig::default());
         tokio::spawn(scheduler.run());
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let locator = Arc::new(Gated {
-            gate: Mutex::new(gate),
-            file: file.clone(),
+        let source = Arc::new(Gated {
+            gate: tokio::sync::Mutex::new(gate),
+            jsonl: jsonl.to_owned(),
         });
-        tokio::spawn(commands::serve(commands_rx, outbox, locator, None));
+        tokio::spawn(commands::serve(commands_rx, outbox, source, None));
 
         let source = Arc::new(Batches {
             calls: AtomicUsize::new(0),
@@ -399,7 +390,7 @@ mod tests {
             })
         };
 
-        // The first command is stuck in `locate`, yet both batches were
+        // The first command is stuck in its source, yet both batches were
         // fetched and the offset saved past them.
         tokio::time::timeout(Duration::from_secs(10), source.polled_twice.notified())
             .await
@@ -417,7 +408,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), answered)
             .await
             .expect("both commands answered");
-        let turns = transcript::parse(&std::fs::read_to_string(&file).unwrap());
+        let turns = transcript::parse(jsonl);
         let want = [
             transcript::render_brief(&turns),
             transcript::render_full(&turns),

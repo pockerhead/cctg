@@ -12,8 +12,6 @@ use crate::wire::{Secret, SecretError};
 pub const TOKEN_VAR: &str = "CCTG_BOT_TOKEN";
 pub const CHAT_VAR: &str = "CCTG_CHAT_ID";
 pub const ALLOWLIST_VAR: &str = "CCTG_ALLOWED_USER_IDS";
-/// Optional: Claude Code projects directory; defaults to `<home>/.claude/projects`.
-pub const PROJECTS_VAR: &str = "CCTG_PROJECTS_DIR";
 /// Optional: hub state directory (the saved `getUpdates` offset); defaults to `.cctg`.
 pub const STATE_VAR: &str = "CCTG_STATE_DIR";
 pub const DEFAULT_STATE_DIR: &str = ".cctg";
@@ -102,9 +100,6 @@ pub struct Config {
     /// Supergroup id in the Bot API `-100...` form.
     pub chat_id: i64,
     pub allowlist: Allowlist,
-    /// Where Claude Code keeps `<encoded-cwd>/<session-id>.jsonl`. `None` when
-    /// `CCTG_PROJECTS_DIR` is unset and no home directory is known.
-    pub projects_dir: Option<PathBuf>,
     pub state_dir: PathBuf,
     /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start then.
     pub hub_secret: Option<Secret>,
@@ -176,14 +171,6 @@ impl Config {
             return Err(ConfigError::AllowlistEmpty);
         }
 
-        let home = if cfg!(windows) {
-            optional("USERPROFILE").or_else(|| optional("HOME"))
-        } else {
-            optional("HOME")
-        };
-        let projects_dir = optional(PROJECTS_VAR)
-            .map(PathBuf::from)
-            .or_else(|| home.map(|home| PathBuf::from(home).join(".claude").join("projects")));
         let state_dir = PathBuf::from(optional(STATE_VAR).as_deref().unwrap_or(DEFAULT_STATE_DIR));
         let hub_secret = optional(SECRET_VAR)
             .map(|value| Secret::parse(&value).map_err(ConfigError::Secret))
@@ -204,7 +191,6 @@ impl Config {
             token: BotToken(token),
             chat_id,
             allowlist,
-            projects_dir,
             state_dir,
             hub_secret,
             agent_listen,
@@ -285,24 +271,10 @@ mod tests {
             (ALLOWLIST_VAR, "1"),
         ];
         let config = Config::from_vars(vars(&base)).unwrap();
-        assert_eq!(config.projects_dir, None);
         assert_eq!(config.state_dir, Path::new(DEFAULT_STATE_DIR));
 
-        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-        let with_home = [base.as_slice(), &[(home_var, "home-dir")]].concat();
-        let config = Config::from_vars(vars(&with_home)).unwrap();
-        assert_eq!(
-            config.projects_dir,
-            Some(Path::new("home-dir").join(".claude").join("projects"))
-        );
-
-        let overridden = [
-            with_home.as_slice(),
-            &[(PROJECTS_VAR, " other-projects "), (STATE_VAR, "state")],
-        ]
-        .concat();
+        let overridden = [base.as_slice(), &[(STATE_VAR, " state ")]].concat();
         let config = Config::from_vars(vars(&overridden)).unwrap();
-        assert_eq!(config.projects_dir, Some(PathBuf::from("other-projects")));
         assert_eq!(config.state_dir, Path::new("state"));
     }
 

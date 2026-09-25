@@ -18,7 +18,8 @@
 //! [`Register::console_commands`]; `update` and `released`, see
 //! [`Client::self_update`]; `file_start` and the hub's `file_chunk`, see
 //! [`Register::files`]; `file_offer` and the agent's `file_chunk`, see
-//! [`HubMsg::Registered`]). Any other
+//! [`HubMsg::Registered`]; `session_read` and `session_answer`, see
+//! [`Register::session_reads`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -157,6 +158,12 @@ pub struct Register {
     /// topic instead of a file.
     #[serde(default)]
     pub files: bool,
+    /// The agent reads its session's files for the hub: it answers
+    /// `session_read` with `session_answer`s (TASK-034). Agents built before
+    /// leave it out; the hub then shows no `/brief`, no ai-title and builds
+    /// subagent blocks from the hooks alone.
+    #[serde(default)]
+    pub session_reads: bool,
 }
 
 /// The agent's build and update abilities.
@@ -255,6 +262,115 @@ pub enum AgentMsg {
     },
     /// Bytes of an accepted offer ([`FileChunk`]).
     FileChunk(FileChunk),
+    /// One answer to the `session_read` with the same `read_id`. A `text`
+    /// comes in pieces, in order, until one without `more`; every other
+    /// answer comes alone.
+    SessionAnswer {
+        read_id: u64,
+        answer: SessionAnswer,
+    },
+}
+
+/// What the hub asks the agent to read of its session (TASK-034).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionAsk {
+    /// `/brief` or `/full`: the last `prompts` prompts of the transcript,
+    /// rendered; answered with `text` pieces.
+    Render { view: TranscriptView, prompts: u32 },
+    /// The first ai-title after byte `from`; answered with `title`.
+    Title { from: u64 },
+    /// The `Agent` calls and the agent ids of their results after byte
+    /// `from`; answered with `calls`.
+    Calls { from: u64 },
+    /// The finished block text of subagent `agent_id` of this session;
+    /// `path` is its `agent-<id>.jsonl`. Answered with `text` pieces.
+    Subagent {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// The running block's header, kept when the meta has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header: Option<String>,
+        /// `SubagentStop.last_assistant_message` (the hook caps it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last: Option<String>,
+    },
+    /// An ask of a newer hub.
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptView {
+    Brief,
+    Full,
+}
+
+/// The agent's answer to a `session_read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionAnswer {
+    /// A piece of a rendered text; `more`: another piece follows.
+    Text {
+        text: String,
+        #[serde(default)]
+        more: bool,
+    },
+    /// `scanned`: the end of the complete lines looked at (the next ask
+    /// starts there).
+    Title {
+        #[serde(default)]
+        title: Option<String>,
+        scanned: u64,
+    },
+    /// `offset`: the end of the complete lines looked at; `more`: lines
+    /// past it did not fit.
+    Calls {
+        offset: u64,
+        #[serde(default)]
+        calls: Vec<SpawnCall>,
+        #[serde(default)]
+        links: Vec<SpawnLink>,
+        #[serde(default)]
+        more: bool,
+    },
+    /// No such file of this session in the agent's own project folder (not
+    /// written yet, or that folder not found yet).
+    Missing,
+    /// The agent serves nothing: it has no session id or no Claude Code
+    /// config folder to find its own project folder in (TASK-034 decision 12).
+    Refused,
+    /// The file is there but could not be read.
+    Unreadable,
+    /// Larger than the agent reads or sends.
+    TooLarge,
+    /// An ask this agent does not know.
+    Unsupported,
+    /// An answer of a newer agent.
+    #[serde(other)]
+    Other,
+}
+
+/// An `Agent` call of the parent transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnCall {
+    /// The tool use id.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The result of an `Agent` call that named the subagent it launched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnLink {
+    pub agent_id: String,
+    pub tool_use_id: String,
 }
 
 /// One piece of a file transfer on the agent link, either way: the bytes
@@ -416,6 +532,7 @@ impl Kinds for AgentMsg {
         "update_answer",
         "file_offer",
         "file_chunk",
+        "session_answer",
     ];
 }
 
@@ -462,9 +579,11 @@ pub enum HubMsg {
         verdict_id: Option<u64>,
     },
     /// Sent only to an agent that registered with `transcript_reads`: read
-    /// the complete lines of the transcript `path` from byte `from` (`None`:
-    /// from the end of its last complete line) and answer with one
-    /// `transcript_chunk`.
+    /// the complete lines of the transcript of `session_id` from byte `from`
+    /// (`None`: from the end of its last complete line) and answer with one
+    /// `transcript_chunk`. `path` is the hook's `transcript_path`, still sent
+    /// for agents before TASK-034; a newer agent never opens it and reads
+    /// `<own project folder>/<session_id>.jsonl`.
     TranscriptRead {
         session_id: String,
         path: String,
@@ -523,6 +642,17 @@ pub enum HubMsg {
         transfer_id: u64,
         outcome: FileOutcome,
     },
+    /// Sent only to an agent that registered with `session_reads`: read the
+    /// files of session `session_id` for `ask` and answer with
+    /// `session_answer`s carrying the same `read_id`. The agent builds the
+    /// paths itself under its own project folder (the session's transcript,
+    /// its `subagents/` files for a subagent ask); a `path` an earlier hub
+    /// sends is ignored.
+    SessionRead {
+        read_id: u64,
+        session_id: String,
+        ask: SessionAsk,
+    },
 }
 
 impl Kinds for HubMsg {
@@ -539,6 +669,7 @@ impl Kinds for HubMsg {
         "file_start",
         "file_chunk",
         "file_answer",
+        "session_read",
     ];
 }
 
@@ -900,6 +1031,7 @@ mod tests {
                 console_commands: true,
                 client: None,
                 files: true,
+                session_reads: true,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -967,6 +1099,44 @@ mod tests {
                 offset: 0,
                 data: "AAEC".into(),
             }),
+            AgentMsg::SessionAnswer {
+                read_id: 5,
+                answer: SessionAnswer::Text {
+                    text: "> p\n\u{2014}".into(),
+                    more: true,
+                },
+            },
+            AgentMsg::SessionAnswer {
+                read_id: 6,
+                answer: SessionAnswer::Calls {
+                    offset: 9,
+                    calls: vec![SpawnCall {
+                        id: "t1".into(),
+                        subagent_type: Some("Explore".into()),
+                        description: None,
+                    }],
+                    links: vec![SpawnLink {
+                        agent_id: "a1".into(),
+                        tool_use_id: "t1".into(),
+                    }],
+                    more: false,
+                },
+            },
+            AgentMsg::SessionAnswer {
+                read_id: 7,
+                answer: SessionAnswer::Title {
+                    title: Some("t".into()),
+                    scanned: 3,
+                },
+            },
+            AgentMsg::SessionAnswer {
+                read_id: 8,
+                answer: SessionAnswer::Missing,
+            },
+            AgentMsg::SessionAnswer {
+                read_id: 9,
+                answer: SessionAnswer::Refused,
+            },
         ]
     }
 
@@ -1031,6 +1201,25 @@ mod tests {
             HubMsg::FileAnswer {
                 transfer_id: 4,
                 outcome: FileOutcome::Accepted,
+            },
+            HubMsg::SessionRead {
+                read_id: 5,
+                session_id: "s".into(),
+                ask: SessionAsk::Render {
+                    view: TranscriptView::Full,
+                    prompts: 2,
+                },
+            },
+            HubMsg::SessionRead {
+                read_id: 6,
+                session_id: "s".into(),
+                ask: SessionAsk::Subagent {
+                    agent_id: "a1".into(),
+                    agent_type: Some("Explore".into()),
+                    description: None,
+                    header: None,
+                    last: Some("done".into()),
+                },
             },
         ]
     }
@@ -1171,6 +1360,7 @@ mod tests {
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             }))
         );
     }
@@ -1333,6 +1523,7 @@ mod tests {
             console_keys: true,
             console_commands: false,
             files: false,
+            session_reads: false,
             client: Some(Client {
                 version: "0.1.0".into(),
                 build: "ab".repeat(32),
@@ -1429,6 +1620,47 @@ mod tests {
                 .starts_with(r#"{"v":1,"type":"file_chunk","transfer_id":2,"offset":7"#)
         );
         assert_eq!(FileKind::Voice.as_str(), "voice");
+    }
+
+    #[test]
+    fn session_reads_stay_compatible_with_version_one_peers() {
+        // An agent before TASK-034 never announces session reads.
+        let old = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
+        match decode::<AgentMsg>(old) {
+            Ok(AgentMsg::Register(register)) => assert!(!register.session_reads),
+            other => panic!("{other:?}"),
+        }
+        // An ask or an answer of a newer peer is read, not refused; the
+        // `path` an earlier hub sends is dropped unread.
+        let ask = br#"{"v":1,"type":"session_read","read_id":1,"session_id":"s","path":"p","ask":{"kind":"diff","x":1}}"#;
+        assert!(matches!(
+            decode::<HubMsg>(ask),
+            Ok(HubMsg::SessionRead {
+                ask: SessionAsk::Other,
+                ..
+            })
+        ));
+        let answer = br#"{"v":1,"type":"session_answer","read_id":1,"answer":{"kind":"queued"}}"#;
+        assert_eq!(
+            decode::<AgentMsg>(answer),
+            Ok(AgentMsg::SessionAnswer {
+                read_id: 1,
+                answer: SessionAnswer::Other
+            })
+        );
+        // The last piece of a text leaves `more` out.
+        let last =
+            br#"{"v":1,"type":"session_answer","read_id":2,"answer":{"kind":"text","text":"x"}}"#;
+        assert_eq!(
+            decode::<AgentMsg>(last),
+            Ok(AgentMsg::SessionAnswer {
+                read_id: 2,
+                answer: SessionAnswer::Text {
+                    text: "x".into(),
+                    more: false
+                }
+            })
+        );
     }
 
     #[test]

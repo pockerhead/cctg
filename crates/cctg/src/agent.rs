@@ -26,6 +26,10 @@
 //! events were written, and types a one-line command into its input box
 //! (`console_command`, TASK-043) and answers what became of it.
 //!
+//! Session reads (TASK-034): the hub never opens a file of this machine; it
+//! asks with `session_read` and the agent answers from its session's files
+//! ([`crate::reads`]), one read at a time, off the loop.
+//!
 //! Files (TASK-032): a hub that takes files says so in `registered`; the
 //! `send_file` tool then offers the file, and once the hub accepts it goes
 //! over in chunks, and the tool answers what Telegram did. A file from the
@@ -65,13 +69,14 @@ use crate::device::{self, DeviceConfig};
 use crate::files;
 use crate::keys::{self, Typed};
 use crate::proctree;
+use crate::reads;
 use crate::shim;
 use crate::spool;
 use crate::tail;
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
     self, AgentMsg, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome, HubMsg,
-    Register, Rejection, Secret, UpdateOutcome, WireError,
+    Register, Rejection, Secret, SessionAsk, UpdateOutcome, WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -399,9 +404,9 @@ pub struct Console {
 /// Folders of the agent.
 #[derive(Debug, Clone, Default)]
 pub struct Dirs {
-    /// Transcript reads are answered only from under it
-    /// ([`tail::projects_root`]).
-    pub projects: Option<PathBuf>,
+    /// The agent's own project folder ([`tail::OwnProject`]): transcript
+    /// and session reads are answered only from it; without one, none are.
+    pub project: Option<Arc<tail::OwnProject>>,
     /// The session's working folder: files from the topic are kept under
     /// it ([`files::save`]) and a relative `send_file` path starts there.
     pub work: Option<PathBuf>,
@@ -413,6 +418,7 @@ pub struct Dirs {
 pub async fn run_stdio() -> i32 {
     let config = DeviceConfig::load();
     let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+    let own_session = session_id.clone();
     let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
     // Not env `CLAUDE_PID`: in an MCP server it is inherited from an outer
     // claude, or unset (TASK-004). The shim between claude and this worker
@@ -473,6 +479,7 @@ pub async fn run_stdio() -> i32 {
                 console_commands: console.is_some(),
                 client,
                 files: true,
+                session_reads: true,
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: config.agent_addr.clone(),
@@ -492,8 +499,25 @@ pub async fn run_stdio() -> i32 {
         }
     };
     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
+    // Found by the env session's transcript, looked for again on each read
+    // until it is there: after `/clear` the env id is stale, the folder is
+    // not (TASK-034 decision 12).
+    let project = tokio::task::spawn_blocking(move || {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|dir| dir.into_os_string().into_string().ok());
+        tail::projects_root()
+            .and_then(|root| tail::OwnProject::new(root, own_session.as_deref(), cwd.as_deref()))
+    })
+    .await
+    .ok()
+    .flatten()
+    .map(Arc::new);
+    if project.is_none() {
+        info!("no session id or config folder; session reads refused");
+    }
     let dirs = Dirs {
-        projects: tail::projects_root(),
+        project,
         work: std::env::current_dir().ok(),
     };
     let worker = Some(Arc::new(worker));
@@ -602,8 +626,8 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 
 /// The MCP loop: stdin frames and hub events in, JSON-RPC lines out. Returns
 /// when stdin ends (the hub link stops with it) or stdout fails. Transcript
-/// reads are answered only from under `dirs.projects`
-/// ([`tail::projects_root`]); files from the topic are kept under
+/// reads are answered only from `dirs.project` ([`tail::OwnProject`]);
+/// files from the topic are kept under
 /// `dirs.work`. Console keys are pressed and commands typed with `console`;
 /// without one a `console_key` or `console_command` is answered as failed.
 ///
@@ -625,13 +649,14 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     console: Option<Console>,
     worker: Option<Arc<Worker>>,
 ) -> std::io::Result<Ended> {
-    let (reads, console_jobs, outbox) = match &hub {
+    let (reads, session_reads, console_jobs, outbox) = match &hub {
         Hub::Link(outbox) => (
-            Some(spawn_reader(outbox.clone(), dirs.projects.clone())),
+            Some(spawn_reader(outbox.clone(), dirs.project.clone())),
+            Some(spawn_session_reader(outbox.clone(), dirs.project.clone())),
             Some(spawn_console(outbox.clone(), console)),
             Some(outbox.clone()),
         ),
-        Hub::Off(_) => (None, None, None),
+        Hub::Off(_) => (None, None, None, None),
     };
     let mut sender = outbox
         .clone()
@@ -799,14 +824,25 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                     }
                     Vec::new()
                 }
-                Some(LinkEvent::Message(HubMsg::TranscriptRead { session_id, path, from })) => {
+                Some(LinkEvent::Message(HubMsg::TranscriptRead { session_id, from, .. })) => {
                     // One read at a time: while one runs, a request waits in
                     // the slot and a further one is dropped (the hub asks
-                    // again after its timeout).
+                    // again after its timeout). Its `path` is never opened:
+                    // the agent builds the path from the session id.
                     if let Some(reads) = &reads
-                        && reads.try_send((session_id, path, from)).is_err()
+                        && reads.try_send((session_id, from)).is_err()
                     {
                         debug!("transcript read busy; request dropped");
+                    }
+                    Vec::new()
+                }
+                Some(LinkEvent::Message(HubMsg::SessionRead { read_id, session_id, ask })) => {
+                    // The hub has few reads out per session (TASK-034); one
+                    // beyond the queue is dropped and the hub's wait runs out.
+                    if let Some(session_reads) = &session_reads
+                        && session_reads.try_send((read_id, session_id, ask)).is_err()
+                    {
+                        debug!("session reads busy; request dropped");
                     }
                     Vec::new()
                 }
@@ -1275,21 +1311,21 @@ fn refused(outcome: FileOutcome) -> (String, bool) {
     (text.to_owned(), true)
 }
 
-type ReadRequest = (String, String, Option<u64>);
+type ReadRequest = (String, Option<u64>);
 
 /// The one worker that reads transcript chunks off the loop, one blocking
 /// read at a time, and queues each answer for the hub; the hub asks again if
 /// an answer gets lost with the link.
 fn spawn_reader(
     outbox: mpsc::Sender<AgentMsg>,
-    projects: Option<PathBuf>,
+    project: Option<Arc<tail::OwnProject>>,
 ) -> mpsc::Sender<ReadRequest> {
     let (requests, mut pending) = mpsc::channel::<ReadRequest>(1);
     tokio::spawn(async move {
-        while let Some((session_id, path, from)) = pending.recv().await {
-            let root = projects.clone();
+        while let Some((session_id, from)) = pending.recv().await {
+            let project = project.clone();
             let chunk = tokio::task::spawn_blocking(move || {
-                tail::read_chunk(root.as_deref(), &session_id, &path, from)
+                tail::read_chunk(project.as_deref(), &session_id, from)
             })
             .await;
             if let Ok(chunk) = chunk
@@ -1297,6 +1333,42 @@ fn spawn_reader(
             {
                 debug!("hub link gone; transcript chunk dropped");
                 return;
+            }
+        }
+    });
+    requests
+}
+
+type SessionRead = (u64, String, SessionAsk);
+/// Session reads waiting for the reader.
+const SESSION_READS: usize = 8;
+
+/// The one worker that answers `session_read`s off the loop, one blocking
+/// read at a time, apart from the transcript stream's reader (a `/full` of a
+/// long session must not hold up the stream); each answer, and each piece of
+/// a text, is queued for the hub in order.
+fn spawn_session_reader(
+    outbox: mpsc::Sender<AgentMsg>,
+    project: Option<Arc<tail::OwnProject>>,
+) -> mpsc::Sender<SessionRead> {
+    let (requests, mut pending) = mpsc::channel::<SessionRead>(SESSION_READS);
+    tokio::spawn(async move {
+        while let Some((read_id, session_id, ask)) = pending.recv().await {
+            let project = project.clone();
+            let answers = tokio::task::spawn_blocking(move || {
+                reads::answer(project.as_deref(), &session_id, ask)
+            })
+            .await
+            .unwrap_or_default();
+            for answer in answers {
+                if outbox
+                    .send(AgentMsg::SessionAnswer { read_id, answer })
+                    .await
+                    .is_err()
+                {
+                    debug!("hub link gone; session answer dropped");
+                    return;
+                }
             }
         }
     });
@@ -1417,6 +1489,7 @@ mod tests {
             console_commands: false,
             client: None,
             files: true,
+            session_reads: false,
         }
     }
 
@@ -1841,12 +1914,12 @@ mod tests {
     fn claude_reading(
         hub: Hub,
         events: Option<mpsc::Receiver<LinkEvent>>,
-        projects: Option<PathBuf>,
+        project: Option<PathBuf>,
     ) -> Claude {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 16);
         let dirs = Dirs {
-            projects,
+            project: project.map(|folder| Arc::new(tail::OwnProject::at(folder))),
             work: None,
         };
         tokio::spawn(serve_channel(
@@ -2102,11 +2175,7 @@ mod tests {
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let (outbox, events) = spawn(config(addr, Backoff::default()));
-        let mut claude = claude_reading(
-            Hub::Link(outbox),
-            Some(events),
-            Some(dir.path().join("projects")),
-        );
+        let mut claude = claude_reading(Hub::Link(outbox), Some(events), Some(project.clone()));
         claude
             .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
             .await;
@@ -2115,11 +2184,14 @@ mod tests {
             .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .await;
         let (mut reader, mut write) = raw_hub(&listener).await;
+        // The hub's `path` (still sent for older agents) names something
+        // else entirely: it is never opened.
+        let (bait, touched) = bait("transcript-read").await;
         wire::write_msg(
             &mut write,
             &HubMsg::TranscriptRead {
                 session_id: session.into(),
-                path: path.to_string_lossy().into_owned(),
+                path: bait,
                 from: Some(0),
             },
         )
@@ -2143,6 +2215,131 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        assert!(!touched().await, "the hub's path was opened");
+        // Claude Code saw nothing of it: the next line it gets is the answer
+        // to its own request.
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 5);
+    }
+
+    /// A path a hub might name to make the agent open something: on Windows
+    /// a named pipe whose server sees any client, elsewhere a missing file.
+    /// The closure answers whether anything opened it.
+    #[cfg(windows)]
+    async fn bait(
+        name: &str,
+    ) -> (
+        String,
+        impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>,
+    ) {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let pipe = format!(r"\\.\pipe\cctg-bait-{name}-{}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe)
+            .unwrap();
+        let touched = move || -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>> {
+            Box::pin(async move {
+                tokio::time::timeout(Duration::from_millis(300), server.connect())
+                    .await
+                    .is_ok()
+            })
+        };
+        (pipe, touched)
+    }
+
+    #[cfg(not(windows))]
+    async fn bait(
+        name: &str,
+    ) -> (
+        String,
+        impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>>,
+    ) {
+        let path = std::env::temp_dir().join(format!("cctg-bait-{name}-{}", std::process::id()));
+        let touched = || -> std::pin::Pin<Box<dyn std::future::Future<Output = bool>>> {
+            Box::pin(async { false })
+        };
+        (path.to_string_lossy().into_owned(), touched)
+    }
+
+    #[tokio::test]
+    async fn session_reads_are_answered_in_pieces_over_the_link_and_never_reach_claude() {
+        let dir = crate::hub::testdir::TempDir::new("agent-session-read");
+        let session = "5e551017-0000-4000-8000-000000000001";
+        let project = dir.path().join("projects").join("C--w");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join(format!("{session}.jsonl"));
+        // A prompt longer than one piece of an answer.
+        let long = "я".repeat(reads::PIECE);
+        std::fs::write(
+            &path,
+            format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{long}\"}}}}\n{{\"type\":\"ai-title\",\"aiTitle\":\"T\"}}\n"),
+        )
+        .unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (outbox, events) = spawn(config(addr, Backoff::default()));
+        let mut claude = claude_reading(Hub::Link(outbox), Some(events), Some(project.clone()));
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 0);
+        claude
+            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await;
+        let (mut reader, mut write) = raw_hub(&listener).await;
+        let read = HubMsg::SessionRead {
+            read_id: 7,
+            session_id: session.into(),
+            ask: SessionAsk::Render {
+                view: wire::TranscriptView::Brief,
+                prompts: 1,
+            },
+        };
+        wire::write_msg(&mut write, &read).await.unwrap();
+        // A hub of the first TASK-034 build still names a path: ignored,
+        // never opened.
+        let (bait, touched) = bait("session-read").await;
+        let earlier = serde_json::json!({
+            "v": wire::VERSION, "type": "session_read", "read_id": 8,
+            "session_id": session, "path": bait, "ask": { "kind": "title", "from": 0 },
+        });
+        write
+            .write_all(format!("{earlier}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut text = String::new();
+        loop {
+            match agent_line(&mut reader).await {
+                AgentMsg::SessionAnswer {
+                    read_id: 7,
+                    answer: wire::SessionAnswer::Text { text: piece, more },
+                } => {
+                    text.push_str(&piece);
+                    if !more {
+                        break;
+                    }
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(
+            text.starts_with("> я") && text.len() > reads::PIECE,
+            "{}",
+            text.len()
+        );
+        match agent_line(&mut reader).await {
+            AgentMsg::SessionAnswer {
+                read_id: 8,
+                answer: wire::SessionAnswer::Title { title, .. },
+            } => assert_eq!(title.as_deref(), Some("T")),
+            other => panic!("{other:?}"),
+        }
+        assert!(!touched().await, "the hub's path was opened");
         // Claude Code saw nothing of it: the next line it gets is the answer
         // to its own request.
         claude
@@ -2329,7 +2526,7 @@ mod tests {
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 20);
         let dirs = Dirs {
-            projects: None,
+            project: None,
             work: Some(work.to_owned()),
         };
         tokio::spawn(serve_channel(

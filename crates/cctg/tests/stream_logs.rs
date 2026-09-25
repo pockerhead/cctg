@@ -97,7 +97,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
         stream_every: Duration::from_millis(10),
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (_control, control_rx) = mpsc::unbounded_channel();
@@ -119,19 +119,17 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
         .expect("hook");
     let (to_agent, mut from_hub) = mpsc::channel(16);
     let reads = agents.clone();
-    let root = state.join("projects");
+    let root = cctg::tail::OwnProject::at(project.clone());
     let asked = Arc::new(Mutex::new(0usize));
     let counted = asked.clone();
     tokio::spawn(async move {
         while let Some(msg) = from_hub.recv().await {
             if let HubMsg::TranscriptRead {
-                session_id,
-                path,
-                from,
+                session_id, from, ..
             } = msg
             {
                 *counted.lock().expect("count") += 1;
-                let msg = cctg::tail::read_chunk(Some(&root), &session_id, &path, from);
+                let msg = cctg::tail::read_chunk(Some(&root), &session_id, from);
                 let event = AgentEvent::Message {
                     conn: 1,
                     received_at: std::time::Instant::now(),
@@ -157,6 +155,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         })

@@ -225,7 +225,7 @@ async fn start_hub_in(state: TempRoot, every: Duration) -> Hub {
         status_every: Some(every),
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(registry, store, outbox, options);
+    let slots = Slots::new(registry, store, outbox, options);
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -412,6 +412,7 @@ impl Agent {
             console_commands: true,
             client: None,
             files: false,
+            session_reads: false,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
         let mut agent = Self {

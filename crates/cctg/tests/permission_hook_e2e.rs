@@ -156,7 +156,7 @@ async fn hub(test: &str) -> Hub {
         chat_id: -1000000000001,
         ..Options::default()
     };
-    let (mut slots, _view) = Slots::new(store.load().unwrap(), store, outbox, options);
+    let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
     let asks = slots.permission_asks();
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
@@ -215,6 +215,7 @@ async fn hub(test: &str) -> Hub {
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         })

@@ -8,15 +8,19 @@
 //! line becomes its [`transcript::stream_events`]; lines without events are
 //! passed over but still move `to`.
 //!
-//! Only the session's own transcript under the Claude projects directory of
-//! this device is opened: `<CLAUDE_CONFIG_DIR|~/.claude>/projects/<project>/
-//! <session_id>.jsonl`, checked on the canonical path (no `..`, symlink or
-//! junction way out). The hub is trusted, but the link must never become a
-//! way to read other files of the device.
+//! Only a transcript in the agent's own project folder is opened
+//! ([`OwnProject`]: `<CLAUDE_CONFIG_DIR|~/.claude>/projects/<project>` of
+//! its claude session): `<project>/<session_id>.jsonl`, a path the agent
+//! builds from the session id alone (the `path` of a `transcript_read` is
+//! never opened) and checks on the canonical path (no symlink or junction
+//! way out). Any session id in that folder is served (after `/clear` the id
+//! changes, the folder does not); another project's sessions never are
+//! (TASK-034 decision 12: the hub may run on another machine).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use transcript::StreamEvent;
 
@@ -60,15 +64,165 @@ pub fn projects_root() -> Option<PathBuf> {
     home.map(|home| PathBuf::from(home).join(".claude").join("projects"))
 }
 
-/// Reads the chunk the hub asked for. Never fails: a file that cannot be
-/// opened (or is not the session's transcript under `root`) is `missing`, a
-/// read error ends the chunk where it happened.
-pub fn read_chunk(
-    root: Option<&Path>,
-    session_id: &str,
-    path: &str,
-    from: Option<u64>,
-) -> AgentMsg {
+/// Claude Code keeps a longer project folder name to this many characters
+/// and adds `-<hash>`.
+const MAX_FOLDER_NAME: usize = 200;
+
+/// The agent's own project folder `<projects root>/<project>` (TASK-034
+/// decision 12): where Claude Code keeps the transcript of the agent's claude
+/// session (its env `CLAUDE_CODE_SESSION_ID`). Found, not computed: the
+/// folder that holds `<session id>.jsonl` ([`Self::folder`]), looked for on
+/// each read until it is there and then kept. Until then Claude Code's names
+/// for the cwd ([`project_folder_name`] of the resolved and the given cwd)
+/// stand in, never kept: they serve a session that `/clear`ed before its
+/// first record, whose env id never gets a transcript.
+#[derive(Debug)]
+pub struct OwnProject {
+    root: PathBuf,
+    session_id: String,
+    by_cwd: Vec<PathBuf>,
+    found: OnceLock<PathBuf>,
+}
+
+impl OwnProject {
+    /// Under the projects directory `root`, for the claude session
+    /// `session_id` started in `cwd`. `None` without a plain session id: the
+    /// agent then reads nothing. Blocking: it resolves `cwd`.
+    pub fn new(root: PathBuf, session_id: Option<&str>, cwd: Option<&str>) -> Option<Self> {
+        let session_id = session_id.filter(|id| is_plain_session_id(id))?.to_owned();
+        let mut by_cwd = Vec::new();
+        if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+            // Claude Code names the folder after the resolved cwd; the given
+            // spelling comes second (the case of a drive letter changes the
+            // hash of a long name).
+            for spelling in [crate::device::canonical_cwd(cwd), cwd.to_owned()] {
+                let folder = root.join(project_folder_name(&spelling));
+                if !by_cwd.contains(&folder) {
+                    by_cwd.push(folder);
+                }
+            }
+        }
+        Some(Self {
+            root,
+            session_id,
+            by_cwd,
+            found: OnceLock::new(),
+        })
+    }
+
+    /// A folder known already (tests), kept from the start.
+    pub fn at(folder: PathBuf) -> Self {
+        let root = folder.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self {
+            root,
+            session_id: String::new(),
+            by_cwd: Vec::new(),
+            found: OnceLock::from(folder),
+        }
+    }
+
+    /// The folder to read from now: the one that holds the session's
+    /// transcript (kept once found), else an existing folder named after the
+    /// cwd, else none. Blocking: it may list the projects root.
+    pub fn folder(&self) -> Option<PathBuf> {
+        if let Some(found) = self.found.get() {
+            return Some(found.clone());
+        }
+        let file = format!("{}.jsonl", self.session_id);
+        let holds = |folder: &Path| folder.join(&file).is_file();
+        let found = self
+            .by_cwd
+            .iter()
+            .find(|folder| holds(folder))
+            .cloned()
+            .or_else(|| {
+                let mut holding = std::fs::read_dir(&self.root)
+                    .ok()?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|folder| holds(folder));
+                let first = holding.next()?;
+                // Claude Code's own lookup gives up on an id in two folders.
+                holding.next().is_none().then_some(first)
+            });
+        match found {
+            Some(found) => Some(self.found.get_or_init(|| found).clone()),
+            None => self.by_cwd.iter().find(|folder| folder.is_dir()).cloned(),
+        }
+    }
+
+    /// Opens `<folder>/<parts>` only when the folder sits right in the
+    /// projects root, the canonical path is exactly `<canonical
+    /// folder>/<parts>` (no link, `..` or other spelling on the way) and it
+    /// is a file. `parts` are plain names (session and agent ids checked by
+    /// the caller): the agent builds every path itself and never opens one
+    /// the hub sent. Blocking.
+    pub(crate) fn open(&self, parts: &[&str]) -> Option<File> {
+        let folder = self.folder()?;
+        let own = std::fs::canonicalize(&folder).ok()?;
+        let root = std::fs::canonicalize(&self.root).ok()?;
+        if own.parent() != Some(root.as_path()) {
+            return None;
+        }
+        let (mut path, mut want) = (folder, own);
+        for part in parts {
+            path.push(part);
+            want.push(part);
+        }
+        if std::fs::canonicalize(&path).ok()? != want {
+            return None;
+        }
+        let file = File::open(&want).ok()?;
+        file.metadata().ok()?.is_file().then_some(file)
+    }
+}
+
+/// Claude Code's project folder name for a working folder (its `dx`, read
+/// from the 2.1.28x binary in TASK-034): every UTF-16 unit that is not an
+/// ASCII letter or digit becomes `-` (`C:\Users\a_b` is `C--Users-a-b`); a
+/// name longer than 200 keeps its first 200 characters plus `-<hash>`.
+pub fn project_folder_name(cwd: &str) -> String {
+    let name: String = cwd
+        .encode_utf16()
+        .map(|unit| match char::from_u32(u32::from(unit)) {
+            Some(c) if c.is_ascii_alphanumeric() => c,
+            _ => '-',
+        })
+        .collect();
+    if name.len() <= MAX_FOLDER_NAME {
+        return name;
+    }
+    let hash = base36(js_hash(cwd).unsigned_abs());
+    format!("{}-{hash}", &name[..MAX_FOLDER_NAME])
+}
+
+/// JavaScript's `h = (h << 5) - h + s.charCodeAt(i) | 0` over the UTF-16
+/// units of `text`.
+fn js_hash(text: &str) -> i32 {
+    text.encode_utf16().fold(0, |hash: i32, unit| {
+        hash.wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(i32::from(unit))
+    })
+}
+
+/// JavaScript's `n.toString(36)`.
+fn base36(mut n: u32) -> String {
+    let mut digits = Vec::new();
+    loop {
+        digits.extend(char::from_digit(n % 36, 36));
+        n /= 36;
+        if n == 0 {
+            return digits.into_iter().rev().collect();
+        }
+    }
+}
+
+/// Reads the chunk the hub asked for from `<own folder>/<session_id>.jsonl`
+/// ([`open_transcript`]; the hub's `path` is never used). Never fails: a
+/// file that cannot be opened is `missing`, a read error ends the chunk
+/// where it happened.
+pub fn read_chunk(project: Option<&OwnProject>, session_id: &str, from: Option<u64>) -> AgentMsg {
     let asked = from.unwrap_or(0);
     let empty = |missing: bool, reset: bool| AgentMsg::TranscriptChunk {
         session_id: session_id.to_owned(),
@@ -79,7 +233,7 @@ pub fn read_chunk(
         more: false,
         reset,
     };
-    let Some(mut file) = root.and_then(|root| open_transcript(root, session_id, path)) else {
+    let Some(mut file) = project.and_then(|project| open_transcript(project, session_id)) else {
         return empty(true, false);
     };
     let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -161,27 +315,23 @@ pub fn read_chunk(
     }
 }
 
-/// The session's own transcript, opened only when its canonical path is
-/// `<canonical root>/<project>/<session_id>.jsonl` and it is a file.
-fn open_transcript(root: &Path, session_id: &str, path: &str) -> Option<File> {
-    let plain = !session_id.is_empty()
+/// The transcript `<own folder>/<session_id>.jsonl` of the agent's own
+/// project folder ([`OwnProject::open`]), any session id of that folder
+/// (after `/clear` the id changes, the folder does not).
+pub(crate) fn open_transcript(project: &OwnProject, session_id: &str) -> Option<File> {
+    if !is_plain_session_id(session_id) {
+        return None;
+    }
+    project.open(&[&format!("{session_id}.jsonl")])
+}
+
+/// A session id that can only name one file: letters, digits and dashes.
+pub(crate) fn is_plain_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
         && session_id.len() <= 64
         && session_id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    if !plain {
-        return None;
-    }
-    let name = format!("{session_id}.jsonl");
-    let path = std::fs::canonicalize(path).ok()?;
-    let root = std::fs::canonicalize(root).ok()?;
-    let inside = path.parent().and_then(Path::parent) == Some(root.as_path())
-        && path.file_name().is_some_and(|file| *file == *name);
-    if !inside {
-        return None;
-    }
-    let file = File::open(&path).ok()?;
-    file.metadata().ok()?.is_file().then_some(file)
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 /// Offsets the hub keeps are ends of lines: byte `at - 1` is a newline. A
@@ -315,8 +465,13 @@ mod tests {
         file.write_all(bytes.as_bytes()).unwrap();
     }
 
-    fn read(dir: &TempDir, path: &str, from: Option<u64>) -> AgentMsg {
-        read_chunk(Some(&root(dir)), SESSION, path, from)
+    /// The agent's own project folder in these tests.
+    fn project(dir: &TempDir) -> PathBuf {
+        root(dir).join("C--work")
+    }
+
+    fn read(dir: &TempDir, from: Option<u64>) -> AgentMsg {
+        read_chunk(Some(&OwnProject::at(project(dir))), SESSION, from)
     }
 
     /// (from, to, texts, missing, more, reset)
@@ -352,7 +507,7 @@ mod tests {
         let two = prompt("two");
         append(&path, &one);
         append(&path, &two[..10]);
-        let first = read(&dir, &path, Some(0));
+        let first = read(&dir, Some(0));
         assert_eq!(
             texts(&first),
             (
@@ -365,7 +520,7 @@ mod tests {
             )
         );
         append(&path, &two[10..]);
-        let second = read(&dir, &path, Some(one.len() as u64));
+        let second = read(&dir, Some(one.len() as u64));
         assert_eq!(
             texts(&second),
             (
@@ -387,7 +542,7 @@ mod tests {
         let second = prompt("two").replace('\n', "\r\n");
         append(&path, &first);
         append(&path, &second);
-        let (from, to, got, ..) = texts(&read(&dir, &path, Some(0)));
+        let (from, to, got, ..) = texts(&read(&dir, Some(0)));
         assert_eq!((from, to), (0, (first.len() + second.len()) as u64));
         assert_eq!(got, ["one", "two"]);
     }
@@ -399,13 +554,13 @@ mod tests {
         append(&path, &prompt("history"));
         let end = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
-            texts(&read(&dir, &path, None)),
+            texts(&read(&dir, None)),
             (end, end, vec![], false, false, false)
         );
         let mode = "{\"type\":\"mode\",\"mode\":\"x\"}\n";
         append(&path, mode);
         assert_eq!(
-            texts(&read(&dir, &path, Some(end))),
+            texts(&read(&dir, Some(end))),
             (end, end + mode.len() as u64, vec![], false, false, false)
         );
     }
@@ -421,13 +576,13 @@ mod tests {
         let torn = prompt(&"x".repeat(100 << 10));
         append(&path, &torn[..torn.len() - 10]);
         assert_eq!(
-            texts(&read(&dir, &path, None)),
+            texts(&read(&dir, None)),
             (boundary, boundary, vec![], false, false, false)
         );
         // Whole now: read from the boundary once, no reset, no history.
         append(&path, &torn[torn.len() - 10..]);
         append(&path, &prompt("new"));
-        let (from, to, got, missing, more, reset) = texts(&read(&dir, &path, Some(boundary)));
+        let (from, to, got, missing, more, reset) = texts(&read(&dir, Some(boundary)));
         let end = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
             (from, to, missing, more, reset),
@@ -445,63 +600,203 @@ mod tests {
         let first = prompt("first");
         append(&path, &first[..8]);
         assert_eq!(
-            texts(&read(&dir, &path, None)),
+            texts(&read(&dir, None)),
             (0, 0, vec![], false, false, false)
         );
     }
 
     #[test]
-    fn a_missing_file_or_a_foreign_path_is_missing() {
+    fn a_missing_file_or_an_id_that_is_no_plain_name_is_missing() {
         let dir = TempDir::new("tail-missing");
         let path = transcript(&dir);
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            texts(&read(&dir, &path, Some(5))),
+            texts(&read(&dir, Some(5))),
             (5, 5, vec![], true, false, false)
         );
-        // Right name, wrong place: outside the projects root, one level too
-        // deep, through `..`, or the root of another config.
-        let outside = dir.path().join("other").join("C--work");
-        std::fs::create_dir_all(&outside).unwrap();
-        let deep = root(&dir).join("C--work").join("sub");
-        std::fs::create_dir_all(&deep).unwrap();
-        for place in [outside.clone(), deep] {
-            let file = place.join(format!("{SESSION}.jsonl"));
-            std::fs::write(&file, prompt("private")).unwrap();
-            let file = file.to_string_lossy().into_owned();
-            assert!(texts(&read(&dir, &file, Some(0))).3, "{file}");
-        }
-        let dotdot = root(&dir)
-            .join("C--work")
-            .join("..")
-            .join("..")
-            .join("other")
-            .join("C--work")
-            .join(format!("{SESSION}.jsonl"));
-        assert!(texts(&read(&dir, &dotdot.to_string_lossy(), Some(0))).3);
         let path = transcript(&dir);
         append(&path, &prompt("mine"));
-        let other_root = dir.path().join("other");
-        assert!(texts(&read_chunk(Some(&other_root), SESSION, &path, Some(0))).3);
-        assert!(texts(&read_chunk(None, SESSION, &path, Some(0))).3);
-        // Another session's name, or a session id that is not plain.
-        assert!(
-            texts(&read_chunk(
-                Some(&root(&dir)),
-                "other-session",
-                &path,
-                Some(0)
-            ))
-            .3
+        let own = OwnProject::at(project(&dir));
+        assert!(texts(&read_chunk(None, SESSION, Some(0))).3);
+        // Another session's name, or ids that could name another file.
+        for id in ["other-session", "../x", "..", "a/b", r"a\b", ""] {
+            assert!(texts(&read_chunk(Some(&own), id, Some(0))).3, "{id}");
+        }
+        // The projects directory itself is no project folder.
+        let root_itself = OwnProject::at(root(&dir));
+        assert!(texts(&read_chunk(Some(&root_itself), SESSION, Some(0))).3);
+        assert_eq!(texts(&read(&dir, Some(0))).2, ["mine"]);
+    }
+
+    #[test]
+    fn only_transcripts_of_the_agents_own_project_folder_are_served() {
+        let dir = TempDir::new("tail-own-project");
+        let mine = transcript(&dir);
+        append(&mine, &prompt("mine"));
+        // Another project's session: the agent never looks outside its
+        // own folder.
+        let other = "5e551017-0000-4000-8000-000000000003";
+        let foreign = root(&dir).join("C--other");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join(format!("{other}.jsonl")), prompt("private")).unwrap();
+        let own = OwnProject::at(project(&dir));
+        assert!(texts(&read_chunk(Some(&own), other, Some(0))).3);
+        // A new session id in the same folder (after `/clear`) is served.
+        let cleared = "5e551017-0000-4000-8000-000000000002";
+        let next = project(&dir).join(format!("{cleared}.jsonl"));
+        std::fs::write(&next, prompt("after clear")).unwrap();
+        let got = read_chunk(Some(&own), cleared, Some(0));
+        assert_eq!(texts(&got).2, ["after clear"]);
+    }
+
+    #[test]
+    fn claude_codes_folder_names_are_matched_long_ones_cut_with_its_hash() {
+        assert_eq!(
+            project_folder_name(r"C:\Users\a_b\my dev.x"),
+            "C--Users-a-b-my-dev-x"
         );
-        assert!(texts(&read_chunk(Some(&root(&dir)), "../x", &path, Some(0))).3);
-        assert_eq!(texts(&read(&dir, &path, Some(0))).2, ["mine"]);
+        assert_eq!(project_folder_name("/home/я/w"), "-home---w");
+        // Expected names from Claude Code's own `dx`, run under node
+        // (TASK-034 scratch/fixer/claude_folder_name.js).
+        let long = format!(r"C:\work\{}", "x".repeat(220));
+        assert_eq!(
+            project_folder_name(&long),
+            format!("C--work-{}-5dl4ti", "x".repeat(192))
+        );
+        let negative_hash = format!(r"D:\{}", "y".repeat(230));
+        assert_eq!(
+            project_folder_name(&negative_hash),
+            format!("D--{}-ue235m", "y".repeat(197))
+        );
+        let wide = format!("/home/я/{}", "проект-😀-".repeat(30));
+        assert_eq!(
+            project_folder_name(&wide),
+            format!("-home{}-onm1xj", "-".repeat(195))
+        );
+        assert_eq!(project_folder_name(&"a".repeat(200)), "a".repeat(200));
+    }
+
+    #[test]
+    fn the_own_folder_is_found_by_the_sessions_transcript_and_then_kept() {
+        let dir = TempDir::new("tail-own-find");
+        let root = root(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = r"C:\Users\a_b\my dev.x";
+        let by_cwd = root.join("C--Users-a-b-my-dev-x");
+        // A new session: nothing written, no folder named after the cwd.
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(cwd)).unwrap();
+        assert_eq!(own.folder(), None);
+        // Once the cwd's folder exists it stands in, not kept.
+        std::fs::create_dir_all(&by_cwd).unwrap();
+        assert_eq!(own.folder(), Some(by_cwd.clone()));
+        // Claude Code wrote the session's first record elsewhere (a
+        // junction cwd, a shortened name): that folder is found and kept.
+        let real = root.join("C--real-folder");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join(format!("{SESSION}.jsonl")), prompt("one")).unwrap();
+        assert_eq!(own.folder(), Some(real.clone()));
+        std::fs::write(by_cwd.join(format!("{SESSION}.jsonl")), prompt("x")).unwrap();
+        assert_eq!(own.folder(), Some(real.clone()));
+        // A resumed session starts with its transcript's folder, the cwd's
+        // own folder comes first when it holds it.
+        let resumed = OwnProject::new(root.clone(), Some(SESSION), Some(cwd)).unwrap();
+        assert_eq!(resumed.folder(), Some(by_cwd));
+        let resumed = OwnProject::new(root.clone(), Some(SESSION), None).unwrap();
+        assert_eq!(resumed.folder(), None, "an id in two folders is no answer");
+        std::fs::remove_file(real.join(format!("{SESSION}.jsonl"))).unwrap();
+        assert!(resumed.folder().is_some());
+        // Nothing to find it by: no reads at all.
+        assert!(OwnProject::new(root.clone(), None, Some(cwd)).is_none());
+        assert!(OwnProject::new(root.clone(), Some("../x"), Some(cwd)).is_none());
+    }
+
+    #[test]
+    fn a_new_session_with_a_long_cwd_is_served_from_claude_codes_folder() {
+        let dir = TempDir::new("tail-own-long");
+        let root = root(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = format!(r"C:\work\{}", "x".repeat(220));
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(&cwd)).unwrap();
+        // Claude Code writes the first record under its cut name.
+        let folder = root.join(format!("C--work-{}-5dl4ti", "x".repeat(192)));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("{SESSION}.jsonl"));
+        append(&path.to_string_lossy(), &prompt("long"));
+        assert_eq!(texts(&read_chunk(Some(&own), SESSION, Some(0))).2, ["long"]);
+        // Before its first record a `/clear`ed session is served from it too.
+        let cleared = "5e551017-0000-4000-8000-000000000002";
+        std::fs::remove_file(&path).unwrap();
+        let fresh = OwnProject::new(root, Some(SESSION), Some(&cwd)).unwrap();
+        append(
+            &folder.join(format!("{cleared}.jsonl")).to_string_lossy(),
+            &prompt("after clear"),
+        );
+        assert_eq!(
+            texts(&read_chunk(Some(&fresh), cleared, Some(0))).2,
+            ["after clear"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_new_session_under_a_junction_is_served_from_its_resolved_folder() {
+        let dir = TempDir::new("tail-own-junction");
+        let real = dir.path().join("real").join("proj");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(dir.path().join("real"))
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("mklink /J unavailable; skipped");
+            return;
+        }
+        let root = root(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        // Agent start: the cwd as given goes through the junction, nothing
+        // is written yet.
+        let raw_cwd = link.join("proj").to_string_lossy().into_owned();
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(&raw_cwd)).unwrap();
+        // Claude Code names its folder after the resolved cwd.
+        let resolved = crate::device::canonical_cwd(&real.to_string_lossy());
+        let folder = root.join(project_folder_name(&resolved));
+        assert_ne!(folder, root.join(project_folder_name(&raw_cwd)));
+        std::fs::create_dir_all(&folder).unwrap();
+        append(
+            &folder.join(format!("{SESSION}.jsonl")).to_string_lossy(),
+            &prompt("real"),
+        );
+        assert_eq!(texts(&read_chunk(Some(&own), SESSION, Some(0))).2, ["real"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_own_folder_named_in_another_case_than_on_disk_is_served() {
+        // Claude Code may have named the folder after a `c:\` spelling.
+        let dir = TempDir::new("tail-own-case");
+        let root = root(&dir);
+        let on_disk = root.join("c--users-a-proj");
+        std::fs::create_dir_all(&on_disk).unwrap();
+        append(
+            &on_disk.join(format!("{SESSION}.jsonl")).to_string_lossy(),
+            &prompt("cased"),
+        );
+        let own = OwnProject::new(root, Some(SESSION), Some(r"C:\Users\a\proj")).unwrap();
+        assert_eq!(
+            texts(&read_chunk(Some(&own), SESSION, Some(0))).2,
+            ["cased"]
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn a_junction_out_of_the_projects_root_is_not_followed() {
         let dir = TempDir::new("tail-junction");
+        transcript(&dir);
         let outside = dir.path().join("elsewhere");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join(format!("{SESSION}.jsonl")), prompt("private")).unwrap();
@@ -518,8 +813,9 @@ mod tests {
             eprintln!("mklink /J unavailable; skipped");
             return;
         }
-        let path = link.join(format!("{SESSION}.jsonl"));
-        assert!(texts(&read(&dir, &path.to_string_lossy(), Some(0))).3);
+        // An own folder that is a junction out of the projects root.
+        let own = OwnProject::at(link);
+        assert!(texts(&read_chunk(Some(&own), SESSION, Some(0))).3);
     }
 
     #[test]
@@ -533,17 +829,17 @@ mod tests {
         // Truncated below the offset.
         std::fs::write(&path, prompt("new")).unwrap();
         assert_eq!(
-            texts(&read(&dir, &path, Some(end))),
+            texts(&read(&dir, Some(end))),
             (end, end, vec![], false, false, true)
         );
         // Replaced by a longer file whose offset falls inside a line.
         std::fs::write(&path, prompt("a much longer first line")).unwrap();
         append(&path, &prompt("more"));
-        let (.., reset) = texts(&read(&dir, &path, Some(one.len() as u64)));
+        let (.., reset) = texts(&read(&dir, Some(one.len() as u64)));
         assert!(reset);
         // From its start it reads like any file.
         assert_eq!(
-            texts(&read(&dir, &path, Some(0))).2,
+            texts(&read(&dir, Some(0))).2,
             ["a much longer first line", "more"]
         );
     }
@@ -555,10 +851,10 @@ mod tests {
         for n in 0..(MAX_CHUNK_LINES + 3) {
             append(&path, &prompt(&format!("p{n}")));
         }
-        let first = texts(&read(&dir, &path, Some(0)));
+        let first = texts(&read(&dir, Some(0)));
         assert_eq!(first.2.len(), MAX_CHUNK_LINES);
         assert!(first.4, "more");
-        let second = texts(&read(&dir, &path, Some(first.1)));
+        let second = texts(&read(&dir, Some(first.1)));
         assert_eq!(second.2, ["p64", "p65", "p66"]);
         assert!(!second.4);
     }
@@ -599,7 +895,7 @@ mod tests {
         let end = std::fs::metadata(&path).unwrap().len();
         let mut reads = 0;
         while from < end {
-            let chunk = read(&dir, &path, Some(from));
+            let chunk = read(&dir, Some(from));
             let bytes = crate::wire::encode(&chunk);
             assert!(bytes.len() < crate::wire::MAX_LINE, "{}", bytes.len());
             let (_, to, ..) = texts(&chunk);

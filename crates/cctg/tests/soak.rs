@@ -740,7 +740,7 @@ impl Soak {
         let (scheduler, outbox) = Scheduler::new(self.tg.clone(), self.bucket);
         let store = RegistryStore::open(&self.state).expect("registry store");
         let registry = store.load().expect("registry loads");
-        let (slots, _view) = Slots::new(registry, store, outbox, self.options.clone());
+        let slots = Slots::new(registry, store, outbox, self.options.clone());
         let (agents, agents_rx) = mpsc::channel(256);
         let (hooks, hooks_rx) = mpsc::channel(256);
         let (control, control_rx) = mpsc::unbounded_channel();

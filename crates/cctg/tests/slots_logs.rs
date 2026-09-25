@@ -13,7 +13,7 @@ use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Control, Options, Slots};
-use cctg::wire::{HookEvent, HookPost, Register};
+use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, Register, SessionAnswer, SessionAsk};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Default)]
@@ -89,13 +89,59 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let (slots, _view) = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();
     tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
 
     let session = "5e551017-0000-4000-8000-000000000001";
+    // The session's agent reads the title from its transcript (TASK-034).
+    let (to_agent, mut from_hub) = mpsc::channel(4);
+    let answers = agents.clone();
+    let agent_title = title.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = from_hub.recv().await {
+            if let HubMsg::SessionRead {
+                read_id,
+                ask: SessionAsk::Title { from },
+                ..
+            } = msg
+            {
+                let answer = SessionAnswer::Title {
+                    title: Some(agent_title.clone()),
+                    scanned: from + 1,
+                };
+                let msg = AgentMsg::SessionAnswer { read_id, answer };
+                let event = AgentEvent::Message {
+                    conn: 1,
+                    received_at: std::time::Instant::now(),
+                    msg,
+                };
+                let _ = answers.send(event).await;
+            }
+        }
+    });
+    agents
+        .send(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: session.into(),
+                host: "box".into(),
+                cwd: cwd.clone(),
+                claude_pid: Some(10),
+                verdict_ack: false,
+                transcript_reads: false,
+                console_keys: false,
+                console_commands: false,
+                client: None,
+                files: false,
+                session_reads: true,
+            },
+            to_agent,
+        })
+        .await
+        .expect("agent");
     let post = |event| {
         HookPost::new(
             "box".into(),
@@ -136,6 +182,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 console_commands: false,
                 client: None,
                 files: false,
+                session_reads: false,
             },
             to_agent,
         })
@@ -158,6 +205,12 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
         .filter(|op| matches!(op, Op::Delete { .. }))
         .count();
     assert_eq!(deletes, 3, "every delete was tried: {ops:?}");
+    assert!(
+        ops.iter().any(
+            |op| matches!(op, Op::EditTopic { name: Some(name), .. } if name.contains(&title))
+        ),
+        "the title reached the topic: {ops:?}"
+    );
     let _ = std::fs::remove_dir_all(&state);
 
     let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
