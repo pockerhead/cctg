@@ -1,0 +1,234 @@
+"""TASK-047 probe (approved by the user 2026-09-25): does a background subagent
+killed with its session by /exit continue after `claude --resume` when the
+main session sends it a message with SendMessage?
+
+Hidden console, own probe folder, CLAUDE* env stripped, kills only its own tree.
+Writes a report to probe_resume_agent.out.txt next to this script.
+"""
+import glob
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+import ctypes
+import ctypes.wintypes as wt
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location("rs", r"C:\Users\user\.cctg\restart_session.py")
+rs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rs)
+k32 = rs.k32
+
+PROBE = os.path.join(os.environ["TEMP"], "cctg-t047-probe")
+os.makedirs(PROBE, exist_ok=True)
+for name in os.listdir(PROBE):
+    p = os.path.join(PROBE, name)
+    if os.path.isfile(p):
+        os.remove(p)
+OUT = open(os.path.join(HERE, "probe_resume_agent.out.txt"), "w", encoding="utf-8")
+
+
+def log(msg):
+    OUT.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    OUT.flush()
+
+
+def write(chars):
+    h = k32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+    recs = []
+    for ch in chars:
+        vk = {"\r": 0x0D, "\b": 0x08, "\x1b": 0x1B}.get(ch, 0)
+        for down in (1, 0):
+            r = rs.INPUT_RECORD()
+            r.EventType = 1
+            r.Event.KeyEvent.bKeyDown = down
+            r.Event.KeyEvent.wRepeatCount = 1
+            r.Event.KeyEvent.wVirtualKeyCode = vk
+            r.Event.KeyEvent.uChar.UnicodeChar = ch
+            recs.append(r)
+    arr = (rs.INPUT_RECORD * len(recs))(*recs)
+    n = wt.DWORD(0)
+    k32.WriteConsoleInputW(wt.HANDLE(h), arr, len(recs), ctypes.byref(n))
+    k32.CloseHandle(wt.HANDLE(h))
+
+
+def screen():
+    return rs.screen_lines()
+
+
+def boxed(lines):
+    rules = [i for i, l in enumerate(lines) if len(l.strip()) >= 20 and set(l.strip()) == {"\u2500"}]
+    return len(rules) >= 2
+
+
+def env():
+    e = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k != "MSYS_NO_PATHCONV"}
+    return e
+
+
+def start(args):
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    p = subprocess.Popen([r"C:\Users\user\.local\bin\claude.exe"] + args, cwd=PROBE, env=env(),
+                         creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=si)
+    time.sleep(2)
+    for _ in range(40):
+        if rs.attach(p.pid):
+            break
+        time.sleep(0.5)
+    # answer the trust dialog, wait for the input box
+    for _ in range(120):
+        lines = screen()
+        text = "\n".join(lines).lower()
+        if "enter to confirm" in text:
+            selected = next((l for l in lines if "❯" in l), "")
+            if "no" in selected.lower() or "exit" in selected.lower():
+                rs.press(["down"])
+                time.sleep(0.5)
+                continue
+            rs.press(["enter"])
+            time.sleep(3)
+            continue
+        if boxed(lines):
+            break
+        time.sleep(0.5)
+    time.sleep(2)
+    return p
+
+
+def type_prompt(text):
+    write(text)
+    time.sleep(0.8)
+    write("\r")
+
+
+def wait_idle(seconds):
+    """Wait until the main turn ends (no 'esc to interrupt')."""
+    end = time.time() + seconds
+    while time.time() < end:
+        tail = "\n".join(screen()[-12:]).lower()
+        if "esc to interrupt" not in tail and "interrupt" not in tail:
+            return True
+        time.sleep(2)
+    return False
+
+
+def dump(title):
+    lines = screen()
+    log("=== screen: " + title)
+    for l in lines[-25:]:
+        if l.strip():
+            log("  | " + l[:150])
+
+
+def progress():
+    p = os.path.join(PROBE, "progress.txt")
+    return open(p, encoding="utf-8", errors="replace").read().strip().splitlines() if os.path.exists(p) else []
+
+
+def session_id():
+    enc = "".join(c if c.isalnum() else "-" for c in os.path.realpath(PROBE))
+    files = sorted(glob.glob(os.path.expanduser(f"~/.claude/projects/*/*.jsonl")), key=os.path.getmtime)
+    for f in reversed(files):
+        if os.path.basename(os.path.dirname(f)).lower() == enc.lower():
+            return os.path.splitext(os.path.basename(f))[0], f
+    return None, None
+
+
+FIRST = ("Launch ONE background subagent with the Agent tool: subagent_type general-purpose, "
+         "name probe-sleeper, run_in_background true. Its task: 8 times, append the line "
+         "'step N' (N from 1 to 8) to the file progress.txt in the current folder with a Bash "
+         "command, then run Bash sleep 15; when done, append 'done'. After launching it, reply "
+         "only 'launched' and end your turn. Do not wait for it.")
+SECOND = ("Earlier you launched a background subagent; the session was restarted while it "
+          "worked. Find its agentId in the Agent tool result earlier in this conversation and use "
+          "SendMessage with to set to that agentId, asking it to continue its steps from where "
+          "progress.txt ends. Reply with exactly what SendMessage returned, then end your turn.")
+
+procs = []
+try:
+    p1 = start(["--dangerously-skip-permissions"])
+    procs.append(p1)
+    log(f"claude 1 pid {p1.pid}")
+    type_prompt(FIRST)
+    time.sleep(10)
+    wait_idle(120)
+    dump("after launch")
+    # let the agent make progress
+    for _ in range(30):
+        if len(progress()) >= 2:
+            break
+        time.sleep(3)
+    log("progress before exit: " + repr(progress()))
+    sid, path = session_id()
+    log(f"session {sid}")
+    type_prompt("/exit")
+    time.sleep(3)
+    dump("right after /exit")
+    for _ in range(60):
+        if p1.poll() is not None:
+            break
+        lines = screen()
+        text = "\n".join(lines).lower()
+        if "enter to confirm" in text or "(y/n)" in text:
+            dump("exit dialog")
+            selected = next((l for l in lines if "❯" in l), "")
+            log("exit dialog selected: " + selected.strip()[:100])
+            if "no" in selected.lower() or "cancel" in selected.lower() or "stay" in selected.lower():
+                rs.press(["down"])
+                time.sleep(0.5)
+                continue
+            rs.press(["enter"])
+            time.sleep(2)
+            continue
+        time.sleep(0.5)
+    log(f"claude 1 exited: {p1.poll()}")
+    if p1.poll() is None:
+        dump("still alive after /exit")
+        subprocess.run(["taskkill", "/PID", str(p1.pid), "/T", "/F"], capture_output=True)
+        log("claude 1 killed by the probe (did not exit)")
+    k32.FreeConsole()
+    before = progress()
+    time.sleep(40)
+    after = progress()
+    log(f"progress 40 s after exit: {after} (grew: {len(after) > len(before)})")
+    if not sid:
+        log("no session id found; stop")
+        sys.exit(0)
+    p2 = start(["--dangerously-skip-permissions", "--resume", sid])
+    procs.append(p2)
+    log(f"claude 2 pid {p2.pid}")
+    type_prompt(SECOND)
+    time.sleep(10)
+    wait_idle(180)
+    dump("after SendMessage")
+    base = len(progress())
+    for _ in range(40):
+        time.sleep(3)
+    final = progress()
+    log(f"progress 120 s after SendMessage: {final} (grew: {len(final) > base})")
+    # transcript facts
+    sid2, path2 = session_id()
+    log(f"session after resume {sid2}")
+    agents = glob.glob(os.path.join(os.path.dirname(path2), sid2, "subagents", "agent-*.jsonl")) if path2 else []
+    log(f"subagent transcripts: {[os.path.basename(a) for a in agents]}")
+    if path2:
+        for line in open(path2, encoding="utf-8", errors="replace"):
+            if '"SendMessage"' in line and '"tool_result"' in line:
+                try:
+                    r = json.loads(line)
+                    for b in r.get("message", {}).get("content", []):
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            c = b.get("content")
+                            log("SendMessage result: " + (json.dumps(c, ensure_ascii=False)[:400]))
+                except Exception:
+                    pass
+finally:
+    k32.FreeConsole()
+    for p in procs:
+        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+    log("probe done")
+    OUT.close()
