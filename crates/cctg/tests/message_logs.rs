@@ -202,6 +202,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             },
             to_agent,
         })

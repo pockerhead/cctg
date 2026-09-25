@@ -21,12 +21,14 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use socket2::{SockRef, TcpKeepalive};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -195,6 +197,23 @@ pub fn is_loopback_addr(addr: &str) -> bool {
     })
 }
 
+/// Idle time before the first TCP keepalive probe, and between probes
+/// (TASK-049): traffic every half minute keeps a NAT or tunnel on the way
+/// from forgetting a quiet connection. The link's own heartbeat
+/// ([`crate::wire::Heartbeat`]) finds one that is gone anyway.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Turns on TCP keepalive; a socket that refuses it works as before.
+fn keepalive(tcp: &TcpStream) {
+    let params = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    if let Err(error) = SockRef::from(tcp).set_tcp_keepalive(&params) {
+        tracing::debug!(kind = ?error.kind(), "TCP keepalive not set");
+    }
+}
+
 /// Whether plain TCP (the secret in the clear) may go to `peer`: a
 /// loopback address only.
 fn plain_peer_allowed(peer: SocketAddr) -> bool {
@@ -264,6 +283,7 @@ impl HubAddr {
     pub async fn connect(&self) -> io::Result<Stream> {
         let tcp = TcpStream::connect(self.addr.as_str()).await?;
         let _ = tcp.set_nodelay(true);
+        keepalive(&tcp);
         match &self.tls {
             None if !plain_peer_allowed(tcp.peer_addr()?) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -423,6 +443,7 @@ impl Incoming {
 
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<Stream> {
         let _ = tcp.set_nodelay(true);
+        keepalive(&tcp);
         match &self.0 {
             None => Ok(Stream::Plain(tcp)),
             Some(acceptor) => acceptor.accept(tcp).await,
@@ -592,6 +613,48 @@ mod tests {
             _: rustls::server::ClientHello<'_>,
         ) -> Option<Arc<rustls::sign::CertifiedKey>> {
             Some(self.0.clone())
+        }
+    }
+
+    fn tcp_of(stream: &Stream) -> &TcpStream {
+        match stream {
+            Stream::Plain(tcp) => tcp,
+            Stream::Tls(tls) => tls.get_ref().0,
+        }
+    }
+
+    /// TASK-049: both ends of both kinds of link have TCP keepalive on.
+    #[tokio::test]
+    async fn both_ends_keep_the_connection_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepting = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            Incoming::plain().accept(tcp).await.unwrap()
+        });
+        let client = HubAddr::plain(&addr).connect().await.unwrap();
+        let server = accepting.await.unwrap();
+        for stream in [&client, &server] {
+            assert!(SockRef::from(tcp_of(stream)).keepalive().unwrap());
+        }
+
+        let (chain, key) = certified("localhost");
+        let (acceptor, pin) = Acceptor::new(chain, key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepting = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            Incoming::tls(acceptor).accept(tcp).await.unwrap()
+        });
+        let client = HubAddr::pinned(&addr, pin)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let server = accepting.await.unwrap();
+        for stream in [&client, &server] {
+            assert!(matches!(stream, Stream::Tls(_)));
+            assert!(SockRef::from(tcp_of(stream)).keepalive().unwrap());
         }
     }
 
