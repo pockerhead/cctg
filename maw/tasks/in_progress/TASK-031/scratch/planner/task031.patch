@@ -1,0 +1,2259 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,2 @@
++# Scripts run by sh must keep LF on a core.autocrlf checkout (TASK-031).
++*.sh text eol=lf
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,5 +1,6 @@
+ # Every push and pull request: format, lints and all tests of the workspace
+-# on Linux and Windows, and the hub image builds (not pushed).
++# on Linux and Windows, the installer on macOS too (TASK-031), and the hub
++# image builds (not pushed).
+ name: ci
+ 
+ on:
+@@ -37,10 +38,27 @@
+       - name: fmt
+         if: runner.os == 'Linux'
+         run: cargo fmt --all -- --check
++      - name: shellcheck install.sh
++        if: runner.os == 'Linux'
++        run: shellcheck --shell=sh install.sh
+       - name: clippy
+         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+       - name: test
+         run: cargo test --workspace --locked --no-fail-fast
++
++  # install.sh end to end on an Apple Silicon Mac (Linux and Windows run it
++  # in the test job above): local fake release, no network.
++  install-macos:
++    runs-on: macos-15
++    timeout-minutes: 60
++    steps:
++      - uses: actions/checkout@v7
++      - uses: dtolnay/rust-toolchain@master
++        with:
++          toolchain: ${{ env.RUST_TOOLCHAIN }}
++      - uses: Swatinem/rust-cache@v2
++      - name: install.sh end to end
++        run: cargo test -p cctg --locked --test install_e2e
+ 
+   image:
+     runs-on: ubuntu-latest
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -1,6 +1,8 @@
+ # Publishing (TASK-035). A push to main: the hub image as :main and
+ # :sha-<commit>. A tag v*: the image as :<version> and :latest, and the
+-# client binaries (Windows and static Linux, x86_64) in a GitHub Release.
++# client binaries (Windows x86_64, static Linux x86_64, macOS aarch64) in a
++# GitHub Release. Asset names carry no version, so install.sh (TASK-031)
++# finds the newest one at releases/latest/download/<asset>.
+ # Image and binaries of one run are built with the same CCTG_BUILD_ID, so a
+ # hub and a client of one commit report the same build. Only GITHUB_TOKEN;
+ # no other secret.
+@@ -62,7 +64,7 @@
+           build-args: CCTG_BUILD_ID=${{ github.sha }}
+           cache-from: type=gha
+       - if: startsWith(github.ref, 'refs/tags/v')
+-        run: mv dist/cctg "dist/cctg-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl"
++        run: mv dist/cctg dist/cctg-x86_64-unknown-linux-musl
+       - if: startsWith(github.ref, 'refs/tags/v')
+         uses: actions/upload-artifact@v7
+         with:
+@@ -87,15 +89,40 @@
+         run: |
+           target/release/cctg.exe --version | grep -F "${{ github.sha }}"
+           mkdir dist
+-          cp target/release/cctg.exe "dist/cctg-${GITHUB_REF_NAME}-x86_64-pc-windows-msvc.exe"
++          cp target/release/cctg.exe dist/cctg-x86_64-pc-windows-msvc.exe
+       - uses: actions/upload-artifact@v7
+         with:
+           name: windows
+           path: dist/
+ 
++  macos:
++    if: startsWith(github.ref, 'refs/tags/v')
++    # Apple Silicon; the linker signs the binary ad hoc, which arm64 macOS
++    # requires, and curl sets no quarantine flag.
++    runs-on: macos-15
++    timeout-minutes: 60
++    steps:
++      - uses: actions/checkout@v7
++      - uses: dtolnay/rust-toolchain@master
++        with:
++          toolchain: ${{ env.RUST_TOOLCHAIN }}
++      - name: build
++        env:
++          CCTG_BUILD_ID: ${{ github.sha }}
++        run: cargo build --release --locked -p cctg
++      - name: the binary carries this commit
++        run: |
++          target/release/cctg --version | grep -F "${{ github.sha }}"
++          mkdir dist
++          cp target/release/cctg dist/cctg-aarch64-apple-darwin
++      - uses: actions/upload-artifact@v7
++        with:
++          name: macos
++          path: dist/
++
+   release:
+     if: startsWith(github.ref, 'refs/tags/v')
+-    needs: [image, windows]
++    needs: [image, windows, macos]
+     runs-on: ubuntu-latest
+     permissions:
+       contents: write
+diff --git a/CLAUDE.md b/CLAUDE.md
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -72,6 +72,8 @@
+                           registry.json                              Claude Code process
+                           transcript reader                          (--dangerously-load-development-channels)
+ ```
++
++Установка (TASK-031): `install.sh` в корне, POSIX sh для Linux, macOS и Windows в Git Bash. Клиент: бинарник из GitHub Releases в `~/.cctg/bin`, `~/.cctg/device.env`, `~/.cctg/claude/{mcp.json,settings.json}`, обёртка `~/.local/bin/claude-cctg` (и `.cmd`), проверка `cctg doctor`; `~/.claude/settings.json` и `~/.claude.json` не трогает. `--hub`: hub в Docker на сервере. Для людей `README.md`.
+ 
+ ### 1. `cctg hub` — один процесс на "главном" устройстве
+ 
+diff --git a/README.md b/README.md
+new file mode 100644
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,87 @@
++# cctg: Claude Code в Telegram
++
++Сессии Claude Code на ваших машинах видны в одной закрытой Telegram-группе с темами. Каждая папка проекта получает свою тему: там видно, что делает Claude, приходят его ответы и кнопки разрешений, а ваше сообщение в теме уходит в сессию.
++
++```
++ноутбук, ПК, сервер          сервер с Docker             Telegram
++claude-cctg в папке  ── TLS ──>  cctg hub  ── Bot API ──>  группа: тема на папку
++```
++
++Hub это один процесс с ботом. Он живёт на сервере (или на одной из ваших машин). На каждой машине с Claude Code стоит клиент `cctg`, его ставит одна команда.
++
++## Что нужно
++
++- Telegram-бот и группа с темами (ниже, 5 минут).
++- Сервер с Docker для hub. Можно и без сервера: hub на своей машине, `docs/poc.md`.
++- На каждой машине с сессиями: Linux, macOS (Apple Silicon) или Windows. Claude Code установщик поставит сам, если его нет.
++- Windows: Git for Windows (в нём Git Bash, через него работают установщик и хуки cctg). Если его нет: `winget install Git.Git`, потом откройте Git Bash.
++
++## 1. Бот и группа
++
++1. В Telegram у @BotFather: `/newbot`, получить токен бота.
++2. Создать группу, в настройках включить «Темы» (Topics).
++3. Добавить бота в группу и сделать админом с правами «Управление темами», «Удаление сообщений», «Закрепление сообщений».
++4. Написать в группу любое сообщение и открыть `https://api.telegram.org/bot<токен>/getUpdates`: `chat.id` (начинается с `-100`) это id группы, `from.id` это ваш id.
++
++## 2. Hub на сервере
++
++На сервере с Docker:
++
++```sh
++curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --hub
++```
++
++Установщик спросит токен бота (не показывается при вводе), id группы, ваш id, адрес сервера и, если Telegram с сервера доступен только через прокси, адрес прокси. Он сам сделает секрет и сертификат, запустит hub в Docker и проверит бота и группу. В конце он печатает строку для установки клиентов. В ней секрет hub: вставляйте её только на своих машинах.
++
++Подробности (прокси, обновление, порты): `docs/remote-hub.md`.
++
++## 3. Клиент на каждой машине
++
++Выполните строку, которую напечатал hub (в Windows это Git Bash). Она выглядит так:
++
++```sh
++curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | CCTG_HUB_SECRET='...' sh -s -- --hub-host <сервер> --pin <отпечаток>
++```
++
++Без строки можно так, установщик всё спросит (секрет при вводе не показывается):
++
++```sh
++curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh
++```
++
++Установщик ставит `cctg` в `~/.cctg`, команду `claude-cctg` в `~/.local/bin` и проверяет связь с hub. Ваши `~/.claude/settings.json` и `~/.claude.json` он не трогает.
++
++Проверить связь потом: `~/.cctg/bin/cctg doctor`.
++
++## 4. Запуск
++
++В папке проекта вместо `claude`:
++
++```sh
++claude-cctg
++```
++
++Все аргументы `claude` работают так же (`claude-cctg --resume`, `claude-cctg "почини тест"`). Claude Code при старте спрашивает про development channels: выберите пункт 1. В Windows в обычной консоли (PowerShell, cmd, Windows Terminal) cctg нажимает за вас; в окне Git Bash (mintty) нет, поэтому сессии в Windows лучше запускать из PowerShell или cmd.
++
++## Что видно в Telegram
++
++- Тема `[машина] папка · название сессии`. Иконка показывает, жива сессия, ждёт ли разрешения.
++- Ваши промпты, текст Claude, по строке на каждый вызов инструмента и финальный ответ хода.
++- Запрос разрешения приходит с кнопками Allow и Deny.
++- Закреплённое сообщение со статусом: модель, контекст, лимиты.
++- Сообщение в теме уходит в сессию. Файлы и фото тоже.
++- `/brief` и `/full` в теме присылают транскрипт сессии.
++- Сессия закрыта: сообщения ждут в теме (до 50) до следующего запуска в этой папке.
++
++## Обновление
++
++- Клиент: та же команда установки ещё раз. Работающие сессии получат новую версию по кнопке «⬆️ Обновить» в теме.
++- Hub: `sh -s -- --hub` ещё раз или `docker compose pull && docker compose up -d` в папке hub (`~/cctg-hub`).
++
++## Удаление
++
++```sh
++curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --uninstall
++```
++
++Удаляет только то, что поставил установщик. Hub: `sh -s -- --hub --uninstall` (останавливает контейнер, `hub.env`, ключ и состояние остаются).
+diff --git a/crates/cctg/src/doctor.rs b/crates/cctg/src/doctor.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/doctor.rs
+@@ -0,0 +1,245 @@
++//! `cctg doctor` (TASK-031): checks this device's hub settings the way the
++//! hook and the agent use them, and says what is wrong. `install.sh` runs it
++//! after an install.
++//!
++//! It reads the same config ([`DeviceConfig::load`]), opens both hub links
++//! (TLS with the pin when one is set) and sends the secret once to the
++//! hook endpoint's `POST /v1/ping`, which only checks it. It never prints the
++//! secret. Exit code 0 when everything a session needs works.
++
++use std::time::Duration;
++
++use crate::client;
++use crate::device::DeviceConfig;
++use crate::hook::{self, PostError};
++
++/// Per check; a far hub over TLS answers well within it.
++pub const TIMEOUT: Duration = Duration::from_secs(5);
++
++pub async fn run() -> i32 {
++    let report = check(&DeviceConfig::load(), TIMEOUT).await;
++    for line in &report.lines {
++        println!("{line}");
++    }
++    if report.ok { 0 } else { 1 }
++}
++
++#[derive(Debug)]
++pub struct Report {
++    pub lines: Vec<String>,
++    pub ok: bool,
++}
++
++pub async fn check(config: &DeviceConfig, timeout: Duration) -> Report {
++    let mut lines = vec![format!("cctg {}", client::LONG_VERSION)];
++    let mut ok = true;
++    let mut fail = |lines: &mut Vec<String>, line: String| {
++        ok = false;
++        lines.push(line);
++    };
++    let secret = match &config.secret {
++        Ok(secret) => {
++            lines.push("secret: set".to_owned());
++            Some(secret)
++        }
++        Err(problem) => {
++            fail(&mut lines, format!("secret: {problem}"));
++            None
++        }
++    };
++    match &config.pin {
++        None => lines.push("certificate pin: none (plain TCP, a hub on this machine only)".into()),
++        Some(Ok(_)) => lines.push("certificate pin: set (TLS)".into()),
++        Some(Err(problem)) => fail(&mut lines, format!("certificate pin: {problem}")),
++    }
++
++    let agent = &config.agent_addr;
++    match config.hub(agent) {
++        Err(problem) => fail(&mut lines, format!("agent link {agent}: {problem}")),
++        Ok(addr) => match tokio::time::timeout(timeout, addr.connect()).await {
++            Ok(Ok(_)) => lines.push(format!("agent link {agent}: reachable")),
++            Ok(Err(error)) => fail(
++                &mut lines,
++                format!("agent link {agent}: cannot connect ({:?})", error.kind()),
++            ),
++            Err(_) => fail(
++                &mut lines,
++                format!("agent link {agent}: no answer in {timeout:?}"),
++            ),
++        },
++    }
++
++    let hooks = &config.hook_addr;
++    match (config.hub(hooks), secret) {
++        (Err(problem), _) => fail(&mut lines, format!("hooks {hooks}: {problem}")),
++        (Ok(_), None) => fail(
++            &mut lines,
++            format!("hooks {hooks}: not checked without a secret"),
++        ),
++        (Ok(addr), Some(secret)) => match hook::ping(&addr, secret, timeout).await {
++            Ok(()) => lines.push(format!("hooks {hooks}: reachable, the hub took the secret")),
++            Err(PostError::Status(401)) => fail(
++                &mut lines,
++                format!("hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET)"),
++            ),
++            // A hub from before `cctg doctor` has no ping route.
++            Err(PostError::Status(404)) => lines.push(format!(
++                "hooks {hooks}: reachable; this hub is older and cannot check the secret"
++            )),
++            Err(error) => fail(&mut lines, format!("hooks {hooks}: {error}")),
++        },
++    }
++    Report { lines, ok }
++}
++
++#[cfg(test)]
++mod tests {
++    use tokio::net::TcpListener;
++    use tokio::sync::mpsc;
++
++    use super::*;
++    use crate::device::{AGENT_ADDR_VAR, HOOK_ADDR_VAR};
++    use crate::hub::config::SECRET_VAR;
++    use crate::hub::ingress;
++    use crate::wire::Secret;
++
++    const SECRET: &str = "doctor-secret-0123456789";
++    const SHORT: Duration = Duration::from_secs(2);
++
++    fn config(pairs: Vec<(&'static str, String)>) -> DeviceConfig {
++        DeviceConfig::from_vars(move |name| {
++            pairs
++                .iter()
++                .find(|(key, _)| *key == name)
++                .map(|(_, value)| value.clone())
++        })
++    }
++
++    /// A real hook endpoint and a listener that only accepts, like the
++    /// hub's agent listener before a handshake.
++    async fn hub() -> (String, String, mpsc::Receiver<crate::wire::HookPost>) {
++        let hooks = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let hook_addr = hooks.local_addr().unwrap().to_string();
++        let (tx, rx) = mpsc::channel(8);
++        tokio::spawn(ingress::serve_hooks(
++            hooks,
++            Secret::parse(SECRET).unwrap(),
++            tx,
++        ));
++        let agents = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let agent_addr = agents.local_addr().unwrap().to_string();
++        tokio::spawn(async move {
++            let mut kept = Vec::new();
++            while let Ok((stream, _)) = agents.accept().await {
++                kept.push(stream);
++            }
++        });
++        (agent_addr, hook_addr, rx)
++    }
++
++    #[tokio::test]
++    async fn a_working_setup_passes_and_the_ping_is_no_event() {
++        let (agent, hooks, mut events) = hub().await;
++        let report = check(
++            &config(vec![
++                (SECRET_VAR, SECRET.into()),
++                (AGENT_ADDR_VAR, agent),
++                (HOOK_ADDR_VAR, hooks),
++            ]),
++            SHORT,
++        )
++        .await;
++        assert!(report.ok, "{:?}", report.lines);
++        assert!(
++            report
++                .lines
++                .iter()
++                .any(|line| line.contains("took the secret"))
++        );
++        assert!(events.try_recv().is_err(), "a ping is not a hook event");
++        assert!(!report.lines.concat().contains(SECRET));
++    }
++
++    #[tokio::test]
++    async fn a_wrong_secret_and_a_missing_one_fail_without_echo() {
++        let (agent, hooks, _events) = hub().await;
++        let wrong = "doctor-wrong-secret-000000";
++        let report = check(
++            &config(vec![
++                (SECRET_VAR, wrong.into()),
++                (AGENT_ADDR_VAR, agent.clone()),
++                (HOOK_ADDR_VAR, hooks.clone()),
++            ]),
++            SHORT,
++        )
++        .await;
++        assert!(!report.ok);
++        assert!(
++            report
++                .lines
++                .iter()
++                .any(|line| line.contains("rejected the secret"))
++        );
++        assert!(!report.lines.concat().contains(wrong));
++        let report = check(
++            &config(vec![(AGENT_ADDR_VAR, agent), (HOOK_ADDR_VAR, hooks)]),
++            SHORT,
++        )
++        .await;
++        assert!(!report.ok);
++        assert!(report.lines.iter().any(|line| line.starts_with("secret: ")));
++    }
++
++    #[tokio::test]
++    async fn a_remote_hub_without_a_pin_is_never_contacted() {
++        let report = check(
++            &config(vec![
++                (SECRET_VAR, SECRET.into()),
++                (AGENT_ADDR_VAR, "203.0.113.9:47291".into()),
++                (HOOK_ADDR_VAR, "203.0.113.9:47292".into()),
++            ]),
++            SHORT,
++        )
++        .await;
++        assert!(!report.ok);
++        assert_eq!(
++            report
++                .lines
++                .iter()
++                .filter(|line| line.contains("CCTG_HUB_CERT_SHA256"))
++                .count(),
++            2,
++            "{:?}",
++            report.lines
++        );
++    }
++
++    #[tokio::test]
++    async fn an_older_hub_without_the_ping_route_still_passes() {
++        // A stand-in that answers 404 like a hub from before TASK-031.
++        let hooks = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let hook_addr = hooks.local_addr().unwrap().to_string();
++        tokio::spawn(async move {
++            use tokio::io::{AsyncReadExt, AsyncWriteExt};
++            while let Ok((mut stream, _)) = hooks.accept().await {
++                let mut buf = [0u8; 1024];
++                let _ = stream.read(&mut buf).await;
++                let _ = stream
++                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
++                    .await;
++            }
++        });
++        let (agent, _, _events) = hub().await;
++        let report = check(
++            &config(vec![
++                (SECRET_VAR, SECRET.into()),
++                (AGENT_ADDR_VAR, agent),
++                (HOOK_ADDR_VAR, hook_addr),
++            ]),
++            SHORT,
++        )
++        .await;
++        assert!(report.ok, "{:?}", report.lines);
++        assert!(report.lines.iter().any(|line| line.contains("older")));
++    }
++}
+diff --git a/crates/cctg/src/hook.rs b/crates/cctg/src/hook.rs
+--- a/crates/cctg/src/hook.rs
++++ b/crates/cctg/src/hook.rs
+@@ -47,8 +47,8 @@
+ use crate::spool;
+ use crate::tls::HubAddr;
+ use crate::wire::{
+-    Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PermissionAnswer, PermissionPost,
+-    Secret, VERSION,
++    Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PING_PATH, PermissionAnswer,
++    PermissionPost, Secret, VERSION,
+ };
+ 
+ /// Budget of the POST, connect included. `SessionEnd` hooks share 1.5 s in
+@@ -658,8 +658,33 @@
+     timeout: Duration,
+ ) -> Result<(), PostError> {
+     let body = serde_json::to_vec(post).expect("hook posts always serialize");
++    match exchange(addr, HOOK_PATH, secret, &body, timeout).await? {
++        204 => Ok(()),
++        code => Err(PostError::Status(code)),
++    }
++}
++
++/// `POST /v1/ping` (TASK-031, `cctg doctor`): `Ok` when the hub took the
++/// secret. A wrong secret gets 401; a hub older than the route answers 404
++/// before it looks at the secret.
++pub async fn ping(addr: &HubAddr, secret: &Secret, timeout: Duration) -> Result<(), PostError> {
++    match exchange(addr, PING_PATH, secret, &[], timeout).await? {
++        204 => Ok(()),
++        code => Err(PostError::Status(code)),
++    }
++}
++
++/// One request to the hub hook endpoint within `timeout`; the answer's
++/// status code.
++async fn exchange(
++    addr: &HubAddr,
++    path: &str,
++    secret: &Secret,
++    body: &[u8],
++    timeout: Duration,
++) -> Result<u16, PostError> {
+     let head = format!(
+-        "POST {HOOK_PATH} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
++        "POST {path} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
+          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+         secret.expose(),
+         body.len()
+@@ -668,7 +693,7 @@
+         let io = |error: std::io::Error| PostError::Io(error.kind());
+         let mut stream = addr.connect().await.map_err(io)?;
+         stream
+-            .write_all(&[head.as_bytes(), &body].concat())
++            .write_all(&[head.as_bytes(), body].concat())
+             .await
+             .map_err(io)?;
+         let mut status_line = Vec::new();
+@@ -677,11 +702,7 @@
+             .read_until(b'\n', &mut status_line)
+             .await
+             .map_err(io)?;
+-        match parse_status(&status_line) {
+-            Some(204) => Ok(()),
+-            Some(code) => Err(PostError::Status(code)),
+-            None => Err(PostError::BadResponse),
+-        }
++        parse_status(&status_line).ok_or(PostError::BadResponse)
+     };
+     tokio::time::timeout(timeout, exchange)
+         .await
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -25,7 +25,7 @@
+ use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
+ use crate::wire::{
+     self, AgentMsg, Behavior, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, PERMISSION_PATH,
+-    PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
++    PING_PATH, PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
+ };
+ 
+ /// Time an agent has to send `hello` and `register`.
+@@ -578,6 +578,11 @@
+     let status =
+         match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream, secret)).await {
+             Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
++            // `cctg doctor`: the secret matched; nothing else happens.
++            Ok(Ok((Route::Ping, _))) => {
++                debug!(%peer, "ping answered");
++                Status::NoContent
++            }
+             Ok(Err(None)) => {
+                 debug!(%peer, "connection closed before its first byte");
+                 return;
+@@ -756,11 +761,12 @@
+     )
+ }
+ 
+-/// The two endpoints.
++/// The endpoints.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum Route {
+     Hook,
+     Permission,
++    Ping,
+ }
+ 
+ /// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
+@@ -811,6 +817,7 @@
+     let route = match target {
+         HOOK_PATH => Route::Hook,
+         PERMISSION_PATH => Route::Permission,
++        PING_PATH => Route::Ping,
+         _ => return Err(Some(Status::NotFound)),
+     };
+ 
+@@ -1218,6 +1225,28 @@
+     }
+ 
+     #[tokio::test]
++    async fn a_ping_checks_the_secret_and_is_no_event() {
++        let (addr, mut events) = hooks_hub(8).await;
++        let ping = |auth: &str| {
++            format!(
++                "POST {PING_PATH} HTTP/1.1\r\nAuthorization: {auth}\r\nContent-Length: 0\r\n\r\n"
++            )
++            .into_bytes()
++        };
++        assert_eq!(
++            exchange(addr, &ping(&format!("Bearer {SECRET}"))).await,
++            204
++        );
++        assert_eq!(
++            exchange(addr, &ping("Bearer 0123456789abcdef-wrong")).await,
++            401
++        );
++        let hook = crate::tls::HubAddr::plain(addr.to_string());
++        assert_eq!(crate::hook::ping(&hook, &secret(), WAIT).await, Ok(()));
++        assert!(events.try_recv().is_err());
++    }
++
++    #[tokio::test]
+     async fn a_repeated_post_is_delivered_once() {
+         let (addr, mut events) = hooks_hub(8).await;
+         let bearer = format!("Bearer {SECRET}");
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -6,6 +6,7 @@
+ pub mod client;
+ pub mod deploy;
+ pub mod device;
++pub mod doctor;
+ pub mod files;
+ pub mod hook;
+ pub mod hub;
+diff --git a/crates/cctg/src/main.rs b/crates/cctg/src/main.rs
+--- a/crates/cctg/src/main.rs
++++ b/crates/cctg/src/main.rs
+@@ -76,6 +76,9 @@
+     /// its listeners (`CCTG_AGENT_LISTEN`, `CCTG_HOOK_LISTEN`), else 1: the
+     /// Docker healthcheck.
+     Health,
++    /// Check this device's hub settings (~/.cctg/device.env): both hub
++    /// links, the certificate pin and the secret. Exit 0 when they work.
++    Doctor,
+ }
+ 
+ #[tokio::main]
+@@ -181,6 +184,7 @@
+         Command::Health => {
+             std::process::exit(if cctg::hub::healthy().await { 0 } else { 1 });
+         }
++        Command::Doctor => std::process::exit(cctg::doctor::run().await),
+         Command::AgentInstall => {
+             let exe = std::env::current_exe()?;
+             let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
+@@ -292,5 +296,9 @@
+             Cli::try_parse_from(["cctg", "health"]).unwrap().command,
+             Command::Health
+         ));
++        assert!(matches!(
++            Cli::try_parse_from(["cctg", "doctor"]).unwrap().command,
++            Command::Doctor
++        ));
+     }
+ }
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -42,6 +42,9 @@
+ /// Longest accepted hook POST body.
+ pub const MAX_HOOK_BODY: usize = 1 << 20;
+ pub const HOOK_PATH: &str = "/v1/hook";
++/// `cctg doctor` (TASK-031): an empty `POST` that only checks the secret;
++/// `204` with it, `401` without, `404` from a hub older than this path.
++pub const PING_PATH: &str = "/v1/ping";
+ pub const MIN_SECRET_LEN: usize = 16;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+diff --git a/crates/cctg/tests/install_e2e.rs b/crates/cctg/tests/install_e2e.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/install_e2e.rs
+@@ -0,0 +1,753 @@
++//! `install.sh` end to end (TASK-031) on the system the tests run on: `sh`
++//! on Linux and macOS, Git Bash on Windows. The script goes in on stdin
++//! (`sh -s -- ...`), as with `curl ... | sh`.
++//!
++//! Nothing reaches the network: the release (this build's `cctg` under the
++//! asset name of this system, plus `SHA256SUMS`) and the raw deploy files
++//! come from a local HTTP server; Anthropic's installer, `docker` and
++//! `cargo` are stand-ins on `PATH`. Every run has its own home directory;
++//! the developer's `~/.cctg`, `~/.claude` and `~/.claude.json` are never
++//! used (`common::isolate`).
++
++use std::collections::BTreeSet;
++use std::io::{BufRead, BufReader, Write};
++use std::net::TcpListener;
++use std::path::{Path, PathBuf};
++use std::process::{Child, Command, Output, Stdio};
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++
++use serde_json::Value;
++
++mod common;
++
++/// Every character dotenv or sh could take for syntax (visible ASCII only:
++/// the hub takes nothing else).
++const SECRET: &str = r#"in'st$HOME#"x\y`z-0123456789"#;
++const TOKEN: &str = "123456:install-e2e-token-value";
++const EXE: &str = std::env::consts::EXE_SUFFIX;
++const EVENTS: [&str; 10] = [
++    "PermissionRequest",
++    "PostToolUse",
++    "PostToolUseFailure",
++    "PreToolUse",
++    "SessionEnd",
++    "SessionStart",
++    "Stop",
++    "SubagentStart",
++    "SubagentStop",
++    "UserPromptSubmit",
++];
++
++fn install_sh() -> Vec<u8> {
++    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
++    std::fs::read(path).expect("install.sh at the repository root")
++}
++
++fn asset() -> &'static str {
++    if cfg!(windows) {
++        "cctg-x86_64-pc-windows-msvc.exe"
++    } else if cfg!(target_os = "macos") {
++        "cctg-aarch64-apple-darwin"
++    } else {
++        "cctg-x86_64-unknown-linux-musl"
++    }
++}
++
++struct Root(PathBuf);
++
++impl Root {
++    fn new(name: &str) -> Self {
++        let path =
++            std::env::temp_dir().join(format!("cctg-install-e2e-{}-{name}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path).unwrap();
++        Self(path)
++    }
++
++    fn dir(&self, name: &str) -> PathBuf {
++        let dir = self.0.join(name);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++}
++
++impl Drop for Root {
++    fn drop(&mut self) {
++        for _ in 0..50 {
++            if std::fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
++                return;
++            }
++            std::thread::sleep(Duration::from_millis(100));
++        }
++    }
++}
++
++struct Killed(Child);
++
++impl Drop for Killed {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++
++// ------------------------------------------------------------ fake release
++
++/// Serves the files under `dir` over HTTP/1.1 on loopback; `GET /a/b` is
++/// `dir/a/b`. The requested paths are kept.
++fn serve(dir: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
++    let asked = Arc::new(Mutex::new(Vec::new()));
++    let log = asked.clone();
++    std::thread::spawn(move || {
++        for stream in listener.incoming() {
++            let Ok(mut stream) = stream else { continue };
++            let mut reader = BufReader::new(stream.try_clone().unwrap());
++            let mut request = String::new();
++            if reader.read_line(&mut request).is_err() {
++                continue;
++            }
++            loop {
++                let mut line = String::new();
++                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
++                    break;
++                }
++            }
++            let path = request.split(' ').nth(1).unwrap_or("/").to_owned();
++            log.lock().unwrap().push(path.clone());
++            let file = dir.join(path.trim_start_matches('/'));
++            let answer = match std::fs::read(&file) {
++                Ok(body) if file.is_file() => [
++                    format!(
++                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
++                        body.len()
++                    )
++                    .into_bytes(),
++                    body,
++                ]
++                .concat(),
++                _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++                    .to_vec(),
++            };
++            let _ = stream.write_all(&answer);
++        }
++    });
++    (base, asked)
++}
++
++/// A release directory with `binary` as this system's asset.
++fn release(dir: &Path, binary: &[u8]) {
++    let file = dir.join(asset());
++    common::write_program(&file, binary);
++    let hash = cctg::client::build_of(&file).unwrap();
++    std::fs::write(
++        dir.join("SHA256SUMS"),
++        format!("{hash}  {}\n0000  other-asset\n", asset()),
++    )
++    .unwrap();
++}
++
++fn this_build() -> Vec<u8> {
++    std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap()
++}
++
++// ------------------------------------------------------------ the shell
++
++/// `PATH` without any Claude Code or claude-cctg of the developer, with
++/// `fake` first.
++fn path_with(fake: &Path) -> std::ffi::OsString {
++    let current = std::env::var_os("PATH").unwrap_or_default();
++    let kept = std::env::split_paths(&current).filter(|dir| {
++        ["claude", "claude.exe", "claude-cctg", "claude-cctg.cmd"]
++            .iter()
++            .all(|name| !dir.join(name).exists())
++    });
++    std::env::join_paths(std::iter::once(fake.to_owned()).chain(kept)).unwrap()
++}
++
++fn shell() -> Command {
++    if cfg!(windows) {
++        let bash =
++            cctg::statusline::git_bash(&|name| std::env::var(name).ok(), &|path| path.is_file())
++                .expect("Git Bash (Git for Windows) runs install.sh on Windows");
++        Command::new(bash)
++    } else {
++        Command::new("sh")
++    }
++}
++
++struct Run {
++    home: PathBuf,
++    fake: PathBuf,
++    work: PathBuf,
++    env: Vec<(String, String)>,
++}
++
++impl Run {
++    fn new(root: &Root) -> Self {
++        Self {
++            home: root.dir("home"),
++            fake: root.dir("fake-bin"),
++            work: root.dir("work"),
++            env: Vec::new(),
++        }
++    }
++
++    fn env(&mut self, name: &str, value: &str) -> &mut Self {
++        self.env.retain(|(key, _)| key != name);
++        self.env.push((name.to_owned(), value.to_owned()));
++        self
++    }
++
++    /// A stand-in program in the fake `PATH` directory (a shell script).
++    fn fake_program(&self, name: &str, script: &str) {
++        common::write_program(&self.fake.join(name), script.as_bytes());
++    }
++
++    fn install(&self, args: &[&str]) -> (Output, String) {
++        let mut command = shell();
++        common::isolate(&mut command, &self.home);
++        command
++            .arg("-s")
++            .arg("--")
++            .args(args)
++            .env("PATH", path_with(&self.fake))
++            .current_dir(&self.work)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped());
++        for (name, value) in &self.env {
++            command.env(name, value);
++        }
++        let mut child = command.spawn().expect("start the shell");
++        child
++            .stdin
++            .take()
++            .unwrap()
++            .write_all(&install_sh())
++            .unwrap();
++        let output = child.wait_with_output().unwrap();
++        let text = format!(
++            "{}{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        (output, text)
++    }
++
++    fn cctg_dir(&self) -> PathBuf {
++        self.home.join(".cctg")
++    }
++
++    fn exe(&self) -> PathBuf {
++        self.cctg_dir().join("bin").join(format!("cctg{EXE}"))
++    }
++
++    fn wrapper(&self) -> PathBuf {
++        self.home.join(".local").join("bin").join("claude-cctg")
++    }
++}
++
++/// A fake Claude Code that writes its arguments, one per line, to
++/// `<home>/claude-args`.
++const FAKE_CLAUDE: &str =
++    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$HOME/claude-args\"\n";
++
++/// The hub side `cctg doctor` talks to: the real hook endpoint with
++/// [`SECRET`], and an agent listener that only accepts.
++fn fake_hub(runtime: &tokio::runtime::Runtime) -> (String, String) {
++    runtime.block_on(async {
++        let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let hook_addr = hooks.local_addr().unwrap().to_string();
++        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
++        tokio::spawn(cctg::hub::ingress::serve_hooks(
++            hooks,
++            cctg::wire::Secret::parse(SECRET).unwrap(),
++            tx,
++        ));
++        tokio::spawn(async move { while rx.recv().await.is_some() {} });
++        let agents = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let agent_addr = agents.local_addr().unwrap().to_string();
++        tokio::spawn(async move {
++            let mut kept = Vec::new();
++            while let Ok((stream, _)) = agents.accept().await {
++                kept.push(stream);
++            }
++        });
++        (agent_addr, hook_addr)
++    })
++}
++
++fn same_file(a: &Path, b: &Path) -> bool {
++    std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
++}
++
++fn modified(path: &Path) -> std::time::SystemTime {
++    std::fs::metadata(path).unwrap().modified().unwrap()
++}
++
++// ------------------------------------------------------------ the tests
++
++#[test]
++fn install_update_and_uninstall_a_device() {
++    let root = Root::new("device");
++    let dist = root.dir("dist");
++    release(&dist, &this_build());
++    let (base, asked) = serve(dist.clone());
++    let runtime = tokio::runtime::Runtime::new().unwrap();
++    let (agent_addr, hook_addr) = fake_hub(&runtime);
++
++    let mut run = Run::new(&root);
++    run.env("CCTG_INSTALL_BASE_URL", &base);
++    run.fake_program("claude", FAKE_CLAUDE);
++    // What must stay as it was: the user's Claude Code config, a file of
++    // theirs in ~/.cctg, and a hand-written wrapper (moved aside once).
++    let claude_dir = run.home.join(".claude");
++    std::fs::create_dir_all(&claude_dir).unwrap();
++    std::fs::write(claude_dir.join("settings.json"), "{\"mine\":1}\n").unwrap();
++    std::fs::write(run.home.join(".claude.json"), "{\"mine\":2}\n").unwrap();
++    std::fs::create_dir_all(run.cctg_dir()).unwrap();
++    std::fs::write(run.cctg_dir().join("keep.txt"), "mine").unwrap();
++    std::fs::create_dir_all(run.wrapper().parent().unwrap()).unwrap();
++    std::fs::write(run.wrapper(), "#!/bin/sh\necho handmade\n").unwrap();
++    let claude_json = run.home.join(".claude.json");
++    let untouched = || {
++        assert_eq!(
++            std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
++            "{\"mine\":1}\n"
++        );
++        assert_eq!(
++            std::fs::read_to_string(&claude_json).unwrap(),
++            "{\"mine\":2}\n"
++        );
++    };
++
++    // 1. A fresh install, the secret from the environment.
++    run.env("CCTG_HUB_SECRET", SECRET);
++    let (output, text) = run.install(&[
++        "--yes",
++        "--agent-addr",
++        &agent_addr,
++        "--hook-addr",
++        &hook_addr,
++    ]);
++    assert!(output.status.success(), "{text}");
++    assert!(!text.contains(SECRET), "the secret was printed: {text}");
++    assert!(text.contains("took the secret"), "cctg doctor: {text}");
++    assert!(asked.lock().unwrap().contains(&"/SHA256SUMS".to_owned()));
++    assert_eq!(std::fs::read(run.exe()).unwrap(), this_build());
++    untouched();
++
++    let conf = run.cctg_dir().join("claude");
++    let mcp: Value =
++        serde_json::from_slice(&std::fs::read(conf.join("mcp.json")).unwrap()).unwrap();
++    let server = &mcp["mcpServers"]["cctg"];
++    assert!(same_file(
++        Path::new(server["command"].as_str().unwrap()),
++        &run.exe()
++    ));
++    assert_eq!(server["args"], serde_json::json!(["agent"]));
++    let settings: Value =
++        serde_json::from_slice(&std::fs::read(conf.join("settings.json")).unwrap()).unwrap();
++    let events: BTreeSet<&str> = settings["hooks"]
++        .as_object()
++        .unwrap()
++        .keys()
++        .map(String::as_str)
++        .collect();
++    assert_eq!(events, EVENTS.into_iter().collect());
++    let mut commands = vec![
++        settings["statusLine"]["command"]
++            .as_str()
++            .unwrap()
++            .to_owned(),
++    ];
++    for groups in settings["hooks"].as_object().unwrap().values() {
++        for group in groups.as_array().unwrap() {
++            for hook in group["hooks"].as_array().unwrap() {
++                commands.push(hook["command"].as_str().unwrap().to_owned());
++            }
++        }
++    }
++    for command in &commands {
++        let (quoted, rest) = command[1..].split_once('"').unwrap();
++        assert!(same_file(Path::new(quoted), &run.exe()), "{command}");
++        assert!(
++            rest.starts_with(" hook ") || rest == " statusline",
++            "{command}"
++        );
++    }
++
++    let wrapper = std::fs::read_to_string(run.wrapper()).unwrap();
++    assert!(
++        wrapper.contains("cctg-install") && wrapper.contains(" run -- --mcp-config "),
++        "{wrapper}"
++    );
++    assert!(wrapper.contains("server:cctg --settings "), "{wrapper}");
++    let aside = run
++        .wrapper()
++        .with_file_name("claude-cctg.before-cctg-install");
++    assert_eq!(
++        std::fs::read_to_string(&aside).unwrap(),
++        "#!/bin/sh\necho handmade\n"
++    );
++    if cfg!(windows) {
++        let cmd = std::fs::read_to_string(run.wrapper().with_file_name("claude-cctg.cmd")).unwrap();
++        assert!(
++            cmd.starts_with("@echo off\r\n") && cmd.contains("%*\r\n"),
++            "{cmd}"
++        );
++    }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        let mode = std::fs::metadata(run.cctg_dir().join("device.env"))
++            .unwrap()
++            .permissions()
++            .mode();
++        assert_eq!(mode & 0o777, 0o600);
++        // The wrapper starts claude through cctg run, the prompt last.
++        let mut shell = shell();
++        common::isolate(&mut shell, &run.home);
++        let status = shell
++            .arg(run.wrapper())
++            .arg("fix the bug")
++            .env("PATH", path_with(&run.fake))
++            .status()
++            .unwrap();
++        assert!(status.success());
++        let args = std::fs::read_to_string(run.home.join("claude-args")).unwrap();
++        let args: Vec<&str> = args.lines().collect();
++        assert_eq!(args[0], "--mcp-config");
++        assert_eq!(
++            &args[2..5],
++            [
++                "--dangerously-load-development-channels",
++                "server:cctg",
++                "--settings"
++            ]
++        );
++        assert_eq!(args[6], "fix the bug");
++    }
++
++    // 2. Again with nothing new: nothing is rewritten, the secret stays.
++    let files = [
++        conf.join("mcp.json"),
++        conf.join("settings.json"),
++        run.cctg_dir().join("device.env"),
++        run.wrapper(),
++        run.exe(),
++    ];
++    let before: Vec<_> = files.iter().map(|file| modified(file)).collect();
++    std::thread::sleep(Duration::from_millis(1100));
++    run.env.retain(|(key, _)| key != "CCTG_HUB_SECRET");
++    let (output, text) = run.install(&["--yes"]);
++    assert!(output.status.success(), "{text}");
++    assert!(
++        text.contains("binary unchanged") && text.contains("took the secret"),
++        "{text}"
++    );
++    let after: Vec<_> = files.iter().map(|file| modified(file)).collect();
++    assert_eq!(before, after, "an update without changes rewrote a file");
++
++    // 3. A new release while a session runs from the installed binary: it
++    // is replaced in place (on Windows the running file is renamed).
++    let mut newer = this_build();
++    newer.extend_from_slice(b"\0newer build\0");
++    release(&dist, &newer);
++    #[cfg(target_os = "macos")]
++    assert!(
++        Command::new("codesign")
++            .args(["--force", "-s", "-"])
++            .arg(dist.join(asset()))
++            .status()
++            .unwrap()
++            .success()
++    );
++    let newer = std::fs::read(dist.join(asset())).unwrap();
++    std::fs::write(
++        dist.join("SHA256SUMS"),
++        format!(
++            "{}  {}\n",
++            cctg::client::build_of(&dist.join(asset())).unwrap(),
++            asset()
++        ),
++    )
++    .unwrap();
++    let mut session = Command::new(run.exe());
++    common::isolate(&mut session, &run.home);
++    let (program, args): (&str, &[&str]) = if cfg!(windows) {
++        ("ping", &["-n", "30", "127.0.0.1"])
++    } else {
++        ("sleep", &["30"])
++    };
++    let session = Killed(
++        session
++            .arg("run")
++            .arg("--")
++            .args(args)
++            .env("CCTG_CLAUDE", program)
++            .stdout(Stdio::null())
++            .stderr(Stdio::null())
++            .spawn()
++            .unwrap(),
++    );
++    std::thread::sleep(Duration::from_millis(500));
++    let (output, text) = run.install(&["--yes"]);
++    assert!(output.status.success(), "{text}");
++    assert_eq!(std::fs::read(run.exe()).unwrap(), newer);
++    if cfg!(windows) {
++        assert!(run.exe().with_file_name("cctg.old.exe").exists(), "{text}");
++    }
++    drop(session);
++    untouched();
++
++    // 4. Uninstall: only what the script wrote goes.
++    let (output, text) = run.install(&["--uninstall"]);
++    assert!(output.status.success(), "{text}");
++    for gone in [
++        run.exe(),
++        run.exe().with_file_name("cctg.old.exe"),
++        conf.join("mcp.json"),
++        conf.join("settings.json"),
++        run.cctg_dir().join("device.env"),
++        run.wrapper(),
++        run.wrapper().with_file_name("claude-cctg.cmd"),
++    ] {
++        assert!(!gone.exists(), "{} left: {text}", gone.display());
++    }
++    assert!(aside.exists(), "a file not written by the script stays");
++    assert!(run.cctg_dir().join("keep.txt").exists());
++    untouched();
++}
++
++#[test]
++fn a_bad_checksum_installs_nothing() {
++    let root = Root::new("checksum");
++    let dist = root.dir("dist");
++    release(&dist, &this_build());
++    std::fs::write(
++        dist.join("SHA256SUMS"),
++        format!("{}  {}\n", "0".repeat(64), asset()),
++    )
++    .unwrap();
++    let (base, _) = serve(dist);
++    let mut run = Run::new(&root);
++    run.env("CCTG_INSTALL_BASE_URL", &base)
++        .env("CCTG_HUB_SECRET", SECRET);
++    run.fake_program("claude", FAKE_CLAUDE);
++    let (output, text) = run.install(&["--yes"]);
++    assert!(!output.status.success(), "{text}");
++    assert!(text.contains("checksum mismatch"), "{text}");
++    let bin = run.cctg_dir().join("bin");
++    let left: Vec<_> = std::fs::read_dir(&bin)
++        .map(|dir| dir.flatten().collect())
++        .unwrap_or_default();
++    assert!(left.is_empty(), "{left:?}");
++    assert!(!run.cctg_dir().join("device.env").exists());
++}
++
++#[test]
++fn a_missing_claude_code_comes_from_anthropics_installer_when_asked() {
++    let root = Root::new("claude");
++    let dist = root.dir("dist");
++    release(&dist, &this_build());
++    let (base, _) = serve(dist);
++    let mut run = Run::new(&root);
++    run.env("CCTG_INSTALL_BASE_URL", &base)
++        .env("CCTG_HUB_SECRET", SECRET);
++    // The official installer is never downloaded: a stand-in answers its
++    // command (curl https://claude.ai/install.sh | bash; on Windows
++    // powershell ... irm https://claude.ai/install.ps1 | iex).
++    let stub = "mkdir -p \"$HOME/.local/bin\" && printf '#!/bin/sh\\n' > \"$HOME/.local/bin/claude\" && chmod 755 \"$HOME/.local/bin/claude\" && : > \"$HOME/official-installer-ran\"";
++    if cfg!(windows) {
++        run.fake_program(
++            "powershell",
++            &format!("#!/bin/sh\ncase \"$*\" in *https://claude.ai/install.ps1*) HOME=$(cygpath -u \"$USERPROFILE\"); {stub};; *) exit 9;; esac\n"),
++        );
++    } else {
++        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
++            .map(|dir| dir.join("curl"))
++            .find(|curl| curl.is_file())
++            .expect("curl");
++        run.fake_program(
++            "curl",
++            &format!(
++                "#!/bin/sh\nfor a in \"$@\"; do case $a in https://claude.ai/*) printf '%s\\n' '{}'; exit 0;; esac; done\nexec '{}' \"$@\"\n",
++                stub.replace('\'', "'\\''"),
++                real.display()
++            ),
++        );
++    }
++    // Without --yes and without a terminal: skipped, the install goes on.
++    let (output, text) = run.install(&[]);
++    assert!(output.status.success(), "{text}");
++    assert!(text.contains("skipped Claude Code"), "{text}");
++    assert!(!run.home.join("official-installer-ran").exists());
++    // With --yes: Anthropic's installer (the stand-in) runs first.
++    let (output, text) = run.install(&["--yes"]);
++    assert!(output.status.success(), "{text}");
++    assert!(text.contains("installing Claude Code"), "{text}");
++    assert!(run.home.join("official-installer-ran").exists(), "{text}");
++    assert!(!text.contains("still not found"), "{text}");
++}
++
++#[test]
++fn from_source_builds_with_cargo_in_the_clone() {
++    let root = Root::new("source");
++    let mut run = Run::new(&root);
++    let target = root.dir("target");
++    std::fs::write(run.work.join("Cargo.toml"), "[workspace]\n").unwrap();
++    run.fake_program(
++        "cargo",
++        &format!(
++            "#!/bin/sh\n[ \"$1 $2 $3 $4 $5\" = 'build --release --locked -p cctg' ] || exit 9\nmkdir -p \"$CARGO_TARGET_DIR/release\" && cp \"$FAKE_CARGO_BUILT\" \"$CARGO_TARGET_DIR/release/cctg{EXE}\"\n"
++        ),
++    );
++    run.fake_program("claude", FAKE_CLAUDE);
++    run.env("CCTG_HUB_SECRET", SECRET)
++        .env("CARGO_TARGET_DIR", &target.to_string_lossy())
++        .env("FAKE_CARGO_BUILT", env!("CARGO_BIN_EXE_cctg"))
++        // Nothing may be downloaded.
++        .env("CCTG_INSTALL_BASE_URL", "http://127.0.0.1:9/");
++    let (output, text) = run.install(&["--yes", "--from-source"]);
++    assert!(output.status.success(), "{text}");
++    assert_eq!(std::fs::read(run.exe()).unwrap(), this_build());
++}
++
++#[test]
++fn a_hub_is_set_up_with_docker_compose() {
++    let root = Root::new("hub");
++    let raw = root.dir("raw");
++    let deploy = raw.join("deploy");
++    std::fs::create_dir_all(&deploy).unwrap();
++    for file in ["compose.yml", "compose.host.yml"] {
++        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("../../deploy")
++            .join(file);
++        std::fs::copy(from, deploy.join(file)).unwrap();
++    }
++    let (raw_url, _) = serve(raw);
++    let mut run = Run::new(&root);
++    // docker: every call goes to docker.log; the hub's log says it started.
++    run.fake_program(
++        "docker",
++        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\ncase \"$*\" in *' logs '*) echo 'hub-1  | INFO hub started, polling bot=x';; esac\nexit 0\n",
++    );
++    let docker_log = root.0.join("docker.log");
++    let hub_dir = run.home.join("hub");
++    let dir = hub_dir.to_string_lossy().into_owned();
++    run.env("CCTG_INSTALL_RAW_URL", &raw_url)
++        .env("DOCKER_LOG", &docker_log.to_string_lossy())
++        .env("CCTG_BOT_TOKEN", TOKEN);
++    let args = [
++        "--hub",
++        "--yes",
++        "--dir",
++        &dir,
++        "--chat-id",
++        "-1001234567",
++        "--users",
++        "1001,1002",
++        "--proxy",
++        "http://127.0.0.1:10809",
++        "--public-host",
++        "hub.example.org",
++    ];
++    let (output, text) = run.install(&args);
++    assert!(output.status.success(), "{text}");
++    assert!(!text.contains(TOKEN), "the token was printed: {text}");
++
++    let env = std::fs::read_to_string(hub_dir.join("hub.env")).unwrap();
++    let value = |key: &str| {
++        env.lines()
++            .find_map(|line| line.strip_prefix(&format!("{key}=")))
++            .unwrap_or_else(|| panic!("{key} in hub.env"))
++            .to_owned()
++    };
++    assert_eq!(value("CCTG_BOT_TOKEN"), TOKEN);
++    assert_eq!(value("CCTG_CHAT_ID"), "-1001234567");
++    assert_eq!(value("CCTG_ALLOWED_USER_IDS"), "1001,1002");
++    assert_eq!(value("HTTPS_PROXY"), "http://127.0.0.1:10809");
++    let secret = value("CCTG_HUB_SECRET");
++    assert!(
++        cctg::wire::Secret::parse(&secret).is_ok() && secret.len() == 48,
++        "{secret}"
++    );
++    assert_eq!(
++        std::fs::read_to_string(hub_dir.join(".env"))
++            .unwrap()
++            .lines()
++            .last(),
++        Some("COMPOSE_FILE=compose.yml:compose.host.yml"),
++        "a proxy on the host's loopback needs the host network"
++    );
++    assert_eq!(
++        std::fs::read(hub_dir.join("compose.yml")).unwrap(),
++        std::fs::read(deploy.join("compose.yml")).unwrap()
++    );
++    // The hub takes the certificate and key the script made.
++    let (_, pin) = cctg::tls::Acceptor::from_files(
++        &hub_dir.join("tls").join("cert.pem"),
++        &hub_dir.join("tls").join("key.pem"),
++    )
++    .expect("the hub loads the generated certificate");
++    let pin = pin.to_string().replace(':', "").to_lowercase();
++    let line = text
++        .lines()
++        .find(|line| line.starts_with("curl -fsSL"))
++        .expect("the client line");
++    assert!(
++        line.ends_with(&format!(
++            "| CCTG_HUB_SECRET='{secret}' sh -s -- --hub-host hub.example.org --pin {pin}"
++        )),
++        "{line}"
++    );
++    assert_eq!(
++        text.matches(&secret).count(),
++        1,
++        "the secret only in the line"
++    );
++    let calls = std::fs::read_to_string(&docker_log).unwrap();
++    assert!(
++        calls.contains("compose pull hub") && calls.contains("compose up -d --force-recreate hub"),
++        "{calls}"
++    );
++
++    // Again without the token: everything kept, the same pin and secret.
++    run.env.retain(|(key, _)| key != "CCTG_BOT_TOKEN");
++    let (output, text) = run.install(&[
++        "--hub",
++        "--yes",
++        "--dir",
++        &dir,
++        "--public-host",
++        "hub.example.org",
++    ]);
++    assert!(output.status.success(), "{text}");
++    assert_eq!(
++        std::fs::read_to_string(hub_dir.join("hub.env")).unwrap(),
++        env
++    );
++    assert!(text.contains(&format!("--pin {pin}")), "{text}");
++
++    // Stop: compose down; the secrets and the key stay for the user.
++    let (output, text) = run.install(&["--hub", "--uninstall", "--dir", &dir]);
++    assert!(output.status.success(), "{text}");
++    assert!(
++        std::fs::read_to_string(&docker_log)
++            .unwrap()
++            .contains("compose down")
++    );
++    assert!(!hub_dir.join("compose.yml").exists());
++    assert!(hub_dir.join("hub.env").exists() && hub_dir.join("tls").join("key.pem").exists());
++}
++
++#[test]
++fn the_script_has_unix_line_endings() {
++    // A CRLF checkout (core.autocrlf on Windows) breaks `sh`; .gitattributes
++    // keeps it LF.
++    assert!(!install_sh().contains(&b'\r'));
++}
+diff --git a/docs/remote-hub.md b/docs/remote-hub.md
+--- a/docs/remote-hub.md
++++ b/docs/remote-hub.md
+@@ -12,10 +12,12 @@
+ 
+ - Образ `ghcr.io/pockerhead/cctg`: статический Linux-бинарник `cctg` на Alpine, пользователь uid 10001, состояние (`registry.json`, `offset`) в томе `/data`. Секретов в образе нет: `.dockerignore` пускает в сборку только исходники.
+ - Теги образа: `latest` и `<версия>` для релизов (git-тег `v*`), `main` и `sha-<коммит>` для каждого пуша в main.
+-- GitHub Releases (на тег `v*`): `cctg-<тег>-x86_64-pc-windows-msvc.exe`, `cctg-<тег>-x86_64-unknown-linux-musl`, `SHA256SUMS`.
++- GitHub Releases (на тег `v*`): `cctg-x86_64-pc-windows-msvc.exe`, `cctg-x86_64-unknown-linux-musl`, `cctg-aarch64-apple-darwin`, `SHA256SUMS`. Имена без версии: `install.sh` берёт `releases/latest/download/<имя>` (TASK-031).
+ - `deploy/compose.yml` и `deploy/hub.env.example` в репозитории: всё, что нужно серверу.
+ 
+ ## Один раз на сервере
++
++Всё, что ниже, делает одна команда (TASK-031): `curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --hub` (папка `~/cctg-hub`, другая: `--dir`). Она спрашивает токен, id группы и пользователей, прокси и адрес сервера (или берёт `CCTG_BOT_TOKEN`, `--chat-id`, `--users`, `--proxy`, `--public-host`), делает секрет и сертификат, пишет `hub.env` (600) и `.env` с `COMPOSE_FILE` (с `compose.host.yml`, если прокси на `127.0.0.1` хоста), запускает `docker compose up -d`, ждёт в логе `hub started, polling` (бот, группа и права проверены) и печатает строку установки клиента с адресом, pin и секретом. Повторный запуск обновляет образ и оставляет записанные значения. Руками то же самое:
+ 
+ Нужны Docker Engine с плагином compose и открытые наружу TCP-порты 47291 (агенты) и 47292 (хуки).
+ 
+@@ -79,7 +81,7 @@
+ - Без pin устройство говорит открытым TCP и только с loopback (`127.x`, `[::1]`, `localhost`). Адрес другой машины без pin не используется вовсе, секрет в открытом виде по сети не уходит.
+ - Адрес может быть именем или IP. Через Tailscale всё то же самое, с pin.
+ - Хуки над TLS ждут дольше: 900 мс (600 мс для `UserPromptSubmit` и тулов) вместо 500/300. Строка статуса держит свои 80 мс: если до сервера далеко, цифры контекста и лимитов в сообщение статуса не дойдут, строка статуса от этого не тормозит.
+-- Бинарник устройства: из GitHub Releases того же тега, что образ на сервере (про версии ниже). Регистрация агента и хуков как в `docs/poc.md`: `cctg agent-install`, `docs/hook-settings.json`.
++- Устройство ставит `install.sh` (README, шаг 3): бинарник из GitHub Releases, этот `device.env`, `~/.cctg/claude/{mcp.json,settings.json}` и обёртку `claude-cctg`. `~/.cctg/bin/cctg doctor` проверяет оба канала, pin и секрет. Ручная регистрация агента и хуков: `docs/poc.md`.
+ 
+ ## Обновление
+ 
+@@ -97,7 +99,7 @@
+ Сборка определяется коммитом, из которого она собрана, а не байтами файла: `cctg --version` печатает `cctg 0.1.0 (<коммит>)`. Hub в Linux-контейнере и Windows-клиент одного коммита считаются одной сборкой. Клиент другого коммита получает в теме одно предупреждение «устарел» с кнопкой «Обновить» (номера обеих сборок в тексте).
+ 
+ - Коммит в сборку кладёт `build.rs`: `CCTG_BUILD_ID` из окружения сборки (CI и Docker передают полный коммит), иначе `git rev-parse HEAD`. Если в `crates/`, `Cargo.toml` или `Cargo.lock` есть незакоммиченные изменения, к коммиту добавляется `-dirty` и хеш исполняемого файла: две разные грязные сборки одного коммита не равны. Без git и без переменной сборкой остаётся sha256 файла, как до TASK-035.
+-- «Обновить» на удалённой машине работает так же, как локально: агент берёт новый файл, если он лежит на месте старого. Сам он его не скачивает. Порядок на удалённой машине: скачать бинарник нужного тега из Releases, переименовать работающий `cctg.exe` (Windows разрешает переименовать запущенный exe), положить новый под старым именем, нажать «Обновить». Если нового файла нет, тема получает подсказку, что делать.
++- «Обновить» на удалённой машине работает так же, как локально: агент берёт новый файл, если он лежит на месте старого. Сам он его не скачивает. Порядок на удалённой машине: запустить команду установки ещё раз (она кладёт новый бинарник на место старого, работающий `cctg.exe` в Windows переименовывает в `cctg.old.exe`), потом нажать «Обновить». Если нового файла нет, тема получает подсказку, что делать.
+ 
+ ## Hub на своей машине с TLS
+ 
+@@ -109,6 +111,6 @@
+ 
+ ## Ограничения
+ 
+-- Только x86_64 (образ и бинарники).
++- Образ и бинарник Linux только x86_64; клиент macOS только Apple Silicon (aarch64). Остальное: `install.sh --from-source` из клона (нужен cargo).
+ - Смена сертификата меняет pin: его надо обновить в `device.env` всех устройств, до этого они молчат.
+ - Порты hub видны всему интернету. Незнакомые соединения отбрасываются до секрета (рукопожатие TLS не проходит, у hub это строка debug), но их поток не ограничивается: 256 агентских и 64 хуковых соединения одновременно, как и раньше.
+diff --git a/install.sh b/install.sh
+new file mode 100755
+--- /dev/null
++++ b/install.sh
+@@ -0,0 +1,787 @@
++#!/bin/sh
++# cctg installer (TASK-031): the client on Linux, macOS and Windows under Git
++# Bash; with --hub, the hub on a server with Docker.
++#
++#   curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh
++#   curl -fsSL .../install.sh | sh -s -- --uninstall
++#   curl -fsSL .../install.sh | sh -s -- --hub
++#   sh install.sh --help
++#
++# The client writes only these files (<home> is $HOME, on Windows %USERPROFILE%):
++#   <home>/.cctg/bin/cctg[.exe]         the binary; an update replaces it in place
++#   <home>/.cctg/device.env             hub addresses, secret, certificate pin
++#   <home>/.cctg/claude/mcp.json        the cctg channel server for claude
++#   <home>/.cctg/claude/settings.json   cctg hooks and status line
++#   <home>/.local/bin/claude-cctg       the wrapper (and claude-cctg.cmd on Windows)
++# It never writes ~/.claude/settings.json or ~/.claude.json and never prints
++# the hub secret (--hub prints it once, inside the client install line).
++# Running it again updates; --uninstall removes these files.
++#
++# The body is one function called on the last line: a download cut short
++# runs nothing.
++
++main() {
++set -eu
++LC_ALL=C
++export LC_ALL
++
++REPO=pockerhead/cctg
++# Marks every wrapper this script writes; --uninstall removes only those.
++MARK=cctg-install
++# device.env keys this script sets; other lines of the file are kept.
++MANAGED='CCTG_HUB_SECRET|CCTG_HUB_AGENT_ADDR|CCTG_HUB_HOOK_ADDR|CCTG_HUB_CERT_SHA256'
++AGENT_PORT=47291
++HOOK_PORT=47292
++
++hub_host=
++hub_mode=0
++hub_dir=
++chat_id=
++users=
++proxy=
++public_host=
++agent_addr=
++hook_addr=
++pin=
++secret_file=
++version=
++from_source=0
++yes=0
++uninstall=0
++while [ $# -gt 0 ]; do
++    case $1 in
++        --hub-host) need_value "$@"; hub_host=$2; shift 2 ;;
++        --hub) hub_mode=1; shift ;;
++        --dir) need_value "$@"; hub_dir=$2; shift 2 ;;
++        --chat-id) need_value "$@"; chat_id=$2; shift 2 ;;
++        --users) need_value "$@"; users=$2; shift 2 ;;
++        --proxy) need_value "$@"; proxy=$2; shift 2 ;;
++        --public-host) need_value "$@"; public_host=$2; shift 2 ;;
++        --agent-addr) need_value "$@"; agent_addr=$2; shift 2 ;;
++        --hook-addr) need_value "$@"; hook_addr=$2; shift 2 ;;
++        --pin) need_value "$@"; pin=$2; shift 2 ;;
++        --secret-file) need_value "$@"; secret_file=$2; shift 2 ;;
++        --version) need_value "$@"; version=$2; shift 2 ;;
++        --from-source) from_source=1; shift ;;
++        -y|--yes) yes=1; shift ;;
++        --uninstall) uninstall=1; shift ;;
++        -h|--help) usage; return 0 ;;
++        *) die "unknown option $1 (see --help)" ;;
++    esac
++done
++
++case $(uname -s) in
++    Linux) os=linux ;;
++    Darwin) os=macos ;;
++    MINGW*|MSYS*|CYGWIN*) os=windows ;;
++    *) die "unsupported system $(uname -s)" ;;
++esac
++arch=$(uname -m)
++case $arch in
++    x86_64|amd64) arch=x86_64 ;;
++    arm64|aarch64) arch=aarch64 ;;
++esac
++# A shell under Rosetta reports x86_64 on an Apple Silicon Mac.
++if [ "$os" = macos ] && [ "$arch" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
++    arch=aarch64
++fi
++
++if [ "$os" = windows ]; then
++    [ -n "${USERPROFILE:-}" ] || die "USERPROFILE is not set"
++    home=$(cygpath -u "$USERPROFILE")
++    ext=.exe
++else
++    [ -n "${HOME:-}" ] || die "HOME is not set"
++    home=$HOME
++    ext=
++fi
++root=$home/.cctg
++bin_dir=$root/bin
++exe=$bin_dir/cctg$ext
++conf_dir=$root/claude
++env_file=$root/device.env
++wrap_dir=$home/.local/bin
++wrapper=$wrap_dir/claude-cctg
++
++tmp=$(mktemp -d)
++stty_saved=
++trap cleanup EXIT
++trap 'exit 130' INT TERM
++
++if [ "$hub_mode" = 1 ]; then
++    if [ "$uninstall" = 1 ]; then uninstall_hub; else setup_hub; fi
++    return 0
++fi
++if [ "$uninstall" = 1 ]; then
++    uninstall_all
++    return 0
++fi
++
++check_paths
++read_settings
++offer_claude
++install_binary
++write_device_env
++write_claude_files
++write_wrappers
++say "installed $("$exe" --version)"
++if [ -e "$bin_dir/cctg.hub-started" ]; then
++    say "note: cctg supervise runs a hub from $bin_dir; it takes the new binary at its next restart"
++fi
++say "checking the hub (cctg doctor):"
++"$exe" doctor </dev/null || say "the hub check failed; fix device.env and run $exe doctor again"
++case ":$PATH:" in
++    *":$wrap_dir:"*) ;;
++    *) say "note: $wrap_dir is not in PATH; add it (Claude Code's installer uses the same folder)" ;;
++esac
++say "done: run claude-cctg in a project folder"
++}
++
++usage() {
++    cat <<'EOF'
++cctg installer. A device with Claude Code (Linux, macOS, Windows in Git
++Bash): the cctg binary, device.env, Claude Code files and claude-cctg.
++
++  --hub-host HOST       the hub's host name or IP (ports 47291 and 47292)
++  --agent-addr H:P      the hub's agent address (instead of --hub-host)
++  --hook-addr H:P       the hub's hook address (instead of --hub-host)
++  --pin SHA256          the hub certificate's sha256 (needed for a hub on
++                        another machine; the openssl fingerprint line works)
++  --secret-file FILE    read the hub secret from the first line of FILE
++                        (or set CCTG_HUB_SECRET; otherwise it is asked for)
++  --version vX.Y.Z      install this release instead of the latest
++  --from-source         build with cargo from the clone this script is in
++  -y, --yes             ask nothing (also: install Claude Code when missing)
++  --uninstall           remove what this script wrote
++  CCTG_INSTALL_BASE_URL   where the release files are (a mirror; http only
++                          on this machine)
++
++The hub on a server with Docker (docs/remote-hub.md):
++
++  --hub                 set up or update the hub in --dir with docker compose
++  --dir DIR             the hub's folder (default ~/cctg-hub)
++  --chat-id -100N       the forum group
++  --users ID[,ID]       Telegram user ids allowed to use the bot
++  --proxy URL           HTTPS_PROXY for the Bot API (optional)
++  --public-host HOST    how devices reach this server (for the client line)
++  CCTG_BOT_TOKEN        the bot token (otherwise it is asked for)
++  --hub --uninstall     stop the hub; hub.env, tls/ and the state volume stay
++
++Running it again updates and keeps the values already written unless new
++ones are given.
++EOF
++}
++
++say() { printf '%s\n' "cctg-install: $*"; }
++die() { printf '%s\n' "cctg-install: error: $*" >&2; exit 1; }
++need_value() { [ $# -ge 2 ] || die "$1 needs a value"; }
++
++cleanup() {
++    if [ -n "$stty_saved" ]; then
++        stty "$stty_saved" </dev/tty 2>/dev/null || true
++    fi
++    rm -rf "$tmp"
++}
++
++# The machine's own spelling of a path: C:/... on Windows.
++native() {
++    if [ "$os" = windows ]; then cygpath -m "$1"; else printf '%s' "$1"; fi
++}
++
++# The paths go into JSON, into shell commands of hooks and into the
++# wrappers unescaped; refuse what would need escaping.
++check_paths() {
++    for p in "$(native "$root")" "$(native "$wrap_dir")"; do
++        case $p in
++            *[\"\$\`%\\]*) die "the path $p has a character the configs cannot carry" ;;
++        esac
++    done
++}
++
++interactive() {
++    [ "$yes" = 0 ] && (: </dev/tty) 2>/dev/null
++}
++
++# ask <question> -> $answer (empty without a terminal)
++ask() {
++    answer=
++    if interactive; then
++        printf '%s' "$1" >/dev/tty
++        IFS= read -r answer </dev/tty || answer=
++    fi
++}
++
++# line_of <file> <key>: the last line of an env file that sets key (or empty).
++line_of() {
++    [ -f "$1" ] || return 0
++    grep -E "^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=" "$1" | tail -n 1 || true
++}
++old_line() { line_of "$env_file" "$1"; }
++
++is_loopback() {
++    case ${1%:*} in
++        localhost|127.*|\[::1\]) return 0 ;;
++        *) return 1 ;;
++    esac
++}
++
++check_addr() {
++    case $1 in
++        *[!A-Za-z0-9.:_\[\]-]*|:*|*:) die "hub address $1 is not host:port" ;;
++        *:*) ;;
++        *) die "hub address $1 is not host:port" ;;
++    esac
++    port=${1##*:}
++    case $port in
++        ''|*[!0-9]*) die "hub address $1 is not host:port" ;;
++    esac
++}
++
++# 64 hex digits; a whole openssl line (sha256 Fingerprint=AB:CD:..) works.
++normalize_pin() {
++    p=${1##*=}
++    p=$(printf '%s' "$p" | tr -d ': ' | tr 'A-F' 'a-f')
++    case $p in
++        *[!0-9A-Fa-f]*) die "the pin is not a sha256 fingerprint (64 hex digits)" ;;
++    esac
++    [ ${#p} -eq 64 ] || die "the pin is not a sha256 fingerprint (64 hex digits)"
++    pin=$p
++}
++
++check_secret() {
++    case $secret in
++        *[!!-~]*) die "the secret must be visible ASCII characters without spaces" ;;
++    esac
++    [ ${#secret} -ge 16 ] || die "the secret must have at least 16 characters"
++}
++
++# read_hidden <prompt> <what to set instead> -> $hidden, typed without echo.
++read_hidden() {
++    stty_saved=$(stty -g </dev/tty 2>/dev/null) || stty_saved=
++    [ -n "$stty_saved" ] || die "cannot hide typing here; $2"
++    printf '%s' "$1" >/dev/tty
++    stty -echo </dev/tty
++    IFS= read -r hidden </dev/tty || hidden=
++    stty "$stty_saved" </dev/tty
++    stty_saved=
++    printf '\n' >/dev/tty
++}
++
++read_settings() {
++    if [ -n "$hub_host" ]; then
++        agent_addr=${agent_addr:-$hub_host:$AGENT_PORT}
++        hook_addr=${hook_addr:-$hub_host:$HOOK_PORT}
++    fi
++    if [ -z "$agent_addr$hook_addr" ] && [ -z "$(old_line CCTG_HUB_AGENT_ADDR)$(old_line CCTG_HUB_HOOK_ADDR)" ]; then
++        ask "Hub host (empty: the hub runs on this machine): "
++        if [ -n "$answer" ]; then
++            agent_addr=$answer:$AGENT_PORT
++            hook_addr=$answer:$HOOK_PORT
++        fi
++    fi
++    [ -z "$agent_addr" ] || check_addr "$agent_addr"
++    [ -z "$hook_addr" ] || check_addr "$hook_addr"
++
++    if [ -n "$pin" ]; then
++        normalize_pin "$pin"
++    elif [ -z "$(old_line CCTG_HUB_CERT_SHA256)" ]; then
++        remote=0
++        for a in "$agent_addr" "$hook_addr"; do
++            if [ -n "$a" ] && ! is_loopback "$a"; then remote=1; fi
++        done
++        if [ "$remote" = 1 ]; then
++            ask "Hub certificate sha256 (the hub logs it at start): "
++            [ -n "$answer" ] || die "a hub on another machine needs --pin (see docs/remote-hub.md)"
++            normalize_pin "$answer"
++        fi
++    fi
++
++    secret=${CCTG_HUB_SECRET:-}
++    # Nothing started from here gets it: cctg doctor must check the file,
++    # as the sessions will.
++    unset CCTG_HUB_SECRET
++    if [ -n "$secret" ]; then
++        :
++    elif [ -n "$secret_file" ]; then
++        [ "$os" != windows ] || secret_file=$(cygpath -u "$secret_file")
++        [ -r "$secret_file" ] || die "cannot read $secret_file"
++        IFS= read -r secret <"$secret_file" || true
++        secret=$(printf '%s' "$secret" | tr -d '\r')
++    elif [ -z "$(old_line CCTG_HUB_SECRET)" ]; then
++        interactive || die "no hub secret: set CCTG_HUB_SECRET or use --secret-file"
++        read_hidden "Hub secret (CCTG_HUB_SECRET of the hub, not shown): " \
++            "set CCTG_HUB_SECRET or use --secret-file"
++        secret=$hidden
++        hidden=
++    fi
++    [ -z "$secret" ] || check_secret
++}
++
++have_claude() {
++    command -v claude >/dev/null 2>&1 || [ -x "$wrap_dir/claude" ] || [ -x "$wrap_dir/claude.exe" ]
++}
++
++# Claude Code's own installer, as its setup page gives it
++# (https://code.claude.com/docs/en/setup); never a copy of it.
++offer_claude() {
++    have_claude && return 0
++    if [ "$yes" = 1 ]; then
++        answer=y
++    else
++        ask "Claude Code is not installed. Install it with Anthropic's installer now? [Y/n] "
++        interactive || answer=n
++    fi
++    case $answer in
++        ''|y|Y|yes) ;;
++        *) say "skipped Claude Code; install it later: https://code.claude.com/docs/en/setup"; return 0 ;;
++    esac
++    say "installing Claude Code with Anthropic's installer"
++    if [ "$os" = windows ]; then
++        powershell -NoProfile -Command "irm https://claude.ai/install.ps1 | iex" </dev/null || true
++    elif command -v bash >/dev/null 2>&1; then
++        curl -fsSL https://claude.ai/install.sh | bash || true
++    else
++        say "Anthropic's installer needs bash; install bash, then Claude Code"
++    fi
++    have_claude || say "Claude Code is still not found; see https://code.claude.com/docs/en/setup"
++}
++
++# The clone this script is in: its folder when run as a file, else (piped
++# into sh) the current folder.
++source_dir() {
++    case $0 in
++        *install.sh) cd "$(dirname "$0")" && pwd ;;
++        *) pwd ;;
++    esac
++}
++
++release_asset() {
++    case $os-$arch in
++        linux-x86_64) asset=cctg-x86_64-unknown-linux-musl ;;
++        macos-aarch64) asset=cctg-aarch64-apple-darwin ;;
++        windows-*) asset=cctg-x86_64-pc-windows-msvc.exe ;;
++        *) die "no release build for $os $arch; run this script from a clone with --from-source" ;;
++    esac
++}
++
++# curl only: Claude Code's own installer needs it too.
++fetch() {
++    curl -fsSL --retry 3 $curl_proto -o "$2" "$1" || die "download failed: $1"
++}
++
++# https only; plain http only to this machine (a test or a local mirror).
++set_proto() {
++    case $1 in
++        https://*) curl_proto='--proto =https --proto-redir =https --tlsv1.2' ;;
++        http://127.0.0.1:*|http://127.0.0.1/*|http://localhost:*|http://localhost/*)
++            curl_proto='--proto =http --proto-redir =http' ;;
++        *) die "$1: only https:// (http:// only on this machine)" ;;
++    esac
++}
++
++base_url() {
++    if [ -n "${CCTG_INSTALL_BASE_URL:-}" ]; then
++        base=${CCTG_INSTALL_BASE_URL%/}
++    else
++        if [ -n "$version" ]; then
++            base=https://github.com/$REPO/releases/download/$version
++        else
++            base=https://github.com/$REPO/releases/latest/download
++        fi
++    fi
++    set_proto "$base"
++}
++
++sha256() {
++    if command -v sha256sum >/dev/null 2>&1; then
++        sha256sum "$1" | cut -d ' ' -f 1
++    else
++        shasum -a 256 "$1" | cut -d ' ' -f 1
++    fi
++}
++
++install_binary() {
++    command -v curl >/dev/null 2>&1 || [ "$from_source" = 1 ] || die "curl is needed"
++    mkdir -p "$bin_dir"
++    new=$bin_dir/cctg.install$ext
++    if [ "$from_source" = 1 ]; then
++        src=$(source_dir)
++        [ -f "$src/Cargo.toml" ] || die "--from-source runs from a clone of $REPO"
++        command -v cargo >/dev/null 2>&1 || die "--from-source needs cargo"
++        say "building cctg with cargo"
++        (cd "$src" && cargo build --release --locked -p cctg) || die "cargo build failed"
++        cp "${CARGO_TARGET_DIR:-$src/target}/release/cctg$ext" "$new"
++    else
++        release_asset
++        base_url
++        say "downloading $asset"
++        fetch "$base/$asset" "$tmp/$asset"
++        fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS"
++        want=$(awk -v n="$asset" '$2 == n || $2 == "*" n { print $1 }' "$tmp/SHA256SUMS")
++        [ -n "$want" ] || die "SHA256SUMS has no line for $asset"
++        [ "$(sha256 "$tmp/$asset")" = "$want" ] || die "checksum mismatch for $asset; nothing installed"
++        mv -f "$tmp/$asset" "$new"
++    fi
++    if [ -f "$exe" ] && cmp -s "$new" "$exe"; then
++        rm -f "$new"
++        say "binary unchanged"
++        return 0
++    fi
++    chmod 755 "$new"
++    got=$("$new" --version 2>/dev/null) || { rm -f "$new"; die "the new binary does not run"; }
++    case $got in
++        "cctg "*) ;;
++        *) rm -f "$new"; die "the new binary is not cctg" ;;
++    esac
++    if [ "$os" = windows ] && [ -e "$exe" ]; then
++        # A running cctg.exe cannot be replaced, but it can be renamed:
++        # sessions keep running from the old file (as with cctg deploy).
++        old=$bin_dir/cctg.old.exe
++        rm -f "$old" 2>/dev/null || true
++        [ ! -e "$old" ] || old=$old.$(date +%s)
++        mv -f "$exe" "$old" || die "cannot move $exe aside"
++    fi
++    mv -f "$new" "$exe"
++    rm -f "$bin_dir"/cctg.old.exe.* 2>/dev/null || true
++}
++
++# Writes stdin to $1 (mode $2) only when the bytes differ: an unchanged
++# settings file must keep its time, or every session would restart on
++# the next "Обновить".
++put() {
++    cat >"$1.tmp"
++    chmod "$2" "$1.tmp"
++    if [ -f "$1" ] && cmp -s "$1.tmp" "$1"; then
++        rm -f "$1.tmp"
++    else
++        mv -f "$1.tmp" "$1"
++    fi
++}
++
++# A value in single quotes, ' as '\'': literal for sh and for dotenvy
++# (no $ expansion inside single quotes).
++squote() {
++    q=
++    rest=$1
++    while :; do
++        case $rest in
++            *\'*) q="$q${rest%%\'*}'\\''"; rest=${rest#*\'} ;;
++            *) break ;;
++        esac
++    done
++    printf "'%s%s'" "$q" "$rest"
++}
++
++managed_line() {
++    if [ -n "$2" ]; then
++        printf '%s=%s\n' "$1" "$(squote "$2")"
++    else
++        old_line "$1"
++    fi
++}
++
++write_device_env() {
++    mkdir -p "$root"
++    host_line=
++    # Without /proc a Mac has no host name for cctg (the hook and the agent
++    # read CCTG_HOST, else /proc, else HOSTNAME, which is not exported).
++    if [ "$os" = macos ] && [ -z "$(old_line CCTG_HOST)" ]; then
++        host_line="CCTG_HOST=$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
++    fi
++    old_umask=$(umask)
++    umask 077
++    {
++        if [ -f "$env_file" ]; then
++            grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=" "$env_file" || true
++        else
++            printf '%s\n' "# cctg device config, written by install.sh (docs/remote-hub.md)"
++        fi
++        [ -z "$host_line" ] || printf '%s\n' "$host_line"
++        managed_line CCTG_HUB_SECRET "$secret"
++        managed_line CCTG_HUB_AGENT_ADDR "$agent_addr"
++        managed_line CCTG_HUB_HOOK_ADDR "$hook_addr"
++        managed_line CCTG_HUB_CERT_SHA256 "$pin"
++    } | put "$env_file" 600
++    umask "$old_umask"
++    secret=
++}
++
++write_claude_files() {
++    mkdir -p "$conf_dir"
++    c=$(native "$exe")
++    put "$conf_dir/mcp.json" 644 <<EOF
++{
++  "mcpServers": {
++    "cctg": { "command": "$c", "args": ["agent"] }
++  }
++}
++EOF
++    put "$conf_dir/settings.json" 644 <<EOF
++{
++  "statusLine": { "type": "command", "command": "\"$c\" statusline" },
++  "hooks": {
++    "SessionStart": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SessionStart" }] }],
++    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SessionEnd" }] }],
++    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook UserPromptSubmit" }] }],
++    "Stop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook Stop" }] }],
++    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStart" }] }],
++    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStop" }] }],
++    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
++    "PostToolUse": [
++      { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"$c\" hook PostToolUse" }] },
++      { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
++    ],
++    "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
++    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PermissionRequest", "timeout": 100 }] }]
++  }
++}
++EOF
++}
++
++# A file of ours at $1 carries $MARK; anything else there is moved aside once.
++make_room() {
++    if [ -e "$1" ] && ! grep -q "$MARK" "$1" 2>/dev/null; then
++        aside=$1.before-cctg-install
++        [ ! -e "$aside" ] || aside=$aside.$(date +%s)
++        mv -f "$1" "$aside"
++        say "moved the existing $1 to $aside"
++    fi
++}
++
++write_wrappers() {
++    mkdir -p "$wrap_dir"
++    c=$(native "$exe")
++    m=$(native "$conf_dir/mcp.json")
++    s=$(native "$conf_dir/settings.json")
++    # --settings (one value) goes last: the options before it take every
++    # word up to the next option, so a prompt would become a channel name.
++    make_room "$wrapper"
++    put "$wrapper" 755 <<EOF
++#!/bin/sh
++# claude-cctg: Claude Code with the cctg channel and hooks ($MARK).
++# Written by cctg install.sh; running it again rewrites this file.
++exec "$c" run -- --mcp-config "$m" --dangerously-load-development-channels server:cctg --settings "$s" "\$@"
++EOF
++    if [ "$os" = windows ]; then
++        cw=$(cygpath -w "$exe")
++        mw=$(cygpath -w "$conf_dir/mcp.json")
++        sw=$(cygpath -w "$conf_dir/settings.json")
++        make_room "$wrapper.cmd"
++        printf '%s\r\n' \
++            '@echo off' \
++            "rem claude-cctg: Claude Code with the cctg channel and hooks ($MARK)." \
++            "\"$cw\" run -- --mcp-config \"$mw\" --dangerously-load-development-channels server:cctg --settings \"$sw\" %*" \
++            | put "$wrapper.cmd" 644
++    fi
++}
++
++remove() {
++    if [ -e "$1" ]; then
++        rm -f "$1" 2>/dev/null || true
++        if [ -e "$1" ]; then say "left $1 (in use?)"; else say "removed $1"; fi
++    fi
++}
++
++uninstall_all() {
++    for w in "$wrapper" "$wrapper.cmd"; do
++        if [ -e "$w" ]; then
++            if grep -q "$MARK" "$w" 2>/dev/null; then remove "$w"; else say "left $w (not written by this script)"; fi
++        fi
++    done
++    remove "$conf_dir/mcp.json"
++    remove "$conf_dir/settings.json"
++    remove "$env_file"
++    remove "$exe"
++    for f in "$bin_dir"/cctg.old.exe "$bin_dir"/cctg.old.exe.* "$bin_dir/cctg.install$ext"; do
++        remove "$f"
++    done
++    for d in "$conf_dir" "$bin_dir/cctg-workers" "$bin_dir" "$root" "$wrap_dir"; do
++        rmdir "$d" 2>/dev/null || true
++    done
++    if [ -d "$root" ]; then
++        say "left $root: files cctg made while running (spool, restart) or not written by this script"
++    fi
++    say "uninstalled; ~/.claude and ~/.claude.json were not touched"
++}
++
++# ------------------------------------------------------------- hub (--hub)
++
++# A value of an env file line as it was written (surrounding quotes off).
++value_of() {
++    v=$(line_of "$1" "$2")
++    v=${v#*=}
++    case $v in
++        \'*\') v=${v#\'}; v=${v%\'} ;;
++        \"*\") v=${v#\"}; v=${v%\"} ;;
++    esac
++    printf '%s' "$v"
++}
++
++# hub_line <key> <new value>: KEY=value, or the line already in hub.env.
++# compose reads hub.env; the values are checked to need no quoting.
++hub_line() {
++    if [ -n "$2" ]; then printf '%s=%s\n' "$1" "$2"; else line_of "$hub_env" "$1"; fi
++}
++
++# ask_kept <key> <question> <current value> -> $answer: the given value, or
++# asked for when hub.env has none.
++ask_kept() {
++    answer=$3
++    if [ -z "$answer" ] && [ -z "$(line_of "$hub_env" "$1")" ]; then
++        ask "$2"
++    fi
++}
++
++setup_hub() {
++    command -v docker >/dev/null 2>&1 || die "--hub needs Docker with the compose plugin (docs/remote-hub.md)"
++    docker compose version >/dev/null 2>&1 </dev/null || die "--hub needs the docker compose plugin"
++    command -v openssl >/dev/null 2>&1 || die "--hub needs openssl for the hub certificate"
++    hub_dir=${hub_dir:-$home/cctg-hub}
++    [ "$os" != windows ] || hub_dir=$(cygpath -u "$hub_dir")
++    hub_env=$hub_dir/hub.env
++    mkdir -p "$hub_dir/tls"
++
++    # The compose files of the same source as this script.
++    src=$(source_dir)
++    for f in compose.yml compose.host.yml; do
++        if [ -f "$src/deploy/$f" ]; then
++            cp "$src/deploy/$f" "$tmp/$f"
++        else
++            raw=${CCTG_INSTALL_RAW_URL:-https://raw.githubusercontent.com/$REPO/${version:-main}}
++            set_proto "$raw"
++            fetch "${raw%/}/deploy/$f" "$tmp/$f"
++        fi
++        put "$hub_dir/$f" 644 <"$tmp/$f"
++    done
++
++    token=${CCTG_BOT_TOKEN:-}
++    unset CCTG_BOT_TOKEN
++    if [ -z "$token" ] && [ -z "$(line_of "$hub_env" CCTG_BOT_TOKEN)" ]; then
++        interactive || die "no bot token: set CCTG_BOT_TOKEN"
++        read_hidden "Bot token from @BotFather (not shown): " "set CCTG_BOT_TOKEN"
++        token=$hidden
++        hidden=
++    fi
++    case $token in
++        *[!0-9A-Za-z:_-]*) die "the bot token has characters a token never has" ;;
++        ''|[0-9]*:?*) ;;
++        *) die "the bot token is not <digits>:<letters>" ;;
++    esac
++    ask_kept CCTG_CHAT_ID "Group chat id (-100...): " "$chat_id"
++    chat_id=$answer
++    case $chat_id in
++        '') ;;
++        -100*[!0-9]*|-100) die "the chat id is -100 and digits" ;;
++        -100*) ;;
++        *) die "the chat id is -100 and digits (Bot API form)" ;;
++    esac
++    ask_kept CCTG_ALLOWED_USER_IDS "Your Telegram user id (several: 1,2): " "$users"
++    users=$answer
++    case $users in
++        *[!0-9,]*) die "user ids are digits separated by commas" ;;
++    esac
++    [ -n "$token$(line_of "$hub_env" CCTG_BOT_TOKEN)" ] || die "the bot token is needed"
++    [ -n "$chat_id$(line_of "$hub_env" CCTG_CHAT_ID)" ] || die "--chat-id is needed"
++    [ -n "$users$(line_of "$hub_env" CCTG_ALLOWED_USER_IDS)" ] || die "--users is needed"
++    ask_kept HTTPS_PROXY "HTTPS proxy for Telegram (empty: none): " "$proxy"
++    proxy=$answer
++    case $proxy in
++        *[\ \"\'\$\#\`\\]*) die "the proxy URL has a character hub.env cannot carry" ;;
++    esac
++    hub_secret=$(value_of "$hub_env" CCTG_HUB_SECRET)
++    new_secret=
++    if [ -z "$hub_secret" ]; then
++        new_secret=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
++        hub_secret=$new_secret
++    fi
++
++    old_umask=$(umask)
++    umask 077
++    {
++        if [ -f "$hub_env" ]; then
++            grep -v -E "^[[:space:]]*(export[[:space:]]+)?(CCTG_BOT_TOKEN|CCTG_CHAT_ID|CCTG_ALLOWED_USER_IDS|CCTG_HUB_SECRET|HTTPS_PROXY)[[:space:]]*=" "$hub_env" || true
++        else
++            printf '%s\n' "# cctg hub settings, written by install.sh --hub (docs/remote-hub.md). Never commit."
++        fi
++        hub_line CCTG_BOT_TOKEN "$token"
++        hub_line CCTG_CHAT_ID "$chat_id"
++        hub_line CCTG_ALLOWED_USER_IDS "$users"
++        hub_line CCTG_HUB_SECRET "$new_secret"
++        hub_line HTTPS_PROXY "$proxy"
++    } | put "$hub_env" 600
++    umask "$old_umask"
++    token=
++
++    # A proxy on the host's loopback needs the host network.
++    compose_files=compose.yml
++    case $(value_of "$hub_env" HTTPS_PROXY) in
++        *://127.*|*://localhost*|*@127.*|*@localhost*) compose_files=compose.yml:compose.host.yml ;;
++    esac
++    printf '%s\n' "# written by install.sh --hub: the compose files of this hub" \
++        "COMPOSE_FILE=$compose_files" | put "$hub_dir/.env" 644
++
++    if [ ! -f "$hub_dir/tls/cert.pem" ] || [ ! -f "$hub_dir/tls/key.pem" ]; then
++        say "making the hub certificate (self-signed, EC P-256, 10 years)"
++        (
++            cd "$hub_dir"
++            # MSYS would turn /CN=... into a Windows path.
++            MSYS_NO_PATHCONV=1 openssl ecparam -name prime256v1 -genkey -noout -out tls/key.pem
++            MSYS_NO_PATHCONV=1 openssl req -x509 -new -key tls/key.pem -days 3650 \
++                -subj /CN=cctg-hub -out tls/cert.pem
++        ) >/dev/null 2>&1 </dev/null || die "openssl could not make the certificate"
++    fi
++    if [ "$(id -u)" = 0 ]; then
++        chown 10001 "$hub_dir/tls/key.pem" && chmod 600 "$hub_dir/tls/key.pem"
++    else
++        chmod 644 "$hub_dir/tls/key.pem"
++        say "note: tls/key.pem is readable by every user here (as root it would belong to uid 10001 only)"
++    fi
++    fp=$(cd "$hub_dir" && openssl x509 -in tls/cert.pem -noout -fingerprint -sha256 </dev/null) \
++        || die "openssl cannot read tls/cert.pem"
++    normalize_pin "$fp"
++
++    say "starting the hub (docker compose in $hub_dir)"
++    (cd "$hub_dir" && docker compose pull hub </dev/null)         || die "docker compose pull failed (the ghcr.io package must be public, or docker login ghcr.io)"
++    started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
++    (cd "$hub_dir" && docker compose up -d --force-recreate hub </dev/null) || die "docker compose up failed"
++    wait_hub
++
++    if [ -z "$public_host" ]; then
++        ask "How do devices reach this server (host name or IP): "
++        public_host=${answer:-<this-server>}
++    fi
++    say "the hub is up. On each device with Claude Code run (the line carries the hub secret: only your own machines, and clear it from chat history):"
++    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | CCTG_HUB_SECRET=$(squote "$hub_secret") sh -s -- --hub-host $public_host --pin $pin"
++    hub_secret=
++}
++
++# The hub's own start checks (bot token, group, topic rights) end in
++# "hub started, polling"; a failed one ends the process with "Error: ...".
++wait_hub() {
++    i=0
++    logs=
++    while [ $i -lt 60 ]; do
++        logs=$(cd "$hub_dir" && docker compose logs --no-color --since "$started" hub 2>&1 </dev/null || true)
++        case $logs in
++            *"hub started, polling"*) say "hub started: bot and group checked"; return 0 ;;
++            *"Error: "*) break ;;
++        esac
++        sleep 2
++        i=$((i + 1))
++    done
++    printf '%s\n' "$logs" | tail -n 20
++    die "the hub did not start; its log is above (docker compose logs hub in $hub_dir)"
++}
++
++uninstall_hub() {
++    hub_dir=${hub_dir:-$home/cctg-hub}
++    [ "$os" != windows ] || hub_dir=$(cygpath -u "$hub_dir")
++    [ -f "$hub_dir/compose.yml" ] || die "no hub set up by this script in $hub_dir"
++    (cd "$hub_dir" && docker compose down </dev/null) || die "docker compose down failed"
++    remove "$hub_dir/compose.yml"
++    remove "$hub_dir/compose.host.yml"
++    remove "$hub_dir/.env"
++    say "stopped; $hub_dir keeps hub.env (token, secret) and tls/ (key), docker keeps the state volume: delete them by hand if you want"
++}
++
++main "$@"
