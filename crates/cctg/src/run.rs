@@ -10,8 +10,9 @@
 //! claude exits and `<state>/restart/<this pid>.json` is there, the file is
 //! removed and claude starts again with the arguments it lists (the worker
 //! agent made them: `--resume <session>`, the options, no prompt, see
-//! [`crate::update::relaunch_args`]); its development channels dialog is
-//! answered with Enter when option 1 is selected. Without a request
+//! [`crate::update::relaunch_args`]). The development channels dialog of
+//! every start, the first one too, is answered with Enter when option 1 is
+//! selected. Without a request
 //! `cctg run` exits with claude's exit code.
 //!
 //! Not updated while it runs, so nothing else lives here: no versions, no
@@ -55,7 +56,6 @@ fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
     let program = std::env::var_os(CLAUDE_VAR).unwrap_or_else(|| OsString::from("claude"));
     let run_args = serde_json::to_string(&args).unwrap_or_default();
     let mut claude_args = args;
-    let mut resumed = false;
     loop {
         let mut child = match Command::new(&program)
             .args(&claude_args)
@@ -70,7 +70,7 @@ fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
             }
         };
         let running = Arc::new(AtomicBool::new(true));
-        if resumed {
+        {
             let running = running.clone();
             std::thread::spawn(move || answer_channels_dialog(&running));
         }
@@ -85,7 +85,6 @@ fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
         };
         eprintln!("cctg run: starting claude again");
         claude_args = next;
-        resumed = true;
     }
 }
 
