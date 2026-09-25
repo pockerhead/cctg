@@ -76,6 +76,9 @@ enum Command {
     /// its listeners (`CCTG_AGENT_LISTEN`, `CCTG_HOOK_LISTEN`), else 1: the
     /// Docker healthcheck.
     Health,
+    /// Check this device's hub settings (~/.cctg/device.env): both hub
+    /// links, the certificate pin and the secret. Exit 0 when they work.
+    Doctor,
 }
 
 #[tokio::main]
@@ -181,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Health => {
             std::process::exit(if cctg::hub::healthy().await { 0 } else { 1 });
         }
+        Command::Doctor => std::process::exit(cctg::doctor::run().await),
         Command::AgentInstall => {
             let exe = std::env::current_exe()?;
             let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
@@ -291,6 +295,10 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["cctg", "health"]).unwrap().command,
             Command::Health
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "doctor"]).unwrap().command,
+            Command::Doctor
         ));
     }
 }

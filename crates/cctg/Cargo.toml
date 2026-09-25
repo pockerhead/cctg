@@ -39,6 +39,11 @@ tokio = { workspace = true, features = ["test-util"] }
 # Self-signed certificates for the TLS tests (TASK-035).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
+# install_e2e runs install.sh in a session of its own (setsid): no terminal.
+# Already in the lock file through tokio; no new download.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 # The supervisor e2e test stops the supervisor with Ctrl+Break
 # (GenerateConsoleCtrlEvent).
 [target.'cfg(windows)'.dev-dependencies]

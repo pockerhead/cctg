@@ -1,5 +1,6 @@
 # Every push and pull request: format, lints and all tests of the workspace
-# on Linux, Windows and macOS; the hub image builds (not pushed) and passes
+# on Linux, Windows and macOS (install.sh end to end included, TASK-031),
+# shellcheck of install.sh; the hub image builds (not pushed) and passes
 # the container smoke (.github/smoke). Actions are pinned to commits; the
 # toolchain comes from the runner's rustup. No secret is used.
 name: ci
@@ -42,6 +43,9 @@ jobs:
       - name: fmt
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+      - name: shellcheck install.sh
+        if: runner.os == 'Linux'
+        run: shellcheck --shell=sh install.sh
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test

@@ -42,6 +42,9 @@ pub const MAX_LINE: usize = 1 << 20;
 /// Longest accepted hook POST body.
 pub const MAX_HOOK_BODY: usize = 1 << 20;
 pub const HOOK_PATH: &str = "/v1/hook";
+/// `cctg doctor` (TASK-031): an empty `POST` that only checks the secret;
+/// `204` with it, `401` without, `404` from a hub older than this path.
+pub const PING_PATH: &str = "/v1/ping";
 pub const MIN_SECRET_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
