@@ -1,0 +1,40 @@
+called `Result::unwrap()` on an `Err` value: Os { code: 3, kind: NotFound, message: "Системе не удается найти указанный путь." }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+---- a_hub_is_set_up_with_docker_compose stdout ----
+thread 'a_hub_is_set_up_with_docker_compose' (36880) panicked at crates\cctg\tests\install_e2e.rs:663:64:
+called `Result::unwrap()` on an `Err` value: Os { code: 3, kind: NotFound, message: "Системе не удается найти указанный путь." }
+---- install_update_and_uninstall_a_device stdout ----
+thread 'install_update_and_uninstall_a_device' (32408) panicked at crates\cctg\tests\install_e2e.rs:338:5:
+cctg doctor: cctg-install: downloading cctg-x86_64-pc-windows-msvc.exe
+cctg-install: installed cctg 0.1.0 (15908a30031bb394bd4d56e7c6ff7c6795a29d4d-dirty)
+cctg-install: checking the hub (cctg doctor):
+cctg 0.1.0 (15908a30031bb394bd4d56e7c6ff7c6795a29d4d-dirty)
+secret: CCTG_HUB_SECRET is not set (process env or ~/.cctg/device.env)
+certificate pin: none (plain TCP, a hub on this machine only)
+agent link 127.0.0.1:47291: reachable
+hooks 127.0.0.1:47292: not checked without a secret
+cctg-install: the hub check failed; fix device.env and run /tmp/cctg-install-e2e-30904-device/home-ÐÐ²Ð°Ð½/.cctg/bin/cctg.exe doctor again
+cctg-install: note: /tmp/cctg-install-e2e-30904-device/home-ÐÐ²Ð°Ð½/.local/bin is not in PATH; add it (Claude Code's installer uses the same folder)
+cctg-install: done: run claude-cctg in a project folder
+---- a_missing_claude_code_comes_from_anthropics_installer_when_asked stdout ----
+thread 'a_missing_claude_code_comes_from_anthropics_installer_when_asked' (33780) panicked at crates\cctg\tests\install_e2e.rs:593:5:
+cctg-install: installing Claude Code with Anthropic's installer
+cctg-install: downloading cctg-x86_64-pc-windows-msvc.exe
+cctg-install: binary unchanged
+cctg-install: installed cctg 0.1.0 (15908a30031bb394bd4d56e7c6ff7c6795a29d4d-dirty)
+cctg-install: checking the hub (cctg doctor):
+cctg 0.1.0 (15908a30031bb394bd4d56e7c6ff7c6795a29d4d-dirty)
+secret: CCTG_HUB_SECRET is not set (process env or ~/.cctg/device.env)
+certificate pin: none (plain TCP, a hub on this machine only)
+agent link 127.0.0.1:47291: reachable
+hooks 127.0.0.1:47292: not checked without a secret
+cctg-install: the hub check failed; fix device.env and run /tmp/cctg-install-e2e-30904-claude/home-ÐÐ²Ð°Ð½/.cctg/bin/cctg.exe doctor again
+cctg-install: note: /tmp/cctg-install-e2e-30904-claude/home-ÐÐ²Ð°Ð½/.local/bin is not in PATH; add it (Claude Code's installer uses the same folder)
+cctg-install: done: run claude-cctg in a project folder
+failures:
+    a_hub_is_set_up_with_docker_compose
+    a_missing_claude_code_comes_from_anthropics_installer_when_asked
+    from_source_builds_with_cargo_in_the_clone
+    install_update_and_uninstall_a_device
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.21s
+error: test failed, to rerun pass `-p cctg --test install_e2e`

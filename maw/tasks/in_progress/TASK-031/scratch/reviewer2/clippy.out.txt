@@ -1,0 +1,3 @@
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-031-rev2\crates\cctg)
+    Finished `dev` profile [unoptimized] target(s) in 15.68s
+exit=0
