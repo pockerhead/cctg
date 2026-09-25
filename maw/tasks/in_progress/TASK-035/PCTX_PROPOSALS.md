@@ -9,3 +9,6 @@
 5. Risk lesson (hub/channel): "`tokio::io::split` halves keep the socket open while either half lives; a reader task spawned per connection must be aborted on drop (`tls::ReadTask`), or a cancelled connection task (a stopped `serve_agents`) never closes the link." Evidence: two agent tests failed until the guard.
 6. Risk lesson (general): "Tests that copy the cctg binary must make the copy executable on Unix (`tests/common::write_program`); `std::fs::write` gives no execute bit." Evidence: first Linux run (supervise_e2e, update_e2e: PermissionDenied).
 7. README invariant on builds: "Linux checks run in CI (ubuntu-latest) or, when Docker is available, in a `rust:1.95-bookworm` container with its own named target volume (it cannot share the Windows target dir)." Why: the shared-target rule has no Linux case.
+
+## 2026-09-25 (implementer)
+8. Risk lesson (hub): "`registry.json` is written by the slots saver task after the actor has moved on; a test that reads it must poll until the expected content appears, never read once after an unrelated signal (a sent notice)." Evidence: `tests/message_logs.rs` failed 4/8 runs after TASK-035 changed timings, fixed by polling.
