@@ -128,6 +128,11 @@ impl Drop for Hub {
 }
 
 async fn start_hub(state: &Path, listener: TcpListener, read_wait: Duration) -> Hub {
+    // The hub's log, shown with a failing test's output only.
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(false)
+        .try_init();
     let fake = Arc::new(Fake::default());
     let bucket = BucketConfig {
         capacity: 1000,
@@ -239,6 +244,15 @@ impl Session {
         format!("../cfg/projects/C--qa-w/{}.jsonl", self.id)
     }
 
+    /// Claude Code's project folder name for the session's cwd: it names the
+    /// folder after `realpathSync(process.cwd())` (TASK-034), so the name
+    /// comes from the resolved cwd. On macOS the temp dir `/var/folders/..`
+    /// resolves to `/private/var/folders/..`, a name the agent's cwd (always
+    /// resolved there) never gives (TASK-031 CI run 2).
+    fn claude_folder(&self) -> String {
+        cctg::tail::project_folder_name(&canonical_cwd(&self.workdir.to_string_lossy()))
+    }
+
     fn subagent_file(&self) -> String {
         format!(
             "../cfg/projects/C--qa-w/{}/subagents/agent-{AGENT}.jsonl",
@@ -258,6 +272,29 @@ impl Session {
             assert!(self.workdir.join(&path).is_file(), "the agent sees {path}");
             assert!(!Path::new(&path).exists(), "the hub must not see {path}");
         }
+    }
+
+    fn agent_log(&self) -> PathBuf {
+        self.root.join("agent.log")
+    }
+
+    /// What a timed-out wait prints: the agent's log, the cwd spellings and
+    /// the project folders, so a CI failure explains itself.
+    fn report(&self) -> String {
+        let log = std::fs::read_to_string(self.agent_log()).unwrap_or_default();
+        let mut folders: Vec<String> = std::fs::read_dir(self.config.join("projects"))
+            .map(|dir| {
+                dir.flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        folders.sort();
+        format!(
+            "cwd {:?}, resolved {:?}; project folders {folders:?}\n--- agent log ---\n{log}",
+            self.workdir,
+            canonical_cwd(&self.workdir.to_string_lossy()),
+        )
     }
 
     fn post(&self, event: HookEvent) -> HookPost {
@@ -300,7 +337,7 @@ fn start_agent(s: &Session, port: u16) -> Agent {
         .env("CLAUDE_CONFIG_DIR", &s.config)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(s.agent_log()).expect("agent log"))
         .spawn()
         .expect("spawn cctg agent");
     let mut stdin = child.stdin.take().unwrap();
@@ -585,8 +622,10 @@ fn post_naming(s: &Session, path: &str, event: HookEvent) -> HookPost {
     )
 }
 
-/// Sends `/brief` to the topic until a send contains `wanted`.
-async fn brief_until(hub: &Hub, what: &str, wanted: &str) {
+/// Sends `/brief` to the topic until a send contains `wanted`; on a timeout
+/// the panic carries the sends and [`Session::report`], and the hub's log
+/// is in the test output.
+async fn brief_until(hub: &Hub, s: &Session, what: &str, wanted: &str) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         hub.command(Some(THREAD), "/brief");
@@ -596,8 +635,9 @@ async fn brief_until(hub: &Hub, what: &str, wanted: &str) {
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for: {what}: {:?}",
-            hub.fake.sends()
+            "timed out waiting for: {what}: {:?}\n{}",
+            hub.fake.sends(),
+            s.report()
         );
     }
 }
@@ -609,7 +649,7 @@ async fn brief_until(hub: &Hub, what: &str, wanted: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_sessions_folder_comes_from_the_cwd_and_is_served() {
     let s = session("own", 5);
-    let folder = cctg::tail::project_folder_name(&s.workdir.to_string_lossy());
+    let folder = s.claude_folder();
     let path = format!("../cfg/projects/{folder}/{}.jsonl", s.id);
     let (listener, port) = listener().await;
     let hub = start_hub(&s.state, listener, Duration::from_secs(20)).await;
@@ -625,12 +665,12 @@ async fn a_new_sessions_folder_comes_from_the_cwd_and_is_served() {
     ))
     .await;
     // The agent answers before the transcript exists: not found.
-    brief_until(&hub, "the agent's first answer", "не найден").await;
+    brief_until(&hub, &s, "the agent's first answer", "не найден").await;
     let own = s.config.join("projects").join(&folder);
     std::fs::create_dir_all(&own).unwrap();
     std::fs::write(own.join(format!("{}.jsonl", s.id)), PARENT).unwrap();
     assert!(!Path::new(&path).exists(), "the hub must not see {path}");
-    brief_until(&hub, "the brief", &render(PARENT, false, 3)).await;
+    brief_until(&hub, &s, "the brief", &render(PARENT, false, 3)).await;
 }
 
 /// TASK-034 decision 12: the agent builds its paths itself. The hook names
@@ -639,7 +679,7 @@ async fn a_new_sessions_folder_comes_from_the_cwd_and_is_served() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_path_the_hub_names_is_never_opened() {
     let s = session("foreign", 6);
-    let folder = cctg::tail::project_folder_name(&s.workdir.to_string_lossy());
+    let folder = s.claude_folder();
     let own = s.config.join("projects").join(&folder);
     std::fs::create_dir_all(&own).unwrap();
     std::fs::write(own.join(format!("{}.jsonl", s.id)), PARENT).unwrap();
@@ -662,7 +702,7 @@ async fn a_path_the_hub_names_is_never_opened() {
         },
     ))
     .await;
-    brief_until(&hub, "the own brief", &render(PARENT, false, 3)).await;
+    brief_until(&hub, &s, "the own brief", &render(PARENT, false, 3)).await;
     assert!(
         !hub.fake
             .sends()
