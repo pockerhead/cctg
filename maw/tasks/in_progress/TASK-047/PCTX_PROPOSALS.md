@@ -26,3 +26,28 @@ back (restart did not happen) clears it.
 
 Why: the flag outlives the agent link and the update press; later work on
 updates or resume must keep this pairing.
+
+## 2026-09-25 (fixer) — hub domain, invariant
+
+An update press is held (no `update` sent, one notice, goes on after the
+last stop) while a live top-level session has a typed subagent whose
+`SubagentStart` came and `SubagentStop` did not, and that is still a
+subagent candidate or matched to an `Agent` call, for at most 6 h
+(`Slots::agents_running`, in memory only). A restart the hub lets through
+while such agents are known records their ids in
+`registry.sessions[..].restart_agents` and the continuation message names
+them for `SendMessage` by agentId.
+
+Why: the screen detector sees only what the terminal shows; the hub view is
+the second, independent signal, and its filters (candidate/confirmed, age)
+exist because the hook drops the stops of Claude Code's internal agents.
+
+## 2026-09-25 (fixer) — channel domain, risk lesson
+
+`/exit` typed with background work running opens a dialog whose default
+(Enter) stops the subagents. `keys::type_exit` watches for it
+(`keys::exit_dialog`, under the last `▔` panel edge) and closes it with Esc
+only; nothing typed into the console may ever pick an option of it.
+
+Why: any future code that types `/exit` or another exiting command must go
+through `type_exit`, not `type_line`.
