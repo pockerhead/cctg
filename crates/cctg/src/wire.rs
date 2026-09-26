@@ -1149,6 +1149,74 @@ pub fn decode_permission(body: &[u8]) -> Result<PermissionPost, WireError> {
     serde_json::from_value(value).map_err(|_| WireError::Malformed)
 }
 
+/// Claude Code's tool that asks the user multiple-choice questions
+/// (TASK-038). Its `PreToolUse` hook asks the hub at [`QUESTION_PATH`]; the
+/// permission paths leave it alone.
+pub const QUESTION_TOOL: &str = "AskUserQuestion";
+pub const QUESTION_PATH: &str = "/v1/question";
+/// Questions of one `AskUserQuestion` call, as its input allows at most.
+pub const MAX_QUESTIONS: usize = 4;
+/// Options of one question the hub shows as buttons.
+pub const MAX_OPTIONS: usize = 8;
+
+/// Body of one `AskUserQuestion` `PreToolUse` hook POST to
+/// [`QUESTION_PATH`]. The hub holds the request open until it has an answer:
+/// `200` with a [`QuestionAnswer`] when every question was answered in
+/// Telegram, `204` when it has none (sent to the terminal, the wait ran out,
+/// the session ended, the hub stopped). A hub without the path answers `404`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionPost {
+    pub v: u32,
+    pub host: String,
+    pub session_id: String,
+    pub questions: Vec<AskedQuestion>,
+}
+
+/// One question of an `AskUserQuestion` call, texts capped by the hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedQuestion {
+    pub question: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub multi_select: bool,
+    pub options: Vec<AskedOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskedOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// One answer per question, in order: an option label, the labels of a
+/// multiSelect question joined by `, `, or the user's own text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnswer {
+    pub answers: Vec<String>,
+}
+
+/// Also checks the shape the hub can show: 1 to [`MAX_QUESTIONS`] questions
+/// with text, each with 1 to [`MAX_OPTIONS`] labelled options.
+pub fn decode_question(body: &[u8]) -> Result<QuestionPost, WireError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| WireError::Malformed)?;
+    check_version(&value)?;
+    let post: QuestionPost = serde_json::from_value(value).map_err(|_| WireError::Malformed)?;
+    let shown = |question: &AskedQuestion| {
+        !question.question.trim().is_empty()
+            && (1..=MAX_OPTIONS).contains(&question.options.len())
+            && question
+                .options
+                .iter()
+                .all(|option| !option.label.trim().is_empty())
+    };
+    if !(1..=MAX_QUESTIONS).contains(&post.questions.len()) || !post.questions.iter().all(shown) {
+        return Err(WireError::Malformed);
+    }
+    Ok(post)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -2138,6 +2206,62 @@ mod tests {
         })
         .unwrap();
         assert_eq!(answer, r#"{"behavior":"deny"}"#);
+    }
+
+    #[test]
+    fn question_posts_round_trip_and_are_checked() {
+        let question = |text: &str, labels: &[&str]| AskedQuestion {
+            question: text.into(),
+            header: "H".into(),
+            multi_select: false,
+            options: labels
+                .iter()
+                .map(|label| AskedOption {
+                    label: (*label).into(),
+                    description: String::new(),
+                })
+                .collect(),
+        };
+        let post = QuestionPost {
+            v: VERSION,
+            host: "box".into(),
+            session_id: "s".into(),
+            questions: vec![question("Which?", &["A", "B"])],
+        };
+        let body = serde_json::to_vec(&post).unwrap();
+        assert_eq!(decode_question(&body), Ok(post.clone()));
+        let short = br#"{"v":1,"host":"h","session_id":"s","questions":[{"question":"Q","options":[{"label":"A"}]}]}"#;
+        let decoded = decode_question(short).unwrap();
+        assert_eq!(decoded.questions[0].header, "");
+        assert!(!decoded.questions[0].multi_select);
+        let mut v2 = serde_json::to_value(&post).unwrap();
+        v2["v"] = json!(2);
+        assert_eq!(
+            decode_question(&serde_json::to_vec(&v2).unwrap()),
+            Err(WireError::Version)
+        );
+        let many: Vec<String> = (0..=MAX_OPTIONS).map(|n| n.to_string()).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        for questions in [
+            vec![],
+            vec![question("Q", &["A"]); MAX_QUESTIONS + 1],
+            vec![question(" ", &["A"])],
+            vec![question("Q", &[])],
+            vec![question("Q", &many)],
+            vec![question("Q", &["A", " "])],
+        ] {
+            let bad = QuestionPost {
+                questions,
+                ..post.clone()
+            };
+            let body = serde_json::to_vec(&bad).unwrap();
+            assert_eq!(decode_question(&body), Err(WireError::Malformed));
+        }
+        let answer = serde_json::to_string(&QuestionAnswer {
+            answers: vec!["A, B".into()],
+        })
+        .unwrap();
+        assert_eq!(answer, r#"{"answers":["A, B"]}"#);
     }
 
     #[test]

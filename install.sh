@@ -611,7 +611,10 @@ EOF
     "Stop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook Stop" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStart" }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStop" }] }],
-    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "\"$c\" hook PreToolUse", "timeout": 330, "statusMessage": "Вопрос в Telegram: ответьте там или кнопкой «В терминале»" }] },
+      { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
+    ],
     "PostToolUse": [
       { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"$c\" hook PostToolUse" }] },
       { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }

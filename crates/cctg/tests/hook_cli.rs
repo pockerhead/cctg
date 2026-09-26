@@ -330,17 +330,24 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
                 assert_eq!(timeout, None, "{event}");
                 continue;
             }
-            assert_eq!(
-                matcher,
-                (event == "PostToolUse").then_some("SubagentHandback"),
-                "{event}"
-            );
+            let wanted = match event.as_str() {
+                "PostToolUse" => Some("SubagentHandback"),
+                "PreToolUse" => Some("AskUserQuestion"),
+                _ => None,
+            };
+            assert_eq!(matcher, wanted, "{event}");
             assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
             assert_eq!(commands[0].get("async"), None, "{event}");
-            // Only the waiting hook needs more than Claude Code's default time.
+            // Only the waiting hooks need more than Claude Code's default time.
+            let wait = match event.as_str() {
+                "PermissionRequest" => Some(100),
+                "PreToolUse" => Some(330),
+                _ => None,
+            };
+            assert_eq!(timeout, wait, "{event}");
             assert_eq!(
-                timeout,
-                (event == "PermissionRequest").then_some(100),
+                commands[0].get("statusMessage").is_some(),
+                event == "PreToolUse",
                 "{event}"
             );
         }
