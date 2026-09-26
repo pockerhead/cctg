@@ -9,6 +9,11 @@
 //! TLS handshake is logged at debug level only.
 //! Nothing here logs message contents, paths or the secret: log lines carry
 //! the connection number, the peer address and fixed text only.
+//!
+//! An agent that registered with `heartbeat` (TASK-049) gets a `ping` when
+//! the hub wrote nothing to it for [`Heartbeat::interval`], and is unbound
+//! like a closed connection when nothing came from it for
+//! [`Heartbeat::timeout`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -24,8 +29,9 @@ use tracing::{debug, info, warn};
 
 use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
 use crate::wire::{
-    self, AgentMsg, Behavior, EventId, HOOK_PATH, HookPost, HubMsg, MAX_HOOK_BODY, PERMISSION_PATH,
-    PING_PATH, PermissionAnswer, PermissionPost, Register, Rejection, Secret, WireError,
+    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, Liveness,
+    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, Register,
+    Rejection, Secret, WireError,
 };
 
 /// Time an agent has from its TCP connect to finish the TLS handshake (when
@@ -263,6 +269,16 @@ pub async fn serve_agents(
     secret: Secret,
     events: mpsc::Sender<AgentEvent>,
 ) {
+    serve_agents_with(listener, secret, events, Heartbeat::default()).await;
+}
+
+/// [`serve_agents`] with another [`Heartbeat`] (tests use short ones).
+pub async fn serve_agents_with(
+    listener: impl Into<Listener>,
+    secret: Secret,
+    events: mpsc::Sender<AgentEvent>,
+    heartbeat: Heartbeat,
+) {
     let Listener {
         tcp: listener,
         incoming,
@@ -311,7 +327,8 @@ pub async fn serve_agents(
                             peer_place,
                             gate,
                         };
-                        agent_session(stream, peer, conn, &secret, &events, handshake).await;
+                        agent_session(stream, peer, conn, &secret, &events, handshake, heartbeat)
+                            .await;
                     }
                     drop(permit);
                 });
@@ -368,6 +385,7 @@ async fn agent_session(
     secret: &Secret,
     events: &mpsc::Sender<AgentEvent>,
     pre_auth: Handshake,
+    heartbeat: Heartbeat,
 ) {
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
@@ -427,29 +445,37 @@ async fn agent_session(
     drop(pre_auth.peer_place);
 
     let session = short(&register.session_id).to_owned();
+    let mut liveness = Liveness::new(register.heartbeat.then_some(heartbeat));
     let (to_agent, mut outbound) = mpsc::channel(TO_AGENT_QUEUE);
     let registered = AgentEvent::Registered {
         conn,
         register,
         to_agent,
     };
-    // This hub takes files from agents (TASK-032).
-    if events.send(registered).await.is_err()
-        || write_hub_msg(&mut write, &HubMsg::Registered { files: true })
-            .await
-            .is_err()
-    {
+    // This hub takes files from agents (TASK-032) and keeps a heartbeat
+    // with those that want one (TASK-049).
+    let answer = HubMsg::Registered {
+        files: true,
+        heartbeat: true,
+    };
+    if events.send(registered).await.is_err() || write_hub_msg(&mut write, &answer).await.is_err() {
         return;
     }
+    liveness.said();
     info!(conn, session, "agent registered");
 
     let (frames_tx, mut frames) = mpsc::channel(TO_AGENT_QUEUE);
     let reader_task = ReadTask::spawn(read_agent_frames(reader, frames_tx));
     let mut outbound_open = true;
     loop {
+        let next_beat = liveness.next();
         tokio::select! {
             frame = frames.recv() => {
+                if frame.is_some() {
+                    liveness.heard();
+                }
                 match frame {
+                    Some((_, Ok(AgentMsg::Ping))) => {}
                     Some((received_at, Ok(
                         msg @ (AgentMsg::Reply { .. }
                         | AgentMsg::PermissionRequest(_)
@@ -485,8 +511,23 @@ async fn agent_session(
                     if write_hub_msg(&mut write, &msg).await.is_err() {
                         break;
                     }
+                    liveness.said();
                 }
                 None => outbound_open = false,
+            },
+            beat = wire::beat(next_beat) => match beat {
+                Beat::Ping => {
+                    if write_hub_msg(&mut write, &HubMsg::Ping).await.is_err() {
+                        break;
+                    }
+                    liveness.said();
+                }
+                // A frame read meanwhile goes first.
+                Beat::Dead if !frames.is_empty() => {}
+                Beat::Dead => {
+                    info!(conn, session, "agent silent past the heartbeat timeout; unbinding");
+                    break;
+                }
             },
         }
     }
@@ -1138,6 +1179,7 @@ mod tests {
             client: None,
             files: false,
             session_reads: false,
+            heartbeat: false,
         }
     }
 
@@ -1222,7 +1264,13 @@ mod tests {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         let Some(AgentEvent::Registered {
             conn,
             register: got,
@@ -1263,13 +1311,105 @@ mod tests {
         }
     }
 
+    /// Short heartbeat for the TASK-049 tests.
+    const BEAT: Heartbeat = Heartbeat {
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_millis(600),
+    };
+
+    /// A registered peer of a hub with [`BEAT`]; `heartbeat`: what the peer
+    /// announces.
+    async fn beating_peer(heartbeat: bool) -> (Peer, mpsc::Receiver<AgentEvent>, u64) {
+        let listener = bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut events) = mpsc::channel(16);
+        tokio::spawn(serve_agents_with(listener, secret(), tx, BEAT));
+        let mut peer = Peer::connect(addr).await;
+        peer.send(&AgentMsg::Hello { secret: secret() }).await;
+        let register = Register {
+            heartbeat,
+            ..register()
+        };
+        peer.send(&AgentMsg::Register(register)).await;
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true,
+            })
+        );
+        let Some(AgentEvent::Registered { conn, .. }) = within(events.recv()).await else {
+            panic!("expected registration");
+        };
+        (peer, events, conn)
+    }
+
+    /// TASK-049: an agent that went silent (its connection died on the way
+    /// without a close) is pinged, then unbound like a closed one.
+    #[tokio::test]
+    async fn a_silent_agent_is_pinged_then_unbound() {
+        let (mut peer, mut events, conn) = beating_peer(true).await;
+        let registered = Instant::now();
+        assert_eq!(peer.recv().await, Ok(HubMsg::Ping));
+        match within(events.recv()).await {
+            Some(AgentEvent::Disconnected { conn: gone }) => assert_eq!(gone, conn),
+            other => panic!("expected disconnect, got {other:?}"),
+        }
+        assert!(
+            registered.elapsed() >= BEAT.timeout,
+            "{:?}",
+            registered.elapsed()
+        );
+        loop {
+            match peer.recv().await {
+                Ok(HubMsg::Ping) => continue,
+                other => {
+                    assert_eq!(other, Err(WireError::Closed));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// An agent's pings keep it bound; they reach the hub's actor never.
+    #[tokio::test]
+    async fn an_agent_that_pings_stays_bound() {
+        let (mut peer, mut events, _) = beating_peer(true).await;
+        let started = Instant::now();
+        while started.elapsed() < BEAT.timeout * 3 {
+            peer.send(&AgentMsg::Ping).await;
+            tokio::time::sleep(BEAT.interval).await;
+        }
+        assert!(events.try_recv().is_err());
+        assert_eq!(peer.recv().await, Ok(HubMsg::Ping));
+    }
+
+    /// An agent before TASK-049 gets no ping and is never timed out.
+    #[tokio::test]
+    async fn an_agent_without_heartbeat_gets_no_pings_and_stays() {
+        let (mut peer, mut events, _) = beating_peer(false).await;
+        let quiet = tokio::time::timeout(
+            BEAT.timeout * 2,
+            wire::read_line(&mut peer.reader, &mut peer.line),
+        )
+        .await;
+        assert!(quiet.is_err(), "{:?}", peer.line);
+        assert!(events.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn a_split_agent_line_survives_concurrent_outbound_traffic() {
         let (addr, mut events, _hub) = agents_hub().await;
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         let Some(AgentEvent::Registered { to_agent, .. }) = within(events.recv()).await else {
             panic!("expected registration");
         };
@@ -1283,10 +1423,19 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         to_agent
-            .send(HubMsg::Registered { files: true })
+            .send(HubMsg::Registered {
+                files: true,
+                heartbeat: true,
+            })
             .await
             .unwrap();
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         peer.raw(second).await;
 
         match within(events.recv()).await {
@@ -1301,7 +1450,13 @@ mod tests {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         let _ = within(events.recv()).await;
 
         // No newline ever: the hub must stop reading at the limit and close.
@@ -1342,7 +1497,13 @@ mod tests {
         let mut peer = Peer::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, local.port()))).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         assert!(matches!(
             rx.recv().await,
             Some(AgentEvent::Registered { .. })
@@ -1957,7 +2118,13 @@ mod tests {
         let mut peer = Peer::connect(addr).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         assert!(matches!(
             within(events.recv()).await,
             Some(AgentEvent::Registered { .. })
@@ -2193,7 +2360,13 @@ mod tests {
         let mut peer = Peer::connect(plain_agents).await;
         peer.send(&AgentMsg::Hello { secret: secret() }).await;
         peer.send(&AgentMsg::Register(register())).await;
-        assert_eq!(peer.recv().await, Ok(HubMsg::Registered { files: true }));
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: true
+            })
+        );
         assert!(matches!(
             within(agent_events.recv()).await,
             Some(AgentEvent::Registered { .. })

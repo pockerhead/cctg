@@ -19,7 +19,8 @@
 //! [`Client::self_update`]; `file_start` and the hub's `file_chunk`, see
 //! [`Register::files`]; `file_offer` and the agent's `file_chunk`, see
 //! [`HubMsg::Registered`]; `session_read` and `session_answer`, see
-//! [`Register::session_reads`]). Any other
+//! [`Register::session_reads`]; `ping` either way, see
+//! [`Register::heartbeat`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -28,13 +29,14 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 pub const VERSION: u32 = 1;
 /// Longest accepted agent-link line, newline included.
@@ -167,6 +169,12 @@ pub struct Register {
     /// subagent blocks from the hooks alone.
     #[serde(default)]
     pub session_reads: bool,
+    /// The agent sends `ping` when it wrote nothing for a while and drops
+    /// a link that brought nothing for longer ([`Heartbeat`], TASK-049);
+    /// the hub does the same once both announced it. Agents built before
+    /// leave it out and get no pings.
+    #[serde(default)]
+    pub heartbeat: bool,
 }
 
 /// The agent's build and update abilities.
@@ -274,6 +282,9 @@ pub enum AgentMsg {
         read_id: u64,
         answer: SessionAnswer,
     },
+    /// Only that the link lives ([`Heartbeat`]); sent only to a hub whose
+    /// `registered` said `heartbeat`. Never answered.
+    Ping,
 }
 
 /// What the hub asks the agent to read of its session (TASK-034).
@@ -546,6 +557,7 @@ impl Kinds for AgentMsg {
         "file_offer",
         "file_chunk",
         "session_answer",
+        "ping",
     ];
 }
 
@@ -573,6 +585,12 @@ pub enum HubMsg {
     Registered {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         files: bool,
+        /// The hub keeps the [`Heartbeat`] with an agent that announced
+        /// [`Register::heartbeat`] (TASK-049). Hubs built before leave it
+        /// out: the agent then sends no pings and waits for the hub as long
+        /// as the connection stays open.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        heartbeat: bool,
     },
     Rejected {
         reason: Rejection,
@@ -666,6 +684,9 @@ pub enum HubMsg {
         session_id: String,
         ask: SessionAsk,
     },
+    /// Only that the link lives ([`Heartbeat`]); sent only to an agent that
+    /// registered with `heartbeat`. Never answered.
+    Ping,
 }
 
 impl Kinds for HubMsg {
@@ -683,7 +704,93 @@ impl Kinds for HubMsg {
         "file_chunk",
         "file_answer",
         "session_read",
+        "ping",
     ];
+}
+
+/// Idle ping and dead-peer timeout of the agent link (TASK-049). A half-open
+/// connection (a NAT or tunnel on the way forgot it) never reports an
+/// error: only the silence of the peer shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heartbeat {
+    /// A side that wrote nothing for this long sends `ping`.
+    pub interval: Duration,
+    /// A side that read nothing for this long drops the link.
+    pub timeout: Duration,
+}
+
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self {
+            interval: HEARTBEAT_INTERVAL,
+            timeout: HEARTBEAT_TIMEOUT,
+        }
+    }
+}
+
+/// What a link's [`Liveness`] asks for next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Beat {
+    /// Nothing written for the interval: send `ping`.
+    Ping,
+    /// Nothing read for the timeout: the peer is gone.
+    Dead,
+}
+
+/// When one end of a link last read and wrote; off without a heartbeat.
+#[derive(Debug, Clone, Copy)]
+pub struct Liveness {
+    heartbeat: Option<Heartbeat>,
+    heard: Instant,
+    said: Instant,
+}
+
+impl Liveness {
+    pub fn new(heartbeat: Option<Heartbeat>) -> Self {
+        let now = Instant::now();
+        Self {
+            heartbeat,
+            heard: now,
+            said: now,
+        }
+    }
+
+    /// A line came from the peer.
+    pub fn heard(&mut self) {
+        self.heard = Instant::now();
+    }
+
+    /// A line went to the peer.
+    pub fn said(&mut self) {
+        self.said = Instant::now();
+    }
+
+    /// The next beat and when it is due; `None` without a heartbeat.
+    pub fn next(&self) -> Option<(Instant, Beat)> {
+        let heartbeat = self.heartbeat?;
+        let dead = self.heard + heartbeat.timeout;
+        let ping = self.said + heartbeat.interval;
+        Some(if dead <= ping {
+            (dead, Beat::Dead)
+        } else {
+            (ping, Beat::Ping)
+        })
+    }
+}
+
+/// Waits for `next` ([`Liveness::next`]); never ends for `None`. Takes the
+/// value, not the [`Liveness`], so a `select!` branch borrows nothing.
+pub async fn beat(next: Option<(Instant, Beat)>) -> Beat {
+    match next {
+        Some((at, beat)) => {
+            tokio::time::sleep_until(at).await;
+            beat
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// One agent-link line: the message plus `"v"`, newline-terminated.
@@ -1055,6 +1162,7 @@ mod tests {
                 client: None,
                 files: true,
                 session_reads: true,
+                heartbeat: true,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -1169,13 +1277,21 @@ mod tests {
                 read_id: 9,
                 answer: SessionAnswer::Refused,
             },
+            AgentMsg::Ping,
         ]
     }
 
     fn hub_samples() -> Vec<HubMsg> {
         vec![
-            HubMsg::Registered { files: false },
-            HubMsg::Registered { files: true },
+            HubMsg::Registered {
+                files: false,
+                heartbeat: false,
+            },
+            HubMsg::Registered {
+                files: true,
+                heartbeat: true,
+            },
+            HubMsg::Ping,
             HubMsg::Rejected {
                 reason: Rejection::Auth,
             },
@@ -1412,6 +1528,7 @@ mod tests {
                 client: None,
                 files: false,
                 session_reads: false,
+                heartbeat: false,
             }))
         );
     }
@@ -1542,12 +1659,77 @@ mod tests {
         ));
     }
 
+    /// TASK-049: the heartbeat is announced both ways; a peer before it sees
+    /// the lines it saw before and never gets a `ping`.
+    #[test]
+    fn heartbeats_stay_compatible_with_version_one_peers() {
+        assert_eq!(
+            encode(&HubMsg::Ping),
+            b"{\"v\":1,\"type\":\"ping\"}
+"
+        );
+        assert_eq!(
+            encode(&AgentMsg::Ping),
+            b"{\"v\":1,\"type\":\"ping\"}
+"
+        );
+        // A hub before it: no heartbeat.
+        assert_eq!(
+            decode::<HubMsg>(br#"{"v":1,"type":"registered","files":true}"#),
+            Ok(HubMsg::Registered {
+                files: true,
+                heartbeat: false,
+            })
+        );
+        // An agent before it: no heartbeat.
+        let old = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
+        match decode::<AgentMsg>(old) {
+            Ok(AgentMsg::Register(register)) => assert!(!register.heartbeat),
+            other => panic!("{other:?}"),
+        }
+        let line =
+            br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w","heartbeat":true}"#;
+        assert!(matches!(
+            decode::<AgentMsg>(line),
+            Ok(AgentMsg::Register(Register {
+                heartbeat: true,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_pings_when_quiet_and_dies_when_deaf() {
+        assert_eq!(Liveness::new(None).next(), None);
+        let heartbeat = Heartbeat {
+            interval: Duration::from_secs(3),
+            timeout: Duration::from_secs(9),
+        };
+        let start = Instant::now();
+        let mut live = Liveness::new(Some(heartbeat));
+        assert_eq!(live.next(), Some((start + heartbeat.interval, Beat::Ping)));
+        tokio::time::advance(Duration::from_secs(8)).await;
+        live.said();
+        // One second to the timeout, three to the next ping.
+        assert_eq!(live.next(), Some((start + heartbeat.timeout, Beat::Dead)));
+        live.heard();
+        assert_eq!(
+            live.next(),
+            Some((start + Duration::from_secs(11), Beat::Ping))
+        );
+        assert_eq!(beat(live.next()).await, Beat::Ping);
+        assert_eq!(Instant::now(), start + Duration::from_secs(11));
+    }
+
     #[test]
     fn unknown_fields_are_ignored() {
         let line = br#"{"v":1,"type":"registered","extra":{"a":1}}"#;
         assert_eq!(
             decode::<HubMsg>(line),
-            Ok(HubMsg::Registered { files: false })
+            Ok(HubMsg::Registered {
+                files: false,
+                heartbeat: false,
+            })
         );
         let line = br#"{"v":1,"type":"reply","text":"t","later":true}"#;
         assert_eq!(
@@ -1575,6 +1757,7 @@ mod tests {
             console_commands: false,
             files: false,
             session_reads: false,
+            heartbeat: false,
             client: Some(Client {
                 version: "0.1.0".into(),
                 build: "ab".repeat(32),
@@ -1628,14 +1811,23 @@ mod tests {
         let legacy = br#"{"v":1,"type":"registered"}"#;
         assert_eq!(
             decode::<HubMsg>(legacy),
-            Ok(HubMsg::Registered { files: false })
+            Ok(HubMsg::Registered {
+                files: false,
+                heartbeat: false,
+            })
         );
         assert_eq!(
-            encode(&HubMsg::Registered { files: false }),
+            encode(&HubMsg::Registered {
+                files: false,
+                heartbeat: false,
+            }),
             [&legacy[..], b"\n"].concat()
         );
-        let newer: Value =
-            serde_json::from_slice(&encode(&HubMsg::Registered { files: true })).unwrap();
+        let newer: Value = serde_json::from_slice(&encode(&HubMsg::Registered {
+            files: true,
+            heartbeat: false,
+        }))
+        .unwrap();
         assert_eq!((&newer["v"], &newer["files"]), (&json!(1), &json!(true)));
         // An agent before TASK-032 never announces files.
         let old = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;

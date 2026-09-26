@@ -11,6 +11,10 @@
 //! backoff and register again. Only the agent reconnects; the hub just
 //! accepts. Messages queued while the link is down wait in the outbox and go
 //! out after the next registration. A message whose write failed is lost.
+//! With a hub that keeps the heartbeat (TASK-049) the agent sends `ping`
+//! when it wrote nothing for a while and reconnects when nothing came from
+//! the hub for longer: a connection that a NAT dropped on the way never
+//! reports an error by itself.
 //!
 //! A permission verdict with a `verdict_id` is acknowledged once it is queued
 //! for the channel loop. The hub sends the same verdict again until the ack
@@ -75,8 +79,8 @@ use crate::tail;
 use crate::tls::{HubAddr, ReadTask, Stream};
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
-    self, AgentMsg, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome, HubMsg,
-    Register, Rejection, Secret, SessionAsk, UpdateOutcome, WireError,
+    self, AgentMsg, Beat, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome,
+    Heartbeat, HubMsg, Liveness, Register, Rejection, Secret, SessionAsk, UpdateOutcome, WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -124,6 +128,8 @@ pub struct LinkConfig {
     /// Where the session's undelivered hook events are kept, and the hub
     /// hook endpoint to send them to after each registration.
     pub replay: Option<Replay>,
+    /// Used when `register.heartbeat` is set and the hub keeps one too.
+    pub heartbeat: Heartbeat,
 }
 
 #[derive(Debug, Clone)]
@@ -213,7 +219,12 @@ async fn run(
             return;
         }
         match connect(&config).await {
-            Ok((reader, write, files)) => {
+            Ok(Linked {
+                reader,
+                write,
+                files,
+                heartbeat,
+            }) => {
                 attempt = 0;
                 last_error.clear();
                 info!("registered with the hub");
@@ -221,7 +232,14 @@ async fn run(
                 if events.send(LinkEvent::Up { files }).await.is_err() {
                     return;
                 }
-                let stopped = serve(reader, write, &mut outbox, &events, &mut verdicts).await;
+                let heartbeat =
+                    (config.register.heartbeat && heartbeat).then_some(config.heartbeat);
+                let link = Link {
+                    reader,
+                    write,
+                    heartbeat,
+                };
+                let stopped = serve(link, &mut outbox, &events, &mut verdicts).await;
                 if stopped || events.send(LinkEvent::Down).await.is_err() {
                     return;
                 }
@@ -255,7 +273,15 @@ async fn write_agent_msg(write: &mut LinkWrite, msg: &AgentMsg) -> Result<(), Wi
         .unwrap_or(Err(WireError::Io(std::io::ErrorKind::TimedOut)))
 }
 
-async fn connect(config: &LinkConfig) -> Result<(LinkRead, LinkWrite, bool), ConnectError> {
+/// A registered connection and what the hub said it does.
+struct Linked {
+    reader: LinkRead,
+    write: LinkWrite,
+    files: bool,
+    heartbeat: bool,
+}
+
+async fn connect(config: &LinkConfig) -> Result<Linked, ConnectError> {
     let handshake = async {
         let stream = config
             .addr
@@ -272,7 +298,12 @@ async fn connect(config: &LinkConfig) -> Result<(LinkRead, LinkWrite, bool), Con
         let mut line = Vec::new();
         wire::read_line(&mut reader, &mut line).await?;
         match wire::decode::<HubMsg>(&line)? {
-            HubMsg::Registered { files } => Ok((reader, write, files)),
+            HubMsg::Registered { files, heartbeat } => Ok(Linked {
+                reader,
+                write,
+                files,
+                heartbeat,
+            }),
             HubMsg::Rejected { reason } => Err(ConnectError::Rejected(reason)),
             _ => Err(ConnectError::Wire(WireError::Malformed)),
         }
@@ -282,22 +313,40 @@ async fn connect(config: &LinkConfig) -> Result<(LinkRead, LinkWrite, bool), Con
         .unwrap_or(Err(ConnectError::Timeout))
 }
 
+/// One registered connection; `heartbeat` when both ends keep one.
+struct Link {
+    reader: LinkRead,
+    write: LinkWrite,
+    heartbeat: Option<Heartbeat>,
+}
+
 /// Runs one registered link. Returns `true` when the owner is gone (stop),
 /// `false` when the link dropped (reconnect). `verdicts`: ids of verdicts
-/// already passed on, newest last.
+/// already passed on, newest last. The hub's pings end here and never
+/// reach the owner, so a busy owner does not hold them up.
 async fn serve(
-    reader: LinkRead,
-    mut write: LinkWrite,
+    link: Link,
     outbox: &mut mpsc::Receiver<AgentMsg>,
     events: &mpsc::Sender<LinkEvent>,
     verdicts: &mut VecDeque<u64>,
 ) -> bool {
+    let Link {
+        reader,
+        mut write,
+        heartbeat,
+    } = link;
+    let mut liveness = Liveness::new(heartbeat);
     let (frames_tx, mut frames) = mpsc::channel(QUEUE);
     let reader_task = ReadTask::spawn(read_hub_frames(reader, frames_tx));
     let stopped = loop {
+        let next_beat = liveness.next();
         tokio::select! {
             frame = frames.recv() => {
+                if frame.is_some() {
+                    liveness.heard();
+                }
                 match frame {
+                    Some(Ok(HubMsg::Ping)) => {}
                     Some(Ok(msg)) => {
                         let ack = match &msg {
                             HubMsg::PermissionVerdict { verdict_id, .. } => *verdict_id,
@@ -321,6 +370,7 @@ async fn serve(
                             debug!(%error, "write to hub failed");
                             break false;
                         }
+                        liveness.said();
                     }
                     Some(Err(WireError::Version)) => {
                         warn!("hub changed protocol version; reconnecting");
@@ -340,8 +390,24 @@ async fn serve(
                         debug!(%error, "write to hub failed");
                         break false;
                     }
+                    liveness.said();
                 }
                 None => break true,
+            },
+            beat = wire::beat(next_beat) => match beat {
+                Beat::Ping => {
+                    if let Err(error) = write_agent_msg(&mut write, &AgentMsg::Ping).await {
+                        debug!(%error, "write to hub failed");
+                        break false;
+                    }
+                    liveness.said();
+                }
+                // A frame read meanwhile goes first.
+                Beat::Dead if !frames.is_empty() => {}
+                Beat::Dead => {
+                    info!("hub silent past the heartbeat timeout; reconnecting");
+                    break false;
+                }
             },
         }
     };
@@ -482,6 +548,7 @@ pub async fn run_stdio() -> i32 {
                 client,
                 files: true,
                 session_reads: true,
+                heartbeat: true,
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: plan.agent,
@@ -492,6 +559,7 @@ pub async fn run_stdio() -> i32 {
                     spool: spool::dir(state),
                     hook_addr: plan.hook,
                 }),
+                heartbeat: Heartbeat::default(),
             });
             (Hub::Link(outbox), Some(events))
         }
@@ -1525,6 +1593,7 @@ mod tests {
             client: None,
             files: true,
             session_reads: false,
+            heartbeat: false,
         }
     }
 
@@ -1535,6 +1604,7 @@ mod tests {
             register: register(),
             backoff,
             replay: None,
+            heartbeat: Heartbeat::default(),
         }
     }
 
@@ -1613,12 +1683,18 @@ mod tests {
         let (got, to_agent) = registered(&mut hub_rx).await;
         assert_eq!(got, register());
         to_agent
-            .send(HubMsg::Registered { files: true })
+            .send(HubMsg::Registered {
+                files: true,
+                heartbeat: false,
+            })
             .await
             .unwrap();
         assert_eq!(
             next(&mut events).await,
-            LinkEvent::Message(HubMsg::Registered { files: true })
+            LinkEvent::Message(HubMsg::Registered {
+                files: true,
+                heartbeat: false
+            })
         );
 
         // Hub goes away: its listener and every connection close.
@@ -1773,9 +1849,15 @@ mod tests {
         line.clear();
         wire::read_line(&mut reader, &mut line).await.unwrap();
         line.clear();
-        wire::write_msg(&mut write, &HubMsg::Registered { files: false })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut write,
+            &HubMsg::Registered {
+                files: false,
+                heartbeat: false,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
 
         let inbound = HubMsg::Inbound {
@@ -1825,6 +1907,158 @@ mod tests {
                 .is_err(),
             "the closed outbox must prevent another connection attempt"
         );
+    }
+
+    /// Short heartbeat for the TASK-049 tests: pings every 100 ms, a link
+    /// silent for 600 ms is dead.
+    const BEAT: Heartbeat = Heartbeat {
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_millis(600),
+    };
+
+    fn beating(addr: SocketAddr) -> LinkConfig {
+        let backoff = Backoff {
+            initial: Duration::from_millis(20),
+            max: Duration::from_millis(40),
+        };
+        let mut link = config(addr, backoff);
+        link.register.heartbeat = true;
+        link.heartbeat = BEAT;
+        link
+    }
+
+    /// A hub stand-in: takes `hello` and `register`, answers `registered`
+    /// with `heartbeat` as given, and returns the open connection.
+    async fn fake_hub(
+        listener: &TcpListener,
+        heartbeat: bool,
+    ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+        let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("agent connected")
+            .unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = Vec::new();
+        for _ in 0..2 {
+            wire::read_line(&mut reader, &mut line).await.unwrap();
+            line.clear();
+        }
+        let registered = HubMsg::Registered {
+            files: false,
+            heartbeat,
+        };
+        wire::write_msg(&mut write, &registered).await.unwrap();
+        (reader, write)
+    }
+
+    /// TASK-049: a hub that stops answering but never closes (a NAT on the
+    /// way forgot the connection) is left after the timeout, and the agent
+    /// connects again.
+    #[tokio::test]
+    async fn a_frozen_hub_is_left_after_the_heartbeat_timeout() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let (_outbox, mut events) = spawn(beating(listener.local_addr().unwrap()));
+        let (mut reader, _write) = fake_hub(&listener, true).await;
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+        let up = tokio::time::Instant::now();
+        // The agent pings the quiet hub.
+        let mut line = Vec::new();
+        tokio::time::timeout(WAIT, wire::read_line(&mut reader, &mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wire::decode::<AgentMsg>(&line), Ok(AgentMsg::Ping));
+        // The hub never writes: the link is given up once the timeout passed.
+        assert_eq!(next(&mut events).await, LinkEvent::Down);
+        assert!(up.elapsed() >= BEAT.timeout, "{:?}", up.elapsed());
+        let (_reader, _write) = fake_hub(&listener, true).await;
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+    }
+
+    /// A hub before TASK-049 gets no ping and is waited for as long as the
+    /// connection stays open; so is any hub when the agent announced none.
+    #[tokio::test]
+    async fn without_a_heartbeat_on_both_ends_nothing_is_sent_or_timed() {
+        for (agent, hub) in [(true, false), (false, true)] {
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+            let mut link = beating(listener.local_addr().unwrap());
+            link.register.heartbeat = agent;
+            let (_outbox, mut events) = spawn(link);
+            let (mut reader, _write) = fake_hub(&listener, hub).await;
+            assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+            let mut line = Vec::new();
+            let quiet = BEAT.timeout * 2;
+            let read = tokio::time::timeout(quiet, wire::read_line(&mut reader, &mut line)).await;
+            assert!(read.is_err(), "agent {agent}, hub {hub}: {line:?}");
+            assert!(events.try_recv().is_err(), "agent {agent}, hub {hub}");
+        }
+    }
+
+    /// Pings keep a quiet link up while the owner reads nothing (a worker
+    /// that hands over or waits for claude to exit, TASK-040), and one-way
+    /// traffic either way (file chunks, TASK-032) does not trip the side
+    /// that only reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_heartbeat_holds_a_quiet_or_one_way_link() {
+        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hub_tx, mut hub_rx) = mpsc::channel(16);
+        let _hub = tokio::spawn(ingress::serve_agents_with(
+            listener,
+            Secret::parse(SECRET).unwrap(),
+            hub_tx,
+            BEAT,
+        ));
+        let (outbox, mut events) = spawn(beating(addr));
+        let (_, to_agent) = registered(&mut hub_rx).await;
+        assert_eq!(next(&mut events).await, LinkEvent::Up { files: true });
+
+        // Quiet, and nobody reads the link events.
+        let quiet = tokio::time::timeout(BEAT.timeout * 3, hub_rx.recv()).await;
+        assert!(quiet.is_err(), "{quiet:?}");
+        assert!(events.try_recv().is_err());
+
+        // The agent writes, the hub only reads.
+        let span = BEAT.timeout * 2;
+        let started = tokio::time::Instant::now();
+        let mut replies = 0;
+        while started.elapsed() < span {
+            let reply = AgentMsg::Reply {
+                text: "chunk".into(),
+            };
+            outbox.send(reply).await.unwrap();
+            match within(hub_rx.recv()).await {
+                Some(AgentEvent::Message { .. }) => replies += 1,
+                other => panic!("expected the reply, got {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(replies > 10, "{replies}");
+
+        // The hub writes, the agent only reads.
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < span {
+            let inbound = HubMsg::Inbound {
+                content: "chunk".into(),
+                meta: Default::default(),
+            };
+            to_agent.send(inbound.clone()).await.unwrap();
+            assert_eq!(next(&mut events).await, LinkEvent::Message(inbound));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(hub_rx.try_recv().is_err(), "the hub kept the agent");
+        assert!(events.try_recv().is_err(), "the agent kept the hub");
+    }
+
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(WAIT, future).await.expect("in time")
     }
 
     fn device(secret: Option<&str>) -> DeviceConfig {
@@ -2555,9 +2789,15 @@ mod tests {
             wire::read_line(&mut reader, &mut line).await.unwrap();
             line.clear();
         }
-        wire::write_msg(&mut write, &HubMsg::Registered { files })
-            .await
-            .unwrap();
+        wire::write_msg(
+            &mut write,
+            &HubMsg::Registered {
+                files,
+                heartbeat: false,
+            },
+        )
+        .await
+        .unwrap();
         (reader, write)
     }
 

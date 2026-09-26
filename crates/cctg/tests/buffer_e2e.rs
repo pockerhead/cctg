@@ -184,6 +184,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         client: None,
         files: false,
         session_reads: false,
+        heartbeat: false,
     };
     write
         .write_all(&wire::encode(&AgentMsg::Register(register)))
@@ -199,7 +200,13 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
             .expect("read");
         got.push(wire::decode::<HubMsg>(&line).expect("hub message"));
     }
-    assert_eq!(got[0], HubMsg::Registered { files: true });
+    assert_eq!(
+        got[0],
+        HubMsg::Registered {
+            files: true,
+            heartbeat: true
+        }
+    );
     let kept: Vec<(String, String)> = got[1..]
         .iter()
         .map(|msg| match msg {
