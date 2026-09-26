@@ -8,7 +8,10 @@
 //! typed while the screen shows Claude Code's agent view or a running
 //! background agent ([`agents_block`]), and a `/exit` that opens Claude
 //! Code's "Background work is running" dialog is cancelled with Esc
-//! ([`exit_dialog`]).
+//! ([`exit_dialog`]). Since TASK-057 faint text in the input box (Claude
+//! Code's prompt suggestion, placeholder, inline completion) is not taken
+//! for a draft where the screen read tells it ([`typed_box`]), and a typed
+//! line wrapped over several rows of the box is joined back ([`box_shows`]).
 //!
 //! Channels have no command for it, so on Windows the agent (a child of
 //! that claude) attaches to its console and writes the key events into the
@@ -236,6 +239,23 @@ fn panel_edge(line: &str) -> bool {
 /// of `screen`, blank ones left out: Claude Code's input box. `None`
 /// without two rules.
 pub fn input_box(screen: &[String]) -> Option<Vec<String>> {
+    box_rows(screen).map(|rows| non_blank(&screen[rows]))
+}
+
+/// [`input_box`] of what was typed: faint text (placeholder, prompt
+/// suggestion, inline completion) left out where the screen read can tell
+/// ([`crate::term::Rows`]), as if the box showed only its [`input_box`]
+/// otherwise.
+pub fn typed_box(rows: &crate::term::Rows) -> Option<Vec<String>> {
+    let found = box_rows(&rows.lines)?;
+    match &rows.solid {
+        Some(solid) if solid.len() == rows.lines.len() => Some(non_blank(&solid[found])),
+        _ => Some(non_blank(&rows.lines[found])),
+    }
+}
+
+/// The row indexes strictly between the last two rule lines of `screen`.
+fn box_rows(screen: &[String]) -> Option<std::ops::Range<usize>> {
     let rules: Vec<usize> = screen
         .iter()
         .enumerate()
@@ -248,32 +268,59 @@ pub fn input_box(screen: &[String]) -> Option<Vec<String>> {
     let [.., top, bottom] = rules[..] else {
         return None;
     };
-    Some(
-        screen[top + 1..bottom]
-            .iter()
-            .filter(|line| !line.trim().is_empty())
-            .cloned()
-            .collect(),
-    )
+    Some(top + 1..bottom)
+}
+
+fn non_blank(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .cloned()
+        .collect()
 }
 
 /// The box shows exactly the typed `text` and nothing else. Claude Code
 /// puts a no-break space after the prompt glyph (probe TASK-040 P2), which
 /// `str::trim` removes like any Unicode space. A `!` typed into an empty box
 /// switches Claude Code to bash mode, which may show the `!` in place of the
-/// glyph: for a text that starts with `!` that form counts too.
+/// glyph: for a text that starts with `!` that form counts too. A text too
+/// long for one row goes on in the next rows of the box, indented, broken
+/// after a word (the space dropped) or, without one, inside it (probe
+/// TASK-057): the rows are joined back.
 pub fn box_shows(lines: &[String], text: &str) -> bool {
-    let [line] = lines else {
+    let Some((line, rest)) = lines.split_first() else {
         return false;
     };
     let text = text.trim();
-    if line.strip_prefix(PROMPTS).map(str::trim) == Some(text) {
+    let joined = |first: &str, text: &str| {
+        let pieces = std::iter::once(first.trim()).chain(rest.iter().map(|line| line.trim()));
+        !first.trim().is_empty() && joins(pieces, text)
+    };
+    if line
+        .strip_prefix(PROMPTS)
+        .is_some_and(|shown| joined(shown, text))
+    {
         return true;
     }
     match (text.strip_prefix('!'), line.strip_prefix('!')) {
-        (Some(command), Some(shown)) => shown.trim() == command.trim(),
+        (Some(command), Some(shown)) => joined(shown, command.trim()),
         _ => false,
     }
+}
+
+/// `text` is `pieces` one after another, with any whitespace between two.
+fn joins<'a>(pieces: impl Iterator<Item = &'a str>, text: &str) -> bool {
+    let mut rest = text;
+    for (index, piece) in pieces.enumerate() {
+        if index > 0 {
+            rest = rest.trim_start();
+        }
+        let Some(after) = rest.strip_prefix(piece) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
 }
 
 /// The text of the panel on `screen`: what `/cost` or `/usage` open in
@@ -350,8 +397,12 @@ pub fn agents_on_screen(target: &Target) -> bool {
 
 /// A claude terminal as typing needs it.
 trait Terminal {
+    /// The visible rows, right trimmed, with their faint text where known.
+    fn rows(&mut self) -> Option<crate::term::Rows>;
     /// The visible rows, right trimmed.
-    fn lines(&mut self) -> Option<Vec<String>>;
+    fn lines(&mut self) -> Option<Vec<String>> {
+        self.rows().map(|rows| rows.lines)
+    }
     /// Writes `text` as key presses: `\r` is Enter, `\u{8}` Backspace,
     /// `\u{1b}` Esc.
     fn write(&mut self, text: &str) -> bool;
@@ -387,8 +438,8 @@ fn watch(
     } else if terminal.write(text) {
         std::thread::sleep(waits.echo);
         let shown = terminal
-            .lines()
-            .and_then(|screen| input_box(&screen))
+            .rows()
+            .and_then(|rows| typed_box(&rows))
             .map(|lines| box_shows(&lines, text));
         if shown == Some(true) && terminal.write("\r") {
             Typed::Sent
@@ -460,8 +511,8 @@ fn cancel_exit_dialog(terminal: &mut dyn Terminal, waits: Waits) -> Typed {
 struct Run(PathBuf);
 
 impl Terminal for Run {
-    fn lines(&mut self) -> Option<Vec<String>> {
-        crate::term::screen(&self.0)
+    fn rows(&mut self) -> Option<crate::term::Rows> {
+        crate::term::rows(&self.0)
     }
 
     /// A terminal sends DEL for Backspace. A text goes in as its first
@@ -528,8 +579,11 @@ impl Drop for Attached {
 
 #[cfg(windows)]
 impl Terminal for Attached {
-    fn lines(&mut self) -> Option<Vec<String>> {
-        visible_lines()
+    /// No faint text: the console's attribute words do not carry it (probe
+    /// TASK-057: Claude Code's faint placeholder reads as 0x0007, like typed
+    /// text).
+    fn rows(&mut self) -> Option<crate::term::Rows> {
+        visible_lines().map(|lines| crate::term::Rows { lines, solid: None })
     }
 
     fn write(&mut self, text: &str) -> bool {
@@ -932,10 +986,15 @@ mod tests {
     /// (Backspace erases, the typed text first), Enter submits; `/cost`
     /// opens a panel, `/exit` opens the background-work dialog while `busy`,
     /// Esc closes either (unless `stuck`). `view`: the agent view is open.
+    /// `ghost`: faint text Claude Code shows after the input (a prompt
+    /// suggestion in an empty box, an inline completion after typed text),
+    /// told apart only when `faint` (a Unix screen, not a Windows console).
     #[derive(Default)]
     struct Fake {
         draft: String,
         input: String,
+        ghost: String,
+        faint: bool,
         panel: bool,
         dialog: bool,
         busy: bool,
@@ -945,8 +1004,9 @@ mod tests {
         escapes: usize,
     }
 
-    impl Terminal for Fake {
-        fn lines(&mut self) -> Option<Vec<String>> {
+    impl Fake {
+        /// The screen, with the ghost when `ghost` is set.
+        fn screen(&self, ghost: bool) -> Vec<String> {
             let mut lines = vec!["\u{25cf} earlier answer".to_owned()];
             if self.panel {
                 lines.push("\u{2594}".repeat(40));
@@ -961,11 +1021,21 @@ mod tests {
                 } else {
                     shown
                 };
+                let ghost = if ghost { self.ghost.as_str() } else { "" };
                 lines.push(RULE.to_owned());
-                lines.push(format!("\u{276f}\u{a0}{shown}"));
+                lines.push(format!("\u{276f}\u{a0}{shown}{ghost}"));
                 lines.push(RULE.to_owned());
             }
-            Some(lines)
+            lines
+        }
+    }
+
+    impl Terminal for Fake {
+        fn rows(&mut self) -> Option<crate::term::Rows> {
+            Some(crate::term::Rows {
+                lines: self.screen(true),
+                solid: self.faint.then(|| self.screen(false)),
+            })
         }
 
         fn write(&mut self, text: &str) -> bool {
@@ -1037,6 +1107,101 @@ mod tests {
             (Typed::Agents, None)
         );
         assert!(claude.sent.is_empty() && claude.input.is_empty());
+    }
+
+    #[test]
+    fn faint_text_in_the_box_is_not_a_draft() {
+        // The live case of TASK-057 (Linux, 2026-09-26): a prompt suggestion
+        // in the empty box, or a completion after the typed text.
+        let mut claude = Fake {
+            ghost: "\u{0414}\u{0430}, \u{0434}\u{0430}\u{0432}\u{0430}\u{0439} T2I".into(),
+            faint: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "!curl -s localhost", After::Nothing, QUICK),
+            (Typed::Sent, None)
+        );
+        assert_eq!(claude.sent, ["!curl -s localhost"]);
+        // A draft of the user's still blocks, ghost or not.
+        let mut claude = Fake {
+            draft: "fix the".into(),
+            ghost: " tests".into(),
+            faint: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
+            (Typed::Draft, None)
+        );
+        assert!(claude.sent.is_empty() && claude.input.is_empty());
+        // A screen read that cannot tell faint text (a Windows console, a
+        // `cctg run` older than the `rows` ask) keeps refusing, as before.
+        let mut claude = Fake {
+            ghost: " -la".into(),
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "!ls", After::Nothing, QUICK),
+            (Typed::Draft, None)
+        );
+        assert!(claude.sent.is_empty() && claude.input.is_empty());
+    }
+
+    #[test]
+    fn the_typed_box_leaves_out_faint_text_only_where_known() {
+        let rows = |solid: Option<&[&str]>| crate::term::Rows {
+            lines: screen(&[RULE, "\u{276f}\u{a0}!ls -la", "  more", RULE]),
+            solid: solid.map(screen),
+        };
+        assert_eq!(
+            typed_box(&rows(Some(&[RULE, "\u{276f}\u{a0}!ls", "", RULE]))),
+            Some(screen(&["\u{276f}\u{a0}!ls"]))
+        );
+        let whole = Some(screen(&["\u{276f}\u{a0}!ls -la", "  more"]));
+        assert_eq!(typed_box(&rows(None)), whole);
+        // Solid rows that do not match the screen are not used.
+        assert_eq!(typed_box(&rows(Some(&["\u{276f}\u{a0}!ls"]))), whole);
+        assert_eq!(
+            typed_box(&crate::term::Rows {
+                lines: screen(&["\u{276f} x"]),
+                solid: None
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_line_wrapped_in_the_box_is_joined_back() {
+        // Probe TASK-057 (2.1.283, 120 columns): a bash command broken after
+        // a word, a line without spaces broken inside it.
+        let words = (0..25)
+            .map(|i| format!("word{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (head, tail) = words.split_at(words.find(" word16").unwrap());
+        let command = format!("!echo {words}");
+        let shown = [format!("!\u{a0}echo {head}"), format!(" {tail}")];
+        assert!(box_shows(&shown, &command));
+        let glyph = [format!("\u{276f}\u{a0}echo {head}"), format!(" {tail}")];
+        assert!(box_shows(&glyph, &format!("echo {words}")));
+        let xs = "x".repeat(150);
+        let hard = [
+            format!("\u{276f}\u{a0}{}", &xs[..118]),
+            format!("  {}", &xs[118..]),
+        ];
+        assert!(box_shows(&hard, &xs));
+        // Anything more or less than the typed text still counts as a draft:
+        // a draft line after or before it, a missing piece, a glyph alone.
+        for (lines, text) in [
+            (&["\u{276f}\u{a0}/exit", "  draft"][..], "/exit"),
+            (&["\u{276f}\u{a0}draft", "  /exit"], "/exit"),
+            (&["\u{276f}", "  /exit"], "/exit"),
+            (&["\u{276f}\u{a0}!echo a", "  b"], "!echo a b c"),
+            (&["\u{276f}\u{a0}!echo a", "  bc"], "!echo a b"),
+        ] {
+            assert!(!box_shows(&screen(lines), text), "{lines:?} {text}");
+        }
     }
 
     #[test]
