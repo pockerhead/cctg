@@ -267,6 +267,9 @@ pub const QUESTION_WAIT: Duration = Duration::from_secs(300);
 const QUESTION_HOOK_WINDOW: Duration = Duration::from_secs(340);
 /// Channel requests remembered for a hook that comes after them.
 const MAX_RELAYED: usize = 64;
+/// Topic messages held while a question's message id is not known yet
+/// (see [`Slots::hold`]); beyond this they go on at once.
+const MAX_HELD: usize = 64;
 /// Bytes of files from sessions held at a time, being received or waiting
 /// for Telegram (one file of Telegram's largest size); an offer beyond gets
 /// `busy`.
@@ -913,6 +916,8 @@ pub struct Slots {
     question_asks: Option<mpsc::Receiver<QuestionAsk>>,
     /// Questions shown or to be shown.
     questions: Asks,
+    /// Topic messages waiting for a question's message id, oldest first.
+    held: VecDeque<Inbound>,
     /// Hooks waiting for the answers, by the key of their question.
     question_waiters: HashMap<u64, QuestionWaiter>,
     /// When each session's question hook last asked; pruned after
@@ -1038,6 +1043,7 @@ impl Slots {
             relayed: VecDeque::new(),
             question_asks: None,
             questions: Asks::default(),
+            held: VecDeque::new(),
             question_waiters: HashMap::new(),
             question_hooks: HashMap::new(),
             candidates: Candidates::default(),
@@ -1199,6 +1205,8 @@ impl Slots {
         for key in self.question_waiters.keys().copied().collect::<Vec<_>>() {
             self.end_question(key, questions::State::Expired);
         }
+        // Messages held for a question's id go on (into the slot buffer).
+        self.release_held();
         self.pump();
         let save_task = self.save_task.take();
         // Closes the save channel: the task writes the last snapshot and ends.
@@ -2718,6 +2726,9 @@ impl Slots {
     fn on_topic_message(&mut self, input: Inbound) {
         let Some(thread_id) = input.thread_id else {
             debug!("message outside a topic; not forwarded");
+            return;
+        };
+        let Some(input) = self.hold(thread_id, input) else {
             return;
         };
         // An answer to an open question never goes to the session.
@@ -4350,7 +4361,7 @@ impl Slots {
                     "permission request queued for the topic"
                 );
                 if let Some(gone) = expired {
-                    self.expire(gone);
+                    self.expire(*gone);
                 }
             }
             Opened::Duplicate => debug!(conn, "permission request already shown; not repeated"),
@@ -4522,7 +4533,7 @@ impl Slots {
                     );
                     self.hook_waiters.insert(key, Waiter { answer, until });
                     if let Some(gone) = expired {
-                        self.expire(gone);
+                        self.expire(*gone);
                     }
                     self.sync_waiting(&session);
                     return;
@@ -4852,17 +4863,19 @@ impl Slots {
     /// A question button. Only the question of that message and its current
     /// step count; a press after the hook left closes the question. A press
     /// that beats Telegram's answer to the send (the message id is not known
-    /// yet) counts for the one question with its id still in flight.
+    /// yet) counts for the one question of that topic with its id still in
+    /// flight.
     fn press_question(
         &mut self,
-        message_id: Option<i64>,
+        input: &CallbackInput,
         id: &str,
         question: usize,
         press: questions::Press,
     ) -> Option<&'static str> {
-        let Some(key) = message_id
+        let Some(key) = input
+            .message_id
             .and_then(|message_id| self.questions.by_message(message_id))
-            .or_else(|| self.questions.in_flight(id))
+            .or_else(|| self.questions.in_flight(id, input.thread_id))
         else {
             debug!("button of a question this hub does not know");
             return Some(questions::ANSWER_STALE);
@@ -4887,6 +4900,38 @@ impl Slots {
             self.sync_waiting(&session);
         }
         answer
+    }
+
+    /// Keeps `input` back while it may answer a question whose message
+    /// Telegram has sent but whose id the hub does not know yet: an explicit
+    /// reply to a message the hub cannot match, in a topic with such a
+    /// question (TASK-060). Later messages of that topic wait behind it, so
+    /// the session gets them in order. `Some`: it goes on now.
+    fn hold(&mut self, thread_id: i64, input: Inbound) -> Option<Inbound> {
+        let behind = self
+            .held
+            .iter()
+            .any(|held| held.thread_id == Some(thread_id));
+        let unknown_reply = input.text.is_some()
+            && !input.forwarded
+            && input
+                .reply_to
+                .is_some_and(|reply_to| self.questions.by_message(reply_to).is_none())
+            && self.questions.sending_in(thread_id);
+        if !(behind || unknown_reply) || self.held.len() >= MAX_HELD {
+            return Some(input);
+        }
+        debug!("topic message waits for a question's message id");
+        self.held.push_back(input);
+        None
+    }
+
+    /// A question's send came back: the held messages go through again,
+    /// oldest first; those that still have to wait are held again.
+    fn release_held(&mut self) {
+        for input in std::mem::take(&mut self.held) {
+            self.on_topic_message(input);
+        }
     }
 
     /// A text message in topic `thread_id` that answers an open question:
@@ -4994,6 +5039,7 @@ impl Slots {
             };
             if let Some(prompt) = self.prompts.get_mut(key) {
                 prompt.sent = true;
+                prompt.thread_id = Some(thread_id);
             }
             self.hand_off(Work::Permission(key), op);
         }
@@ -5052,7 +5098,7 @@ impl Slots {
         if let Some((id, question, press)) =
             input.data.as_deref().and_then(questions::parse_callback)
         {
-            return self.press_question(input.message_id, id, question, press);
+            return self.press_question(input, id, question, press);
         }
         let Some((behavior, request_id)) =
             input.data.as_deref().and_then(permissions::parse_callback)
@@ -5061,10 +5107,14 @@ impl Slots {
             return None;
         };
         let expired = Some(permissions::ANSWER_EXPIRED);
-        let Some(message_id) = input.message_id else {
-            return expired;
-        };
-        let Some(key) = self.prompts.by_message(message_id) else {
+        // A press that beats Telegram's answer to the send (the message id
+        // is not known yet) counts for the one prompt of that topic with its
+        // id still in flight (TASK-060).
+        let Some(key) = input
+            .message_id
+            .and_then(|message_id| self.prompts.by_message(message_id))
+            .or_else(|| self.prompts.in_flight(request_id, input.thread_id))
+        else {
             debug!("button of a prompt this hub does not know");
             return expired;
         };
@@ -6488,7 +6538,10 @@ impl Slots {
                 key,
                 version,
                 delivery,
-            } => self.on_question_done(key, version, delivery),
+            } => {
+                self.on_question_done(key, version, delivery);
+                self.release_held();
+            }
             Done::QuestionEdit {
                 key,
                 version,
@@ -7913,6 +7966,7 @@ again"
             query_id: query.into(),
             data: Some(data.into()),
             message_id,
+            thread_id: None,
             from_name: None,
         })
     }

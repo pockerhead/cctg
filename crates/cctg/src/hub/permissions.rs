@@ -193,6 +193,8 @@ pub struct Prompt {
     pub text: String,
     /// Handed to Telegram (the send may still be in flight).
     pub sent: bool,
+    /// The topic it was handed to.
+    pub thread_id: Option<i64>,
     /// Set once Telegram accepted the message.
     pub message_id: Option<i64>,
     pub state: State,
@@ -228,6 +230,7 @@ impl Prompt {
             request_id: request.request_id.clone(),
             text: prompt_text(request),
             sent: false,
+            thread_id: None,
             message_id: None,
             state: State::Open,
             waits: true,
@@ -268,7 +271,10 @@ impl Prompt {
 pub enum Opened {
     /// `expired`: an open prompt that made room; its message (if any) should
     /// lose its buttons.
-    Added { key: u64, expired: Option<Prompt> },
+    Added {
+        key: u64,
+        expired: Option<Box<Prompt>>,
+    },
     /// An active prompt of the same session and request id is there.
     Duplicate,
     /// Every prompt is still in use; this one is not shown.
@@ -305,7 +311,10 @@ impl Prompts {
                 return Opened::Full;
             };
             if let Some(key) = self.order.get(victim).copied() {
-                expired = self.remove(key).filter(|gone| gone.state.is_active());
+                expired = self
+                    .remove(key)
+                    .filter(|gone| gone.state.is_active())
+                    .map(Box::new);
             }
         }
         let key = self.next;
@@ -366,6 +375,22 @@ impl Prompts {
 
     pub fn by_message(&self, message_id: i64) -> Option<u64> {
         self.by_message.get(&message_id).copied()
+    }
+
+    /// The one prompt with `request_id` whose message is on its way to
+    /// Telegram in topic `thread_id`: its buttons can be pressed before
+    /// Telegram's answer with the message id reaches the hub (TASK-060).
+    /// `None` when no or several prompts match, or the topic is unknown.
+    pub fn in_flight(&self, request_id: &str, thread_id: Option<i64>) -> Option<u64> {
+        let thread_id = thread_id?;
+        let mut found = self.prompts.iter().filter(|(_, prompt)| {
+            prompt.sent
+                && prompt.message_id.is_none()
+                && prompt.request_id == request_id
+                && prompt.thread_id == Some(thread_id)
+        });
+        let (key, _) = found.next()?;
+        found.next().is_none().then_some(*key)
     }
 
     /// The selected prompt waiting for the ack of `verdict_id`.
@@ -655,6 +680,31 @@ mod tests {
             Some(decided_text(&prompt.text, Behavior::Deny, None))
         );
         assert_eq!(book.due_edits(), [key]);
+    }
+
+    /// TASK-060: a press can arrive before Telegram's answer to the send;
+    /// only a single prompt with that id in flight in that topic takes it.
+    #[test]
+    fn a_press_before_the_message_id_finds_the_prompt_in_flight() {
+        let mut book = Prompts::default();
+        let key = added(book.open(prompt("A", "abcde")));
+        assert_eq!(book.in_flight("abcde", Some(100)), None, "not handed out");
+        let sending = book.get_mut(key).unwrap();
+        sending.sent = true;
+        sending.thread_id = Some(100);
+        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
+        assert_eq!(book.in_flight("bcdef", Some(100)), None);
+        assert_eq!(book.in_flight("abcde", Some(101)), None, "other topic");
+        assert_eq!(book.in_flight("abcde", None), None, "topic unknown");
+        let twin = added(book.open(prompt("B", "abcde")));
+        let sending = book.get_mut(twin).unwrap();
+        sending.sent = true;
+        sending.thread_id = Some(100);
+        assert_eq!(book.in_flight("abcde", Some(100)), None, "ambiguous");
+        book.delivered(twin, 11);
+        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
+        book.delivered(key, 10);
+        assert_eq!(book.in_flight("abcde", Some(100)), None, "id known");
     }
 
     #[test]

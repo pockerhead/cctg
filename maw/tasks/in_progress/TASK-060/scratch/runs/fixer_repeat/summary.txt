@@ -1,0 +1,8 @@
+permission_hook_e2e 10/10
+question_hook_e2e 10/10
+status_e2e 10/10
+hook_cli 10/10
+statusline_cli 10/10
+statusline_agent_e2e 10/10
+reap_e2e 10/10
+DONE
