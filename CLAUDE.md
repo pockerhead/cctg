@@ -119,6 +119,7 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
 - Gate по `from.id` пользователя, не по чату. Allowlist в hub.
 - Permission relay только от allowlisted. Кнопки Allow/Deny с `request_id` в callback data.
 - Секрет hub в `.env`, не в репо. `.cctg/` в gitignore.
+- Секреты устройств (TASK-045, `docs/remote-hub.md` «Устройства и коды»): одноразовый код (`cctg hub code`, 10 минут) `cctg join` меняет на свой секрет устройства `cctgd_<id>_<hex>` в `device.env`; hub хранит только sha256 в `<state>/devices.json`, `/devices` в General отзывает (линк агента рвётся сразу, хуки получают 401). Общий секрет работает, пока `CCTG_SHARED_SECRET` не `off`.
 - Hub на другой машине (TASK-035, `docs/remote-hub.md`): оба канала по TLS 1.3, устройство держит pin сертификата hub (`CCTG_HUB_CERT_SHA256`); без pin устройство ходит только на loopback. Сборка = коммит (`build.rs`, `CCTG_BUILD_ID` в CI и Docker), hub и клиент одного коммита на разных ОС не «устаревшие».
 
 ## Порядок разработки

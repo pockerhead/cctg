@@ -11,6 +11,7 @@ pub mod download;
 pub mod files;
 pub mod hook;
 pub mod hub;
+pub mod join;
 pub mod keys;
 pub mod proctree;
 pub mod reads;

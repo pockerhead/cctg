@@ -1,6 +1,6 @@
 //! The hub opens no file of a session's machine (TASK-034): outside its own
 //! state (`registry.json` through `RegistryStore`, the `getUpdates` offset,
-//! the `.env` it starts with) and its test helpers, no file API appears in
+//! the device list and join codes (TASK-045), the `.env` it starts with) and its test helpers, no file API appears in
 //! the non-test code of `src/hub/` (every file, also in subfolders). Session
 //! files are read by the session's agent (`crate::reads`, `crate::tail`),
 //! which the hub only asks over the link.
@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 /// Files that keep the hub's own state; they may touch files anywhere.
-const OWN_STATE: [&str; 3] = ["config.rs", "offset.rs", "testdir.rs"];
+const OWN_STATE: [&str; 4] = ["config.rs", "devices.rs", "offset.rs", "testdir.rs"];
 
 /// Items that keep the hub's own state inside other files: the file and the
 /// first line of the item, which ends at its matching closing brace.
@@ -105,10 +105,12 @@ fn code_only(source: &str) -> String {
             // A string: `"..."` with escapes, or `r#"..."#` without.
             let raw = c == 'r';
             let mut hashes = 0;
-            i += 1;
-            while raw && chars.get(i) == Some(&'#') {
-                hashes += 1;
-                i += 1;
+            if raw {
+                i += 1; // the `r`
+                while chars.get(i) == Some(&'#') {
+                    hashes += 1;
+                    i += 1;
+                }
             }
             i += 1; // the opening quote
             out.push('"');
@@ -341,6 +343,8 @@ fn the_guard_sees_a_file_read() {
         "let u = (\"//\", std::fs::read(p));",
         "let u = (r#\"a \"// b\"#, std::fs::read(p));",
         "let c = '\"'; let _ = std::fs::read(p);",
+        // An empty string ends at its second quote (TASK-045).
+        "let e = \"\"; let _ = std::fs::read(p);",
     ] {
         let source = format!("fn f() {{ {read} }}\n#[cfg(test)]\nmod tests {{}}\n");
         assert_eq!(offending("slots.rs", &source).len(), 1, "{read}");
@@ -365,6 +369,7 @@ fn the_guard_sees_a_file_read() {
                  fn f(x: &File) { let _ = files::chunks(1, b); let _ = files::MAX_UPLOAD; }\n\
                  fn g(&mut self) { self.reads.insert(1); let files = true; let _ = \"std::fs\"; }\n\
                  struct C { reads: bool, files: bool }\n\
+                 fn e() -> [&'static str; 2] { [\"\", \"a device list\"] }\n\
                  fn h<'a>(x: &'a str) -> char { '\\'' }\n\
                  /* std::fs::read(p) */\n\
                  #[cfg(test)]\nmod tests { fn g() { std::fs::read(\"x\"); } }\n";

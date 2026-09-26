@@ -1,7 +1,12 @@
 //! Hub ingress: the agent TCP link and the hook HTTP endpoint.
 //!
-//! Both check the shared secret before anything else and hand what they
-//! accept to the hub over bounded channels ([`AgentEvent`], [`HookPost`]).
+//! Both check the secret before anything else ([`Devices`]: the shared
+//! secret while it is on, and the secrets of enrolled devices, TASK-045)
+//! and hand what they accept to the hub over bounded channels
+//! ([`AgentEvent`], [`HookPost`]). A revoked device loses its agent links
+//! and its waiting hooks at once, its other hooks from the next request on.
+//! `POST /v1/join` is the one request without a secret: its join code is
+//! the credential.
 //! Either can take its connections over TLS ([`Listener::tls`], TASK-035):
 //! the handshake runs in the connection's own task, within its time limit,
 //! so a slow client never holds up accepting others. A connection that
@@ -23,15 +28,17 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use super::devices::{Devices, JoinError, Who};
 use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
 use crate::wire::{
-    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, Liveness,
-    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, QUESTION_PATH,
-    QuestionAnswer, QuestionPost, Register, Rejection, Secret, WireError,
+    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, JOIN_PATH,
+    JoinAnswer, Liveness, MAX_HOOK_BODY, MAX_JOIN_BODY, PERMISSION_PATH, PING_PATH,
+    PermissionAnswer, PermissionPost, QUESTION_PATH, QuestionAnswer, QuestionPost, Register,
+    Rejection, WireError,
 };
 
 /// Time an agent has from its TCP connect to finish the TLS handshake (when
@@ -50,7 +57,8 @@ const MAX_PENDING_AGENTS_PER_PEER: usize = 4;
 /// Longest `hello` line: read before the secret is checked. A secret longer
 /// than about 4000 characters cannot authenticate.
 const MAX_HELLO_LINE: usize = 4 * 1024;
-/// A wrong secret is answered only after this pause (both listeners).
+/// A wrong secret or join code is answered only after this pause (both
+/// listeners).
 const AUTH_FAIL_DELAY: Duration = Duration::from_millis(250);
 const MAX_HOOK_REQUESTS: usize = 64;
 /// Hook requests of one peer address still before their secret (the
@@ -270,16 +278,16 @@ pub enum AgentEvent {
 /// agent connection, which is what a hub restart looks like to an agent.
 pub async fn serve_agents(
     listener: impl Into<Listener>,
-    secret: Secret,
+    auth: impl Into<Devices>,
     events: mpsc::Sender<AgentEvent>,
 ) {
-    serve_agents_with(listener, secret, events, Heartbeat::default()).await;
+    serve_agents_with(listener, auth, events, Heartbeat::default()).await;
 }
 
 /// [`serve_agents`] with another [`Heartbeat`] (tests use short ones).
 pub async fn serve_agents_with(
     listener: impl Into<Listener>,
-    secret: Secret,
+    auth: impl Into<Devices>,
     events: mpsc::Sender<AgentEvent>,
     heartbeat: Heartbeat,
 ) {
@@ -287,7 +295,7 @@ pub async fn serve_agents_with(
         tcp: listener,
         incoming,
     } = listener.into();
-    let secret = Arc::new(secret);
+    let devices = auth.into();
     let slots = Arc::new(Semaphore::new(MAX_AGENTS));
     let pending = Arc::new(Semaphore::new(MAX_PENDING_AGENTS));
     let per_peer = PerPeer::new(MAX_PENDING_AGENTS_PER_PEER);
@@ -320,8 +328,8 @@ pub async fn serve_agents_with(
                     continue;
                 };
                 let conn = next_conn.fetch_add(1, Ordering::Relaxed);
-                let (secret, events, incoming, gate) =
-                    (secret.clone(), events.clone(), incoming.clone(), gate.clone());
+                let (devices, events, incoming, gate) =
+                    (devices.clone(), events.clone(), incoming.clone(), gate.clone());
                 let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
                 sessions.spawn(async move {
                     if let Some(stream) = open(&incoming, stream, peer, deadline).await {
@@ -331,7 +339,7 @@ pub async fn serve_agents_with(
                             peer_place,
                             gate,
                         };
-                        agent_session(stream, peer, conn, &secret, &events, handshake, heartbeat)
+                        agent_session(stream, peer, conn, &devices, &events, handshake, heartbeat)
                             .await;
                     }
                     drop(permit);
@@ -386,7 +394,7 @@ async fn agent_session(
     stream: Stream,
     peer: SocketAddr,
     conn: u64,
-    secret: &Secret,
+    devices: &Devices,
     events: &mpsc::Sender<AgentEvent>,
     pre_auth: Handshake,
     heartbeat: Heartbeat,
@@ -394,6 +402,8 @@ async fn agent_session(
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
     let mut line = Vec::new();
+    // Before the check: a revoke right after it is still seen.
+    let mut changes = devices.subscribe();
 
     let handshake = tokio::time::timeout_at(pre_auth.deadline, async {
         // Read before the secret is checked: a short line only.
@@ -403,20 +413,20 @@ async fn agent_session(
             Err(WireError::Closed) if line.is_empty() => return Ok(None),
             Err(_) => return Err(Rejection::Protocol),
         }
-        let authed = match wire::decode::<AgentMsg>(&line) {
-            Ok(AgentMsg::Hello { secret: offered }) => secret.matches(offered.expose().as_bytes()),
+        let who = match wire::decode::<AgentMsg>(&line) {
+            Ok(AgentMsg::Hello { secret: offered }) => devices.check(offered.expose().as_bytes()),
             Err(WireError::Version) => return Err(Rejection::Version),
-            _ => false,
+            _ => None,
         };
-        if !authed {
+        let Some(who) = who else {
             return Err(Rejection::Auth);
-        }
+        };
         line.clear();
         wire::read_line(&mut reader, &mut line)
             .await
             .map_err(|_| Rejection::Protocol)?;
         let result = match wire::decode::<AgentMsg>(&line) {
-            Ok(AgentMsg::Register(register)) => Ok(Some(register)),
+            Ok(AgentMsg::Register(register)) => Ok(Some((who, register))),
             Err(WireError::Version) => Err(Rejection::Version),
             _ => Err(Rejection::Protocol),
         };
@@ -424,8 +434,8 @@ async fn agent_session(
         result
     })
     .await;
-    let register = match handshake {
-        Ok(Ok(Some(register))) => register,
+    let (who, register) = match handshake {
+        Ok(Ok(Some(registered))) => registered,
         Ok(Ok(None)) => {
             debug!(conn, %peer, "connection closed before its first byte");
             return;
@@ -534,6 +544,10 @@ async fn agent_session(
                     break;
                 }
             },
+            () = revoked(&mut changes, devices, &who) => {
+                info!(conn, session, "agent of a revoked device; link closed");
+                break;
+            }
         }
     }
     reader_task.stop().await;
@@ -556,6 +570,19 @@ async fn read_agent_frames(
         };
         line.clear();
         if frames.send(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Completes when `who` no longer gets in (its device was revoked); never
+/// for the shared secret.
+async fn revoked(changes: &mut watch::Receiver<u64>, devices: &Devices, who: &Who) {
+    loop {
+        if changes.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+        if !devices.is_active(who) {
             return;
         }
     }
@@ -627,6 +654,7 @@ pub enum Status {
     NoContent,
     BadRequest,
     Unauthorized,
+    Forbidden,
     NotFound,
     MethodNotAllowed,
     LengthRequired,
@@ -642,6 +670,7 @@ impl Status {
             Self::NoContent => 204,
             Self::BadRequest => 400,
             Self::Unauthorized => 401,
+            Self::Forbidden => 403,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
             Self::LengthRequired => 411,
@@ -657,6 +686,7 @@ impl Status {
             Self::NoContent => "No Content",
             Self::BadRequest => "Bad Request",
             Self::Unauthorized => "Unauthorized",
+            Self::Forbidden => "Forbidden",
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",
             Self::LengthRequired => "Length Required",
@@ -698,10 +728,10 @@ struct PermissionWaits {
 /// [`serve_hooks_and_permissions`].
 pub async fn serve_hooks(
     listener: impl Into<Listener>,
-    secret: Secret,
+    auth: impl Into<Devices>,
     events: mpsc::Sender<HookPost>,
 ) {
-    serve(listener.into(), secret, events, None).await;
+    serve(listener.into(), auth.into(), events, None).await;
 }
 
 /// [`serve_hooks`] plus `POST /v1/permission`: each such request goes to
@@ -710,7 +740,7 @@ pub async fn serve_hooks(
 /// request never holds up other hook requests.
 pub async fn serve_hooks_and_permissions(
     listener: impl Into<Listener>,
-    secret: Secret,
+    auth: impl Into<Devices>,
     events: mpsc::Sender<HookPost>,
     asks: mpsc::Sender<PermissionAsk>,
 ) {
@@ -719,7 +749,7 @@ pub async fn serve_hooks_and_permissions(
         questions: None,
         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
     };
-    serve(listener.into(), secret, events, Some(waits)).await;
+    serve(listener.into(), auth.into(), events, Some(waits)).await;
 }
 
 /// [`serve_hooks_and_permissions`] plus `POST /v1/question`: each such
@@ -728,7 +758,7 @@ pub async fn serve_hooks_and_permissions(
 /// [`MAX_PERMISSION_WAITS`] places.
 pub async fn serve_hooks_and_asks(
     listener: impl Into<Listener>,
-    secret: Secret,
+    auth: impl Into<Devices>,
     events: mpsc::Sender<HookPost>,
     asks: mpsc::Sender<PermissionAsk>,
     questions: mpsc::Sender<QuestionAsk>,
@@ -738,12 +768,12 @@ pub async fn serve_hooks_and_asks(
         questions: Some(questions),
         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
     };
-    serve(listener.into(), secret, events, Some(waits)).await;
+    serve(listener.into(), auth.into(), events, Some(waits)).await;
 }
 
 async fn serve(
     listener: Listener,
-    secret: Secret,
+    devices: Devices,
     events: mpsc::Sender<HookPost>,
     waits: Option<PermissionWaits>,
 ) {
@@ -751,7 +781,6 @@ async fn serve(
         tcp: listener,
         incoming,
     } = listener;
-    let secret = Arc::new(secret);
     let dedup = Arc::new(Mutex::new(Dedup::new(DEDUP_MAX, DEDUP_TTL)));
     let waits = waits.map(Arc::new);
     let slots = Arc::new(Semaphore::new(MAX_HOOK_REQUESTS));
@@ -777,8 +806,8 @@ async fn serve(
                     pre_auth!(gate, peer, %peer, "too many hook requests; refused");
                     continue;
                 };
-                let (secret, dedup, events, waits, incoming) = (
-                    secret.clone(),
+                let (devices, dedup, events, waits, incoming) = (
+                    devices.clone(),
                     dedup.clone(),
                     events.clone(),
                     waits.clone(),
@@ -795,7 +824,7 @@ async fn serve(
                     };
                     let waits = waits.as_deref();
                     hook_request(
-                        stream, peer, &secret, &dedup, &events, waits, permit, pre_auth, deadline,
+                        stream, peer, &devices, &dedup, &events, waits, permit, pre_auth, deadline,
                     )
                     .await;
                 });
@@ -817,7 +846,7 @@ struct PreAuth {
 async fn hook_request(
     mut stream: Stream,
     peer: SocketAddr,
-    secret: &Secret,
+    devices: &Devices,
     dedup: &Mutex<Dedup>,
     events: &mpsc::Sender<HookPost>,
     waits: Option<&PermissionWaits>,
@@ -825,33 +854,48 @@ async fn hook_request(
     pre_auth: PreAuth,
     deadline: tokio::time::Instant,
 ) {
-    let read = tokio::time::timeout_at(deadline, read_request(&mut stream, secret)).await;
+    // Before the check: a revoke while a hook waits is seen.
+    let mut changes = devices.subscribe();
+    let read = tokio::time::timeout_at(deadline, read_request(&mut stream, devices)).await;
     drop(pre_auth.peer_place);
     let gate = pre_auth.gate;
     let status = match read {
-        Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
+        // Revoked while the body was still coming: the check of its header
+        // no longer holds.
+        Ok(Ok((Route::Hook | Route::Ping, _, Some(who)))) if !devices.is_active(&who) => {
+            debug!(%peer, "hook request of a revoked device");
+            Status::Unauthorized
+        }
+        Ok(Ok((Route::Hook, body, _))) => accept_hook(&body, dedup, events),
         // `cctg doctor`: the secret matched; nothing else happens.
-        Ok(Ok((Route::Ping, _))) => {
+        Ok(Ok((Route::Ping, _, _))) => {
             debug!(%peer, "ping answered");
             Status::NoContent
+        }
+        Ok(Ok((Route::Join, body, _))) => {
+            // The request place stays taken, also through the pause of a
+            // refused code (as for a wrong secret).
+            return join_request(stream, peer, &body, devices, &gate).await;
         }
         Ok(Err(None)) => {
             debug!(%peer, "connection closed before its first byte");
             return;
         }
-        Ok(Ok((Route::Permission, body))) => match waits {
-            Some(waits) => {
+        Ok(Ok((Route::Permission, body, who))) => match (waits, who) {
+            (Some(waits), Some(who)) => {
                 // A waiting hook takes one of its own places, not a
                 // hook request place.
                 drop(permit);
-                return permission_request(stream, peer, &body, waits).await;
+                let revoked = revoked(&mut changes, devices, &who);
+                return permission_request(stream, peer, &body, waits, revoked).await;
             }
-            None => Status::NotFound,
+            _ => Status::NotFound,
         },
-        Ok(Ok((Route::Question, body))) => match waits {
-            Some(waits) if waits.questions.is_some() => {
+        Ok(Ok((Route::Question, body, who))) => match (waits, who) {
+            (Some(waits), Some(who)) if waits.questions.is_some() => {
                 drop(permit);
-                return question_request(stream, peer, &body, waits).await;
+                let revoked = revoked(&mut changes, devices, &who);
+                return question_request(stream, peer, &body, waits, revoked).await;
             }
             _ => Status::NotFound,
         },
@@ -904,6 +948,7 @@ async fn permission_request(
     peer: SocketAddr,
     body: &[u8],
     waits: &PermissionWaits,
+    revoked: impl Future<Output = ()>,
 ) {
     let post = match wire::decode_permission(body) {
         Ok(post) => post,
@@ -929,7 +974,7 @@ async fn permission_request(
         );
         return respond(&mut stream, Status::NoContent, &[]).await;
     }
-    let Some(behavior) = wait_for(&mut stream, decided, PERMISSION_WAIT_CAP).await else {
+    let Some(behavior) = wait_for(&mut stream, decided, PERMISSION_WAIT_CAP, revoked).await else {
         debug!(session, "permission hook went away before an answer");
         return;
     };
@@ -954,6 +999,7 @@ async fn question_request(
     peer: SocketAddr,
     body: &[u8],
     waits: &PermissionWaits,
+    revoked: impl Future<Output = ()>,
 ) {
     let Some(questions) = waits.questions.as_ref() else {
         return respond(&mut stream, Status::NotFound, &[]).await;
@@ -982,7 +1028,7 @@ async fn question_request(
         );
         return respond(&mut stream, Status::NoContent, &[]).await;
     }
-    let Some(answers) = wait_for(&mut stream, decided, QUESTION_WAIT_CAP).await else {
+    let Some(answers) = wait_for(&mut stream, decided, QUESTION_WAIT_CAP, revoked).await else {
         debug!(session, "question hook went away before an answer");
         return;
     };
@@ -1001,15 +1047,21 @@ async fn question_request(
 }
 
 /// The hub's answer on `decided`, at most `cap` later. `None`: the hook went
-/// away first; `Some(None)`: no decision (none, dropped, or time ran out).
+/// away first, or its device was revoked (it then gets no answer at all);
+/// `Some(None)`: no decision (none, dropped, or time ran out).
 async fn wait_for<T>(
     stream: &mut Stream,
     decided: oneshot::Receiver<Option<T>>,
     cap: Duration,
+    revoked: impl Future<Output = ()>,
 ) -> Option<Option<T>> {
     tokio::select! {
         decided = decided => Some(decided.ok().flatten()),
         () = gone(stream) => None,
+        () = revoked => {
+            info!("hook of a revoked device dropped while it waited");
+            None
+        }
         () = tokio::time::sleep(cap) => Some(None),
     }
 }
@@ -1022,6 +1074,54 @@ async fn gone(stream: &mut Stream) {
         match stream.read(&mut byte).await {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
+        }
+    }
+}
+
+/// `POST /v1/join` (TASK-045): spends the code and answers the new
+/// device's secret. A refused code gets the same `403` whether it was
+/// unknown, used or expired, after the pause of a wrong secret. Neither the
+/// code nor the secret is logged.
+async fn join_request(
+    mut stream: Stream,
+    peer: SocketAddr,
+    body: &[u8],
+    devices: &Devices,
+    gate: &WarnGate,
+) {
+    let post = match wire::decode_join(body) {
+        Ok(post) => post,
+        Err(error) => {
+            pre_auth!(gate, peer, %peer, %error, "join request rejected");
+            return respond(&mut stream, Status::BadRequest, &[]).await;
+        }
+    };
+    let joining = devices.clone();
+    let joined = tokio::task::spawn_blocking(move || joining.join(&post.code, &post.name)).await;
+    match joined {
+        Ok(Ok(enrolled)) => {
+            info!(%peer, device_id = enrolled.id, "device enrolled with a join code");
+            let answer = JoinAnswer {
+                device_id: enrolled.id,
+                name: enrolled.name,
+                secret: enrolled.secret,
+            };
+            let body = serde_json::to_vec(&answer).expect("a join answer always serializes");
+            respond(&mut stream, Status::Ok, &body).await;
+        }
+        Ok(Err(JoinError::Refused)) => {
+            pre_auth!(gate, peer, %peer, "join code refused");
+            // No fast guessing, as for a wrong secret.
+            tokio::time::sleep(AUTH_FAIL_DELAY).await;
+            respond(&mut stream, Status::Forbidden, &[]).await;
+        }
+        Ok(Err(error)) => {
+            warn!(%peer, %error, "join request not served");
+            respond(&mut stream, Status::Unavailable, &[]).await;
+        }
+        Err(_) => {
+            warn!(%peer, "join request failed");
+            respond(&mut stream, Status::Unavailable, &[]).await;
         }
     }
 }
@@ -1098,15 +1198,19 @@ enum Route {
     Permission,
     Question,
     Ping,
+    /// The one route without a secret (TASK-045).
+    Join,
 }
 
 /// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
-/// and returns its target and body. The secret is checked before the body
-/// is read. `Err(None)`: closed before its first byte, nothing to answer.
+/// and returns its target, body and whose secret it carried. The secret is
+/// checked before the body is read; a join request has none (`None`) and a
+/// body of at most [`MAX_JOIN_BODY`]. `Err(None)`: closed before its first
+/// byte, nothing to answer.
 async fn read_request<S: AsyncRead + Unpin>(
     stream: &mut S,
-    secret: &Secret,
-) -> Result<(Route, Vec<u8>), Option<Status>> {
+    devices: &Devices,
+) -> Result<(Route, Vec<u8>, Option<Who>), Option<Status>> {
     let mut buf = Vec::with_capacity(1024);
     let head_end = loop {
         if let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -1150,6 +1254,7 @@ async fn read_request<S: AsyncRead + Unpin>(
         PERMISSION_PATH => Route::Permission,
         QUESTION_PATH => Route::Question,
         PING_PATH => Route::Ping,
+        JOIN_PATH => Route::Join,
         _ => return Err(Some(Status::NotFound)),
     };
 
@@ -1181,18 +1286,29 @@ async fn read_request<S: AsyncRead + Unpin>(
             if authorized.is_some() {
                 return Err(Some(Status::BadRequest));
             }
+            // A join request needs none: its header is not looked at.
             let token = value
                 .split_once(' ')
                 .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
                 .map(|(_, token)| token.trim_matches([' ', '\t']));
-            authorized = Some(token.is_some_and(|token| secret.matches(token.as_bytes())));
+            authorized = Some(
+                token
+                    .filter(|_| route != Route::Join)
+                    .and_then(|token| devices.check(token.as_bytes())),
+            );
         }
     }
-    if authorized != Some(true) {
+    let who = authorized.flatten();
+    if route != Route::Join && who.is_none() {
         return Err(Some(Status::Unauthorized));
     }
     let length = length.ok_or(Some(Status::LengthRequired))?;
-    if length > MAX_HOOK_BODY {
+    let max = if route == Route::Join {
+        MAX_JOIN_BODY
+    } else {
+        MAX_HOOK_BODY
+    };
+    if length > max {
         return Err(Some(Status::PayloadTooLarge));
     }
     let mut body = buf.split_off(head_end + 4);
@@ -1205,7 +1321,7 @@ async fn read_request<S: AsyncRead + Unpin>(
         .read_exact(&mut body[received..])
         .await
         .map_err(|_| Some(Status::BadRequest))?;
-    Ok((route, body))
+    Ok((route, body, who))
 }
 
 fn is_tchar(byte: u8) -> bool {
@@ -1245,7 +1361,7 @@ mod tests {
     use tokio::io::AsyncBufReadExt;
 
     use super::*;
-    use crate::wire::HookEvent;
+    use crate::wire::{HookEvent, Secret};
 
     const SECRET: &str = "0123456789abcdef-secret";
     const WAIT: Duration = Duration::from_secs(10);
@@ -2415,7 +2531,7 @@ mod tests {
             // Parsers of both listeners on arbitrary input: an answer, never
             // a panic.
             let mut reader = &input[..];
-            let _ = read_request(&mut reader, &secret()).await;
+            let _ = read_request(&mut reader, &Devices::from(secret())).await;
             let _ = wire::decode::<AgentMsg>(&input);
             let mut line = Vec::new();
             let mut reader = BufReader::new(&input[..]);
@@ -2500,5 +2616,306 @@ mod tests {
         let mut response = Vec::new();
         let _ = within(stream.read_to_end(&mut response)).await;
         response
+    }
+
+    // ------------------------------------------------ devices (TASK-045)
+
+    use crate::hub::devices::{Devices, mint_code};
+    use crate::hub::testdir::TempDir;
+
+    fn join_request(body: &[u8], auth: Option<&str>) -> Vec<u8> {
+        let mut head = format!(
+            "POST {JOIN_PATH} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some(auth) = auth {
+            head.push_str(&format!("Authorization: {auth}\r\n"));
+        }
+        head.push_str("\r\n");
+        [head.as_bytes(), body].concat()
+    }
+
+    fn join_body(code: &str) -> Vec<u8> {
+        serde_json::to_vec(&wire::JoinPost {
+            v: wire::VERSION,
+            code: code.into(),
+            name: "laptop".into(),
+        })
+        .unwrap()
+    }
+
+    /// The status and body of one raw exchange.
+    async fn answer(addr: SocketAddr, raw: &[u8]) -> (u16, Vec<u8>) {
+        let response = exchange_raw(addr, raw).await;
+        let head_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a complete answer");
+        let status = std::str::from_utf8(&response[9..12])
+            .unwrap()
+            .parse()
+            .unwrap();
+        (status, response[head_end + 4..].to_vec())
+    }
+
+    /// Both listeners over one device book of `dir`.
+    async fn device_hub(
+        devices: &Devices,
+    ) -> (
+        SocketAddr,
+        SocketAddr,
+        mpsc::Receiver<AgentEvent>,
+        mpsc::Receiver<HookPost>,
+    ) {
+        let agents = bind(loopback()).await.unwrap();
+        let hooks = bind(loopback()).await.unwrap();
+        let (agent_addr, hook_addr) = (agents.local_addr().unwrap(), hooks.local_addr().unwrap());
+        let (agents_tx, agents_rx) = mpsc::channel(16);
+        let (hooks_tx, hooks_rx) = mpsc::channel(16);
+        tokio::spawn(serve_agents(agents, devices.clone(), agents_tx));
+        tokio::spawn(serve_hooks(hooks, devices.clone(), hooks_tx));
+        (agent_addr, hook_addr, agents_rx, hooks_rx)
+    }
+
+    #[tokio::test]
+    async fn a_join_code_buys_one_device_secret_and_nothing_else() {
+        let dir = TempDir::new("ingress-join");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let (_, addr, _agents, mut hooks) = device_hub(&devices).await;
+        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
+
+        // Any Authorization header is ignored: the code is the credential.
+        let (status, body) = answer(
+            addr,
+            &join_request(&join_body(&code), Some("Bearer nothing-at-all-000")),
+        )
+        .await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let joined: JoinAnswer = serde_json::from_slice(&body).unwrap();
+        assert_eq!(joined.name, "laptop");
+        let bearer = format!("Bearer {}", joined.secret.expose());
+        assert_eq!(
+            exchange(addr, &request(Some(&bearer), &body_of_start())).await,
+            204
+        );
+        assert!(within(hooks.recv()).await.is_some());
+
+        // The same code again, a made-up one and an expired one: the same
+        // 403, after the pause of a wrong secret.
+        let old = mint_code(
+            dir.path(),
+            std::time::SystemTime::now() - crate::hub::devices::CODE_TTL - Duration::from_secs(1),
+        )
+        .unwrap();
+        for code in [code.as_str(), "ABCD-EFGH-JKMN-PQRS", old.as_str()] {
+            let started = Instant::now();
+            let (status, body) = answer(addr, &join_request(&join_body(code), None)).await;
+            assert_eq!((status, body.len()), (403, 0), "{code}");
+            assert!(started.elapsed() >= AUTH_FAIL_DELAY);
+        }
+        // A join body is short and must parse; the hook secret is no code.
+        let long = join_body(&"A".repeat(MAX_JOIN_BODY));
+        assert_eq!(answer(addr, &join_request(&long, None)).await.0, 413);
+        assert_eq!(answer(addr, &join_request(b"{}", None)).await.0, 400);
+        assert_eq!(devices.list().0.len(), 1);
+    }
+
+    /// A refused join code keeps its hook request place through the pause,
+    /// as a wrong secret does: 64 of them leave no place for a 65th request.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_refused_join_keeps_its_request_place_through_the_pause() {
+        let dir = TempDir::new("ingress-join-place");
+        let devices = Devices::open(dir.path(), Some(secret())).unwrap();
+        let (_, addr, _agents, _hooks) = device_hub(&devices).await;
+        let raw = join_request(&join_body("ABCD-EFGH-JKMN-PQRS"), None);
+        let mut refused = Vec::new();
+        for n in 0..MAX_HOOK_REQUESTS {
+            let source = IpAddr::from([127, 0, 3, 2 + u8::try_from(n).unwrap()]);
+            let mut stream = connect_from(source, addr).await;
+            stream.write_all(&raw).await.unwrap();
+            refused.push(stream);
+        }
+        // Read and in their pause (250 ms), each still holding its place.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let late = connect_from(IpAddr::from([127, 0, 4, 2]), addr).await;
+        closed_at_once(late).await;
+        for mut stream in refused {
+            let mut answer = Vec::new();
+            within(stream.read_to_end(&mut answer)).await.unwrap();
+            assert!(answer.starts_with(b"HTTP/1.1 403"), "{answer:?}");
+        }
+    }
+
+    fn body_of_start() -> Vec<u8> {
+        body(&post(start()))
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_loses_its_link_and_its_hooks_at_once() {
+        let dir = TempDir::new("ingress-revoke");
+        let shared = Secret::parse(SECRET).unwrap();
+        let devices = Devices::open(dir.path(), Some(shared)).unwrap();
+        let (agent_addr, hook_addr, mut agents, _hooks) = device_hub(&devices).await;
+        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
+        let joined = devices.join(&code, "old box").unwrap();
+
+        let mut device = Peer::connect(agent_addr).await;
+        device
+            .send(&AgentMsg::Hello {
+                secret: joined.secret.clone(),
+            })
+            .await;
+        device.send(&AgentMsg::Register(register())).await;
+        assert!(matches!(device.recv().await, Ok(HubMsg::Registered { .. })));
+        let Some(AgentEvent::Registered { conn, .. }) = within(agents.recv()).await else {
+            panic!("expected registration");
+        };
+        let mut other = Peer::connect(agent_addr).await;
+        other.send(&AgentMsg::Hello { secret: secret() }).await;
+        other.send(&AgentMsg::Register(register())).await;
+        assert!(matches!(other.recv().await, Ok(HubMsg::Registered { .. })));
+        let Some(AgentEvent::Registered {
+            conn: shared_conn, ..
+        }) = within(agents.recv()).await
+        else {
+            panic!("expected registration");
+        };
+
+        assert!(devices.revoke(&joined.id).is_some());
+        assert!(matches!(
+            within(agents.recv()).await,
+            Some(AgentEvent::Disconnected { conn: gone }) if gone == conn
+        ));
+        assert_eq!(device.recv().await, Err(WireError::Closed));
+        let bearer = format!("Bearer {}", joined.secret.expose());
+        assert_eq!(
+            exchange(hook_addr, &request(Some(&bearer), &body_of_start())).await,
+            401
+        );
+        let mut again = Peer::connect(agent_addr).await;
+        again
+            .send(&AgentMsg::Hello {
+                secret: joined.secret.clone(),
+            })
+            .await;
+        again.send(&AgentMsg::Register(register())).await;
+        assert_eq!(
+            again.recv().await,
+            Ok(HubMsg::Rejected {
+                reason: Rejection::Auth
+            })
+        );
+
+        // The shared secret's link stays.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            agents.try_recv().is_err(),
+            "shared link {shared_conn} untouched"
+        );
+        assert_eq!(
+            exchange(
+                hook_addr,
+                &request(Some(&format!("Bearer {SECRET}")), &body_of_start())
+            )
+            .await,
+            204
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_revoked_between_its_header_and_its_body_is_refused() {
+        let dir = TempDir::new("ingress-revoke-midway");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let (_, hook_addr, _agents, mut hooks) = device_hub(&devices).await;
+        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
+        let joined = devices.join(&code, "old box").unwrap();
+        let bearer = format!("Bearer {}", joined.secret.expose());
+        let raw = request(Some(&bearer), &body_of_start());
+        let split = raw.len() - 5;
+
+        let mut stream = TcpStream::connect(hook_addr).await.unwrap();
+        stream.write_all(&raw[..split]).await.unwrap();
+        // The header (and its secret) is read by now; the body is not.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(devices.revoke(&joined.id).is_some());
+        stream.write_all(&raw[split..]).await.unwrap();
+        let mut response = Vec::new();
+        within(stream.read_to_end(&mut response)).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 401 "), "{text}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(hooks.try_recv().is_err(), "no event of the revoked device");
+    }
+
+    #[tokio::test]
+    async fn with_the_shared_secret_off_only_devices_get_in() {
+        let dir = TempDir::new("ingress-shared-off");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let (agent_addr, hook_addr, _agents, _hooks) = device_hub(&devices).await;
+        assert_eq!(
+            exchange(
+                hook_addr,
+                &request(Some(&format!("Bearer {SECRET}")), &body_of_start())
+            )
+            .await,
+            401
+        );
+        let mut peer = Peer::connect(agent_addr).await;
+        peer.send(&AgentMsg::Hello { secret: secret() }).await;
+        peer.send(&AgentMsg::Register(register())).await;
+        assert_eq!(
+            peer.recv().await,
+            Ok(HubMsg::Rejected {
+                reason: Rejection::Auth
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_hook_of_a_revoked_device_is_dropped_unanswered() {
+        let dir = TempDir::new("ingress-revoke-wait");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
+        let joined = devices.join(&code, "box").unwrap();
+        let listener = bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (events, _events) = mpsc::channel(4);
+        let (asks_tx, mut asks) = mpsc::channel(4);
+        tokio::spawn(serve_hooks_and_permissions(
+            listener,
+            devices.clone(),
+            events,
+            asks_tx,
+        ));
+        let permission = serde_json::to_vec(&PermissionPost {
+            v: wire::VERSION,
+            host: "box".into(),
+            session_id: "5e551017-0000-4000-8000-000000000001".into(),
+            tool_name: "Bash".into(),
+            description: String::new(),
+            input_preview: String::new(),
+        })
+        .unwrap();
+        let raw = [
+            format!(
+                "POST {PERMISSION_PATH} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
+                joined.secret.expose(),
+                permission.len()
+            )
+            .into_bytes(),
+            permission,
+        ]
+        .concat();
+        let waiting = tokio::spawn(async move { exchange_raw(addr, &raw).await });
+        let ask = within(asks.recv())
+            .await
+            .expect("the hook waits for an answer");
+        devices.revoke(&joined.id).unwrap();
+        assert!(
+            within(waiting).await.unwrap().is_empty(),
+            "no answer at all"
+        );
+        drop(ask);
     }
 }
