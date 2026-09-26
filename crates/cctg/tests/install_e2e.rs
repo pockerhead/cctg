@@ -676,31 +676,45 @@ fn a_container_gets_its_host_name_written() {
             .collect()
     };
 
-    // No name anywhere: a warning, nothing written.
-    let (output, text) = run.install(&args);
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("warning: in a container"), "{text}");
-    assert!(hosts(&env()).is_empty(), "{}", env());
+    if cfg!(target_os = "macos") {
+        // A Mac is never a container: the sign is ignored and the Mac's
+        // own name is written, as without it.
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("warning: in a container"), "{text}");
+        let hosts = hosts(&env());
+        assert_eq!(hosts.len(), 2, "{hosts:?}");
+        assert_eq!(
+            hosts[0],
+            "# the CCTG_HOST line below: written by install.sh (macOS gives cctg no host name)"
+        );
+    } else {
+        // No name anywhere: a warning, nothing written.
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("warning: in a container"), "{text}");
+        assert!(hosts(&env()).is_empty(), "{}", env());
 
-    run.env("CCTG_HOST", "dev-box");
-    let (output, text) = run.install(&args);
-    assert!(output.status.success(), "{text}");
-    assert!(!text.contains("warning: in a container"), "{text}");
-    assert_eq!(
-        hosts(&env()),
-        [
-            "# the CCTG_HOST line below: written by install.sh (in a container the host name is its id)",
-            "CCTG_HOST=dev-box"
-        ]
-    );
-    // Once written it stays.
-    run.env("CCTG_HOST", "other-name");
-    let (output, text) = run.install(&args);
-    assert!(output.status.success(), "{text}");
-    assert!(env().contains("CCTG_HOST=dev-box\n"), "{}", env());
+        run.env("CCTG_HOST", "dev-box");
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("warning: in a container"), "{text}");
+        assert_eq!(
+            hosts(&env()),
+            [
+                "# the CCTG_HOST line below: written by install.sh (in a container the host name is its id)",
+                "CCTG_HOST=dev-box"
+            ]
+        );
+        // Once written it stays.
+        run.env("CCTG_HOST", "other-name");
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(env().contains("CCTG_HOST=dev-box\n"), "{}", env());
+    }
 
-    // --host replaces it, and a line the user wrote as well.
-    let mine = env().replace("CCTG_HOST=dev-box\n", "CCTG_HOST=dev-box\nCCTG_HOST=mine\n");
+    // --host replaces our line, and a line the user wrote as well.
+    let mine = format!("{}CCTG_HOST=mine\n", env());
     std::fs::write(&device_env, mine).unwrap();
     let (output, text) = run.install(&with_host);
     assert!(output.status.success(), "{text}");

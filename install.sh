@@ -348,8 +348,10 @@ check_host() {
 }
 
 # A Docker, Podman or other container (a fake one in the tests: env
-# container=...).
+# container=...). A Mac is never one: containers there run Linux, and
+# macOS gets its own stable name in write_device_env.
 in_container() {
+    [ "$os" != macos ] || return 1
     [ -f /.dockerenv ] || [ -f /run/.containerenv ] || env | grep -q '^container=' \
         || grep -q -E 'docker|containerd|kubepods|libpod|lxc' /proc/1/cgroup 2>/dev/null
 }
