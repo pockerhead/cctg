@@ -1,0 +1,95 @@
+    // Round-2 code-review repros, appended to hub::scheduler::tests in a %TEMP%
+    // copy of 010b9c5 (copy deleted afterwards). Output of the run:
+    //   CREV2 n=2:  createTopic 10s, decision 10s, reaction 10s, callback 10s (submitted 10s); refresh max latency 8s
+    //   CREV2 n=3:  createTopic 10s, decision 12s, reaction 16s, callback 10s; refresh max latency 18s
+    //   CREV2 n=10: createTopic 12s, decision 16s, reaction 20s, callback 10s; refresh max latency 52s
+    //   CREV2 prompt-flush thin budget: x0..x4 at 0..4s, "a ✓" 5s, "prompt" 8s
+    //   CREV2 prompt alone thin budget: x0..x4 at 0..4s, "prompt" 5s
+    //   CREV2 refresh under a reaction every 3 s (bucket drained first) went at 164s
+    //   CREV2 429 fg->bg: [("question", 0s, fg), ("refresh", 5.1s, fg)] answers [Superseded, Done]
+
+    async fn churn2(n: i64) -> (Vec<Call>, Vec<Duration>) {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        tokio::spawn(scheduler.run());
+        let latencies = Arc::new(Mutex::new(Vec::new()));
+        for slot in 0..n {
+            let outbox = outbox.clone();
+            let latencies = latencies.clone();
+            tokio::spawn(async move {
+                let mut tick = 0u64;
+                loop {
+                    let submitted = Instant::now();
+                    let rx = outbox.submit(refresh(100 + slot, &format!("s{slot}:{tick}"))).await;
+                    let _ = rx.await;
+                    latencies.lock().unwrap().push(Instant::now() - submitted);
+                    tick += 1;
+                    sleep_until(submitted + Duration::from_secs(5)).await;
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let _ = outbox
+            .submit(Op::CreateTopic { name: "new-session".into(), icon_custom_emoji_id: None })
+            .await;
+        let _ = outbox.submit(edit(999, "decision")).await;
+        let _ = outbox.submit(Op::React { message_id: 555, emoji: "x".into() }).await;
+        let _ = outbox.submit(Op::AnswerCallback { query_id: "q".into(), text: None }).await;
+        tokio::time::sleep(Duration::from_secs(170)).await;
+        let l = latencies.lock().unwrap().clone();
+        (fake.calls(), l)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crev2_repro_edit_lane_under_status_churn() {
+        for n in [2, 3, 10] {
+            let (calls, lat) = churn2(n).await;
+            let at = |pred: &dyn Fn(&Op) -> bool| calls.iter().find(|c| pred(&c.op)).map(|c| c.at);
+            let create = at(&|op| matches!(op, Op::CreateTopic { .. }));
+            let decision = at(&|op| matches!(op, Op::Edit { message_id: 999, .. }));
+            let react = at(&|op| matches!(op, Op::React { message_id: 555, .. }));
+            let cb = at(&|op| matches!(op, Op::AnswerCallback { .. }));
+            let max = lat.iter().skip(n as usize).max().copied();
+            eprintln!("CREV2 n={n}: createTopic {create:?}, decision {decision:?}, reaction {react:?}, callback {cb:?} (submitted 10s); refresh max latency {max:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crev2_prompt_after_flushed_line_with_last_token() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<(u64, Op)> = (0..5).map(|i| (0, send(9, &format!("x{i}")))).collect();
+        ops.push((4000, line(1, "a ✓")));
+        ops.push((4050, permission(1, "prompt")));
+        run_timed(&fake, ops).await;
+        eprintln!("CREV2 prompt-flush thin budget: {:?}", stream_times(&fake));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crev2_prompt_without_lines_thin_budget() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<(u64, Op)> = (0..5).map(|i| (0, send(9, &format!("x{i}")))).collect();
+        ops.push((4050, permission(1, "prompt")));
+        run_timed(&fake, ops).await;
+        eprintln!("CREV2 prompt alone thin budget: {:?}", stream_times(&fake));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crev2_foreground_stream_starves_refresh() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<(u64, Op)> = (0..5).map(|i| (0, edit(2000 + i, "drain"))).collect();
+        ops.push((100, refresh(1, "status")));
+        for i in 0..40u64 {
+            ops.push((i * 3000, Op::React { message_id: 1000 + i as i64, emoji: "x".into() }));
+        }
+        run_timed(&fake, ops).await;
+        let at = fake.calls().iter().find(|c| matches!(c.op, Op::Edit { message_id: 1, .. })).map(|c| c.at);
+        eprintln!("CREV2 refresh under a reaction every 3 s went at {at:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crev2_429_foreground_then_newer_background() {
+        let fake = Fake::with_delay(&[5], ms(100));
+        let answers = run_timed(&fake, vec![(0, edit(1, "question")), (50, refresh(1, "refresh"))]).await;
+        let calls: Vec<(String, Duration, bool)> = fake.calls().iter().map(|c| (text_of(&c.op).to_owned(), c.at, c.op.background())).collect();
+        eprintln!("CREV2 429 fg->bg: {calls:?} answers {:?}", answers.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>());
+    }

@@ -1,0 +1,50 @@
+    // Appended to hub::scheduler::tests in a %TEMP% copy (code-reviewer repro).
+    // N slots whose status changes on every tick behave like pump_status:
+    // one edit in flight per slot, the next one 5 s after the previous submit.
+    async fn churn(n: i64) -> (Vec<Call>, Vec<Duration>) {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        tokio::spawn(scheduler.run());
+        let latencies = Arc::new(Mutex::new(Vec::new()));
+        for slot in 0..n {
+            let outbox = outbox.clone();
+            let latencies = latencies.clone();
+            tokio::spawn(async move {
+                let mut tick = 0u64;
+                loop {
+                    let submitted = Instant::now();
+                    let rx = outbox.submit(edit(100 + slot, &format!("s{slot}:{tick}"))).await;
+                    let _ = rx.await;
+                    latencies.lock().unwrap().push(Instant::now() - submitted);
+                    tick += 1;
+                    sleep_until(submitted + Duration::from_secs(5)).await;
+                }
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let _ = outbox
+            .submit(Op::CreateTopic { name: "new-session".into(), icon_custom_emoji_id: None })
+            .await;
+        let _ = outbox.submit(edit(999, "decision")).await;
+        let _ = outbox.submit(Op::React { message_id: 555, emoji: "x".into() }).await;
+        tokio::time::sleep(Duration::from_secs(170)).await;
+        let l = latencies.lock().unwrap().clone();
+        (fake.calls(), l)
+    }
+
+    fn report(n: i64, calls: &[Call], lat: &[Duration]) {
+        let at = |pred: &dyn Fn(&Op) -> bool| calls.iter().find(|c| pred(&c.op)).map(|c| c.at);
+        let create = at(&|op| matches!(op, Op::CreateTopic { .. }));
+        let decision = at(&|op| matches!(op, Op::Edit { message_id: 999, .. }));
+        let react = at(&|op| matches!(op, Op::React { message_id: 555, .. }));
+        let max = lat.iter().skip(n as usize).max().copied();
+        eprintln!("REPRO n={n}: createTopic at {create:?}, decision edit at {decision:?}, reaction at {react:?} (all submitted at 10s); status edit max latency {max:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repro_edit_lane_under_status_churn() {
+        for n in [2, 3, 10] {
+            let (calls, lat) = churn(n).await;
+            report(n, &calls, &lat);
+        }
+    }

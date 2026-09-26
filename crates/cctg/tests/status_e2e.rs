@@ -169,6 +169,7 @@ fn edits(ops: &[Op], message: i64) -> Vec<(String, Vec<String>)> {
                 message_id,
                 text,
                 reply_markup,
+                ..
             } if *message_id == message => {
                 let buttons = reply_markup
                     .as_ref()
