@@ -620,7 +620,8 @@ EOF
       { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
     ],
     "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
-    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PermissionRequest", "timeout": 100 }] }]
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PermissionRequest", "timeout": 100 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PreCompact", "timeout": 5 }] }]
   }
 }
 EOF

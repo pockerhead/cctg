@@ -127,6 +127,17 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cctg hook PreCompact",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

@@ -1091,7 +1091,9 @@ impl Registry {
             | HookEvent::SubagentStop { .. }
             | HookEvent::SubagentHandback { .. } => Followup::default(),
             // What a session does now lives in the slots actor only.
-            HookEvent::ToolStart { .. } | HookEvent::ToolEnd { .. } => Followup::default(),
+            HookEvent::ToolStart { .. }
+            | HookEvent::ToolEnd { .. }
+            | HookEvent::PreCompact { .. } => Followup::default(),
             HookEvent::StatusLine {
                 model,
                 effort,
