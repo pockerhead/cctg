@@ -406,6 +406,9 @@ fn install_update_and_uninstall_a_device() {
         .map(String::as_str)
         .collect();
     assert_eq!(events, EVENTS.into_iter().collect());
+    // The session's status line is cctg's (TASK-056): its own two lines, or
+    // the user's command chained through it.
+    assert_eq!(settings["statusLine"]["type"], "command");
     let mut commands = vec![
         settings["statusLine"]["command"]
             .as_str()
