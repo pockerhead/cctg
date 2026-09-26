@@ -201,6 +201,30 @@ pub fn receipt(stream: &mut Stream, message_id: i64) {
         stream.receipts.remove(0);
     }
     stream.receipts.push(message_id);
+    let receipts = &stream.receipts;
+    stream.parts.retain(|(key, _)| receipts.contains(key));
+}
+
+/// Messages handed to the session's agent as one inbound (TASK-048), in
+/// order: the last one, whose id the inbound's `message_id` carries, waits
+/// for ✍ like [`receipt`]; the others turn ✍ with it ([`take_parts`]).
+pub fn receipt_parts(stream: &mut Stream, message_ids: &[i64]) {
+    let Some((&key, others)) = message_ids.split_last() else {
+        return;
+    };
+    receipt(stream, key);
+    stream.parts.retain(|(known, _)| *known != key);
+    if !others.is_empty() {
+        stream.parts.push((key, others.to_vec()));
+    }
+}
+
+/// The other messages of the burst whose receipt `key` turned ✍.
+pub fn take_parts(stream: &mut Stream, key: i64) -> Vec<i64> {
+    match stream.parts.iter().position(|(known, _)| *known == key) {
+        Some(at) => stream.parts.remove(at).1,
+        None => Vec::new(),
+    }
 }
 
 /// A turn answer held until the stream lines before it are handed out.
@@ -720,6 +744,33 @@ mod tests {
         }
         assert_eq!(stream.receipts.len(), MAX_RECEIPTS);
         assert_eq!(stream.receipts[0], 5);
+    }
+
+    #[test]
+    fn a_burst_waits_on_its_last_message_and_its_parts_go_with_it_once() {
+        let mut stream = Stream::default();
+        receipt_parts(&mut stream, &[1, 2, 3]);
+        receipt_parts(&mut stream, &[4]);
+        assert_eq!(stream.receipts, [3, 4]);
+        assert_eq!(stream.parts, [(3, vec![1, 2])]);
+        let steps = apply_line(
+            &mut Vec::new(),
+            &mut stream.receipts,
+            &[StreamItem::Channel { message_id: 3 }],
+        );
+        assert_eq!(steps, [Step::Working(3)]);
+        assert_eq!(take_parts(&mut stream, 3), [1, 2]);
+        assert!(take_parts(&mut stream, 3).is_empty(), "only once");
+        assert!(
+            take_parts(&mut stream, 4).is_empty(),
+            "a lone message has none"
+        );
+        // Parts leave with their receipt when newer ones push it out.
+        receipt_parts(&mut stream, &[10, 11]);
+        for id in 100..(100 + MAX_RECEIPTS as i64) {
+            receipt(&mut stream, id);
+        }
+        assert!(stream.parts.is_empty());
     }
 
     #[test]
