@@ -325,6 +325,7 @@ fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
             query_id: "q".into(),
             data: Some(questions::callback_data(id, question, press)),
             message_id: Some(message_id),
+            from_name: None,
         }))
         .unwrap();
 }
@@ -339,6 +340,7 @@ fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
             quote: None,
             forwarded: false,
             media: None,
+            from_name: None,
         }))
         .unwrap();
 }
