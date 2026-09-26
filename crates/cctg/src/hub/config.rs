@@ -16,8 +16,13 @@ pub const ALLOWLIST_VAR: &str = "CCTG_ALLOWED_USER_IDS";
 /// Optional: hub state directory (the saved `getUpdates` offset); defaults to `.cctg`.
 pub const STATE_VAR: &str = "CCTG_STATE_DIR";
 pub const DEFAULT_STATE_DIR: &str = ".cctg";
-/// Shared secret of agents and hooks; required by `cctg hub`.
+/// Shared secret of agents and hooks; required by `cctg hub` while
+/// [`SHARED_VAR`] is on.
 pub const SECRET_VAR: &str = "CCTG_HUB_SECRET";
+/// Optional, `on` (default) or `off`: whether the hub still takes
+/// [`SECRET_VAR`] from agents and hooks. Off once every device has its own
+/// secret (TASK-045, `cctg join`).
+pub const SHARED_VAR: &str = "CCTG_SHARED_SECRET";
 /// Optional: agent TCP listener `ip:port`; defaults to loopback.
 pub const AGENT_LISTEN_VAR: &str = "CCTG_AGENT_LISTEN";
 /// Optional: hook HTTP listener `ip:port`; defaults to loopback.
@@ -51,6 +56,8 @@ pub enum ConfigError {
     EnvFile { path: String, reason: &'static str },
     #[error("{SECRET_VAR} is invalid: {0}")]
     Secret(SecretError),
+    #[error("{SHARED_VAR} must be on or off")]
+    Shared,
     #[error("{0} must be an ip:port address such as 127.0.0.1:47291 (host names are not resolved)")]
     ListenAddr(&'static str),
     #[error("{API_URL_VAR} must start with https://, or http:// to a loopback host")]
@@ -110,8 +117,11 @@ pub struct Config {
     pub chat_id: i64,
     pub allowlist: Allowlist,
     pub state_dir: PathBuf,
-    /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start then.
+    /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start
+    /// then, unless `shared_secret` is off.
     pub hub_secret: Option<Secret>,
+    /// [`SHARED_VAR`]: agents and hooks may use `hub_secret`.
+    pub shared_secret: bool,
     /// Loopback unless configured; any other address is an explicit choice.
     pub agent_listen: SocketAddr,
     pub hook_listen: SocketAddr,
@@ -194,6 +204,12 @@ impl Config {
         let hub_secret = optional(SECRET_VAR)
             .map(|value| Secret::parse(&value).map_err(ConfigError::Secret))
             .transpose()?;
+        let shared_secret = match optional(SHARED_VAR).map(|value| value.to_ascii_lowercase()) {
+            None => true,
+            Some(value) if value == "on" => true,
+            Some(value) if value == "off" => false,
+            Some(_) => return Err(ConfigError::Shared),
+        };
         let listen = |name: &'static str, default: SocketAddr| {
             optional(name).map_or(Ok(default), |value| {
                 value.parse().map_err(|_| ConfigError::ListenAddr(name))
@@ -220,12 +236,30 @@ impl Config {
             allowlist,
             state_dir,
             hub_secret,
+            shared_secret,
             agent_listen,
             hook_listen,
             api_url,
             tls,
         })
     }
+}
+
+/// The hub state directory alone ([`STATE_VAR`], process environment first,
+/// then `env_file` or `./.env`), for `cctg hub code`: it needs neither the
+/// token nor the other settings.
+pub fn state_dir(env_file: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let file_vars = match env_file {
+        Some(path) => load_env_file(path)?,
+        None if Path::new(".env").is_file() => load_env_file(Path::new(".env"))?,
+        None => HashMap::new(),
+    };
+    let value = std::env::var(STATE_VAR)
+        .ok()
+        .or_else(|| file_vars.get(STATE_VAR).cloned())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    Ok(PathBuf::from(value.as_deref().unwrap_or(DEFAULT_STATE_DIR)))
 }
 
 /// `http://localhost`, `http://127.x.x.x` or `http://[::1]`, any port and path.
@@ -547,6 +581,25 @@ mod tests {
                 ConfigError::TlsPair
             );
         }
+    }
+
+    #[test]
+    fn the_shared_secret_is_on_unless_turned_off() {
+        let base = [
+            (TOKEN_VAR, "123:abc"),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+        ];
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let pairs: Vec<_> = base.iter().chain(extra).copied().collect();
+            Config::from_vars(vars(&pairs))
+        };
+        assert!(with(&[]).unwrap().shared_secret);
+        assert!(with(&[(SHARED_VAR, " On ")]).unwrap().shared_secret);
+        assert!(!with(&[(SHARED_VAR, "OFF")]).unwrap().shared_secret);
+        let error = with(&[(SHARED_VAR, "maybe-secret-value")]).unwrap_err();
+        assert_eq!(error, ConfigError::Shared);
+        assert!(!error.to_string().contains("maybe-secret-value"));
     }
 
     #[test]

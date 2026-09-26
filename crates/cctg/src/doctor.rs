@@ -12,6 +12,7 @@ use std::time::Duration;
 use crate::client;
 use crate::device::DeviceConfig;
 use crate::hook::{self, PostError};
+use crate::hub::devices::secret_device_id;
 
 /// Per check; a far hub over TLS answers well within it.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,7 +40,10 @@ pub async fn check(config: &DeviceConfig, timeout: Duration) -> Report {
     };
     let secret = match &config.secret {
         Ok(secret) => {
-            lines.push("secret: set".to_owned());
+            lines.push(match secret_device_id(secret) {
+                Some(id) => format!("secret: set, this device's own (device {id})"),
+                None => "secret: set, the hub's shared secret".to_owned(),
+            });
             Some(secret)
         }
         Err(problem) => {
@@ -80,7 +84,10 @@ pub async fn check(config: &DeviceConfig, timeout: Duration) -> Report {
             Ok(()) => lines.push(format!("hooks {hooks}: reachable, the hub took the secret")),
             Err(PostError::Status(401)) => fail(
                 &mut lines,
-                format!("hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET)"),
+                format!(
+                    "hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET; a device \
+                     secret may have been revoked: join again with a new code, cctg join)"
+                ),
             ),
             // A hub from before `cctg doctor` has no ping route.
             Err(PostError::Status(404)) => lines.push(format!(

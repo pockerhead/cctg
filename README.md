@@ -35,7 +35,7 @@ Hub это один процесс с ботом. Он живёт на серв�
 curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub
 ```
 
-Установщик спросит токен бота (не показывается при вводе), id группы, ваш id, адрес сервера и, если Telegram с сервера доступен только через прокси, адрес прокси. Он сам сделает секрет и сертификат, запустит hub в Docker и проверит бота и группу. В конце он печатает строку для установки клиентов. В ней секрет hub: вставляйте её только на своих машинах.
+Установщик спросит токен бота (не показывается при вводе), id группы, ваш id, адрес сервера и, если Telegram с сервера доступен только через прокси, адрес прокси. Он сам сделает секрет и сертификат, запустит hub в Docker и проверит бота и группу. В конце он печатает строку для установки клиента. В ней одноразовый код: он работает один раз и 10 минут, секрета hub в строке нет. Код для следующей машины: `cd ~/cctg-hub && docker compose exec hub cctg hub code`.
 
 Подробности (прокси, обновление, порты): `docs/remote-hub.md`.
 
@@ -44,10 +44,12 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 Выполните строку, которую напечатал hub (в Windows это Git Bash). Она выглядит так:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | CCTG_HUB_SECRET='...' sh -s -- --hub-host <сервер> --pin <отпечаток>
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub-host <сервер> --pin <отпечаток> --join XXXX-XXXX-XXXX-XXXX
 ```
 
-Без строки можно так, установщик всё спросит (секрет при вводе не показывается):
+Установщик обменяет код на собственный секрет этой машины и запишет его в `~/.cctg/device.env`, на экран секрет не попадает. Для каждой машины нужен свой код. Список машин и кнопка «Отозвать»: `/devices` в теме General.
+
+Без строки можно так, установщик всё спросит:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh
