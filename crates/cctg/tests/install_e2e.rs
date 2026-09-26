@@ -426,6 +426,37 @@ fn install_update_and_uninstall_a_device() {
             "{command}"
         );
     }
+    // The question hook group (TASK-038) is the one docs/hook-settings.json
+    // shows, but for the command's path.
+    let documented: Value =
+        serde_json::from_str(include_str!("../../../docs/hook-settings.json")).unwrap();
+    let question_group = |settings: &Value| {
+        settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["matcher"] == "AskUserQuestion")
+            .cloned()
+            .expect("an AskUserQuestion group")
+    };
+    let mut installed = question_group(&settings);
+    let documented = question_group(&documented);
+    let hook = &installed["hooks"][0];
+    assert!(
+        hook["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("\" hook PreToolUse"),
+        "{hook}"
+    );
+    assert_eq!(hook["timeout"], 330);
+    assert!(
+        hook["statusMessage"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    installed["hooks"][0]["command"] = documented["hooks"][0]["command"].clone();
+    assert_eq!(installed, documented);
 
     let wrapper = std::fs::read_to_string(run.wrapper()).unwrap();
     assert!(

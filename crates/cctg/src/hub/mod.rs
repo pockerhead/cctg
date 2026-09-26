@@ -9,6 +9,7 @@ pub mod fetch;
 pub mod ingress;
 pub mod offset;
 pub mod permissions;
+pub mod questions;
 pub mod registry;
 pub mod scheduler;
 pub mod slots;
@@ -322,6 +323,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
     let permission_asks = slots.permission_asks();
+    let question_asks = slots.question_asks();
     let transcript_asks = slots.transcript_asks();
     slots.fetch_files(api.clone());
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -338,11 +340,12 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         secret.clone(),
         agents_tx,
     ));
-    tokio::spawn(ingress::serve_hooks_and_permissions(
+    tokio::spawn(ingress::serve_hooks_and_asks(
         hook_listener,
         secret,
         hooks_tx,
         permission_asks,
+        question_asks,
     ));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let actor = tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));

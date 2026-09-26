@@ -66,6 +66,17 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cctg hook PreToolUse",
+            "timeout": 330,
+            "statusMessage": "Вопрос в Telegram: ответьте там или кнопкой «В терминале»"
+          }
+        ]
+      },
+      {
         "hooks": [
           {
             "type": "command",

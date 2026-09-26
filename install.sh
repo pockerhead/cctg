@@ -31,7 +31,7 @@ set -eu
 REPO=pockerhead/cctg
 # The release this script belongs to. Bumped in the commit that gets the
 # tag; release.yml refuses a tag that differs.
-RELEASE=v0.1.5
+RELEASE=v0.1.6
 # Marks every wrapper this script writes; --uninstall removes only those.
 MARK=cctg-install
 # device.env keys this script sets; other lines of the file are kept.
@@ -611,7 +611,10 @@ EOF
     "Stop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook Stop" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStart" }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStop" }] }],
-    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
+    "PreToolUse": [
+      { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "\"$c\" hook PreToolUse", "timeout": 330, "statusMessage": "Вопрос в Telegram: ответьте там или кнопкой «В терминале»" }] },
+      { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
+    ],
     "PostToolUse": [
       { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"$c\" hook PostToolUse" }] },
       { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
