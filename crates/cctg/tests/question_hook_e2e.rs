@@ -5,7 +5,8 @@
 //! topic come back as Claude Code's `allow` + `updatedInput` with `answers`;
 //! ⌨ В терминале, a question nobody answers and a stopped hub give no
 //! decision, exit 0 and an empty stdout; the `PermissionRequest` hook of a
-//! question never waits and shows no Allow/Deny.
+//! question never waits, shows no Allow/Deny and tells the topic once that
+//! the client lacks the question hook.
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -70,6 +71,19 @@ impl Fake {
                     if markup.to_string().contains("\"allow:"))
             })
             .count()
+    }
+
+    /// Sends of the "no question hook" notice: whether each had buttons.
+    fn hook_hints(&self) -> Vec<bool> {
+        self.ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    text, reply_markup, ..
+                } if text == questions::NO_HOOK_NOTICE => Some(reply_markup.is_some()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn last_edit_of(&self, message: i64) -> Option<String> {
@@ -391,13 +405,14 @@ async fn own_text_answers_after_other_or_as_a_reply() {
     until("question", || hub.fake.questions().len() == 1).await;
     let (message_id, id) = hub.fake.questions().remove(0);
     press(&hub, message_id, &id, 0, Press::Other);
-    say(&hub, 50, "Teal, like the sea", None);
+    // Cyrillic own text: the hook's stdout carries it as UTF-8 JSON.
+    say(&hub, 50, "Бирюзовый, как море", None);
     // The second question: a tick, then a reply to the question message.
     press(&hub, message_id, &id, 1, Press::Option(1));
     say(&hub, 51, "and a fig", Some(message_id));
     let (output, _) = running.await.unwrap();
     assert_clean(&output);
-    assert_answers(&output, "Teal, like the sea", "Pear, and a fig");
+    assert_answers(&output, "Бирюзовый, как море", "Pear, and a fig");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -443,13 +458,17 @@ async fn an_unanswered_question_gives_no_decision() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_permission_hook_of_a_question_never_waits() {
     let hub = hub("permission", Duration::from_secs(60)).await;
-    let (output, elapsed) = run_hook(home("permission", &hub.addr), "PermissionRequest").await;
-    assert_clean(&output);
-    assert!(output.stdout.is_empty());
-    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    for _ in 0..2 {
+        let (output, elapsed) = run_hook(home("permission", &hub.addr), "PermissionRequest").await;
+        assert_clean(&output);
+        assert!(output.stdout.is_empty());
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(hub.fake.permission_prompts(), 0, "no Allow/Deny");
     assert!(hub.fake.questions().is_empty());
+    // No question hook asked first: the topic is told once, without buttons.
+    assert_eq!(hub.fake.hook_hints(), [false]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

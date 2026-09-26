@@ -194,9 +194,9 @@ use super::updates::{CallbackInput, Inbound};
 use crate::channel::is_request_id;
 use crate::files;
 use crate::wire::{
-    AgentMsg, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome, HookEvent,
-    HookPost, HubMsg, PermissionPost, PermissionRequest, QUESTION_TOOL, SessionAnswer, SessionAsk,
-    StreamItem, StreamLine, UpdateOutcome,
+    AgentMsg, Answered, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome,
+    HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest, QUESTION_TOOL, SessionAnswer,
+    SessionAsk, StreamItem, StreamLine, UpdateOutcome,
 };
 
 /// The longest text one session read may bring, as the agent sends at most
@@ -243,6 +243,10 @@ const HOOK_CHECK_EVERY: Duration = Duration::from_secs(1);
 /// A question nobody answered by then goes to the terminal: its hook gets
 /// no decision, under the hook's own 310 s and the 330 s the settings give it.
 pub const QUESTION_WAIT: Duration = Duration::from_secs(300);
+/// A question's `PermissionRequest` hook this soon after a question hook of
+/// its session follows that hook's "no decision" (the settings give the
+/// question hook 330 s); later, the session's client has no question hook.
+const QUESTION_HOOK_WINDOW: Duration = Duration::from_secs(340);
 /// Channel requests remembered for a hook that comes after them.
 const MAX_RELAYED: usize = 64;
 /// Bytes of files from sessions held at a time, being received or waiting
@@ -774,7 +778,7 @@ struct Waiter {
 
 /// The waiting hook of a question.
 struct QuestionWaiter {
-    answer: oneshot::Sender<Option<Vec<String>>>,
+    answer: oneshot::Sender<Option<Vec<Answered>>>,
     until: Instant,
 }
 
@@ -874,6 +878,9 @@ pub struct Slots {
     questions: Asks,
     /// Hooks waiting for the answers, by the key of their question.
     question_waiters: HashMap<u64, QuestionWaiter>,
+    /// When each session's question hook last asked; pruned after
+    /// [`QUESTION_HOOK_WINDOW`].
+    question_hooks: HashMap<String, Instant>,
     /// Typed subagents not yet matched to an `Agent` call of their parent.
     candidates: Candidates,
     /// Subagents of live top-level sessions that started and did not stop
@@ -992,6 +999,7 @@ impl Slots {
             question_asks: None,
             questions: Asks::default(),
             question_waiters: HashMap::new(),
+            question_hooks: HashMap::new(),
             candidates: Candidates::default(),
             started_agents: HashMap::new(),
             indexes: HashMap::new(),
@@ -4109,6 +4117,7 @@ impl Slots {
                 session = short(&session),
                 "permission hook of a question; its PreToolUse hook asks; no decision"
             );
+            self.hint_question_hook(&session);
             return;
         }
         if !self.registry.is_live_top_level(&session) {
@@ -4282,13 +4291,63 @@ impl Slots {
         self.sync_waiting(&gone.session);
     }
 
-    /// An `AskUserQuestion` hook asks. Only a live top-level session gets a
-    /// question in its topic; dropping `ask.answer` is the "no decision"
-    /// answer.
+    /// A question came as a `PermissionRequest` hook only. Unless a question
+    /// hook of the session asked within [`QUESTION_HOOK_WINDOW`] (this is its
+    /// "no decision" going on), its client has none: the topic is told once
+    /// per session that the question waits in the terminal and how to get
+    /// the hook.
+    fn hint_question_hook(&mut self, session: &str) {
+        let now = Instant::now();
+        self.question_hooks
+            .retain(|_, at| now.saturating_duration_since(*at) <= QUESTION_HOOK_WINDOW);
+        if self.question_hooks.contains_key(session) {
+            return;
+        }
+        let Some(slot) = self.current_slot(session) else {
+            return;
+        };
+        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+            return;
+        };
+        if self
+            .registry
+            .sessions
+            .get(session)
+            .is_none_or(|entry| entry.question_hint)
+        {
+            return;
+        }
+        if self.send_messages(vec![message_op(
+            thread_id,
+            questions::NO_HOOK_NOTICE.to_owned(),
+        )]) {
+            if let Some(entry) = self.registry.sessions.get_mut(session) {
+                entry.question_hint = true;
+            }
+            info!(
+                session = short(session),
+                "question without a question hook; the topic is told once"
+            );
+        }
+    }
+
+    /// The topic of `session`'s slot, if it has one.
+    fn session_topic(&self, session: &str) -> Option<i64> {
+        let slot = self.registry.sessions.get(session)?.slot?;
+        self.registry.slot(slot)?.topic_id
+    }
+
+    /// An `AskUserQuestion` hook asks. Only a live top-level session whose
+    /// slot has a topic gets a question there; dropping `ask.answer` is the
+    /// "no decision" answer.
     fn on_question_ask(&mut self, ask: QuestionAsk) {
         let QuestionAsk { post, answer } = ask;
         let session = post.session_id.clone();
-        if !self.registry.is_live_top_level(&session) {
+        let now = Instant::now();
+        self.question_hooks
+            .retain(|_, at| now.saturating_duration_since(*at) <= QUESTION_HOOK_WINDOW);
+        self.question_hooks.insert(session.clone(), now);
+        if !self.registry.is_live_top_level(&session) || self.session_topic(&session).is_none() {
             debug!(
                 session = short(&session),
                 "question hook of a session without a live topic; no decision"
@@ -4357,7 +4416,12 @@ impl Slots {
                 match ask.answers() {
                     Some(answers) => match waiter.answer.send(Some(answers)) {
                         Ok(()) => info!(session, "question answers handed to the hook"),
-                        Err(_) => info!(session, "question hook left before the answers"),
+                        Err(_) => {
+                            info!(session, "question hook left before the answers");
+                            if let Some(ask) = self.questions.get_mut(key) {
+                                ask.answers_not_taken();
+                            }
+                        }
                     },
                     None => debug!(session, "question hook gets no decision"),
                 }
@@ -4394,14 +4458,9 @@ impl Slots {
             if !ask.is_open() || ask.thread_id.is_some() {
                 continue;
             }
-            let thread_id = self
-                .registry
-                .sessions
-                .get(&ask.session)
-                .and_then(|entry| entry.slot)
-                .and_then(|slot| self.registry.slot(slot))
-                .and_then(|slot| slot.topic_id);
-            let Some(thread_id) = thread_id else {
+            let Some(thread_id) = self.session_topic(&ask.session) else {
+                // Nowhere to show it: the terminal dialog, not a silent wait.
+                self.end_question(key, questions::State::Expired);
                 continue;
             };
             let op = Op::Send {
@@ -7566,7 +7625,7 @@ again"
         }
     }
 
-    async fn question_ask(rig: &Rig, session: &str) -> oneshot::Receiver<Option<Vec<String>>> {
+    async fn question_ask(rig: &Rig, session: &str) -> oneshot::Receiver<Option<Vec<Answered>>> {
         let (answer, answered) = oneshot::channel();
         let post = question_post(session);
         rig.questions
@@ -7577,8 +7636,8 @@ again"
     }
 
     async fn question_answer(
-        answered: oneshot::Receiver<Option<Vec<String>>>,
-    ) -> Option<Vec<String>> {
+        answered: oneshot::Receiver<Option<Vec<Answered>>>,
+    ) -> Option<Vec<Answered>> {
         tokio::time::timeout(WAIT, answered)
             .await
             .expect("question hook answered in time")
@@ -7654,7 +7713,16 @@ again"
             .unwrap();
         assert_eq!(
             question_answer(answered).await,
-            Some(vec!["Blue".to_owned(), "Plum, and a fig".to_owned()])
+            Some(vec![
+                Answered {
+                    options: vec![1],
+                    text: None
+                },
+                Answered {
+                    options: vec![2],
+                    text: Some("and a fig".into())
+                }
+            ])
         );
         let ops = settled(&rig, |ops| {
             edited_to(ops, message_id, questions::ANSWERED_TITLE)
@@ -7803,6 +7871,164 @@ again"
             prompts(&ops)
         );
         drop(answered);
+    }
+
+    /// Sends of the "no question hook" notice: (topic, has buttons).
+    fn hook_hints(ops: &[Op]) -> Vec<(i64, bool)> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(thread),
+                    text,
+                    reply_markup,
+                    ..
+                } if text == questions::NO_HOOK_NOTICE => Some((*thread, reply_markup.is_some())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A client without the question hook (settings from before TASK-038)
+    /// asks only through the `PermissionRequest` hook: no decision at once
+    /// and one plain notice per session. A session whose question hook
+    /// asked just before (its "no decision" going on) gets no notice.
+    #[tokio::test]
+    async fn a_question_without_its_hook_is_told_once_per_session() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        for _ in 0..2 {
+            let asked = std::time::Instant::now();
+            assert_eq!(
+                hook_answer(hook_ask(&rig, A, QUESTION_TOOL).await).await,
+                None
+            );
+            assert!(asked.elapsed() < TWIN_WINDOW, "{:?}", asked.elapsed());
+        }
+        let ops = settled(&rig, |ops| !hook_hints(ops).is_empty()).await;
+        assert_eq!(hook_hints(&ops), [(100, false)]);
+        // B has the question hook: its question went to the terminal first.
+        let answered = question_ask(&rig, B).await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (thread, _, message_id) = prompts(&ops).remove(0);
+        assert_eq!(thread, 101);
+        let id = question_id(&ops, 0);
+        rig.control
+            .send(press_of(
+                "q1",
+                message_id,
+                &questions::callback_data(&id, 0, questions::Press::Terminal),
+            ))
+            .unwrap();
+        assert_eq!(question_answer(answered).await, None);
+        assert_eq!(
+            hook_answer(hook_ask(&rig, B, QUESTION_TOOL).await).await,
+            None
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hook_hints(&rig.fake.ops()), [(100, false)]);
+    }
+
+    /// A live session whose slot has no topic (its creation hangs) gets no
+    /// decision at once, not a silent five-minute wait.
+    #[tokio::test]
+    async fn a_question_of_a_session_without_a_topic_goes_to_the_terminal_at_once() {
+        let fake = Fake {
+            stall: true,
+            ..Fake::default()
+        };
+        let rig = rig(fake, message_options());
+        rig.hook(start(A, 10)).await;
+        let asked = std::time::Instant::now();
+        assert_eq!(question_answer(question_ask(&rig, A).await).await, None);
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            asked.elapsed()
+        );
+    }
+
+    /// Two sessions ask at once in their own topics: presses and texts of
+    /// one topic never touch the other's question.
+    #[tokio::test]
+    async fn questions_of_two_sessions_never_mix() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, true).await;
+        let answered_a = question_ask(&rig, A).await;
+        settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let answered_b = question_ask(&rig, B).await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
+        let found = prompts(&ops);
+        let ((thread_a, _, message_a), (thread_b, _, message_b)) =
+            (found[0].clone(), found[1].clone());
+        assert_eq!((thread_a, thread_b), (100, 101));
+        let (id_a, id_b) = (question_id(&ops, 0), question_id(&ops, 1));
+        let press_in = |query: &str, message: i64, id: &str, question, press| {
+            press_of(
+                query,
+                message,
+                &questions::callback_data(id, question, press),
+            )
+        };
+        // ✏️ Другое in A; a text in B's topic goes to B's session.
+        rig.control
+            .send(press_in("q1", message_a, &id_a, 0, questions::Press::Other))
+            .unwrap();
+        rig.control
+            .send(say(Some(101), 60, Some("for session B")))
+            .unwrap();
+        let texts = inbound_contents(&received(&mut rig, 1).await);
+        assert!(
+            texts.len() == 1 && texts[0].contains("for session B"),
+            "{texts:?}"
+        );
+        // A's own text; B's button pressed on A's message changes nothing.
+        rig.control.send(say(Some(100), 61, Some("Teal"))).unwrap();
+        rig.control
+            .send(press_in(
+                "q2",
+                message_a,
+                &id_b,
+                1,
+                questions::Press::Terminal,
+            ))
+            .unwrap();
+        for (query, press) in [
+            ("q3", questions::Press::Option(0)),
+            ("q4", questions::Press::Done),
+        ] {
+            rig.control
+                .send(press_in(query, message_a, &id_a, 1, press))
+                .unwrap();
+        }
+        assert_eq!(
+            question_answer(answered_a).await,
+            Some(vec![
+                Answered {
+                    options: vec![],
+                    text: Some("Teal".into())
+                },
+                Answered {
+                    options: vec![0],
+                    text: None
+                }
+            ])
+        );
+        rig.control
+            .send(press_in(
+                "q5",
+                message_b,
+                &id_b,
+                0,
+                questions::Press::Terminal,
+            ))
+            .unwrap();
+        assert_eq!(question_answer(answered_b).await, None);
+        settled(&rig, |ops| {
+            edited_to(ops, message_a, questions::ANSWERED_TITLE)
+                && edited_to(ops, message_b, questions::TERMINAL_TITLE)
+        })
+        .await;
+        assert!(inbound_contents(&received(&mut rig, 0).await).is_empty());
     }
 
     /// The request id on the buttons of the permission send `index`.

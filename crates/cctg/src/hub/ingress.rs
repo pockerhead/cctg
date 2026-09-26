@@ -680,7 +680,7 @@ pub struct QuestionAsk {
     pub post: QuestionPost,
     /// `Some`: one answer per question, chosen in Telegram. `None` or
     /// dropped: no decision.
-    pub answer: oneshot::Sender<Option<Vec<String>>>,
+    pub answer: oneshot::Sender<Option<Vec<wire::Answered>>>,
 }
 
 /// Where waiting hooks go, and how many may wait at a time. `questions`:

@@ -1151,7 +1151,8 @@ pub fn decode_permission(body: &[u8]) -> Result<PermissionPost, WireError> {
 
 /// Claude Code's tool that asks the user multiple-choice questions
 /// (TASK-038). Its `PreToolUse` hook asks the hub at [`QUESTION_PATH`]; the
-/// permission paths leave it alone.
+/// hub shows no Allow/Deny for it and gives its `PermissionRequest` hook no
+/// decision at once.
 pub const QUESTION_TOOL: &str = "AskUserQuestion";
 pub const QUESTION_PATH: &str = "/v1/question";
 /// Questions of one `AskUserQuestion` call, as its input allows at most.
@@ -1190,11 +1191,22 @@ pub struct AskedOption {
     pub description: String,
 }
 
-/// One answer per question, in order: an option label, the labels of a
-/// multiSelect question joined by `, `, or the user's own text.
+/// One answer per question, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionAnswer {
-    pub answers: Vec<String>,
+    pub answers: Vec<Answered>,
+}
+
+/// The answer to one question: the chosen options by index into the
+/// question's options, and the user's own text. The hook turns the indexes
+/// into the labels of the original tool input, so Claude gets exactly the
+/// labels it offered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answered {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Also checks the shape the hub can show: 1 to [`MAX_QUESTIONS`] questions
@@ -2258,10 +2270,22 @@ mod tests {
             assert_eq!(decode_question(&body), Err(WireError::Malformed));
         }
         let answer = serde_json::to_string(&QuestionAnswer {
-            answers: vec!["A, B".into()],
+            answers: vec![
+                Answered {
+                    options: vec![0, 2],
+                    text: Some("и свой".into()),
+                },
+                Answered {
+                    options: vec![1],
+                    text: None,
+                },
+            ],
         })
         .unwrap();
-        assert_eq!(answer, r#"{"answers":["A, B"]}"#);
+        assert_eq!(
+            answer,
+            r#"{"answers":[{"options":[0,2],"text":"и свой"},{"options":[1]}]}"#
+        );
     }
 
     #[test]

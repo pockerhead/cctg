@@ -22,7 +22,7 @@ use transcript::TELEGRAM_TEXT_LIMIT;
 use super::permissions::no_keyboard;
 use super::registry::cut;
 use crate::channel::is_request_id;
-use crate::wire::AskedQuestion;
+use crate::wire::{Answered, AskedQuestion};
 
 /// Asks kept at a time, open or owing their last edit; one more is refused
 /// and its hook gets no decision.
@@ -35,6 +35,8 @@ const BUTTON_LABEL: usize = 40;
 /// UTF-16 units of a question and of an option in the message text.
 const QUESTION_TEXT: usize = 1500;
 const OPTION_TEXT: usize = 300;
+/// Bytes of the user's own answer kept (more than one Telegram message).
+pub const MAX_OWN_TEXT: usize = 16 << 10;
 
 pub const OTHER_BUTTON: &str = "✏️ Другое";
 pub const TERMINAL_BUTTON: &str = "⌨ В терминале";
@@ -53,6 +55,12 @@ pub const TERMINAL_TITLE: &str = "⌨ Вопрос ушёл в терминал"
 pub const EXPIRED_TITLE: &str = "⌛ Ответа не было, вопрос ушёл в терминал";
 pub const GONE_TITLE: &str = "Вопрос закрыт в терминале";
 pub const CLOSED_TITLE: &str = "Сессия завершилась";
+/// Sent once per session when a question comes only as a `PermissionRequest`
+/// hook: its client has no `PreToolUse` hook for `AskUserQuestion`.
+pub const NO_HOOK_NOTICE: &str = "❓ Claude задал вопрос, он ждёт ответа в терминале. \
+Чтобы отвечать на такие вопросы из Telegram, клиенту этой машины нужен хук PreToolUse \
+для AskUserQuestion: запустите install.sh этого релиза ещё раз (или добавьте хук по \
+docs/poc.md) и перезапустите сессию.";
 
 /// A button of the current question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +138,7 @@ pub struct Ask {
     pub questions: Vec<AskedQuestion>,
     /// The question shown now; `questions.len()` once all are answered.
     pub step: usize,
-    pub answers: Vec<String>,
+    pub answers: Vec<Answered>,
     /// Options of the current multiSelect question ticked so far.
     pub picked: BTreeSet<usize>,
     /// ✏️ Другое was pressed: the next text in the topic is the answer.
@@ -194,16 +202,21 @@ impl Ask {
                     self.version += 1;
                     None
                 } else {
-                    let label = current.options[index].label.trim().to_owned();
-                    Some(self.advance(label))
+                    Some(self.advance(Answered {
+                        options: vec![index],
+                        text: None,
+                    }))
                 }
             }
             Press::Done if current.multi_select => {
                 if self.picked.is_empty() {
                     return Some(ANSWER_PICK_ONE);
                 }
-                let answer = self.picked_labels().join(", ");
-                Some(self.advance(answer))
+                let options = self.picked.iter().copied().collect();
+                Some(self.advance(Answered {
+                    options,
+                    text: None,
+                }))
             }
             Press::Other => {
                 if !self.typing {
@@ -220,32 +233,43 @@ impl Ask {
         }
     }
 
-    /// The user's own text for the current question. A multiSelect
-    /// question keeps its ticked options in front of it. `false`: nothing
-    /// taken (ended, or a blank text).
+    /// The user's own text for the current question, as typed (at most
+    /// [`MAX_OWN_TEXT`] bytes). A multiSelect question keeps its ticked
+    /// options in front of it. `false`: nothing taken (ended, or a blank
+    /// text).
     pub fn type_answer(&mut self, text: &str) -> bool {
-        let text = text.trim();
-        if !self.is_open() || text.is_empty() || self.step >= self.questions.len() {
+        if !self.is_open() || text.trim().is_empty() || self.step >= self.questions.len() {
             return false;
         }
-        let mut parts = self.picked_labels();
-        parts.push(text.to_owned());
-        self.advance(parts.join(", "));
+        let mut end = text.len().min(MAX_OWN_TEXT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let options = self.picked.iter().copied().collect();
+        self.advance(Answered {
+            options,
+            text: Some(text[..end].to_owned()),
+        });
         true
     }
 
-    fn picked_labels(&self) -> Vec<String> {
-        let Some(current) = self.questions.get(self.step) else {
-            return Vec::new();
+    /// How the message shows the answer to question `index`.
+    fn shown_answer(&self, index: usize) -> String {
+        let (Some(question), Some(answer)) = (self.questions.get(index), self.answers.get(index))
+        else {
+            return String::new();
         };
-        self.picked
+        let mut parts: Vec<&str> = answer
+            .options
             .iter()
-            .filter_map(|index| current.options.get(*index))
-            .map(|option| option.label.trim().to_owned())
-            .collect()
+            .filter_map(|option| question.options.get(*option))
+            .map(|option| option.label.trim())
+            .collect();
+        parts.extend(answer.text.as_deref().map(str::trim));
+        parts.join(", ")
     }
 
-    fn advance(&mut self, answer: String) -> &'static str {
+    fn advance(&mut self, answer: Answered) -> &'static str {
         self.answers.push(answer);
         self.step += 1;
         self.picked.clear();
@@ -270,8 +294,17 @@ impl Ask {
         true
     }
 
+    /// The hook left before it could take the answers: the message says the
+    /// question closed in the terminal instead of "sent".
+    pub fn answers_not_taken(&mut self) {
+        if self.state == State::Answered {
+            self.state = State::Gone;
+            self.version += 1;
+        }
+    }
+
     /// The answers for the hook, once every question has one.
-    pub fn answers(&self) -> Option<Vec<String>> {
+    pub fn answers(&self) -> Option<Vec<Answered>> {
         (self.state == State::Answered).then(|| self.answers.clone())
     }
 
@@ -290,13 +323,9 @@ impl Ask {
         for (index, question) in self.questions.iter().enumerate() {
             text.push_str("\n\n");
             text.push_str(&cut(question.question.trim(), QUESTION_TEXT));
-            if let Some(answer) = self
-                .answers
-                .get(index)
-                .filter(|_| self.state == State::Answered)
-            {
+            if self.state == State::Answered && index < self.answers.len() {
                 text.push_str("\n→ ");
-                text.push_str(answer);
+                text.push_str(&self.shown_answer(index));
             }
         }
         cut(&text, TELEGRAM_TEXT_LIMIT)
@@ -308,13 +337,14 @@ impl Ask {
         if total > 1 {
             text.push_str(&format!(" ({} из {total})", self.step + 1));
         }
-        for (question, answer) in self.questions.iter().zip(&self.answers) {
+        for (index, question) in self.questions.iter().enumerate().take(self.answers.len()) {
             let name = if question.header.trim().is_empty() {
                 cut(question.question.trim(), BUTTON_LABEL)
             } else {
                 question.header.trim().to_owned()
             };
-            text.push_str(&format!("\n✓ {name}: {}", cut(answer, OPTION_TEXT)));
+            let answer = self.shown_answer(index);
+            text.push_str(&format!("\n✓ {name}: {}", cut(&answer, OPTION_TEXT)));
         }
         let Some(current) = self.questions.get(self.step) else {
             return text;
@@ -444,22 +474,22 @@ impl Asks {
     }
 
     /// The open ask of topic `thread_id` a text message answers: the one it
-    /// replies to, else the newest one waiting for typed text.
+    /// replies to; a plain message (no reply) answers the newest one waiting
+    /// for typed text. A reply to any other message answers nothing.
     pub fn text_target(&self, thread_id: i64, reply_to: Option<i64>) -> Option<u64> {
         let open = |ask: &Ask| ask.is_open() && ask.thread_id == Some(thread_id);
-        let replied = reply_to.and_then(|reply_to| {
-            self.asks
+        let found = match reply_to {
+            Some(reply_to) => self
+                .asks
                 .iter()
-                .find(|(_, ask)| open(ask) && ask.message_id == Some(reply_to))
-        });
-        replied
-            .or_else(|| {
-                self.asks
-                    .iter()
-                    .rev()
-                    .find(|(_, ask)| open(ask) && ask.typing)
-            })
-            .map(|(key, _)| *key)
+                .find(|(_, ask)| open(ask) && ask.message_id == Some(reply_to)),
+            None => self
+                .asks
+                .iter()
+                .rev()
+                .find(|(_, ask)| open(ask) && ask.typing),
+        };
+        found.map(|(key, _)| *key)
     }
 
     /// `session` has an open ask.
@@ -517,6 +547,13 @@ mod tests {
 
     fn ask(questions: Vec<AskedQuestion>) -> Ask {
         Ask::new("s".into(), "abcde".into(), questions)
+    }
+
+    fn answered(options: &[usize], text: Option<&str>) -> Answered {
+        Answered {
+            options: options.to_vec(),
+            text: text.map(str::to_owned),
+        }
     }
 
     fn data(keyboard: &Value) -> Vec<Vec<String>> {
@@ -589,11 +626,19 @@ mod tests {
         assert_eq!(ask.answers(), None);
         assert_eq!(ask.press(1, Press::Option(0)), Some(ANSWER_TAKEN));
         assert_eq!(ask.state, State::Answered);
-        assert_eq!(ask.answers(), Some(vec!["Blue".to_owned(), "S".to_owned()]));
+        assert_eq!(
+            ask.answers(),
+            Some(vec![answered(&[1], None), answered(&[0], None)])
+        );
         assert_eq!(data(&ask.keyboard()), Vec::<Vec<String>>::new());
         assert!(ask.text().starts_with(ANSWERED_TITLE));
-        assert!(ask.text().contains("Size?\n→ S"));
+        assert!(ask.text().contains("Color?\n→ Blue") && ask.text().contains("Size?\n→ S"));
         assert_eq!(ask.press(1, Press::Option(0)), Some(ANSWER_STALE));
+        // The hook left before it took them: the message must not say "sent".
+        let before = ask.version;
+        ask.answers_not_taken();
+        assert!(ask.version > before && ask.text().starts_with(GONE_TITLE));
+        assert_eq!(ask.answers(), None);
     }
 
     #[test]
@@ -611,7 +656,8 @@ mod tests {
         assert!(ask.text().contains("☑ 1. Apple") && ask.text().contains("☐ 2. Pear"));
         assert_eq!(ask.keyboard()["inline_keyboard"][2][0]["text"], "☑ 3. Plum");
         assert_eq!(ask.press(0, Press::Done), Some(ANSWER_TAKEN));
-        assert_eq!(ask.answers(), Some(vec!["Apple, Plum".to_owned()]));
+        assert_eq!(ask.answers(), Some(vec![answered(&[0, 2], None)]));
+        assert!(ask.text().contains("Fruits?\n→ Apple, Plum"));
     }
 
     #[test]
@@ -628,14 +674,21 @@ mod tests {
         assert!(ask.type_answer("  and a fig "));
         assert!(!ask.typing);
         assert!(ask.type_answer("my own words"));
+        // The text goes as typed; the message shows it trimmed.
         assert_eq!(
             ask.answers(),
             Some(vec![
-                "Pear, and a fig".to_owned(),
-                "my own words".to_owned()
+                answered(&[1], Some("  and a fig ")),
+                answered(&[], Some("my own words"))
             ])
         );
+        assert!(ask.text().contains("Fruits?\n→ Pear, and a fig\n"));
         assert!(!ask.type_answer("late"));
+        // A long text is cut at a character boundary.
+        let mut long = self::ask(vec![question("Note?", false, &["Yes"])]);
+        assert!(long.type_answer(&"й".repeat(MAX_OWN_TEXT)));
+        let text = long.answers().unwrap().remove(0).text.unwrap();
+        assert_eq!(text, "й".repeat(MAX_OWN_TEXT / 2));
     }
 
     #[test]
@@ -723,6 +776,11 @@ mod tests {
         assert!(book.waiting("s") && book.id_taken("s", "abcde") && !book.id_taken("t", "abcde"));
         book.get_mut(first).unwrap().end(State::Gone);
         assert_eq!(book.text_target(100, Some(5)), None);
+        // With ✏️ Другое armed, a reply to any other message is no answer.
+        book.get_mut(second).unwrap().press(0, Press::Other);
+        assert_eq!(book.text_target(100, None), Some(second));
+        assert_eq!(book.text_target(100, Some(6)), Some(second));
+        assert_eq!(book.text_target(100, Some(777)), None);
         for _ in book.len()..MAX_ASKS {
             assert!(
                 book.open(ask(vec![question("C?", false, &["z"])]))
@@ -730,5 +788,25 @@ mod tests {
             );
         }
         assert_eq!(book.open(ask(vec![question("D?", false, &["z"])])), None);
+    }
+
+    /// The review's repro: ✏️ Другое armed, then a reply to some other bot
+    /// message (a subagent block, an older answer) goes on to the session;
+    /// a padded label is answered by its index, not by trimmed text.
+    #[test]
+    fn a_reply_to_another_message_is_no_answer_while_typing() {
+        let q = question("Q?", false, &["  Padded label  "]);
+        let mut typing = ask(vec![q.clone()]);
+        typing.thread_id = Some(100);
+        typing.message_id = Some(5);
+        typing.press(0, Press::Other);
+        let mut book = Asks::default();
+        let key = book.open(typing).unwrap();
+        assert_eq!(book.text_target(100, Some(777)), None);
+        assert_eq!(book.text_target(100, Some(5)), Some(key));
+        assert_eq!(book.text_target(100, None), Some(key));
+        let mut plain = ask(vec![q]);
+        plain.press(0, Press::Option(0));
+        assert_eq!(plain.answers(), Some(vec![answered(&[0], None)]));
     }
 }
