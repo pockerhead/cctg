@@ -128,10 +128,14 @@
 //! first, and the waiting texts go as one inbound, in order, each marked as
 //! it would be alone, [`buffer::PART_SEPARATOR`] between them. Every one
 //! gets 👀, and all turn ✍ with the channel record of the last one, whose id
-//! the inbound's `message_id` carries (`message_ids` lists them all). A file
-//! or a console command ends the burst: the burst goes first, then the file
-//! or the command. Messages kept while the slot had no live session go one
-//! by one as before.
+//! the inbound's `message_id` carries (`message_ids` lists them all). One
+//! inbound has one addressee and one reply target: a burst is cut where the
+//! explicit reply changes (to a subagent's block, to another message, or
+//! none). A file or a console command ends the burst: the burst goes first,
+//! then the file; a command is refused as busy while messages wait in the
+//! slot or texts went less than `Options::inbound_settle` ago. Messages kept
+//! while the slot had no live session, or left behind by a full link queue
+//! before the burst began, go one by one as before, without waiting for it.
 //!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
@@ -269,6 +273,11 @@ pub const GATHER_MAX: Duration = Duration::from_secs(3);
 /// the rest of the burst follows in the next one. A link line holds
 /// [`crate::wire::MAX_LINE`], and a JSON escape takes up to 6 bytes per byte.
 const MAX_GATHER_BYTES: usize = 128 * 1024;
+/// A console command for a session that got topic texts less than this long
+/// ago is refused as busy: the turn those texts start is not known to the
+/// hub at once (whether `UserPromptSubmit` fires for a channel message is not
+/// verified), and a command typed into it would mix with it.
+pub const INBOUND_SETTLE: Duration = Duration::from_secs(3);
 
 /// The channel message after a restart that cut off work or stopped the
 /// background subagents `agents` (TASK-047).
@@ -340,12 +349,18 @@ pub struct Options {
     /// A burst goes at most this long after its first message
     /// ([`GATHER_MAX`] in the hub).
     pub gather_max: Duration,
+    /// [`INBOUND_SETTLE`] in the hub; `ZERO`: a command right after a text
+    /// is typed.
+    pub inbound_settle: Duration,
 }
 
 /// A burst of topic messages of a slot being gathered into one inbound
 /// (TASK-048); its messages wait in the slot's buffer.
 #[derive(Debug, Clone, Copy)]
 struct Gather {
+    /// Its first message; texts kept in front of it are older and do not
+    /// wait for it.
+    start: i64,
     first: Instant,
     /// The burst goes then, or at once when that passed (a file or a
     /// command ended it, or the link queue had no room).
@@ -407,6 +422,7 @@ impl Default for Options {
             read_wait: READ_WAIT,
             gather_quiet: Duration::ZERO,
             gather_max: Duration::ZERO,
+            inbound_settle: Duration::ZERO,
         }
     }
 }
@@ -833,6 +849,9 @@ pub struct Slots {
     link_losses: HashMap<SlotId, (i64, u32)>,
     /// Bursts of topic messages being gathered, by slot.
     gathers: HashMap<SlotId, Gather>,
+    /// When topic texts last went to a session, within
+    /// `Options::inbound_settle`.
+    handed_at: HashMap<String, Instant>,
     /// Transfers to agents of this run.
     transfers: u64,
     /// Files coming from agents, one per connection.
@@ -913,6 +932,7 @@ impl Slots {
             fetching: HashMap::new(),
             link_losses: HashMap::new(),
             gathers: HashMap::new(),
+            handed_at: HashMap::new(),
             transfers: 0,
             uploads: HashMap::new(),
             file_bytes: 0,
@@ -2317,7 +2337,7 @@ impl Slots {
         if file.is_some() {
             self.end_gather(slot);
         } else {
-            self.gather(slot);
+            self.gather(slot, input.message_id);
         }
         self.park(
             slot,
@@ -2334,10 +2354,11 @@ impl Slots {
         self.flush(slot);
     }
 
-    /// A text message for the live session of `slot` joins the burst being
-    /// gathered there or starts one; a burst already due is not held back
-    /// again. No burst without `Options::gather_quiet` or a live agent.
-    fn gather(&mut self, slot: SlotId) {
+    /// Text message `message_id` for the live session of `slot` joins the
+    /// burst being gathered there or starts one; a burst already due is not
+    /// held back again. No burst without `Options::gather_quiet` or a live
+    /// agent.
+    fn gather(&mut self, slot: SlotId, message_id: i64) {
         let quiet = self.options.gather_quiet;
         if quiet.is_zero() || self.live_agent(slot).is_none() {
             return;
@@ -2351,8 +2372,9 @@ impl Slots {
                 self.gathers.insert(
                     slot,
                     Gather {
+                        start: message_id,
                         first: now,
-                        due: (now + quiet).min(now + max),
+                        due: now + quiet.min(max),
                     },
                 );
             }
@@ -2443,6 +2465,9 @@ impl Slots {
                 },
                 None => {
                     let parts = match self.gathers.get(&slot) {
+                        // Kept before the burst began (the link queue had
+                        // no room): it goes alone as soon as there is room.
+                        Some(gather) if self.before_burst(slot, gather.start) => vec![parked],
                         Some(gather) if gather.due > Instant::now() => break,
                         Some(_) => self.burst(slot),
                         None => vec![parked],
@@ -2463,6 +2488,7 @@ impl Slots {
                         );
                         break;
                     }
+                    self.mark_handed(&session);
                     (parts, true)
                 }
             };
@@ -2927,11 +2953,23 @@ impl Slots {
         meta
     }
 
+    /// The front text of `slot` was kept before its burst's first message
+    /// `start`, which still waits behind it.
+    fn before_burst(&self, slot: SlotId, start: i64) -> bool {
+        self.registry.slot(slot).is_some_and(|entry| {
+            let mut kept = entry.buffer.messages.iter();
+            kept.next().is_some_and(|front| front.message_id != start)
+                && kept.any(|parked| parked.message_id == start)
+        })
+    }
+
     /// The texts at the front of `slot` that go as one inbound: up to the
     /// first file, at most [`MAX_GATHER_BYTES`] of content (the first text
-    /// always).
+    /// always), and only those that reply to the same message as the first
+    /// (or all to none): one inbound has one addressee, the session or one
+    /// of its subagents, and one reply target.
     fn burst(&self, slot: SlotId) -> Vec<Parked> {
-        let mut parts = Vec::new();
+        let mut parts: Vec<Parked> = Vec::new();
         let mut size = 0;
         let Some(entry) = self.registry.slot(slot) else {
             return parts;
@@ -2942,6 +2980,11 @@ impl Slots {
             .iter()
             .take_while(|parked| parked.file.is_none())
         {
+            if parts.first().is_some_and(|first| {
+                (first.thread_id, first.reply_to) != (parked.thread_id, parked.reply_to)
+            }) {
+                break;
+            }
             size += parked.content().len() + buffer::PART_SEPARATOR.len();
             if !parts.is_empty() && size > MAX_GATHER_BYTES {
                 break;
@@ -2951,23 +2994,17 @@ impl Slots {
         parts
     }
 
-    /// The meta of `parts` going as one inbound: [`Self::inbound_meta`] of
-    /// the last one that explicitly replies (else of the last one), with
-    /// `message_id` of the last one (its channel record turns them all ✍),
-    /// `message_ids` of all in order when there are several, and
+    /// The meta of `parts` going as one inbound (all in one topic and
+    /// replying to the same message, see [`Self::burst`]):
+    /// [`Self::inbound_meta`] of the last one (its channel record turns them
+    /// all ✍), `message_ids` of all in order when there are several, and
     /// `forwarded` only when every one is a forward. One part: exactly its
     /// own meta.
     fn burst_meta(&self, session: &str, parts: &[Parked]) -> BTreeMap<String, String> {
         let Some(last) = parts.last() else {
             return BTreeMap::new();
         };
-        let replied = parts
-            .iter()
-            .rev()
-            .find(|parked| parked.reply_to.is_some())
-            .unwrap_or(last);
-        let mut meta = self.inbound_meta(session, replied);
-        meta.insert("message_id".to_owned(), last.message_id.to_string());
+        let mut meta = self.inbound_meta(session, last);
         if parts.iter().all(|parked| parked.forwarded) {
             meta.insert("forwarded".to_owned(), "true".to_owned());
         } else {
@@ -4750,6 +4787,32 @@ impl Slots {
         self.activity.get(session).is_some_and(Activity::busy)
     }
 
+    /// Topic messages wait in `slot` (the link queue had no room, a file is
+    /// on its way).
+    fn kept(&self, slot: SlotId) -> bool {
+        self.registry
+            .slot(slot)
+            .is_some_and(|entry| !entry.buffer.messages.is_empty())
+    }
+
+    /// Topic texts went to `session` less than `Options::inbound_settle` ago.
+    fn settling(&self, session: &str) -> bool {
+        self.handed_at
+            .get(session)
+            .is_some_and(|at| Instant::now() < *at + self.options.inbound_settle)
+    }
+
+    /// Topic texts went to `session` now (see [`Self::settling`]).
+    fn mark_handed(&mut self, session: &str) {
+        let settle = self.options.inbound_settle;
+        if settle.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        self.handed_at.retain(|_, at| now < *at + settle);
+        self.handed_at.insert(session.to_owned(), now);
+    }
+
     /// A permission prompt of the session waits.
     fn waiting(&self, session: &str) -> bool {
         self.registry
@@ -4862,7 +4925,13 @@ impl Slots {
                 console::NO_CONSOLE_NOTICE
             }
             (Ok(_), Some((session, _))) if self.waiting(&session) => console::WAITING_NOTICE,
-            (Ok(_), Some((session, _))) if self.busy(&session) => console::BUSY_NOTICE,
+            // Topic messages still in the slot, or texts that went a moment
+            // ago, come before the command: the session is as good as busy.
+            (Ok(_), Some((session, _)))
+                if self.busy(&session) || self.kept(slot) || self.settling(&session) =>
+            {
+                console::BUSY_NOTICE
+            }
             (Ok(text), Some((session, conn))) => {
                 let command_id = crate::wire::random_u64();
                 let asked = self.conns.get(&conn).is_some_and(|bound| {
@@ -14203,6 +14272,7 @@ again"
         Options {
             gather_quiet: GATHER_QUIET,
             gather_max: GATHER_MAX,
+            inbound_settle: INBOUND_SETTLE,
             notice_every: Duration::ZERO,
             ..message_options()
         }
@@ -14378,9 +14448,9 @@ again"
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_command_in_a_burst_lets_the_burst_go_first() {
+    async fn a_command_in_a_burst_lets_the_burst_go_first_and_is_refused_while_it_settles() {
         let dir = TempDir::new("slots-gather-command");
-        let (_fake, mut slots, mut from_hub) = console_slots_with(&dir, true, gather_options());
+        let (fake, mut slots, mut from_hub) = console_slots_with(&dir, true, gather_options());
         slots.on_topic_message(topic_text(1, "one", false));
         slots.on_topic_message(topic_text(2, "two", true));
         slots.on_topic_message(topic_text(3, "!ls", false));
@@ -14393,8 +14463,12 @@ again"
             }
             other => panic!("no burst first: {other:?}"),
         }
-        let (_, text) = command_of(from_hub.try_recv().ok());
-        assert_eq!(text, "!ls");
+        // The burst may be starting a turn the hub does not see yet.
+        assert!(from_hub.try_recv().is_err(), "the command is not typed");
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(3, console::BUSY_NOTICE.to_owned())]
+        );
         slots.on_topic_message(topic_text(4, "four", false));
         assert!(from_hub.try_recv().is_err());
         pass(&mut slots, GATHER_QUIET).await;
@@ -14405,6 +14479,41 @@ again"
             }
             other => panic!("no message after the command: {other:?}"),
         }
+        // Once the texts settled and no turn is known, a command is typed.
+        pass(&mut slots, INBOUND_SETTLE).await;
+        slots.on_topic_message(topic_text(5, "!ls", false));
+        let (_, text) = command_of(from_hub.try_recv().ok());
+        assert_eq!(text, "!ls");
+    }
+
+    #[tokio::test]
+    async fn a_command_behind_messages_the_link_queue_had_no_room_for_is_refused() {
+        let dir = TempDir::new("slots-command-behind");
+        // No gathering, no settle: only the kept messages hold it back.
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        for id in 1..=9 {
+            slots.on_topic_message(topic_text(id, "x", false));
+        }
+        assert_eq!(buffered(&slots, 0), [9], "the queue holds 8");
+        slots.on_topic_message(topic_text(10, "!ls", false));
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(10, console::BUSY_NOTICE.to_owned())]
+        );
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            while let Ok(msg) = from_hub.try_recv() {
+                match msg {
+                    HubMsg::Inbound { meta, .. } => ids.push(meta["message_id"].clone()),
+                    other => panic!("the command overtook the messages: {other:?}"),
+                }
+            }
+            slots.pump();
+        }
+        assert_eq!(ids, (1..=9).map(|id| id.to_string()).collect::<Vec<_>>());
+        slots.on_topic_message(topic_text(11, "!ls", false));
+        let (_, text) = command_of(from_hub.try_recv().ok());
+        assert_eq!(text, "!ls");
     }
 
     #[tokio::test(start_paused = true)]
@@ -14474,5 +14583,169 @@ again"
             writing,
             [41, 42, 43].map(|id| (id, "✍".to_owned())).to_vec()
         );
+    }
+
+    fn topic_reply(message_id: i64, text: &str, reply_to: i64) -> Inbound {
+        Inbound {
+            reply_to: Some(reply_to),
+            ..topic_text(message_id, text, false)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_is_cut_where_its_addressee_or_reply_target_changes() {
+        let dir = TempDir::new("slots-gather-addressee");
+        let (mut slots, _work, mut agent) = gather_slots(&dir);
+        // Subagent S1 of A has its block as message 900 of topic 100.
+        slots.registry.subagents.insert(
+            S1.to_owned(),
+            crate::hub::registry::SubagentEntry {
+                parent_session: A.to_owned(),
+                slot: Some(SlotId(0)),
+                block: crate::hub::registry::Block {
+                    thread_id: Some(100),
+                    message_id: Some(900),
+                    ..Default::default()
+                },
+                seen: 0,
+            },
+        );
+        // For the subagent, then for the session; for the session, then
+        // for the subagent.
+        slots.on_topic_message(topic_reply(1, "s1 a", 900));
+        slots.on_topic_message(topic_reply(2, "s1 b", 900));
+        slots.on_topic_message(topic_reply(3, "on 999", 999));
+        slots.on_topic_message(topic_text(4, "plain", false));
+        slots.on_topic_message(topic_text(5, "plain 2", true));
+        slots.on_topic_message(topic_reply(6, "s1 c", 900));
+        pass(&mut slots, GATHER_QUIET - ms(1)).await;
+        assert!(inbounds(&mut agent).is_empty(), "one window for all");
+        pass(&mut slots, ms(1)).await;
+        let chat = ("chat_id", "-1000000000001");
+        let topic = ("thread_id", "100");
+        assert_eq!(
+            inbounds(&mut agent),
+            [
+                (
+                    "s1 a\n\n---\n\ns1 b".to_owned(),
+                    meta_of(&[
+                        chat,
+                        ("message_id", "2"),
+                        ("message_ids", "1,2"),
+                        ("reply_to_message_id", "900"),
+                        ("target_agent", S1),
+                        topic,
+                    ]),
+                ),
+                (
+                    "on 999".to_owned(),
+                    meta_of(&[
+                        chat,
+                        ("message_id", "3"),
+                        ("reply_to_message_id", "999"),
+                        topic
+                    ]),
+                ),
+                (
+                    "plain\n\n---\n\n(переслано)\nplain 2".to_owned(),
+                    meta_of(&[chat, ("message_id", "5"), ("message_ids", "4,5"), topic]),
+                ),
+                (
+                    "s1 c".to_owned(),
+                    meta_of(&[
+                        chat,
+                        ("message_id", "6"),
+                        ("reply_to_message_id", "900"),
+                        ("target_agent", S1),
+                        topic,
+                    ]),
+                ),
+            ]
+        );
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_message_the_link_queue_left_behind_does_not_wait_for_a_new_burst() {
+        let dir = TempDir::new("slots-gather-left");
+        let mut slots = stalled_slots(&dir, gather_options());
+        let _work = capture_dispatch(&mut slots);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        // Kept while A had no agent; its agent's queue then takes one.
+        slots.on_topic_message(topic_text(1, "one", false));
+        slots.on_topic_message(topic_text(2, "two", false));
+        let mut agent = connect_queue(&mut slots, 1, A, Some(10), 1);
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [2]);
+        // A new message starts a burst behind the one left over.
+        slots.on_topic_message(topic_text(3, "three", false));
+        assert_eq!(inbounds(&mut agent)[0].0, "one");
+        // The queue has room again: two goes at once, alone.
+        slots.pump();
+        let got = inbounds(&mut agent);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "two");
+        assert_eq!(got[0].1["message_id"], "2");
+        assert!(!got[0].1.contains_key("message_ids"));
+        pass(&mut slots, GATHER_QUIET - ms(1)).await;
+        assert!(inbounds(&mut agent).is_empty(), "three keeps its window");
+        pass(&mut slots, ms(1)).await;
+        let got = inbounds(&mut agent);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "three");
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_lost_in_the_window_loses_and_repeats_nothing() {
+        let dir = TempDir::new("slots-gather-reconnect");
+        let (mut slots, _work, mut agent) = gather_slots(&dir);
+        slots.on_topic_message(topic_text(1, "one", false));
+        slots.on_topic_message(topic_text(2, "two", false));
+        pass(&mut slots, ms(500)).await;
+        slots.on_agent(AgentEvent::Disconnected { conn: 1 });
+        slots.pump();
+        pass(&mut slots, GATHER_MAX).await;
+        assert!(inbounds(&mut agent).is_empty());
+        assert_eq!(buffered(&slots, 0), [1, 2]);
+        // The agent links again: what waited goes once, in order.
+        let mut again = connect_queue(&mut slots, 2, A, Some(10), 64);
+        slots.pump();
+        let ids: Vec<String> = inbounds(&mut again)
+            .into_iter()
+            .map(|(_, meta)| meta["message_id"].clone())
+            .collect();
+        assert_eq!(ids, ["1", "2"]);
+        pass(&mut slots, GATHER_MAX).await;
+        assert!(inbounds(&mut again).is_empty(), "nothing twice");
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_over_the_content_limit_goes_as_two_inbounds() {
+        let dir = TempDir::new("slots-gather-big");
+        let (mut slots, mut work, mut agent) = gather_slots(&dir);
+        topic_ops(&mut work);
+        // Two of these and a separator fit, three do not.
+        let big = "x".repeat(MAX_GATHER_BYTES / 3);
+        for id in 1..=3 {
+            slots.on_topic_message(topic_text(id, &big, false));
+        }
+        pass(&mut slots, GATHER_QUIET).await;
+        let got = inbounds(&mut agent);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, format!("{big}{}{big}", buffer::PART_SEPARATOR));
+        assert_eq!(got[0].1["message_id"], "2");
+        assert_eq!(got[0].1["message_ids"], "1,2");
+        assert_eq!(got[1].0, big);
+        assert_eq!(got[1].1["message_id"], "3");
+        assert!(!got[1].1.contains_key("message_ids"));
+        assert_eq!(topic_ops(&mut work).1, [1, 2, 3], "👀 on every message");
+        // Both channel records turn their parts ✍.
+        let stream = slots.registry.sessions[A].stream.as_ref().unwrap();
+        assert_eq!(stream.receipts, [2, 3]);
+        assert_eq!(stream.parts, [(2, vec![1])]);
+        assert!(slots.registry.slots[0].buffer.is_idle());
     }
 }
