@@ -128,6 +128,22 @@ fn a_device_joins_with_a_code_and_is_out_after_a_revoke() {
     )
     .unwrap();
 
+    // `cctg hub code` next to no hub (a device's own ~/.cctg, a missing
+    // directory): refused, no code the hub would never see.
+    for elsewhere in [home.join(".cctg"), root.0.join("nowhere")] {
+        let elsewhere_text = elsewhere.to_string_lossy().into_owned();
+        let (output, text) = run(
+            &home,
+            &root.0,
+            &["hub", "code"],
+            &[("CCTG_STATE_DIR", &elsewhere_text)],
+        );
+        assert!(!output.status.success(), "{text}");
+        assert!(output.stdout.is_empty(), "{text}");
+        assert!(text.contains("no hub has started"), "{text}");
+        assert!(!elsewhere.join("join").exists());
+    }
+
     // `cctg hub code`: only the code on stdout.
     let state_text = state.to_string_lossy().into_owned();
     let (output, _) = run(

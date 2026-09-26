@@ -344,8 +344,10 @@ read_settings() {
         [ -n "$secret" ] || die "$secret_file is empty (the secret is its first line)"
     elif [ -z "$(old_line CCTG_HUB_SECRET)" ]; then
         interactive || die "no join code and no hub secret: use --join CODE (or CCTG_HUB_SECRET, --secret-file)"
-        ask "Join code from the hub (empty: type the hub's shared secret instead): "
-        join_code=$answer
+        read_hidden "Join code from the hub, not shown (empty: type the hub's shared secret instead): " \
+            "use --join CODE, set CCTG_HUB_SECRET or use --secret-file"
+        join_code=$hidden
+        hidden=
         if [ -n "$join_code" ]; then
             check_code
         else

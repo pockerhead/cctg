@@ -209,11 +209,23 @@ fn probe_target(listen: SocketAddr) -> SocketAddr {
 /// needs only the hub's state directory ([`STATE_VAR`] of the process
 /// environment or `env_file`), so it runs next to a running hub, e.g.
 /// `docker compose exec hub cctg hub code`; the hub takes the code from
-/// there. Only the code goes to stdout.
+/// there. Only the code goes to stdout. A directory no hub has started
+/// with (no `join/` in it) is refused, not filled with a dead code.
 pub fn mint_code(env_file: Option<&Path>) -> anyhow::Result<String> {
     let state_dir = config::state_dir(env_file)?;
-    devices::mint_code(&state_dir, std::time::SystemTime::now())
-        .with_context(|| format!("no join code; check {STATE_VAR}"))
+    match devices::mint_code(&state_dir, std::time::SystemTime::now()) {
+        Ok(code) => Ok(code),
+        // The hub would never see a code minted here: say where we looked.
+        Err(devices::MintError::NoHub) => {
+            let shown = std::path::absolute(&state_dir).unwrap_or(state_dir);
+            anyhow::bail!(
+                "no join code: no hub has started with the state directory {} \
+                 (run cctg hub code where the hub runs, with its {STATE_VAR} or --env-file)",
+                shown.display()
+            )
+        }
+        Err(error) => Err(error).with_context(|| format!("no join code; check {STATE_VAR}")),
+    }
 }
 
 /// How long a stopping hub waits for the slot actor to write the registry.

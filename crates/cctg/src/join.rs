@@ -131,8 +131,11 @@ pub async fn join(
         200 => {
             let answer: JoinAnswer =
                 serde_json::from_slice(body).map_err(|_| JoinFailed::BadAnswer)?;
-            // The hub's secret must be one the hook and agent can send.
-            Secret::parse(answer.secret.expose()).map_err(|_| JoinFailed::BadAnswer)?;
+            // A device secret of the device the hub names: letters, digits
+            // and `_` only, so `write_secret` has nothing to escape.
+            if secret_device_id(&answer.secret) != Some(answer.device_id.as_str()) {
+                return Err(JoinFailed::BadAnswer);
+            }
             Ok(answer)
         }
         403 => Err(JoinFailed::Refused),
@@ -326,6 +329,47 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// A hub that answers every join with `secret` for device `id`.
+    async fn fake_hub(id: &'static str, secret: String) -> String {
+        let hooks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = hooks.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = hooks.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = serde_json::json!({ "device_id": id, "name": "x", "secret": secret })
+                    .to_string();
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(format!("{head}{body}").as_bytes()).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn only_a_device_secret_of_the_named_device_is_taken() {
+        let tail = "a".repeat(64);
+        for (id, secret) in [
+            // Visible ASCII, but a quote would break the device.env line.
+            ("0123abcd", format!("cctgd_0123abcd_{}'x", "a".repeat(62))),
+            ("0123abcd", "a-shared-secret-0123456789".to_owned()),
+            ("0123abcd", format!("cctgd_ffffffff_{tail}")),
+        ] {
+            let addr = fake_hub(id, secret).await;
+            assert_eq!(
+                join(&config(&addr), "ABCD-EFGH-JKMN-PQRS", TIMEOUT)
+                    .await
+                    .unwrap_err(),
+                JoinFailed::BadAnswer
+            );
+        }
+        let addr = fake_hub("0123abcd", format!("cctgd_0123abcd_{tail}")).await;
+        let answer = join(&config(&addr), "ABCD-EFGH-JKMN-PQRS", TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(answer.device_id, "0123abcd");
     }
 
     #[test]
