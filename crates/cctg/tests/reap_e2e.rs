@@ -4,7 +4,7 @@
 //! real process named `claude(.exe)` that was killed, the live one is still
 //! running.
 
-#![cfg(any(windows, target_os = "linux"))]
+#![cfg(any(windows, target_os = "linux", target_os = "macos"))]
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};

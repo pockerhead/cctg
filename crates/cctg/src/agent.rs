@@ -26,10 +26,12 @@
 //! endpoint: a session that started while the hub was down becomes known as
 //! soon as the hub is back, without waiting for its next hook.
 //!
-//! On Windows the agent also presses Esc in its claude's console when the
-//! hub asks (`console_key`, see [`crate::keys`]) and answers whether the key
-//! events were written, and types a one-line command into its input box
-//! (`console_command`, TASK-043) and answers what became of it.
+//! The agent also presses Esc in its claude's terminal when the hub asks
+//! (`console_key`, see [`crate::keys`]) and answers whether the key events
+//! were written, and types a one-line command into its input box
+//! (`console_command`, TASK-043) and answers what became of it: on Windows
+//! in claude's console, elsewhere through the `cctg run` that holds claude's
+//! terminal (TASK-044).
 //!
 //! Session reads (TASK-034): the hub never opens a file of this machine; it
 //! asks with `session_read` and the agent answers from its session's files
@@ -491,18 +493,15 @@ pub async fn run_stdio() -> i32 {
     // claude, or unset (TASK-004). The shim between claude and this worker
     // is no claude and the walk passes it.
     let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
-    let console = claude_pid.filter(|_| keys::SUPPORTED).map(|pid| Console {
-        press: Arc::new(move |key| keys::press(pid, key)),
-        type_line: Arc::new(move |text: &str| keys::type_command(pid, text)),
-    });
     let mut worker = Worker::from_env(
         |name| std::env::var(name).ok(),
         claude_pid,
         config.state_dir.clone(),
-        console.is_some(),
+        None,
     );
-    // Only the `cctg run` that started this claude restarts it; an inherited
-    // `CCTG_RUN` of another session's terminal does not count.
+    // Only the `cctg run` that started this claude restarts it (and, off
+    // Windows, holds its terminal); an inherited `CCTG_RUN` of another
+    // session's terminal does not count.
     if let (Some(run), Some(claude)) = (worker.run_pid, claude_pid) {
         let chain = tokio::task::spawn_blocking(move || proctree::ancestors(claude))
             .await
@@ -514,6 +513,14 @@ pub async fn run_stdio() -> i32 {
             worker.run_pid = None;
         }
     }
+    worker.console = console_target(claude_pid, worker.run_pid, worker.state_dir.clone()).await;
+    let console = worker.console.clone().map(|target| {
+        let pressed = target.clone();
+        Console {
+            press: Arc::new(move |key| keys::press(&pressed, key)),
+            type_line: Arc::new(move |text: &str| keys::type_command(&target, text)),
+        }
+    });
     // The file hash is this process's own file (the shim's copy); a new
     // build shows up in the file the copy came from. The hub is told the
     // build's source (TASK-035), which needs the hash only without a clean
@@ -612,6 +619,29 @@ pub async fn run_stdio() -> i32 {
             0
         }
     }
+}
+
+/// Where this agent presses and types: its claude's console on Windows;
+/// elsewhere the terminal of the `cctg run` that started its claude, when
+/// that one answers on its socket ([`crate::term`], TASK-044). `None`: no
+/// console keys or commands.
+async fn console_target(
+    claude_pid: Option<u32>,
+    run_pid: Option<u32>,
+    state_dir: Option<PathBuf>,
+) -> Option<keys::Target> {
+    if cfg!(windows) {
+        return claude_pid.map(keys::Target::Console);
+    }
+    let socket = crate::term::socket_path(&state_dir?, run_pid?);
+    let probe = socket.clone();
+    let answers = tokio::task::spawn_blocking(move || crate::term::screen(&probe).is_some())
+        .await
+        .unwrap_or(false);
+    if !answers {
+        info!("cctg run keeps no terminal for this claude; no console keys");
+    }
+    answers.then_some(keys::Target::Run(socket))
 }
 
 /// How this agent talks to the hub: as which session, and where.

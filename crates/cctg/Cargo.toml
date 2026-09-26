@@ -29,6 +29,15 @@ tokio = { workspace = true, features = ["io-std", "io-util", "net", "process", "
 tracing.workspace = true
 tracing-subscriber.workspace = true
 transcript = { path = "../transcript" }
+# Screen copy of the terminal `cctg run` holds for claude on Linux and macOS
+# (TASK-044). Pure Rust; built on every platform so its tests run everywhere.
+vt100 = "0.16"
+
+# The pseudo-terminal of `cctg run`, raw mode, signals, the macOS process
+# walk (TASK-044); install_e2e's setsid. Already in the lock file through
+# tokio; no new download.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot);
 # console key presses of the agent (TASK-029: AttachConsole, CreateFileW
@@ -41,11 +50,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 tokio = { workspace = true, features = ["test-util"] }
 # Self-signed certificates for the TLS tests (TASK-035).
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
-
-# install_e2e runs install.sh in a session of its own (setsid): no terminal.
-# Already in the lock file through tokio; no new download.
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
 
 # The supervisor e2e test stops the supervisor with Ctrl+Break
 # (GenerateConsoleCtrlEvent).
@@ -68,4 +72,10 @@ harness = false
 # stand-in that `cctg run` starts.
 [[test]]
 name = "run_e2e"
+harness = false
+
+# The TASK-044 test of `cctg run` in a terminal (Linux, macOS): it is also
+# the claude stand-in in the pseudo-terminal.
+[[test]]
+name = "run_pty_e2e"
 harness = false
