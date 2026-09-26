@@ -33,7 +33,7 @@ set -eu
 REPO=pockerhead/cctg
 # The release this script belongs to. Bumped in the commit that gets the
 # tag; release.yml refuses a tag that differs.
-RELEASE=v0.1.8
+RELEASE=v0.1.9
 # Marks every wrapper this script writes; --uninstall removes only those.
 MARK=cctg-install
 # device.env keys this script sets; other lines of the file are kept.
