@@ -1,0 +1,67 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg-058\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 24.34s
+     Running tests\hook_cli.rs (C:/Users/user/dev/cctg/target\debug\deps\hook_cli-b1885ce6542a5431.exe)
+
+running 9 tests
+test settings_snippet_registers_every_event_without_secrets_or_paths ... ok
+test a_hub_without_compactions_leaves_the_hook_quiet ... ok
+test bad_hook_arguments_still_exit_zero ... ok
+test broken_input_and_missing_config_exit_zero_quietly ... ok
+test every_event_reaches_the_hub ... ok
+test an_open_silent_stdin_does_not_hold_the_hook ... ok
+test an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure ... ok
+test no_hub_listening_is_quiet_and_fast ... FAILED
+test a_silent_hub_keeps_session_end_well_inside_its_budget ... FAILED
+
+failures:
+
+---- no_hub_listening_is_quiet_and_fast stdout ----
+
+thread 'no_hub_listening_is_quiet_and_fast' (34828) panicked at crates\cctg\tests\hook_cli.rs:251:9:
+SessionStart: 1.2386726s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_silent_hub_keeps_session_end_well_inside_its_budget stdout ----
+
+thread 'a_silent_hub_keeps_session_end_well_inside_its_budget' (25744) panicked at crates\cctg\tests\hook_cli.rs:234:5:
+1.2526496s
+
+
+failures:
+    a_silent_hub_keeps_session_end_well_inside_its_budget
+    no_hub_listening_is_quiet_and_fast
+
+test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+
+error: test failed, to rerun pass `-p cctg --test hook_cli`
+     Running tests\statusline_agent_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\statusline_agent_e2e-45b3178cabfd6063.exe)
+
+running 2 tests
+test with_a_hub_before_task_058_the_status_line_posts_as_before ... ok
+test a_slow_hub_gets_the_numbers_through_the_agent_and_no_post_is_made ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.35s
+
+     Running tests\statusline_cli.rs (C:/Users/user/dev/cctg/target\debug\deps\statusline_cli-c504c5cd54efdde7.exe)
+
+running 6 tests
+test the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte ... ok
+test a_command_that_prints_too_much_is_cut_without_waiting_for_the_timeout ... ok
+test colours_lines_a_failing_exit_and_empty_output_pass_unchanged ... ok
+test the_own_line_shows_the_branch_and_the_account_and_the_hub_never_gets_the_email ... ok
+test without_a_command_or_inside_one_cctg_prints_its_own_line ... ok
+test a_stopped_hub_adds_well_under_150_ms ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+
+     Running tests\update_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\update_e2e-b9fd1d4ff831a768.exe)
+
+running 3 tests
+test a_new_binary_is_taken_without_losing_a_line ... ok
+test the_hubs_release_is_downloaded_checked_and_taken ... ok
+test a_failed_download_leaves_the_old_binary_and_the_agent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.48s
+
+error: 1 target failed:
+    `-p cctg --test hook_cli`
