@@ -12,10 +12,17 @@
 //! new build and needs no second `initialize`; it asks Claude Code to list
 //! the tools again, and its `send_file` works through the shim (TASK-032).
 //! The real `~/.cctg` is never touched: home, state and config are temp dirs.
+//!
+//! TASK-050: an `update` that names the hub's release makes the worker
+//! download that release's binary for its platform from a fake release on
+//! loopback HTTP (`CCTG_RELEASE_BASE_URL`), check it against `SHA256SUMS`,
+//! put it in place of the shim's file and hand over to it; a bad checksum,
+//! a missing file and a cut connection leave the old file and the agent,
+//! and then a newer file put in place otherwise is still taken.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -237,7 +244,10 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     assert_ne!(newer_build, first_build, "the two files are two builds");
 
     to_first
-        .send(HubMsg::Update { update_id: 7 })
+        .send(HubMsg::Update {
+            update_id: 7,
+            release: None,
+        })
         .await
         .unwrap();
     // Claude Code keeps talking while the worker changes: a reply and a
@@ -381,7 +391,10 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
 
     // Nothing up to date asks for nothing.
     to_second
-        .send(HubMsg::Update { update_id: 8 })
+        .send(HubMsg::Update {
+            update_id: 8,
+            release: None,
+        })
         .await
         .unwrap();
     let up_to_date = loop {
@@ -468,4 +481,353 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+// ------------------------------------------------------------ TASK-050
+
+const TAG: &str = "v9.9.9-e2e";
+
+/// Serves the files under `dir` over HTTP/1.1 on loopback: `GET /a/b` is
+/// `dir/a/b`, anything else 404; a path under `/cut/` gets a body cut
+/// short (a dropped connection). The asked paths are kept.
+fn serve(dir: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = asked.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() {
+                continue;
+            }
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let path = request.split(' ').nth(1).unwrap_or("/").to_owned();
+            log.lock().unwrap().push(path.clone());
+            let file = dir.join(path.trim_start_matches('/'));
+            let answer =
+                if path.starts_with("/cut/") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\nshort"
+                        .to_vec()
+                } else {
+                    match std::fs::read(&file) {
+                    Ok(body) if file.is_file() => [
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes(),
+                        body,
+                    ]
+                    .concat(),
+                    _ => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec(),
+                }
+                };
+            let _ = stream.write_all(&answer);
+        }
+    });
+    (base, asked)
+}
+
+fn asset(tag: &str) -> String {
+    cctg::download::asset_name(tag, cctg::download::target().expect("a release platform"))
+}
+
+/// A shim started from `exe` with the release at `base`, and Claude Code's
+/// end of it: its stdin and the lines it wrote.
+struct Session {
+    shim: Shim,
+    claude: std::process::ChildStdin,
+    out: Arc<Mutex<Vec<String>>>,
+}
+
+fn start_session(root: &Path, exe: &Path, port: u16, base: &str) -> Session {
+    let (home, work) = (root.join("home"), root.join("work"));
+    for dir in [&home, &work] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mut command = Command::new(exe);
+    common::isolate(&mut command, &home);
+    let mut child = command
+        .arg("agent")
+        .current_dir(&work)
+        .env("CCTG_HUB_SECRET", SECRET)
+        .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
+        .env("CCTG_HOST", "box")
+        .env("CCTG_STATE_DIR", root.join("state"))
+        .env("CCTG_RELEASE_BASE_URL", base)
+        .env("CLAUDE_CODE_SESSION_ID", SESSION)
+        .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cctg agent starts");
+    let mut claude = child.stdin.take().unwrap();
+    let out = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let out = out.clone();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                out.lock().unwrap().push(line);
+            }
+        });
+    }
+    send(
+        &mut claude,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#,
+    );
+    send(
+        &mut claude,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    Session {
+        shim: Shim(child),
+        claude,
+        out,
+    }
+}
+
+impl Session {
+    /// Claude Code pings and gets its answer: the channel loop runs.
+    async fn ping(&mut self, id: i64) {
+        send(
+            &mut self.claude,
+            &format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#),
+        );
+        let out = self.out.clone();
+        wait_for("a ping answer", move || {
+            out.lock().unwrap().iter().any(|line| {
+                serde_json::from_str::<Value>(line).is_ok_and(|value| value["id"] == id)
+            })
+        })
+        .await;
+    }
+
+    /// Claude Code closes stdin: shim and worker end.
+    async fn end(self) {
+        let Session {
+            mut shim, claude, ..
+        } = self;
+        drop(claude);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = shim.0.try_wait().unwrap() {
+                assert!(status.success(), "{status:?}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "the shim ends with its stdin");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+async fn update_answer(
+    events: &mut mpsc::Receiver<AgentEvent>,
+    conn: u64,
+    to_agent: &mpsc::Sender<HubMsg>,
+    update_id: u64,
+    release: Option<&str>,
+) -> UpdateOutcome {
+    to_agent
+        .send(HubMsg::Update {
+            update_id,
+            release: release.map(str::to_owned),
+        })
+        .await
+        .unwrap();
+    loop {
+        if let AgentMsg::UpdateAnswer {
+            update_id: answered,
+            outcome,
+        } = message(events, conn).await
+        {
+            assert_eq!(answered, update_id);
+            return outcome;
+        }
+    }
+}
+
+async fn agent_link() -> (u16, mpsc::Receiver<AgentEvent>) {
+    let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (events_tx, events) = mpsc::channel(64);
+    tokio::spawn(ingress::serve_agents(
+        listener,
+        Secret::parse(SECRET).unwrap(),
+        events_tx,
+    ));
+    (port, events)
+}
+
+#[tokio::test]
+async fn the_hubs_release_is_downloaded_checked_and_taken() {
+    let root =
+        Root(std::env::temp_dir().join(format!("cctg-update-e2e-dl-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    let (bin, release) = (root.0.join("bin"), root.0.join("release").join(TAG));
+    for dir in [&bin, &release] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let exe = bin.join(format!("cctg{EXE}"));
+    let original = std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap();
+    common::write_program(&exe, &original);
+    // The release: a newer build under this platform's asset name.
+    let published = release.join(asset(TAG));
+    let newer_build = write_newer(&published, &original);
+    let sum = cctg::client::build_of(&published).unwrap();
+    std::fs::write(
+        release.join("SHA256SUMS"),
+        format!(
+            "{}  cctg-{TAG}-other-target\n{sum}  {}\n",
+            "0".repeat(64),
+            asset(TAG)
+        ),
+    )
+    .unwrap();
+    let (base, asked) = serve(root.0.join("release"));
+
+    let (port, mut events) = agent_link().await;
+    let mut session = start_session(&root.0, &exe, port, &base);
+    let (first, register, to_first) = registered(&mut events).await;
+    let first_build = register.client.expect("a client").build;
+    assert_ne!(first_build, newer_build);
+
+    let outcome = update_answer(&mut events, first, &to_first, 7, Some(TAG)).await;
+    assert_eq!(outcome, UpdateOutcome::Reloading);
+    assert_eq!(
+        std::fs::read(&exe).unwrap(),
+        std::fs::read(&published).unwrap(),
+        "the release's binary is in the file's place"
+    );
+    if cfg!(windows) {
+        assert_eq!(
+            std::fs::read(bin.join(format!("cctg.old{EXE}"))).unwrap(),
+            original,
+            "the running file was moved aside"
+        );
+    }
+    to_first
+        .send(HubMsg::Released {
+            update_id: 7,
+            session_id: SESSION.into(),
+        })
+        .await
+        .unwrap();
+    let (second, register, to_second) = registered(&mut events).await;
+    assert_eq!(
+        register.client.expect("a client").build,
+        newer_build,
+        "the new worker runs the downloaded file"
+    );
+    session.ping(50).await;
+
+    // The file is the release now: nothing more is downloaded.
+    let outcome = update_answer(&mut events, second, &to_second, 8, Some(TAG)).await;
+    assert_eq!(outcome, UpdateOutcome::UpToDate);
+    let asked = asked.lock().unwrap().clone();
+    let count = |path: String| asked.iter().filter(|seen| **seen == path).count();
+    assert_eq!(count(format!("/{TAG}/SHA256SUMS")), 2, "{asked:?}");
+    assert_eq!(count(format!("/{TAG}/{}", asset(TAG))), 1, "{asked:?}");
+    let parts: Vec<_> = std::fs::read_dir(&bin)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+        .collect();
+    assert!(parts.is_empty(), "{parts:?}");
+    session.end().await;
+}
+
+#[tokio::test]
+async fn a_failed_download_leaves_the_old_binary_and_the_agent() {
+    let root =
+        Root(std::env::temp_dir().join(format!("cctg-update-e2e-bad-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    let bin = root.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join(format!("cctg{EXE}"));
+    let original = std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap();
+    common::write_program(&exe, &original);
+    let releases = root.0.join("release");
+    // `bad`: the file does not match its line. `nosum`: no line for this
+    // platform. `gone`: no such release (404). `cut`: the connection drops.
+    for tag in ["bad", "nosum"] {
+        let dir = releases.join(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_newer(&dir.join(asset(tag)), &original);
+    }
+    std::fs::write(
+        releases.join("bad").join("SHA256SUMS"),
+        format!("{}  {}\n", "ab".repeat(32), asset("bad")),
+    )
+    .unwrap();
+    std::fs::write(
+        releases.join("nosum").join("SHA256SUMS"),
+        format!("{}  cctg-nosum-other-target\n", "ab".repeat(32)),
+    )
+    .unwrap();
+    let (base, asked) = serve(releases);
+
+    let (port, mut events) = agent_link().await;
+    let mut session = start_session(&root.0, &exe, port, &base);
+    let (conn, _, to_agent) = registered(&mut events).await;
+    for (update_id, tag, want) in [
+        (1, "bad", UpdateOutcome::ChecksumMismatch),
+        (2, "nosum", UpdateOutcome::NoReleaseBuild),
+        (3, "gone", UpdateOutcome::NoReleaseBuild),
+        (4, "cut", UpdateOutcome::DownloadFailed),
+        (5, "../x", UpdateOutcome::NoReleaseBuild),
+    ] {
+        let outcome = update_answer(&mut events, conn, &to_agent, update_id, Some(tag)).await;
+        assert_eq!(outcome, want, "{tag}");
+        assert_eq!(std::fs::read(&exe).unwrap(), original, "{tag}: untouched");
+        session.ping(100 + update_id as i64).await;
+    }
+    let left: Vec<String> = std::fs::read_dir(&bin)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("cctg") && name != "cctg-workers")
+        .collect();
+    assert_eq!(left, [format!("cctg{EXE}")], "nothing written next to it");
+    assert!(
+        !asked.lock().unwrap().iter().any(|path| path.contains("..")),
+        "a bad tag is never asked for"
+    );
+    // A hub without a release tag: the disk alone, as before TASK-050.
+    let outcome = update_answer(&mut events, conn, &to_agent, 6, None).await;
+    assert_eq!(outcome, UpdateOutcome::UpToDate);
+    // The release does not come, but a newer file put in place otherwise
+    // (by hand, install.sh) is still taken.
+    std::fs::rename(&exe, bin.join(format!("cctg.old{EXE}"))).unwrap();
+    let newer_build = write_newer(&exe, &original);
+    let outcome = update_answer(&mut events, conn, &to_agent, 7, Some("cut")).await;
+    assert_eq!(outcome, UpdateOutcome::Reloading);
+    to_agent
+        .send(HubMsg::Released {
+            update_id: 7,
+            session_id: SESSION.into(),
+        })
+        .await
+        .unwrap();
+    let (_, register, _) = registered(&mut events).await;
+    assert_eq!(
+        register.client.expect("a client").build,
+        newer_build,
+        "the new worker runs the file put in place"
+    );
+    session.ping(200).await;
+    session.end().await;
 }

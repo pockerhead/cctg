@@ -304,6 +304,10 @@ pub struct Options {
     /// The hub's own build ([`crate::client`]); `None`: agents are never
     /// outdated.
     pub build: Option<String>,
+    /// The release tag the hub was built for ([`crate::client::release`]),
+    /// sent with `update` to an outdated agent, which downloads that
+    /// release's binary (TASK-050); `None`: the agent looks only at its disk.
+    pub release: Option<String>,
     /// A session read the agent has not answered by then has failed
     /// ([`READ_WAIT`]); each piece of a text starts the wait again.
     pub read_wait: Duration,
@@ -360,6 +364,7 @@ impl Default for Options {
             can_pin: true,
             prompt_settle: PROMPT_SETTLE,
             build: None,
+            release: None,
             read_wait: READ_WAIT,
         }
     }
@@ -4305,11 +4310,14 @@ impl Slots {
                 .and_then(|bound| bound.client.as_ref())
                 .is_some_and(|client| client.self_update);
             let update_id = crate::wire::random_u64();
+            // Only an agent of another build downloads; the next agent of
+            // the session, already the hub's build, only restarts claude.
+            let release = self.options.release.clone().filter(|_| self.outdated(conn));
             let sent = able
                 && self.conns.get(&conn).is_some_and(|bound| {
                     bound
                         .to_agent
-                        .try_send(HubMsg::Update { update_id })
+                        .try_send(HubMsg::Update { update_id, release })
                         .is_ok()
                 });
             if !sent {
@@ -4450,6 +4458,9 @@ impl Slots {
             UpdateOutcome::NeedsManualRestart => status::MANUAL_RESTART_NOTICE,
             UpdateOutcome::DraftInInput => status::DRAFT_NOTICE,
             UpdateOutcome::AgentsRunning => status::UPDATE_AGENTS_NOTICE,
+            UpdateOutcome::DownloadFailed => status::DOWNLOAD_FAILED_NOTICE,
+            UpdateOutcome::ChecksumMismatch => status::CHECKSUM_NOTICE,
+            UpdateOutcome::NoReleaseBuild => status::NO_RELEASE_BUILD_NOTICE,
             _ => status::UPDATE_FAILED_NOTICE,
         };
         if !asked && outcome == UpdateOutcome::UpToDate {
@@ -12650,7 +12661,12 @@ again"
             },
         ));
         slots.pump();
-        let Ok(HubMsg::Update { update_id }) = first.try_recv() else {
+        // A hub built without a release tag sends none (TASK-050).
+        let Ok(HubMsg::Update {
+            update_id,
+            release: None,
+        }) = first.try_recv()
+        else {
             panic!("no update after the turn");
         };
 
@@ -12670,7 +12686,7 @@ again"
         // The next agent runs the hub's build and is asked again.
         let mut second = register_client(&mut slots, 2, client(HUB_BUILD, true));
         slots.pump();
-        let Ok(HubMsg::Update { update_id }) = second.try_recv() else {
+        let Ok(HubMsg::Update { update_id, .. }) = second.try_recv() else {
             panic!("no second round");
         };
         answer(&mut slots, 2, update_id, UpdateOutcome::UpToDate);
@@ -12684,6 +12700,72 @@ again"
         assert_eq!(slots.press_update(A), status::ANSWER_CURRENT);
     }
 
+    /// TASK-050: a hub built for a release sends its tag with `update` to
+    /// an outdated agent only; a failed download ends the press with its
+    /// own notice and the agent stays bound.
+    #[tokio::test]
+    async fn a_release_hub_sends_its_tag_to_outdated_agents_and_tells_download_failures() {
+        let dir = TempDir::new("slots-update-release");
+        let options = Options {
+            build: Some(HUB_BUILD.into()),
+            release: Some("v0.1.3".into()),
+            ..options()
+        };
+        let (fake, mut slots) = live_slots(&dir, options);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
+        let failures = [
+            (
+                UpdateOutcome::DownloadFailed,
+                status::DOWNLOAD_FAILED_NOTICE,
+            ),
+            (UpdateOutcome::ChecksumMismatch, status::CHECKSUM_NOTICE),
+            (
+                UpdateOutcome::NoReleaseBuild,
+                status::NO_RELEASE_BUILD_NOTICE,
+            ),
+        ];
+        for (outcome, _) in failures {
+            assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+            slots.pump();
+            let Ok(HubMsg::Update { update_id, release }) = first.try_recv() else {
+                panic!("no update");
+            };
+            assert_eq!(release.as_deref(), Some("v0.1.3"));
+            answer(&mut slots, 1, update_id, outcome);
+            assert!(slots.updates.is_empty(), "{outcome:?} ends the press");
+            assert_eq!(slots.live_agent(SlotId(0)), Some((A.to_owned(), 1)));
+        }
+        slots.pump();
+        let texts: Vec<String> = sent_texts(&fake)
+            .await
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        for (outcome, notice) in failures {
+            assert!(
+                texts.iter().any(|text| text == notice),
+                "{outcome:?}: {texts:?}"
+            );
+        }
+        // Downloaded and handed over: the next agent runs the hub's build
+        // and is asked only about a restart, without the tag.
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        let Ok(HubMsg::Update { update_id, .. }) = first.try_recv() else {
+            panic!("no update");
+        };
+        answer(&mut slots, 1, update_id, UpdateOutcome::Reloading);
+        assert!(matches!(first.try_recv(), Ok(HubMsg::Released { .. })));
+        let mut second = register_client(&mut slots, 2, client(HUB_BUILD, true));
+        slots.pump();
+        let Ok(HubMsg::Update { release, .. }) = second.try_recv() else {
+            panic!("no second round");
+        };
+        assert_eq!(release, None, "a current agent downloads nothing");
+    }
+
     #[tokio::test]
     async fn a_refused_restart_binds_the_agent_back_and_old_clients_are_told() {
         let dir = TempDir::new("slots-update-refused");
@@ -12691,7 +12773,7 @@ again"
         let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
         assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
         slots.pump();
-        let Ok(HubMsg::Update { update_id }) = agent.try_recv() else {
+        let Ok(HubMsg::Update { update_id, .. }) = agent.try_recv() else {
             panic!("no update");
         };
         answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
@@ -12755,7 +12837,7 @@ again"
         let mut agent = register_client(&mut slots, 1, client(OLD_BUILD, true));
         assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
         slots.pump();
-        let Ok(HubMsg::Update { update_id }) = agent.try_recv() else {
+        let Ok(HubMsg::Update { update_id, .. }) = agent.try_recv() else {
             panic!("no update");
         };
         // A prompt from the terminal between `update` and its answer.
@@ -12784,7 +12866,7 @@ again"
             },
         ));
         slots.pump();
-        let Ok(HubMsg::Update { update_id }) = agent.try_recv() else {
+        let Ok(HubMsg::Update { update_id, .. }) = agent.try_recv() else {
             panic!("no update after the turn");
         };
         answer(&mut slots, 1, update_id, UpdateOutcome::Restarting);
@@ -12801,7 +12883,7 @@ again"
 
     fn update_of(agent: &mut mpsc::Receiver<HubMsg>) -> u64 {
         match agent.try_recv() {
-            Ok(HubMsg::Update { update_id }) => update_id,
+            Ok(HubMsg::Update { update_id, .. }) => update_id,
             other => panic!("no update: {other:?}"),
         }
     }
@@ -13073,7 +13155,7 @@ again"
         let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
         assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
         slots.pump();
-        let Ok(HubMsg::Update { update_id }) = first.try_recv() else {
+        let Ok(HubMsg::Update { update_id, .. }) = first.try_recv() else {
             panic!("no update");
         };
         answer(&mut slots, 1, update_id, UpdateOutcome::Reloading);

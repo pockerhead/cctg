@@ -3,6 +3,8 @@
 # client binaries (Windows x86_64, static Linux x86_64, macOS arm64) in a
 # GitHub Release. Image and binaries of one run are built with the same
 # CCTG_BUILD_ID, so a hub and a client of one commit report the same build.
+# A tag run also bakes CCTG_RELEASE=<tag> (TASK-050): its hub offers the
+# clients this release's binaries on ⬆️ Обновить; a main run bakes none.
 # Tag only a commit whose `ci` run is green and whose install.sh says
 # RELEASE=<the tag>. Only GITHUB_TOKEN; no other secret. Actions are pinned
 # to commits.
@@ -20,6 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.95.0"
   IMAGE: ghcr.io/${{ github.repository }}
+  RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
 jobs:
   image:
@@ -62,7 +65,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: CCTG_BUILD_ID=${{ github.sha }}
+          build-args: |
+            CCTG_BUILD_ID=${{ github.sha }}
+            CCTG_RELEASE=${{ env.RELEASE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: static Linux binary from the same build stage
@@ -72,7 +77,9 @@ jobs:
           context: .
           target: binary
           outputs: type=local,dest=dist
-          build-args: CCTG_BUILD_ID=${{ github.sha }}
+          build-args: |
+            CCTG_BUILD_ID=${{ github.sha }}
+            CCTG_RELEASE=${{ env.RELEASE_TAG }}
           cache-from: type=gha
       - if: startsWith(github.ref, 'refs/tags/v')
         run: mv dist/cctg "dist/cctg-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl"
@@ -109,6 +116,7 @@ jobs:
         shell: bash
         env:
           CCTG_BUILD_ID: ${{ github.sha }}
+          CCTG_RELEASE: ${{ env.RELEASE_TAG }}
         run: cargo build --release --locked -p cctg --target "${{ matrix.target }}"
       - name: the binary carries this commit
         shell: bash

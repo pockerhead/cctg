@@ -8,32 +8,43 @@
 //! - else empty (no git, no variable): the executable's hash stands in.
 //!
 //! Never fails the build for want of git.
+//!
+//! Also bakes `CCTG_RELEASE` (TASK-050): the release tag CI and the Docker
+//! build pass for a tag build, empty otherwise. A hub with a tag offers its
+//! clients that release's binary on ⬆️ Обновить.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ID_VAR: &str = "CCTG_BUILD_ID";
+const RELEASE_VAR: &str = "CCTG_RELEASE";
 
 fn main() {
     println!("cargo::rerun-if-env-changed={ID_VAR}");
+    println!("cargo::rerun-if-env-changed={RELEASE_VAR}");
     println!("cargo::rerun-if-changed=build.rs");
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let source = match std::env::var(ID_VAR) {
-        Ok(id) if !id.trim().is_empty() => checked(id.trim()),
+        Ok(id) if !id.trim().is_empty() => checked(ID_VAR, id.trim()),
         _ => from_git(&manifest).unwrap_or_default(),
     };
     println!("cargo::rustc-env=CCTG_SOURCE={source}");
+    let release = match std::env::var(RELEASE_VAR) {
+        Ok(tag) if !tag.trim().is_empty() => checked(RELEASE_VAR, tag.trim()),
+        _ => String::new(),
+    };
+    println!("cargo::rustc-env=CCTG_RELEASE={release}");
 }
 
-/// A given id goes into logs, the agent link and Telegram texts: short and
-/// plain, or the build stops.
-fn checked(id: &str) -> String {
+/// A given id or tag goes into logs, the agent link, Telegram texts and
+/// download URLs: short and plain, or the build stops.
+fn checked(var: &str, id: &str) -> String {
     let plain = id
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
     assert!(
         plain && id.len() <= 64,
-        "{ID_VAR} must be 1-64 characters of [A-Za-z0-9._-]"
+        "{var} must be 1-64 characters of [A-Za-z0-9._-]"
     );
     id.to_owned()
 }

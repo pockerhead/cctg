@@ -68,8 +68,8 @@ forward it with SendMessage to that agent instead of acting on it yourself. Tool
 never ask for permissions through `reply`. A tag with a `file_path` attribute brings a file the user sent \
 (a photo, a document, a voice message...): it is saved on this machine at that path; open it with your \
 tools when it matters. To give the user a file of this machine, call this server's `send_file` tool \
-(normally `mcp__cctg__send_file`) with its path: pictures arrive as photos, anything else as a \
-document, 50 MB at most.";
+(normally `mcp__cctg__send_file`) with its path and a short caption saying what the file is: \
+pictures arrive as photos, anything else as a document, 50 MB at most.";
 
 /// Why this agent has no hub link. Shown to Claude when it calls `reply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,7 +477,7 @@ fn send_file_tool() -> Value {
                 },
                 "caption": {
                     "type": "string",
-                    "description": "Optional short text shown with the file (Telegram shows at most 1024 characters).",
+                    "description": "Always give one: a short text shown with the file, what it is and why you send it (Telegram shows at most 1024 characters). Without it the file name is shown.",
                 },
             },
             "required": ["path"],
@@ -642,6 +642,7 @@ mod tests {
         assert!(instructions.contains("never ask for permissions through `reply`"));
         assert!(instructions.contains("`file_path` attribute"));
         assert!(instructions.contains("`mcp__cctg__send_file`"));
+        assert!(instructions.contains("a short caption saying what the file is"));
     }
 
     #[test]
@@ -895,6 +896,11 @@ mod tests {
         assert_eq!(tools[1]["inputSchema"]["required"], json!(["path"]));
         let description = tools[1]["description"].as_str().unwrap();
         assert!(description.contains("as a photo") && description.contains("50 MB"));
+        // TASK-051: a caption is asked for; the name stands in without one.
+        let caption = tools[1]["inputSchema"]["properties"]["caption"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(caption.starts_with("Always give one") && caption.contains("file name"));
         assert_eq!(tools[0]["name"], "reply");
         assert_eq!(tools[0]["inputSchema"]["required"], json!(["text"]));
         let description = tools[0]["description"].as_str().unwrap();
@@ -1089,7 +1095,10 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["method"], "notifications/claude/channel");
         for msg in [
-            HubMsg::Update { update_id: 1 },
+            HubMsg::Update {
+                update_id: 1,
+                release: None,
+            },
             HubMsg::Released {
                 update_id: 1,
                 session_id: "s".into(),

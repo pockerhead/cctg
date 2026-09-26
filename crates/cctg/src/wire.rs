@@ -469,6 +469,16 @@ pub enum UpdateOutcome {
     AgentsRunning,
     /// Already up to date: no newer binary, no restart needed.
     UpToDate,
+    /// The hub's release could not be downloaded or put in place (network,
+    /// timeout, a write); the old binary stays (TASK-050). Hubs before it
+    /// read [`Self::Other`], a failure; so do the next two.
+    DownloadFailed,
+    /// The downloaded binary does not match the release's `SHA256SUMS`;
+    /// nothing was put in place.
+    ChecksumMismatch,
+    /// The release has no binary for the agent's platform (no such file,
+    /// no `SHA256SUMS` line, or a platform without release builds).
+    NoReleaseBuild,
     /// Something failed; nothing changed.
     Failed,
     /// An outcome of a newer agent.
@@ -639,9 +649,15 @@ pub enum HubMsg {
     },
     /// Sent only to an agent whose [`Client::self_update`] is set, on the
     /// user's "Обновить": take a newer binary, or restart claude when
-    /// needed; answered with one `update_answer`.
+    /// needed; answered with one `update_answer`. `release`: the hub's
+    /// release tag, sent only to an outdated agent by a hub built for a
+    /// release (TASK-050): the agent first puts that release's binary for
+    /// its platform in place of its file when the file is another one.
+    /// Agents before it ignore the field.
     Update {
         update_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release: Option<String>,
     },
     /// The answer to a leaving `update_answer`, queued behind every message
     /// handed to the agent before it: after it nothing more comes.
@@ -1328,7 +1344,14 @@ mod tests {
                 command_id: 8,
                 text: "!echo \u{2014} hi".into(),
             },
-            HubMsg::Update { update_id: 9 },
+            HubMsg::Update {
+                update_id: 9,
+                release: None,
+            },
+            HubMsg::Update {
+                update_id: 10,
+                release: Some("v0.1.3".into()),
+            },
             HubMsg::Released {
                 update_id: 9,
                 session_id: "s".into(),
@@ -1785,6 +1808,38 @@ mod tests {
                 outcome: UpdateOutcome::Other
             })
         );
+        // A hub without a release tag sends the line hubs before TASK-050
+        // sent; an agent of then ignores a tag (no unknown-field refusal).
+        assert_eq!(
+            encode(&HubMsg::Update {
+                update_id: 4,
+                release: None
+            }),
+            b"{\"v\":1,\"type\":\"update\",\"update_id\":4}\n"
+        );
+        let tagged = br#"{"v":1,"type":"update","update_id":5,"release":"v0.1.3"}"#;
+        assert_eq!(
+            decode::<HubMsg>(tagged),
+            Ok(HubMsg::Update {
+                update_id: 5,
+                release: Some("v0.1.3".into())
+            })
+        );
+        for (name, outcome) in [
+            ("download_failed", UpdateOutcome::DownloadFailed),
+            ("checksum_mismatch", UpdateOutcome::ChecksumMismatch),
+            ("no_release_build", UpdateOutcome::NoReleaseBuild),
+        ] {
+            let line =
+                format!(r#"{{"v":1,"type":"update_answer","update_id":6,"outcome":"{name}"}}"#);
+            assert_eq!(
+                decode::<AgentMsg>(line.as_bytes()),
+                Ok(AgentMsg::UpdateAnswer {
+                    update_id: 6,
+                    outcome
+                })
+            );
+        }
         // Hook posts carry the hook's version; older ones leave it out.
         let post = HookPost::new(
             "h".into(),

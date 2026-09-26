@@ -300,6 +300,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         build = build
             .as_deref()
             .map_or_else(|| "?".to_owned(), crate::client::short),
+        release = crate::client::release().unwrap_or("-"),
         "hub started, polling"
     );
 
@@ -312,6 +313,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         can_pin,
         status_every: Some(slots::STATUS_EVERY),
         build,
+        release: crate::client::release().map(str::to_owned),
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
