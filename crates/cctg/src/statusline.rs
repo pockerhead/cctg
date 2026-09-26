@@ -8,8 +8,8 @@
 //! status line the terminal would have shown without cctg: the
 //! `statusLine.command` of the user's own settings (`$CLAUDE_CONFIG_DIR` or
 //! `~/.claude/settings.json`, read on every call), run with the same stdin
-//! through the shell Claude Code uses for it, or, without one, a short line
-//! of its own. It exits with the user's command's exit code (Claude Code
+//! through the shell Claude Code uses for it, or, without one, two lines of
+//! its own ([`own_line`], TASK-056). It exits with the user's command's exit code (Claude Code
 //! blanks the line on a non-zero one, as it would without cctg), else 0;
 //! problems go to stderr as fixed text, never the input or the secret.
 
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -48,6 +49,17 @@ const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
 const GIT_BASH_VAR: &str = "CLAUDE_CODE_GIT_BASH_PATH";
 /// Longest model and effort names sent.
 const MAX_NAME: usize = 64;
+/// Longest run of each `git` call of cctg's own line (branch and dirty
+/// mark, run side by side): past it the line goes without that part.
+pub const GIT_TIMEOUT: Duration = Duration::from_millis(400);
+/// Longest account email shown (the longest a mail address can be).
+const MAX_EMAIL: usize = 254;
+
+const BOLD: &str = "\x1b[1m";
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
 
 /// Runs one status line call and returns the exit code: the user's command's,
 /// or 0 when cctg printed its own line. Never fails.
@@ -84,7 +96,10 @@ pub async fn run() -> i32 {
         Some(command) => run_chained(&command, &input).await,
         None => None,
     };
-    let (output, code) = chained.unwrap_or_else(|| (own_line(&value).into_bytes(), 0));
+    let (output, code) = match chained {
+        Some(chained) => chained,
+        None => (own_output(&value).await.into_bytes(), 0),
+    };
     {
         let mut stdout = std::io::stdout().lock();
         let _ = std::io::Write::write_all(&mut stdout, &output);
@@ -142,25 +157,183 @@ pub fn event(input: &Value) -> Option<(String, String, String, HookEvent)> {
     Some((session, cwd, transcript, event))
 }
 
-/// cctg's own short line: `Opus · ctx 50% · 5h 3% · 7d 92%`, the parts
-/// Claude Code gave.
-pub fn own_line(input: &Value) -> String {
-    let mut parts = Vec::new();
-    if let Some(model) =
-        text(input, &["model", "display_name"]).or_else(|| text(input, &["model", "id"]))
-    {
-        parts.push(model);
+/// cctg's own line for `input`, with the git branch of its folder and the
+/// account of this machine's Claude Code login.
+async fn own_output(input: &Value) -> String {
+    let cwd = session_dir(input);
+    let branch = git_branch(&cwd).await;
+    let email = account_email(&|name| std::env::var(name).ok());
+    own_line(input, &cwd, branch.as_deref(), email.as_deref())
+}
+
+/// The session's folder: `workspace.current_dir`, then `cwd`, then the
+/// folder this process runs in.
+fn session_dir(input: &Value) -> String {
+    [&["workspace", "current_dir"][..], &["cwd"]]
+        .into_iter()
+        .find_map(|path| {
+            let mut at = input;
+            for key in path {
+                at = at.get(key)?;
+            }
+            at.as_str()
+                .filter(|dir| !dir.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|dir| dir.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// cctg's own two lines, the parts that are known (as the user's
+/// `statusline.py`):
+/// `<bold model> [effort] <cyan br:branch*> dir:folder ctx:50%` and
+/// `acc:email 5h:3% 7d:92%`, a limit yellow from 80 % and red from 95 %.
+/// `branch` carries its `*` already. The email is only printed here.
+pub fn own_line(input: &Value, cwd: &str, branch: Option<&str>, email: Option<&str>) -> String {
+    let model = text(input, &["model", "display_name"])
+        .or_else(|| text(input, &["model", "id"]))
+        .unwrap_or_else(|| "?".to_owned());
+    let mut parts = vec![format!("{BOLD}{model}{RESET}")];
+    if let Some(effort) = text(input, &["effort", "level"]) {
+        parts.push(format!("[{effort}]"));
+    }
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        parts.push(format!("{CYAN}br:{branch}{RESET}"));
+    }
+    parts.push(format!("dir:{}", folder_name(cwd)));
+    if let Some(context) = percent(input, &["context_window", "used_percentage"]) {
+        parts.push(format!("ctx:{context}%"));
+    }
+    let mut limits = Vec::new();
+    if let Some(email) = email {
+        limits.push(format!("acc:{email}"));
     }
     for (label, path) in [
-        ("ctx", &["context_window", "used_percentage"][..]),
-        ("5h", &["rate_limits", "five_hour", "used_percentage"]),
+        ("5h", &["rate_limits", "five_hour", "used_percentage"][..]),
         ("7d", &["rate_limits", "seven_day", "used_percentage"]),
     ] {
-        if let Some(value) = percent(input, path) {
-            parts.push(format!("{label} {value}%"));
+        if let Some(used) = percent(input, path) {
+            limits.push(match used {
+                95.. => format!("{RED}{label}:{used}%{RESET}"),
+                80.. => format!("{YELLOW}{label}:{used}%{RESET}"),
+                _ => format!("{label}:{used}%"),
+            });
         }
     }
-    parts.join(" · ")
+    let mut line = parts.join(" ");
+    if !limits.is_empty() {
+        line.push('\n');
+        line.push_str(&limits.join(" "));
+    }
+    line
+}
+
+/// The last part of a folder path of any OS; the path itself when it has
+/// none (a drive root).
+fn folder_name(cwd: &str) -> &str {
+    let trimmed = cwd.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(cwd)
+}
+
+/// The branch checked out in `cwd`, with `*` when the work tree has
+/// changes; `None` outside a repository, on a detached head, without `git`
+/// on `PATH` or when it takes longer than [`GIT_TIMEOUT`].
+pub async fn git_branch(cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    let (branch, status) = tokio::join!(
+        git(cwd, &["branch", "--show-current"]),
+        git(cwd, &["status", "--porcelain"])
+    );
+    let branch = branch.filter(|branch| !branch.is_empty())?;
+    Some(match status {
+        Some(status) if !status.is_empty() => format!("{branch}*"),
+        _ => branch,
+    })
+}
+
+/// The trimmed output of a successful `git -C <cwd> --no-optional-locks
+/// <args>`; the process is killed after [`GIT_TIMEOUT`].
+async fn git(cwd: &str, args: &[&str]) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    // A repository chosen by the caller's environment would name the wrong
+    // branch for `cwd`.
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(var);
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
+        .arg("-C")
+        .arg(cwd)
+        .arg("--no-optional-locks")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(GIT_TIMEOUT, output).await.ok()?.ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The email of the Claude Code account logged in on this machine, for the
+/// terminal only: it never goes to the hub or a log.
+fn account_email(var: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    let path = claude_json_path(var)?;
+    email_of(&std::fs::read(path).ok()?)
+}
+
+/// `$CLAUDE_CONFIG_DIR/.claude.json`, else `<home>/.claude.json`.
+pub fn claude_json_path(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(dir) = var(CONFIG_DIR_VAR).filter(|dir| !dir.trim().is_empty()) {
+        return Some(Path::new(dir.trim()).join(".claude.json"));
+    }
+    device::home_dir(var).map(|home| home.join(".claude.json"))
+}
+
+#[derive(Deserialize)]
+struct ClaudeJson {
+    #[serde(default, rename = "oauthAccount")]
+    account: Option<OauthAccount>,
+}
+
+#[derive(Deserialize)]
+struct OauthAccount {
+    #[serde(default, rename = "emailAddress")]
+    email: Option<String>,
+}
+
+/// `oauthAccount.emailAddress` of a `.claude.json`; nothing that is not
+/// plain text a terminal shows as is.
+pub fn email_of(claude_json: &[u8]) -> Option<String> {
+    let config: ClaudeJson = serde_json::from_slice(claude_json).ok()?;
+    let email = config.account?.email?;
+    let email = email.trim();
+    (!email.is_empty()
+        && email.chars().count() <= MAX_EMAIL
+        && !email.chars().any(char::is_control))
+    .then(|| email.to_owned())
 }
 
 /// The user's own status line command from their Claude Code settings.
@@ -341,10 +514,47 @@ mod tests {
                 seven_day: Some(92),
             }
         );
+    }
+
+    #[test]
+    fn the_own_line_is_the_users_statusline_py() {
+        let input = sample();
         assert_eq!(
-            own_line(&sample()),
-            "Opus 5.5 (1M context) · ctx 50% · 5h 3% · 7d 92%"
+            own_line(&input, "/w/app", Some("main*"), Some("me@example.test")),
+            "\x1b[1mOpus 5.5 (1M context)\x1b[0m [medium] \x1b[36mbr:main*\x1b[0m dir:app ctx:50%\n\
+             acc:me@example.test 5h:3% \x1b[33m7d:92%\x1b[0m"
         );
+        // Without git or a login: no branch, no account.
+        assert_eq!(
+            own_line(&input, "/w/app", None, None),
+            "\x1b[1mOpus 5.5 (1M context)\x1b[0m [medium] dir:app ctx:50%\n5h:3% \x1b[33m7d:92%\x1b[0m"
+        );
+        // Limits: plain below 80, yellow from 80, red from 95.
+        for (used, shown) in [
+            (79.4, "5h:79%".to_owned()),
+            (79.5, "\x1b[33m5h:80%\x1b[0m".to_owned()),
+            (94.4, "\x1b[33m5h:94%\x1b[0m".to_owned()),
+            (95.0, "\x1b[31m5h:95%\x1b[0m".to_owned()),
+            (100.0, "\x1b[31m5h:100%\x1b[0m".to_owned()),
+        ] {
+            let input = json!({ "model": { "id": "m" },
+                "rate_limits": { "five_hour": { "used_percentage": used } } });
+            assert_eq!(
+                own_line(&input, "/w", None, None),
+                format!("\x1b[1mm\x1b[0m dir:w\n{shown}"),
+                "{used}"
+            );
+        }
+        // Folder names of every OS; a root is shown whole.
+        for (cwd, name) in [
+            ("C:\\Users\\u\\dev\\cctg", "cctg"),
+            ("C:/Users/u/dev/cctg/", "cctg"),
+            ("/home/u/app", "app"),
+            ("C:\\", "C:"),
+            ("/", "/"),
+        ] {
+            assert_eq!(folder_name(cwd), name, "{cwd}");
+        }
     }
 
     #[test]
@@ -368,10 +578,16 @@ mod tests {
                 seven_day: None,
             }
         );
-        assert_eq!(own_line(&early), "claude-x");
+        assert_eq!(
+            own_line(&early, "/w", None, None),
+            "\x1b[1mclaude-x\x1b[0m dir:w"
+        );
         assert!(super::event(&json!({ "model": {} })).is_none());
         assert!(super::event(&Value::Null).is_none());
-        assert_eq!(own_line(&Value::Null), "");
+        assert_eq!(
+            own_line(&Value::Null, "", None, None),
+            "\x1b[1m?\x1b[0m dir:"
+        );
         for bad in [json!(-1), json!(100.6), json!(999), json!(f64::MAX)] {
             let input = json!({ "session_id": "s", "context_window": { "used_percentage": bad },
                 "rate_limits": { "seven_day": { "used_percentage": bad } } });
@@ -408,6 +624,43 @@ mod tests {
             ))
         ));
         assert!(POST_TIMEOUT <= Duration::from_millis(100));
+    }
+
+    #[test]
+    fn the_account_email_comes_from_claude_json() {
+        assert_eq!(
+            email_of(br#"{"numStartups":3,"oauthAccount":{"emailAddress":" me@example.test ","accountUuid":"x"}}"#)
+                .as_deref(),
+            Some("me@example.test")
+        );
+        for claude_json in [
+            &br#"{"oauthAccount":null}"#[..],
+            br#"{"oauthAccount":{"emailAddress":null}}"#,
+            br#"{"oauthAccount":{"emailAddress":"  "}}"#,
+            br#"{"oauthAccount":{"emailAddress":"a\u001b[31m@b"}}"#,
+            br#"{"oauthAccount":{"emailAddress":7}}"#,
+            br#"{"projects":{}}"#,
+            b"not json",
+        ] {
+            assert_eq!(email_of(claude_json), None, "{claude_json:?}");
+        }
+        let vars = |config: Option<&str>| {
+            let config = config.map(str::to_owned);
+            move |name: &str| match name {
+                "CLAUDE_CONFIG_DIR" => config.clone(),
+                "USERPROFILE" | "HOME" => Some("/home/u".to_owned()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            claude_json_path(&vars(Some("/cfg"))),
+            Some(Path::new("/cfg").join(".claude.json"))
+        );
+        assert_eq!(
+            claude_json_path(&vars(None)),
+            Some(Path::new("/home/u").join(".claude.json"))
+        );
+        assert!(GIT_TIMEOUT <= Duration::from_millis(500));
     }
 
     #[test]
