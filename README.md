@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh
 ```
 
-Установщик ставит `cctg` в `~/.cctg`, команду `claude-cctg` в `~/.local/bin` и проверяет связь с hub. Ваши `~/.claude/settings.json` и `~/.claude.json` он не трогает.
+Установщик ставит `cctg` в `~/.cctg`, команду `claude-cctg` в `~/.local/bin` и проверяет связь с hub. Ваши `~/.claude/settings.json` и `~/.claude.json` он не трогает. Если `~/.local/bin` нет в `PATH`, он предлагает дописать его одной строкой в `~/.zshrc`, `~/.bashrc` или `~/.profile` (по вашему shell; с `--yes` без вопроса, `--uninstall` строку убирает). В Docker-контейнере имя машины это id контейнера, поэтому установщик спрашивает имя для тем (или `--host NAME`).
 
 Проверить связь потом: `~/.cctg/bin/cctg doctor`.
 
