@@ -7,6 +7,7 @@ pub mod client;
 pub mod deploy;
 pub mod device;
 pub mod doctor;
+pub mod download;
 pub mod files;
 pub mod hook;
 pub mod hub;
