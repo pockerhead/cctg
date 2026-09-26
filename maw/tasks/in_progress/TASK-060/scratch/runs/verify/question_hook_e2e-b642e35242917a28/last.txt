@@ -1,0 +1,11 @@
+
+running 6 tests
+test choices_in_the_topic_are_the_hooks_answers ... ok
+test own_text_answers_after_other_or_as_a_reply ... ok
+test the_terminal_button_gives_no_decision_at_once ... ok
+test a_stopped_hub_means_no_decision_and_a_quick_exit ... ok
+test an_unanswered_question_gives_no_decision ... ok
+test the_permission_hook_of_a_question_never_waits ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.20s
+

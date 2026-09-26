@@ -1,0 +1,19 @@
+
+running 2 tests
+test settings_snippet_registers_every_event_without_secrets_or_paths ... ok
+test every_event_reaches_the_hub ... FAILED
+
+failures:
+
+---- every_event_reaches_the_hub stdout ----
+
+thread 'every_event_reaches_the_hub' (43488) panicked at crates\cctg\tests\hook_cli.rs:196:14:
+hub got the event: Elapsed(())
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    every_event_reaches_the_hub
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 5.13s
+

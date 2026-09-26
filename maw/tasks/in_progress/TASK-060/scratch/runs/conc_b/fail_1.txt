@@ -1,0 +1,21 @@
+
+running 2 tests
+test settings_snippet_registers_every_event_without_secrets_or_paths ... ok
+test every_event_reaches_the_hub ... FAILED
+
+failures:
+
+---- every_event_reaches_the_hub stdout ----
+
+thread 'every_event_reaches_the_hub' (14476) panicked at crates\cctg\tests\hook_cli.rs:198:9:
+assertion `left == right` failed: SessionEnd
+  left: "session_start"
+ right: "session_end"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    every_event_reaches_the_hub
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.16s
+

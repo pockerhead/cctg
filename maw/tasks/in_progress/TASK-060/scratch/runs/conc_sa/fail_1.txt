@@ -1,0 +1,29 @@
+
+running 6 tests
+test a_stopped_hub_adds_well_under_150_ms ... FAILED
+test the_own_line_shows_the_branch_and_the_account_and_the_hub_never_gets_the_email ... ok
+test the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte ... ok
+test colours_lines_a_failing_exit_and_empty_output_pass_unchanged ... ok
+test a_command_that_prints_too_much_is_cut_without_waiting_for_the_timeout ... ok
+test without_a_command_or_inside_one_cctg_prints_its_own_line ... FAILED
+
+failures:
+
+---- a_stopped_hub_adds_well_under_150_ms stdout ----
+
+thread 'a_stopped_hub_adds_well_under_150_ms' (24976) panicked at crates\cctg\tests\statusline_cli.rs:36:6:
+called `Result::unwrap()` on an `Err` value: Os { code: 3, kind: NotFound, message: "Системе не удается найти указанный путь." }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- without_a_command_or_inside_one_cctg_prints_its_own_line stdout ----
+
+thread 'without_a_command_or_inside_one_cctg_prints_its_own_line' (22188) panicked at crates\cctg\tests\statusline_cli.rs:171:10:
+hub got the numbers: Elapsed(())
+
+
+failures:
+    a_stopped_hub_adds_well_under_150_ms
+    without_a_command_or_inside_one_cctg_prints_its_own_line
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.26s
+

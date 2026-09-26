@@ -1,0 +1,11 @@
+
+running 6 tests
+test the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte ... ok
+test a_command_that_prints_too_much_is_cut_without_waiting_for_the_timeout ... ok
+test colours_lines_a_failing_exit_and_empty_output_pass_unchanged ... ok
+test the_own_line_shows_the_branch_and_the_account_and_the_hub_never_gets_the_email ... ok
+test without_a_command_or_inside_one_cctg_prints_its_own_line ... ok
+test a_stopped_hub_adds_well_under_150_ms ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.09s
+

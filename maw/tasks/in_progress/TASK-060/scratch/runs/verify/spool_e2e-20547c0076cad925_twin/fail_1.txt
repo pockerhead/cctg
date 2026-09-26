@@ -1,0 +1,21 @@
+
+running 4 tests
+test a_missed_session_start_reaches_the_hub_before_the_next_hook ... FAILED
+test the_agent_delivers_its_sessions_kept_start_when_it_registers ... ok
+test a_silent_hub_costs_a_hook_one_budget_however_much_is_kept ... ok
+test the_spool_holds_no_text_and_is_bounded ... ok
+
+failures:
+
+---- a_missed_session_start_reaches_the_hub_before_the_next_hook stdout ----
+
+thread 'a_missed_session_start_reaches_the_hub_before_the_next_hook' (26216) panicked at crates\cctg\tests\spool_e2e.rs:137:10:
+called `Result::unwrap()` on an `Err` value: Os { code: 10048, kind: AddrInUse, message: "Обычно разрешается только одно использование адреса сокета (протокол/сетевой адрес/порт)." }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_missed_session_start_reaches_the_hub_before_the_next_hook
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.45s
+
