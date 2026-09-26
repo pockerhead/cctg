@@ -195,6 +195,7 @@ impl Hub {
                 quote: None,
                 forwarded: false,
                 media: None,
+                from_name: None,
             })
             .unwrap();
     }

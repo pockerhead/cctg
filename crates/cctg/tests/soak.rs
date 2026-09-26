@@ -806,6 +806,7 @@ impl Soak {
                 quote: None,
                 forwarded: false,
                 media: None,
+                from_name: None,
             }));
             return;
         }
@@ -826,6 +827,7 @@ impl Soak {
                 query_id: query,
                 data: Some(data.to_owned()),
                 message_id: Some(message_id),
+                from_name: None,
             }));
             return;
         }
