@@ -16,6 +16,8 @@
 #   <home>/.cctg/claude/mcp.json        the cctg channel server for claude
 #   <home>/.cctg/claude/settings.json   cctg hooks and status line
 #   <home>/.local/bin/claude-cctg       the wrapper (and claude-cctg.cmd on Windows)
+#   one PATH line (marked "# cctg") in the shell's start file when
+#   <home>/.local/bin is not in PATH: ~/.zshrc, ~/.bashrc or ~/.profile
 # It never writes ~/.claude/settings.json or ~/.claude.json and never prints
 # the hub secret (--hub prints it once, inside the client install line).
 # Running it again updates; --uninstall removes these files.
@@ -36,7 +38,12 @@ MARK=cctg-install
 MANAGED='CCTG_HUB_SECRET|CCTG_HUB_AGENT_ADDR|CCTG_HUB_HOOK_ADDR|CCTG_HUB_CERT_SHA256'
 # The other lines of device.env this script writes (--uninstall removes them).
 ENV_HEADER='# cctg device config, written by install.sh (docs/remote-hub.md)'
-HOST_MARK='# the CCTG_HOST line below: written by install.sh (macOS gives cctg no host name)'
+HOST_MARKED='# the CCTG_HOST line below: written by install.sh'
+HOST_MARK="$HOST_MARKED (macOS gives cctg no host name)"
+HOST_MARK_CONTAINER="$HOST_MARKED (in a container the host name is its id)"
+HOST_MARK_GIVEN="$HOST_MARKED (--host)"
+# The line that puts ~/.local/bin in PATH; --uninstall removes exactly it.
+PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\" # cctg"
 # hub.env: the hub runs without a proxy (so the question is not asked again).
 PROXY_NONE='# HTTPS_PROXY: none (install.sh --hub)'
 AGENT_PORT=47291
@@ -53,6 +60,7 @@ agent_addr=
 hook_addr=
 pin=
 secret_file=
+host=
 from_source=0
 yes=0
 uninstall=0
@@ -69,6 +77,7 @@ while [ $# -gt 0 ]; do
         --hook-addr) need_value "$@"; hook_addr=$2; shift 2 ;;
         --pin) need_value "$@"; pin=$2; shift 2 ;;
         --secret-file) need_value "$@"; secret_file=$2; shift 2 ;;
+        --host) need_value "$@"; host=$2; shift 2 ;;
         --from-source) from_source=1; shift ;;
         -y|--yes) yes=1; shift ;;
         --uninstall) uninstall=1; shift ;;
@@ -141,10 +150,7 @@ if [ -e "$bin_dir/cctg.hub-started" ]; then
 fi
 say "checking the hub (cctg doctor):"
 "$exe" doctor </dev/null || say "the hub check failed; fix device.env and run $exe doctor again"
-case ":$PATH:" in
-    *":$wrap_dir:"*) ;;
-    *) say "note: $wrap_dir is not in PATH; add it (Claude Code's installer uses the same folder)" ;;
-esac
+offer_path
 say "done: run claude-cctg in a project folder"
 }
 
@@ -160,8 +166,12 @@ Bash): the cctg binary, device.env, Claude Code files and claude-cctg.
                         another machine; the openssl fingerprint line works)
   --secret-file FILE    read the hub secret from the first line of FILE
                         (or set CCTG_HUB_SECRET; otherwise it is asked for)
+  --host NAME           this machine's name in the topic titles (CCTG_HOST);
+                        in a container it is asked for, with --yes taken
+                        from CCTG_HOST
   --from-source         build with cargo from the clone this script is in
-  -y, --yes             ask nothing (also: install Claude Code when missing)
+  -y, --yes             ask nothing (also: install Claude Code when missing,
+                        add ~/.local/bin to PATH in the shell's start file)
   --uninstall           remove what this script wrote
   CCTG_INSTALL_BASE_URL   where this release's files are (a mirror; http
                           only on this machine)
@@ -328,6 +338,62 @@ read_settings() {
         [ -n "$secret" ] || die "no hub secret typed"
     fi
     [ -z "$secret" ] || check_secret
+    choose_host
+}
+
+check_host() {
+    case $1 in
+        ''|*[!A-Za-z0-9._-]*) die "the host name takes letters, digits, '.', '_' and '-' only" ;;
+    esac
+}
+
+# A Docker, Podman or other container (a fake one in the tests: env
+# container=...).
+in_container() {
+    [ -f /.dockerenv ] || [ -f /run/.containerenv ] || env | grep -q '^container=' \
+        || grep -q -E 'docker|containerd|kubepods|libpod|lxc' /proc/1/cgroup 2>/dev/null
+}
+
+# The CCTG_HOST line to write -> $host_line (empty: none) and $host_mark.
+# --host always; in a container, where the host name is the container's id
+# (a new device, and new topics, with every new container), unless
+# device.env has one: asked, with --yes or without a terminal CCTG_HOST
+# of the environment, else a warning.
+choose_host() {
+    host_line=
+    host_mark=
+    if [ -n "$host" ]; then
+        check_host "$host"
+        host_line=CCTG_HOST=$host
+        host_mark=$HOST_MARK_GIVEN
+        return 0
+    fi
+    if [ -n "$(old_line CCTG_HOST)" ] || ! in_container; then
+        return 0
+    fi
+    name=${CCTG_HOST:-}
+    if interactive; then
+        if [ -z "$name" ]; then
+            name=$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null || true)
+            # A container id (hex) is no name to suggest.
+            case $name in
+                *[!0-9a-f]*) ;;
+                *) [ ${#name} -lt 12 ] || name= ;;
+            esac
+            case $name in
+                ''|*[!A-Za-z0-9._-]*) name=container ;;
+            esac
+        fi
+        ask "This is a container: its host name is its id. Name for the topics [$name]: "
+        name=${answer:-$name}
+    fi
+    if [ -z "$name" ]; then
+        say "warning: in a container the host name is the container's id, a new one for every container; give a name with --host NAME (or CCTG_HOST=NAME in $env_file)"
+        return 0
+    fi
+    check_host "$name"
+    host_line=CCTG_HOST=$name
+    host_mark=$HOST_MARK_CONTAINER
 }
 
 have_claude() {
@@ -495,21 +561,25 @@ managed_line() {
 
 write_device_env() {
     mkdir -p "$root"
-    host_line=
     # Without /proc a Mac has no host name for cctg (the hook and the agent
     # read CCTG_HOST, else /proc, else HOSTNAME, which is not exported).
-    if [ "$os" = macos ] && [ -z "$(old_line CCTG_HOST)" ]; then
+    if [ -z "$host_line" ] && [ "$os" = macos ] && [ -z "$(old_line CCTG_HOST)" ]; then
         host_line="CCTG_HOST=$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+        host_mark=$HOST_MARK
     fi
+    # --host replaces every CCTG_HOST line there is, and its mark.
+    drop=$MANAGED
+    [ -z "$host" ] || drop="$MANAGED|CCTG_HOST"
     old_umask=$(umask)
     umask 077
     {
         if [ -f "$env_file" ]; then
-            grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=" "$env_file" || true
+            grep -v -E "^[[:space:]]*(export[[:space:]]+)?($drop)[[:space:]]*=" "$env_file" \
+                | if [ -n "$host" ]; then grep -v -F "$HOST_MARKED" || true; else cat; fi
         else
             printf '%s\n' "$ENV_HEADER"
         fi
-        [ -z "$host_line" ] || printf '%s\n' "$HOST_MARK" "$host_line"
+        [ -z "$host_line" ] || printf '%s\n' "$host_mark" "$host_line"
         managed_line CCTG_HUB_SECRET "$secret"
         managed_line CCTG_HUB_AGENT_ADDR "$agent_addr"
         managed_line CCTG_HUB_HOOK_ADDR "$hook_addr"
@@ -588,6 +658,61 @@ EOF
     fi
 }
 
+# The shell's start file for the PATH line: by $SHELL, Git Bash's ~/.bashrc.
+rc_file() {
+    if [ "$os" = windows ]; then
+        printf '%s' "$home/.bashrc"
+        return 0
+    fi
+    shell=${SHELL:-}
+    case ${shell##*/} in
+        zsh) printf '%s' "$home/.zshrc" ;;
+        bash) printf '%s' "$home/.bashrc" ;;
+        *) printf '%s' "$home/.profile" ;;
+    esac
+}
+
+# ~/.local/bin not in PATH: the PATH line goes into the shell's start file
+# once (asked; --yes adds it without asking).
+offer_path() {
+    case ":$PATH:" in
+        *":$wrap_dir:"*) return 0 ;;
+    esac
+    rc=$(rc_file)
+    if [ -f "$rc" ] && grep -q -x -F "$PATH_LINE" "$rc"; then
+        say "note: $rc puts $wrap_dir in PATH; open a new terminal (or run: . $rc)"
+        return 0
+    fi
+    if [ "$yes" = 1 ]; then
+        answer=y
+    else
+        ask "$wrap_dir is not in PATH. Add it in $rc? [Y/n] "
+        interactive || answer=n
+    fi
+    case $answer in
+        ''|y|Y|yes) ;;
+        *) say "note: $wrap_dir is not in PATH; add it (Claude Code's installer uses the same folder)"; return 0 ;;
+    esac
+    # A last line without its newline keeps its text.
+    if [ -s "$rc" ] && [ -n "$(tail -c 1 "$rc")" ]; then
+        printf '\n' >>"$rc"
+    fi
+    printf '%s\n' "$PATH_LINE" >>"$rc"
+    say "added $wrap_dir to PATH in $rc; open a new terminal (or run: . $rc)"
+}
+
+# The PATH line out of every start file it can be in; the other lines stay.
+# Written in place: a linked start file stays a link.
+strip_path_line() {
+    for rc in "$home/.zshrc" "$home/.bashrc" "$home/.profile"; do
+        if [ -f "$rc" ] && grep -q -x -F "$PATH_LINE" "$rc"; then
+            grep -v -x -F "$PATH_LINE" "$rc" >"$tmp/rc" || true
+            cat "$tmp/rc" >"$rc"
+            say "removed the PATH line of this script from $rc"
+        fi
+    done
+}
+
 remove() {
     if [ -e "$1" ]; then
         rm -f "$1" 2>/dev/null || true
@@ -601,9 +726,9 @@ strip_device_env() {
     [ -f "$env_file" ] || return 0
     rest=$(grep -v -E "^[[:space:]]*(export[[:space:]]+)?($MANAGED)[[:space:]]*=" "$env_file" \
         | grep -v -x -F "$ENV_HEADER" \
-        | awk -v mark="$HOST_MARK" '
+        | awk -v mark="$HOST_MARKED" '
             host && index($0, "CCTG_HOST=") == 1 { host = 0; next }
-            $0 == mark { host = 1; next }
+            index($0, mark) == 1 { host = 1; next }
             { host = 0; print }')
     if printf '%s\n' "$rest" | grep -q '[^[:space:]]'; then
         printf '%s\n' "$rest" | put "$env_file" 600
@@ -627,6 +752,7 @@ uninstall_all() {
     remove "$conf_dir/mcp.json"
     remove "$conf_dir/settings.json"
     strip_device_env
+    strip_path_line
     remove "$exe"
     # cctg-workers: the agent's links to the binary (TASK-040).
     for f in "$bin_dir"/cctg.old.exe "$bin_dir"/cctg.old.exe.* "$bin_dir/cctg.install$ext" "$bin_dir"/cctg-workers/*; do
