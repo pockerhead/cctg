@@ -2161,6 +2161,18 @@ mod tests {
                 ..
             })
         ));
+        // An agent before TASK-059 reads `albums` as an unknown field, which
+        // never fails a line: pinned with a field no version knows.
+        assert!(matches!(
+            decode::<HubMsg>(
+                br#"{"v":1,"type":"registered","files":true,"albums":true,"later":[1]}"#
+            ),
+            Ok(HubMsg::Registered {
+                files: true,
+                albums: true,
+                ..
+            })
+        ));
         let single = encode(&AgentMsg::FileOffer {
             transfer_id: 1,
             name: "n".into(),

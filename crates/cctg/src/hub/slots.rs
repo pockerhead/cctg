@@ -479,6 +479,12 @@ struct Offer {
     parts: Vec<FilePart>,
 }
 
+/// The most messages an offer can take in the topic: an album can be a
+/// photo album and a document album, known only from its bytes.
+fn offer_messages(parts: &[FilePart]) -> usize {
+    if parts.is_empty() { 1 } else { 2 }
+}
+
 /// An offer's parts, if any, are 2 to [`MAX_ALBUM`] files of 1 byte to
 /// [`files::MAX_UPLOAD`] each that add up to its size.
 fn album_fits(parts: &[FilePart], size: u64) -> bool {
@@ -3275,7 +3281,7 @@ impl Slots {
         } else if size == 0 || size > files::MAX_UPLOAD || !album_fits(&parts, size) {
             FileOutcome::Failed
         } else if self.file_bytes + size > MAX_FILE_BYTES
-            || self.queued_messages >= MAX_QUEUED_MESSAGES
+            || self.queued_messages + offer_messages(&parts) > MAX_QUEUED_MESSAGES
         {
             FileOutcome::Busy
         } else {
@@ -3489,6 +3495,17 @@ impl Slots {
         }
         // `album_fits` checked that the sizes add up to the bytes.
         debug_assert_eq!(offset as u64, size);
+        if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
+            self.file_bytes = self.file_bytes.saturating_sub(size);
+            info!(
+                conn,
+                size,
+                messages = ops.len(),
+                "album from an agent not sent: the message queue is full"
+            );
+            self.answer_file(conn, upload.transfer_id, FileOutcome::Busy);
+            return;
+        }
         self.queued_messages += ops.len();
         info!(
             ordinal = self.ordinal(slot),
@@ -17049,6 +17066,52 @@ again"
             ]
         );
         assert_eq!(slots.file_bytes, 0);
+    }
+
+    /// TASK-059 review: an album counts every message it can take against
+    /// [`MAX_QUEUED_MESSAGES`]: two at the offer, what its bytes need once
+    /// they are all here.
+    #[tokio::test]
+    async fn an_album_is_accepted_only_with_room_for_its_messages() {
+        let dir = TempDir::new("slots-file-album-cap");
+        let (mut slots, mut work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        let png: &[u8] = b"\x89PNG\r\n\x1a\npng";
+        let mixed: [(&str, &[u8]); 2] = [("a.png", png), ("b.txt", b"bee")];
+        let bytes = [png, b"bee".as_slice()].concat();
+        use FileOutcome::{Accepted, Busy};
+        // One free message: an album is refused before any byte.
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
+        album_offer(&mut slots, 1, &mixed, None);
+        assert_eq!(album_answers(&mut agent), [(1, Busy, Vec::new())]);
+        // Two free: accepted; the queue fills meanwhile, so a mixed album
+        // (two messages) is refused when its bytes are complete.
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 2;
+        album_offer(&mut slots, 2, &mixed, None);
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
+        send_bytes(&mut slots, 1, 2, &bytes);
+        assert_eq!(
+            album_answers(&mut agent),
+            [(2, Accepted, Vec::new()), (2, Busy, Vec::new())]
+        );
+        assert!(work.try_recv().is_err(), "nothing sent");
+        assert_eq!(
+            (slots.file_bytes, slots.queued_messages),
+            (0, MAX_QUEUED_MESSAGES - 1)
+        );
+        assert!(slots.albums.is_empty());
+        // A one-kind album is one message and fits the last free one.
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 2;
+        let pictures: [(&str, &[u8]); 2] = [("a.png", png), ("b.png", png)];
+        album_offer(&mut slots, 3, &pictures, None);
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
+        send_bytes(&mut slots, 1, 3, &[png, png].concat());
+        assert_eq!(album_answers(&mut agent), [(3, Accepted, Vec::new())]);
+        assert!(matches!(
+            work.try_recv(),
+            Ok((_, Op::SendAlbum { photos: true, .. }))
+        ));
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
     }
 
     #[tokio::test(start_paused = true)]
