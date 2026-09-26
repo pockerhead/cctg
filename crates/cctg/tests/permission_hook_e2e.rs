@@ -7,7 +7,7 @@
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -79,9 +79,20 @@ impl Fake {
     }
 }
 
+/// A prompt's buttons are pressed as soon as its send reaches Telegram;
+/// Telegram's answer (the message id) comes back to the hub only this much
+/// later, so every press lands before the hub knows the message (TASK-060).
+const PROMPT_ANSWER_LAG: Duration = Duration::from_millis(300);
+
 impl Transport for Fake {
     async fn execute(&self, op: &Op) -> Delivery {
         self.ops.lock().unwrap().push(op.clone());
+        if let Op::Send {
+            permission: true, ..
+        } = op
+        {
+            tokio::time::sleep(PROMPT_ANSWER_LAG).await;
+        }
         match op {
             Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
                 message_thread_id: 100,
@@ -236,7 +247,7 @@ async fn hub(test: &str) -> Hub {
 
 /// A home directory whose `.cctg/device.env` points at `addr`.
 fn home(test: &str, addr: &str) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("permission-hook-{test}"));
+    let home = common::own_tmp().join(format!("permission-hook-{test}"));
     let dir = home.join(".cctg");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -324,6 +335,7 @@ fn press(hub: &Hub, message_id: i64, data: String) {
             query_id: "q".into(),
             data: Some(data),
             message_id: Some(message_id),
+            thread_id: Some(100),
             from_name: None,
         }))
         .unwrap();

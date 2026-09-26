@@ -599,6 +599,7 @@ mod tests {
             query_id: "d".to_owned(),
             data: Some("dev:n".to_owned()),
             message_id: Some(8),
+            thread_id: None,
             from_name: None,
         }));
         route(Routed::Input(Inbound {
@@ -609,6 +610,7 @@ mod tests {
             query_id: "q".to_owned(),
             data: Some("allow:abcde".to_owned()),
             message_id: Some(9),
+            thread_id: None,
             from_name: None,
         };
         route(Routed::Callback(press.clone()));

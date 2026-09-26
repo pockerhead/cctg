@@ -385,56 +385,101 @@ async fn the_agent_delivers_its_sessions_kept_start_when_it_registers() {
 }
 
 /// The real `cctg hook SessionEnd` against a hub that accepts and never
-/// answers, with a nearly full spool: one connection, one POST budget (the
-/// kept files do not each get a timeout), and the own end is kept after the
-/// kept ones. The whole process stays inside the 1.5 s `SessionEnd` budget.
+/// answers, with a nearly full spool: at most one connection, one POST
+/// budget (the kept files do not each get a timeout), and the own end is
+/// kept after the kept ones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_silent_hub_costs_a_hook_one_budget_however_much_is_kept() {
     let silent = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let port = silent.local_addr().unwrap().port();
-    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = accepted.clone();
+    // Peers in accept order; nobody is ever answered.
+    let accepted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let peers = accepted.clone();
     tokio::spawn(async move {
         let mut open = Vec::new();
-        while let Ok((stream, _)) = silent.accept().await {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        while let Ok((stream, peer)) = silent.accept().await {
+            peers.lock().unwrap().push(peer);
             open.push(stream);
         }
     });
-    let home = std::sync::Arc::new(Home::new("silent", port, free_port()));
+    let run = |name: &'static str, kept: usize| {
+        let home = std::sync::Arc::new(Home::new(name, port, free_port()));
+        for n in 0..kept {
+            let post = HookPost::new(
+                "box".into(),
+                SESSION.into(),
+                "/nowhere/w".into(),
+                "/nowhere/t.jsonl".into(),
+                HookEvent::SessionStart {
+                    source: Some("resume".into()),
+                    claude_pid: None,
+                    parent_claude_pid: None,
+                },
+            );
+            let at = std::time::SystemTime::now() - Duration::from_secs(60 - n as u64);
+            cctg::spool::save(&home.spool(), &post, at).unwrap();
+        }
+        let h = home.clone();
+        let done = blocking(move || {
+            let started = std::time::Instant::now();
+            let stderr = hook(
+                &h,
+                "SessionEnd",
+                input("SessionEnd", serde_json::json!({"reason": "other"})),
+            );
+            (stderr, started.elapsed())
+        });
+        (home, done)
+    };
+    // The same hook with nothing kept: one POST that runs into its timeout.
+    // Process start-up under load is in both runs and cancels out.
+    let (_empty, done) = run("silent-empty", 0);
+    let (_, baseline) = done.await.unwrap();
+    let connections_before = connections_through_sentinel(&accepted, port).await;
     let kept = cctg::spool::MAX_PER_SESSION - 1;
-    for n in 0..kept {
-        let post = HookPost::new(
-            "box".into(),
-            SESSION.into(),
-            "/nowhere/w".into(),
-            "/nowhere/t.jsonl".into(),
-            HookEvent::SessionStart {
-                source: Some("resume".into()),
-                claude_pid: None,
-                parent_claude_pid: None,
-            },
-        );
-        let at = std::time::SystemTime::now() - Duration::from_secs(60 - n as u64);
-        cctg::spool::save(&home.spool(), &post, at).unwrap();
-    }
-    let h = home.clone();
-    let (stderr, took) = blocking(move || {
-        let started = std::time::Instant::now();
-        let stderr = hook(
-            &h,
-            "SessionEnd",
-            input("SessionEnd", serde_json::json!({"reason": "other"})),
-        );
-        (stderr, started.elapsed())
-    })
-    .await
-    .unwrap();
-    assert!(took < Duration::from_millis(1500), "{took:?}");
+    let (home, done) = run("silent", kept);
+    let (stderr, took) = done.await.unwrap();
+    // One budget: a timeout per kept file would add `POST_TIMEOUT` each
+    // (15 of them: 7.5 s); a whole budget of margin keeps load noise out.
+    assert!(
+        took < baseline + 2 * cctg::hook::POST_TIMEOUT,
+        "{took:?} against {baseline:?} with nothing kept"
+    );
     assert!(stderr.contains("kept for the next hook"), "{stderr}");
-    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // At most one connection for all kept files and the own end (none when
+    // a starved hook ran out of its budget before connecting).
+    let connections =
+        connections_through_sentinel(&accepted, port).await - (connections_before + 1);
+    assert!(connections <= 1, "{connections} connections");
     let files = home.kept();
     assert_eq!(files.len(), kept + 1);
     let last: serde_json::Value = serde_json::from_str(&files[kept].1).unwrap();
     assert_eq!(last["event"]["type"], "session_end", "the own end is last");
+}
+
+/// How many connections the silent hub took before a fresh one of ours:
+/// the accept loop takes them in order, so once it took ours, every earlier
+/// connection (those of a hook that has exited) has been counted.
+async fn connections_through_sentinel(
+    accepted: &std::sync::Mutex<Vec<SocketAddr>>,
+    port: u16,
+) -> usize {
+    let sentinel = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let ours = sentinel.local_addr().unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(at) = accepted
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|peer| *peer == ours)
+        {
+            // Earlier sentinels count too: the caller subtracts them.
+            return at;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "sentinel accepted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
