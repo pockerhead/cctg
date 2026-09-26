@@ -20,7 +20,8 @@
 //! [`Register::files`]; `file_offer` and the agent's `file_chunk`, see
 //! [`HubMsg::Registered`]; `session_read` and `session_answer`, see
 //! [`Register::session_reads`]; `ping` either way, see
-//! [`Register::heartbeat`]). Any other
+//! [`Register::heartbeat`]; `bound` and `status_line`, see
+//! [`Register::status_lines`]). Any other
 //! new message type or a changed meaning bumps it. Errors never carry the
 //! offending input: a line can contain the secret.
 
@@ -175,6 +176,12 @@ pub struct Register {
     /// leave it out and get no pings.
     #[serde(default)]
     pub heartbeat: bool,
+    /// The agent passes its session's status line numbers on (TASK-058):
+    /// the hub tells it which session it is bound to with `bound` (again
+    /// after `/clear`), and only then does it send `status_line` for that
+    /// session. Agents built before leave it out and get no `bound`.
+    #[serde(default)]
+    pub status_lines: bool,
 }
 
 /// The agent's build and update abilities.
@@ -285,6 +292,22 @@ pub enum AgentMsg {
     /// Only that the link lives ([`Heartbeat`]); sent only to a hub whose
     /// `registered` said `heartbeat`. Never answered.
     Ping,
+    /// The numbers of `cctg statusline` for `session_id`, the session of
+    /// the last `bound` on this connection (TASK-058); the hub takes them
+    /// as that session's `status_line` hook event. Sent only after `bound`.
+    StatusLine {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        five_hour: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seven_day: Option<u32>,
+    },
 }
 
 /// What the hub asks the agent to read of its session (TASK-034).
@@ -568,6 +591,7 @@ impl Kinds for AgentMsg {
         "file_chunk",
         "session_answer",
         "ping",
+        "status_line",
     ];
 }
 
@@ -703,6 +727,12 @@ pub enum HubMsg {
     /// Only that the link lives ([`Heartbeat`]); sent only to an agent that
     /// registered with `heartbeat`. Never answered.
     Ping,
+    /// Sent only to an agent that registered with `status_lines`, after its
+    /// registration and whenever the hub moves it to another session
+    /// (`/clear`): the session it is bound to now (TASK-058).
+    Bound {
+        session_id: String,
+    },
 }
 
 impl Kinds for HubMsg {
@@ -721,6 +751,7 @@ impl Kinds for HubMsg {
         "file_answer",
         "session_read",
         "ping",
+        "bound",
     ];
 }
 
@@ -1269,6 +1300,7 @@ mod tests {
                 client: None,
                 files: true,
                 session_reads: true,
+                status_lines: false,
                 heartbeat: true,
             }),
             AgentMsg::Reply {
@@ -1385,6 +1417,14 @@ mod tests {
                 answer: SessionAnswer::Refused,
             },
             AgentMsg::Ping,
+            AgentMsg::StatusLine {
+                session_id: "s".into(),
+                model: Some("Opus".into()),
+                effort: None,
+                context: Some(50),
+                five_hour: None,
+                seven_day: Some(92),
+            },
         ]
     }
 
@@ -1399,6 +1439,9 @@ mod tests {
                 heartbeat: true,
             },
             HubMsg::Ping,
+            HubMsg::Bound {
+                session_id: "s".into(),
+            },
             HubMsg::Rejected {
                 reason: Rejection::Auth,
             },
@@ -1645,6 +1688,7 @@ mod tests {
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             }))
         );
@@ -1874,6 +1918,7 @@ mod tests {
             console_commands: false,
             files: false,
             session_reads: false,
+            status_lines: false,
             heartbeat: false,
             client: Some(Client {
                 version: "0.1.0".into(),

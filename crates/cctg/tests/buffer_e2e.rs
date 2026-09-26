@@ -186,6 +186,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         client: None,
         files: false,
         session_reads: false,
+        status_lines: false,
         heartbeat: false,
     };
     write
@@ -331,6 +332,7 @@ async fn a_burst_reaches_a_live_session_over_tcp_as_one_inbound() {
         client: None,
         files: false,
         session_reads: false,
+        status_lines: false,
         heartbeat: false,
     };
     write

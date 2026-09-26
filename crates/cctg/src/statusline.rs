@@ -1,10 +1,12 @@
 //! `cctg statusline`: the `statusLine` command of cctg sessions (TASK-029).
 //!
 //! Claude Code runs it with its status line JSON on stdin after every
-//! assistant message (debounced 300 ms) and shows what it prints. It sends
+//! assistant message (debounced 300 ms) and shows what it prints. It hands
 //! the numbers the status message in Telegram shows (model, effort, context
-//! and rate limit percentages) to the hub as one `status_line` hook event,
-//! with a short timeout and never waiting for more than that, and prints the
+//! and rate limit percentages) to the session's agent through a local file
+//! ([`crate::statusfile`], TASK-058); only when no agent takes them does it
+//! post them to a hub on this machine as one `status_line` hook event, with
+//! a short timeout and never waiting for more than that. It prints the
 //! status line the terminal would have shown without cctg: the
 //! `statusLine.command` of the user's own settings (`$CLAUDE_CONFIG_DIR` or
 //! `~/.claude/settings.json`, read on every call), run with the same stdin
@@ -15,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -24,14 +26,16 @@ use tracing::{debug, warn};
 
 use crate::device::{self, DeviceConfig};
 use crate::hook;
+use crate::statusfile;
+use crate::tls;
 use crate::wire::{HookEvent, HookPost};
 
 /// Budget of the POST to the hub. It runs next to the user's command, but
 /// the terminal waits for this process, so a stopped hub may cost the status
 /// line this much (a closed local port on Windows is retried until the
-/// timeout). Kept well under the 150 ms the whole call may add, also over
-/// TLS (TASK-035): a hub more than a short round trip away misses the
-/// numbers rather than slowing the status line.
+/// timeout). Kept well under the 150 ms the whole call may add. Only a hub
+/// on this machine is posted to: one farther away (TLS, TASK-035) gets the
+/// numbers from the session's agent (TASK-058).
 pub const POST_TIMEOUT: Duration = Duration::from_millis(80);
 /// Claude Code writes the whole input at once and closes stdin.
 const STDIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -71,8 +75,11 @@ pub async fn run() -> i32 {
         (!nested)
             .then(|| event(&value))
             .flatten()
-            .map(|(session, cwd, transcript, event)| {
+            .and_then(|(session, cwd, transcript, event)| {
                 let config = DeviceConfig::load();
+                if !hand_over(&config, &session, &event) {
+                    return None;
+                }
                 let post = HookPost::new(
                     config.host.clone(),
                     session,
@@ -80,7 +87,7 @@ pub async fn run() -> i32 {
                     transcript,
                     event,
                 );
-                tokio::spawn(async move {
+                Some(tokio::spawn(async move {
                     let Ok(secret) = &config.secret else {
                         return;
                     };
@@ -90,7 +97,7 @@ pub async fn run() -> i32 {
                     if let Err(error) = hook::post(&hub, secret, &post, POST_TIMEOUT).await {
                         debug!(%error, "status line numbers not delivered");
                     }
-                })
+                }))
             });
     let chained = match (!nested).then(user_command).flatten() {
         Some(command) => run_chained(&command, &input).await,
@@ -109,6 +116,21 @@ pub async fn run() -> i32 {
         let _ = posting.await;
     }
     code
+}
+
+/// Keeps the numbers of `session` for its agent ([`statusfile`]) and
+/// answers whether to post them too: only when no agent passes them on and
+/// the hub is on this machine. A hub farther away is never waited for.
+fn hand_over(config: &DeviceConfig, session: &str, numbers: &HookEvent) -> bool {
+    if let Some(state) = &config.state_dir {
+        if let Err(error) = statusfile::write(state, session, numbers) {
+            debug!(kind = ?error.kind(), "status line numbers not kept");
+        }
+        if statusfile::agent_present(state, session, SystemTime::now()) {
+            return false;
+        }
+    }
+    tls::is_loopback_addr(&config.hook_addr)
 }
 
 fn text(value: &Value, path: &[&str]) -> Option<String> {
@@ -514,6 +536,38 @@ mod tests {
                 seven_day: Some(92),
             }
         );
+    }
+
+    /// TASK-058: the numbers always go to the file; a POST only without an
+    /// agent's mark and only to a hub on this machine.
+    #[test]
+    fn numbers_go_to_the_agent_and_a_post_only_to_a_local_hub_without_one() {
+        let state = std::env::temp_dir().join(format!(
+            "cctg-test-statusline-handover-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&state);
+        let state_var = state.to_str().unwrap().to_owned();
+        let config = |hook: &str| {
+            let (hook, state) = (hook.to_owned(), state_var.clone());
+            DeviceConfig::from_vars(move |name| match name {
+                "CCTG_HUB_HOOK_ADDR" => Some(hook.clone()),
+                "CCTG_STATE_DIR" => Some(state.clone()),
+                _ => None,
+            })
+        };
+        let (session, _, _, numbers) = event(&sample()).unwrap();
+        // A hub on another machine is never posted to, agent or not.
+        assert!(!hand_over(&config("hub.example:47292"), &session, &numbers));
+        assert_eq!(
+            statusfile::read(&state, &session).map(|(_, kept)| kept),
+            Some(numbers.clone())
+        );
+        // A hub on this machine: posted to until an agent marks the session.
+        assert!(hand_over(&config("127.0.0.1:47292"), &session, &numbers));
+        statusfile::mark(&state, &session).unwrap();
+        assert!(!hand_over(&config("127.0.0.1:47292"), &session, &numbers));
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
