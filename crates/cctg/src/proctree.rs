@@ -9,7 +9,8 @@
 //! Windows reads one ToolHelp snapshot (about 7 ms for ~450 processes on the
 //! dev host), then queries only the processes in the current ancestry for
 //! their image path and creation time. Linux follows `/proc/<pid>/stat`
-//! upward; other systems report no chain. Nothing here spawns a process.
+//! upward, macOS `proc_pidinfo` (TASK-044); other systems report no chain.
+//! Nothing here spawns a process.
 
 #[cfg(any(windows, test))]
 use std::collections::HashMap;
@@ -35,8 +36,8 @@ pub struct Lineage {
 }
 
 /// Longest chain followed; real chains are under 20 processes. Unused on
-/// systems without a process source (macOS: TASK-044).
-#[cfg(any(windows, target_os = "linux", test))]
+/// systems without a process source.
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 const MAX_DEPTH: usize = 64;
 
 // Filled by the Windows snapshot and by tests; Linux reads /proc directly.
@@ -201,7 +202,12 @@ fn platform_processes() -> Option<Vec<(u32, String)>> {
     linux::processes()
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn platform_processes() -> Option<Vec<(u32, String)>> {
+    macos::processes()
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn platform_processes() -> Option<Vec<(u32, String)>> {
     None
 }
@@ -249,7 +255,12 @@ fn platform_ancestors(pid: u32) -> Option<Vec<Proc>> {
     Some(linux::ancestors(pid))
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn platform_ancestors(pid: u32) -> Option<Vec<Proc>> {
+    Some(macos::ancestors(pid))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn platform_ancestors(_pid: u32) -> Option<Vec<Proc>> {
     None
 }
@@ -459,6 +470,154 @@ mod linux {
             }
         }
         Some(out)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::{MAX_DEPTH, Proc};
+
+    struct Info {
+        parent: u32,
+        name: String,
+        image_path: Option<String>,
+        /// Start time (seconds, microseconds).
+        started: (u64, u64),
+    }
+
+    fn info(pid: u32) -> Option<Info> {
+        // SAFETY: an all-zero `proc_bsdinfo` is valid plain data.
+        let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer is a live `proc_bsdinfo` of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut bsd as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if got != size {
+            return None;
+        }
+        let name = c_text(&bsd.pbi_name)
+            .filter(|name| !name.is_empty())
+            .or_else(|| c_text(&bsd.pbi_comm))?;
+        let image_path = image_path(pid);
+        Some(Info {
+            parent: bsd.pbi_ppid,
+            name: super::process_name(&name, image_path.as_deref()),
+            image_path,
+            started: (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
+        })
+    }
+
+    fn c_text(chars: &[libc::c_char]) -> Option<String> {
+        let bytes: Vec<u8> = chars
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8(bytes).ok()
+    }
+
+    fn image_path(pid: u32) -> Option<String> {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: a live buffer of the length given.
+        let len = unsafe {
+            libc::proc_pidpath(
+                pid as libc::c_int,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+            )
+        };
+        if len <= 0 {
+            return None;
+        }
+        buf.truncate(len as usize);
+        String::from_utf8(buf).ok()
+    }
+
+    /// Follows `proc_pidinfo` upward. A parent that started after its
+    /// child is a reused pid: the chain ends before it.
+    pub fn ancestors(pid: u32) -> Vec<Proc> {
+        let mut chain = Vec::new();
+        let mut current = pid;
+        let mut child_started = None;
+        while chain.len() < MAX_DEPTH {
+            let Some(info) = info(current) else {
+                break;
+            };
+            if chain.iter().any(|proc: &Proc| proc.pid == current)
+                || child_started.is_some_and(|child| info.started > child)
+            {
+                break;
+            }
+            chain.push(Proc {
+                pid: current,
+                name: info.name,
+                image_path: info.image_path,
+            });
+            if info.parent == 0 || info.parent == current {
+                break;
+            }
+            child_started = Some(info.started);
+            current = info.parent;
+        }
+        chain
+    }
+
+    /// Every process this user can query, as (pid, name). `None` when the
+    /// pid list cannot be read.
+    pub fn processes() -> Option<Vec<(u32, String)>> {
+        // SAFETY: a null buffer asks for the count only.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return None;
+        }
+        // Room for processes started since the count.
+        let mut pids: Vec<libc::c_int> = vec![0; count as usize + 64];
+        let bytes = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+        // SAFETY: a live buffer of `bytes` bytes.
+        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if got <= 0 {
+            return None;
+        }
+        pids.truncate(got as usize);
+        Some(
+            pids.into_iter()
+                .filter(|&pid| pid > 0)
+                .filter_map(|pid| {
+                    let pid = pid as u32;
+                    info(pid).map(|info| (pid, info.name))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The name a process goes by here. macOS names a process after the file it
+/// runs, and the native Claude Code install runs
+/// `~/.local/share/claude/versions/<version>` through the link
+/// `~/.local/bin/claude` (Activity Monitor shows "2.0.53",
+/// anthropics/claude-code#12433): a file in a `claude/versions` folder is
+/// `claude`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn process_name(name: &str, image_path: Option<&str>) -> String {
+    let versioned = image_path.is_some_and(|path| {
+        let mut parts = std::path::Path::new(path).components().rev();
+        parts.next().is_some()
+            && parts
+                .next()
+                .is_some_and(|dir| dir.as_os_str() == "versions")
+            && parts.next().is_some_and(|dir| dir.as_os_str() == "claude")
+    });
+    if versioned {
+        "claude".to_owned()
+    } else {
+        name.to_owned()
     }
 }
 
@@ -836,7 +995,25 @@ mod tests {
         assert_eq!(claude_pids(many), None, "an overlong list is no list");
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_native_claude_on_macos_is_named_claude() {
+        let version = "/Users/u/.local/share/claude/versions/2.1.282";
+        assert_eq!(process_name("2.1.282", Some(version)), "claude");
+        assert_eq!(
+            process_name("claude", Some("/opt/homebrew/bin/claude")),
+            "claude"
+        );
+        for (name, path) in [
+            ("2.1.282", None),
+            ("node", Some("/usr/local/bin/node")),
+            ("1.0", Some("/Users/u/app/versions/1.0")),
+            ("versions", Some("claude/versions")),
+        ] {
+            assert_eq!(process_name(name, path), name, "{path:?}");
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_live_list_is_readable_here() {
         // Whatever runs here, the call works and stays bounded.
@@ -844,7 +1021,7 @@ mod tests {
         assert!(pids.len() <= MAX_LIVE_PIDS);
     }
 
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_live_chain_starts_at_this_process() {
         let chain = ancestors(std::process::id()).expect("supported platform");

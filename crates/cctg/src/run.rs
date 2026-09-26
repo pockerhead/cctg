@@ -15,12 +15,19 @@
 //! selected. Without a request
 //! `cctg run` exits with claude's exit code.
 //!
+//! On Linux and macOS (TASK-044), when stdin and stdout are terminals,
+//! claude runs in a pseudo-terminal `cctg run` holds ([`crate::term`]):
+//! same window, every key relayed as it is typed, the window size followed,
+//! a claude that suspends itself (Ctrl+Z) suspends `cctg run` with it; the
+//! agent reads that terminal and types into it through a socket. Without a
+//! terminal (piped, `-p`) claude runs as before, without console keys.
+//!
 //! Not updated while it runs, so nothing else lives here: no versions, no
 //! network, no protocol, no knowledge of claude's options.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -43,12 +50,132 @@ pub async fn run(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
             while signal.recv().await.is_some() {}
         }
     });
-    tokio::task::spawn_blocking(move || run_claude(args, state_dir))
-        .await
-        .unwrap_or(1)
+    let place = Place::new(state_dir.as_deref());
+    #[cfg(unix)]
+    if let Place::Pty(host) = &place {
+        follow_signals(host);
+    }
+    let code = tokio::task::spawn_blocking({
+        let place = place.clone();
+        move || run_claude(args, state_dir, &place)
+    })
+    .await
+    .unwrap_or(1);
+    place.finish();
+    code
 }
 
-fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
+/// Where claude runs: in this console (Windows, or wherever `cctg run` has
+/// no terminal to hold), or in the pseudo-terminal of `cctg run` (Unix).
+#[derive(Clone)]
+enum Place {
+    Console,
+    #[cfg(unix)]
+    Pty(Arc<crate::term::Host>),
+}
+
+impl Place {
+    #[cfg(unix)]
+    fn new(state_dir: Option<&std::path::Path>) -> Self {
+        let socket = state_dir.map(|state| crate::term::socket_path(state, std::process::id()));
+        crate::term::Host::start(socket).map_or(Place::Console, Place::Pty)
+    }
+
+    #[cfg(not(unix))]
+    fn new(_state_dir: Option<&std::path::Path>) -> Self {
+        Place::Console
+    }
+
+    fn command(&self, program: &OsStr) -> std::io::Result<Command> {
+        match self {
+            Place::Console => Ok(Command::new(program)),
+            #[cfg(unix)]
+            Place::Pty(host) => host.command(program),
+        }
+    }
+
+    /// claude's exit code.
+    fn wait(&self, mut child: Child) -> i32 {
+        match self {
+            Place::Console => child
+                .wait()
+                .ok()
+                .and_then(|status| status.code())
+                .unwrap_or(1),
+            #[cfg(unix)]
+            Place::Pty(host) => host.wait(child.id()),
+        }
+    }
+
+    fn lines(&self) -> Option<Vec<String>> {
+        match self {
+            Place::Console => crate::keys::visible_lines(),
+            #[cfg(unix)]
+            Place::Pty(host) => host.lines(),
+        }
+    }
+
+    fn enter(&self) -> bool {
+        match self {
+            Place::Console => crate::keys::write_text("\r"),
+            #[cfg(unix)]
+            Place::Pty(host) => host.write(b"\r"),
+        }
+    }
+
+    /// `cctg run` was told to stop (SIGTERM, SIGHUP): no restart.
+    fn stopping(&self) -> bool {
+        match self {
+            Place::Console => false,
+            #[cfg(unix)]
+            Place::Pty(host) => host.stopping(),
+        }
+    }
+
+    /// A line of `cctg run` on stderr (in raw mode a line needs its `\r`).
+    fn say(&self, text: &str) {
+        match self {
+            Place::Console => eprintln!("{text}"),
+            #[cfg(unix)]
+            Place::Pty(_) => eprint!("{text}\r\n"),
+        }
+    }
+
+    fn finish(&self) {
+        #[cfg(unix)]
+        if let Place::Pty(host) = self {
+            host.finish();
+        }
+    }
+}
+
+/// The user's window size goes to claude's terminal; SIGTERM and SIGHUP
+/// reach claude as SIGHUP (its terminal is gone) and end `cctg run` after it.
+#[cfg(unix)]
+fn follow_signals(host: &Arc<crate::term::Host>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    if let Ok(mut resized) = signal(SignalKind::window_change()) {
+        let host = host.clone();
+        tokio::spawn(async move {
+            while resized.recv().await.is_some() {
+                host.sync_size();
+            }
+        });
+    }
+    for kind in [SignalKind::terminate(), SignalKind::hangup()] {
+        if let Ok(mut stop) = signal(kind) {
+            let host = host.clone();
+            tokio::spawn(async move {
+                while stop.recv().await.is_some() {
+                    host.hang_up();
+                }
+            });
+        }
+    }
+}
+
+fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>, place: &Place) -> i32 {
     let request = state_dir.map(|state| update::request_path(&state, std::process::id()));
     if let Some(stale) = &request {
         let _ = std::fs::remove_file(stale);
@@ -57,33 +184,35 @@ fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
     let run_args = serde_json::to_string(&args).unwrap_or_default();
     let mut claude_args = args;
     loop {
-        let mut child = match Command::new(&program)
-            .args(&claude_args)
-            .env(RUN_VAR, std::process::id().to_string())
-            .env(RUN_ARGS_VAR, &run_args)
-            .spawn()
-        {
+        let spawned = place.command(&program).and_then(|mut command| {
+            command
+                .args(&claude_args)
+                .env(RUN_VAR, std::process::id().to_string())
+                .env(RUN_ARGS_VAR, &run_args)
+                .spawn()
+        });
+        let child = match spawned {
             Ok(child) => child,
             Err(error) => {
-                eprintln!("cctg run: cannot start claude: {error}");
+                place.say(&format!("cctg run: cannot start claude: {error}"));
                 return 1;
             }
         };
         let running = Arc::new(AtomicBool::new(true));
         {
             let running = running.clone();
-            std::thread::spawn(move || answer_channels_dialog(&running));
+            let place = place.clone();
+            std::thread::spawn(move || answer_channels_dialog(&running, &place));
         }
-        let code = child
-            .wait()
-            .ok()
-            .and_then(|status| status.code())
-            .unwrap_or(1);
+        let code = place.wait(child);
         running.store(false, Ordering::Relaxed);
+        if place.stopping() {
+            return code;
+        }
         let Some(next) = request.as_ref().and_then(take_request) else {
             return code;
         };
-        eprintln!("cctg run: starting claude again");
+        place.say("cctg run: starting claude again");
         claude_args = next;
     }
 }
@@ -112,22 +241,22 @@ pub fn channels_dialog(screen: &[String]) -> Option<bool> {
     Some(selected.contains("1.") && selected.contains("local development"))
 }
 
-/// Watches this console until the dialog shows (Enter when option 1 is
+/// Watches claude's screen until the dialog shows (Enter when option 1 is
 /// selected), claude exits or [`DIALOG_WAIT`] passes.
-fn answer_channels_dialog(running: &AtomicBool) {
+fn answer_channels_dialog(running: &AtomicBool, place: &Place) {
     let until = Instant::now() + DIALOG_WAIT;
     while running.load(Ordering::Relaxed) && Instant::now() < until {
         std::thread::sleep(DIALOG_POLL);
-        let Some(screen) = crate::keys::visible_lines() else {
+        let Some(screen) = place.lines() else {
             return;
         };
         match channels_dialog(&screen) {
             Some(true) => {
-                crate::keys::write_text("\r");
+                place.enter();
                 return;
             }
             Some(false) => {
-                eprintln!("cctg run: the channels dialog has another option selected; left to you");
+                place.say("cctg run: the channels dialog has another option selected; left to you");
                 return;
             }
             None => {}
