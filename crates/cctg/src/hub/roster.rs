@@ -168,6 +168,7 @@ async fn on_press(outbox: &Outbox, devices: &Devices, input: CallbackInput) {
             message_id,
             text,
             reply_markup: Some(keyboard.unwrap_or_else(|| json!({ "inline_keyboard": [] }))),
+            background: false,
         };
         submit(outbox, op).await;
     }

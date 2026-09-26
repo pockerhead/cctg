@@ -39,7 +39,7 @@ use devices::Devices;
 use ingress::Listener;
 use offset::OffsetStore;
 use registry::{Icons, RegistryStore};
-use scheduler::{BucketConfig, Scheduler};
+use scheduler::{Limits, Scheduler};
 use slots::{Control, Slots};
 use updates::{Inbound, Routed, ServiceKind};
 
@@ -355,7 +355,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         "hub started, polling"
     );
 
-    let (scheduler, outbox) = Scheduler::new(api.clone(), BucketConfig::default());
+    let (scheduler, outbox) = Scheduler::new(api.clone(), Limits::default());
     tokio::spawn(scheduler.run());
     let options = slots::Options {
         icons,
@@ -437,7 +437,7 @@ mod tests {
     use super::*;
     use api::Message;
     use commands::{Prepared, TranscriptCommand, TranscriptSource};
-    use scheduler::{Delivery, Op, Outcome, Transport};
+    use scheduler::{BucketConfig, Delivery, Op, Outcome, Transport};
     use testdir::TempDir;
     use updates::UpdateSource;
 
