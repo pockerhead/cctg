@@ -1,0 +1,28 @@
+    Blocking waiting for file lock on artifact directory
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg-045\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 33.63s
+     Running tests\install_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\install_e2e-f992769144e721bf.exe)
+
+running 11 tests
+test the_script_has_unix_line_endings ... ok
+test missing_or_bad_settings_without_a_terminal_write_nothing ... ok
+test a_bad_checksum_installs_nothing ... ok
+test from_source_builds_with_cargo_in_the_clone ... ok
+test a_hub_that_does_not_start_or_has_no_address_is_an_error ... ok
+test uninstall_keeps_what_the_script_did_not_write ... ok
+test a_missing_claude_code_comes_from_anthropics_installer_when_asked ... ok
+test a_device_joins_with_a_code ... ok
+test install_update_and_uninstall_a_device ... ok
+test a_container_gets_its_host_name_written ... ok
+test a_hub_is_set_up_with_docker_compose ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 38.78s
+
+     Running tests\join_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\join_e2e-f029ab4ef20bcb21.exe)
+
+running 1 test
+test a_device_joins_with_a_code_and_is_out_after_a_revoke ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+exit 0

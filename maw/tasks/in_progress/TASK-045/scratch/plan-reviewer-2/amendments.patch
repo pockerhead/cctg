@@ -1,0 +1,83 @@
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -866,7 +866,8 @@
+             Status::NoContent
+         }
+         Ok(Ok((Route::Join, body, _))) => {
+-            drop(permit);
++            // The request place stays taken, also through the pause of a
++            // refused code (as for a wrong secret).
+             return join_request(stream, peer, &body, devices, &gate).await;
+         }
+         Ok(Err(None)) => {
+@@ -2711,6 +2712,33 @@
+         assert_eq!(devices.list().0.len(), 1);
+     }
+ 
++    /// A refused join code keeps its hook request place through the pause,
++    /// as a wrong secret does: 64 of them leave no place for a 65th request.
++    #[cfg(not(target_os = "macos"))]
++    #[tokio::test]
++    async fn a_refused_join_keeps_its_request_place_through_the_pause() {
++        let dir = TempDir::new("ingress-join-place");
++        let devices = Devices::open(dir.path(), Some(secret())).unwrap();
++        let (_, addr, _agents, _hooks) = device_hub(&devices).await;
++        let raw = join_request(&join_body("ABCD-EFGH-JKMN-PQRS"), None);
++        let mut refused = Vec::new();
++        for n in 0..MAX_HOOK_REQUESTS {
++            let source = IpAddr::from([127, 0, 3, 2 + u8::try_from(n).unwrap()]);
++            let mut stream = connect_from(source, addr).await;
++            stream.write_all(&raw).await.unwrap();
++            refused.push(stream);
++        }
++        // Read and in their pause (250 ms), each still holding its place.
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        let late = connect_from(IpAddr::from([127, 0, 4, 2]), addr).await;
++        closed_at_once(late).await;
++        for mut stream in refused {
++            let mut answer = Vec::new();
++            within(stream.read_to_end(&mut answer)).await.unwrap();
++            assert!(answer.starts_with(b"HTTP/1.1 403"), "{answer:?}");
++        }
++    }
++
+     fn body_of_start() -> Vec<u8> {
+         body(&post(start()))
+     }
+--- a/crates/cctg/src/doctor.rs
++++ b/crates/cctg/src/doctor.rs
+@@ -85,7 +85,8 @@
+             Err(PostError::Status(401)) => fail(
+                 &mut lines,
+                 format!(
+-                    "hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET; a device                      secret may have been revoked: join again with a new code, cctg join)"
++                    "hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET; a device \
++                     secret may have been revoked: join again with a new code, cctg join)"
+                 ),
+             ),
+             // A hub from before `cctg doctor` has no ping route.
+--- a/docs/remote-hub.md
++++ b/docs/remote-hub.md
+@@ -108,7 +108,7 @@
+ 
+ С TASK-045 у каждой машины свой секрет, а общий `CCTG_HUB_SECRET` из `hub.env` на устройства больше не раздаётся.
+ 
+-- Код: 16 знаков Crockford base32 (80 случайных бит), вид `XXXX-XXXX-XXXX-XXXX`, работает один раз и 10 минут. Регистр, дефисы и пробелы не важны, `O` читается как `0`, `I` и `L` как `1`. Код даёт `cctg hub code` рядом с запущенным hub: в Docker `cd ~/cctg-hub && docker compose exec hub cctg hub code`, у hub без Docker `cctg hub --env-file <тот же .env> code` в той же папке, что и hub (ему нужен только `CCTG_STATE_DIR`). `install.sh --hub` печатает один код в строке клиента. В каталоге состояния (`/data/join/`) лежит только sha256 кода и срок, не сам код. Неиспользованных кодов не больше 32 одновременно.
++- Код: 16 знаков Crockford base32 (80 случайных бит), вид `XXXX-XXXX-XXXX-XXXX`, работает один раз и 10 минут. Регистр, дефисы и пробелы не важны, `O` читается как `0`, `I` и `L` как `1`. Код даёт `cctg hub code` рядом с запущенным hub: в Docker `cd ~/cctg-hub && docker compose exec hub cctg hub code`, у hub без Docker `cctg hub --env-file <тот же .env> code` в той же папке, что и hub (ему нужен только `CCTG_STATE_DIR`). Запускать от того же пользователя, что и hub (в Docker `docker compose exec` без `-u`, без Docker без `sudo`): файл кода другого пользователя hub не прочитает, и код будет отвергнут. `install.sh --hub` печатает один код в строке клиента. В каталоге состояния (`/data/join/`) лежит только sha256 кода и срок, не сам код. Неиспользованных кодов не больше 32 одновременно.
+ - Обмен: `install.sh --join КОД` (или `CCTG_JOIN_CODE`) пишет адрес и pin, потом запускает `~/.cctg/bin/cctg join`. `cctg join [КОД]` можно запустить и руками на уже настроенной машине: он берёт адрес и pin из `device.env`, по TLS с pin (или по loopback без pin) шлёт `POST /v1/join` с кодом и именем машины (`CCTG_HOST` или имя системы) и заменяет строку `CCTG_HUB_SECRET` в `device.env` полученным секретом (файл 600 на Linux и macOS). Ни код, ни секрет он не печатает. Отказ один на все случаи: код неверный, уже использован или истёк.
+ - Секрет устройства `cctgd_<id>_<64 hex>`: `<id>` (8 hex) публичный и виден в `/devices`, остальное 256 случайных бит. Hub хранит только sha256 секрета в `/data/devices.json` (имя, id, дата). Медленный хеш не нужен: подбирать 256 случайных бит бессмысленно. Устройств не больше 32.
+ - `/devices` в теме General (только из allowlist): список устройств с датой и последним входом с запуска hub, состояние общего секрета (когда с ним входили последний раз) и по кнопке «Отозвать» на устройство. Отзыв спрашивает подтверждение. После «Да, отозвать» линки агентов этого устройства закрываются сразу, ждущие хуки разрешений и вопросов обрываются без ответа, следующий хук получает 401, `cctg doctor` пишет «rejected the secret». Отозванное устройство возвращается только с новым кодом. Сессии отозванного устройства в темах остаются «живыми без агента», пока hub не уберёт их по обычным правилам: `SessionEnd` от них больше не принимается.
+@@ -119,10 +119,12 @@
+ 
+ 1. Hub этой версии поднимается как раньше: общий секрет принимается (`CCTG_SHARED_SECRET` по умолчанию `on`), уже настроенные машины ничего не замечают.
+ 2. На каждой машине по очереди: код (`docker compose exec hub cctg hub code`), потом `~/.cctg/bin/cctg join КОД` или та же строка `install.sh ... --join КОД`. `cctg doctor` покажет «secret: set, this device's own». Запущенные сессии claude перезапускать не обязательно, но до перезапуска их агенты ходят с общим секретом.
+-3. `/devices` показывает все машины и строку «последний вход с общим секретом». Когда она долго не меняется, в `hub.env` дописать `CCTG_SHARED_SECRET=off` и `docker compose up -d`. С этого момента общий секрет не пускает никого; hub с `off` запускается и без `CCTG_HUB_SECRET`.
++3. `/devices` показывает все машины и строку «последний вход с общим секретом». Строка обновляется только при новом входе (подключение агента или хук), а уже подключённый агент старой сессии её не двигает, поэтому перед `off` перезапустите сессии claude, начатые до `cctg join` (иначе они потеряют hub до перезапуска). Когда строка долго не меняется, в `hub.env` дописать `CCTG_SHARED_SECRET=off` и `docker compose up -d`. С этого момента общий секрет не пускает никого; hub с `off` запускается и без `CCTG_HUB_SECRET`.
+ 
+ Откат: `CCTG_SHARED_SECRET=on` (или убрать строку) и перезапуск hub; секреты устройств продолжают работать.
+ 
++Откат образа hub на релиз до TASK-045 не знает `devices.json`: машины со своим секретом получат отказ, общего секрета у них уже нет. Им снова нужен общий секрет: `install.sh` с `CCTG_HUB_SECRET` или `--secret-file` на каждой такой машине.
++
+ ## Обновление
+ 
+ Выпуск это git-тег `vX.Y.Z` на main, поставленный на коммит с зелёным `ci`, в котором `install.sh` уже говорит `RELEASE=vX.Y.Z` (иначе `release.yml` ничего не публикует; строки установки в README тоже на новый тег). GitHub Actions (`.github/workflows/release.yml`) собирает образ и бинарники одного коммита, с одним и тем же `CCTG_BUILD_ID`, кладёт образ в GHCR (`latest` и `X.Y.Z`) и создаёт релиз с бинарниками. Никаких секретов, кроме встроенного `GITHUB_TOKEN`, workflow не использует. Серверу ssh от оркестратора не нужен.

@@ -1191,6 +1191,56 @@ pub fn decode_permission(body: &[u8]) -> Result<PermissionPost, WireError> {
     serde_json::from_value(value).map_err(|_| WireError::Malformed)
 }
 
+/// `cctg join` (TASK-045): a [`JoinPost`] without `Authorization`; the code
+/// is the credential. `200` with a [`JoinAnswer`]: the device is enrolled;
+/// `403`: the code is unknown, used or expired (one answer for all);
+/// `503`: the hub cannot enroll now (full, disk); `404`: a hub before it.
+pub const JOIN_PATH: &str = "/v1/join";
+/// Longest join body: it is read before anything is authenticated.
+pub const MAX_JOIN_BODY: usize = 1024;
+
+/// Body of a join request. `name`: what `/devices` calls the device (its
+/// host name); the hub cleans it. `Debug` never shows the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinPost {
+    pub v: u32,
+    pub code: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+impl fmt::Debug for JoinPost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JoinPost")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The new device: its id, its cleaned name and its secret (the value of
+/// `CCTG_HUB_SECRET` from now on). `Debug` never shows the secret.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct JoinAnswer {
+    pub device_id: String,
+    pub name: String,
+    pub secret: Secret,
+}
+
+impl fmt::Debug for JoinAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JoinAnswer")
+            .field("device_id", &self.device_id)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn decode_join(body: &[u8]) -> Result<JoinPost, WireError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| WireError::Malformed)?;
+    check_version(&value)?;
+    serde_json::from_value(value).map_err(|_| WireError::Malformed)
+}
+
 /// Claude Code's tool that asks the user multiple-choice questions
 /// (TASK-038). Its `PreToolUse` hook asks the hub at [`QUESTION_PATH`]; the
 /// hub shows no Allow/Deny for it and gives its `PermissionRequest` hook no
@@ -2109,6 +2159,38 @@ mod tests {
         let hello = AgentMsg::Hello { secret: secret() };
         assert!(!format!("{hello:?}").contains(SECRET));
         assert!(!format!("{:?}", secret()).contains(SECRET));
+        let join = JoinPost {
+            v: VERSION,
+            code: SECRET.into(),
+            name: "box".into(),
+        };
+        assert!(!format!("{join:?}").contains(SECRET));
+        let answer = JoinAnswer {
+            device_id: "0123abcd".into(),
+            name: "box".into(),
+            secret: secret(),
+        };
+        assert!(!format!("{answer:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn join_posts_round_trip_and_check_the_version() {
+        let post = JoinPost {
+            v: VERSION,
+            code: "ABCD-EFGH-JKMN-PQRS".into(),
+            name: "box".into(),
+        };
+        assert_eq!(decode_join(&serde_json::to_vec(&post).unwrap()), Ok(post));
+        assert_eq!(
+            decode_join(br#"{"v":1,"code":"X"}"#).map(|post| post.name),
+            Ok(String::new())
+        );
+        assert_eq!(
+            decode_join(br#"{"v":2,"code":"X"}"#),
+            Err(WireError::Version)
+        );
+        assert_eq!(decode_join(br#"{"v":1}"#), Err(WireError::Malformed));
+        assert_eq!(decode_join(b"code"), Err(WireError::Malformed));
     }
 
     #[test]

@@ -1,0 +1,48 @@
+// Probe (plan-reviewer-2): appended to the tests module of crates/cctg/src/hub/ingress.rs
+// of the reference patch in a %TEMP% copy. Output on Windows 11, 2026-09-26:
+// PR2PROBE join bad code: first wave answered=64/64, second wave (sent while the first sleeps) answered=64/64
+// PR2PROBE hook bad secret: first wave answered=64/64, second wave (sent while the first sleeps) answered=0/64
+
+    async fn pr2_wave(addr: SocketAddr, raw: &[u8], base: u32) -> tokio::task::JoinSet<bool> {
+        use tokio::net::TcpSocket;
+        let mut set = tokio::task::JoinSet::new();
+        for n in 0..64u32 {
+            let raw = raw.to_vec();
+            set.spawn(async move {
+                let socket = TcpSocket::new_v4().unwrap();
+                let src: SocketAddr = format!("127.0.{}.{}:0", base, 2 + n).parse().unwrap();
+                socket.bind(src).unwrap();
+                let Ok(mut stream) = socket.connect(addr).await else { return false };
+                let _ = stream.write_all(&raw).await;
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await;
+                out.starts_with(b"HTTP/1.1 4")
+            });
+        }
+        set
+    }
+
+    async fn pr2_count(mut set: tokio::task::JoinSet<bool>) -> usize {
+        let mut n = 0;
+        while let Some(r) = set.join_next().await { if r.unwrap() { n += 1 } }
+        n
+    }
+
+    #[tokio::test]
+    async fn pr2_probe_bad_codes_hold_no_request_place() {
+        let dir = TempDir::new("ingress-pr2");
+        let devices = Devices::open(dir.path(), Some(Secret::parse(SECRET).unwrap())).unwrap();
+        let (_, addr, _agents, _hooks) = device_hub(&devices).await;
+        for (label, raw, base) in [
+            ("join bad code", join_request(&join_body("ABCD-EFGH-JKMN-PQRS"), None), 10u32),
+            ("hook bad secret", request(Some("Bearer wrong-secret-wrong-secret"), &body_of_start()), 20u32),
+        ] {
+            let first = pr2_wave(addr, &raw, base).await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let second = pr2_wave(addr, &raw, base + 1).await;
+            let (a, b) = (pr2_count(first).await, pr2_count(second).await);
+            eprintln!("PR2PROBE {label}: first wave answered={a}/64, second wave (sent while the first sleeps) answered={b}/64");
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+    }
+

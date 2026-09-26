@@ -1,0 +1,12 @@
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.67s
+
+     Running tests\join_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\join_e2e-f029ab4ef20bcb21.exe)
+
+--
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running tests\question_hook_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\question_hook_e2e-b642e35242917a28.exe)
+
+--
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+
