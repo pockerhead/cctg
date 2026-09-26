@@ -1,0 +1,65 @@
+p='crates/cctg/src/hub/questions.rs'
+s=open(p,encoding='utf-8',newline='').read()
+BS='\\'
+def rep(a,b,cnt=1):
+    global s
+    a=a.replace('<NL>',BS+'n'); b=b.replace('<NL>',BS+'n')
+    assert s.count(a)==cnt,(a,s.count(a))
+    s=s.replace(a,b)
+rep("""    fn ask(questions: Vec<AskedQuestion>) -> Ask {
+        Ask::new("s".into(), "abcde".into(), questions)
+    }
+""","""    fn ask(questions: Vec<AskedQuestion>) -> Ask {
+        Ask::new("s".into(), "abcde".into(), questions)
+    }
+
+    fn answered(options: &[usize], text: Option<&str>) -> Answered {
+        Answered {
+            options: options.to_vec(),
+            text: text.map(str::to_owned),
+        }
+    }
+""")
+rep("""        assert_eq!(ask.answers(), Some(vec!["Blue".to_owned(), "S".to_owned()]));""",
+"""        assert_eq!(
+            ask.answers(),
+            Some(vec![answered(&[1], None), answered(&[0], None)])
+        );""")
+rep("""        assert!(ask.text().contains("Size?<NL>→ S"));""","""        assert!(ask.text().contains("Color?<NL>→ Blue") && ask.text().contains("Size?<NL>→ S"));""")
+rep("""        assert_eq!(ask.answers(), Some(vec!["Apple, Plum".to_owned()]));""",
+"""        assert_eq!(ask.answers(), Some(vec![answered(&[0, 2], None)]));
+        assert!(ask.text().contains("Fruits?<NL>→ Apple, Plum"));""")
+rep("""        assert!(ask.type_answer("my own words"));
+        assert_eq!(
+            ask.answers(),
+            Some(vec![
+                "Pear, and a fig".to_owned(),
+                "my own words".to_owned()
+            ])
+        );
+        assert!(!ask.type_answer("late"));""","""        assert!(ask.type_answer("my own words"));
+        // The text goes as typed; the message shows it trimmed.
+        assert_eq!(
+            ask.answers(),
+            Some(vec![
+                answered(&[1], Some("  and a fig ")),
+                answered(&[], Some("my own words"))
+            ])
+        );
+        assert!(ask.text().contains("Fruits?<NL>→ Pear, and a fig<NL>"));
+        assert!(!ask.type_answer("late"));
+        // A long text is cut at a character boundary.
+        let mut long = self::ask(vec![question("Note?", false, &["Yes"])]);
+        assert!(long.type_answer(&"й".repeat(MAX_OWN_TEXT)));
+        let text = long.answers().unwrap().remove(0).text.unwrap();
+        assert_eq!(text, "й".repeat(MAX_OWN_TEXT / 2));""")
+rep("""        assert_eq!(book.text_target(100, Some(5)), None);
+        for _ in book.len()..MAX_ASKS {""","""        assert_eq!(book.text_target(100, Some(5)), None);
+        // With ✏️ Другое armed, a reply to any other message is no answer.
+        book.get_mut(second).unwrap().press(0, Press::Other);
+        assert_eq!(book.text_target(100, None), Some(second));
+        assert_eq!(book.text_target(100, Some(6)), Some(second));
+        assert_eq!(book.text_target(100, Some(777)), None);
+        for _ in book.len()..MAX_ASKS {""")
+open(p,'w',encoding='utf-8',newline='').write(s)
+print("ok")

@@ -1,0 +1,24 @@
+p='crates/cctg/src/hub/slots.rs'
+s=open(p,encoding='utf-8',newline='').read()
+def rep(a,b,cnt=1):
+    global s
+    assert s.count(a)==cnt,(a,s.count(a))
+    s=s.replace(a,b)
+rep("""    async fn question_ask(rig: &Rig, session: &str) -> oneshot::Receiver<Option<Vec<String>>> {""",
+"""    async fn question_ask(rig: &Rig, session: &str) -> oneshot::Receiver<Option<Vec<Answered>>> {""")
+rep("""        answered: oneshot::Receiver<Option<Vec<String>>>,
+    ) -> Option<Vec<String>> {""","""        answered: oneshot::Receiver<Option<Vec<Answered>>>,
+    ) -> Option<Vec<Answered>> {""")
+rep("""            Some(vec!["Blue".to_owned(), "Plum, and a fig".to_owned()])""",
+"""            Some(vec![
+                Answered {
+                    options: vec![1],
+                    text: None
+                },
+                Answered {
+                    options: vec![2],
+                    text: Some("and a fig".into())
+                }
+            ])""")
+open(p,'w',encoding='utf-8',newline='').write(s)
+print("ok")

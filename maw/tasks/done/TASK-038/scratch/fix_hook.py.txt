@@ -1,0 +1,63 @@
+p='crates/cctg/src/hook.rs'
+s=open(p,encoding='utf-8',newline='').read()
+def rep(a,b,cnt=1):
+    global s
+    assert s.count(a)==cnt,(a,s.count(a))
+    s=s.replace(a,b)
+rep("""    AskedOption, AskedQuestion, Behavior,""","""    Answered, AskedOption, AskedQuestion, Behavior,""")
+rep("""/// Longest hub answer with question answers read: up to four Telegram
+/// messages of the user's own text, JSON-escaped.
+const MAX_QUESTION_ANSWER: u64 = 256 << 10;""","""/// Longest hub answer with question answers read: four of the user's own
+/// texts (`hub::questions::MAX_OWN_TEXT`, 16 KiB each), JSON-escaped.
+const MAX_QUESTION_ANSWER: u64 = 512 << 10;""")
+rep("""/// Claude Code's `PreToolUse` decision for stdout: `allow` with the call's
+/// own input plus `answers` (question text -> answer). `None` when the hub's
+/// answers do not match the questions one to one.
+pub fn question_json(tool_input: &Value, answers: &[String]) -> Option<String> {
+    let questions = tool_input.get("questions")?.as_array()?;
+    if answers.len() != questions.len() || answers.iter().any(|answer| answer.trim().is_empty()) {
+        return None;
+    }
+    let mut by_question = serde_json::Map::new();
+    for (question, answer) in questions.iter().zip(answers) {
+        let text = question.get("question")?.as_str()?;
+        by_question.insert(text.to_owned(), Value::String(answer.clone()));
+    }""","""/// Claude Code's `PreToolUse` decision for stdout: `allow` with the call's
+/// own input plus `answers` (question text -> answer). An answer is the
+/// labels of the chosen options exactly as the input has them, then the
+/// user's own text, joined by `, `. `None` when the hub's answers do not
+/// match the questions one to one, name an option the question lacks or
+/// are empty.
+pub fn question_json(tool_input: &Value, answers: &[Answered]) -> Option<String> {
+    let questions = tool_input.get("questions")?.as_array()?;
+    if answers.len() != questions.len() {
+        return None;
+    }
+    let mut by_question = serde_json::Map::new();
+    for (question, answer) in questions.iter().zip(answers) {
+        let text = question.get("question")?.as_str()?;
+        let options = question.get("options")?.as_array()?;
+        let mut parts = answer
+            .options
+            .iter()
+            .map(|index| options.get(*index)?.get("label")?.as_str())
+            .collect::<Option<Vec<&str>>>()?;
+        parts.extend(
+            answer
+                .text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()),
+        );
+        if parts.is_empty() {
+            return None;
+        }
+        by_question.insert(text.to_owned(), Value::String(parts.join(", ")));
+    }""")
+rep("""    if input.tool_name == QUESTION_TOOL {
+        return Err(Skip("questions are asked by their PreToolUse hook"));
+    }
+""","")
+rep(""") -> Result<Option<Vec<String>>, PostError> {""",""") -> Result<Option<Vec<Answered>>, PostError> {""",2)
+rep("""        decide: impl Fn(&QuestionPost) -> Option<Option<Vec<String>>> + Send + 'static,""","""        decide: impl Fn(&QuestionPost) -> Option<Option<Vec<Answered>>> + Send + 'static,""")
+open(p,'w',encoding='utf-8',newline='').write(s)
+print("ok")
