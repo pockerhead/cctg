@@ -17,7 +17,8 @@
 //! download that release's binary for its platform from a fake release on
 //! loopback HTTP (`CCTG_RELEASE_BASE_URL`), check it against `SHA256SUMS`,
 //! put it in place of the shim's file and hand over to it; a bad checksum,
-//! a missing file and a cut connection leave the old file and the agent.
+//! a missing file and a cut connection leave the old file and the agent,
+//! and then a newer file put in place otherwise is still taken.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
@@ -808,5 +809,25 @@ async fn a_failed_download_leaves_the_old_binary_and_the_agent() {
     // A hub without a release tag: the disk alone, as before TASK-050.
     let outcome = update_answer(&mut events, conn, &to_agent, 6, None).await;
     assert_eq!(outcome, UpdateOutcome::UpToDate);
+    // The release does not come, but a newer file put in place otherwise
+    // (by hand, install.sh) is still taken.
+    std::fs::rename(&exe, bin.join(format!("cctg.old{EXE}"))).unwrap();
+    let newer_build = write_newer(&exe, &original);
+    let outcome = update_answer(&mut events, conn, &to_agent, 7, Some("cut")).await;
+    assert_eq!(outcome, UpdateOutcome::Reloading);
+    to_agent
+        .send(HubMsg::Released {
+            update_id: 7,
+            session_id: SESSION.into(),
+        })
+        .await
+        .unwrap();
+    let (_, register, _) = registered(&mut events).await;
+    assert_eq!(
+        register.client.expect("a client").build,
+        newer_build,
+        "the new worker runs the file put in place"
+    );
+    session.ping(200).await;
     session.end().await;
 }
