@@ -1,0 +1,8 @@
+== x86_64-unknown-linux-gnu
+    Finished `dev` profile [unoptimized] target(s) in 9.28s
+== x86_64-unknown-linux-musl
+    Finished `dev` profile [unoptimized] target(s) in 2.08s
+== aarch64-apple-darwin
+    Finished `dev` profile [unoptimized] target(s) in 2.03s
+
+[exited with code 0]
