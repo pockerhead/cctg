@@ -540,6 +540,43 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     let answer = claude.send_file(13, &big, "big").await;
     assert_eq!(answer["result"]["isError"], true, "{answer}");
     std::fs::remove_file(&big).unwrap();
+    // TASK-051: without a caption (blank or none) the file name is the
+    // caption, for a photo and a document; a given caption stays as it is.
+    let bare = work.join("bare-shot.png");
+    std::fs::write(
+        &bare,
+        [b"\x89PNG\r\n\x1a\n".as_slice(), b"bare picture"].concat(),
+    )
+    .unwrap();
+    let answer = claude.send_file(14, &bare, "  ").await;
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+    let report = work.join("report.txt");
+    std::fs::write(&report, "report").unwrap();
+    let call = json!({"jsonrpc":"2.0","id":15,"method":"tools/call","params":{
+        "name":"send_file","arguments":{"path":report}}});
+    claude.send(&call.to_string()).await;
+    let answer = claude.recv().await;
+    assert_eq!(
+        (answer["id"].clone(), answer["result"]["isError"].clone()),
+        (json!(15), json!(false)),
+        "{answer}"
+    );
+    let caption = |text: &str| format!("name=\"caption\"\r\n\r\n{text}\r\n");
+    let photos = seen_methods(&seen, "sendPhoto");
+    let documents = seen_methods(&seen, "sendDocument");
+    assert_eq!((photos.len(), documents.len()), (3, 3));
+    assert!(
+        photos[2].contains(&caption("bare-shot.png")),
+        "{}",
+        photos[2]
+    );
+    assert!(
+        documents[2].contains(&caption("report.txt")),
+        "{}",
+        documents[2]
+    );
+    assert!(photos[0].contains(&caption(&format!("outbound caption {marker}"))));
+    assert!(documents[0].contains(&caption("notes")));
 
     // The session ends: a photo waits as its reference and goes to the
     // agent of the resumed session.
@@ -652,7 +689,14 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         !logs.contains(&marker),
         "a private marker in the logs:\n{logs}"
     );
-    for private in ["notes.txt", "odd.png", "big.iso", "inbox"] {
+    for private in [
+        "notes.txt",
+        "odd.png",
+        "big.iso",
+        "inbox",
+        "bare-shot.png",
+        "report.txt",
+    ] {
         assert!(!logs.contains(private), "{private} in the logs:\n{logs}");
     }
     // Nor the bot token of the download URLs (`/file/bot<token>/...`).

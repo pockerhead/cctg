@@ -269,7 +269,7 @@ async fn restarted(files: &Files, before: Option<&str>, timeout: Duration) -> bo
 /// `current` -> `old`, `part` -> `current`; on failure `current` is back.
 /// Without a `current` (a half-failed rollback) `old` is the binary to keep
 /// and is left alone.
-fn swap_in(files: &Files) -> Result<(), String> {
+pub(crate) fn swap_in(files: &Files) -> Result<(), String> {
     let had_current = files.current.exists();
     if had_current {
         set_aside(&files.old)?;
@@ -327,7 +327,7 @@ fn aside_name(path: &Path) -> PathBuf {
 }
 
 /// Deletes binaries set aside by earlier deploys that nothing runs any more.
-fn sweep(files: &Files) {
+pub(crate) fn sweep(files: &Files) {
     let Some(dir) = files.current.parent() else {
         return;
     };
@@ -347,7 +347,7 @@ fn sweep(files: &Files) {
     }
 }
 
-fn rename(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     let mut result = std::fs::rename(from, to);
     for wait in RENAME_WAITS {
         match &result {
