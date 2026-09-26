@@ -409,9 +409,13 @@ mod host {
                     // terminal before the shell takes it back.
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     self.restore();
-                    // SAFETY: a signal to this process.
+                    // To this thread, which stops before it returns (the
+                    // whole process stops with it). `kill(getpid())` lets
+                    // Linux hand the stop to the main thread while this
+                    // one runs on into raw mode.
+                    // SAFETY: a signal to this thread.
                     unsafe {
-                        libc::kill(libc::getpid(), libc::SIGSTOP);
+                        libc::raise(libc::SIGSTOP);
                     }
                     self.raw();
                     self.sync_size();
