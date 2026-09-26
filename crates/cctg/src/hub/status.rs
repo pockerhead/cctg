@@ -72,6 +72,10 @@ pub const UPDATE_WAITS_NOTICE: &str = "⏳ Обновление клиента �
 pub const UPDATE_AGENTS_NOTICE: &str = "⏳ Обновление клиента ждёт: работают фоновые агенты или в терминале открыт вид субагента. Продолжится само, когда агенты закончат; вид субагента закройте (вернитесь к main).";
 pub const UPDATE_FAILED_NOTICE: &str =
     "Обновить клиент не получилось; подробности в debug-логе claude этой сессии.";
+/// The client could not download the hub's release (TASK-050).
+pub const DOWNLOAD_FAILED_NOTICE: &str = "Не получилось скачать или поставить сборку cctg релиза hub: нет связи с GitHub Releases, не хватило времени или файл не записался. Старая сборка на месте; нажмите «Обновить» ещё раз позже, подробности в debug-логе claude этой сессии.";
+pub const CHECKSUM_NOTICE: &str = "Скачанная сборка cctg не совпала с SHA256SUMS релиза hub и не поставлена. Старая сборка на месте.";
+pub const NO_RELEASE_BUILD_NOTICE: &str = "В релизе hub нет сборки cctg для платформы этой машины. Старая сборка на месте; поставьте клиент вручную (install.sh --from-source) и нажмите «Обновить».";
 
 /// A status button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

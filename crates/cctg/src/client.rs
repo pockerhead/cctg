@@ -21,6 +21,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SOURCE: &str = env!("CCTG_SOURCE");
 /// What `cctg --version` prints after the name.
 pub const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("CCTG_SOURCE"), ")");
+/// Baked in by `build.rs` (TASK-050): the release tag of a CI or Docker tag
+/// build, or empty.
+const RELEASE: &str = env!("CCTG_RELEASE");
+
+/// The release tag this binary was built for; `None` for a local build.
+pub fn release() -> Option<&'static str> {
+    (!RELEASE.is_empty()).then_some(RELEASE)
+}
 
 /// sha256 of the file at `path`, lowercase hex. Reads it in 64 KiB pieces.
 pub fn build_of(path: &Path) -> std::io::Result<String> {
@@ -165,5 +173,6 @@ mod tests {
         );
         assert!(SOURCE.len() <= 64 + "-dirty".len());
         assert!(LONG_VERSION.starts_with(VERSION));
+        assert!(release().is_none_or(crate::download::is_tag), "{RELEASE}");
     }
 }

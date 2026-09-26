@@ -46,7 +46,9 @@
 //! Update (TASK-040): the agent runs as `cctg agent-worker` under the
 //! `cctg agent` shim ([`crate::shim`]) and registers with its build
 //! ([`Client`]); on the hub's `update` it hands over to a newer binary or
-//! restarts claude through `cctg run` ([`crate::update`]).
+//! restarts claude through `cctg run` ([`crate::update`]). An `update` that
+//! names the hub's release tag first puts that release's binary in place of
+//! the worker's file ([`crate::download`], TASK-050).
 //!
 //! A headless run (`claude -p`, `CLAUDE_CODE_ENTRYPOINT=sdk-cli`) never gets a
 //! channel from Claude Code (TASK-004), so its agent answers MCP but never
@@ -69,6 +71,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::channel::{self, FileCall, Hub, NoHub};
 use crate::client;
 use crate::device::{self, DeviceConfig};
+use crate::download;
 use crate::files;
 use crate::keys::{self, Typed};
 use crate::proctree;
@@ -763,6 +766,8 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     // stay after it; Claude Code's lines are answered meanwhile.
     let mut saving: Option<tokio::task::JoinHandle<HubMsg>> = None;
     let mut leaving: Option<Leaving> = None;
+    // The hub's release being downloaded for an `update` (TASK-050).
+    let mut downloading: Option<(u64, Download)> = None;
     let mut frames_open = true;
     let answer = |update_id, outcome| {
         let outbox = outbox.clone();
@@ -824,6 +829,27 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                 }
                 Vec::new()
             }
+            fetched = async {
+                match downloading.as_mut() {
+                    Some((_, task)) => task.await,
+                    None => std::future::pending().await,
+                }
+            }, if downloading.is_some() => {
+                let update_id = downloading.take().map_or(0, |(update_id, _)| update_id);
+                match (fetched, worker.clone()) {
+                    (Ok(Ok(_)), Some(worker)) => {
+                        follow_plan(&worker, update_id, &mut leaving, &answer).await
+                    }
+                    (Ok(Err(failure)), _) => {
+                        answer(update_id, download_outcome(failure)).await;
+                        Vec::new()
+                    }
+                    _ => {
+                        answer(update_id, UpdateOutcome::Failed).await;
+                        Vec::new()
+                    }
+                }
+            }
             saved = async {
                 match saving.as_mut() {
                     Some(save) => save.await,
@@ -840,56 +866,26 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                 }
             }
             event = recv_event(&mut events), if events.is_some() && saving.is_none() => match event {
-                Some(LinkEvent::Message(HubMsg::Update { update_id })) => {
-                    let Some(worker) = worker.clone().filter(|_| leaving.is_none()) else {
+                Some(LinkEvent::Message(HubMsg::Update { update_id, release })) => {
+                    let Some(worker) = worker
+                        .clone()
+                        .filter(|_| leaving.is_none() && downloading.is_none())
+                    else {
                         debug!("update without a worker or during another one; ignored");
                         continue;
                     };
-                    let plan = tokio::task::spawn_blocking({
-                        let worker = worker.clone();
-                        move || worker.plan()
-                    })
-                    .await
-                    .unwrap_or(Plan::Failed);
-                    info!(?plan, "update asked");
-                    match plan {
-                        Plan::Reload => {
-                            leaving = Some(Leaving::Draining { update_id });
-                            vec![shim::SWITCH.to_vec()]
-                        }
-                        Plan::Restart if tokio::task::spawn_blocking({
-                            let worker = worker.clone();
-                            move || worker.agents_on_screen()
-                        })
-                        .await
-                        .unwrap_or(false) => {
-                            // Looked at before leaving too (and again before
-                            // `/exit`): waiting for background agents does
-                            // not unbind the agent from the hub.
-                            answer(update_id, UpdateOutcome::AgentsRunning).await;
-                            Vec::new()
-                        }
-                        Plan::Restart => {
-                            answer(update_id, UpdateOutcome::Restarting).await;
-                            leaving = Some(Leaving::Released {
+                    match (release, worker.exe.clone()) {
+                        // The hub's release first (TASK-050), off the loop:
+                        // Claude Code's lines are answered meanwhile.
+                        (Some(tag), Some(exe)) if worker.self_update() => {
+                            let base = download::base_from_env();
+                            downloading = Some((
                                 update_id,
-                                restart: true,
-                                until: Instant::now() + LEAVE_WAIT,
-                            });
+                                tokio::spawn(async move { download::fetch(&base, &tag, &exe).await }),
+                            ));
                             Vec::new()
                         }
-                        Plan::ManualRestart => {
-                            answer(update_id, UpdateOutcome::NeedsManualRestart).await;
-                            Vec::new()
-                        }
-                        Plan::UpToDate => {
-                            answer(update_id, UpdateOutcome::UpToDate).await;
-                            Vec::new()
-                        }
-                        Plan::Failed => {
-                            answer(update_id, UpdateOutcome::Failed).await;
-                            Vec::new()
-                        }
+                        _ => follow_plan(&worker, update_id, &mut leaving, &answer).await,
                     }
                 }
                 Some(LinkEvent::Message(HubMsg::Released { update_id, session_id })) => {
@@ -1042,7 +1038,85 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         output.flush().await?;
     }
     output.flush().await?;
+    // A swap cut off by the process exit could leave no binary in place.
+    if let Some((_, task)) = downloading {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
     Ok(Ended::Input)
+}
+
+/// The hub's release on its way to the worker's file ([`download::fetch`]).
+type Download = JoinHandle<Result<download::Fetched, download::Failure>>;
+
+fn download_outcome(failure: download::Failure) -> UpdateOutcome {
+    match failure {
+        download::Failure::Download => UpdateOutcome::DownloadFailed,
+        download::Failure::Missing => UpdateOutcome::NoReleaseBuild,
+        download::Failure::Checksum => UpdateOutcome::ChecksumMismatch,
+    }
+}
+
+/// Carries out what `update` leads to ([`Worker::plan`]), after the hub's
+/// release was put in place when it sent one: a hand-over (the lines to
+/// write, [`shim::SWITCH`]), a claude restart, or an answer.
+async fn follow_plan<F, Fut>(
+    worker: &Arc<Worker>,
+    update_id: u64,
+    leaving: &mut Option<Leaving>,
+    answer: &F,
+) -> Vec<Vec<u8>>
+where
+    F: Fn(u64, UpdateOutcome) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let plan = tokio::task::spawn_blocking({
+        let worker = worker.clone();
+        move || worker.plan()
+    })
+    .await
+    .unwrap_or(Plan::Failed);
+    info!(?plan, "update asked");
+    match plan {
+        Plan::Reload => {
+            *leaving = Some(Leaving::Draining { update_id });
+            vec![shim::SWITCH.to_vec()]
+        }
+        Plan::Restart
+            if tokio::task::spawn_blocking({
+                let worker = worker.clone();
+                move || worker.agents_on_screen()
+            })
+            .await
+            .unwrap_or(false) =>
+        {
+            // Looked at before leaving too (and again before `/exit`):
+            // waiting for background agents does not unbind the agent from
+            // the hub.
+            answer(update_id, UpdateOutcome::AgentsRunning).await;
+            Vec::new()
+        }
+        Plan::Restart => {
+            answer(update_id, UpdateOutcome::Restarting).await;
+            *leaving = Some(Leaving::Released {
+                update_id,
+                restart: true,
+                until: Instant::now() + LEAVE_WAIT,
+            });
+            Vec::new()
+        }
+        Plan::ManualRestart => {
+            answer(update_id, UpdateOutcome::NeedsManualRestart).await;
+            Vec::new()
+        }
+        Plan::UpToDate => {
+            answer(update_id, UpdateOutcome::UpToDate).await;
+            Vec::new()
+        }
+        Plan::Failed => {
+            answer(update_id, UpdateOutcome::Failed).await;
+            Vec::new()
+        }
+    }
 }
 
 /// How [`serve_channel`] ended.
@@ -1344,11 +1418,14 @@ async fn upload(
     let transfer_id = wire::random_u64();
     let size = bytes.len() as u64;
     info!(size, "file offered to the hub");
+    // Without a caption the topic still says what the file is (TASK-051):
+    // a photo shows no name of its own.
+    let caption = call.caption.clone().unwrap_or_else(|| name.clone());
     let offer = AgentMsg::FileOffer {
         transfer_id,
         name,
         size,
-        caption: call.caption.clone(),
+        caption: Some(caption),
     };
     if outbox.send(offer).await.is_err() {
         return (

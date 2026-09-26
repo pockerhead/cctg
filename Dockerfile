@@ -23,9 +23,13 @@ COPY crates crates
 # The commit this image is built from: the hub's build, compared with the
 # clients' (no .git in the context). Empty: the binary's hash stands in.
 ARG CCTG_BUILD_ID=
+# The release tag of a tag build (TASK-050): its hub offers the clients that
+# release's binaries. Empty: no download, clients update from their disk.
+ARG CCTG_RELEASE=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    CCTG_BUILD_ID="${CCTG_BUILD_ID}" cargo build --release --locked -p cctg \
+    CCTG_BUILD_ID="${CCTG_BUILD_ID}" CCTG_RELEASE="${CCTG_RELEASE}" \
+    cargo build --release --locked -p cctg \
     && cp target/release/cctg /cctg \
     && /cctg --version
 
