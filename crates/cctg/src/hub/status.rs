@@ -24,7 +24,9 @@ use serde_json::{Value, json};
 
 use super::permissions;
 
-/// A first ⏹ press waits this long for the confirming second one.
+/// A first ⏹ press waits this long for the confirming second one, counted
+/// again from when Telegram shows the question (its edit may wait for the
+/// group's edit budget).
 pub const CONFIRM_FOR: Duration = Duration::from_secs(10);
 /// A key the agent was asked to press and has not answered is forgotten
 /// after this.
@@ -368,6 +370,17 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
         json!({ "inline_keyboard": [row] })
     };
     (text, keyboard)
+}
+
+/// The keyboard asks for the confirming ⏹ press.
+pub fn asks_confirm(keyboard: &Value) -> bool {
+    keyboard["inline_keyboard"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .flatten()
+        .any(|button| button["callback_data"] == CONFIRM)
 }
 
 /// The words for how a compaction began.

@@ -80,7 +80,12 @@
 //! prompts, `Stop`, the tool hooks, tool results and interrupt notes in the
 //! stream, permission prompts and the session's end) and shows the numbers
 //! of its status line. It is edited at most once per `Options::status_every`,
-//! except right after a button press. Its ⏹ button asks the session's agent
+//! except right after a button press. These periodic edits are background
+//! edits for the scheduler (TASK-054): they take only the edit budget other
+//! edits leave, round-robin over the slots. An edit that shows a ⏹ press is
+//! foreground, may go while a refresh of the message still waits (the
+//! scheduler lets it take that refresh's place), and the ⏹ question gets its
+//! whole wait from when Telegram shows it. Its ⏹ button asks the session's agent
 //! to write Esc into the claude console; only an agent that announced
 //! `console_keys` for the live current session of that very slot is asked,
 //! never while a permission prompt of that session waits (Esc would answer
@@ -587,7 +592,8 @@ enum Done {
     },
 }
 
-/// A call about a slot's status message; at most one per slot in flight.
+/// A call about a slot's status message; at most one per slot in flight,
+/// except a ⏹ edit next to a waiting refresh.
 #[derive(Debug, Clone)]
 enum StatusJob {
     Create {
@@ -610,8 +616,13 @@ enum StatusJob {
 struct Shown {
     /// The text and keyboard Telegram shows, as far as known.
     content: Option<(String, serde_json::Value)>,
-    /// A [`StatusJob`] is in flight.
-    busy: bool,
+    /// [`StatusJob`]s in flight: one, or two when a ⏹ edit went after a
+    /// refresh that still waits for the edit budget (the scheduler lets the
+    /// newer one replace it).
+    in_flight: u8,
+    /// The next edit shows a ⏹ press: it goes as a foreground edit, also
+    /// while a refresh of the message waits.
+    urgent: bool,
     /// No edit before this (`Options::status_every` after the last one).
     next_at: Option<Instant>,
     /// A first ⏹ press of this session waits for its second until then.
@@ -3532,6 +3543,7 @@ impl Slots {
                 message_id,
                 text: buffer::RESUMED_TEXT.to_owned(),
                 reply_markup: Some(permissions::no_keyboard()),
+                background: false,
             },
         );
     }
@@ -4562,6 +4574,7 @@ impl Slots {
                     message_id,
                     text: permissions::ANSWER_EXPIRED.to_owned(),
                     reply_markup: Some(permissions::no_keyboard()),
+                    background: false,
                 },
             );
         }
@@ -4775,6 +4788,7 @@ impl Slots {
                     message_id,
                     text,
                     reply_markup: Some(keyboard),
+                    background: false,
                 },
             );
         }
@@ -4998,6 +5012,7 @@ impl Slots {
                     message_id,
                     text,
                     reply_markup: Some(permissions::no_keyboard()),
+                    background: false,
                 },
             );
         }
@@ -5123,6 +5138,7 @@ impl Slots {
             // Esc would answer the prompt, not stop the turn.
             if shown.confirm.take().is_some() {
                 shown.next_at = Some(now);
+                shown.urgent = true;
             }
             return status::ANSWER_WAITING;
         }
@@ -5132,6 +5148,7 @@ impl Slots {
             Press::Confirm if armed => {
                 shown.confirm = None;
                 shown.next_at = Some(now);
+                shown.urgent = true;
                 if !self.send_key(slot, &session, conn) {
                     return status::ANSWER_OFFLINE;
                 }
@@ -5145,8 +5162,10 @@ impl Slots {
             // A first press, or a second one after the wait ran out.
             Press::Stop | Press::Confirm => {
                 shown.confirm = Some((session, now + status::CONFIRM_FOR));
-                // Shown at once, whatever the edit pace.
+                // Shown at once, whatever the edit pace and the refreshes
+                // of other slots.
                 shown.next_at = Some(now);
+                shown.urgent = true;
                 status::ANSWER_CONFIRM
             }
         }
@@ -5759,6 +5778,7 @@ impl Slots {
             // Shown at once, whatever the edit pace.
             if let Some(shown) = self.shown.get_mut(&ask.slot) {
                 shown.next_at = Some(Instant::now());
+                shown.urgent = true;
             }
             return;
         }
@@ -5979,7 +5999,9 @@ impl Slots {
     }
 
     /// Sends, pins and edits the status messages that need it: one call per
-    /// slot at a time, edits at most once per `Options::status_every`.
+    /// slot at a time (plus a ⏹ edit next to a waiting refresh), edits at
+    /// most once per `Options::status_every`, as background edits unless
+    /// they show a ⏹ press.
     fn pump_status(&mut self) {
         let Some(every) = self.options.status_every else {
             return;
@@ -5994,7 +6016,12 @@ impl Slots {
             };
             let message = entry.status;
             let separated = entry.pending_separator.is_none();
-            if self.shown.get(&slot).is_some_and(|shown| shown.busy) {
+            let (in_flight, urgent) = self
+                .shown
+                .get(&slot)
+                .map_or((0, false), |shown| (shown.in_flight, shown.urgent));
+            // Only a ⏹ edit goes next to a call in flight.
+            if in_flight > 1 || (in_flight == 1 && !urgent) {
                 continue;
             }
             let (text, keyboard) = self.status_view(slot, &session, now);
@@ -6005,7 +6032,11 @@ impl Slots {
                 None => {
                     // A new message only for a live session, after its
                     // separator, so it lands below it.
-                    if !live || !separated || shown.retry_at.is_some_and(|at| now < at) {
+                    if in_flight > 0
+                        || !live
+                        || !separated
+                        || shown.retry_at.is_some_and(|at| now < at)
+                    {
                         continue;
                     }
                     StatusJob::Create {
@@ -6017,10 +6048,19 @@ impl Slots {
                 Some(StatusMessage {
                     message_id,
                     pinned: false,
-                }) if can_pin && !shown.pin_failed => StatusJob::Pin { message_id },
+                }) if can_pin && !shown.pin_failed => {
+                    if in_flight > 0 {
+                        continue;
+                    }
+                    StatusJob::Pin { message_id }
+                }
                 Some(StatusMessage { message_id, .. }) => {
                     let current = Some((text.clone(), keyboard.clone()));
-                    if shown.content == current || shown.next_at.is_some_and(|at| now < at) {
+                    if shown.content == current {
+                        shown.urgent = false;
+                        continue;
+                    }
+                    if shown.next_at.is_some_and(|at| now < at) {
                         continue;
                     }
                     StatusJob::Edit {
@@ -6030,10 +6070,13 @@ impl Slots {
                     }
                 }
             };
-            shown.busy = true;
-            if matches!(job, StatusJob::Edit { .. }) {
+            shown.in_flight += 1;
+            let background = if matches!(job, StatusJob::Edit { .. }) {
                 shown.next_at = Some(now + every);
-            }
+                !std::mem::take(&mut shown.urgent)
+            } else {
+                false
+            };
             let op = match &job {
                 StatusJob::Create {
                     thread_id,
@@ -6056,6 +6099,7 @@ impl Slots {
                     message_id: *message_id,
                     text: text.clone(),
                     reply_markup: Some(keyboard.clone()),
+                    background,
                 },
                 StatusJob::Pin { message_id } => Op::Pin {
                     message_id: *message_id,
@@ -6074,7 +6118,11 @@ impl Slots {
         let topic_id = self.registry.slot(slot).and_then(|slot| slot.topic_id);
         let message = self.registry.slot(slot).and_then(|slot| slot.status);
         let shown = self.shown.entry(slot).or_default();
-        shown.busy = false;
+        shown.in_flight = shown.in_flight.saturating_sub(1);
+        if matches!(delivery, Some(Ok(Outcome::Superseded))) {
+            // A ⏹ edit of the message took its place; its answer counts.
+            return;
+        }
         match job {
             StatusJob::Create {
                 thread_id,
@@ -6134,6 +6182,18 @@ impl Slots {
                     )
                 });
                 if applied {
+                    // The ⏹ question gets its whole wait from when it shows,
+                    // however long its edit waited for the budget.
+                    let asked = shown
+                        .content
+                        .as_ref()
+                        .is_some_and(|(_, shown)| status::asks_confirm(shown));
+                    if !asked
+                        && status::asks_confirm(&keyboard)
+                        && let Some((_, until)) = shown.confirm.as_mut()
+                    {
+                        *until = now + status::CONFIRM_FOR;
+                    }
                     shown.content = Some((text, keyboard));
                 } else if gone {
                     // Deleted in Telegram: a new one is sent and pinned.
@@ -6700,6 +6760,7 @@ impl Slots {
                     message_id: *message_id,
                     text: text.clone(),
                     reply_markup: None,
+                    background: false,
                 },
             };
             self.hand_off(Work::Block(job), op);
@@ -6913,7 +6974,7 @@ mod tests {
     use super::*;
     use crate::hub::api::{ForumTopic, Message};
     use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL};
-    use crate::hub::scheduler::{BucketConfig, Scheduler, Transport};
+    use crate::hub::scheduler::{BucketConfig, Limits, Scheduler, Transport};
     use crate::hub::testdir::TempDir;
     use crate::wire::{
         AskedOption, AskedQuestion, Behavior, HookEvent, PermissionRequest, QuestionPost, Register,
@@ -7068,10 +7129,14 @@ mod tests {
     }
 
     fn rig_in(fake: Fake, options: Options, dir: TempDir) -> Rig {
+        rig_with(fake, options, dir, BucketConfig::default())
+    }
+
+    fn rig_with(fake: Fake, options: Options, dir: TempDir, limits: impl Into<Limits>) -> Rig {
         let fake = Arc::new(fake);
         let store = RegistryStore::open(dir.path()).unwrap();
         let registry = store.load().unwrap();
-        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), limits);
         tokio::spawn(scheduler.run());
         let mut slots = Slots::new(registry, store, outbox, options);
         let asks = slots.permission_asks();
@@ -8632,7 +8697,7 @@ again"
             .collect();
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert!(
-            matches!(edits[0], Op::Edit { message_id: id, text: edited, reply_markup: Some(markup) }
+            matches!(edits[0], Op::Edit { message_id: id, text: edited, reply_markup: Some(markup), background: false }
             if *id == message_id
                 && *edited == format!("{text}{}", permissions::ALLOWED_MARK)
                 && *markup == permissions::no_keyboard())
@@ -8726,6 +8791,7 @@ again"
                     message_id,
                     text,
                     reply_markup,
+                    ..
                 } if *message_id == message => Some((text.clone(), reply_markup.clone())),
                 _ => None,
             })
@@ -14588,6 +14654,78 @@ again"
         assert_eq!(text, "⏹ Esc отправлен в терминал");
     }
 
+    /// The status calls handed to the scheduler since the last call.
+    fn status_work(work: &mut mpsc::UnboundedReceiver<(Work, Op)>) -> Vec<(StatusJob, Op)> {
+        let mut found = Vec::new();
+        while let Ok((job, op)) = work.try_recv() {
+            if let Work::Status { job, .. } = job {
+                found.push((job, op));
+            }
+        }
+        found
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_question_replaces_a_waiting_refresh_and_gets_its_whole_wait_once_shown() {
+        let dir = TempDir::new("slots-status-late-question");
+        let (mut slots, mut from_hub) = keyed_slots(&dir, status_options());
+        slots.registry.slots[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: true,
+        });
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        slots.pump();
+        // A refresh waits for the edit budget.
+        let mut handed = status_work(&mut work);
+        assert_eq!(handed.len(), 1);
+        let (refresh, op) = handed.remove(0);
+        assert!(
+            matches!(
+                op,
+                Op::Edit {
+                    background: true,
+                    ..
+                }
+            ),
+            "{op:?}"
+        );
+        // ⏹: the question goes next to it as a foreground edit.
+        assert_eq!(
+            slots.press_status(Some(500), Press::Stop),
+            status::ANSWER_CONFIRM
+        );
+        slots.pump();
+        let mut handed = status_work(&mut work);
+        assert_eq!(handed.len(), 1);
+        let (question, op) = handed.remove(0);
+        assert!(
+            matches!(&op, Op::Edit { message_id: 500, background: false, reply_markup: Some(keys), .. }
+                if status::asks_confirm(keys)),
+            "{op:?}"
+        );
+        // No third call while both are out.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        slots.pump();
+        assert!(status_work(&mut work).is_empty());
+        // The scheduler let the question replace the refresh; Telegram shows
+        // it 9 s after the press.
+        slots.on_status_done(SlotId(0), refresh, Some(Ok(Outcome::Superseded)));
+        tokio::time::advance(Duration::from_secs(8)).await;
+        slots.on_status_done(SlotId(0), question, Some(Ok(Outcome::Done)));
+        assert_eq!(slots.shown[&SlotId(0)].in_flight, 0);
+        // 14 s after the press, 5 s after it showed: still the second press.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            slots.press_status(Some(500), Press::Confirm),
+            status::ANSWER_INTERRUPTING
+        );
+        assert!(matches!(
+            from_hub.recv().await,
+            Some(HubMsg::ConsoleKey { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn an_interrupt_note_at_an_open_prompt_ends_the_wait() {
         let dir = TempDir::new("slots-status-interrupt-waiting");
@@ -14618,6 +14756,279 @@ again"
             last_status_text(ops).as_deref() == Some("💤 Ждёт вас")
         })
         .await;
+    }
+
+    // ------------------------------------------------------------ TASK-054
+
+    /// Session `n` of the paced test: its short id is `n` in hex.
+    fn paced_session(n: u32) -> String {
+        format!("{n:08x}-0000-4000-8000-{n:012x}")
+    }
+
+    /// An agent of `session` that presses keys; what the hub sends it comes
+    /// out of `rig._to_agent` (in registration order).
+    async fn keys_agent(rig: &mut Rig, conn: u64, session: &str, pid: u32) {
+        let (to_agent, rx) = mpsc::channel(64);
+        rig._to_agent.push(rx);
+        let register = Register {
+            session_id: session.into(),
+            host: "box".into(),
+            cwd: CWD.into(),
+            claude_pid: Some(pid),
+            verdict_ack: false,
+            transcript_reads: false,
+            console_keys: true,
+            console_commands: false,
+            client: None,
+            files: false,
+            session_reads: false,
+            status_lines: false,
+            heartbeat: false,
+        };
+        rig.agents
+            .send(AgentEvent::Registered {
+                conn,
+                register,
+                to_agent,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn tool_start(session: &str, step: u64) -> HookPost {
+        hook(
+            session,
+            HookEvent::ToolStart {
+                tool_use_id: format!("t{step}"),
+                line: format!("• Bash: step {step}"),
+            },
+        )
+    }
+
+    /// The ops once they satisfy `ready`; fails when that takes longer than
+    /// `limit` of (paused) time.
+    async fn within(
+        rig: &Rig,
+        limit: Duration,
+        what: &str,
+        ready: impl Fn(&[Op]) -> bool,
+    ) -> Vec<Op> {
+        let start = Instant::now();
+        loop {
+            let ops = rig.fake.ops();
+            if ready(&ops) {
+                return ops;
+            }
+            assert!(
+                Instant::now() - start <= limit,
+                "{what} took longer than {limit:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// When each recorded op was first seen, sampled every 100 ms.
+    fn op_times(fake: Arc<Fake>) -> Arc<Mutex<Vec<Instant>>> {
+        let times = Arc::new(Mutex::new(Vec::new()));
+        let seen = times.clone();
+        tokio::spawn(async move {
+            loop {
+                let count = fake.ops().len();
+                if let Ok(mut seen) = seen.lock() {
+                    let now = Instant::now();
+                    while seen.len() < count {
+                        seen.push(now);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+        times
+    }
+
+    /// Status messages sent so far: (topic, message id Telegram gave).
+    fn status_messages(ops: &[Op]) -> Vec<(i64, i64)> {
+        ops.iter()
+            .filter(|op| matches!(op, Op::Send { .. }))
+            .zip(1000..)
+            .filter_map(|(op, message_id)| match op {
+                Op::Send {
+                    thread_id: Some(thread),
+                    reply_markup: Some(_),
+                    permission: false,
+                    ..
+                } => Some((*thread, message_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The topic Telegram gave the session with short id `n`.
+    fn topic_of(ops: &[Op], n: u32) -> Option<i64> {
+        let short = format!("{n:08x}");
+        ops.iter()
+            .filter(|op| is_create(op))
+            .zip(100..)
+            .find_map(|(op, topic)| match op {
+                Op::CreateTopic { name, .. } if name.ends_with(&short) => Some(topic),
+                _ => None,
+            })
+    }
+
+    fn has_button(markup: Option<&serde_json::Value>, data: &str) -> bool {
+        markup.is_some_and(|markup| markup.to_string().contains(data))
+    }
+
+    /// The hub's real pacing (`Limits::default()`): ten sessions whose status
+    /// changes every 2 s keep the edit budget busy for good, and still a new
+    /// session gets its topic, a permission prompt and its decision show,
+    /// ⏹ asks and interrupts, and every status message is refreshed.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_hubs_pacing_topics_prompts_and_stop_stay_quick_under_status_churn() {
+        let options = Options {
+            status_every: Some(STATUS_EVERY),
+            ..message_options()
+        };
+        let mut rig = rig_with(
+            Fake::default(),
+            options,
+            TempDir::new("slots-paced"),
+            Limits::default(),
+        );
+        let times = op_times(rig.fake.clone());
+        // Session 0 asks for a permission; sessions 1..=10 churn.
+        for n in 0..=10u32 {
+            let session = paced_session(n);
+            rig.hook(start(&session, 10 + n)).await;
+            keys_agent(&mut rig, u64::from(n) + 1, &session, 10 + n).await;
+            rig.hook(hook(
+                &session,
+                HookEvent::UserPromptSubmit { prompt_id: None },
+            ))
+            .await;
+            rig.hook(tool_start(&session, 0)).await;
+        }
+        within(
+            &rig,
+            Duration::from_secs(300),
+            "eleven pinned status messages",
+            |ops| count(ops, |op| matches!(op, Op::Pin { .. })) == 11,
+        )
+        .await;
+        let hooks = rig.hooks.clone();
+        let churn = tokio::spawn(async move {
+            for step in 1u64.. {
+                for n in 1..=10u32 {
+                    let session = paced_session(n);
+                    let _ = hooks.send(tool_start(&session, step)).await;
+                    let end = HookEvent::ToolEnd {
+                        tool_use_id: format!("t{}", step - 1),
+                    };
+                    let _ = hooks.send(hook(&session, end)).await;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        let churn_from = Instant::now();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        // A new session: its topic comes at once, not after the refreshes.
+        rig.hook(start(&paced_session(11), 21)).await;
+        within(&rig, Duration::from_secs(10), "the new topic", |ops| {
+            topic_of(ops, 11).is_some()
+        })
+        .await;
+
+        // A permission prompt and the decision on it.
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        let ops = within(&rig, Duration::from_secs(5), "the prompt", |ops| {
+            prompts(ops).len() == 1
+        })
+        .await;
+        let (_, _, prompt_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q1", Some(prompt_id), "allow:abcde"))
+            .unwrap();
+        // Two edit tokens at most: a topic call (the ❓ icon, the new
+        // session's pin) may take its turn first.
+        within(&rig, Duration::from_secs(8), "the decision edit", |ops| {
+            edits_of(ops, prompt_id)
+                .iter()
+                .any(|(text, _)| text.contains(permissions::ALLOWED_MARK))
+        })
+        .await;
+
+        // ⏹ on session 1 right after that: the question shows within two
+        // edit tokens (the icon edit after the decision may take its turn first), inside its 10 s
+        // even counted from the press, and the second press interrupts.
+        let ops = rig.fake.ops();
+        let topic = topic_of(&ops, 1).expect("topic of session 1");
+        let (_, status_id) = status_messages(&ops)
+            .into_iter()
+            .find(|(thread, _)| *thread == topic)
+            .expect("status message of session 1");
+        rig.control
+            .send(press("q2", Some(status_id), "status:stop"))
+            .unwrap();
+        within(&rig, Duration::from_secs(8), "the ⏹ question", |ops| {
+            edits_of(ops, status_id)
+                .iter()
+                .any(|(_, markup)| has_button(markup.as_ref(), "status:confirm"))
+        })
+        .await;
+        rig.control
+            .send(press("q3", Some(status_id), "status:confirm"))
+            .unwrap();
+        let ops = within(&rig, Duration::from_secs(5), "both answers", |ops| {
+            answers(ops).len() == 3
+        })
+        .await;
+        assert_eq!(
+            answers(&ops)[1..],
+            [
+                Some(status::ANSWER_CONFIRM),
+                Some(status::ANSWER_INTERRUPTING)
+            ]
+        );
+        let got = received(&mut rig, 1).await;
+        assert!(
+            got.iter()
+                .any(|msg| matches!(msg, HubMsg::ConsoleKey { .. })),
+            "{got:?}"
+        );
+
+        // Every churning slot's status goes on being refreshed.
+        tokio::time::sleep(Duration::from_secs(150)).await;
+        churn.abort();
+        let ops = rig.fake.ops();
+        let times = times.lock().map(|times| times.clone()).unwrap_or_default();
+        let statuses = status_messages(&ops);
+        for n in 1..=10u32 {
+            let topic = topic_of(&ops, n).expect("topic");
+            let (_, status_id) = statuses
+                .iter()
+                .find(|(thread, _)| *thread == topic)
+                .copied()
+                .expect("status message");
+            let edited: Vec<Instant> = ops
+                .iter()
+                .zip(&times)
+                .filter(
+                    |(op, _)| matches!(op, Op::Edit { message_id, .. } if *message_id == status_id),
+                )
+                .map(|(_, at)| *at)
+                .filter(|at| *at >= churn_from)
+                .collect();
+            assert!(edited.len() >= 3, "session {n}: {} refreshes", edited.len());
+            for pair in edited.windows(2) {
+                assert!(
+                    pair[1] - pair[0] <= Duration::from_secs(90),
+                    "session {n}: {:?} between refreshes",
+                    pair[1] - pair[0]
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------ TASK-040
