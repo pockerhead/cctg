@@ -39,6 +39,14 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 
 Подробности (прокси, обновление, порты): `docs/remote-hub.md`.
 
+### Или hub на этой машине, без Docker
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub --local
+```
+
+Те же вопросы; прокси остаётся только в `hub.env`. Hub запускается при входе в систему без окон: в Windows запись автозагрузки (`HKCU\...\Run`, Windows Script Host запускает `cctg supervise` скрыто), в Linux пользовательский юнит systemd `cctg-hub.service`, в macOS LaunchAgent. Всё лежит в `~/.cctg/hub` (`hub.env`, состояние, лог `hub.log`). Без `--public-host ХОСТ` hub пускает только эту машину; с ним слушает все адреса по TLS, и строку для других машин даёт `/join`. В конце установщик печатает строку клиента для этой машины. Linux: hub живёт, пока вы в системе; чтобы работал и без входа, `loginctl enable-linger`.
+
 ## 3. Клиент на каждой машине
 
 Выполните строку, которую напечатал hub (в Windows это Git Bash). Она выглядит так:
@@ -47,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub-host <сервер> --pin <отпечаток> --join XXXX-XXXX-XXXX-XXXX
 ```
 
-Установщик обменяет код на собственный секрет этой машины и запишет его в `~/.cctg/device.env`, на экран секрет не попадает. Для каждой машины нужен свой код. Список машин и кнопка «Отозвать»: `/devices` в теме General.
+Установщик обменяет код на собственный секрет этой машины и запишет его в `~/.cctg/device.env`, на экран секрет не попадает. Для каждой машины нужен свой код: `/join` в теме General отвечает готовой строкой с новым кодом (только людям из allowlist); сообщение потом говорит, что код использован (и каким устройством) или истёк. Список машин и кнопка «Отозвать»: `/devices` в теме General.
 
 Без строки можно так, установщик всё спросит:
 
@@ -93,4 +101,4 @@ claude-cctg
 curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --uninstall
 ```
 
-Удаляет только то, что поставил установщик. Hub: та же строка с `--hub --uninstall` вместо `--uninstall` (останавливает контейнер, `hub.env`, ключ и состояние остаются).
+Удаляет только то, что поставил установщик. Hub: та же строка с `--hub --uninstall` вместо `--uninstall` (останавливает контейнер, `hub.env`, ключ и состояние остаются), hub на этой машине: `--hub --local --uninstall` (останавливает hub и убирает автозапуск, `~/.cctg/hub` остаётся). Пока стоит локальный hub, `--uninstall` клиента оставляет бинарник: hub работает из него.

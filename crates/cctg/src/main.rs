@@ -33,6 +33,10 @@ enum Command {
         /// Passed to `cctg hub`.
         #[arg(long)]
         env_file: Option<PathBuf>,
+        /// Append the supervisor's and the hub's log to this file (moved to
+        /// <file>.prev at start when larger than 5 MiB).
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
     /// Install a built binary next to the running `cctg supervise`, have the
     /// hub restarted on it and roll back when it does not keep running.
@@ -113,14 +117,23 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(error) => error.exit(),
     };
-    init_tracing(matches!(
+    // A supervisor with a log file sets its log up once it holds its lock.
+    if !matches!(
         &cli.command,
-        Command::Hook { .. }
-            | Command::Agent
-            | Command::AgentWorker
-            | Command::Statusline
-            | Command::Run { .. }
-    ));
+        Command::Supervise {
+            log_file: Some(_),
+            ..
+        }
+    ) {
+        init_tracing(matches!(
+            &cli.command,
+            Command::Hook { .. }
+                | Command::Agent
+                | Command::AgentWorker
+                | Command::Statusline
+                | Command::Run { .. }
+        ));
+    }
     match cli.command {
         Command::Hub {
             env_file,
@@ -132,15 +145,29 @@ async fn main() -> anyhow::Result<()> {
             stop_on_stdin,
             command: None,
         } => cctg::hub::run(env_file.as_deref(), stop_on_stdin).await?,
-        Command::Supervise { env_file } => {
+        Command::Supervise { env_file, log_file } => {
             let hub_args = env_file
                 .map(|path| vec!["--env-file".into(), path.into_os_string()])
                 .unwrap_or_default();
-            cctg::supervise::supervise(cctg::supervise::Settings {
-                exe: std::env::current_exe()?,
-                hub_args,
-            })
-            .await?;
+            let exe = std::env::current_exe()?;
+            // Held until this process ends.
+            let Some(_lock) = cctg::supervise::lock(&exe)? else {
+                eprintln!("cctg supervise: another supervisor runs from this folder; leaving");
+                return Ok(());
+            };
+            let log = match log_file {
+                Some(path) => {
+                    let file = cctg::supervise::open_log(&path)?;
+                    let _ = tracing_subscriber::fmt()
+                        .with_writer(std::sync::Mutex::new(file.try_clone()?))
+                        .with_target(false)
+                        .with_ansi(false)
+                        .try_init();
+                    Some(file)
+                }
+                None => None,
+            };
+            cctg::supervise::supervise(cctg::supervise::Settings { exe, hub_args, log }).await?;
         }
         Command::Deploy {
             exe,
@@ -287,7 +314,14 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from(["cctg", "supervise"]).unwrap().command,
-            Command::Supervise { env_file: None }
+            Command::Supervise {
+                env_file: None,
+                log_file: None
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "supervise", "--log-file", "hub.log"]).unwrap().command,
+            Command::Supervise { log_file: Some(path), .. } if path == std::path::Path::new("hub.log")
         ));
         assert!(matches!(
             Cli::try_parse_from(["cctg", "deploy", "new.exe"])

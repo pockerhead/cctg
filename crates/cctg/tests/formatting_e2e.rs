@@ -81,7 +81,7 @@ async fn scheduler(bodies: Arc<Mutex<Vec<Value>>>) -> (Scheduler<BotApi>, Outbox
     })
     .unwrap()
     .token;
-    let api = Arc::new(BotApi::with_api_url(&url, &token, -1001).unwrap());
+    let api = Arc::new(BotApi::with_api_url(&url, &token, -1001, None).unwrap());
     let fast = BucketConfig {
         capacity: 100,
         refill_every: std::time::Duration::from_millis(1),

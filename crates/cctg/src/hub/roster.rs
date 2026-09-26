@@ -1,4 +1,6 @@
-//! `/devices` in General and its «Отозвать» buttons (TASK-045).
+//! `/devices` in General and its «Отозвать» buttons (TASK-045), and `/join`
+//! in General (TASK-046): a fresh one-time code inside a ready client
+//! install line.
 //!
 //! One worker, like the transcript commands: `/devices` sends the list of
 //! enrolled devices with one button per device; a press asks once more
@@ -6,16 +8,29 @@
 //! revokes the device at once ([`Devices::revoke`]) and edits the message
 //! back into the list. Only allowlisted users get here (the poll drops the
 //! rest). Logs carry device ids, never names, codes or secrets.
+//!
+//! `/join` answers with `curl .../<release>/install.sh | sh -s -- <hub
+//! address> [--pin <sha256>] --join <code>`; the address and pin say how
+//! devices reach the hub ([`JoinInfo`]), no secret is in it. The message
+//! stays in the group's history, so it is edited to say the code was used
+//! (device name and id) or, after [`CODE_TTL`], expired. A hub restart
+//! loses those edits (its codes expire all the same).
 
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::devices::{CODE_TTL, Devices, Listed, SharedState};
-use super::scheduler::{Op, Outbox};
+use super::config::PublicAddrs;
+use super::devices::{CODE_TTL, Devices, Listed, MAX_CODES, MintError, SharedState, code_key};
+use super::scheduler::{Op, Outbox, Outcome};
 use super::updates::{CallbackInput, Inbound};
+use crate::tls::CertPin;
 
 const PREFIX: &str = "dev";
 const ASK: &str = "r";
@@ -29,17 +44,174 @@ pub enum Input {
     Press(CallbackInput),
 }
 
-/// `/devices` (optionally `@bot`) in General. The same text in a topic is a
-/// message for its session, like every other slash text there (TASK-021).
+/// Where the install script of a release is: `<RAW_BASE>/<tag>/install.sh`.
+pub const RAW_BASE: &str = "https://raw.githubusercontent.com/pockerhead/cctg";
+/// The ports install.sh takes for `--hub-host`.
+const AGENT_PORT: u16 = 47291;
+const HOOK_PORT: u16 = 47292;
+/// What the `/join` message says once its code expired.
+pub const EXPIRED: &str = "Код из этого сообщения истёк. Новый: /join.";
+
+/// What the `/join` message says once a device took its code.
+fn used_text(id: &str, name: &str) -> String {
+    format!(
+        "Код из этого сообщения использован: подключено устройство «{name}» ({id}). Новый код: /join."
+    )
+}
+
+/// The command of a General text: `devices` or `join` (`/name`,
+/// optionally `@bot`, any case).
+fn command_name(input: &Inbound) -> Option<&'static str> {
+    if input.thread_id.is_some() {
+        return None;
+    }
+    let name = input
+        .text
+        .as_deref()
+        .and_then(|text| text.split_whitespace().next())
+        .and_then(|word| word.strip_prefix('/'))
+        .map(|head| head.split_once('@').map_or(head, |(name, _)| name))?;
+    ["devices", "join"]
+        .into_iter()
+        .find(|known| name.eq_ignore_ascii_case(known))
+}
+
+/// `/devices` or `/join` (optionally `@bot`) in General. The same text in a
+/// topic is a message for its session, like every other slash text there
+/// (TASK-021).
 pub fn is_command(input: &Inbound) -> bool {
-    input.thread_id.is_none()
-        && input
-            .text
-            .as_deref()
-            .and_then(|text| text.split_whitespace().next())
-            .and_then(|word| word.strip_prefix('/'))
-            .map(|head| head.split_once('@').map_or(head, |(name, _)| name))
-            .is_some_and(|name| name.eq_ignore_ascii_case("devices"))
+    command_name(input).is_some()
+}
+
+/// What `/join` puts in the install line besides the code.
+#[derive(Debug, Clone)]
+pub struct JoinInfo {
+    /// The release of this hub's build: the install script of that tag
+    /// installs the same build. `None`: a local build (`main` then).
+    pub release: Option<String>,
+    /// How other devices reach the hub ([`super::config::PUBLIC_AGENT_VAR`]).
+    pub public: Option<PublicAddrs>,
+    /// The listeners as the hub's own machine reaches them.
+    pub agent_listen: SocketAddr,
+    pub hook_listen: SocketAddr,
+    /// The certificate's sha256 when the listeners speak TLS.
+    pub pin: Option<CertPin>,
+}
+
+impl JoinInfo {
+    /// A line for other machines needs their address and TLS: a device
+    /// talks to another machine only with a pin.
+    fn for_other_machines(&self) -> bool {
+        self.public.is_some() && self.pin.is_some()
+    }
+
+    /// The install line with `code`.
+    pub fn line(&self, code: &str) -> String {
+        let tag = self.release.as_deref().unwrap_or("main");
+        let (agent, hook) = match &self.public {
+            Some(public) if self.for_other_machines() => {
+                (public.agent.clone(), public.hook.clone())
+            }
+            _ => (local_addr(self.agent_listen), local_addr(self.hook_listen)),
+        };
+        let mut args = hub_args(&agent, &hook);
+        if let Some(pin) = &self.pin {
+            let hex = pin.to_string().replace(':', "").to_ascii_lowercase();
+            args.push_str(&format!(" --pin {hex}"));
+        }
+        format!("curl -fsSL {RAW_BASE}/{tag}/install.sh | sh -s -- {args} --join {code}")
+    }
+}
+
+/// A listener as the hub's machine reaches it: a wildcard or loopback
+/// address is 127.0.0.1, or [::1] for IPv6 (on Windows `[::]` takes IPv6
+/// only).
+fn local_addr(listen: SocketAddr) -> String {
+    let ip = match listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() || ip.is_loopback() => {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() || ip.is_loopback() => {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        }
+        ip => ip,
+    };
+    SocketAddr::new(ip, listen.port()).to_string()
+}
+
+/// A shell word: an [IPv6] address is quoted, it is a glob pattern
+/// otherwise (zsh fails on it). The values are checked shell-safe
+/// (config::public_addr), so single quotes suffice.
+fn word(value: &str) -> String {
+    if value.contains('[') {
+        format!("'{value}'")
+    } else {
+        value.to_owned()
+    }
+}
+
+/// `--hub-host H` when both are on one host at the usual ports, else both
+/// addresses.
+fn hub_args(agent: &str, hook: &str) -> String {
+    let split = |addr: &str| {
+        addr.rsplit_once(':')
+            .map(|(host, port)| (host.to_owned(), port.parse::<u16>().ok()))
+    };
+    match (split(agent), split(hook)) {
+        (Some((a, Some(AGENT_PORT))), Some((h, Some(HOOK_PORT)))) if a == h => {
+            format!("--hub-host {}", word(&a))
+        }
+        _ => format!("--agent-addr {} --hook-addr {}", word(agent), word(hook)),
+    }
+}
+
+/// The `/join` answer: plain text and its HTML (the line in a code block,
+/// one tap copies it).
+fn join_message(info: &JoinInfo, code: &str) -> (String, String) {
+    let line = info.line(code);
+    let minutes = CODE_TTL.as_secs() / 60;
+    let before = if info.for_other_machines() {
+        format!(
+            "Установка cctg на новую машину: выполните строку на ней (Linux, macOS; Windows в Git Bash). Код в строке одноразовый и действует {minutes} минут; это сообщение видят все участники группы."
+        )
+    } else {
+        format!(
+            "Этот hub пускает устройства только со своей машины: у него нет адреса для других машин или TLS. Строка для машины hub (код одноразовый, {minutes} минут):"
+        )
+    };
+    let mut after = Vec::new();
+    if !info.for_other_machines() {
+        after.push("Для других машин нужен hub с TLS и адресом: install.sh --hub --local --public-host ХОСТ или hub на сервере (install.sh --hub).");
+    }
+    if info.release.is_none() {
+        after.push("Hub собран не из релиза: скрипт с main ставит последний релиз, сборка клиента будет другой.");
+    }
+    let mut text = format!(
+        "{before}
+
+{line}"
+    );
+    let mut html = format!(
+        "{}
+
+<pre>{}</pre>",
+        transcript::escape_html(&before),
+        transcript::escape_html(&line)
+    );
+    for note in after {
+        text.push_str(&format!(
+            "
+
+{note}"
+        ));
+        html.push_str(&format!(
+            "
+
+{}",
+            transcript::escape_html(note)
+        ));
+    }
+    (text, html)
 }
 
 /// A button of this worker.
@@ -72,37 +244,92 @@ fn is_id(id: &str) -> bool {
     id.len() == 8 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Serves `/devices` and its buttons until `inputs` closes.
+/// Serves `/devices`, its buttons and `/join` until `inputs` closes and
+/// every `/join` message got its used or expired edit.
 pub async fn serve(
     mut inputs: mpsc::UnboundedReceiver<Input>,
     outbox: Outbox,
     devices: Devices,
+    join: JoinInfo,
     bot_username: Option<String>,
 ) {
-    while let Some(input) = inputs.recv().await {
-        match input {
-            Input::Command(input) => {
-                if addressed_elsewhere(input.text.as_deref(), bot_username.as_deref()) {
-                    continue;
+    let mut spent = devices.spent();
+    // Code key -> the `/join` message and when its code expires. At most
+    // MAX_CODES: minting refuses beyond that.
+    let mut waiting: HashMap<String, (i64, Instant)> = HashMap::new();
+    let mut inputs_open = true;
+    let mut spent_open = true;
+    while inputs_open || !waiting.is_empty() {
+        let next = waiting.values().map(|&(_, at)| at).min();
+        tokio::select! {
+            input = inputs.recv(), if inputs_open => match input {
+                None => inputs_open = false,
+                Some(Input::Command(input)) => {
+                    if addressed_elsewhere(input.text.as_deref(), bot_username.as_deref()) {
+                        continue;
+                    }
+                    if command_name(&input) == Some("join") {
+                        if let Some((key, message_id)) = on_join(&outbox, &devices, &join).await {
+                            waiting.insert(key, (message_id, Instant::now() + CODE_TTL));
+                        }
+                        continue;
+                    }
+                    let (text, keyboard) = list(&devices, None);
+                    submit(
+                        &outbox,
+                        Op::Send {
+                            thread_id: None,
+                            text,
+                            html: None,
+                            reply_markup: keyboard,
+                            permission: false,
+                            reply_to: None,
+                            notify: false,
+                        },
+                    )
+                    .await;
                 }
-                let (text, keyboard) = list(&devices, None);
-                submit(
-                    &outbox,
-                    Op::Send {
-                        thread_id: None,
-                        text,
-                        html: None,
-                        reply_markup: keyboard,
-                        permission: false,
-                        reply_to: None,
-                        notify: false,
-                    },
-                )
-                .await;
+                Some(Input::Press(press)) => on_press(&outbox, &devices, press).await,
+            },
+            used = spent.recv(), if spent_open => match used {
+                Ok(used) => {
+                    if let Some((message_id, _)) = waiting.remove(&used.key) {
+                        info!(device_id = used.id, "join message marked used");
+                        edit(&outbox, message_id, used_text(&used.id, &used.name)).await;
+                    }
+                }
+                // Missed ones get the expiry edit.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => spent_open = false,
+            },
+            () = tokio::time::sleep_until(next.unwrap_or_else(Instant::now)), if next.is_some() => {
+                let now = Instant::now();
+                let due: Vec<String> = waiting
+                    .iter()
+                    .filter(|(_, (_, at))| *at <= now)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in due {
+                    if let Some((message_id, _)) = waiting.remove(&key) {
+                        edit(&outbox, message_id, EXPIRED.to_owned()).await;
+                    }
+                }
             }
-            Input::Press(press) => on_press(&outbox, &devices, press).await,
         }
     }
+}
+
+async fn edit(outbox: &Outbox, message_id: i64, text: String) {
+    submit(
+        outbox,
+        Op::Edit {
+            message_id,
+            text,
+            reply_markup: None,
+            background: false,
+        },
+    )
+    .await;
 }
 
 /// `/devices@other_bot`.
@@ -112,6 +339,59 @@ fn addressed_elsewhere(text: Option<&str>, bot: Option<&str>) -> bool {
         .and_then(|word| word.split_once('@'))
         .map(|(_, target)| target);
     matches!((target, bot), (Some(target), Some(bot)) if !target.eq_ignore_ascii_case(bot))
+}
+
+/// `/join`: a new code in a new message; `Some((code key, message id))`
+/// when the line went out ([`serve`] edits the message later). A failed
+/// mint is answered with why, never with a line.
+async fn on_join(outbox: &Outbox, devices: &Devices, join: &JoinInfo) -> Option<(String, i64)> {
+    let minting = devices.clone();
+    let minted = tokio::task::spawn_blocking(move || minting.mint_code())
+        .await
+        .unwrap_or(Err(MintError::NoHub));
+    let mut key = None;
+    let (text, html) = match minted {
+        Ok(code) => {
+            info!("join code minted from Telegram");
+            key = code_key(&code);
+            let (text, html) = join_message(join, &code);
+            (text, Some(html))
+        }
+        Err(error) => {
+            warn!(%error, "no join code for /join");
+            let text = match error {
+                MintError::Full => format!(
+                    "Уже ждут {MAX_CODES} неиспользованных кодов; новый будет, когда они истекут."
+                ),
+                MintError::NoHub | MintError::Io(_) => {
+                    "Код сделать не вышло: hub не может записать его в свой каталог состояния (подробности в логе hub).".to_owned()
+                }
+            };
+            (text, None)
+        }
+    };
+    let op = Op::Send {
+        thread_id: None,
+        text,
+        html,
+        reply_markup: None,
+        permission: false,
+        reply_to: None,
+        notify: false,
+    };
+    let sent = match outbox.submit(op).await.await {
+        Ok(Ok(Outcome::Sent(message))) => Some(message.message_id),
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => {
+            warn!(%error, "join message not delivered");
+            None
+        }
+        Err(_) => {
+            warn!("join message dropped: the scheduler stopped");
+            None
+        }
+    };
+    key.zip(sent)
 }
 
 async fn on_press(outbox: &Outbox, devices: &Devices, input: CallbackInput) {
@@ -248,7 +528,7 @@ fn render(listed: &[Listed], shared: SharedState, notice: Option<&str>, now: Sys
         ),
     });
     text.push_str(&format!(
-        "\n\nНовое устройство: код на {} минут даёт «cctg hub code» на машине hub (в Docker: docker compose exec hub cctg hub code); на устройстве install.sh --join КОД или cctg join КОД.",
+        "\n\nНовое устройство: /join здесь даёт строку установки с кодом на {} минут (или «cctg hub code» на машине hub, в Docker: docker compose exec hub cctg hub code; на устройстве install.sh --join КОД или cctg join КОД).",
         CODE_TTL.as_secs() / 60
     ));
     text
@@ -280,10 +560,19 @@ mod tests {
     #[derive(Default)]
     struct Fake(Mutex<Vec<Op>>);
 
+    /// Sent messages get ids 501, 502, ...
     impl Transport for Fake {
         async fn execute(&self, op: &Op) -> Delivery {
-            self.0.lock().unwrap().push(op.clone());
-            Ok(Outcome::Sent(Message::default()))
+            let mut ops = self.0.lock().unwrap();
+            ops.push(op.clone());
+            let sent = ops
+                .iter()
+                .filter(|op| matches!(op, Op::Send { .. }))
+                .count();
+            Ok(Outcome::Sent(Message {
+                message_id: 500 + sent as i64,
+                ..Message::default()
+            }))
         }
     }
 
@@ -319,9 +608,36 @@ mod tests {
             tx.send(input).unwrap();
         }
         drop(tx);
-        serve(rx, outbox, devices.clone(), Some("cctg_bot".into())).await;
+        serve(
+            rx,
+            outbox,
+            devices.clone(),
+            join_info(),
+            Some("cctg_bot".into()),
+        )
+        .await;
         scheduler.await.unwrap();
         fake.0.lock().unwrap().clone()
+    }
+
+    /// sha256 bytes 0, 1, 2, ...: `000102...1f` in a line.
+    fn pin() -> CertPin {
+        let hex: String = (0..32u8).map(|byte| format!("{byte:02x}")).collect();
+        CertPin::parse(&hex).unwrap()
+    }
+
+    /// A hub on a server: TLS, the usual ports, a release build.
+    fn join_info() -> JoinInfo {
+        JoinInfo {
+            release: Some("v9.9.9".into()),
+            public: Some(PublicAddrs {
+                agent: "hub.example.org:47291".into(),
+                hook: "hub.example.org:47292".into(),
+            }),
+            agent_listen: "0.0.0.0:47291".parse().unwrap(),
+            hook_listen: "0.0.0.0:47292".parse().unwrap(),
+            pin: Some(pin()),
+        }
     }
 
     fn enroll(dir: &TempDir, devices: &Devices, name: &str) -> (String, Secret) {
@@ -332,6 +648,10 @@ mod tests {
 
     #[test]
     fn commands_and_buttons_are_recognised() {
+        assert!(is_command(&command("/join", None)));
+        assert!(is_command(&command("/Join@cctg_bot", None)));
+        assert!(!is_command(&command("/join", Some(7))));
+        assert!(!is_command(&command("/joined", None)));
         assert!(is_command(&command("/devices", None)));
         assert!(is_command(&command("/Devices@cctg_bot", None)));
         assert!(
@@ -452,6 +772,250 @@ mod tests {
         );
         assert_eq!(devices.check(secret.expose().as_bytes()), None);
         assert_eq!(Devices::open(dir.path(), None).unwrap().list().0.len(), 1);
+    }
+
+    #[test]
+    fn the_install_line_says_how_devices_reach_the_hub() {
+        let hex: String = (0..32u8).map(|byte| format!("{byte:02x}")).collect();
+        let code = "ABCD-EFGH-JKMN-PQRS";
+        // A server hub at the usual ports.
+        assert_eq!(
+            join_info().line(code),
+            format!(
+                "curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v9.9.9/install.sh \
+                 | sh -s -- --hub-host hub.example.org --pin {hex} --join {code}"
+            )
+        );
+        // Other host ports (a changed compose.yml).
+        let other_ports = JoinInfo {
+            public: Some(PublicAddrs {
+                agent: "hub.example.org:52191".into(),
+                hook: "hub.example.org:47292".into(),
+            }),
+            ..join_info()
+        };
+        assert!(
+            other_ports.line(code).ends_with(&format!(
+                "| sh -s -- --agent-addr hub.example.org:52191 --hook-addr hub.example.org:47292 --pin {hex} --join {code}"
+            )),
+            "{}",
+            other_ports.line(code)
+        );
+        // No TLS: only the hub's own machine, on loopback, whatever the
+        // public addresses say; a local build takes main's script.
+        let plain = JoinInfo {
+            release: None,
+            pin: None,
+            ..join_info()
+        };
+        assert_eq!(
+            plain.line(code),
+            format!(
+                "curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh \
+                 | sh -s -- --hub-host 127.0.0.1 --join {code}"
+            )
+        );
+        // TLS without an address for others: loopback with the pin; an IPv6
+        // wildcard is reached on [::1] (on Windows it takes IPv6 only).
+        let local_tls = JoinInfo {
+            public: None,
+            agent_listen: "0.0.0.0:5000".parse().unwrap(),
+            hook_listen: "[::]:5001".parse().unwrap(),
+            ..join_info()
+        };
+        assert!(
+            local_tls.line(code).ends_with(&format!(
+                "--agent-addr 127.0.0.1:5000 --hook-addr '[::1]:5001' --pin {hex} --join {code}"
+            )),
+            "{}",
+            local_tls.line(code)
+        );
+        // An [IPv6] address is quoted: unquoted it is a glob pattern.
+        let v6 = JoinInfo {
+            public: Some(PublicAddrs {
+                agent: "[2001:db8::1]:47291".into(),
+                hook: "[2001:db8::1]:47292".into(),
+            }),
+            ..join_info()
+        };
+        assert!(
+            v6.line(code)
+                .contains("| sh -s -- --hub-host '[2001:db8::1]' --pin "),
+            "{}",
+            v6.line(code)
+        );
+        let v6_ports = JoinInfo {
+            public: Some(PublicAddrs {
+                agent: "[2001:db8::1]:52191".into(),
+                hook: "[2001:db8::1]:47292".into(),
+            }),
+            ..join_info()
+        };
+        assert!(
+            v6_ports.line(code).contains(
+                "| sh -s -- --agent-addr '[2001:db8::1]:52191' --hook-addr '[2001:db8::1]:47292' --pin "
+            ),
+            "{}",
+            v6_ports.line(code)
+        );
+        let v6_listener = JoinInfo {
+            public: None,
+            agent_listen: "[2001:db8::5]:5000".parse().unwrap(),
+            hook_listen: "[::1]:5001".parse().unwrap(),
+            ..join_info()
+        };
+        assert!(
+            v6_listener
+                .line(code)
+                .contains("--agent-addr '[2001:db8::5]:5000' --hook-addr '[::1]:5001' "),
+            "{}",
+            v6_listener.line(code)
+        );
+
+        let (text, html) = join_message(&join_info(), code);
+        assert!(
+            text.contains("одноразовый") && text.contains("видят все участники"),
+            "{text}"
+        );
+        assert!(
+            html.contains(&format!("<pre>{}</pre>", join_info().line(code))),
+            "{html}"
+        );
+        assert!(!text.contains("не из релиза") && !text.contains("только со своей машины"));
+        let (text, _) = join_message(&plain, code);
+        assert!(
+            text.contains("только со своей машины") && text.contains("не из релиза"),
+            "{text}"
+        );
+        assert!(transcript::telegram_len(&text) < 4096);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_answers_with_a_working_code_that_expires_in_the_message() {
+        let dir = TempDir::new("roster-join");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let started = tokio::time::Instant::now();
+        let ops = run(
+            &devices,
+            vec![
+                Input::Command(command("/join@other_bot", None)),
+                Input::Command(command("/join", None)),
+            ],
+        )
+        .await;
+        let [
+            Op::Send {
+                thread_id: None,
+                text,
+                html: Some(html),
+                reply_markup: None,
+                ..
+            },
+            Op::Edit {
+                text: expired,
+                reply_markup: None,
+                ..
+            },
+        ] = ops.as_slice()
+        else {
+            panic!("{ops:?}");
+        };
+        assert!(
+            started.elapsed() >= CODE_TTL,
+            "edited only once the code expired"
+        );
+        assert_eq!(expired, EXPIRED);
+        let line = text.lines().find(|line| line.starts_with("curl ")).unwrap();
+        assert!(html.contains(line), "{html}");
+        let code = line.rsplit(' ').next().unwrap();
+        assert!(devices.join(code, "new box").is_ok(), "{line}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_used_code_marks_its_message_with_the_device() {
+        let dir = TempDir::new("roster-used");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let fake = Arc::new(Fake::default());
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let scheduler = tokio::spawn(scheduler.run());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(serve(
+            rx,
+            outbox,
+            devices.clone(),
+            join_info(),
+            Some("cctg_bot".into()),
+        ));
+        let ops = || fake.0.lock().unwrap().clone();
+        let started = Instant::now();
+
+        tx.send(Input::Command(command("/join", None))).unwrap();
+        let line = loop {
+            let sent = ops().into_iter().find_map(|op| match op {
+                Op::Send { text, .. } => Some(text),
+                _ => None,
+            });
+            if let Some(text) = sent {
+                break text
+                    .lines()
+                    .find(|line| line.starts_with("curl "))
+                    .unwrap()
+                    .to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let code = line.rsplit(' ').next().unwrap();
+        // A code minted past `/join` edits nothing when it is taken.
+        let side = mint_code(dir.path(), SystemTime::now()).unwrap();
+        devices.join(&side, "side box").unwrap();
+        let enrolled = devices.join(code, "new box").unwrap();
+        while ops().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(tx);
+        worker.await.unwrap();
+        scheduler.await.unwrap();
+        let ops = ops();
+        let [
+            Op::Send { .. },
+            Op::Edit {
+                message_id: 501,
+                text,
+                reply_markup: None,
+                ..
+            },
+        ] = ops.as_slice()
+        else {
+            panic!("{ops:?}");
+        };
+        assert!(
+            text.contains("использован")
+                && text.contains("«new box»")
+                && text.contains(&enrolled.id),
+            "{text}"
+        );
+        assert!(
+            started.elapsed() < CODE_TTL,
+            "no expiry edit after the used one"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_without_a_state_directory_says_why_and_has_no_line() {
+        let devices = Devices::from(Secret::parse("shared-secret-0123456789").unwrap());
+        let ops = run(&devices, vec![Input::Command(command("/join", None))]).await;
+        let [
+            Op::Send {
+                text, html: None, ..
+            },
+        ] = ops.as_slice()
+        else {
+            panic!("{ops:?}");
+        };
+        assert!(
+            text.starts_with("Код сделать не вышло") && !text.contains("curl"),
+            "{text}"
+        );
     }
 
     #[test]
