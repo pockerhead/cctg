@@ -1,0 +1,3309 @@
+diff --git a/crates/cctg/src/hook.rs b/crates/cctg/src/hook.rs
+--- a/crates/cctg/src/hook.rs
++++ b/crates/cctg/src/hook.rs
+@@ -26,6 +26,12 @@
+ //! Claude Code then shows its own dialog as usual. It is never kept in the
+ //! spool: an answer that comes late is worthless.
+ //!
++//! `cctg hook PreToolUse` for `AskUserQuestion` waits too (TASK-038): it
++//! sends the questions to the hub ([`crate::wire::QUESTION_PATH`]) and, when
++//! every one was answered in Telegram, prints `allow` with the questions and
++//! their `answers` as `updatedInput`, so Claude Code takes them without its
++//! dialog. No answer prints nothing and the terminal dialog opens as usual.
++//!
+ //! `cctg hook ToolStatus` is registered as an `async` hook on `PreToolUse`,
+ //! `PostToolUse` and `PostToolUseFailure` (TASK-029): Claude Code does not
+ //! wait for it. It tells the hub which tool call of the main conversation
+@@ -33,6 +39,7 @@
+ //!
+ //! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
+ 
++use std::collections::HashSet;
+ use std::io::Read;
+ use std::path::Path;
+ use std::time::{Duration, SystemTime};
+@@ -47,8 +54,9 @@
+ use crate::spool;
+ use crate::tls::HubAddr;
+ use crate::wire::{
+-    Behavior, HOOK_PATH, HookEvent, HookPost, PERMISSION_PATH, PING_PATH, PermissionAnswer,
+-    PermissionPost, Secret, VERSION,
++    AskedOption, AskedQuestion, Behavior, HOOK_PATH, HookEvent, HookPost, MAX_OPTIONS,
++    MAX_QUESTIONS, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, QUESTION_PATH,
++    QUESTION_TOOL, QuestionAnswer, QuestionPost, Secret, VERSION,
+ };
+ 
+ /// Budget of the POST, connect included. `SessionEnd` hooks share 1.5 s in
+@@ -95,6 +103,22 @@
+ const MAX_ANSWER: u64 = 4096;
+ /// Told to Claude with a refusal.
+ pub const DENY_MESSAGE: &str = "Denied by the user in Telegram";
++/// The hook event whose `AskUserQuestion` calls ask the hub (TASK-038).
++pub const QUESTION_EVENT: &str = "PreToolUse";
++/// Longest wait for the hub's answers, under the `"timeout": 330` the
++/// settings give this hook; the hub itself gives up after 300 s.
++pub const QUESTION_WAIT: Duration = Duration::from_secs(310);
++/// Caps of the texts sent to the hub, in bytes; the answers keep the
++/// question texts whole.
++const MAX_QUESTION_TEXT: usize = 2 << 10;
++const MAX_HEADER: usize = 256;
++const MAX_LABEL: usize = 256;
++const MAX_DESCRIPTION: usize = 1 << 10;
++/// Longest hub answer with question answers read: up to four Telegram
++/// messages of the user's own text, JSON-escaped.
++const MAX_QUESTION_ANSWER: u64 = 256 << 10;
++/// Shown to the user in the terminal (not to Claude) with the answers.
++pub const ANSWERED_REASON: &str = "Answered in Telegram";
+ 
+ /// Runs one hook invocation. Never fails: every problem ends as one fixed
+ /// line on stderr.
+@@ -106,6 +130,9 @@
+     let config = DeviceConfig::load();
+     if event == PERMISSION_EVENT {
+         return permission(&input, &config).await;
++    }
++    if event == QUESTION_EVENT && is_question(&input) {
++        return question(&input, &config).await;
+     }
+     let hook_post = match build_here(event, &input, &config.host) {
+         Ok(hook_post) => hook_post,
+@@ -195,6 +222,188 @@
+     }
+ }
+ 
++/// The `AskUserQuestion` hook: asks the hub and prints the answers, if any.
++/// Every failure ends quietly with no decision.
++async fn question(input: &[u8], config: &DeviceConfig) {
++    let (post, tool_input) = match build_question(input, &config.host) {
++        Ok(built) => built,
++        Err(skip) => {
++            debug!(reason = skip.0, "hook event skipped");
++            return;
++        }
++    };
++    let secret = match &config.secret {
++        Ok(secret) => secret,
++        Err(problem) => {
++            warn!(%problem, "question not sent");
++            return;
++        }
++    };
++    let hub = match config.hub(&config.hook_addr) {
++        Ok(hub) => hub,
++        Err(problem) => {
++            warn!(%problem, "question not sent");
++            return;
++        }
++    };
++    let connect = if hub.is_tls() {
++        TLS_PERMISSION_CONNECT_TIMEOUT
++    } else {
++        PERMISSION_CONNECT_TIMEOUT
++    };
++    match ask_question(&hub, secret, &post, connect, QUESTION_WAIT).await {
++        Ok(Some(answers)) => match question_json(&tool_input, &answers) {
++            Some(output) => {
++                let mut stdout = std::io::stdout().lock();
++                let _ = std::io::Write::write_all(&mut stdout, output.as_bytes());
++                let _ = std::io::Write::flush(&mut stdout);
++            }
++            None => warn!("the hub's answers do not fit the questions; no decision"),
++        },
++        Ok(None) => debug!("no answer from Telegram"),
++        Err(error) => warn!(%error, "question got no answer from the hub"),
++    }
++}
++
++/// A `PreToolUse` input of `AskUserQuestion`.
++fn is_question(input: &[u8]) -> bool {
++    #[derive(Default, Deserialize)]
++    #[serde(default)]
++    struct Tool {
++        tool_name: String,
++    }
++    serde_json::from_slice::<Tool>(input).is_ok_and(|tool| tool.tool_name == QUESTION_TOOL)
++}
++
++#[derive(Debug, Default, Deserialize)]
++#[serde(default)]
++struct QuestionInput {
++    session_id: String,
++    hook_event_name: Option<String>,
++    tool_name: String,
++    tool_input: Option<Value>,
++    agent_id: Option<String>,
++}
++
++/// Turns an `AskUserQuestion` `PreToolUse` input into the hub request (texts
++/// capped) and keeps its `tool_input` whole for the answer. Questions the hub
++/// cannot show, a call inside a subagent and a call that already has
++/// answers are skipped: the terminal dialog handles them.
++pub fn build_question(input: &[u8], host: &str) -> Result<(QuestionPost, Value), Skip> {
++    let input: QuestionInput =
++        serde_json::from_slice(input).map_err(|_| Skip("input is not a hook JSON object"))?;
++    if input.session_id.is_empty() {
++        return Err(Skip("input has no session_id"));
++    }
++    if input
++        .hook_event_name
++        .as_deref()
++        .is_some_and(|name| name != QUESTION_EVENT)
++    {
++        return Err(Skip("input is for another hook event"));
++    }
++    if input.tool_name != QUESTION_TOOL {
++        return Err(Skip("tool is not AskUserQuestion"));
++    }
++    if input.agent_id.is_some_and(|id| !id.is_empty()) {
++        return Err(Skip("question inside a subagent"));
++    }
++    let tool_input = input
++        .tool_input
++        .filter(Value::is_object)
++        .ok_or(Skip("question without its input"))?;
++    if tool_input
++        .get("answers")
++        .is_some_and(|answers| !answers.is_null())
++    {
++        return Err(Skip("question already answered"));
++    }
++    let questions = tool_input
++        .get("questions")
++        .and_then(Value::as_array)
++        .filter(|questions| (1..=MAX_QUESTIONS).contains(&questions.len()))
++        .ok_or(Skip("no questions the hub can show"))?;
++    let text = |value: &Value, key: &str| {
++        value
++            .get(key)
++            .and_then(Value::as_str)
++            .unwrap_or_default()
++            .to_owned()
++    };
++    let mut seen = HashSet::new();
++    let mut asked = Vec::with_capacity(questions.len());
++    for question in questions {
++        let words = text(question, "question");
++        if words.trim().is_empty() || !seen.insert(words.clone()) {
++            return Err(Skip("a question without its own text"));
++        }
++        let options = question
++            .get("options")
++            .and_then(Value::as_array)
++            .filter(|options| (1..=MAX_OPTIONS).contains(&options.len()))
++            .ok_or(Skip("options the hub cannot show"))?;
++        let options = options
++            .iter()
++            .map(|option| {
++                let label = text(option, "label");
++                if label.trim().is_empty() {
++                    return Err(Skip("an option without a label"));
++                }
++                Ok(AskedOption {
++                    label: cap_to(label, MAX_LABEL),
++                    description: cap_to(text(option, "description"), MAX_DESCRIPTION),
++                })
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++        asked.push(AskedQuestion {
++            question: cap_to(words, MAX_QUESTION_TEXT),
++            header: cap_to(text(question, "header"), MAX_HEADER),
++            multi_select: question
++                .get("multiSelect")
++                .and_then(Value::as_bool)
++                .unwrap_or(false),
++            options,
++        });
++    }
++    let post = QuestionPost {
++        v: VERSION,
++        host: host.to_owned(),
++        session_id: input.session_id,
++        questions: asked,
++    };
++    Ok((post, tool_input))
++}
++
++/// Claude Code's `PreToolUse` decision for stdout: `allow` with the call's
++/// own input plus `answers` (question text -> answer). `None` when the hub's
++/// answers do not match the questions one to one.
++pub fn question_json(tool_input: &Value, answers: &[String]) -> Option<String> {
++    let questions = tool_input.get("questions")?.as_array()?;
++    if answers.len() != questions.len() || answers.iter().any(|answer| answer.trim().is_empty()) {
++        return None;
++    }
++    let mut by_question = serde_json::Map::new();
++    for (question, answer) in questions.iter().zip(answers) {
++        let text = question.get("question")?.as_str()?;
++        by_question.insert(text.to_owned(), Value::String(answer.clone()));
++    }
++    let mut updated = tool_input.clone();
++    updated
++        .as_object_mut()?
++        .insert("answers".to_owned(), Value::Object(by_question));
++    Some(
++        json!({
++            "hookSpecificOutput": {
++                "hookEventName": QUESTION_EVENT,
++                "permissionDecision": "allow",
++                "permissionDecisionReason": ANSWERED_REASON,
++                "updatedInput": updated,
++            }
++        })
++        .to_string(),
++    )
++}
++
+ /// Claude Code's `PermissionRequest` decision for stdout.
+ pub fn decision_json(behavior: Behavior) -> String {
+     let decision = match behavior {
+@@ -237,6 +446,9 @@
+     }
+     if input.tool_name.trim().is_empty() {
+         return Err(Skip("permission request without a tool name"));
++    }
++    if input.tool_name == QUESTION_TOOL {
++        return Err(Skip("questions are asked by their PreToolUse hook"));
+     }
+     let mut tool_input = input.tool_input.unwrap_or(Value::Null);
+     let description = tool_input
+@@ -271,8 +483,53 @@
+     wait: Duration,
+ ) -> Result<Option<Behavior>, PostError> {
+     let body = serde_json::to_vec(post).expect("permission posts always serialize");
++    let answer = hold(
++        addr,
++        secret,
++        PERMISSION_PATH,
++        &body,
++        (connect_timeout, wait),
++        MAX_ANSWER,
++    )
++    .await?;
++    parse_answer(&answer)
++}
++
++/// Asks the hub at `addr` for the answers to `post`, like [`ask`].
++/// `Ok(None)`: no answers.
++pub async fn ask_question(
++    addr: &HubAddr,
++    secret: &Secret,
++    post: &QuestionPost,
++    connect_timeout: Duration,
++    wait: Duration,
++) -> Result<Option<Vec<String>>, PostError> {
++    let body = serde_json::to_vec(post).expect("question posts always serialize");
++    let answer = hold(
++        addr,
++        secret,
++        QUESTION_PATH,
++        &body,
++        (connect_timeout, wait),
++        MAX_QUESTION_ANSWER,
++    )
++    .await?;
++    parse_question_answer(&answer)
++}
++
++/// One request the hub holds open: connect (and the TLS handshake) and send
++/// within the first of `times`, then read the whole answer (at most `max`
++/// bytes) within the second.
++async fn hold(
++    addr: &HubAddr,
++    secret: &Secret,
++    path: &str,
++    body: &[u8],
++    (connect_timeout, wait): (Duration, Duration),
++    max: u64,
++) -> Result<Vec<u8>, PostError> {
+     let head = format!(
+-        "POST {PERMISSION_PATH} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
++        "POST {path} HTTP/1.1\r\nHost: cctg-hub\r\nAuthorization: Bearer {}\r\n\
+          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+         secret.expose(),
+         body.len()
+@@ -281,7 +538,7 @@
+     let send = async {
+         let mut stream = addr.connect().await.map_err(io)?;
+         stream
+-            .write_all(&[head.as_bytes(), &body].concat())
++            .write_all(&[head.as_bytes(), body].concat())
+             .await
+             .map_err(io)?;
+         // Over TLS the tail can still sit in the session: push it out
+@@ -293,18 +550,37 @@
+         .await
+         .unwrap_or(Err(PostError::Timeout(connect_timeout)))?;
+     let mut answer = Vec::new();
+-    tokio::time::timeout(
+-        wait,
+-        (&mut stream).take(MAX_ANSWER).read_to_end(&mut answer),
+-    )
+-    .await
+-    .map_err(|_| PostError::Timeout(wait))?
+-    .map_err(io)?;
+-    parse_answer(&answer)
++    tokio::time::timeout(wait, (&mut stream).take(max).read_to_end(&mut answer))
++        .await
++        .map_err(|_| PostError::Timeout(wait))?
++        .map_err(io)?;
++    Ok(answer)
+ }
+ 
+ /// `204`: no decision; `200` with a [`PermissionAnswer`] body: the decision.
+ fn parse_answer(answer: &[u8]) -> Result<Option<Behavior>, PostError> {
++    held_body(answer)?
++        .map(|body| {
++            serde_json::from_slice::<PermissionAnswer>(body)
++                .map(|parsed| parsed.behavior)
++                .map_err(|_| PostError::BadResponse)
++        })
++        .transpose()
++}
++
++/// `204`: no answers; `200` with a [`QuestionAnswer`] body: the answers.
++fn parse_question_answer(answer: &[u8]) -> Result<Option<Vec<String>>, PostError> {
++    held_body(answer)?
++        .map(|body| {
++            serde_json::from_slice::<QuestionAnswer>(body)
++                .map(|parsed| parsed.answers)
++                .map_err(|_| PostError::BadResponse)
++        })
++        .transpose()
++}
++
++/// The body of a `200` answer; `None` for `204`.
++fn held_body(answer: &[u8]) -> Result<Option<&[u8]>, PostError> {
+     let line_end = answer
+         .windows(2)
+         .position(|pair| pair == b"\r\n")
+@@ -318,9 +594,7 @@
+                 .position(|window| window == b"\r\n\r\n")
+                 .ok_or(PostError::BadResponse)?
+                 + 4;
+-            let parsed: PermissionAnswer =
+-                serde_json::from_slice(&answer[body..]).map_err(|_| PostError::BadResponse)?;
+-            Ok(Some(parsed.behavior))
++            Ok(Some(&answer[body..]))
+         }
+         Some(code) => Err(PostError::Status(code)),
+         None => Err(PostError::BadResponse),
+@@ -1094,6 +1368,112 @@
+         assert_eq!(
+             parse_answer(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"),
+             Err(PostError::Status(503))
++        );
++    }
++
++    /// A hub whose questions are answered by `decide` (`None`: dropped).
++    async fn question_hub(
++        decide: impl Fn(&QuestionPost) -> Option<Option<Vec<String>>> + Send + 'static,
++    ) -> String {
++        let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++            .await
++            .unwrap();
++        let addr = listener.local_addr().unwrap().to_string();
++        let (events, events_rx) = mpsc::channel(8);
++        let (asks, asks_rx) = mpsc::channel::<ingress::PermissionAsk>(8);
++        let (questions, mut questions_rx) = mpsc::channel::<ingress::QuestionAsk>(8);
++        tokio::spawn(async move {
++            let _keep = (events_rx, asks_rx);
++            while let Some(ask) = questions_rx.recv().await {
++                if let Some(answer) = decide(&ask.post) {
++                    let _ = ask.answer.send(answer);
++                }
++            }
++        });
++        tokio::spawn(ingress::serve_hooks_and_asks(
++            listener,
++            secret(),
++            events,
++            asks,
++            questions,
++        ));
++        addr
++    }
++
++    #[tokio::test]
++    async fn a_question_returns_the_hub_answers_or_none() {
++        let input = serde_json::json!({
++            "session_id": "s",
++            "tool_name": "AskUserQuestion",
++            "tool_input": { "questions": [
++                { "question": "Which color?", "options": [{ "label": "Red" }] },
++                { "question": "Which fruit?", "options": [{ "label": "Pear" }] },
++            ] },
++        });
++        let (post, _) = build_question(input.to_string().as_bytes(), "box").unwrap();
++        let (connect, wait) = (Duration::from_secs(2), Duration::from_secs(5));
++        let answers = vec!["Red".to_owned(), "Pear".to_owned()];
++        for (decision, want) in [
++            (Some(Some(answers.clone())), Some(answers.clone())),
++            (Some(None), None),
++            (None, None),
++        ] {
++            let decided = decision.clone();
++            let addr = question_hub(move |post| {
++                assert_eq!(post.questions.len(), 2);
++                decided.clone()
++            })
++            .await;
++            let got = ask_question(
++                &HubAddr::plain(addr.as_str()),
++                &secret(),
++                &post,
++                connect,
++                wait,
++            )
++            .await;
++            assert_eq!(got, Ok(want), "{decision:?}");
++        }
++        // A hub that serves permissions but not questions, and one without either.
++        let addr = permission_hub(|_| None).await;
++        let got = ask_question(
++            &HubAddr::plain(addr.as_str()),
++            &secret(),
++            &post,
++            connect,
++            wait,
++        )
++        .await;
++        assert_eq!(got, Err(PostError::Status(404)));
++        let (addr, _events) = hub().await;
++        let got = ask_question(
++            &HubAddr::plain(addr.as_str()),
++            &secret(),
++            &post,
++            connect,
++            wait,
++        )
++        .await;
++        assert_eq!(got, Err(PostError::Status(404)));
++    }
++
++    #[test]
++    fn question_answers_parse_strictly() {
++        assert_eq!(
++            parse_question_answer(b"HTTP/1.1 204 No Content\r\n\r\n"),
++            Ok(None)
++        );
++        assert_eq!(
++            parse_question_answer(b"HTTP/1.1 200 OK\r\n\r\n{\"answers\":[\"A\"]}"),
++            Ok(Some(vec!["A".to_owned()]))
++        );
++        assert_eq!(
++            parse_question_answer(b"HTTP/1.1 200 OK\r\n\r\n{\"behavior\":\"allow\"}"),
++            Err(PostError::BadResponse)
++        );
++        assert_eq!(
++            parse_question_answer(b"HTTP/1.1 404 Not Found\r\n\r\n"),
++            Err(PostError::Status(404))
+         );
+     }
+ 
+@@ -1793,6 +2173,149 @@
+         });
+     }
+ 
++    fn question_input(extra: Value) -> Value {
++        let mut input = serde_json::json!({
++            "session_id": "s",
++            "transcript_path": "/p/s.jsonl",
++            "cwd": "/w",
++            "hook_event_name": "PreToolUse",
++            "tool_name": "AskUserQuestion",
++            "tool_use_id": "toolu_1",
++            "tool_input": { "questions": [
++                { "question": "Which color?", "header": "Color", "multiSelect": false,
++                  "options": [{ "label": "Red", "description": "warm" }, { "label": "Blue" }] },
++                { "question": "Which fruits?", "header": "Fruits", "multiSelect": true,
++                  "options": [{ "label": "Apple" }, { "label": "Pear" }] },
++            ], "metadata": { "source": "x" } },
++        });
++        for (key, value) in extra.as_object().unwrap() {
++            input[key] = value.clone();
++        }
++        input
++    }
++
++    #[test]
++    fn questions_carry_their_capped_texts_and_keep_the_input() {
++        let input = question_input(serde_json::json!({}));
++        let bytes = input.to_string().into_bytes();
++        assert!(is_question(&bytes));
++        let (post, tool_input) = build_question(&bytes, "box").unwrap();
++        assert_eq!(
++            (post.v, post.host.as_str(), post.session_id.as_str()),
++            (VERSION, "box", "s")
++        );
++        assert_eq!(tool_input, input["tool_input"]);
++        assert_eq!(post.questions.len(), 2);
++        assert_eq!(post.questions[0].question, "Which color?");
++        assert_eq!(post.questions[0].header, "Color");
++        assert!(!post.questions[0].multi_select && post.questions[1].multi_select);
++        assert_eq!(post.questions[0].options[0].label, "Red");
++        assert_eq!(post.questions[0].options[0].description, "warm");
++        assert_eq!(post.questions[0].options[1].description, "");
++        let body = serde_json::to_vec(&post).unwrap();
++        assert_eq!(crate::wire::decode_question(&body), Ok(post));
++
++        let mut long = question_input(serde_json::json!({}));
++        long["tool_input"]["questions"][0]["question"] = serde_json::json!("й".repeat(4096));
++        long["tool_input"]["questions"][0]["options"][0]["label"] =
++            serde_json::json!("й".repeat(4096));
++        let (post, tool_input) = build_question(long.to_string().as_bytes(), "box").unwrap();
++        assert!(post.questions[0].question.len() <= MAX_QUESTION_TEXT);
++        assert!(post.questions[0].options[0].label.len() <= MAX_LABEL);
++        // The answer keys stay the whole texts.
++        assert_eq!(tool_input, long["tool_input"]);
++
++        let many: Vec<Value> = (0..=MAX_OPTIONS)
++            .map(|n| serde_json::json!({ "label": n.to_string() }))
++            .collect();
++        let question = |q: Value| serde_json::json!({ "tool_input": { "questions": [q] } });
++        for (extra, why) in [
++            (serde_json::json!({ "agent_id": "a1" }), "subagent"),
++            (
++                serde_json::json!({ "hook_event_name": "PostToolUse" }),
++                "other event",
++            ),
++            (serde_json::json!({ "tool_name": "Bash" }), "other tool"),
++            (serde_json::json!({ "session_id": "" }), "no session"),
++            (serde_json::json!({ "tool_input": "x" }), "no object"),
++            (
++                serde_json::json!({ "tool_input": { "questions": [] } }),
++                "no questions",
++            ),
++            (
++                question(serde_json::json!({ "question": " ", "options": [{ "label": "A" }] })),
++                "blank question",
++            ),
++            (
++                question(serde_json::json!({ "question": "Q", "options": [] })),
++                "no options",
++            ),
++            (
++                question(serde_json::json!({ "question": "Q", "options": many })),
++                "too many options",
++            ),
++            (
++                question(serde_json::json!({ "question": "Q", "options": [{ "label": "" }] })),
++                "blank label",
++            ),
++        ] {
++            let bad = question_input(extra);
++            assert!(
++                build_question(bad.to_string().as_bytes(), "box").is_err(),
++                "{why}"
++            );
++        }
++        let mut twice = question_input(serde_json::json!({}));
++        twice["tool_input"]["questions"][1]["question"] = serde_json::json!("Which color?");
++        assert!(build_question(twice.to_string().as_bytes(), "box").is_err());
++        let mut answered = question_input(serde_json::json!({}));
++        answered["tool_input"]["answers"] = serde_json::json!({ "Which color?": "Red" });
++        assert!(build_question(answered.to_string().as_bytes(), "box").is_err());
++        let five = serde_json::json!({ "tool_input": { "questions":
++            vec![serde_json::json!({ "question": "Q", "options": [{ "label": "A" }] }); MAX_QUESTIONS + 1] } });
++        assert!(build_question(question_input(five).to_string().as_bytes(), "box").is_err());
++        assert!(!is_question(br#"{"tool_name":"SubagentHandback"}"#));
++        assert!(!is_question(b"not json"));
++        // The permission hook leaves questions to this hook.
++        let permission = serde_json::json!({
++            "session_id": "s",
++            "hook_event_name": "PermissionRequest",
++            "tool_name": "AskUserQuestion",
++            "tool_input": input["tool_input"],
++        });
++        assert_eq!(
++            build_permission(permission.to_string().as_bytes(), "box"),
++            Err(Skip("questions are asked by their PreToolUse hook"))
++        );
++    }
++
++    #[test]
++    fn answers_are_claude_code_pre_tool_use_output() {
++        let input = question_input(serde_json::json!({}));
++        let tool_input = &input["tool_input"];
++        let answers = vec!["Red".to_owned(), "Apple, my own".to_owned()];
++        let output: Value =
++            serde_json::from_str(&question_json(tool_input, &answers).unwrap()).unwrap();
++        let mut updated = tool_input.clone();
++        updated["answers"] =
++            serde_json::json!({ "Which color?": "Red", "Which fruits?": "Apple, my own" });
++        assert_eq!(
++            output,
++            serde_json::json!({ "hookSpecificOutput": {
++                "hookEventName": "PreToolUse",
++                "permissionDecision": "allow",
++                "permissionDecisionReason": ANSWERED_REASON,
++                "updatedInput": updated,
++            }})
++        );
++        assert_eq!(question_json(tool_input, &answers[..1]), None);
++        assert_eq!(
++            question_json(tool_input, &["Red".to_owned(), " ".to_owned()]),
++            None
++        );
++        assert_eq!(question_json(&serde_json::json!({}), &answers), None);
++    }
++
+     #[test]
+     fn decisions_are_claude_code_permission_request_output() {
+         let allow: Value = serde_json::from_str(&decision_json(Behavior::Allow)).unwrap();
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -30,8 +30,8 @@
+ use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
+ use crate::wire::{
+     self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, Liveness,
+-    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, Register,
+-    Rejection, Secret, WireError,
++    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, QUESTION_PATH,
++    QuestionAnswer, QuestionPost, Register, Rejection, Secret, WireError,
+ };
+ 
+ /// Time an agent has from its TCP connect to finish the TLS handshake (when
+@@ -62,13 +62,17 @@
+ const NOISE_WARN_EVERY: Duration = Duration::from_secs(60);
+ /// Peer addresses remembered for that; beyond them, debug only.
+ const NOISE_PEERS: usize = 1024;
+-/// `PermissionRequest` hooks waiting for an answer at a time; one more gets
+-/// no decision at once. They do not count against [`MAX_HOOK_REQUESTS`].
++/// `PermissionRequest` and `AskUserQuestion` hooks waiting for an answer at
++/// a time; one more gets no decision at once. They do not count against
++/// [`MAX_HOOK_REQUESTS`].
+ pub const MAX_PERMISSION_WAITS: usize = 16;
+ /// Longest wait for the hub's answer to a `PermissionRequest` hook. The slot
+ /// actor gives up earlier (`slots::HOOK_ANSWER_WAIT`); this only bounds a
+ /// request the actor never answers.
+ pub const PERMISSION_WAIT_CAP: Duration = Duration::from_secs(95);
++/// Longest wait for the hub's answers to an `AskUserQuestion` hook; the slot
++/// actor gives up earlier (`slots::QUESTION_WAIT`).
++pub const QUESTION_WAIT_CAP: Duration = Duration::from_secs(305);
+ const MAX_HEAD: usize = 8 * 1024;
+ const TO_AGENT_QUEUE: usize = 64;
+ /// How long, and how much, a rejected peer's unread input is drained.
+@@ -670,9 +674,20 @@
+     pub answer: oneshot::Sender<Option<Behavior>>,
+ }
+ 
+-/// Where `PermissionRequest` hooks go, and how many may wait at a time.
++/// An `AskUserQuestion` `PreToolUse` hook waiting for the answers (TASK-038).
++#[derive(Debug)]
++pub struct QuestionAsk {
++    pub post: QuestionPost,
++    /// `Some`: one answer per question, chosen in Telegram. `None` or
++    /// dropped: no decision.
++    pub answer: oneshot::Sender<Option<Vec<String>>>,
++}
++
++/// Where waiting hooks go, and how many may wait at a time. `questions`:
++/// `None` answers `POST /v1/question` with 404.
+ struct PermissionWaits {
+     asks: mpsc::Sender<PermissionAsk>,
++    questions: Option<mpsc::Sender<QuestionAsk>>,
+     waiting: Arc<Semaphore>,
+ }
+ 
+@@ -700,6 +715,26 @@
+ ) {
+     let waits = PermissionWaits {
+         asks,
++        questions: None,
++        waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
++    };
++    serve(listener.into(), secret, events, Some(waits)).await;
++}
++
++/// [`serve_hooks_and_permissions`] plus `POST /v1/question`: each such
++/// request goes to `questions` and is held open until the hub answers (at
++/// most [`QUESTION_WAIT_CAP`]). Permission and question hooks share the
++/// [`MAX_PERMISSION_WAITS`] places.
++pub async fn serve_hooks_and_asks(
++    listener: impl Into<Listener>,
++    secret: Secret,
++    events: mpsc::Sender<HookPost>,
++    asks: mpsc::Sender<PermissionAsk>,
++    questions: mpsc::Sender<QuestionAsk>,
++) {
++    let waits = PermissionWaits {
++        asks,
++        questions: Some(questions),
+         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
+     };
+     serve(listener.into(), secret, events, Some(waits)).await;
+@@ -812,6 +847,13 @@
+             }
+             None => Status::NotFound,
+         },
++        Ok(Ok((Route::Question, body))) => match waits {
++            Some(waits) if waits.questions.is_some() => {
++                drop(permit);
++                return question_request(stream, peer, &body, waits).await;
++            }
++            _ => Status::NotFound,
++        },
+         Ok(Err(Some(status))) => {
+             if status == Status::Unauthorized {
+                 pre_auth!(gate, peer, %peer, "hook request rejected: bad or missing secret");
+@@ -886,13 +928,9 @@
+         );
+         return respond(&mut stream, Status::NoContent, &[]).await;
+     }
+-    let behavior = tokio::select! {
+-        decided = decided => decided.ok().flatten(),
+-        () = gone(&mut stream) => {
+-            debug!(session, "permission hook went away before an answer");
+-            return;
+-        }
+-        () = tokio::time::sleep(PERMISSION_WAIT_CAP) => None,
++    let Some(behavior) = wait_for(&mut stream, decided, PERMISSION_WAIT_CAP).await else {
++        debug!(session, "permission hook went away before an answer");
++        return;
+     };
+     match behavior {
+         Some(behavior) => {
+@@ -905,6 +943,73 @@
+             debug!(session, "permission hook answered without a decision");
+             respond(&mut stream, Status::NoContent, &[]).await;
+         }
++    }
++}
++
++/// Hands an `AskUserQuestion` hook to the hub and holds the connection until
++/// the answers, like [`permission_request`].
++async fn question_request(
++    mut stream: Stream,
++    peer: SocketAddr,
++    body: &[u8],
++    waits: &PermissionWaits,
++) {
++    let Some(questions) = waits.questions.as_ref() else {
++        return respond(&mut stream, Status::NotFound, &[]).await;
++    };
++    let post = match wire::decode_question(body) {
++        Ok(post) => post,
++        Err(error) => {
++            debug!(%error, "question hook body rejected");
++            warn!(%peer, status = Status::BadRequest.code(), "hook request rejected");
++            return respond(&mut stream, Status::BadRequest, &[]).await;
++        }
++    };
++    let session = short(&post.session_id).to_owned();
++    let Ok(_waiting) = waits.waiting.clone().try_acquire_owned() else {
++        warn!(
++            session,
++            "too many hooks wait; question answered without a decision"
++        );
++        return respond(&mut stream, Status::NoContent, &[]).await;
++    };
++    let (answer, decided) = oneshot::channel();
++    if questions.try_send(QuestionAsk { post, answer }).is_err() {
++        warn!(
++            session,
++            "hub cannot take a question hook now; answered without a decision"
++        );
++        return respond(&mut stream, Status::NoContent, &[]).await;
++    }
++    let Some(answers) = wait_for(&mut stream, decided, QUESTION_WAIT_CAP).await else {
++        debug!(session, "question hook went away before an answer");
++        return;
++    };
++    match answers {
++        Some(answers) => {
++            info!(session, "question hook answered from Telegram");
++            let body = serde_json::to_vec(&QuestionAnswer { answers })
++                .expect("question answers always serialize");
++            respond(&mut stream, Status::Ok, &body).await;
++        }
++        None => {
++            debug!(session, "question hook answered without a decision");
++            respond(&mut stream, Status::NoContent, &[]).await;
++        }
++    }
++}
++
++/// The hub's answer on `decided`, at most `cap` later. `None`: the hook went
++/// away first; `Some(None)`: no decision (none, dropped, or time ran out).
++async fn wait_for<T>(
++    stream: &mut Stream,
++    decided: oneshot::Receiver<Option<T>>,
++    cap: Duration,
++) -> Option<Option<T>> {
++    tokio::select! {
++        decided = decided => Some(decided.ok().flatten()),
++        () = gone(stream) => None,
++        () = tokio::time::sleep(cap) => Some(None),
+     }
+ }
+ 
+@@ -990,6 +1095,7 @@
+ enum Route {
+     Hook,
+     Permission,
++    Question,
+     Ping,
+ }
+ 
+@@ -1041,6 +1147,7 @@
+     let route = match target {
+         HOOK_PATH => Route::Hook,
+         PERMISSION_PATH => Route::Permission,
++        QUESTION_PATH => Route::Question,
+         PING_PATH => Route::Ping,
+         _ => return Err(Some(Status::NotFound)),
+     };
+diff --git a/crates/cctg/src/hub/mod.rs b/crates/cctg/src/hub/mod.rs
+--- a/crates/cctg/src/hub/mod.rs
++++ b/crates/cctg/src/hub/mod.rs
+@@ -9,6 +9,7 @@
+ pub mod ingress;
+ pub mod offset;
+ pub mod permissions;
++pub mod questions;
+ pub mod registry;
+ pub mod scheduler;
+ pub mod slots;
+@@ -321,6 +322,7 @@
+     };
+     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
+     let permission_asks = slots.permission_asks();
++    let question_asks = slots.question_asks();
+     let transcript_asks = slots.transcript_asks();
+     slots.fetch_files(api.clone());
+     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+@@ -337,11 +339,12 @@
+         secret.clone(),
+         agents_tx,
+     ));
+-    tokio::spawn(ingress::serve_hooks_and_permissions(
++    tokio::spawn(ingress::serve_hooks_and_asks(
+         hook_listener,
+         secret,
+         hooks_tx,
+         permission_asks,
++        question_asks,
+     ));
+     let (control_tx, control_rx) = mpsc::unbounded_channel();
+     let actor = tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
+diff --git a/crates/cctg/src/hub/questions.rs b/crates/cctg/src/hub/questions.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/hub/questions.rs
+@@ -0,0 +1,734 @@
++//! Questions of Claude's `AskUserQuestion` tool (TASK-038): the topic
++//! message, its buttons and the book of questions the hub shows.
++//!
++//! Pure: the slots actor owns an [`Asks`] and does all IO. One tool call (1
++//! to 4 questions) is one message. It shows the current question with a
++//! button per option, ✏️ Другое (the next text in the topic, or a reply to
++//! the message, is the answer) and ⌨ В терминале (the hook lets go and the
++//! terminal dialog opens). A multiSelect question ticks its options and is
++//! answered with ✅ Готово. Each answer moves the message on to the next
++//! question; after the last one it shows the answers without buttons and
++//! they go to the waiting hook.
++//!
++//! A button carries only `ask:<id>:<question>:<action>` (at most 16 bytes)
++//! and is found by the Telegram message it belongs to, like a permission
++//! button. A press on an older question or an ended ask changes nothing.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use serde_json::{Value, json};
++use transcript::TELEGRAM_TEXT_LIMIT;
++
++use super::permissions::no_keyboard;
++use super::registry::cut;
++use crate::channel::is_request_id;
++use crate::wire::AskedQuestion;
++
++/// Asks kept at a time, open or owing their last edit; one more is refused
++/// and its hook gets no decision.
++pub const MAX_ASKS: usize = 16;
++/// An edit that failed this many times is given up.
++pub const MAX_EDIT_ATTEMPTS: u32 = 5;
++const PREFIX: &str = "ask";
++/// UTF-16 units of a label on its button; the message text has it whole.
++const BUTTON_LABEL: usize = 40;
++/// UTF-16 units of a question and of an option in the message text.
++const QUESTION_TEXT: usize = 1500;
++const OPTION_TEXT: usize = 300;
++
++pub const OTHER_BUTTON: &str = "✏️ Другое";
++pub const TERMINAL_BUTTON: &str = "⌨ В терминале";
++pub const DONE_BUTTON: &str = "✅ Готово";
++pub const ANSWER_TAKEN: &str = "Ответ принят";
++pub const ANSWER_NEXT: &str = "Принято, дальше следующий вопрос";
++pub const ANSWER_PICK_ONE: &str = "Отметьте хотя бы один вариант или нажмите ✏️ Другое";
++pub const ANSWER_TYPE: &str = "Напишите ответ следующим сообщением в этой теме";
++pub const ANSWER_TERMINAL: &str = "Ответьте в терминале";
++pub const ANSWER_STALE: &str = "Вопрос уже закрыт";
++const MULTI_HINT: &str = "Отметьте варианты и нажмите ✅ Готово.\n";
++const OTHER_HINT: &str = "Свой ответ: ✏️ Другое или ответ (reply) на это сообщение.";
++const TYPING_HINT: &str = "✏️ Жду ваш ответ следующим сообщением в этой теме.";
++pub const ANSWERED_TITLE: &str = "✅ Ответ отправлен в Claude";
++pub const TERMINAL_TITLE: &str = "⌨ Вопрос ушёл в терминал";
++pub const EXPIRED_TITLE: &str = "⌛ Ответа не было, вопрос ушёл в терминал";
++pub const GONE_TITLE: &str = "Вопрос закрыт в терминале";
++pub const CLOSED_TITLE: &str = "Сессия завершилась";
++
++/// A button of the current question.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Press {
++    /// The option with this index: the answer, or a tick of a multiSelect
++    /// question.
++    Option(usize),
++    /// ✏️ Другое: the next text in the topic is the answer.
++    Other,
++    /// ✅ Готово of a multiSelect question.
++    Done,
++    /// ⌨ В терминале.
++    Terminal,
++}
++
++pub fn callback_data(id: &str, question: usize, press: Press) -> String {
++    let action = match press {
++        Press::Option(index) => format!("o{index}"),
++        Press::Other => "x".to_owned(),
++        Press::Done => "d".to_owned(),
++        Press::Terminal => "t".to_owned(),
++    };
++    format!("{PREFIX}:{id}:{question}:{action}")
++}
++
++/// `ask:<id>:<question>:<action>` with a valid id; anything else is not a
++/// question button.
++pub fn parse_callback(data: &str) -> Option<(&str, usize, Press)> {
++    let mut parts = data.split(':');
++    let (prefix, id, question, action) =
++        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
++    if prefix != PREFIX || parts.next().is_some() || !is_request_id(id) {
++        return None;
++    }
++    let press = match action {
++        "x" => Press::Other,
++        "d" => Press::Done,
++        "t" => Press::Terminal,
++        _ => Press::Option(index(action.strip_prefix('o')?)?),
++    };
++    Some((id, index(question)?, press))
++}
++
++/// One or two decimal digits without a leading zero.
++fn index(text: &str) -> Option<usize> {
++    let digits = !text.is_empty() && text.len() <= 2 && text.bytes().all(|b| b.is_ascii_digit());
++    if !digits || (text.len() > 1 && text.starts_with('0')) {
++        return None;
++    }
++    text.parse().ok()
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum State {
++    /// Waiting for answers.
++    Open,
++    /// Every question answered: the answers go to the hook.
++    Answered,
++    /// ⌨ В терминале: the hook lets go, the terminal dialog opens.
++    Terminal,
++    /// Nobody answered in time: the same, by the clock (or Telegram did
++    /// not take the message).
++    Expired,
++    /// The hook stopped waiting first (Claude Code went on without it).
++    Gone,
++    /// The session ended.
++    Closed,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Ask {
++    pub session: String,
++    /// Five letters like a permission request id; buttons carry it.
++    pub id: String,
++    pub questions: Vec<AskedQuestion>,
++    /// The question shown now; `questions.len()` once all are answered.
++    pub step: usize,
++    pub answers: Vec<String>,
++    /// Options of the current multiSelect question ticked so far.
++    pub picked: BTreeSet<usize>,
++    /// ✏️ Другое was pressed: the next text in the topic is the answer.
++    pub typing: bool,
++    pub state: State,
++    /// The topic it went to; `None` until it is handed to Telegram.
++    pub thread_id: Option<i64>,
++    /// Handed to Telegram, no answer yet.
++    pub sending: bool,
++    pub message_id: Option<i64>,
++    /// Bumped by every change of what the message should show.
++    pub version: u64,
++    /// The version Telegram shows.
++    pub shown: u64,
++    /// An edit is in flight.
++    pub editing: bool,
++    /// A failed edit waits for the retry tick.
++    pub retry: bool,
++    pub edit_failures: u32,
++}
++
++impl Ask {
++    pub fn new(session: String, id: String, questions: Vec<AskedQuestion>) -> Self {
++        Self {
++            session,
++            id,
++            questions,
++            step: 0,
++            answers: Vec::new(),
++            picked: BTreeSet::new(),
++            typing: false,
++            state: State::Open,
++            thread_id: None,
++            sending: false,
++            message_id: None,
++            version: 1,
++            shown: 0,
++            editing: false,
++            retry: false,
++            edit_failures: 0,
++        }
++    }
++
++    pub fn is_open(&self) -> bool {
++        self.state == State::Open
++    }
++
++    /// A button of question `question`. The answer for the button press;
++    /// `None` for a quiet tick.
++    pub fn press(&mut self, question: usize, press: Press) -> Option<&'static str> {
++        if !self.is_open() || question != self.step {
++            return Some(ANSWER_STALE);
++        }
++        let current = self.questions.get(self.step)?;
++        match press {
++            Press::Option(index) if index < current.options.len() => {
++                if current.multi_select {
++                    if !self.picked.remove(&index) {
++                        self.picked.insert(index);
++                    }
++                    self.version += 1;
++                    None
++                } else {
++                    let label = current.options[index].label.trim().to_owned();
++                    Some(self.advance(label))
++                }
++            }
++            Press::Done if current.multi_select => {
++                if self.picked.is_empty() {
++                    return Some(ANSWER_PICK_ONE);
++                }
++                let answer = self.picked_labels().join(", ");
++                Some(self.advance(answer))
++            }
++            Press::Other => {
++                if !self.typing {
++                    self.typing = true;
++                    self.version += 1;
++                }
++                Some(ANSWER_TYPE)
++            }
++            Press::Terminal => {
++                self.end(State::Terminal);
++                Some(ANSWER_TERMINAL)
++            }
++            Press::Option(_) | Press::Done => Some(ANSWER_STALE),
++        }
++    }
++
++    /// The user's own text for the current question. A multiSelect
++    /// question keeps its ticked options in front of it. `false`: nothing
++    /// taken (ended, or a blank text).
++    pub fn type_answer(&mut self, text: &str) -> bool {
++        let text = text.trim();
++        if !self.is_open() || text.is_empty() || self.step >= self.questions.len() {
++            return false;
++        }
++        let mut parts = self.picked_labels();
++        parts.push(text.to_owned());
++        self.advance(parts.join(", "));
++        true
++    }
++
++    fn picked_labels(&self) -> Vec<String> {
++        let Some(current) = self.questions.get(self.step) else {
++            return Vec::new();
++        };
++        self.picked
++            .iter()
++            .filter_map(|index| current.options.get(*index))
++            .map(|option| option.label.trim().to_owned())
++            .collect()
++    }
++
++    fn advance(&mut self, answer: String) -> &'static str {
++        self.answers.push(answer);
++        self.step += 1;
++        self.picked.clear();
++        self.typing = false;
++        self.version += 1;
++        if self.step >= self.questions.len() {
++            self.state = State::Answered;
++            ANSWER_TAKEN
++        } else {
++            ANSWER_NEXT
++        }
++    }
++
++    /// Ends an open ask with `state`. `false`: it had ended.
++    pub fn end(&mut self, state: State) -> bool {
++        if !self.is_open() || state == State::Open {
++            return false;
++        }
++        self.state = state;
++        self.typing = false;
++        self.version += 1;
++        true
++    }
++
++    /// The answers for the hook, once every question has one.
++    pub fn answers(&self) -> Option<Vec<String>> {
++        (self.state == State::Answered).then(|| self.answers.clone())
++    }
++
++    /// What the message shows now, plain text within the Telegram limit.
++    pub fn text(&self) -> String {
++        let mut text = String::new();
++        let title = match self.state {
++            State::Open => return cut(&self.open_text(), TELEGRAM_TEXT_LIMIT),
++            State::Answered => ANSWERED_TITLE,
++            State::Terminal => TERMINAL_TITLE,
++            State::Expired => EXPIRED_TITLE,
++            State::Gone => GONE_TITLE,
++            State::Closed => CLOSED_TITLE,
++        };
++        text.push_str(title);
++        for (index, question) in self.questions.iter().enumerate() {
++            text.push_str("\n\n");
++            text.push_str(&cut(question.question.trim(), QUESTION_TEXT));
++            if let Some(answer) = self
++                .answers
++                .get(index)
++                .filter(|_| self.state == State::Answered)
++            {
++                text.push_str("\n→ ");
++                text.push_str(answer);
++            }
++        }
++        cut(&text, TELEGRAM_TEXT_LIMIT)
++    }
++
++    fn open_text(&self) -> String {
++        let total = self.questions.len();
++        let mut text = String::from("❓ Вопрос от Claude");
++        if total > 1 {
++            text.push_str(&format!(" ({} из {total})", self.step + 1));
++        }
++        for (question, answer) in self.questions.iter().zip(&self.answers) {
++            let name = if question.header.trim().is_empty() {
++                cut(question.question.trim(), BUTTON_LABEL)
++            } else {
++                question.header.trim().to_owned()
++            };
++            text.push_str(&format!("\n✓ {name}: {}", cut(answer, OPTION_TEXT)));
++        }
++        let Some(current) = self.questions.get(self.step) else {
++            return text;
++        };
++        text.push_str("\n\n");
++        if !current.header.trim().is_empty() {
++            text.push_str(current.header.trim());
++            text.push('\n');
++        }
++        text.push_str(&cut(current.question.trim(), QUESTION_TEXT));
++        text.push('\n');
++        for (index, option) in current.options.iter().enumerate() {
++            let mut line = format!(
++                "\n{}{}. {}",
++                self.tick(current, index),
++                index + 1,
++                option.label.trim()
++            );
++            if !option.description.trim().is_empty() {
++                line.push_str(" — ");
++                line.push_str(option.description.trim());
++            }
++            text.push_str(&cut(&line, OPTION_TEXT));
++        }
++        text.push_str("\n\n");
++        if current.multi_select {
++            text.push_str(MULTI_HINT);
++        }
++        text.push_str(if self.typing { TYPING_HINT } else { OTHER_HINT });
++        text
++    }
++
++    fn tick(&self, question: &AskedQuestion, index: usize) -> &'static str {
++        match (question.multi_select, self.picked.contains(&index)) {
++            (false, _) => "",
++            (true, true) => "☑ ",
++            (true, false) => "☐ ",
++        }
++    }
++
++    /// The buttons of the current question; none once the ask ended.
++    pub fn keyboard(&self) -> Value {
++        let Some(current) = self.questions.get(self.step).filter(|_| self.is_open()) else {
++            return no_keyboard();
++        };
++        let button = |text: String, press: Press| json!({ "text": text, "callback_data": callback_data(&self.id, self.step, press) });
++        let mut rows: Vec<Value> = current
++            .options
++            .iter()
++            .enumerate()
++            .map(|(index, option)| {
++                let text = format!(
++                    "{}{}. {}",
++                    self.tick(current, index),
++                    index + 1,
++                    cut(option.label.trim(), BUTTON_LABEL)
++                );
++                json!([button(text, Press::Option(index))])
++            })
++            .collect();
++        let mut last = Vec::new();
++        if current.multi_select {
++            last.push(button(DONE_BUTTON.to_owned(), Press::Done));
++        }
++        last.push(button(OTHER_BUTTON.to_owned(), Press::Other));
++        last.push(button(TERMINAL_BUTTON.to_owned(), Press::Terminal));
++        rows.push(Value::Array(last));
++        json!({ "inline_keyboard": rows })
++    }
++
++    /// Telegram shows an older version and nothing is in flight or waits
++    /// for the retry tick.
++    pub fn edit_due(&self) -> bool {
++        self.message_id.is_some() && self.version > self.shown && !self.editing && !self.retry
++    }
++
++    /// Ended, and nothing left to tell Telegram: safe to forget.
++    pub fn finished(&self) -> bool {
++        !self.is_open()
++            && !self.sending
++            && !self.editing
++            && (self.message_id.is_none() || self.shown >= self.version)
++    }
++}
++
++/// The book of asks, at most [`MAX_ASKS`].
++#[derive(Debug, Default)]
++pub struct Asks {
++    next: u64,
++    asks: BTreeMap<u64, Ask>,
++}
++
++impl Asks {
++    /// Keeps `ask`; `None` when the book is full.
++    pub fn open(&mut self, ask: Ask) -> Option<u64> {
++        if self.asks.len() >= MAX_ASKS {
++            return None;
++        }
++        let key = self.next;
++        self.next += 1;
++        self.asks.insert(key, ask);
++        Some(key)
++    }
++
++    pub fn get(&self, key: u64) -> Option<&Ask> {
++        self.asks.get(&key)
++    }
++
++    pub fn get_mut(&mut self, key: u64) -> Option<&mut Ask> {
++        self.asks.get_mut(&key)
++    }
++
++    pub fn remove(&mut self, key: u64) -> Option<Ask> {
++        self.asks.remove(&key)
++    }
++
++    /// Every key, oldest first.
++    pub fn keys(&self) -> Vec<u64> {
++        self.asks.keys().copied().collect()
++    }
++
++    pub fn by_message(&self, message_id: i64) -> Option<u64> {
++        self.asks
++            .iter()
++            .find(|(_, ask)| ask.message_id == Some(message_id))
++            .map(|(key, _)| *key)
++    }
++
++    /// The open ask of topic `thread_id` a text message answers: the one it
++    /// replies to, else the newest one waiting for typed text.
++    pub fn text_target(&self, thread_id: i64, reply_to: Option<i64>) -> Option<u64> {
++        let open = |ask: &Ask| ask.is_open() && ask.thread_id == Some(thread_id);
++        let replied = reply_to.and_then(|reply_to| {
++            self.asks
++                .iter()
++                .find(|(_, ask)| open(ask) && ask.message_id == Some(reply_to))
++        });
++        replied
++            .or_else(|| {
++                self.asks
++                    .iter()
++                    .rev()
++                    .find(|(_, ask)| open(ask) && ask.typing)
++            })
++            .map(|(key, _)| *key)
++    }
++
++    /// `session` has an open ask.
++    pub fn waiting(&self, session: &str) -> bool {
++        self.asks
++            .values()
++            .any(|ask| ask.is_open() && ask.session == session)
++    }
++
++    /// An open ask of `session` has the id `id`.
++    pub fn id_taken(&self, session: &str, id: &str) -> bool {
++        self.asks
++            .values()
++            .any(|ask| ask.is_open() && ask.session == session && ask.id == id)
++    }
++
++    /// The retry tick: failed edits are due again.
++    pub fn retry_edits(&mut self) {
++        for ask in self.asks.values_mut() {
++            ask.retry = false;
++        }
++    }
++
++    pub fn len(&self) -> usize {
++        self.asks.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.asks.is_empty()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use transcript::telegram_len;
++
++    use super::*;
++    use crate::hub::permissions::MAX_CALLBACK_DATA;
++    use crate::wire::AskedOption;
++
++    fn question(text: &str, multi_select: bool, labels: &[&str]) -> AskedQuestion {
++        AskedQuestion {
++            question: text.into(),
++            header: String::new(),
++            multi_select,
++            options: labels
++                .iter()
++                .map(|label| AskedOption {
++                    label: (*label).into(),
++                    description: String::new(),
++                })
++                .collect(),
++        }
++    }
++
++    fn ask(questions: Vec<AskedQuestion>) -> Ask {
++        Ask::new("s".into(), "abcde".into(), questions)
++    }
++
++    fn data(keyboard: &Value) -> Vec<Vec<String>> {
++        keyboard["inline_keyboard"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|row| {
++                row.as_array()
++                    .unwrap()
++                    .iter()
++                    .map(|button| button["callback_data"].as_str().unwrap().to_owned())
++                    .collect()
++            })
++            .collect()
++    }
++
++    #[test]
++    fn buttons_round_trip_and_fit_callback_data() {
++        for press in [
++            Press::Option(0),
++            Press::Option(7),
++            Press::Option(99),
++            Press::Other,
++            Press::Done,
++            Press::Terminal,
++        ] {
++            let data = callback_data("zzzzz", 3, press);
++            assert!(data.len() <= MAX_CALLBACK_DATA);
++            assert_eq!(parse_callback(&data), Some(("zzzzz", 3, press)));
++        }
++        for bad in [
++            "ask:abcde:0",
++            "ask:abcde:0:o",
++            "ask:abcde:0:o100",
++            "ask:abcde:00:x",
++            "ask:abcde:01:x",
++            "ask:abcde:-1:x",
++            "ask:abcde:0:q",
++            "ask:abcdl:0:x",
++            "ask:abcde:0:x:more",
++            "asks:abcde:0:x",
++            "allow:abcde",
++            "status:stop",
++            "",
++        ] {
++            assert_eq!(parse_callback(bad), None, "{bad}");
++        }
++    }
++
++    #[test]
++    fn a_single_choice_answers_and_moves_on() {
++        let mut ask = ask(vec![
++            question("Color?", false, &["Red", "Blue"]),
++            question("Size?", false, &["S", "M"]),
++        ]);
++        let keyboard = data(&ask.keyboard());
++        assert_eq!(keyboard[0], ["ask:abcde:0:o0"]);
++        assert_eq!(keyboard[1], ["ask:abcde:0:o1"]);
++        assert_eq!(keyboard[2], ["ask:abcde:0:x", "ask:abcde:0:t"]);
++        assert!(ask.text().contains("(1 из 2)") && ask.text().contains("2. Blue"));
++        let before = ask.version;
++        assert_eq!(ask.press(0, Press::Option(1)), Some(ANSWER_NEXT));
++        assert!(ask.version > before);
++        assert!(ask.text().contains("(2 из 2)") && ask.text().contains("Blue"));
++        // A button of the first question no longer counts.
++        assert_eq!(ask.press(0, Press::Option(0)), Some(ANSWER_STALE));
++        assert_eq!(ask.press(1, Press::Option(5)), Some(ANSWER_STALE));
++        assert_eq!(ask.press(1, Press::Done), Some(ANSWER_STALE));
++        assert_eq!(ask.answers(), None);
++        assert_eq!(ask.press(1, Press::Option(0)), Some(ANSWER_TAKEN));
++        assert_eq!(ask.state, State::Answered);
++        assert_eq!(ask.answers(), Some(vec!["Blue".to_owned(), "S".to_owned()]));
++        assert_eq!(data(&ask.keyboard()), Vec::<Vec<String>>::new());
++        assert!(ask.text().starts_with(ANSWERED_TITLE));
++        assert!(ask.text().contains("Size?\n→ S"));
++        assert_eq!(ask.press(1, Press::Option(0)), Some(ANSWER_STALE));
++    }
++
++    #[test]
++    fn a_multi_select_ticks_and_needs_one() {
++        let mut ask = ask(vec![question("Fruits?", true, &["Apple", "Pear", "Plum"])]);
++        assert_eq!(
++            data(&ask.keyboard()).last().unwrap(),
++            &["ask:abcde:0:d", "ask:abcde:0:x", "ask:abcde:0:t"]
++        );
++        assert_eq!(ask.press(0, Press::Done), Some(ANSWER_PICK_ONE));
++        assert_eq!(ask.press(0, Press::Option(2)), None);
++        assert_eq!(ask.press(0, Press::Option(0)), None);
++        assert_eq!(ask.press(0, Press::Option(1)), None);
++        assert_eq!(ask.press(0, Press::Option(1)), None);
++        assert!(ask.text().contains("☑ 1. Apple") && ask.text().contains("☐ 2. Pear"));
++        assert_eq!(ask.keyboard()["inline_keyboard"][2][0]["text"], "☑ 3. Plum");
++        assert_eq!(ask.press(0, Press::Done), Some(ANSWER_TAKEN));
++        assert_eq!(ask.answers(), Some(vec!["Apple, Plum".to_owned()]));
++    }
++
++    #[test]
++    fn own_text_answers_the_current_question() {
++        let mut ask = ask(vec![
++            question("Fruits?", true, &["Apple", "Pear"]),
++            question("Note?", false, &["Yes", "No"]),
++        ]);
++        assert!(!ask.typing);
++        assert_eq!(ask.press(0, Press::Other), Some(ANSWER_TYPE));
++        assert!(ask.typing && ask.text().contains(TYPING_HINT));
++        assert_eq!(ask.press(0, Press::Option(1)), None);
++        assert!(!ask.type_answer("   "));
++        assert!(ask.type_answer("  and a fig "));
++        assert!(!ask.typing);
++        assert!(ask.type_answer("my own words"));
++        assert_eq!(
++            ask.answers(),
++            Some(vec![
++                "Pear, and a fig".to_owned(),
++                "my own words".to_owned()
++            ])
++        );
++        assert!(!ask.type_answer("late"));
++    }
++
++    #[test]
++    fn the_terminal_button_and_the_end_close_the_ask() {
++        let mut ask = ask(vec![question("Color?", false, &["Red"])]);
++        assert_eq!(ask.press(0, Press::Terminal), Some(ANSWER_TERMINAL));
++        assert_eq!(ask.state, State::Terminal);
++        assert_eq!(ask.answers(), None);
++        assert!(ask.text().starts_with(TERMINAL_TITLE));
++        assert!(!ask.end(State::Expired));
++        let mut other = self::ask(vec![question("Color?", false, &["Red"])]);
++        assert!(other.end(State::Expired));
++        assert!(other.text().starts_with(EXPIRED_TITLE) && other.text().contains("Color?"));
++        assert!(!other.end(State::Closed));
++    }
++
++    #[test]
++    fn texts_stay_within_the_telegram_limit() {
++        let label = "й".repeat(200);
++        let labels: Vec<&str> = vec![label.as_str(); 8];
++        let mut long = question(&"вопрос ".repeat(2000), true, &labels);
++        long.header = "Header".into();
++        for option in &mut long.options {
++            option.description = "д".repeat(1000);
++        }
++        let mut ask = ask(vec![long.clone(), long.clone(), long.clone(), long]);
++        for step in 0..4 {
++            assert!(telegram_len(&ask.text()) <= TELEGRAM_TEXT_LIMIT, "{step}");
++            for row in ask.keyboard()["inline_keyboard"].as_array().unwrap() {
++                for button in row.as_array().unwrap() {
++                    assert!(telegram_len(button["text"].as_str().unwrap()) <= BUTTON_LABEL + 8);
++                }
++            }
++            assert!(ask.type_answer(&"ответ ".repeat(700)));
++        }
++        assert!(telegram_len(&ask.text()) <= TELEGRAM_TEXT_LIMIT);
++    }
++
++    #[test]
++    fn edits_are_due_for_a_newer_version_only() {
++        let mut ask = ask(vec![question("Color?", false, &["Red"])]);
++        assert!(!ask.edit_due() && !ask.finished());
++        ask.message_id = Some(7);
++        ask.shown = ask.version;
++        assert!(!ask.edit_due());
++        ask.press(0, Press::Other);
++        assert!(ask.edit_due());
++        ask.retry = true;
++        assert!(!ask.edit_due());
++        ask.retry = false;
++        ask.editing = true;
++        assert!(!ask.edit_due());
++        ask.editing = false;
++        ask.end(State::Gone);
++        assert!(!ask.finished());
++        ask.shown = ask.version;
++        assert!(ask.finished());
++        let mut unsent = self::ask(vec![question("Color?", false, &["Red"])]);
++        unsent.end(State::Closed);
++        assert!(unsent.finished());
++        unsent.sending = true;
++        assert!(!unsent.finished());
++    }
++
++    #[test]
++    fn the_book_finds_asks_by_message_and_text() {
++        let mut book = Asks::default();
++        let mut first = ask(vec![question("A?", false, &["x"])]);
++        first.thread_id = Some(100);
++        first.message_id = Some(5);
++        let mut second = ask(vec![question("B?", false, &["y"])]);
++        second.id = "bcdef".into();
++        second.thread_id = Some(100);
++        second.message_id = Some(6);
++        let first = book.open(first).unwrap();
++        let second = book.open(second).unwrap();
++        assert_eq!(book.by_message(6), Some(second));
++        assert_eq!(book.text_target(100, Some(5)), Some(first));
++        assert_eq!(book.text_target(100, None), None);
++        assert_eq!(book.text_target(100, Some(9)), None);
++        book.get_mut(first).unwrap().press(0, Press::Other);
++        assert_eq!(book.text_target(100, None), Some(first));
++        assert_eq!(book.text_target(101, None), None);
++        assert_eq!(book.text_target(100, Some(6)), Some(second));
++        assert!(book.waiting("s") && book.id_taken("s", "abcde") && !book.id_taken("t", "abcde"));
++        book.get_mut(first).unwrap().end(State::Gone);
++        assert_eq!(book.text_target(100, Some(5)), None);
++        for _ in book.len()..MAX_ASKS {
++            assert!(
++                book.open(ask(vec![question("C?", false, &["z"])]))
++                    .is_some()
++            );
++        }
++        assert_eq!(book.open(ask(vec![question("D?", false, &["z"])])), None);
++    }
++}
+diff --git a/crates/cctg/src/hub/slots.rs b/crates/cctg/src/hub/slots.rs
+--- a/crates/cctg/src/hub/slots.rs
++++ b/crates/cctg/src/hub/slots.rs
+@@ -37,6 +37,17 @@
+ //! prompt of its own whose first press goes straight back to the waiting
+ //! hook. It gets no decision when [`HOOK_ANSWER_WAIT`] runs out, the hook
+ //! goes away, the session ends or the hub stops; its buttons go away then.
++//!
++//! A question of Claude's `AskUserQuestion` (TASK-038, see
++//! [`Slots::question_asks`] and [`questions`]) comes from its `PreToolUse`
++//! hook: one message in the topic of the session's slot with a button per
++//! option, ✏️ Другое and ⌨ В терминале. Answers of every question go back
++//! to the waiting hook; ⌨, [`QUESTION_WAIT`], a hook that goes away, the end
++//! of the session or the hub's stop give it no decision (the terminal dialog
++//! opens). After ✏️ Другое the next text in the topic, and at any time a
++//! reply to the question message, is the answer to the current question and
++//! does not go to the session. The channel's `permission_request` and the
++//! `PermissionRequest` hook of `AskUserQuestion` get no Allow/Deny buttons.
+ //!
+ //! Subagents and nested runs get no topic: each gets one collapsed block
+ //! message in the topic of its parent's slot (see [`subagents`]). A typed
+@@ -157,8 +168,9 @@
+ use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
+ use super::console;
+ use super::fetch::{self, Fetch, Fetched};
+-use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk};
++use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
+ use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
++use super::questions::{self, Asks};
+ use super::registry::{
+     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
+     StatusMessage, TopicJob, cut,
+@@ -174,8 +186,8 @@
+ use crate::files;
+ use crate::wire::{
+     AgentMsg, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome, HookEvent,
+-    HookPost, HubMsg, PermissionPost, PermissionRequest, SessionAnswer, SessionAsk, StreamItem,
+-    StreamLine, UpdateOutcome,
++    HookPost, HubMsg, PermissionPost, PermissionRequest, QUESTION_TOOL, SessionAnswer, SessionAsk,
++    StreamItem, StreamLine, UpdateOutcome,
+ };
+ 
+ /// The longest text one session read may bring, as the agent sends at most
+@@ -219,6 +231,9 @@
+ pub const HOOK_ANSWER_WAIT: Duration = Duration::from_secs(90);
+ /// While hooks wait, the actor looks this often whether one went away.
+ const HOOK_CHECK_EVERY: Duration = Duration::from_secs(1);
++/// A question nobody answered by then goes to the terminal: its hook gets
++/// no decision, under the hook's own 310 s and the 330 s the settings give it.
++pub const QUESTION_WAIT: Duration = Duration::from_secs(300);
+ /// Channel requests remembered for a hook that comes after them.
+ const MAX_RELAYED: usize = 64;
+ /// Bytes of files from sessions held at a time, being received or waiting
+@@ -325,6 +340,9 @@
+     /// A hook prompt nobody answered by then gives its hook no decision
+     /// ([`HOOK_ANSWER_WAIT`]).
+     pub hook_answer_wait: Duration,
++    /// A question nobody answered by then goes to the terminal
++    /// ([`QUESTION_WAIT`]).
++    pub question_wait: Duration,
+     /// Slots get a status message, edited at most this often; `None`: no
+     /// status messages ([`STATUS_EVERY`] in the hub).
+     pub status_every: Option<Duration>,
+@@ -414,6 +432,7 @@
+             hold_answer: Duration::from_secs(5),
+             stream_retry: Duration::from_secs(5),
+             hook_answer_wait: HOOK_ANSWER_WAIT,
++            question_wait: QUESTION_WAIT,
+             status_every: None,
+             can_pin: true,
+             prompt_settle: PROMPT_SETTLE,
+@@ -465,6 +484,18 @@
+     /// The final edit of a prompt, by its key.
+     PromptEdit {
+         key: u64,
++        delivery: Option<Delivery>,
++    },
++    /// A question message sent as `version`, by its key in [`Asks`].
++    Question {
++        key: u64,
++        version: u64,
++        delivery: Option<Delivery>,
++    },
++    /// An edit of a question message to `version`.
++    QuestionEdit {
++        key: u64,
++        version: u64,
+         delivery: Option<Delivery>,
+     },
+     /// A button answer, the edit of an expired prompt or of a Resume
+@@ -615,6 +646,14 @@
+     Message,
+     Permission(u64),
+     PromptEdit(u64),
++    Question {
++        key: u64,
++        version: u64,
++    },
++    QuestionEdit {
++        key: u64,
++        version: u64,
++    },
+     Callback,
+     Resume {
+         slot: SlotId,
+@@ -707,6 +746,12 @@
+ /// The waiting hook of a hook prompt.
+ struct Waiter {
+     answer: oneshot::Sender<Option<Behavior>>,
++    until: Instant,
++}
++
++/// The waiting hook of a question.
++struct QuestionWaiter {
++    answer: oneshot::Sender<Option<Vec<String>>>,
+     until: Instant,
+ }
+ 
+@@ -800,6 +845,12 @@
+     hook_waiters: HashMap<u64, Waiter>,
+     /// Recent channel requests: (arrival, session, tool name).
+     relayed: VecDeque<(Instant, String, String)>,
++    /// `AskUserQuestion` hooks, see [`Slots::question_asks`].
++    question_asks: Option<mpsc::Receiver<QuestionAsk>>,
++    /// Questions shown or to be shown.
++    questions: Asks,
++    /// Hooks waiting for the answers, by the key of their question.
++    question_waiters: HashMap<u64, QuestionWaiter>,
+     /// Typed subagents not yet matched to an `Agent` call of their parent.
+     candidates: Candidates,
+     /// Subagents of live top-level sessions that started and did not stop
+@@ -909,6 +960,9 @@
+             hook_asks: Vec::new(),
+             hook_waiters: HashMap::new(),
+             relayed: VecDeque::new(),
++            question_asks: None,
++            questions: Asks::default(),
++            question_waiters: HashMap::new(),
+             candidates: Candidates::default(),
+             started_agents: HashMap::new(),
+             indexes: HashMap::new(),
+@@ -974,6 +1028,15 @@
+         asks
+     }
+ 
++    /// The channel for `AskUserQuestion` hooks
++    /// ([`super::ingress::serve_hooks_and_asks`]); call before
++    /// [`Self::run`]. Without it the actor gets no questions.
++    pub fn question_asks(&mut self) -> mpsc::Sender<QuestionAsk> {
++        let (asks, asks_rx) = mpsc::channel(MAX_PERMISSION_WAITS);
++        self.question_asks = Some(asks_rx);
++        asks
++    }
++
+     /// The channel for `/brief` and `/full` ([`commands::Asks`]); call before
+     /// [`Self::run`]. Every ask is answered once: with the text its
+     /// session's agent rendered, or with a notice.
+@@ -986,7 +1049,7 @@
+     /// Runs until [`Control::Stop`]; a closed input channel is just no
+     /// longer polled. On stop, hook posts and agent frames already queued are
+     /// handled and the last registry snapshot is on disk before it returns;
+-    /// waiting `PermissionRequest` hooks get no decision.
++    /// waiting `PermissionRequest` and question hooks get no decision.
+     pub async fn run(
+         mut self,
+         mut agents: mpsc::Receiver<AgentEvent>,
+@@ -995,12 +1058,19 @@
+     ) {
+         let mut done = self.done_rx.take().expect("run once");
+         let mut asks = self.asks.take();
++        let mut question_asks = self.question_asks.take();
+         let mut transcript_asks = self.transcript_asks.take();
+         self.pump();
+         loop {
+             let deadline = self.next_deadline();
+             let ask = async {
+                 match asks.as_mut() {
++                    Some(asks) => asks.recv().await,
++                    None => std::future::pending().await,
++                }
++            };
++            let question_ask = async {
++                match question_asks.as_mut() {
+                     Some(asks) => asks.recv().await,
+                     None => std::future::pending().await,
+                 }
+@@ -1015,6 +1085,7 @@
+                 Some(event) = agents.recv() => self.on_agent(event),
+                 Some(post) = hooks.recv() => self.on_hook(&post),
+                 Some(ask) = ask => self.on_permission_ask(ask),
++                Some(ask) = question_ask => self.on_question_ask(ask),
+                 Some(ask) = transcript_ask => self.on_transcript_ask(ask),
+                 Some(control) = control.recv() => {
+                     if control == Control::Stop {
+@@ -1040,9 +1111,13 @@
+         // Waiting hooks get no decision (their answers are dropped), and
+         // their prompts lose the buttons if Telegram still takes the edit.
+         drop(asks);
++        drop(question_asks);
+         self.hook_asks.clear();
+         for key in self.hook_waiters.keys().copied().collect::<Vec<_>>() {
+             self.finish(key, State::Expired);
++        }
++        for key in self.question_waiters.keys().copied().collect::<Vec<_>>() {
++            self.end_question(key, questions::State::Expired);
+         }
+         self.pump();
+         let save_task = self.save_task.take();
+@@ -1067,8 +1142,15 @@
+             .map_or(deadline, |due| deadline.min(due));
+         let hooks = self.hook_asks.iter().map(|ask| ask.show_at.min(ask.until));
+         let waiters = self.hook_waiters.values().map(|waiter| waiter.until);
+-        let mut deadline = hooks.chain(waiters).fold(deadline, Instant::min);
+-        if !self.hook_asks.is_empty() || !self.hook_waiters.is_empty() {
++        let questions = self.question_waiters.values().map(|waiter| waiter.until);
++        let mut deadline = hooks
++            .chain(waiters)
++            .chain(questions)
++            .fold(deadline, Instant::min);
++        if !self.hook_asks.is_empty()
++            || !self.hook_waiters.is_empty()
++            || !self.question_waiters.is_empty()
++        {
+             deadline = deadline.min(Instant::now() + HOOK_CHECK_EVERY);
+         }
+         // A throttled edit, a confirmation that runs out and a failed status
+@@ -2297,6 +2379,13 @@
+             debug!("message outside a topic; not forwarded");
+             return;
+         };
++        // An answer to an open question never goes to the session.
++        if let Some(text) = input.text.as_deref()
++            && !input.forwarded
++            && self.answer_question(thread_id, input.reply_to, text)
++        {
++            return;
++        }
+         let Some(slot) = self.registry.slot_by_topic(thread_id) else {
+             debug!("message in a topic without a slot; not forwarded");
+             return;
+@@ -3846,6 +3935,13 @@
+             );
+             return;
+         }
++        if request.tool_name == QUESTION_TOOL {
++            debug!(
++                conn,
++                "permission request of a question; its hook asks in the topic"
++            );
++            return;
++        }
+         let session = frame_session.to_owned();
+         if self
+             .registry
+@@ -3929,6 +4025,13 @@
+     /// Dropping `ask.answer` is the "no decision" answer.
+     fn on_permission_ask(&mut self, ask: PermissionAsk) {
+         let session = ask.post.session_id.clone();
++        if ask.post.tool_name == QUESTION_TOOL {
++            debug!(
++                session = short(&session),
++                "permission hook of a question; its PreToolUse hook asks; no decision"
++            );
++            return;
++        }
+         if !self.registry.is_live_top_level(&session) {
+             debug!(
+                 session = short(&session),
+@@ -4100,10 +4203,296 @@
+         self.sync_waiting(&gone.session);
+     }
+ 
++    /// An `AskUserQuestion` hook asks. Only a live top-level session gets a
++    /// question in its topic; dropping `ask.answer` is the "no decision"
++    /// answer.
++    fn on_question_ask(&mut self, ask: QuestionAsk) {
++        let QuestionAsk { post, answer } = ask;
++        let session = post.session_id.clone();
++        if !self.registry.is_live_top_level(&session) {
++            debug!(
++                session = short(&session),
++                "question hook of a session without a live topic; no decision"
++            );
++            return;
++        }
++        let mut id = permissions::hook_request_id();
++        for _ in 0..8 {
++            if !self.questions.id_taken(&session, &id) {
++                break;
++            }
++            id = permissions::hook_request_id();
++        }
++        let count = post.questions.len();
++        let Some(key) =
++            self.questions
++                .open(questions::Ask::new(session.clone(), id, post.questions))
++        else {
++            warn!(
++                session = short(&session),
++                "too many questions wait for an answer; this one only in the terminal"
++            );
++            return;
++        };
++        info!(
++            session = short(&session),
++            count, "question queued for the topic"
++        );
++        let until = Instant::now() + self.options.question_wait;
++        self.question_waiters
++            .insert(key, QuestionWaiter { answer, until });
++        self.sync_waiting(&session);
++    }
++
++    /// Open questions whose hook went away, ran out of time or lost its live
++    /// session end; an ended question hands its answers (or no decision) to
++    /// its hook; a question with nothing left to show is forgotten.
++    fn check_questions(&mut self) {
++        let now = Instant::now();
++        for key in self.questions.keys() {
++            let Some(ask) = self.questions.get(key) else {
++                continue;
++            };
++            if ask.is_open() {
++                let waiter = self.question_waiters.get(&key);
++                let end = if !self.registry.is_live_top_level(&ask.session) {
++                    Some(questions::State::Closed)
++                } else if waiter.is_none_or(|waiter| waiter.answer.is_closed()) {
++                    Some(questions::State::Gone)
++                } else if waiter.is_some_and(|waiter| now >= waiter.until) {
++                    Some(questions::State::Expired)
++                } else {
++                    None
++                };
++                if let Some(state) = end {
++                    self.end_question(key, state);
++                }
++            }
++            let Some(ask) = self.questions.get(key) else {
++                continue;
++            };
++            if !ask.is_open()
++                && let Some(waiter) = self.question_waiters.remove(&key)
++            {
++                let session = short(&ask.session).to_owned();
++                match ask.answers() {
++                    Some(answers) => match waiter.answer.send(Some(answers)) {
++                        Ok(()) => info!(session, "question answers handed to the hook"),
++                        Err(_) => info!(session, "question hook left before the answers"),
++                    },
++                    None => debug!(session, "question hook gets no decision"),
++                }
++            }
++            if self
++                .questions
++                .get(key)
++                .is_some_and(questions::Ask::finished)
++            {
++                self.questions.remove(key);
++            }
++        }
++    }
++
++    /// Ends an open question; its edit goes out on the next pump.
++    fn end_question(&mut self, key: u64, state: questions::State) {
++        let Some(ask) = self.questions.get_mut(key) else {
++            return;
++        };
++        if ask.end(state) {
++            let session = ask.session.clone();
++            info!(session = short(&session), ?state, "question ended");
++            self.sync_waiting(&session);
++        }
++    }
++
++    /// Hands every open question not sent yet whose session's slot has a
++    /// topic to Telegram, on the permission lane.
++    fn send_questions(&mut self) {
++        for key in self.questions.keys() {
++            let Some(ask) = self.questions.get(key) else {
++                continue;
++            };
++            if !ask.is_open() || ask.thread_id.is_some() {
++                continue;
++            }
++            let thread_id = self
++                .registry
++                .sessions
++                .get(&ask.session)
++                .and_then(|entry| entry.slot)
++                .and_then(|slot| self.registry.slot(slot))
++                .and_then(|slot| slot.topic_id);
++            let Some(thread_id) = thread_id else {
++                continue;
++            };
++            let op = Op::Send {
++                thread_id: Some(thread_id),
++                text: ask.text(),
++                html: None,
++                reply_markup: Some(ask.keyboard()),
++                permission: true,
++                reply_to: None,
++                notify: true,
++            };
++            let version = ask.version;
++            if let Some(ask) = self.questions.get_mut(key) {
++                ask.thread_id = Some(thread_id);
++                ask.sending = true;
++            }
++            self.hand_off(Work::Question { key, version }, op);
++        }
++    }
++
++    /// Edits every question message that shows an older version.
++    fn send_question_edits(&mut self) {
++        for key in self.questions.keys() {
++            let Some(ask) = self.questions.get_mut(key) else {
++                continue;
++            };
++            let Some(message_id) = ask.message_id.filter(|_| ask.edit_due()) else {
++                continue;
++            };
++            ask.editing = true;
++            let (version, text, keyboard) = (ask.version, ask.text(), ask.keyboard());
++            self.hand_off(
++                Work::QuestionEdit { key, version },
++                Op::Edit {
++                    message_id,
++                    text,
++                    reply_markup: Some(keyboard),
++                },
++            );
++        }
++    }
++
++    fn on_question_done(&mut self, key: u64, version: u64, delivery: Option<Delivery>) {
++        let Some(ask) = self.questions.get_mut(key) else {
++            return;
++        };
++        ask.sending = false;
++        match delivery {
++            Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
++                ask.message_id = Some(message.message_id);
++                ask.shown = version;
++                return;
++            }
++            Some(Ok(_)) => warn!("question sent without a message id; its buttons cannot work"),
++            Some(Err(error)) => {
++                warn!(%error, "question not delivered; it goes to the terminal");
++            }
++            None => warn!("question got no answer from Telegram; it goes to the terminal"),
++        }
++        self.end_question(key, questions::State::Expired);
++    }
++
++    fn on_question_edit_done(&mut self, key: u64, version: u64, delivery: Option<Delivery>) {
++        let applied = match &delivery {
++            Some(Ok(_)) => true,
++            Some(delivery) => telegram_error(
++                delivery,
++                &[
++                    "message is not modified",
++                    "message to edit not found",
++                    "message can't be edited",
++                ],
++            ),
++            None => false,
++        };
++        let Some(ask) = self.questions.get_mut(key) else {
++            return;
++        };
++        ask.editing = false;
++        if applied {
++            ask.shown = ask.shown.max(version);
++            ask.edit_failures = 0;
++            return;
++        }
++        ask.edit_failures += 1;
++        if ask.edit_failures >= questions::MAX_EDIT_ATTEMPTS {
++            warn!("question edit keeps failing; given up");
++            ask.shown = ask.version;
++        } else {
++            debug!(
++                attempts = ask.edit_failures,
++                "question edit failed; retrying later"
++            );
++            ask.retry = true;
++        }
++    }
++
++    /// A question button. Only the question of that message and its current
++    /// step count; a press after the hook left closes the question.
++    fn press_question(
++        &mut self,
++        message_id: Option<i64>,
++        id: &str,
++        question: usize,
++        press: questions::Press,
++    ) -> Option<&'static str> {
++        let Some(key) = message_id.and_then(|message_id| self.questions.by_message(message_id))
++        else {
++            debug!("button of a question this hub does not know");
++            return Some(questions::ANSWER_STALE);
++        };
++        let listening = self
++            .question_waiters
++            .get(&key)
++            .is_some_and(|waiter| !waiter.answer.is_closed());
++        let ask = self.questions.get_mut(key).filter(|ask| ask.id == id)?;
++        if ask.is_open() && !listening {
++            self.end_question(key, questions::State::Gone);
++            return Some(questions::ANSWER_STALE);
++        }
++        let answer = ask.press(question, press);
++        if !ask.is_open() {
++            let (session, state) = (ask.session.clone(), ask.state);
++            info!(
++                session = short(&session),
++                ?state,
++                "question closed in Telegram"
++            );
++            self.sync_waiting(&session);
++        }
++        answer
++    }
++
++    /// A text message in topic `thread_id` that answers an open question:
++    /// a reply to its message, or the next text after ✏️ Другое. `false`:
++    /// it is no answer and goes on as usual.
++    fn answer_question(&mut self, thread_id: i64, reply_to: Option<i64>, text: &str) -> bool {
++        let Some(key) = self.questions.text_target(thread_id, reply_to) else {
++            return false;
++        };
++        let listening = self
++            .question_waiters
++            .get(&key)
++            .is_some_and(|waiter| !waiter.answer.is_closed());
++        if !listening {
++            self.end_question(key, questions::State::Gone);
++            return false;
++        }
++        let Some(ask) = self.questions.get_mut(key) else {
++            return false;
++        };
++        if !ask.type_answer(text) {
++            return false;
++        }
++        let session = ask.session.clone();
++        let done = !ask.is_open();
++        info!(
++            session = short(&session),
++            "question answered with a text from the topic"
++        );
++        if done {
++            self.sync_waiting(&session);
++        }
++        true
++    }
++
+     /// The waiting icon of `session` shows whether it has a prompt that
+-    /// still counts (see [`Prompt::waits`]).
++    /// still counts (see [`Prompt::waits`]) or an open question.
+     fn sync_waiting(&mut self, session: &str) {
+-        let waiting = self.prompts.waiting(session);
++        let waiting = self.prompts.waiting(session) || self.questions.waiting(session);
+         self.registry.set_waiting(session, waiting);
+     }
+ 
+@@ -4225,6 +4614,11 @@
+         if let Some(session) = input.data.as_deref().and_then(status::parse_update) {
+             let session = session.to_owned();
+             return Some(self.press_update(&session));
++        }
++        if let Some((id, question, press)) =
++            input.data.as_deref().and_then(questions::parse_callback)
++        {
++            return self.press_question(input.message_id, id, question, press);
+         }
+         let Some((behavior, request_id)) =
+             input.data.as_deref().and_then(permissions::parse_callback)
+@@ -5483,6 +5877,7 @@
+         if now >= self.next_retry {
+             self.registry.retry_failed();
+             self.prompts.retry_failed_edits();
++            self.questions.retry_edits();
+             self.push_selected(None);
+             self.next_retry = now + self.options.retry_every;
+         }
+@@ -5537,6 +5932,16 @@
+                 }
+             }
+             Done::PromptEdit { key, delivery } => self.on_prompt_edit_done(key, delivery),
++            Done::Question {
++                key,
++                version,
++                delivery,
++            } => self.on_question_done(key, version, delivery),
++            Done::QuestionEdit {
++                key,
++                version,
++                delivery,
++            } => self.on_question_edit_done(key, version, delivery),
+             Done::Callback(delivery) => {
+                 if let Some(Err(error)) = delivery {
+                     debug!(%error, "button answer or expired prompt edit failed");
+@@ -5759,6 +6164,7 @@
+     /// publishes the snapshot to save.
+     fn pump(&mut self) {
+         self.check_hook_asks();
++        self.check_questions();
+         self.send_continuations();
+         self.flush_all();
+         self.offer_resume();
+@@ -5811,7 +6217,9 @@
+             self.hand_off(Work::Block(job), op);
+         }
+         self.send_prompts();
++        self.send_questions();
+         self.send_prompt_edits();
++        self.send_question_edits();
+         self.pump_streams();
+         self.warn_outdated();
+         self.pump_updates();
+@@ -5922,6 +6330,16 @@
+                 Work::Message => Done::Message(delivery),
+                 Work::Permission(key) => Done::Permission { key, delivery },
+                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
++                Work::Question { key, version } => Done::Question {
++                    key,
++                    version,
++                    delivery,
++                },
++                Work::QuestionEdit { key, version } => Done::QuestionEdit {
++                    key,
++                    version,
++                    delivery,
++                },
+                 Work::Callback => Done::Callback(delivery),
+                 Work::Resume { slot, number } => Done::Resume {
+                     slot,
+@@ -5993,7 +6411,9 @@
+     use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL};
+     use crate::hub::scheduler::{BucketConfig, Scheduler, Transport};
+     use crate::hub::testdir::TempDir;
+-    use crate::wire::{Behavior, HookEvent, PermissionRequest, Register};
++    use crate::wire::{
++        AskedOption, AskedQuestion, Behavior, HookEvent, PermissionRequest, QuestionPost, Register,
++    };
+ 
+     const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+     const B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+@@ -6128,6 +6548,7 @@
+         dir: TempDir,
+         _to_agent: Vec<mpsc::Receiver<HubMsg>>,
+         asks: mpsc::Sender<PermissionAsk>,
++        questions: mpsc::Sender<QuestionAsk>,
+     }
+ 
+     fn options() -> Options {
+@@ -6150,6 +6571,7 @@
+         tokio::spawn(scheduler.run());
+         let mut slots = Slots::new(registry, store, outbox, options);
+         let asks = slots.permission_asks();
++        let questions = slots.question_asks();
+         let (agents, agents_rx) = mpsc::channel(16);
+         let (hooks, hooks_rx) = mpsc::channel(16);
+         let (control, control_rx) = mpsc::unbounded_channel();
+@@ -6162,6 +6584,7 @@
+             dir,
+             _to_agent: Vec::new(),
+             asks,
++            questions,
+         }
+     }
+ 
+@@ -6981,6 +7404,271 @@
+             .expect("hook answered in time")
+             .ok()
+             .flatten()
++    }
++
++    fn question_post(session: &str) -> QuestionPost {
++        let option = |label: &str| AskedOption {
++            label: label.into(),
++            description: String::new(),
++        };
++        QuestionPost {
++            v: crate::wire::VERSION,
++            host: "box".into(),
++            session_id: session.into(),
++            questions: vec![
++                AskedQuestion {
++                    question: "Which color?".into(),
++                    header: "Color".into(),
++                    multi_select: false,
++                    options: vec![option("Red"), option("Blue")],
++                },
++                AskedQuestion {
++                    question: "Which fruits?".into(),
++                    header: "Fruits".into(),
++                    multi_select: true,
++                    options: vec![option("Apple"), option("Pear"), option("Plum")],
++                },
++            ],
++        }
++    }
++
++    async fn question_ask(rig: &Rig, session: &str) -> oneshot::Receiver<Option<Vec<String>>> {
++        let (answer, answered) = oneshot::channel();
++        let post = question_post(session);
++        rig.questions
++            .send(QuestionAsk { post, answer })
++            .await
++            .unwrap();
++        answered
++    }
++
++    async fn question_answer(
++        answered: oneshot::Receiver<Option<Vec<String>>>,
++    ) -> Option<Vec<String>> {
++        tokio::time::timeout(WAIT, answered)
++            .await
++            .expect("question hook answered in time")
++            .ok()
++            .flatten()
++    }
++
++    /// The ask id on the buttons of the question send `index`.
++    fn question_id(ops: &[Op], index: usize) -> String {
++        let markup = ops
++            .iter()
++            .filter_map(|op| match op {
++                Op::Send {
++                    permission: true,
++                    reply_markup: Some(markup),
++                    ..
++                } if markup.to_string().contains("\"ask:") => Some(markup),
++                _ => None,
++            })
++            .nth(index)
++            .expect("question send");
++        let data = markup["inline_keyboard"][0][0]["callback_data"]
++            .as_str()
++            .unwrap();
++        questions::parse_callback(data).unwrap().0.to_owned()
++    }
++
++    /// The last edit of `message` starts with `title`.
++    fn edited_to(ops: &[Op], message: i64, title: &str) -> bool {
++        edits_of(ops, message)
++            .last()
++            .is_some_and(|(text, _)| text.starts_with(title))
++    }
++
++    fn inbound_contents(got: &[HubMsg]) -> Vec<String> {
++        got.iter()
++            .filter_map(|msg| match msg {
++                HubMsg::Inbound { content, .. } => Some(content.clone()),
++                _ => None,
++            })
++            .collect()
++    }
++
++    #[tokio::test]
++    async fn a_question_is_answered_with_buttons_and_own_text() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        let answered = question_ask(&rig, A).await;
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (thread, text, message_id) = prompts(&ops).remove(0);
++        assert_eq!(thread, 100);
++        assert!(
++            text.contains("(1 из 2)") && text.contains("Which color?"),
++            "{text}"
++        );
++        settled(&rig, |ops| {
++            last_icon(ops, 100) == Some(crate::hub::registry::ICON_WAITING)
++        })
++        .await;
++        let id = question_id(&ops, 0);
++        let data = |question, press| questions::callback_data(&id, question, press);
++        for (query, question, press) in [
++            ("q1", 0, questions::Press::Option(1)),
++            ("q2", 1, questions::Press::Option(2)),
++            ("q3", 1, questions::Press::Other),
++        ] {
++            rig.control
++                .send(press_of(query, message_id, &data(question, press)))
++                .unwrap();
++        }
++        rig.control
++            .send(say(Some(100), 50, Some("and a fig")))
++            .unwrap();
++        assert_eq!(
++            question_answer(answered).await,
++            Some(vec!["Blue".to_owned(), "Plum, and a fig".to_owned()])
++        );
++        let ops = settled(&rig, |ops| {
++            edited_to(ops, message_id, questions::ANSWERED_TITLE)
++        })
++        .await;
++        let (_, keyboard) = edits_of(&ops, message_id).pop().unwrap();
++        assert_eq!(keyboard, Some(permissions::no_keyboard()));
++        assert_eq!(
++            answers(&ops),
++            [
++                Some(questions::ANSWER_NEXT),
++                None,
++                Some(questions::ANSWER_TYPE)
++            ]
++        );
++        // The answer never reached the session.
++        assert!(inbound_contents(&received(&mut rig, 0).await).is_empty());
++        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
++        rig.control
++            .send(press_of("q4", message_id, &data(1, questions::Press::Done)))
++            .unwrap();
++        let ops = settled(&rig, |ops| answers(ops).len() == 4).await;
++        assert_eq!(answers(&ops)[3], Some(questions::ANSWER_STALE));
++    }
++
++    fn press_of(query: &str, message_id: i64, data: &str) -> Control {
++        press(query, Some(message_id), data)
++    }
++
++    #[tokio::test]
++    async fn a_reply_answers_and_the_terminal_button_lets_the_hook_go() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        let answered = question_ask(&rig, A).await;
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        let id = question_id(&ops, 0);
++        rig.control
++            .send(Control::Message(Inbound {
++                message_id: 51,
++                thread_id: Some(100),
++                text: Some("Green".into()),
++                reply_to: Some(message_id),
++                quote: Some("Which color?".into()),
++                forwarded: false,
++                media: None,
++            }))
++            .unwrap();
++        settled(&rig, |ops| {
++            edits_of(ops, message_id)
++                .iter()
++                .any(|(text, _)| text.contains("(2 из 2)") && text.contains("Color: Green"))
++        })
++        .await;
++        rig.control
++            .send(press_of(
++                "q1",
++                message_id,
++                &questions::callback_data(&id, 1, questions::Press::Terminal),
++            ))
++            .unwrap();
++        assert_eq!(question_answer(answered).await, None);
++        let ops = settled(&rig, |ops| {
++            edited_to(ops, message_id, questions::TERMINAL_TITLE)
++        })
++        .await;
++        assert_eq!(answers(&ops), [Some(questions::ANSWER_TERMINAL)]);
++        // Once the question is closed, a text goes to the session again.
++        rig.control.send(say(Some(100), 52, Some("hello"))).unwrap();
++        let texts = inbound_contents(&received(&mut rig, 0).await);
++        assert_eq!(texts.len(), 1, "{texts:?}");
++        assert!(texts[0].contains("hello") && !texts[0].contains("Green"));
++    }
++
++    #[tokio::test]
++    async fn an_unanswered_question_goes_to_the_terminal() {
++        let options = Options {
++            question_wait: Duration::from_millis(300),
++            ..message_options()
++        };
++        let mut rig = rig(Fake::default(), options);
++        two_live_slots(&mut rig, false).await;
++        let answered = question_ask(&rig, A).await;
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, message_id) = prompts(&ops).remove(0);
++        assert_eq!(question_answer(answered).await, None);
++        settled(&rig, |ops| {
++            edited_to(ops, message_id, questions::EXPIRED_TITLE)
++        })
++        .await;
++    }
++
++    #[tokio::test]
++    async fn a_question_closes_when_its_hook_leaves_or_its_session_ends() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        let answered = question_ask(&rig, A).await;
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        let (_, _, first) = prompts(&ops).remove(0);
++        drop(answered);
++        settled(&rig, |ops| edited_to(ops, first, questions::GONE_TITLE)).await;
++        let answered = question_ask(&rig, A).await;
++        let ops = settled(&rig, |ops| prompts(ops).len() == 2).await;
++        let (_, _, second) = prompts(&ops).remove(1);
++        rig.hook(hook(
++            A,
++            HookEvent::SessionEnd {
++                reason: Some("other".into()),
++                claude_pid: Some(10),
++            },
++        ))
++        .await;
++        assert_eq!(question_answer(answered).await, None);
++        settled(&rig, |ops| edited_to(ops, second, questions::CLOSED_TITLE)).await;
++        // A session that is not live gets no question at all.
++        let answered = question_ask(&rig, A).await;
++        assert_eq!(question_answer(answered).await, None);
++    }
++
++    #[tokio::test]
++    async fn permission_requests_of_a_question_get_no_buttons() {
++        let mut rig = rig(Fake::default(), message_options());
++        two_live_slots(&mut rig, false).await;
++        rig.agents
++            .send(AgentEvent::Message {
++                conn: 1,
++                received_at: std::time::Instant::now(),
++                msg: AgentMsg::PermissionRequest(PermissionRequest {
++                    request_id: "abcde".into(),
++                    tool_name: QUESTION_TOOL.into(),
++                    description: "d".into(),
++                    input_preview: "p".into(),
++                }),
++            })
++            .await
++            .unwrap();
++        let asked = std::time::Instant::now();
++        let answered = hook_ask(&rig, A, QUESTION_TOOL).await;
++        assert_eq!(hook_answer(answered).await, None);
++        assert!(asked.elapsed() < TWIN_WINDOW, "{:?}", asked.elapsed());
++        let answered = hook_ask(&rig, A, "Bash").await;
++        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
++        assert!(
++            prompts(&ops)[0].1.starts_with("Запрос разрешения: Bash"),
++            "{:?}",
++            prompts(&ops)
++        );
++        drop(answered);
+     }
+ 
+     /// The request id on the buttons of the permission send `index`.
+@@ -11251,6 +11939,7 @@
+         tokio::spawn(scheduler.run());
+         let mut slots = Slots::new(registry, store, outbox, options);
+         let asks = slots.permission_asks();
++        let questions = slots.question_asks();
+         let (agents, agents_rx) = mpsc::channel(16);
+         let (hooks, hooks_rx) = mpsc::channel(16);
+         let (control, control_rx) = mpsc::unbounded_channel();
+@@ -11263,6 +11952,7 @@
+             dir,
+             _to_agent: Vec::new(),
+             asks,
++            questions,
+         }
+     }
+ 
+diff --git a/crates/cctg/src/hub/status.rs b/crates/cctg/src/hub/status.rs
+--- a/crates/cctg/src/hub/status.rs
++++ b/crates/cctg/src/hub/status.rs
+@@ -44,7 +44,7 @@
+ pub const ANSWER_CONFIRM: &str = "Нажмите ещё раз, чтобы прервать";
+ pub const ANSWER_INTERRUPTING: &str = "Прерываю";
+ pub const ANSWER_IDLE: &str = "Сейчас нечего прерывать";
+-pub const ANSWER_WAITING: &str = "Сначала ответьте на запрос разрешения";
++pub const ANSWER_WAITING: &str = "Сначала ответьте на запрос разрешения или вопрос";
+ pub const ANSWER_OFFLINE: &str = "Сессия не на связи";
+ pub const ANSWER_NO_KEYS: &str = "Эта сессия не принимает клавиши из Telegram";
+ pub const ANSWER_STALE: &str = "Кнопка устарела";
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -1149,6 +1149,74 @@
+     serde_json::from_value(value).map_err(|_| WireError::Malformed)
+ }
+ 
++/// Claude Code's tool that asks the user multiple-choice questions
++/// (TASK-038). Its `PreToolUse` hook asks the hub at [`QUESTION_PATH`]; the
++/// permission paths leave it alone.
++pub const QUESTION_TOOL: &str = "AskUserQuestion";
++pub const QUESTION_PATH: &str = "/v1/question";
++/// Questions of one `AskUserQuestion` call, as its input allows at most.
++pub const MAX_QUESTIONS: usize = 4;
++/// Options of one question the hub shows as buttons.
++pub const MAX_OPTIONS: usize = 8;
++
++/// Body of one `AskUserQuestion` `PreToolUse` hook POST to
++/// [`QUESTION_PATH`]. The hub holds the request open until it has an answer:
++/// `200` with a [`QuestionAnswer`] when every question was answered in
++/// Telegram, `204` when it has none (sent to the terminal, the wait ran out,
++/// the session ended, the hub stopped). A hub without the path answers `404`.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct QuestionPost {
++    pub v: u32,
++    pub host: String,
++    pub session_id: String,
++    pub questions: Vec<AskedQuestion>,
++}
++
++/// One question of an `AskUserQuestion` call, texts capped by the hook.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AskedQuestion {
++    pub question: String,
++    #[serde(default)]
++    pub header: String,
++    #[serde(default)]
++    pub multi_select: bool,
++    pub options: Vec<AskedOption>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AskedOption {
++    pub label: String,
++    #[serde(default)]
++    pub description: String,
++}
++
++/// One answer per question, in order: an option label, the labels of a
++/// multiSelect question joined by `, `, or the user's own text.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct QuestionAnswer {
++    pub answers: Vec<String>,
++}
++
++/// Also checks the shape the hub can show: 1 to [`MAX_QUESTIONS`] questions
++/// with text, each with 1 to [`MAX_OPTIONS`] labelled options.
++pub fn decode_question(body: &[u8]) -> Result<QuestionPost, WireError> {
++    let value: Value = serde_json::from_slice(body).map_err(|_| WireError::Malformed)?;
++    check_version(&value)?;
++    let post: QuestionPost = serde_json::from_value(value).map_err(|_| WireError::Malformed)?;
++    let shown = |question: &AskedQuestion| {
++        !question.question.trim().is_empty()
++            && (1..=MAX_OPTIONS).contains(&question.options.len())
++            && question
++                .options
++                .iter()
++                .all(|option| !option.label.trim().is_empty())
++    };
++    if !(1..=MAX_QUESTIONS).contains(&post.questions.len()) || !post.questions.iter().all(shown) {
++        return Err(WireError::Malformed);
++    }
++    Ok(post)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use std::collections::HashSet;
+@@ -2141,6 +2209,62 @@
+     }
+ 
+     #[test]
++    fn question_posts_round_trip_and_are_checked() {
++        let question = |text: &str, labels: &[&str]| AskedQuestion {
++            question: text.into(),
++            header: "H".into(),
++            multi_select: false,
++            options: labels
++                .iter()
++                .map(|label| AskedOption {
++                    label: (*label).into(),
++                    description: String::new(),
++                })
++                .collect(),
++        };
++        let post = QuestionPost {
++            v: VERSION,
++            host: "box".into(),
++            session_id: "s".into(),
++            questions: vec![question("Which?", &["A", "B"])],
++        };
++        let body = serde_json::to_vec(&post).unwrap();
++        assert_eq!(decode_question(&body), Ok(post.clone()));
++        let short = br#"{"v":1,"host":"h","session_id":"s","questions":[{"question":"Q","options":[{"label":"A"}]}]}"#;
++        let decoded = decode_question(short).unwrap();
++        assert_eq!(decoded.questions[0].header, "");
++        assert!(!decoded.questions[0].multi_select);
++        let mut v2 = serde_json::to_value(&post).unwrap();
++        v2["v"] = json!(2);
++        assert_eq!(
++            decode_question(&serde_json::to_vec(&v2).unwrap()),
++            Err(WireError::Version)
++        );
++        let many: Vec<String> = (0..=MAX_OPTIONS).map(|n| n.to_string()).collect();
++        let many: Vec<&str> = many.iter().map(String::as_str).collect();
++        for questions in [
++            vec![],
++            vec![question("Q", &["A"]); MAX_QUESTIONS + 1],
++            vec![question(" ", &["A"])],
++            vec![question("Q", &[])],
++            vec![question("Q", &many)],
++            vec![question("Q", &["A", " "])],
++        ] {
++            let bad = QuestionPost {
++                questions,
++                ..post.clone()
++            };
++            let body = serde_json::to_vec(&bad).unwrap();
++            assert_eq!(decode_question(&body), Err(WireError::Malformed));
++        }
++        let answer = serde_json::to_string(&QuestionAnswer {
++            answers: vec!["A, B".into()],
++        })
++        .unwrap();
++        assert_eq!(answer, r#"{"answers":["A, B"]}"#);
++    }
++
++    #[test]
+     fn event_ids_are_fresh_hex() {
+         let ids: HashSet<EventId> = (0..10_000).map(|_| EventId::new()).collect();
+         assert_eq!(ids.len(), 10_000);
+diff --git a/crates/cctg/tests/hook_cli.rs b/crates/cctg/tests/hook_cli.rs
+--- a/crates/cctg/tests/hook_cli.rs
++++ b/crates/cctg/tests/hook_cli.rs
+@@ -330,17 +330,24 @@
+                 assert_eq!(timeout, None, "{event}");
+                 continue;
+             }
+-            assert_eq!(
+-                matcher,
+-                (event == "PostToolUse").then_some("SubagentHandback"),
+-                "{event}"
+-            );
++            let wanted = match event.as_str() {
++                "PostToolUse" => Some("SubagentHandback"),
++                "PreToolUse" => Some("AskUserQuestion"),
++                _ => None,
++            };
++            assert_eq!(matcher, wanted, "{event}");
+             assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
+             assert_eq!(commands[0].get("async"), None, "{event}");
+-            // Only the waiting hook needs more than Claude Code's default time.
++            // Only the waiting hooks need more than Claude Code's default time.
++            let wait = match event.as_str() {
++                "PermissionRequest" => Some(100),
++                "PreToolUse" => Some(330),
++                _ => None,
++            };
++            assert_eq!(timeout, wait, "{event}");
+             assert_eq!(
+-                timeout,
+-                (event == "PermissionRequest").then_some(100),
++                commands[0].get("statusMessage").is_some(),
++                event == "PreToolUse",
+                 "{event}"
+             );
+         }
+diff --git a/crates/cctg/tests/question_hook_e2e.rs b/crates/cctg/tests/question_hook_e2e.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/question_hook_e2e.rs
+@@ -0,0 +1,465 @@
++//! `cctg hook PreToolUse` for `AskUserQuestion` as Claude Code runs it (a
++//! process with JSON on stdin, configured through `<home>/.cctg/device.env`)
++//! against the real `serve_hooks_and_asks`, slot actor and scheduler with a
++//! fake Telegram (TASK-038): choices, ticks and the user's own text in the
++//! topic come back as Claude Code's `allow` + `updatedInput` with `answers`;
++//! ⌨ В терминале, a question nobody answers and a stopped hub give no
++//! decision, exit 0 and an empty stdout; the `PermissionRequest` hook of a
++//! question never waits and shows no Allow/Deny.
++
++use std::io::Write;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::path::{Path, PathBuf};
++use std::process::{Output, Stdio};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use cctg::hub::api::{ForumTopic, Message};
++use cctg::hub::ingress::{self, AgentEvent};
++use cctg::hub::questions::{self, Press};
++use cctg::hub::registry::RegistryStore;
++use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
++use cctg::hub::slots::{Control, Options, Slots};
++use cctg::hub::updates::{CallbackInput, Inbound};
++use cctg::wire::{HookEvent, HookPost, HubMsg, Register, Secret};
++use serde_json::{Value, json};
++use tokio::sync::mpsc;
++
++mod common;
++
++const SECRET: &str = "question-hook-secret-0123456789";
++const SESSION: &str = "5e551017-0000-4000-8000-00000000a5c0";
++const COLOR: &str = "Which private color?";
++const FRUITS: &str = "Which private fruits?";
++
++/// Topic 100; sent messages get ids from 1000 up.
++#[derive(Default)]
++struct Fake {
++    ops: Mutex<Vec<Op>>,
++    next: Mutex<i64>,
++}
++
++impl Fake {
++    fn ops(&self) -> Vec<Op> {
++        self.ops.lock().unwrap().clone()
++    }
++
++    /// (message id, ask id) of every question sent.
++    fn questions(&self) -> Vec<(i64, String)> {
++        let mut message_id = 1000;
++        let mut found = Vec::new();
++        for op in self.ops() {
++            if let Op::Send { reply_markup, .. } = &op {
++                let data = reply_markup
++                    .as_ref()
++                    .and_then(|markup| markup["inline_keyboard"][0][0]["callback_data"].as_str());
++                if let Some((id, _, _)) = data.and_then(questions::parse_callback) {
++                    found.push((message_id, id.to_owned()));
++                }
++                message_id += 1;
++            }
++        }
++        found
++    }
++
++    fn permission_prompts(&self) -> usize {
++        self.ops()
++            .iter()
++            .filter(|op| {
++                matches!(op, Op::Send { reply_markup: Some(markup), .. }
++                    if markup.to_string().contains("\"allow:"))
++            })
++            .count()
++    }
++
++    fn last_edit_of(&self, message: i64) -> Option<String> {
++        self.ops().into_iter().rev().find_map(|op| match op {
++            Op::Edit {
++                message_id, text, ..
++            } if message_id == message => Some(text),
++            _ => None,
++        })
++    }
++}
++
++impl Transport for Fake {
++    async fn execute(&self, op: &Op) -> Delivery {
++        self.ops.lock().unwrap().push(op.clone());
++        match op {
++            Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
++                message_thread_id: 100,
++                name: name.clone(),
++                icon_custom_emoji_id: None,
++            })),
++            Op::Send { .. } | Op::SendDocument { .. } => {
++                let mut next = self.next.lock().unwrap();
++                *next = (*next).max(1000);
++                let message_id = *next;
++                *next += 1;
++                Ok(Outcome::Sent(Message {
++                    message_id,
++                    ..Message::default()
++                }))
++            }
++            _ => Ok(Outcome::Done),
++        }
++    }
++}
++
++struct Hub {
++    addr: String,
++    fake: Arc<Fake>,
++    control: mpsc::UnboundedSender<Control>,
++    _hooks: mpsc::Sender<HookPost>,
++    _agents: mpsc::Sender<AgentEvent>,
++    _to_agent: mpsc::Receiver<HubMsg>,
++    _state: TempState,
++}
++
++struct TempState(PathBuf);
++
++impl Drop for TempState {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++async fn until(what: &str, mut ready: impl FnMut() -> bool) {
++    let wait = async {
++        while !ready() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    };
++    tokio::time::timeout(Duration::from_secs(30), wait)
++        .await
++        .unwrap_or_else(|_| panic!("{what} in time"));
++}
++
++/// A hub with one live session (topic 100) whose agent is linked.
++async fn hub(test: &str, question_wait: Duration) -> Hub {
++    let state =
++        std::env::temp_dir().join(format!("cctg-question-hook-{test}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&state);
++    std::fs::create_dir_all(&state).unwrap();
++    let fake = Arc::new(Fake::default());
++    let (scheduler, outbox) = Scheduler::new(
++        fake.clone(),
++        BucketConfig {
++            capacity: 100,
++            refill_every: Duration::from_millis(10),
++            min_gap: Duration::ZERO,
++        },
++    );
++    tokio::spawn(scheduler.run());
++    let store = RegistryStore::open(&state).unwrap();
++    let options = Options {
++        grace: Duration::ZERO,
++        chat_id: -1000000000001,
++        question_wait,
++        ..Options::default()
++    };
++    let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
++    let asks = slots.permission_asks();
++    let questions = slots.question_asks();
++    let (agents, agents_rx) = mpsc::channel(16);
++    let (hooks, hooks_rx) = mpsc::channel(16);
++    let (control, control_rx) = mpsc::unbounded_channel();
++    tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
++    let (hook_tx, mut hook_rx) = mpsc::channel(16);
++    let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
++        .await
++        .unwrap();
++    let addr = listener.local_addr().unwrap().to_string();
++    tokio::spawn(ingress::serve_hooks_and_asks(
++        listener,
++        Secret::parse(SECRET).unwrap(),
++        hook_tx,
++        asks,
++        questions,
++    ));
++    let forward = hooks.clone();
++    tokio::spawn(async move {
++        while let Some(post) = hook_rx.recv().await {
++            let _ = forward.send(post).await;
++        }
++    });
++    hooks
++        .send(HookPost::new(
++            "box".into(),
++            SESSION.into(),
++            r"C:\w\p".into(),
++            String::new(),
++            HookEvent::SessionStart {
++                source: Some("startup".into()),
++                claude_pid: Some(10),
++                parent_claude_pid: None,
++            },
++        ))
++        .await
++        .unwrap();
++    until("topic", || {
++        fake.ops()
++            .iter()
++            .any(|op| matches!(op, Op::CreateTopic { .. }))
++    })
++    .await;
++    let (to_agent, to_agent_rx) = mpsc::channel(8);
++    agents
++        .send(AgentEvent::Registered {
++            conn: 1,
++            register: Register {
++                session_id: SESSION.into(),
++                host: "box".into(),
++                cwd: r"C:\w\p".into(),
++                claude_pid: Some(10),
++                verdict_ack: true,
++                transcript_reads: false,
++                console_keys: false,
++                console_commands: false,
++                client: None,
++                files: false,
++                session_reads: false,
++                heartbeat: false,
++            },
++            to_agent,
++        })
++        .await
++        .unwrap();
++    Hub {
++        addr,
++        fake,
++        control,
++        _hooks: hooks,
++        _agents: agents,
++        _to_agent: to_agent_rx,
++        _state: TempState(state),
++    }
++}
++
++/// A home directory whose `.cctg/device.env` points at `addr`.
++fn home(test: &str, addr: &str) -> PathBuf {
++    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("question-hook-{test}"));
++    let dir = home.join(".cctg");
++    std::fs::create_dir_all(&dir).unwrap();
++    std::fs::write(
++        dir.join("device.env"),
++        format!("CCTG_HUB_SECRET={SECRET}\nCCTG_HUB_HOOK_ADDR={addr}\nCCTG_HOST=box\n"),
++    )
++    .unwrap();
++    home
++}
++
++fn tool_input() -> Value {
++    json!({
++        "questions": [
++            { "question": COLOR, "header": "Color", "multiSelect": false,
++              "options": [{ "label": "Red", "description": "warm" }, { "label": "Blue" }] },
++            { "question": FRUITS, "header": "Fruits", "multiSelect": true,
++              "options": [{ "label": "Apple" }, { "label": "Pear" }, { "label": "Plum" }] },
++        ],
++    })
++}
++
++fn input(event: &str) -> Vec<u8> {
++    json!({
++        "session_id": SESSION,
++        "transcript_path": "/p/s.jsonl",
++        "cwd": r"C:\w\p",
++        "hook_event_name": event,
++        "permission_mode": "default",
++        "tool_name": "AskUserQuestion",
++        "tool_use_id": "toolu_01question",
++        "tool_input": tool_input(),
++    })
++    .to_string()
++    .into_bytes()
++}
++
++/// Runs the real hook binary for `event` on a blocking thread.
++async fn run_hook(home: PathBuf, event: &'static str) -> (Output, Duration) {
++    tokio::task::spawn_blocking(move || {
++        let started = Instant::now();
++        let mut child = common::cctg(&home)
++            .args(["hook", event])
++            .env("RUST_LOG", "trace")
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .spawn()
++            .expect("cctg starts");
++        let mut stdin = child.stdin.take().unwrap();
++        let _ = stdin.write_all(&input(event));
++        drop(stdin);
++        let output = child.wait_with_output().unwrap();
++        (output, started.elapsed())
++    })
++    .await
++    .unwrap()
++}
++
++fn assert_clean(output: &Output) {
++    assert!(output.status.success(), "{:?}", output.status);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    for private in [SECRET, "private color", "private fruits", "Plum", "fig"] {
++        assert!(!stderr.contains(private), "{private} in {stderr}");
++    }
++}
++
++fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
++    hub.control
++        .send(Control::Callback(CallbackInput {
++            query_id: "q".into(),
++            data: Some(questions::callback_data(id, question, press)),
++            message_id: Some(message_id),
++        }))
++        .unwrap();
++}
++
++fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
++    hub.control
++        .send(Control::Message(Inbound {
++            message_id,
++            thread_id: Some(100),
++            text: Some(text.into()),
++            reply_to,
++            quote: None,
++            forwarded: false,
++            media: None,
++        }))
++        .unwrap();
++}
++
++/// The decision a hook printed: Claude Code's `PreToolUse` `allow` with the
++/// whole input plus `answers`.
++fn assert_answers(output: &Output, color: &str, fruits: &str) {
++    let decision: Value = serde_json::from_slice(&output.stdout).expect("decision JSON");
++    let mut updated = tool_input();
++    updated["answers"] = json!({ COLOR: color, FRUITS: fruits });
++    assert_eq!(
++        decision,
++        json!({ "hookSpecificOutput": {
++            "hookEventName": "PreToolUse",
++            "permissionDecision": "allow",
++            "permissionDecisionReason": "Answered in Telegram",
++            "updatedInput": updated,
++        }})
++    );
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn choices_in_the_topic_are_the_hooks_answers() {
++    let hub = hub("choices", Duration::from_secs(60)).await;
++    let running = tokio::spawn(run_hook(home("choices", &hub.addr), "PreToolUse"));
++    until("question", || hub.fake.questions().len() == 1).await;
++    let (message_id, id) = hub.fake.questions().remove(0);
++    let text = hub
++        .fake
++        .ops()
++        .iter()
++        .find_map(|op| match op {
++            Op::Send {
++                permission: true,
++                text,
++                ..
++            } => Some(text.clone()),
++            _ => None,
++        })
++        .unwrap();
++    assert!(
++        text.contains(COLOR) && text.contains("1. Red — warm"),
++        "{text}"
++    );
++    press(&hub, message_id, &id, 0, Press::Option(1));
++    press(&hub, message_id, &id, 1, Press::Option(0));
++    press(&hub, message_id, &id, 1, Press::Option(2));
++    press(&hub, message_id, &id, 1, Press::Done);
++    let (output, _) = running.await.unwrap();
++    assert_clean(&output);
++    assert_answers(&output, "Blue", "Apple, Plum");
++    until("answers shown", || {
++        hub.fake
++            .last_edit_of(message_id)
++            .is_some_and(|text| text.starts_with(questions::ANSWERED_TITLE))
++    })
++    .await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn own_text_answers_after_other_or_as_a_reply() {
++    let hub = hub("other", Duration::from_secs(60)).await;
++    let running = tokio::spawn(run_hook(home("other", &hub.addr), "PreToolUse"));
++    until("question", || hub.fake.questions().len() == 1).await;
++    let (message_id, id) = hub.fake.questions().remove(0);
++    press(&hub, message_id, &id, 0, Press::Other);
++    say(&hub, 50, "Teal, like the sea", None);
++    // The second question: a tick, then a reply to the question message.
++    press(&hub, message_id, &id, 1, Press::Option(1));
++    say(&hub, 51, "and a fig", Some(message_id));
++    let (output, _) = running.await.unwrap();
++    assert_clean(&output);
++    assert_answers(&output, "Teal, like the sea", "Pear, and a fig");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn the_terminal_button_gives_no_decision_at_once() {
++    let hub = hub("terminal", Duration::from_secs(60)).await;
++    let running = tokio::spawn(run_hook(home("terminal", &hub.addr), "PreToolUse"));
++    until("question", || hub.fake.questions().len() == 1).await;
++    let (message_id, id) = hub.fake.questions().remove(0);
++    let pressed = Instant::now();
++    press(&hub, message_id, &id, 0, Press::Terminal);
++    let (output, _) = running.await.unwrap();
++    assert_clean(&output);
++    assert!(output.stdout.is_empty());
++    assert!(
++        pressed.elapsed() < Duration::from_secs(5),
++        "{:?}",
++        pressed.elapsed()
++    );
++    until("question closed", || {
++        hub.fake
++            .last_edit_of(message_id)
++            .is_some_and(|text| text.starts_with(questions::TERMINAL_TITLE))
++    })
++    .await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn an_unanswered_question_gives_no_decision() {
++    let hub = hub("expired", Duration::from_millis(500)).await;
++    let (output, elapsed) = run_hook(home("expired", &hub.addr), "PreToolUse").await;
++    assert_clean(&output);
++    assert!(output.stdout.is_empty());
++    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
++    let (message_id, _) = hub.fake.questions().remove(0);
++    until("question closed", || {
++        hub.fake
++            .last_edit_of(message_id)
++            .is_some_and(|text| text.starts_with(questions::EXPIRED_TITLE))
++    })
++    .await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn the_permission_hook_of_a_question_never_waits() {
++    let hub = hub("permission", Duration::from_secs(60)).await;
++    let (output, elapsed) = run_hook(home("permission", &hub.addr), "PermissionRequest").await;
++    assert_clean(&output);
++    assert!(output.stdout.is_empty());
++    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
++    tokio::time::sleep(Duration::from_secs(2)).await;
++    assert_eq!(hub.fake.permission_prompts(), 0, "no Allow/Deny");
++    assert!(hub.fake.questions().is_empty());
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn a_stopped_hub_means_no_decision_and_a_quick_exit() {
++    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
++        .unwrap()
++        .local_addr()
++        .unwrap();
++    let (output, elapsed) = run_hook(home("down", &port.to_string()), "PreToolUse").await;
++    assert_clean(&output);
++    assert!(output.stdout.is_empty());
++    assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
++}
+diff --git a/docs/hook-settings.json b/docs/hook-settings.json
+--- a/docs/hook-settings.json
++++ b/docs/hook-settings.json
+@@ -66,6 +66,17 @@
+     ],
+     "PreToolUse": [
+       {
++        "matcher": "AskUserQuestion",
++        "hooks": [
++          {
++            "type": "command",
++            "command": "cctg hook PreToolUse",
++            "timeout": 330,
++            "statusMessage": "Вопрос в Telegram: ответьте там или кнопкой «В терминале»"
++          }
++        ]
++      },
++      {
+         "hooks": [
+           {
+             "type": "command",
+diff --git a/docs/poc.md b/docs/poc.md
+--- a/docs/poc.md
++++ b/docs/poc.md
+@@ -91,7 +91,10 @@
+     "Stop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook Stop" }] }],
+     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStart" }] }],
+     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook SubagentStop" }] }],
+-    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }],
++    "PreToolUse": [
++      { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PreToolUse", "timeout": 330, "statusMessage": "Вопрос в Telegram: ответьте там или кнопкой «В терминале»" }] },
++      { "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }
++    ],
+     "PostToolUse": [
+       { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PostToolUse" }] },
+       { "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }
+@@ -105,6 +108,8 @@
+ `statusLine` и `ToolStatus` нужны для закреплённого сообщения статуса в теме (что делает сессия, модель, контекст и лимиты, кнопка ⏹). `ToolStatus` помечен `"async": true`: Claude Code его не ждёт, один вызов инструмента стоит два коротких процесса в фоне. `cctg statusline` на каждом вызове читает `statusLine.command` из ваших пользовательских настроек (`$CLAUDE_CONFIG_DIR/settings.json` или `~/.claude/settings.json`), запускает его с тем же stdin через Git Bash (на Windows без Git Bash через PowerShell) и печатает его вывод байт в байт, так что строка в терминале остаётся вашей; без своей команды печатается короткая строка cctg. Если в вашем `statusLine` есть `padding`, `refreshInterval` или `hideVimModeIndicator`, скопируйте их в `statusLine` этого файла: `--settings` заменяет `statusLine` целиком, и без них строка будет выглядеть или обновляться иначе. Цифры уходят в hub параллельно вашей команде с таймаутом 80 мс (при остановленном hub строка появляется на столько же позже).
+ 
+ Кнопка ⏹ (с подтверждением вторым нажатием за 10 с) работает на Windows: агент пишет Esc во входной буфер консоли своего claude (`WriteConsoleInputW`; проверено в обычной консоли conhost, в Windows Terminal не проверено, в mintty без консоли не работает, тогда в тему приходит одно уведомление). На Linux и macOS она работает, когда claude запущен через `claude-cctg` в терминале: Esc уходит в псевдотерминал `cctg run` (TASK-044). После этого статус показывает «⏹ Esc отправлен в терминал», а не «ждёт вас»: запись в буфер не значит, что ход остановлен. Конец хода статус узнаёт из `Stop`, заметки о прерывании в транскрипте, следующего промпта или конца сессии; прерывание во время размышления не даёт ни того, ни другого, тогда статус сменится со следующим промптом. Пока ждёт запрос разрешения, ⏹ не показывается: Esc в этот момент отвечает на запрос, а не останавливает ход, поэтому сначала нажмите Allow или Deny.
++
++`PreToolUse` с matcher `AskUserQuestion` отправляет вопросы Claude в тему: кнопка на каждый вариант, для вопроса с несколькими ответами отметки и «✅ Готово», «✏️ Другое» (ответом станет следующее текстовое сообщение в теме; ответ reply на сообщение вопроса работает и без кнопки) и «⌨ В терминале». Когда отвечены все вопросы, хук отдаёт ответы Claude Code, и диалог в терминале не появляется. Пока хук ждёт, в терминале крутится `statusMessage`; «⌨ В терминале», 5 минут без ответа, конец сессии или остановленный hub отпускают хук без решения, и открывается обычный диалог. Поэтому хуку нужен `"timeout": 330`. Запросы разрешения на `AskUserQuestion` (канал или `PermissionRequest`) кнопок Allow/Deny не получают.
+ 
+ `PermissionRequest` ждёт ответа из Telegram до 90 с (кнопки для диалогов, которые канал не пересылает, например проверка безопасности auto mode), поэтому ему нужен свой `"timeout": 100`. Запрос, который уже пришёл через канал, хук отпускает без решения за ~1.5 с.
+ 
+diff --git a/install.sh b/install.sh
+--- a/install.sh
++++ b/install.sh
+@@ -539,7 +539,10 @@
+     "Stop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook Stop" }] }],
+     "SubagentStart": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStart" }] }],
+     "SubagentStop": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook SubagentStop" }] }],
+-    "PreToolUse": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
++    "PreToolUse": [
++      { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": "\"$c\" hook PreToolUse", "timeout": 330, "statusMessage": "Вопрос в Telegram: ответьте там или кнопкой «В терминале»" }] },
++      { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
++    ],
+     "PostToolUse": [
+       { "matcher": "SubagentHandback", "hooks": [{ "type": "command", "command": "\"$c\" hook PostToolUse" }] },
+       { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
