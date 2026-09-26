@@ -27,6 +27,7 @@ use tokio::time::Instant;
 use transcript::{TELEGRAM_TEXT_LIMIT, telegram_len};
 
 use super::registry::cut;
+use super::updates::NAME_LIMIT;
 use crate::channel::is_request_id;
 use crate::wire::{Behavior, PermissionRequest};
 
@@ -41,6 +42,8 @@ const ALLOW: &str = "allow";
 const DENY: &str = "deny";
 pub const ALLOWED_MARK: &str = "\n\n✅ Разрешено из Telegram";
 pub const DENIED_MARK: &str = "\n\n⛔ Отклонено из Telegram";
+/// Between a decision mark and the name of the team member who pressed.
+pub const BY: &str = " · ";
 /// The whole text of a prompt whose session ended before an answer.
 pub const CLOSED_TEXT: &str = "Сессия завершилась";
 pub const ANSWER_ALLOWED: &str = "Разрешено";
@@ -105,7 +108,8 @@ fn mark(behavior: Behavior) -> &'static str {
 }
 
 /// The prompt as plain text (no parse mode, so nothing Claude sent is markup),
-/// cut so that the decision mark still fits the Telegram limit.
+/// cut so that the decision mark and a signing name still fit the Telegram
+/// limit.
 pub fn prompt_text(request: &PermissionRequest) -> String {
     let mut text = format!("Запрос разрешения: {}", request.tool_name.trim());
     if !request.description.trim().is_empty() {
@@ -116,14 +120,21 @@ pub fn prompt_text(request: &PermissionRequest) -> String {
         text.push_str("\n\n");
         text.push_str(request.input_preview.trim());
     }
-    let room = telegram_len(ALLOWED_MARK).max(telegram_len(DENIED_MARK));
+    let room =
+        telegram_len(ALLOWED_MARK).max(telegram_len(DENIED_MARK)) + telegram_len(BY) + NAME_LIMIT;
     cut(&text, TELEGRAM_TEXT_LIMIT - room)
 }
 
-/// The prompt after a decision; within the limit because [`prompt_text`]
-/// left room for the mark.
-pub fn decided_text(prompt: &str, behavior: Behavior) -> String {
-    format!("{prompt}{}", mark(behavior))
+/// The prompt after a decision, signed with the name of the team member who
+/// pressed (TASK-036); within the limit because [`prompt_text`] left room
+/// for the mark and a name of at most [`NAME_LIMIT`].
+pub fn decided_text(prompt: &str, behavior: Behavior, by: Option<&str>) -> String {
+    let mut text = format!("{prompt}{}", mark(behavior));
+    if let Some(name) = by {
+        text.push_str(BY);
+        text.push_str(&cut(name, NAME_LIMIT));
+    }
+    text
 }
 
 pub fn answer(behavior: Behavior) -> &'static str {
@@ -196,6 +207,9 @@ pub struct Prompt {
     pub hook: bool,
     /// When the hub got the request.
     pub opened: Instant,
+    /// The team member whose press fixed the answer (TASK-036); `None`
+    /// outside a team.
+    pub decided_by: Option<String>,
 }
 
 impl Prompt {
@@ -221,13 +235,18 @@ impl Prompt {
             edit_failures: 0,
             hook: false,
             opened: Instant::now(),
+            decided_by: None,
         }
     }
 
     /// What Telegram should show once the prompt ended; `None` while active.
     pub fn final_text(&self) -> Option<String> {
         match self.state {
-            State::Decided(behavior) => Some(decided_text(&self.text, behavior)),
+            State::Decided(behavior) => Some(decided_text(
+                &self.text,
+                behavior,
+                self.decided_by.as_deref(),
+            )),
             State::Closed => Some(CLOSED_TEXT.to_owned()),
             State::Expired => Some(ANSWER_EXPIRED.to_owned()),
             State::Open | State::Selected { .. } => None,
@@ -555,7 +574,7 @@ mod tests {
         assert!(text.starts_with("Запрос разрешения: Bash\nrun the tests\n\n"));
         assert!(text.ends_with('…'));
         for behavior in [Behavior::Allow, Behavior::Deny] {
-            let decided = decided_text(&text, behavior);
+            let decided = decided_text(&text, behavior, Some(&"😀".repeat(NAME_LIMIT)));
             assert!(
                 telegram_len(&decided) <= TELEGRAM_TEXT_LIMIT,
                 "{}",
@@ -567,6 +586,29 @@ mod tests {
         assert_eq!(
             short,
             "Запрос разрешения: Bash\nrun the tests\n\n{\"command\":\"cargo test\"}"
+        );
+    }
+
+    #[test]
+    fn a_team_members_decision_is_signed() {
+        let text = prompt_text(&request("p"));
+        assert_eq!(
+            decided_text(&text, Behavior::Allow, Some("Анна")),
+            format!("{text}{ALLOWED_MARK} · Анна")
+        );
+        assert_eq!(
+            decided_text(&text, Behavior::Deny, None),
+            format!("{text}{DENIED_MARK}")
+        );
+        let mut book = Prompts::default();
+        let key = added(book.open(prompt("A", "abcde")));
+        shown(&mut book, key, 10);
+        book.get_mut(key).unwrap().decided_by = Some("Иван".into());
+        book.finish(key, State::Decided(Behavior::Deny));
+        let edited = book.get(key).unwrap().final_text().unwrap();
+        assert!(
+            edited.ends_with("⛔ Отклонено из Telegram · Иван"),
+            "{edited}"
         );
     }
 
@@ -610,7 +652,7 @@ mod tests {
         let prompt = book.get(key).unwrap();
         assert_eq!(
             prompt.final_text(),
-            Some(decided_text(&prompt.text, Behavior::Deny))
+            Some(decided_text(&prompt.text, Behavior::Deny, None))
         );
         assert_eq!(book.due_edits(), [key]);
     }

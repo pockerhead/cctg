@@ -3287,6 +3287,7 @@ mod tests {
                 quote: None,
                 forwarded: false,
                 file: None,
+                from_name: None,
             },
             false,
         );

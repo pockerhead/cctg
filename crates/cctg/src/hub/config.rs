@@ -83,6 +83,12 @@ impl Allowlist {
     pub fn contains(&self, user_id: i64) -> bool {
         self.0.contains(&user_id)
     }
+
+    /// More than one person may write (TASK-036): messages and button
+    /// answers then carry their author's name.
+    pub fn is_team(&self) -> bool {
+        self.0.len() > 1
+    }
 }
 
 impl FromIterator<i64> for Allowlist {

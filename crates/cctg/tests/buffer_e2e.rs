@@ -88,6 +88,7 @@ fn say(message_id: i64, text: &str) -> Control {
         quote: None,
         forwarded: false,
         media: None,
+        from_name: None,
     })
 }
 

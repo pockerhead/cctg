@@ -67,6 +67,7 @@ pub struct User {
     pub id: i64,
     pub is_bot: bool,
     pub username: Option<String>,
+    pub first_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,7 +82,8 @@ pub struct Message {
     pub message_id: i64,
     pub message_thread_id: Option<i64>,
     pub is_topic_message: bool,
-    pub from: Option<User>,
+    /// Boxed: keeps `Message` (a scheduler `Outcome`) small.
+    pub from: Option<Box<User>>,
     pub chat: Chat,
     pub text: Option<String>,
     /// In a forum topic every message that is not an explicit reply points

@@ -521,6 +521,7 @@ mod tests {
             quote: None,
             forwarded: false,
             media: None,
+            from_name: None,
         };
         let mut route = route_inbound(&commands_tx, &control_tx, BOT);
         route(Routed::Input(input("hello")));
@@ -533,6 +534,7 @@ mod tests {
             query_id: "q".to_owned(),
             data: Some("allow:abcde".to_owned()),
             message_id: Some(9),
+            from_name: None,
         };
         route(Routed::Callback(press.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {

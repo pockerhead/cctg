@@ -323,6 +323,7 @@ fn press(hub: &Hub, message_id: i64, data: String) {
             query_id: "q".into(),
             data: Some(data),
             message_id: Some(message_id),
+            from_name: None,
         }))
         .unwrap();
 }
