@@ -16,7 +16,7 @@ use std::time::Duration;
 use cctg::hook;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
 use cctg::hub::ingress::{bind, serve_agents, serve_hooks};
-use cctg::hub::registry::RegistryStore;
+use cctg::hub::registry::{ICON_ALIVE, RegistryStore};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Control, Options, Slots};
 use cctg::hub::status;
@@ -127,6 +127,33 @@ fn pins(ops: &[Op]) -> Vec<i64> {
             _ => None,
         })
         .collect()
+}
+
+/// The icon topic `thread` shows: set at creation (topics are numbered from
+/// 100 in creation order), then by its last icon edit.
+fn topic_icon(ops: &[Op], thread: i64) -> Option<&str> {
+    let mut created = 100;
+    let mut icon = None;
+    for op in ops {
+        match op {
+            Op::CreateTopic {
+                icon_custom_emoji_id,
+                ..
+            } => {
+                if created == thread {
+                    icon = icon_custom_emoji_id.as_deref();
+                }
+                created += 1;
+            }
+            Op::EditTopic {
+                thread_id,
+                icon_custom_emoji_id: Some(id),
+                ..
+            } if *thread_id == thread => icon = Some(id),
+            _ => {}
+        }
+    }
+    icon
 }
 
 /// Edits of `message`: text and the callback data of its buttons.
@@ -342,6 +369,17 @@ impl Hub {
     async fn shows(&self, what: &str, status: i64, want: (String, Vec<String>)) {
         self.until(what, |ops| edits(ops, status).last() == Some(&want))
             .await;
+    }
+
+    /// Waits until the slot actor has bound the agent of topic `thread`
+    /// (its alive icon shows): the link answers `registered` before the
+    /// actor takes the agent from its own channel, so a command or a key
+    /// asked for right after `Agent::connect` can find no agent yet.
+    async fn agent_bound(&self, thread: i64) {
+        self.until("the agent bound", |ops| {
+            topic_icon(ops, thread) == Some(ICON_ALIVE)
+        })
+        .await;
     }
 
     /// The status message of topic `thread`, once pinned.
@@ -697,6 +735,7 @@ async fn a_late_key_answer_never_reaches_the_next_session_of_the_slot() {
     hub.start(A, 10).await;
     let mut agent_a = Agent::connect(&hub, A, 10).await;
     let status = hub.status_message(100).await;
+    hub.agent_bound(100).await;
     hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
         .await;
     hub.until("A thinks", |ops| {
@@ -893,6 +932,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
     hub.start(A, 10).await;
     let mut agent = Agent::connect(&hub, A, 10).await;
     hub.status_message(100).await;
+    hub.agent_bound(100).await;
     let say = |message_id: i64, text: &str| {
         hub.control
             .send(Control::Message(Inbound {
@@ -917,7 +957,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
                 assert_eq!(got, text);
                 typed.push(command_id);
             }
-            other => panic!("no console command: {other:?}"),
+            other => panic!("no console command: {other:?}: {:#?}", hub.fake.ops()),
         }
     }
     let answer = |command_id, outcome| AgentMsg::ConsoleCommandTyped {

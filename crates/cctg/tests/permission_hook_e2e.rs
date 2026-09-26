@@ -283,6 +283,32 @@ async fn run_hook(home: PathBuf) -> (Output, Duration) {
     .unwrap()
 }
 
+/// Starts the hook of `test` and waits until its prompt is in the topic. A
+/// hook that ends first never reached the hub (connect and send get
+/// `PERMISSION_CONNECT_TIMEOUT`, which a busy CI machine can miss); it is
+/// started again, three times at most, and its log goes into the failure.
+async fn hook_with_prompt(hub: &Hub, test: &str) -> tokio::task::JoinHandle<(Output, Duration)> {
+    let mut ended = Vec::new();
+    for _ in 0..3 {
+        let mut running = tokio::spawn(run_hook(home(test, &hub.addr)));
+        tokio::select! {
+            () = until("hook prompt", || !hub.fake.prompts().is_empty()) => {
+                assert_eq!(hub.fake.prompts().len(), 1);
+                return running;
+            }
+            finished = &mut running => {
+                let (output, elapsed) = finished.unwrap();
+                ended.push(format!(
+                    "{:?} after {elapsed:?}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+    }
+    panic!("the hook ended before its prompt: {ended:#?}");
+}
+
 fn assert_clean(output: &Output) {
     assert!(output.status.success(), "{:?}", output.status);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -305,8 +331,7 @@ fn press(hub: &Hub, message_id: i64, data: String) {
 async fn a_press_in_the_topic_is_the_hooks_decision() {
     for (action, behavior) in [("allow", "allow"), ("deny", "deny")] {
         let hub = hub(&format!("press-{action}")).await;
-        let running = tokio::spawn(run_hook(home(&format!("press-{action}"), &hub.addr)));
-        until("hook prompt", || hub.fake.prompts().len() == 1).await;
+        let running = hook_with_prompt(&hub, &format!("press-{action}")).await;
         let (message_id, id) = hub.fake.prompts().remove(0);
         let sent = hub.fake.ops();
         let text = sent
@@ -368,8 +393,7 @@ async fn a_request_the_channel_relays_gets_no_second_prompt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_end_answers_the_waiting_hook_without_a_decision() {
     let hub = hub("end").await;
-    let running = tokio::spawn(run_hook(home("end", &hub.addr)));
-    until("hook prompt", || hub.fake.prompts().len() == 1).await;
+    let running = hook_with_prompt(&hub, "end").await;
     let (message_id, _) = hub.fake.prompts().remove(0);
     hub.hooks
         .send(HookPost::new(
@@ -393,8 +417,7 @@ async fn a_session_end_answers_the_waiting_hook_without_a_decision() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hub_that_stops_answers_the_waiting_hook_without_a_decision() {
     let hub = hub("stop").await;
-    let running = tokio::spawn(run_hook(home("stop", &hub.addr)));
-    until("hook prompt", || hub.fake.prompts().len() == 1).await;
+    let running = hook_with_prompt(&hub, "stop").await;
     hub.control.send(Control::Stop).unwrap();
     let (output, elapsed) = running.await.unwrap();
     assert_clean(&output);
