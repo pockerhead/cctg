@@ -1,0 +1,44 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling syn v3.0.6
+   Compiling synstructure v0.14.0
+   Compiling zerofrom-derive v0.1.8
+    Checking zerofrom v0.1.8
+   Compiling yoke-derive v0.8.3
+    Checking yoke v0.8.3
+   Compiling zerovec-derive v0.11.6
+    Checking zerovec v0.11.8
+   Compiling displaydoc v0.2.7
+   Compiling serde_derive v1.0.229
+    Checking serde v1.0.229
+    Checking tinystr v0.8.4
+    Checking icu_locale_core v2.3.0
+    Checking transcript v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-044-rev2\crates\transcript)
+    Checking zerotrie v0.2.5
+    Checking potential_utf v0.1.6
+   Compiling tokio-macros v2.7.2
+    Checking icu_collections v2.3.0
+    Checking tokio v1.53.1
+    Checking icu_provider v2.3.1
+    Checking icu_properties v2.3.0
+    Checking icu_normalizer v2.3.0
+   Compiling syn v2.0.119
+   Compiling tracing-attributes v0.1.31
+    Checking idna_adapter v1.2.2
+    Checking hyper v1.11.1
+    Checking idna v1.1.0
+    Checking tracing v0.1.44
+    Checking hyper-util v0.1.20
+    Checking tower v0.5.3
+    Checking url v2.5.8
+    Checking tokio-rustls v0.26.5
+    Checking tower-http v0.6.11
+   Compiling clap_derive v4.6.4
+    Checking hyper-rustls v0.27.10
+   Compiling thiserror-impl v2.0.20
+   Compiling cctg v0.1.0 (C:\Users\user\AppData\Local\Temp\cctg-044-rev2\crates\cctg)
+    Checking thiserror v2.0.20
+    Checking reqwest v0.13.5
+    Checking clap v4.6.6
+    Finished `dev` profile [unoptimized] target(s) in 1m 04s
+clippy=0

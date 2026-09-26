@@ -1,0 +1,24 @@
+use std::path::{Path, PathBuf};
+use crate::keys::{self, Typed};
+pub const RUN_VAR: &str = "CCTG_RUN";
+pub const RUN_ARGS_VAR: &str = "CCTG_RUN_ARGS";
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Request {
+    pub args: Vec<String>,
+}
+pub fn request_path(state_dir: &Path, run_pid: u32) -> PathBuf {
+    state_dir.join("restart").join(format!("{run_pid}.json"))
+}
+#[derive(Debug, Clone, Default)]
+pub struct Worker {
+    pub claude_pid: Option<u32>,
+    pub run_pid: Option<u32>,
+    pub run_args: Vec<String>,
+    pub state_dir: Option<PathBuf>,
+    pub console: Option<keys::Target>,
+    pub other: bool,
+}
+impl Worker {
+    pub fn restartable(&self) -> bool { self.console.is_some() }
+    pub fn restart(&self, _s: &str) -> Typed { keys::type_exit(self.console.as_ref().unwrap()) }
+}

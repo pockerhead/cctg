@@ -1,0 +1,275 @@
+
+    fn gather_options() -> Options {
+        Options {
+            gather_quiet: GATHER_QUIET,
+            gather_max: GATHER_MAX,
+            notice_every: Duration::ZERO,
+            ..message_options()
+        }
+    }
+
+    /// Live A in slot 0 (topic 100) on a hub that gathers bursts, with an
+    /// agent (conn 1) whose link queue holds 64; what the actor hands to
+    /// the scheduler is captured.
+    fn gather_slots(
+        dir: &TempDir,
+    ) -> (
+        Slots,
+        mpsc::UnboundedReceiver<(Work, Op)>,
+        mpsc::Receiver<HubMsg>,
+    ) {
+        let mut slots = stalled_slots(dir, gather_options());
+        let work = capture_dispatch(&mut slots);
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let agent = connect_queue(&mut slots, 1, A, Some(10), 64);
+        slots.pump();
+        (slots, work, agent)
+    }
+
+    /// Time passes for the actor as in `run`: its tick, then a pump.
+    async fn pass(slots: &mut Slots, by: Duration) {
+        tokio::time::advance(by).await;
+        slots.on_tick();
+        slots.pump();
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// `(content, meta)` of each inbound the agent got since the last call.
+    fn inbounds(from_hub: &mut mpsc::Receiver<HubMsg>) -> Vec<(String, BTreeMap<String, String>)> {
+        let mut got = Vec::new();
+        while let Ok(msg) = from_hub.try_recv() {
+            match msg {
+                HubMsg::Inbound { content, meta } => got.push((content, meta)),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        got
+    }
+
+    fn meta_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_forwards_and_a_note_within_300_ms_reach_the_session_as_one_inbound() {
+        let dir = TempDir::new("slots-gather-burst");
+        let (mut slots, mut work, mut agent) = gather_slots(&dir);
+        topic_ops(&mut work);
+        for id in 1..=3 {
+            slots.on_topic_message(topic_text(id, &format!("чужое {id}"), true));
+            slots.pump();
+            pass(&mut slots, ms(100)).await;
+        }
+        slots.on_topic_message(topic_text(4, "что скажешь?", false));
+        slots.pump();
+        pass(&mut slots, GATHER_QUIET - ms(1)).await;
+        assert!(
+            inbounds(&mut agent).is_empty(),
+            "the burst waits for a quiet window"
+        );
+        assert_eq!(buffered(&slots, 0), [1, 2, 3, 4]);
+        assert!(topic_ops(&mut work).1.is_empty(), "no 👀 before it goes");
+        pass(&mut slots, ms(1)).await;
+        let got = inbounds(&mut agent);
+        assert_eq!(
+            got,
+            [(
+                "(переслано)\nчужое 1\n\n---\n\n(переслано)\nчужое 2\n\n---\n\n\
+                 (переслано)\nчужое 3\n\n---\n\nчто скажешь?"
+                    .to_owned(),
+                meta_of(&[
+                    ("chat_id", "-1000000000001"),
+                    ("message_id", "4"),
+                    ("message_ids", "1,2,3,4"),
+                    ("thread_id", "100"),
+                ]),
+            )]
+        );
+        assert!(got[0].1.keys().all(|key| crate::channel::is_meta_key(key)));
+        assert_eq!(topic_ops(&mut work).1, [1, 2, 3, 4], "👀 on every message");
+        assert!(slots.registry.slots[0].buffer.is_idle());
+        let stream = slots.registry.sessions[A].stream.as_ref().unwrap();
+        assert_eq!(stream.receipts, [4]);
+        assert_eq!(stream.parts, [(4, vec![1, 2, 3])]);
+        pass(&mut slots, GATHER_MAX).await;
+        assert!(inbounds(&mut agent).is_empty(), "it went once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_message_goes_after_the_quiet_window_and_a_steady_stream_by_its_limit() {
+        let dir = TempDir::new("slots-gather-window");
+        let (mut slots, _work, mut agent) = gather_slots(&dir);
+        slots.on_topic_message(topic_text(1, "один", false));
+        slots.pump();
+        pass(&mut slots, GATHER_QUIET - ms(1)).await;
+        assert!(inbounds(&mut agent).is_empty());
+        pass(&mut slots, ms(1)).await;
+        assert_eq!(
+            inbounds(&mut agent),
+            [(
+                "один".to_owned(),
+                meta_of(&[
+                    ("chat_id", "-1000000000001"),
+                    ("message_id", "1"),
+                    ("thread_id", "100"),
+                ]),
+            )]
+        );
+        // A message every half second: its burst goes 3 s after the first.
+        let mut went = Vec::new();
+        for id in 10..20 {
+            slots.on_topic_message(topic_text(id, "x", false));
+            slots.pump();
+            pass(&mut slots, ms(500)).await;
+            for (_, meta) in inbounds(&mut agent) {
+                went.push((id, meta["message_ids"].clone()));
+            }
+        }
+        assert_eq!(went, [(15, "10,11,12,13,14,15".to_owned())]);
+        // The rest goes a quiet window after the last one.
+        pass(&mut slots, ms(499)).await;
+        assert!(inbounds(&mut agent).is_empty());
+        pass(&mut slots, ms(1)).await;
+        let rest = inbounds(&mut agent);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].1["message_ids"], "16,17,18,19");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_in_a_burst_lets_the_burst_go_first_and_keeps_its_place() {
+        let dir = TempDir::new("slots-gather-file");
+        let mut slots = stalled_slots(&dir, gather_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.fetch_files(Arc::new(TelegramFiles(
+            [("p".to_owned(), b"x".to_vec())].into(),
+        )));
+        let mut done = slots.done_rx.take().unwrap();
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        slots.pump();
+        let mut bytes = Vec::new();
+        slots.on_topic_message(topic_text(1, "one", false));
+        slots.pump();
+        slots.on_topic_message(topic_text(2, "two", false));
+        slots.pump();
+        assert!(arrived(&mut agent, &mut bytes).is_empty());
+        // The file does not wait for the quiet window, and the burst goes
+        // before it.
+        slots.on_control(photo(3, "p", Some("look"), Some(1)));
+        slots.pump();
+        assert_eq!(arrived(&mut agent, &mut bytes), ["text one\n\n---\n\ntwo"]);
+        // A text after the file waits behind it and for its own window.
+        slots.on_topic_message(topic_text(4, "after", false));
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(arrived(&mut agent, &mut bytes), ["file photo.jpg look"]);
+        pass(&mut slots, GATHER_QUIET).await;
+        assert_eq!(arrived(&mut agent, &mut bytes), ["text after"]);
+        assert_eq!(topic_ops(&mut work).1, [1, 2, 3, 4]);
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_in_a_burst_lets_the_burst_go_first() {
+        let dir = TempDir::new("slots-gather-command");
+        let (_fake, mut slots, mut from_hub) = console_slots_with(&dir, true, gather_options());
+        slots.on_topic_message(topic_text(1, "one", false));
+        slots.on_topic_message(topic_text(2, "two", true));
+        slots.on_topic_message(topic_text(3, "!ls", false));
+        match from_hub.try_recv() {
+            Ok(HubMsg::Inbound { content, meta }) => {
+                assert_eq!(content, "one\n\n---\n\n(переслано)\ntwo");
+                assert_eq!(meta["message_id"], "2");
+                assert_eq!(meta["message_ids"], "1,2");
+                assert!(!meta.contains_key("forwarded"), "{meta:?}");
+            }
+            other => panic!("no burst first: {other:?}"),
+        }
+        let (_, text) = command_of(from_hub.try_recv().ok());
+        assert_eq!(text, "!ls");
+        slots.on_topic_message(topic_text(4, "four", false));
+        assert!(from_hub.try_recv().is_err());
+        pass(&mut slots, GATHER_QUIET).await;
+        match from_hub.try_recv() {
+            Ok(HubMsg::Inbound { content, meta }) => {
+                assert_eq!(content, "four");
+                assert!(!meta.contains_key("message_ids"));
+            }
+            other => panic!("no message after the command: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn messages_kept_while_the_slot_had_no_live_session_go_one_by_one() {
+        let dir = TempDir::new("slots-gather-dead");
+        let (mut slots, _work, mut agent) = gather_slots(&dir);
+        // A burst begun while A lived; A ends before it is due.
+        slots.on_topic_message(topic_text(1, "one", false));
+        slots.pump();
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        for id in 2..=4 {
+            slots.on_topic_message(topic_text(id, "x", true));
+            slots.pump();
+            pass(&mut slots, ms(100)).await;
+        }
+        pass(&mut slots, GATHER_MAX).await;
+        assert!(inbounds(&mut agent).is_empty());
+        assert_eq!(buffered(&slots, 0), [1, 2, 3, 4]);
+        // B takes the slot: the kept messages go at once, one inbound each.
+        slots.on_hook(&start(B, 11));
+        let mut revived = connect_queue(&mut slots, 2, B, Some(11), 64);
+        slots.pump();
+        let got = inbounds(&mut revived);
+        let ids: Vec<&str> = got
+            .iter()
+            .map(|(_, meta)| meta["message_id"].as_str())
+            .collect();
+        assert_eq!(ids, ["1", "2", "3", "4"]);
+        assert!(got.iter().all(|(_, meta)| !meta.contains_key("message_ids")));
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    #[tokio::test]
+    async fn every_message_of_a_burst_turns_writing_with_its_channel_record() {
+        let dir = TempDir::new("slots-gather-writing");
+        let path = transcript_file(&dir, A);
+        let options = Options {
+            gather_quiet: ms(200),
+            gather_max: GATHER_MAX,
+            ..stream_options()
+        };
+        let mut rig = stream_rig(Fake::default(), options, dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let mut kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+        for id in [41, 42, 43] {
+            rig.control.send(say(Some(100), id, Some("m"))).unwrap();
+        }
+        settled(&rig, |ops| reactions(ops).len() == 3).await;
+        match kept.recv().await {
+            Some(HubMsg::Inbound { meta, .. }) => {
+                assert_eq!(meta["message_id"], "43");
+                assert_eq!(meta["message_ids"], "41,42,43");
+            }
+            other => panic!("no burst: {other:?}"),
+        }
+        append(&path, &channel_record(43));
+        let ops = settled(&rig, |ops| reactions(ops).len() == 6).await;
+        let mut writing: Vec<(i64, String)> = reactions(&ops).split_off(3);
+        writing.sort();
+        assert_eq!(
+            writing,
+            [41, 42, 43].map(|id| (id, "✍".to_owned())).to_vec()
+        );
+    }
+}

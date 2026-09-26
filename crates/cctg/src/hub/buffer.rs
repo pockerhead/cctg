@@ -111,6 +111,19 @@ impl Parked {
     }
 }
 
+/// Between the messages of a burst that go as one inbound (TASK-048).
+pub const PART_SEPARATOR: &str = "\n\n---\n\n";
+
+/// What the session reads of messages that go as one inbound: their
+/// [`Parked::content`] in order, [`PART_SEPARATOR`] between them.
+pub fn burst_content(parts: &[Parked]) -> String {
+    parts
+        .iter()
+        .map(Parked::content)
+        .collect::<Vec<_>>()
+        .join(PART_SEPARATOR)
+}
+
 /// The Resume message of an offline period.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeNote {
@@ -276,6 +289,23 @@ mod tests {
             ..parked(2)
         };
         assert_eq!(forward.content(), "(переслано)\nчужие\nслова");
+    }
+
+    #[test]
+    fn a_burst_keeps_each_message_marked_in_order_between_separators() {
+        assert_eq!(burst_content(&[parked(1)]), "m1");
+        let forward = Parked {
+            forwarded: true,
+            ..parked(1)
+        };
+        let reply = Parked {
+            quote: Some("q".into()),
+            ..parked(2)
+        };
+        assert_eq!(
+            burst_content(&[forward, reply, parked(3)]),
+            "(переслано)\nm1\n\n---\n\n> q\n\nm2\n\n---\n\nm3"
+        );
     }
 
     #[test]
