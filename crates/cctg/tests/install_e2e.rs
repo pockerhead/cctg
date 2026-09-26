@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1087,6 +1088,9 @@ fn a_hub_is_set_up_with_docker_compose() {
     assert_eq!(value("CCTG_CHAT_ID"), "-1001234567");
     assert_eq!(value("CCTG_ALLOWED_USER_IDS"), "1001,1002");
     assert_eq!(value("HTTPS_PROXY"), "http://127.0.0.1:10809");
+    // How devices reach the hub, for /join (TASK-046): the host ports.
+    assert_eq!(value("CCTG_PUBLIC_AGENT_ADDR"), "hub.example.org:47291");
+    assert_eq!(value("CCTG_PUBLIC_HOOK_ADDR"), "hub.example.org:47292");
     let secret = value("CCTG_HUB_SECRET");
     assert!(
         cctg::wire::Secret::parse(&secret).is_ok() && secret.len() == 48,
@@ -1192,6 +1196,15 @@ fn a_hub_is_set_up_with_docker_compose() {
         ),
         "{text}"
     );
+    // /join says the same: the public lines follow the host ports, once each.
+    let env = std::fs::read_to_string(hub_dir.join("hub.env")).unwrap();
+    for line in [
+        "CCTG_PUBLIC_AGENT_ADDR=hub.example.org:52191",
+        "CCTG_PUBLIC_HOOK_ADDR=hub.example.org:47292",
+    ] {
+        assert!(env.lines().any(|l| l == line), "{line} in {env}");
+    }
+    assert_eq!(env.matches("CCTG_PUBLIC_").count(), 2, "{env}");
 
     // Stop: compose down; the secrets and the key stay for the user.
     let (output, text) = run.install(&["--hub", "--uninstall", "--dir", &dir]);
@@ -1263,6 +1276,181 @@ fn a_hub_that_does_not_start_or_has_no_address_is_an_error() {
     );
 }
 
+/// The named `NAME=` lines and functions of install.sh, for a script that
+/// runs them alone.
+fn script_parts(constants: &[&str], functions: &[&str]) -> String {
+    let script = String::from_utf8(install_sh()).unwrap();
+    let mut parts = String::new();
+    for name in constants {
+        let line = script
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name}= in install.sh"));
+        parts.push_str(line);
+        parts.push('\n');
+    }
+    for name in functions {
+        let start = script
+            .find(&format!("\n{name}() {{\n"))
+            .unwrap_or_else(|| panic!("{name}() in install.sh"))
+            + 1;
+        let end = start + script[start..].find("\n}\n").expect("the function's end") + 3;
+        parts.push_str(&script[start..end]);
+    }
+    parts
+}
+
+/// The local hub's listeners in hub.env (TASK-046 review): the lines the
+/// script chose are marked and chosen again for another `--public-host`,
+/// the user's own lines stay, and this machine's client line goes where
+/// each listener takes loopback connections: `[::1]` for `[::]`, which
+/// takes IPv6 only on Windows.
+#[test]
+fn local_hub_listeners_follow_the_public_host_and_keep_the_users_lines() {
+    let root = Root::new("listeners");
+    let hub_env = root.0.join("hub.env");
+    let parts = script_parts(
+        &["PROXY_NONE", "LISTEN_MARK", "AGENT_PORT", "HOOK_PORT"],
+        &[
+            "line_of",
+            "value_of",
+            "hub_line",
+            "put",
+            "write_hub_env",
+            "user_listen",
+            "listeners",
+            "loopback_of",
+            "hub_where",
+            "local_where",
+        ],
+    );
+    // As setup_local_hub writes hub.env, then the client line.
+    let script = format!(
+        "set -eu\n{parts}hub_env=$1\npublic_host=$2\ntoken= chat_id= users= new_secret= proxy=\n\
+         listeners\n\
+         write_hub_env '# test' \"CCTG_PUBLIC_AGENT_ADDR$listen_keys\" \"$listen_lines\"\n\
+         local_where\n"
+    );
+    let path = hub_env.to_string_lossy().replace('\\', "/");
+    let step = |public_host: &str| -> (String, String) {
+        let output = shell()
+            .arg("-c")
+            .arg(&script)
+            .arg("sh")
+            .arg(&path)
+            .arg(public_host)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (text, std::fs::read_to_string(&hub_env).unwrap())
+    };
+    let listen = |env: &str| -> Vec<String> {
+        env.lines()
+            .filter(|line| line.starts_with("CCTG_") && line.contains("_LISTEN="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let marks = |env: &str| env.matches("rewritten on each run").count();
+
+    // Only this machine: no listener lines, the defaults on 127.0.0.1.
+    let (line, env) = step("");
+    assert_eq!(line, "--hub-host 127.0.0.1");
+    assert!(listen(&env).is_empty(), "{env}");
+    // A host name: every IPv4 address.
+    let (line, env) = step("hub.example.org");
+    assert_eq!(
+        listen(&env),
+        [
+            "CCTG_AGENT_LISTEN=0.0.0.0:47291",
+            "CCTG_HOOK_LISTEN=0.0.0.0:47292"
+        ]
+    );
+    assert_eq!(marks(&env), 2, "{env}");
+    assert_eq!(line, "--hub-host 127.0.0.1");
+    // Another run for an [IPv6] host: the same lines chosen again.
+    let (line, env) = step("[2001:db8::1]");
+    assert_eq!(
+        listen(&env),
+        [
+            "CCTG_AGENT_LISTEN=[::]:47291",
+            "CCTG_HOOK_LISTEN=[::]:47292"
+        ]
+    );
+    assert_eq!(marks(&env), 2, "{env}");
+    assert_eq!(line, "--hub-host '[::1]'");
+    let (line, env) = step("[::1]");
+    assert_eq!(
+        listen(&env),
+        [
+            "CCTG_AGENT_LISTEN=[::1]:47291",
+            "CCTG_HOOK_LISTEN=[::1]:47292"
+        ]
+    );
+    assert_eq!(line, "--hub-host '[::1]'");
+
+    // The user's own agent line stays for any host; the marked hook line
+    // is chosen again.
+    let users = env.replace(
+        &format!(
+            "{} CCTG_AGENT_LISTEN\nCCTG_AGENT_LISTEN=[::1]:47291\n",
+            "# written by install.sh --hub --local, rewritten on each run:"
+        ),
+        "CCTG_AGENT_LISTEN=[::]:52191\n",
+    );
+    assert_ne!(users, env, "the marked agent line in {env}");
+    std::fs::write(&hub_env, &users).unwrap();
+    let (line, env) = step("hub.example.org");
+    assert_eq!(
+        listen(&env),
+        [
+            "CCTG_AGENT_LISTEN=[::]:52191",
+            "CCTG_HOOK_LISTEN=0.0.0.0:47292"
+        ]
+    );
+    assert_eq!(marks(&env), 1, "{env}");
+    assert_eq!(
+        line,
+        "--agent-addr '[::1]:52191' --hook-addr 127.0.0.1:47292"
+    );
+    // Again: nothing changes.
+    let (_, again) = step("hub.example.org");
+    assert_eq!(again, env);
+}
+
+/// Windows: a Run value is a command line of at most 260 characters; a hub
+/// folder that makes it longer is refused before anything is written.
+#[test]
+fn a_hub_folder_too_long_for_the_run_key_is_refused() {
+    if !cfg!(windows) {
+        return;
+    }
+    let root = Root::new("long-dir");
+    let mut run = Run::new(&root);
+    // Never the real Run key, whatever happens.
+    run.env(
+        "CCTG_INSTALL_RUN_KEY",
+        &format!(
+            "HKCU\\Software\\cctg-install-e2e-{}-long\\Run",
+            std::process::id()
+        ),
+    );
+    let hub_dir = root.0.join("h".repeat(200));
+    let dir = hub_dir.to_string_lossy().into_owned();
+    let (output, text) = run.install(&["--hub", "--local", "--yes", "--dir", &dir]);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("Windows runs at most 260 from the Run key"),
+        "{text}"
+    );
+    assert!(!hub_dir.exists(), "{text}");
+    assert!(!run.cctg_dir().exists(), "{text}");
+}
+
 #[test]
 fn the_script_has_unix_line_endings() {
     // A CRLF checkout (core.autocrlf on Windows) breaks `sh`; .gitattributes
@@ -1285,6 +1473,10 @@ const PROXY_MARK: &str = "pp-marker";
 struct Bot {
     state: Mutex<BotState>,
     new_update: tokio::sync::Notify,
+    /// The next this many getMe calls fail with a dropped connection.
+    get_me_failures: std::sync::atomic::AtomicU32,
+    /// After those, this many answer only after 3 s (Telegram far away).
+    slow_get_me: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Default)]
@@ -1431,6 +1623,24 @@ async fn serve_bot(bot: Arc<Bot>) -> u16 {
                 let path = head.split_whitespace().nth(1).unwrap_or_default();
                 let method = path.rsplit('/').next().unwrap_or_default().to_owned();
                 let body: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                if method == "getMe"
+                    && bot
+                        .get_me_failures
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    // A network error: the hub asks again (START_TRIES).
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return;
+                }
+                if method == "getMe"
+                    && bot
+                        .slow_get_me
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
                 let answer = bot.answer(&method, &body).await.to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
@@ -1655,6 +1865,14 @@ fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
     ] {
         run.env_remove(var);
     }
+    // Windows: the installer's shell has its own proxy and state directory;
+    // the hub, also at its first start, has the logon values of the registry
+    // (start-hub.js), which name neither on a test machine.
+    let shell_state = root.0.join("shell-state");
+    if cfg!(windows) {
+        run.env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("CCTG_STATE_DIR", &shell_state.to_string_lossy());
+    }
     run.fake_program("systemctl", FAKE_SYSTEMCTL);
     run.fake_program("launchctl", FAKE_LAUNCHCTL);
     run.fake_program("claude", FAKE_CLAUDE);
@@ -1697,6 +1915,7 @@ fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
     assert!(!log().contains('\u{1b}'), "colour codes in the log file");
     assert!(log().contains("HTTPS_PROXY of the env file"), "{}", log());
     assert!(!log().contains(PROXY_MARK), "{}", log());
+    assert!(!shell_state.exists(), "the shell's CCTG_STATE_DIR was used");
 
     let env = std::fs::read_to_string(hub_dir.join("hub.env")).unwrap();
     assert!(env.starts_with(&mine), "{env}");
@@ -1736,19 +1955,45 @@ fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
     if cfg!(windows) {
         #[cfg(windows)]
         {
+            // A short Run value (at most 260 characters): the paths are in
+            // the launcher, in ASCII (WSH reads the ANSI code page).
             let value = run_value(&run_key).expect("the Run value");
-            assert!(!value.contains(PROXY_MARK), "{value}");
             let native = |path: &Path| path.to_string_lossy().replace('/', "\\");
             assert!(
                 value.ends_with(&format!(
-                    "\\wscript.exe\" //B //Nologo \"{}\" \"{}\" \"{}\" \"{}\"",
+                    "\\wscript.exe\" //B //Nologo \"{}\"",
                     native(&hub_dir.join("start-hub.js")),
-                    native(&exe),
-                    native(&hub_dir.join("hub.env")),
-                    native(&hub_log)
                 )),
                 "{value}"
             );
+            assert!(value.encode_utf16().count() <= 260, "{value}");
+            let launcher = std::fs::read(hub_dir.join("start-hub.js")).unwrap();
+            assert!(
+                launcher.is_ascii(),
+                "{}",
+                String::from_utf8_lossy(&launcher)
+            );
+            let launcher = String::from_utf8(launcher).unwrap();
+            let js = |path: &Path| {
+                native(path)
+                    .encode_utf16()
+                    .map(|unit| match unit {
+                        0x5c => "\\\\".to_owned(),
+                        0x20..0x7f => char::from(unit as u8).to_string(),
+                        _ => format!("\\u{unit:04x}"),
+                    })
+                    .collect::<String>()
+            };
+            assert!(
+                launcher.contains(&format!(
+                    "shell.Run(q(\"{}\") + \" supervise --env-file \" + q(\"{}\") + \" --log-file \" + q(\"{}\"), 0, false);",
+                    js(&exe),
+                    js(&hub_dir.join("hub.env")),
+                    js(&hub_log)
+                )),
+                "{launcher}"
+            );
+            assert!(!launcher.contains(PROXY_MARK), "{launcher}");
         }
     } else if cfg!(target_os = "macos") {
         let plist = std::fs::read_to_string(
@@ -1862,11 +2107,27 @@ fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
     });
 
     // Again: the same binary, the hub started again on it, one supervisor.
+    // The running hub is in its start checks (getMe fails, as with Telegram
+    // out of reach) and fails them only while the installer waits: its
+    // "Error: getMe failed" is not the new hub's, whose getMe is slow.
     let before = log().matches("hub started, polling").count();
+    let mark = log().len();
+    let since_mark = || log().get(mark..).unwrap_or_default().to_owned();
+    bot.slow_get_me.store(1, Ordering::SeqCst);
+    bot.get_me_failures.store(4, Ordering::SeqCst);
+    std::fs::write(run.cctg_dir().join("bin").join("cctg.restart"), "").unwrap();
+    wait_until("the running hub in its getMe retries", || {
+        since_mark().contains("getMe failed; trying again")
+    });
     let (output, text) = run.install(&args);
     assert!(
         output.status.success(),
         "{text}\n--- hub log ---\n{}",
+        log()
+    );
+    assert!(
+        since_mark().contains("Error: getMe failed"),
+        "the old hub did not fail: {}",
         log()
     );
     assert!(text.contains("binary unchanged"), "{text}");

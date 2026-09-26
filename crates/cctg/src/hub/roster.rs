@@ -17,7 +17,7 @@
 //! loses those edits (its codes expire all the same).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::SystemTime;
 
 use serde_json::{Value, json};
@@ -124,10 +124,16 @@ impl JoinInfo {
 }
 
 /// A listener as the hub's machine reaches it: a wildcard or loopback
-/// address is 127.0.0.1.
+/// address is 127.0.0.1, or [::1] for IPv6 (on Windows `[::]` takes IPv6
+/// only).
 fn local_addr(listen: SocketAddr) -> String {
     let ip = match listen.ip() {
-        ip if ip.is_unspecified() || ip.is_loopback() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V4(ip) if ip.is_unspecified() || ip.is_loopback() => {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() || ip.is_loopback() => {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        }
         ip => ip,
     };
     SocketAddr::new(ip, listen.port()).to_string()
@@ -809,16 +815,21 @@ mod tests {
                  | sh -s -- --hub-host 127.0.0.1 --join {code}"
             )
         );
-        // TLS without an address for others: loopback with the pin.
+        // TLS without an address for others: loopback with the pin; an IPv6
+        // wildcard is reached on [::1] (on Windows it takes IPv6 only).
         let local_tls = JoinInfo {
             public: None,
-            agent_listen: "127.0.0.1:5000".parse().unwrap(),
+            agent_listen: "0.0.0.0:5000".parse().unwrap(),
             hook_listen: "[::]:5001".parse().unwrap(),
             ..join_info()
         };
-        assert!(local_tls.line(code).ends_with(&format!(
-            "--agent-addr 127.0.0.1:5000 --hook-addr 127.0.0.1:5001 --pin {hex} --join {code}"
-        )));
+        assert!(
+            local_tls.line(code).ends_with(&format!(
+                "--agent-addr 127.0.0.1:5000 --hook-addr '[::1]:5001' --pin {hex} --join {code}"
+            )),
+            "{}",
+            local_tls.line(code)
+        );
         // An [IPv6] address is quoted: unquoted it is a glob pattern.
         let v6 = JoinInfo {
             public: Some(PublicAddrs {
@@ -856,7 +867,7 @@ mod tests {
         assert!(
             v6_listener
                 .line(code)
-                .contains("--agent-addr '[2001:db8::5]:5000' --hook-addr 127.0.0.1:5001 "),
+                .contains("--agent-addr '[2001:db8::5]:5000' --hook-addr '[::1]:5001' "),
             "{}",
             v6_listener.line(code)
         );

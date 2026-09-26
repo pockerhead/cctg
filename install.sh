@@ -50,6 +50,10 @@ HOST_MARK_GIVEN="$HOST_MARKED (--host)"
 PATH_LINE="export PATH=\"\$HOME/.local/bin:\$PATH\" # cctg"
 # hub.env: the hub runs without a proxy (so the question is not asked again).
 PROXY_NONE='# HTTPS_PROXY: none (install.sh --hub)'
+# hub.env of --hub --local: "$LISTEN_MARK <key>" marks a CCTG_*_LISTEN line
+# this script chose; it is chosen again on every run. Unmarked ones are the
+# user's and stay.
+LISTEN_MARK='# written by install.sh --hub --local, rewritten on each run:'
 AGENT_PORT=47291
 HOOK_PORT=47292
 # The local hub's autostart entry (--hub --local): the systemd user unit,
@@ -934,7 +938,7 @@ write_hub_env() {
     {
         if [ -f "$hub_env" ]; then
             grep -v -E "^[[:space:]]*(export[[:space:]]+)?($keys)[[:space:]]*=" "$hub_env" \
-                | grep -v -x -F "$PROXY_NONE" || true
+                | grep -v -x -F "$PROXY_NONE" | grep -v -F "$LISTEN_MARK" || true
         else
             printf '%s\n' "$1"
         fi
@@ -968,16 +972,31 @@ make_cert() {
     normalize_pin "$fp"
 }
 
-# The client flags for a hub at <host>: --hub-host at the usual ports. An
-# [IPv6] host is quoted: unquoted it is a glob pattern (zsh fails on it).
+# hub_where <host> <agent port> <hook port> [<hook host>]: the client flags
+# for a hub at <host>: --hub-host at the usual ports. An [IPv6] host is
+# quoted: unquoted it is a glob pattern (zsh fails on it).
 hub_where() {
+    h=${4:-$1}
     q=
+    qh=
     case $1 in \[*) q="'" ;; esac
-    if [ "$2:$3" = "$AGENT_PORT:$HOOK_PORT" ]; then
+    case $h in \[*) qh="'" ;; esac
+    if [ "$h" = "$1" ] && [ "$2:$3" = "$AGENT_PORT:$HOOK_PORT" ]; then
         printf '%s' "--hub-host $q$1$q"
     else
-        printf '%s' "--agent-addr $q$1:$2$q --hook-addr $q$1:$3$q"
+        printf '%s' "--agent-addr $q$1:$2$q --hook-addr $qh$h:$3$qh"
     fi
+}
+
+# The host this machine reaches a listener (ip:port, empty: the default
+# 127.0.0.1) at: 127.0.0.1 for 0.0.0.0, [::1] for [::] (on Windows it takes
+# IPv6 only), else the address itself.
+loopback_of() {
+    case ${1%:*} in
+        ''|0.0.0.0|127.*) printf '%s' 127.0.0.1 ;;
+        \[::\]|\[::1\]) printf '%s' '[::1]' ;;
+        *) printf '%s' "${1%:*}" ;;
+    esac
 }
 
 # check_public_host <host> <error text>: a host name, an IPv4 address or an
@@ -1151,6 +1170,8 @@ local_hub_paths() {
             auto_file=$hub_dir/start-hub.js
             run_key=${CCTG_INSTALL_RUN_KEY:-'HKCU\Software\Microsoft\Windows\CurrentVersion\Run'}
             wscript=$(cygpath -W)/System32/wscript.exe
+            # The Run value; the paths of the hub are in the launcher.
+            run_cmd="\"$(cygpath -w "$wscript")\" //B //Nologo \"$(cygpath -w "$auto_file")\""
             ;;
     esac
     # They go into a unit file, a plist or a command line unescaped.
@@ -1159,6 +1180,71 @@ local_hub_paths() {
             *[\"\$\`%\\\&\<\>]*) die "the path $p has a character the autostart entry cannot carry" ;;
         esac
     done
+}
+
+# user_listen <key>: the value of the user's own CCTG_*_LISTEN line in
+# hub.env; empty when there is none or this script wrote it (LISTEN_MARK).
+user_listen() {
+    grep -q -x -F "$LISTEN_MARK $1" "$hub_env" 2>/dev/null || value_of "$hub_env" "$1"
+}
+
+# The local hub's listeners for $public_host: $agent_port and $hook_port,
+# and for write_hub_env the keys to drop ($listen_keys, "|KEY...") and the
+# lines to write ($listen_lines). The user's own CCTG_*_LISTEN lines stay.
+# For other machines the rest listen on every address of the host's kind
+# (a loopback host only in tests: no firewall question), marked to be
+# chosen again on the next run.
+listeners() {
+    agent_listen=$(user_listen CCTG_AGENT_LISTEN)
+    hook_listen=$(user_listen CCTG_HOOK_LISTEN)
+    agent_port=${agent_listen##*:}
+    hook_port=${hook_listen##*:}
+    agent_port=${agent_port:-$AGENT_PORT}
+    hook_port=${hook_port:-$HOOK_PORT}
+    case $public_host in
+        '') wild= ;;
+        localhost|127.*) wild=127.0.0.1 ;;
+        \[::1\]) wild='[::1]' ;;
+        \[*) wild='[::]' ;;
+        *) wild=0.0.0.0 ;;
+    esac
+    listen_keys=
+    listen_lines=
+    if [ -z "$agent_listen" ]; then
+        listen_keys="$listen_keys|CCTG_AGENT_LISTEN"
+        [ -z "$wild" ] || listen_lines="$LISTEN_MARK CCTG_AGENT_LISTEN
+CCTG_AGENT_LISTEN=$wild:$agent_port"
+    fi
+    if [ -z "$hook_listen" ]; then
+        listen_keys="$listen_keys|CCTG_HOOK_LISTEN"
+        [ -z "$wild" ] || listen_lines="${listen_lines:+$listen_lines
+}$LISTEN_MARK CCTG_HOOK_LISTEN
+CCTG_HOOK_LISTEN=$wild:$hook_port"
+    fi
+}
+
+# This machine's client flags: each listener of hub.env at the address it
+# takes loopback connections on.
+local_where() {
+    hub_where "$(loopback_of "$(value_of "$hub_env" CCTG_AGENT_LISTEN)")" "$agent_port" "$hook_port" \
+        "$(loopback_of "$(value_of "$hub_env" CCTG_HOOK_LISTEN)")"
+}
+
+# js_string <text>: a JScript string literal of <text> in ASCII (Windows
+# Script Host reads a .js file in the ANSI code page). Windows only: od
+# reads the UTF-16 units in the machine's (little-endian) byte order.
+js_string() {
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | od -An -v -tu2 | awk '
+        BEGIN { printf "\"" }
+        {
+            for (i = 1; i <= NF; i++) {
+                n = $i + 0
+                if (n == 92) printf "\\\\"
+                else if (n >= 32 && n < 127 && n != 34) printf "%c", n
+                else printf "\\u%04x", n
+            }
+        }
+        END { printf "\"" }'
 }
 
 # The autostart of this system is there to use, before anything is written.
@@ -1173,6 +1259,11 @@ check_autostart() {
         windows)
             [ -f "$wscript" ] || die "--hub --local needs Windows Script Host ($wscript) to start the hub without a window"
             command -v reg >/dev/null 2>&1 || die "--hub --local needs reg.exe"
+            command -v iconv >/dev/null 2>&1 || die "--hub --local needs iconv (Git Bash has it)"
+            # A Run value is a command line of at most 260 characters.
+            n=$(printf '%s' "$run_cmd" | iconv -f UTF-8 -t UTF-16LE | wc -c)
+            n=$((n / 2))
+            [ "$n" -le 260 ] || die "the autostart command would be $n characters, Windows runs at most 260 from the Run key: choose a shorter --dir than $(native "$hub_dir")"
             ;;
     esac
 }
@@ -1195,15 +1286,8 @@ setup_local_hub() {
     ask_hub_settings
     install_binary
 
-    # Listen ports: the user's CCTG_*_LISTEN lines, else the defaults.
-    agent_listen=$(value_of "$hub_env" CCTG_AGENT_LISTEN)
-    hook_listen=$(value_of "$hub_env" CCTG_HOOK_LISTEN)
-    agent_port=${agent_listen##*:}
-    hook_port=${hook_listen##*:}
-    agent_port=${agent_port:-$AGENT_PORT}
-    hook_port=${hook_port:-$HOOK_PORT}
+    listeners
     more="CCTG_STATE_DIR=$(squote "$(native "$state_dir")")"
-    managed="CCTG_STATE_DIR|CCTG_TLS_CERT|CCTG_TLS_KEY|CCTG_PUBLIC_AGENT_ADDR|CCTG_PUBLIC_HOOK_ADDR"
     pin=
     if [ -n "$public_host" ]; then
         mkdir -p "$hub_dir/tls"
@@ -1214,31 +1298,23 @@ CCTG_TLS_CERT=$(squote "$(native "$hub_dir/tls/cert.pem")")
 CCTG_TLS_KEY=$(squote "$(native "$hub_dir/tls/key.pem")")
 CCTG_PUBLIC_AGENT_ADDR=$public_host:$agent_port
 CCTG_PUBLIC_HOOK_ADDR=$public_host:$hook_port"
-        # Other machines: every address, unless the user chose one (a
-        # loopback host only in tests: no firewall question).
-        case $public_host in
-            localhost|127.*) wild=127.0.0.1 ;;
-            \[::1\]) wild='[::1]' ;;
-            \[*) wild='[::]' ;;
-            *) wild=0.0.0.0 ;;
-        esac
-        [ -n "$agent_listen" ] || more="$more
-CCTG_AGENT_LISTEN=$wild:$agent_port"
-        [ -n "$hook_listen" ] || more="$more
-CCTG_HOOK_LISTEN=$wild:$hook_port"
-        [ -n "$agent_listen$hook_listen" ] || managed="$managed|CCTG_AGENT_LISTEN|CCTG_HOOK_LISTEN"
     fi
+    [ -z "$listen_lines" ] || more="$more
+$listen_lines"
     write_hub_env "# cctg hub on this machine, written by install.sh --hub --local. Never commit." \
-        "$managed" "$more"
+        "CCTG_STATE_DIR|CCTG_TLS_CERT|CCTG_TLS_KEY|CCTG_PUBLIC_AGENT_ADDR|CCTG_PUBLIC_HOOK_ADDR$listen_keys" \
+        "$more"
 
     : >"$marker"
     offset=$(log_size)
     start_local_hub
     wait_local_hub
-    code=$("$exe" hub --env-file "$(native "$hub_env")" code </dev/null) \
+    # The state directory of hub.env, as the hub has it (it runs with the
+    # logon environment, not the installer's).
+    code=$(unset CCTG_STATE_DIR; "$exe" hub --env-file "$(native "$hub_env")" code </dev/null) \
         || die "the hub is up but gave no join code; ask it: $exe hub --env-file $(native "$hub_env") code"
     raw_line="curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | sh -s --"
-    where=$(hub_where 127.0.0.1 "$agent_port" "$hook_port")
+    where=$(local_where)
     [ -z "$pin" ] || where="$where --pin $pin"
     say "the hub runs on this machine and starts at logon; its log: $(native "$hub_log")"
     [ "$os" != linux ] || say "note: it runs while you are logged in; to keep it running after logout: loginctl enable-linger $(id -un)"
@@ -1318,30 +1394,53 @@ EOF
             launchctl bootstrap "gui/$uid" "$auto_file" </dev/null || die "launchctl bootstrap gui/$uid $auto_file failed"
             ;;
         windows)
-            put "$auto_file" 644 <<'EOF'
+            {
+                cat <<'EOF'
 // cctg hub at logon without a window, written by install.sh --hub --local
-// (cctg-install). Arguments: cctg.exe, hub.env, the log file. Run(..., 0):
-// hidden, not waited for.
-var a = WScript.Arguments;
+// (cctg-install). The hub's variables (CCTG_*, proxies) are the logon ones
+// of the registry, also when the installer starts it from a shell that has
+// others. Run(..., 0): hidden, not waited for.
+var shell = new ActiveXObject("WScript.Shell");
+var env = shell.Environment("Process");
+function logon(name) {
+    var kinds = ["Volatile", "User", "System"];
+    for (var k = 0; k < kinds.length; k++) {
+        var value = shell.Environment(kinds[k])(name);
+        if (value) return shell.ExpandEnvironmentStrings(value);
+    }
+    return "";
+}
+var names = [];
+for (var e = new Enumerator(env); !e.atEnd(); e.moveNext()) {
+    var name = String(e.item()).split("=")[0];
+    if (/^(CCTG_|(HTTPS?|ALL|NO)_PROXY$)/i.test(name)) names.push(name);
+}
+for (var i = 0; i < names.length; i++) {
+    var value = logon(names[i]);
+    if (value) env(names[i]) = value; else env.Remove(names[i]);
+}
 function q(s) { return '"' + s + '"'; }
-new ActiveXObject("WScript.Shell").Run(q(a(0)) + " supervise --env-file " + q(a(1)) + " --log-file " + q(a(2)), 0, false);
 EOF
-            w=$(cygpath -w "$wscript")
-            args="\"$(cygpath -w "$auto_file")\" \"$(cygpath -w "$exe")\" \"$(cygpath -w "$hub_env")\" \"$(cygpath -w "$hub_log")\""
+                printf 'shell.Run(q(%s) + " supervise --env-file " + q(%s) + " --log-file " + q(%s), 0, false);\n' \
+                    "$(js_string "$(cygpath -w "$exe")")" "$(js_string "$(cygpath -w "$hub_env")")" \
+                    "$(js_string "$(cygpath -w "$hub_log")")"
+            } | put "$auto_file" 644
             MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' reg add "$run_key" /v "$HUB_RUN_VALUE" /t REG_SZ \
-                /d "\"$w\" //B //Nologo $args" /f </dev/null >/dev/null || die "reg add $run_key failed"
+                /d "$run_cmd" /f </dev/null >/dev/null || die "reg add $run_key failed"
             # A running supervisor restarts its hub on the new binary; a
-            # second one started now leaves at once.
+            # second one started now leaves at once. The same command as at
+            # logon.
             : >"$bin_dir/cctg.restart"
-            MSYS_NO_PATHCONV=1 "$wscript" //B //Nologo "$(cygpath -w "$auto_file")" \
-                "$(cygpath -w "$exe")" "$(cygpath -w "$hub_env")" "$(cygpath -w "$hub_log")" </dev/null \
+            MSYS_NO_PATHCONV=1 "$wscript" //B //Nologo "$(cygpath -w "$auto_file")" </dev/null \
                 || die "wscript could not start the hub"
             ;;
     esac
 }
 
 # The hub's own start checks end in "hub started, polling"; a failed one
-# ends the hub with "Error: ..." (the supervisor then tries again).
+# ends the hub with "Error: ..." (the supervisor then tries again). Only
+# hubs the supervisor started after $offset count: an older hub still in
+# its start checks writes its own "Error: ..." while it is being stopped.
 wait_local_hub() {
     i=0
     logs=
@@ -1350,8 +1449,12 @@ wait_local_hub() {
         [ "$(log_size)" -ge "$offset" ] || offset=0
         logs=$(tail -c "+$((offset + 1))" "$hub_log" 2>/dev/null || true)
         case $logs in
-            *"hub started, polling"*) say "hub started: bot and group checked"; return 0 ;;
-            *"Error: "*) break ;;
+            *"hub started pid="*)
+                case ${logs#*"hub started pid="} in
+                    *"hub started, polling"*) say "hub started: bot and group checked"; return 0 ;;
+                    *"Error: "*) break ;;
+                esac
+                ;;
         esac
         i=$((i + 1))
     done
@@ -1400,7 +1503,7 @@ uninstall_local_hub() {
             MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' reg delete "$run_key" /v "$HUB_RUN_VALUE" /f </dev/null >/dev/null 2>&1 || true
             remove "$auto_file"
             # No service manager: the supervisor stops on cctg.stop.
-            : >"$bin_dir/cctg.stop"
+            [ ! -d "$bin_dir" ] || : >"$bin_dir/cctg.stop"
             wait_stopped "stopping: cctg.stop"
             rm -f "$bin_dir/cctg.stop"
             ;;
