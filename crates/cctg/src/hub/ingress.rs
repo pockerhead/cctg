@@ -30,8 +30,8 @@ use tracing::{debug, info, warn};
 use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
 use crate::wire::{
     self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, Liveness,
-    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, Register,
-    Rejection, Secret, WireError,
+    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, QUESTION_PATH,
+    QuestionAnswer, QuestionPost, Register, Rejection, Secret, WireError,
 };
 
 /// Time an agent has from its TCP connect to finish the TLS handshake (when
@@ -62,13 +62,17 @@ const MAX_PENDING_HOOKS_PER_PEER: usize = 16;
 const NOISE_WARN_EVERY: Duration = Duration::from_secs(60);
 /// Peer addresses remembered for that; beyond them, debug only.
 const NOISE_PEERS: usize = 1024;
-/// `PermissionRequest` hooks waiting for an answer at a time; one more gets
-/// no decision at once. They do not count against [`MAX_HOOK_REQUESTS`].
+/// `PermissionRequest` and `AskUserQuestion` hooks waiting for an answer at
+/// a time; one more gets no decision at once. They do not count against
+/// [`MAX_HOOK_REQUESTS`].
 pub const MAX_PERMISSION_WAITS: usize = 16;
 /// Longest wait for the hub's answer to a `PermissionRequest` hook. The slot
 /// actor gives up earlier (`slots::HOOK_ANSWER_WAIT`); this only bounds a
 /// request the actor never answers.
 pub const PERMISSION_WAIT_CAP: Duration = Duration::from_secs(95);
+/// Longest wait for the hub's answers to an `AskUserQuestion` hook; the slot
+/// actor gives up earlier (`slots::QUESTION_WAIT`).
+pub const QUESTION_WAIT_CAP: Duration = Duration::from_secs(305);
 const MAX_HEAD: usize = 8 * 1024;
 const TO_AGENT_QUEUE: usize = 64;
 /// How long, and how much, a rejected peer's unread input is drained.
@@ -670,9 +674,20 @@ pub struct PermissionAsk {
     pub answer: oneshot::Sender<Option<Behavior>>,
 }
 
-/// Where `PermissionRequest` hooks go, and how many may wait at a time.
+/// An `AskUserQuestion` `PreToolUse` hook waiting for the answers (TASK-038).
+#[derive(Debug)]
+pub struct QuestionAsk {
+    pub post: QuestionPost,
+    /// `Some`: one answer per question, chosen in Telegram. `None` or
+    /// dropped: no decision.
+    pub answer: oneshot::Sender<Option<Vec<String>>>,
+}
+
+/// Where waiting hooks go, and how many may wait at a time. `questions`:
+/// `None` answers `POST /v1/question` with 404.
 struct PermissionWaits {
     asks: mpsc::Sender<PermissionAsk>,
+    questions: Option<mpsc::Sender<QuestionAsk>>,
     waiting: Arc<Semaphore>,
 }
 
@@ -700,6 +715,26 @@ pub async fn serve_hooks_and_permissions(
 ) {
     let waits = PermissionWaits {
         asks,
+        questions: None,
+        waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
+    };
+    serve(listener.into(), secret, events, Some(waits)).await;
+}
+
+/// [`serve_hooks_and_permissions`] plus `POST /v1/question`: each such
+/// request goes to `questions` and is held open until the hub answers (at
+/// most [`QUESTION_WAIT_CAP`]). Permission and question hooks share the
+/// [`MAX_PERMISSION_WAITS`] places.
+pub async fn serve_hooks_and_asks(
+    listener: impl Into<Listener>,
+    secret: Secret,
+    events: mpsc::Sender<HookPost>,
+    asks: mpsc::Sender<PermissionAsk>,
+    questions: mpsc::Sender<QuestionAsk>,
+) {
+    let waits = PermissionWaits {
+        asks,
+        questions: Some(questions),
         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
     };
     serve(listener.into(), secret, events, Some(waits)).await;
@@ -812,6 +847,13 @@ async fn hook_request(
             }
             None => Status::NotFound,
         },
+        Ok(Ok((Route::Question, body))) => match waits {
+            Some(waits) if waits.questions.is_some() => {
+                drop(permit);
+                return question_request(stream, peer, &body, waits).await;
+            }
+            _ => Status::NotFound,
+        },
         Ok(Err(Some(status))) => {
             if status == Status::Unauthorized {
                 pre_auth!(gate, peer, %peer, "hook request rejected: bad or missing secret");
@@ -886,13 +928,9 @@ async fn permission_request(
         );
         return respond(&mut stream, Status::NoContent, &[]).await;
     }
-    let behavior = tokio::select! {
-        decided = decided => decided.ok().flatten(),
-        () = gone(&mut stream) => {
-            debug!(session, "permission hook went away before an answer");
-            return;
-        }
-        () = tokio::time::sleep(PERMISSION_WAIT_CAP) => None,
+    let Some(behavior) = wait_for(&mut stream, decided, PERMISSION_WAIT_CAP).await else {
+        debug!(session, "permission hook went away before an answer");
+        return;
     };
     match behavior {
         Some(behavior) => {
@@ -905,6 +943,73 @@ async fn permission_request(
             debug!(session, "permission hook answered without a decision");
             respond(&mut stream, Status::NoContent, &[]).await;
         }
+    }
+}
+
+/// Hands an `AskUserQuestion` hook to the hub and holds the connection until
+/// the answers, like [`permission_request`].
+async fn question_request(
+    mut stream: Stream,
+    peer: SocketAddr,
+    body: &[u8],
+    waits: &PermissionWaits,
+) {
+    let Some(questions) = waits.questions.as_ref() else {
+        return respond(&mut stream, Status::NotFound, &[]).await;
+    };
+    let post = match wire::decode_question(body) {
+        Ok(post) => post,
+        Err(error) => {
+            debug!(%error, "question hook body rejected");
+            warn!(%peer, status = Status::BadRequest.code(), "hook request rejected");
+            return respond(&mut stream, Status::BadRequest, &[]).await;
+        }
+    };
+    let session = short(&post.session_id).to_owned();
+    let Ok(_waiting) = waits.waiting.clone().try_acquire_owned() else {
+        warn!(
+            session,
+            "too many hooks wait; question answered without a decision"
+        );
+        return respond(&mut stream, Status::NoContent, &[]).await;
+    };
+    let (answer, decided) = oneshot::channel();
+    if questions.try_send(QuestionAsk { post, answer }).is_err() {
+        warn!(
+            session,
+            "hub cannot take a question hook now; answered without a decision"
+        );
+        return respond(&mut stream, Status::NoContent, &[]).await;
+    }
+    let Some(answers) = wait_for(&mut stream, decided, QUESTION_WAIT_CAP).await else {
+        debug!(session, "question hook went away before an answer");
+        return;
+    };
+    match answers {
+        Some(answers) => {
+            info!(session, "question hook answered from Telegram");
+            let body = serde_json::to_vec(&QuestionAnswer { answers })
+                .expect("question answers always serialize");
+            respond(&mut stream, Status::Ok, &body).await;
+        }
+        None => {
+            debug!(session, "question hook answered without a decision");
+            respond(&mut stream, Status::NoContent, &[]).await;
+        }
+    }
+}
+
+/// The hub's answer on `decided`, at most `cap` later. `None`: the hook went
+/// away first; `Some(None)`: no decision (none, dropped, or time ran out).
+async fn wait_for<T>(
+    stream: &mut Stream,
+    decided: oneshot::Receiver<Option<T>>,
+    cap: Duration,
+) -> Option<Option<T>> {
+    tokio::select! {
+        decided = decided => Some(decided.ok().flatten()),
+        () = gone(stream) => None,
+        () = tokio::time::sleep(cap) => Some(None),
     }
 }
 
@@ -990,6 +1095,7 @@ fn other_version(version: Option<&str>) -> Option<&str> {
 enum Route {
     Hook,
     Permission,
+    Question,
     Ping,
 }
 
@@ -1041,6 +1147,7 @@ async fn read_request<S: AsyncRead + Unpin>(
     let route = match target {
         HOOK_PATH => Route::Hook,
         PERMISSION_PATH => Route::Permission,
+        QUESTION_PATH => Route::Question,
         PING_PATH => Route::Ping,
         _ => return Err(Some(Status::NotFound)),
     };
