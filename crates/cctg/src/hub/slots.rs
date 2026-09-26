@@ -7769,6 +7769,7 @@ again"
                 quote: Some("Which color?".into()),
                 forwarded: false,
                 media: None,
+                from_name: None,
             }))
             .unwrap();
         settled(&rig, |ops| {
