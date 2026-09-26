@@ -1,0 +1,6 @@
+     Running tests\hook_cli.rs (C:/Users/user/dev/cctg/target\debug\deps\hook_cli-b1885ce6542a5431.exe)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+     Running tests\install_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\install_e2e-f992769144e721bf.exe)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.73s
+     Running tests\question_hook_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\question_hook_e2e-b642e35242917a28.exe)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s
