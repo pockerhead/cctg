@@ -142,7 +142,7 @@ struct Hub {
     control: mpsc::UnboundedSender<Control>,
     _hooks: mpsc::Sender<HookPost>,
     _agents: mpsc::Sender<AgentEvent>,
-    _to_agent: mpsc::Receiver<HubMsg>,
+    to_agent: mpsc::Receiver<HubMsg>,
     _state: TempState,
 }
 
@@ -262,7 +262,7 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
         control,
         _hooks: hooks,
         _agents: agents,
-        _to_agent: to_agent_rx,
+        to_agent: to_agent_rx,
         _state: TempState(state),
     }
 }
@@ -342,6 +342,7 @@ fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
             query_id: "q".into(),
             data: Some(questions::callback_data(id, question, press)),
             message_id: Some(message_id),
+            thread_id: Some(100),
             from_name: None,
         }))
         .unwrap();
@@ -419,7 +420,7 @@ async fn choices_in_the_topic_are_the_hooks_answers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_text_answers_after_other_or_as_a_reply() {
-    let hub = hub("other", Duration::from_secs(60)).await;
+    let mut hub = hub("other", Duration::from_secs(60)).await;
     let running = tokio::spawn(run_hook(home("other", &hub.addr), "PreToolUse"));
     until("question", || hub.fake.questions().len() == 1).await;
     let (message_id, id) = hub.fake.questions().remove(0);
@@ -427,17 +428,28 @@ async fn own_text_answers_after_other_or_as_a_reply() {
     // Cyrillic own text: the hook's stdout carries it as UTF-8 JSON.
     say(&hub, 50, "Бирюзовый, как море", None);
     // The second question: a tick, then a reply to the question message.
+    // Both come before Telegram's answer tells the hub the message id
+    // (TASK-060); so does a reply to another message, which is no answer.
     press(&hub, message_id, &id, 1, Press::Option(1));
-    // A reply needs the message the user sees: the hub knows its id once it
-    // edits it (a press, unlike a reply, does not wait for that).
-    until("message known", || {
-        hub.fake.last_edit_of(message_id).is_some()
-    })
-    .await;
-    say(&hub, 51, "and a fig", Some(message_id));
+    say(&hub, 51, "not for the question", Some(777));
+    say(&hub, 52, "and a fig", Some(message_id));
     let (output, _) = running.await.unwrap();
     assert_clean(&output);
     assert_answers(&output, "Бирюзовый, как море", "Pear, and a fig");
+    let reached = async {
+        loop {
+            match hub.to_agent.recv().await {
+                Some(HubMsg::Inbound { content, .. }) => return content,
+                Some(_) => {}
+                None => panic!("agent link closed"),
+            }
+        }
+    };
+    let content = tokio::time::timeout(Duration::from_secs(30), reached)
+        .await
+        .expect("the other reply reaches the session in time");
+    assert!(content.contains("not for the question"), "{content}");
+    assert!(!content.contains("fig"), "{content}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

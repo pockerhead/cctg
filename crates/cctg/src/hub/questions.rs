@@ -473,16 +473,31 @@ impl Asks {
             .map(|(key, _)| *key)
     }
 
-    /// The one ask with id `id` whose message is on its way to Telegram:
-    /// its buttons can be pressed before Telegram's answer with the message
-    /// id reaches the hub. `None` when no or several asks match.
-    pub fn in_flight(&self, id: &str) -> Option<u64> {
-        let mut found = self
-            .asks
-            .iter()
-            .filter(|(_, ask)| ask.sending && ask.message_id.is_none() && ask.id == id);
+    /// The one ask with id `id` whose message is on its way to Telegram in
+    /// topic `thread_id`: its buttons can be pressed before Telegram's
+    /// answer with the message id reaches the hub. `None` when no or several
+    /// asks match, or the topic is unknown.
+    pub fn in_flight(&self, id: &str, thread_id: Option<i64>) -> Option<u64> {
+        let thread_id = thread_id?;
+        let mut found = self.asks.iter().filter(|(_, ask)| {
+            ask.sending
+                && ask.message_id.is_none()
+                && ask.id == id
+                && ask.thread_id == Some(thread_id)
+        });
         let (key, _) = found.next()?;
         found.next().is_none().then_some(*key)
+    }
+
+    /// Topic `thread_id` has an open ask whose message id is not known yet:
+    /// a reply there may answer it before the hub can tell.
+    pub fn sending_in(&self, thread_id: i64) -> bool {
+        self.asks.values().any(|ask| {
+            ask.is_open()
+                && ask.sending
+                && ask.message_id.is_none()
+                && ask.thread_id == Some(thread_id)
+        })
     }
 
     /// The open ask of topic `thread_id` a text message answers: the one it
@@ -809,18 +824,29 @@ mod tests {
         let mut book = Asks::default();
         let mut sending = ask(vec![question("A?", false, &["x"])]);
         sending.sending = true;
+        sending.thread_id = Some(100);
         let key = book.open(sending).unwrap();
-        assert_eq!(book.in_flight("abcde"), Some(key));
-        assert_eq!(book.in_flight("bcdef"), None);
+        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
+        assert!(book.sending_in(100));
+        assert_eq!(book.in_flight("bcdef", Some(100)), None);
+        assert_eq!(book.in_flight("abcde", Some(101)), None, "other topic");
+        assert!(!book.sending_in(101));
+        assert_eq!(book.in_flight("abcde", None), None, "topic unknown");
         let mut twin = ask(vec![question("B?", false, &["y"])]);
         twin.session = "t".into();
         twin.sending = true;
+        twin.thread_id = Some(100);
         let twin = book.open(twin).unwrap();
-        assert_eq!(book.in_flight("abcde"), None, "ambiguous");
+        assert_eq!(book.in_flight("abcde", Some(100)), None, "ambiguous");
         book.get_mut(twin).unwrap().message_id = Some(6);
-        assert_eq!(book.in_flight("abcde"), Some(key));
+        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
         book.get_mut(key).unwrap().sending = false;
-        assert_eq!(book.in_flight("abcde"), None, "not handed to Telegram");
+        assert_eq!(
+            book.in_flight("abcde", Some(100)),
+            None,
+            "not handed to Telegram"
+        );
+        assert!(!book.sending_in(100));
     }
 
     /// The review's repro: ✏️ Другое armed, then a reply to some other bot
