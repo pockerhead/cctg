@@ -151,22 +151,6 @@ fn checked_icons(lookup: Result<Vec<Sticker>, ApiError>) -> anyhow::Result<Icons
     Ok(icons)
 }
 
-/// A proxy variable of the process environment that reqwest (the Bot API
-/// client) takes on its own (TASK-035 decision 2: a server that reaches
-/// Telegram only through a local proxy). Only whether one is set.
-fn proxy_in_env() -> bool {
-    [
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ]
-    .iter()
-    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
-}
-
 /// How long `cctg health` waits for each listener.
 const HEALTH_WAIT: Duration = Duration::from_secs(3);
 
@@ -286,19 +270,29 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         .await
         .with_context(|| format!("cannot listen for hooks; check {HOOK_LISTEN_VAR}"))?;
     // The error names the variable, never the file contents.
-    let acceptor = match &config.tls {
+    let (acceptor, pin) = match &config.tls {
         Some(files) => {
             let (acceptor, pin) = crate::tls::Acceptor::from_files(&files.cert, &files.key)?;
             // Not a secret: devices put it in CCTG_HUB_CERT_SHA256.
             info!(sha256 = %pin, "TLS certificate loaded");
-            Some(acceptor)
+            (Some(acceptor), Some(pin))
         }
-        None => None,
+        None => (None, None),
+    };
+    // What `/join` puts in a device's install line (TASK-046).
+    let join = roster::JoinInfo {
+        release: crate::client::release().map(str::to_owned),
+        public: config.public.clone(),
+        agent_listen: config.agent_listen,
+        hook_listen: config.hook_listen,
+        pin,
     };
     let agent_listener = Listener::new(agent_listener, acceptor.clone());
     let hook_listener = Listener::new(hook_listener, acceptor);
-    if proxy_in_env() {
+    if config.proxy.is_some() {
         // Never the value: a proxy URL can carry a user and a password.
+        info!("Bot API requests go through HTTPS_PROXY of the env file");
+    } else if config::proxy_in_env() {
         info!("Bot API requests go through the proxy of the environment");
     }
     if config.api_url != api::TELEGRAM_API {
@@ -309,6 +303,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         &config.api_url,
         &config.token,
         config.chat_id,
+        config.proxy.as_ref(),
     )?);
 
     // A network hiccup at start (seen live: a TLS handshake cut) must not
@@ -388,6 +383,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         roster_rx,
         outbox,
         devices.clone(),
+        join,
         me.username.clone(),
     ));
     let (agents_tx, agents_rx) = mpsc::channel(256);
@@ -595,6 +591,10 @@ mod tests {
             ..input("/devices")
         }));
         route(Routed::Input(input("/devices")));
+        route(Routed::Input(Inbound {
+            thread_id: None,
+            ..input("/join")
+        }));
         route(Routed::Callback(updates::CallbackInput {
             query_id: "d".to_owned(),
             data: Some("dev:n".to_owned()),
@@ -644,6 +644,10 @@ mod tests {
                 thread_id: None,
                 ..
             })
+        ));
+        assert!(matches!(
+            roster_rx.try_recv().unwrap(),
+            roster::Input::Command(Inbound { text: Some(text), thread_id: None, .. }) if text == "/join"
         ));
         assert!(matches!(
             roster_rx.try_recv().unwrap(),

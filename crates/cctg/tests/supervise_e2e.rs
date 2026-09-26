@@ -23,7 +23,11 @@
 //! 7. Ctrl+Break (SIGTERM on Unix): the supervisor stops, its hub stops
 //!    gracefully (registry written), nothing listens any more.
 //!
-//! About 30 s. Runs in the normal `cargo test`.
+//! Then (TASK-046) a supervisor with `--log-file` whose hub exits at once
+//! (no configuration) stops on `cctg.stop` during the wait between
+//! restarts: "supervisor stopped" in the log, exit code 0, the file gone.
+//!
+//! About 40 s. Runs in the normal `cargo test`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
@@ -70,7 +74,12 @@ fn main() {
         .enable_all()
         .build()
         .expect("runtime");
-    let outcome = std::panic::catch_unwind(|| runtime.block_on(scenario()));
+    let outcome = std::panic::catch_unwind(|| {
+        runtime.block_on(async {
+            scenario().await;
+            a_crash_looping_hub_stops_on_the_stop_file().await;
+        })
+    });
     if outcome.is_err() {
         if let Some(log) = SUPERVISOR_LOG.get() {
             eprintln!(
@@ -649,4 +658,54 @@ async fn scenario() {
     // Graceful stops: one per deploy that stopped a hub, and the last one.
     assert!(log.matches("slot registry saved").count() >= 3, "{log}");
     drop(agent);
+}
+
+/// A supervisor whose hub exits at once (no token, no env file) waits
+/// between restarts; `cctg.stop` ends that wait with "supervisor stopped".
+async fn a_crash_looping_hub_stops_on_the_stop_file() {
+    let root =
+        Root(std::env::temp_dir().join(format!("cctg-supervise-e2e-crash-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    let [bin, home, work] = ["bin", "home", "work"].map(|name| root.0.join(name));
+    for dir in [&bin, &home, &work] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let exe = bin.join(format!("cctg{EXE}"));
+    common::write_program(&exe, &std::fs::read(env!("CARGO_BIN_EXE_cctg")).unwrap());
+    let hub_log = root.0.join("hub.log");
+    let read_log = || std::fs::read_to_string(&hub_log).unwrap_or_default();
+
+    let mut command = clean_command(&exe, &home);
+    command
+        .arg("supervise")
+        .arg("--log-file")
+        .arg(&hub_log)
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut supervisor = Proc(command.spawn().expect("cctg supervise"));
+
+    wait_for("two hub exits", || {
+        read_log().matches("hub exited; restarting it").count() >= 2
+    })
+    .await;
+    let stop_file = bin.join("cctg.stop");
+    std::fs::write(&stop_file, b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = supervisor.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor did not stop in 5 s:\n{}",
+            read_log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let log = read_log();
+    assert!(status.success(), "{status:?}\n{log}");
+    assert!(log.contains("supervisor stopped"), "{log}");
+    assert!(!stop_file.exists(), "cctg.stop is removed");
 }

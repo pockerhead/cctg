@@ -35,6 +35,16 @@ pub const DEFAULT_HOOK_LISTEN: SocketAddr =
 /// it at a fake. Plain `http://` only to a loopback host: the token travels
 /// in the URL path.
 pub const API_URL_VAR: &str = "CCTG_BOT_API_URL";
+/// Optional, with [`PUBLIC_HOOK_VAR`]: how other devices reach the agent
+/// listener (`host:port`), for the install line `/join` gives (TASK-046).
+/// install.sh --hub writes both.
+pub const PUBLIC_AGENT_VAR: &str = "CCTG_PUBLIC_AGENT_ADDR";
+/// Optional, with [`PUBLIC_AGENT_VAR`]: how other devices reach the hook
+/// listener.
+pub const PUBLIC_HOOK_VAR: &str = "CCTG_PUBLIC_HOOK_ADDR";
+/// Optional in the env file: the proxy of the Bot API client when the
+/// process environment names none (TASK-046, a hub started at logon).
+pub const PROXY_VAR: &str = "HTTPS_PROXY";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -64,6 +74,28 @@ pub enum ConfigError {
     ApiUrl,
     #[error("{CERT_VAR} and {KEY_VAR} go together: set both for TLS, or neither")]
     TlsPair,
+    #[error("{PUBLIC_AGENT_VAR} and {PUBLIC_HOOK_VAR} go together: set both, or neither")]
+    PublicPair,
+    #[error("{0} must be host:port (letters, digits, '.', '-', '_', an [IPv6] in brackets)")]
+    PublicAddr(&'static str),
+    #[error("{PROXY_VAR} in the env file is not a proxy URL (http://[user:password@]host:port)")]
+    Proxy,
+}
+
+/// A proxy URL; it can carry a user and a password: `Debug` never prints it.
+#[derive(Clone)]
+pub struct ProxyUrl(String);
+
+impl ProxyUrl {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProxyUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProxyUrl(<redacted>)")
+    }
 }
 
 /// Bot token. `Debug` never prints it.
@@ -130,6 +162,20 @@ pub struct Config {
     /// `CCTG_TLS_CERT` and `CCTG_TLS_KEY`: both listeners take TLS with
     /// them ([`crate::tls`]); `None`: plain TCP.
     pub tls: Option<TlsFiles>,
+    /// [`PUBLIC_AGENT_VAR`] and [`PUBLIC_HOOK_VAR`]: the addresses other
+    /// devices use; `None`: only this machine is known.
+    pub public: Option<PublicAddrs>,
+    /// `HTTPS_PROXY` of the env file, taken only when the process
+    /// environment names no proxy (then reqwest takes that one, as before).
+    pub proxy: Option<ProxyUrl>,
+}
+
+/// How other devices reach the hub: `host:port` each, checked to be safe
+/// in a shell line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicAddrs {
+    pub agent: String,
+    pub hook: String,
 }
 
 /// PEM files of the hub certificate and its private key.
@@ -154,11 +200,13 @@ impl Config {
                 }
             }
         };
-        Self::from_vars(|name| {
+        let mut config = Self::from_vars(|name| {
             std::env::var(name)
                 .ok()
                 .or_else(|| file_vars.get(name).cloned())
-        })
+        })?;
+        config.proxy = file_proxy(&file_vars, proxy_in_env())?;
+        Ok(config)
     }
 
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -229,6 +277,14 @@ impl Config {
             (None, None) => None,
             _ => return Err(ConfigError::TlsPair),
         };
+        let public = match (optional(PUBLIC_AGENT_VAR), optional(PUBLIC_HOOK_VAR)) {
+            (Some(agent), Some(hook)) => Some(PublicAddrs {
+                agent: public_addr(PUBLIC_AGENT_VAR, agent)?,
+                hook: public_addr(PUBLIC_HOOK_VAR, hook)?,
+            }),
+            (None, None) => None,
+            _ => return Err(ConfigError::PublicPair),
+        };
 
         Ok(Self {
             token: BotToken(token),
@@ -241,7 +297,67 @@ impl Config {
             hook_listen,
             api_url,
             tls,
+            public,
+            proxy: None,
         })
+    }
+}
+
+/// A proxy variable of the process environment that reqwest (the Bot API
+/// client) takes on its own (TASK-035 decision 2: a server that reaches
+/// Telegram only through a local proxy). Only whether one is set.
+pub fn proxy_in_env() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// [`PROXY_VAR`] of the env file, unless the environment has a proxy.
+fn file_proxy(
+    file_vars: &HashMap<String, String>,
+    env_has_proxy: bool,
+) -> Result<Option<ProxyUrl>, ConfigError> {
+    if env_has_proxy {
+        return Ok(None);
+    }
+    let Some(url) = file_vars
+        .get(PROXY_VAR)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    reqwest::Proxy::https(url).map_err(|_| ConfigError::Proxy)?;
+    Ok(Some(ProxyUrl(url.to_owned())))
+}
+
+/// `host:port` with a host of letters, digits, `.`, `-`, `_` or an IPv6 in
+/// brackets, and a port 1..65535: it goes into a shell command line.
+fn public_addr(var: &'static str, value: String) -> Result<String, ConfigError> {
+    let bad = || ConfigError::PublicAddr(var);
+    let (host, port) = value.rsplit_once(':').ok_or_else(bad)?;
+    let host_ok = match host.strip_prefix('[').and_then(|v6| v6.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        }
+    };
+    let port_ok = port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port > 0);
+    if host_ok && port_ok {
+        Ok(value)
+    } else {
+        Err(bad())
     }
 }
 
@@ -580,6 +696,76 @@ mod tests {
                 Config::from_vars(vars(&half)).unwrap_err(),
                 ConfigError::TlsPair
             );
+        }
+    }
+
+    #[test]
+    fn the_env_file_proxy_is_used_only_without_one_in_the_environment() {
+        let file = |value: &str| HashMap::from([(PROXY_VAR.to_owned(), value.to_owned())]);
+        let proxy = file_proxy(&file(" http://u:p@127.0.0.1:3128 "), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(proxy.expose(), "http://u:p@127.0.0.1:3128");
+        assert!(!format!("{proxy:?}").contains("u:p"));
+        assert!(
+            file_proxy(&file("http://u:p@127.0.0.1:3128"), true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(file_proxy(&file("  "), false).unwrap().is_none());
+        assert!(file_proxy(&HashMap::new(), false).unwrap().is_none());
+        let error = file_proxy(&file("not a url"), false).unwrap_err();
+        assert_eq!(error, ConfigError::Proxy);
+        assert!(!error.to_string().contains("not a url"));
+    }
+
+    #[test]
+    fn public_addresses_go_together_and_are_shell_safe() {
+        let base = [
+            (TOKEN_VAR, TOKEN),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+        ];
+        assert_eq!(Config::from_vars(vars(&base)).unwrap().public, None);
+        let both = [
+            base.as_slice(),
+            &[
+                (PUBLIC_AGENT_VAR, " hub.example.org:52191 "),
+                (PUBLIC_HOOK_VAR, "[2001:db8::1]:52192"),
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            Config::from_vars(vars(&both)).unwrap().public,
+            Some(PublicAddrs {
+                agent: "hub.example.org:52191".into(),
+                hook: "[2001:db8::1]:52192".into(),
+            })
+        );
+        for one in [(PUBLIC_AGENT_VAR, "a:1"), (PUBLIC_HOOK_VAR, "a:1")] {
+            let half = [base.as_slice(), &[one]].concat();
+            assert_eq!(
+                Config::from_vars(vars(&half)).unwrap_err(),
+                ConfigError::PublicPair
+            );
+        }
+        for bad in [
+            "hub.example.org",
+            "hub;rm -rf ~:1",
+            "hub$(x):1",
+            ":47291",
+            "hub:0",
+            "hub:70000",
+            "hub:+1",
+            "[nope]:1",
+        ] {
+            let pairs = [
+                base.as_slice(),
+                &[(PUBLIC_AGENT_VAR, bad), (PUBLIC_HOOK_VAR, "a:1")],
+            ]
+            .concat();
+            let error = Config::from_vars(vars(&pairs)).unwrap_err();
+            assert_eq!(error, ConfigError::PublicAddr(PUBLIC_AGENT_VAR), "{bad}");
         }
     }
 

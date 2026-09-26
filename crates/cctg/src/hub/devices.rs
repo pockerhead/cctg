@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tracing::warn;
 
 use crate::wire::Secret;
@@ -152,6 +152,15 @@ pub enum LoadError {
     Codes(io::ErrorKind),
 }
 
+/// A join code a device took ([`Devices::join`]): the code's key
+/// ([`code_key`]) and the device it enrolled. For the `/join` message.
+#[derive(Clone)]
+pub struct Spent {
+    pub key: String,
+    pub id: String,
+    pub name: String,
+}
+
 /// A revoke that took effect; `saved`: also in `devices.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Revoked {
@@ -171,6 +180,7 @@ struct Shared {
     shared: Option<Secret>,
     inner: Mutex<Inner>,
     changes: watch::Sender<u64>,
+    spent: broadcast::Sender<Spent>,
 }
 
 /// The secrets the hub takes. Cheap to clone.
@@ -197,6 +207,7 @@ impl Devices {
 
     fn with(state_dir: Option<PathBuf>, shared: Option<Secret>, devices: Vec<Device>) -> Self {
         let (changes, _) = watch::channel(0);
+        let (spent, _) = broadcast::channel(16);
         Self(Arc::new(Shared {
             state_dir,
             shared,
@@ -206,6 +217,7 @@ impl Devices {
                 shared_seen: None,
             }),
             changes,
+            spent,
         }))
     }
 
@@ -289,6 +301,12 @@ impl Devices {
         self.0.changes.subscribe()
     }
 
+    /// Each code a device takes. Subscribe before minting: a code taken in
+    /// between is seen.
+    pub fn spent(&self) -> broadcast::Receiver<Spent> {
+        self.0.spent.subscribe()
+    }
+
     /// Takes `code` and enrolls a device named after `name` (cleaned). A
     /// code is spent by the attempt that takes it, also when the save then
     /// fails. Blocking file I/O.
@@ -298,7 +316,21 @@ impl Devices {
         if !take_code(&dir.join(CODES_DIR), &code, SystemTime::now()) {
             return Err(JoinError::Refused);
         }
-        self.enroll(name)
+        let enrolled = self.enroll(name)?;
+        let _ = self.0.spent.send(Spent {
+            key: sha256_hex(code.as_bytes()),
+            id: enrolled.id.clone(),
+            name: enrolled.name.clone(),
+        });
+        Ok(enrolled)
+    }
+
+    /// A new join code in this hub's state directory ([`mint_code`]), for
+    /// `/join` (TASK-046). A book without a state directory mints none.
+    /// Blocking file I/O.
+    pub fn mint_code(&self) -> Result<String, MintError> {
+        let dir = self.0.state_dir.as_deref().ok_or(MintError::NoHub)?;
+        mint_code(dir, SystemTime::now())
     }
 
     fn enroll(&self, name: &str) -> Result<Enrolled, JoinError> {
@@ -530,6 +562,12 @@ pub fn normalize_code(typed: &str) -> Option<String> {
 struct CodeFile {
     /// Unix seconds.
     expires: u64,
+}
+
+/// The key of a code as typed: the name of its file ([`code_path`]) and of
+/// its [`Spent`]. `None`: not a code.
+pub fn code_key(code: &str) -> Option<String> {
+    normalize_code(code).map(|normalized| sha256_hex(normalized.as_bytes()))
 }
 
 fn code_path(dir: &Path, normalized: &str) -> PathBuf {
@@ -847,6 +885,34 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn the_hub_mints_codes_it_then_takes() {
+        let dir = TempDir::new("devices-own-mint");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let code = devices.mint_code().unwrap();
+        assert!(devices.join(&code, "box").is_ok());
+        assert_eq!(
+            Devices::from(shared()).mint_code().unwrap_err(),
+            MintError::NoHub
+        );
+    }
+
+    #[test]
+    fn a_taken_code_is_announced_with_its_device() {
+        let dir = TempDir::new("devices-spent");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let mut spent = devices.spent();
+        let code = devices.mint_code().unwrap();
+        let enrolled = devices.join(&code, "box").unwrap();
+        let used = spent.try_recv().unwrap();
+        assert_eq!(used.key, code_key(&code).unwrap());
+        assert_eq!(used.key, code_key(&code.to_ascii_lowercase()).unwrap());
+        assert_eq!((used.id, used.name), (enrolled.id, enrolled.name));
+        assert!(devices.join(&code, "again").is_err());
+        assert!(devices.join("ABCD-EFGH-JKMN-PQRS", "other").is_err());
+        assert!(spent.try_recv().is_err(), "a refused code sends nothing");
     }
 
     #[test]

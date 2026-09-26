@@ -10,6 +10,8 @@
 //! 2. `http://` Bot API on a loopback port where nothing listens: every
 //!    request goes to the proxy in absolute form, the stand-in answers as the
 //!    Bot API, and the hub starts polling.
+//! 3. (TASK-046) no proxy in the environment, `HTTPS_PROXY` in the hub's
+//!    env file: the same `CONNECT` as in 1.
 //!
 //! Neither the proxy's password nor its user reach the hub's output.
 
@@ -180,16 +182,18 @@ fn collect(mut stream: impl Read + Send + 'static) -> Arc<Mutex<String>> {
     log
 }
 
-/// A real hub with the proxy variable `proxy_var` and the Bot API `api`.
+/// A real hub with the proxy variable `proxy_var` and the Bot API `api`;
+/// `None`: `HTTPS_PROXY` only in its env file (`--env-file`).
 fn hub(
     root: &Root,
     name: &str,
-    proxy_var: &str,
+    proxy_var: Option<&str>,
     proxy_port: u16,
     api: &str,
 ) -> (Proc, Arc<Mutex<String>>) {
     let state = root.0.join(name);
     std::fs::create_dir_all(&state).unwrap();
+    let proxy_url = format!("http://{USER}:{PASSWORD}@127.0.0.1:{proxy_port}");
     let mut command = common::cctg(&state);
     for var in [
         "HTTPS_PROXY",
@@ -203,13 +207,19 @@ fn hub(
     ] {
         command.env_remove(var);
     }
+    command.arg("hub");
+    match proxy_var {
+        Some(var) => {
+            command.env(var, proxy_url);
+        }
+        None => {
+            let env_file = state.join("hub.env");
+            std::fs::write(&env_file, format!("HTTPS_PROXY={proxy_url}\n")).unwrap();
+            command.arg("--env-file").arg(env_file);
+        }
+    }
     command
-        .arg("hub")
         .current_dir(&state)
-        .env(
-            proxy_var,
-            format!("http://{USER}:{PASSWORD}@127.0.0.1:{proxy_port}"),
-        )
         .env("CCTG_BOT_TOKEN", TOKEN)
         .env("CCTG_CHAT_ID", "-1000000000001")
         .env("CCTG_ALLOWED_USER_IDS", "1001")
@@ -254,13 +264,67 @@ async fn the_hub_reaches_the_bot_api_only_through_its_proxy() {
     let proxy = serve_proxy(seen.clone()).await;
 
     // 1. https: a CONNECT with the credentials, then the hub gives up.
-    let (mut tunnel, log) = hub(
-        &root,
-        "connect",
-        "HTTPS_PROXY",
-        proxy,
-        "https://api.telegram.invalid",
+    let text = connects_and_gives_up(
+        &seen,
+        hub(
+            &root,
+            "connect",
+            Some("HTTPS_PROXY"),
+            proxy,
+            "https://api.telegram.invalid",
+        ),
+    )
+    .await;
+    assert!(
+        text.contains("through the proxy of the environment"),
+        "{text}"
     );
+
+    // 2. http: absolute-form requests; the stand-in is the Bot API.
+    let dead = free_port();
+    let (_polling, log) = hub(
+        &root,
+        "forward",
+        Some("HTTP_PROXY"),
+        proxy,
+        &format!("http://127.0.0.1:{dead}"),
+    );
+    wait_for("polling through the proxy", || {
+        seen.lines().iter().any(|(line, authorized)| {
+            *authorized
+                && line.starts_with(&format!("POST http://127.0.0.1:{dead}/bot"))
+                && line.contains("/getUpdates ")
+        })
+    })
+    .await;
+    wait_for("the start line", || {
+        log.lock().unwrap().contains("hub started, polling")
+    })
+    .await;
+    assert_private(&log.lock().unwrap());
+
+    // 3. The env file's HTTPS_PROXY, none in the environment.
+    let text = connects_and_gives_up(
+        &seen,
+        hub(
+            &root,
+            "envfile",
+            None,
+            proxy,
+            "https://api.telegram.invalid",
+        ),
+    )
+    .await;
+    assert!(text.contains("HTTPS_PROXY of the env file"), "{text}");
+}
+
+/// Waits for the hub to give up; checks that it asked the proxy to
+/// `CONNECT` to the Bot API host with the credentials. Its output.
+async fn connects_and_gives_up(
+    seen: &Seen,
+    (mut tunnel, log): (Proc, Arc<Mutex<String>>),
+) -> String {
+    let before = seen.lines().len();
     let exited = tokio::task::spawn_blocking(move || {
         let deadline = Instant::now() + WAIT;
         loop {
@@ -279,10 +343,10 @@ async fn the_hub_reaches_the_bot_api_only_through_its_proxy() {
         exited.is_some_and(|status| !status.success()),
         "the hub gave up"
     );
-    let connects: Vec<_> = seen
-        .lines()
-        .into_iter()
+    let connects: Vec<_> = seen.lines()[before..]
+        .iter()
         .filter(|(line, _)| line.starts_with("CONNECT api.telegram.invalid:443 "))
+        .cloned()
         .collect();
     assert!(!connects.is_empty(), "{:?}", seen.lines());
     assert!(
@@ -290,32 +354,6 @@ async fn the_hub_reaches_the_bot_api_only_through_its_proxy() {
         "credentials go to the proxy"
     );
     let text = log.lock().unwrap().clone();
-    assert!(
-        text.contains("through the proxy of the environment"),
-        "{text}"
-    );
     assert_private(&text);
-
-    // 2. http: absolute-form requests; the stand-in is the Bot API.
-    let dead = free_port();
-    let (_polling, log) = hub(
-        &root,
-        "forward",
-        "HTTP_PROXY",
-        proxy,
-        &format!("http://127.0.0.1:{dead}"),
-    );
-    wait_for("polling through the proxy", || {
-        seen.lines().iter().any(|(line, authorized)| {
-            *authorized
-                && line.starts_with(&format!("POST http://127.0.0.1:{dead}/bot"))
-                && line.contains("/getUpdates ")
-        })
-    })
-    .await;
-    wait_for("the start line", || {
-        log.lock().unwrap().contains("hub started, polling")
-    })
-    .await;
-    assert_private(&log.lock().unwrap());
+    text
 }

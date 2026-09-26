@@ -212,6 +212,8 @@ struct Run {
     fake: PathBuf,
     work: PathBuf,
     env: Vec<(String, String)>,
+    /// Variables of this process the script does not get.
+    removed: Vec<String>,
 }
 
 impl Run {
@@ -221,12 +223,18 @@ impl Run {
             fake: root.dir("fake-bin"),
             work: root.dir("work"),
             env: Vec::new(),
+            removed: Vec::new(),
         }
     }
 
     fn env(&mut self, name: &str, value: &str) -> &mut Self {
         self.env.retain(|(key, _)| key != name);
         self.env.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    fn env_remove(&mut self, name: &str) -> &mut Self {
+        self.removed.push(name.to_owned());
         self
     }
 
@@ -247,6 +255,9 @@ impl Run {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for name in &self.removed {
+            command.env_remove(name);
+        }
         for (name, value) in &self.env {
             command.env(name, value);
         }
@@ -1257,4 +1268,657 @@ fn the_script_has_unix_line_endings() {
     // A CRLF checkout (core.autocrlf on Windows) breaks `sh`; .gitattributes
     // keeps it LF.
     assert!(!install_sh().contains(&b'\r'));
+}
+
+// ------------------------------------------------ the local hub (TASK-046)
+
+const CHAT: i64 = -1000000000001;
+const USER: i64 = 1001;
+/// The local hub's proxy (only in hub.env; nothing listens there: the fake
+/// Bot API is `http://`, which an HTTPS proxy leaves alone).
+const PROXY: &str = "http://pu:pp-marker@127.0.0.1:9";
+const PROXY_MARK: &str = "pp-marker";
+
+/// A Bot API for a real hub: the start checks pass, updates come from the
+/// test, sent messages are kept.
+#[derive(Default)]
+struct Bot {
+    state: Mutex<BotState>,
+    new_update: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct BotState {
+    updates: Vec<Value>,
+    /// `sendMessage` bodies with the message id the fake gave.
+    sent: Vec<(i64, Value)>,
+    /// `editMessageText` bodies.
+    edits: Vec<Value>,
+    messages: i64,
+}
+
+impl Bot {
+    /// A message in General (no topic) from user `from`.
+    fn push_general(&self, from: i64, text: &str) {
+        let mut state = self.state.lock().unwrap();
+        let id = state.updates.len() as i64 + 1;
+        state.updates.push(serde_json::json!({
+            "update_id": id,
+            "message": {
+                "message_id": 7000 + id,
+                "date": 1,
+                "text": text,
+                "from": { "id": from, "is_bot": false, "first_name": "u" },
+                "chat": { "id": CHAT, "type": "supergroup", "is_forum": true },
+            },
+        }));
+        drop(state);
+        self.new_update.notify_waiters();
+    }
+
+    fn sent(&self) -> Vec<(i64, Value)> {
+        self.state.lock().unwrap().sent.clone()
+    }
+
+    fn edits(&self) -> Vec<Value> {
+        self.state.lock().unwrap().edits.clone()
+    }
+
+    async fn answer(&self, method: &str, body: &Value) -> Value {
+        let ok = |result: Value| serde_json::json!({"ok": true, "result": result});
+        match method {
+            "getMe" => ok(
+                serde_json::json!({"id": 3003, "is_bot": true, "first_name": "b", "username": "fake_bot"}),
+            ),
+            "getChatMember" => ok(serde_json::json!({
+                "status": "administrator", "can_manage_topics": true, "can_delete_messages": true,
+            })),
+            "getForumTopicIconStickers" => ok(Value::Array(
+                [
+                    cctg::hub::registry::ICON_ALIVE,
+                    cctg::hub::registry::ICON_DEAD,
+                    cctg::hub::registry::ICON_WAITING,
+                    cctg::hub::registry::ICON_NO_CHANNEL,
+                ]
+                .iter()
+                .map(|id| serde_json::json!({"custom_emoji_id": id, "emoji": "x"}))
+                .collect(),
+            )),
+            "getUpdates" => ok(Value::Array(self.updates(body).await)),
+            "sendMessage" | "editMessageText" => {
+                let mut state = self.state.lock().unwrap();
+                state.messages += 1;
+                let id = state.messages;
+                if method == "sendMessage" {
+                    state.sent.push((id, body.clone()));
+                } else {
+                    state.edits.push(body.clone());
+                }
+                ok(serde_json::json!({
+                    "message_id": state.messages,
+                    "date": 1,
+                    "chat": { "id": CHAT },
+                }))
+            }
+            _ => ok(Value::Bool(true)),
+        }
+    }
+
+    /// Updates at or past the offset, waiting up to a second for one.
+    async fn updates(&self, body: &Value) -> Vec<Value> {
+        let offset = body["offset"].as_i64().unwrap_or(0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let waiting = self.new_update.notified();
+            let found: Vec<Value> = self
+                .state
+                .lock()
+                .unwrap()
+                .updates
+                .iter()
+                .filter(|update| update["update_id"].as_i64().unwrap_or(0) >= offset)
+                .cloned()
+                .collect();
+            if !found.is_empty() {
+                return found;
+            }
+            if tokio::time::timeout_at(deadline, waiting).await.is_err() {
+                return Vec::new();
+            }
+        }
+    }
+}
+
+async fn serve_bot(bot: Arc<Bot>) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let bot = bot.clone();
+            tokio::spawn(async move {
+                // One request per connection, answered with Connection: close.
+                let mut buf = Vec::new();
+                let head_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let Ok(n) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while buf.len() < head_end + length {
+                    let mut chunk = [0u8; 4096];
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let path = head.split_whitespace().nth(1).unwrap_or_default();
+                let method = path.rsplit('/').next().unwrap_or_default().to_owned();
+                let body: Value = serde_json::from_slice(&buf[head_end..]).unwrap_or(Value::Null);
+                let answer = bot.answer(&method, &body).await.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(2),
+    )
+    .is_ok()
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// A stand-in `systemctl` (Linux) that runs the unit's ExecStart line in the
+/// background on restart and stops it with SIGTERM, as systemd would.
+const FAKE_SYSTEMCTL: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_LOG"
+unit=$XDG_CONFIG_HOME/systemd/user/cctg-hub.service
+pidfile=$FAKE_DIR/hub.pid
+stop() {
+    [ -f "$pidfile" ] || return 0
+    pid=$(cat "$pidfile")
+    kill -TERM "$pid" 2>/dev/null
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ $i -lt 450 ]; do sleep 0.1; i=$((i + 1)); done
+    rm -f "$pidfile"
+}
+case "$*" in
+    "--user restart cctg-hub.service")
+        stop
+        cmd=$(sed -n 's/^ExecStart=//p' "$unit")
+        eval "set -- $cmd"
+        "$@" </dev/null >/dev/null 2>&1 &
+        echo $! > "$pidfile"
+        ;;
+    "--user disable --now cctg-hub.service") stop ;;
+esac
+exit 0
+"#;
+
+/// A stand-in `launchctl` (macOS): bootstrap runs the plist's
+/// ProgramArguments in the background, bootout stops them with SIGTERM.
+const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_LOG"
+pidfile=$FAKE_DIR/hub.pid
+case $1 in
+    print)
+        [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null && exit 0
+        exit 113
+        ;;
+    bootout)
+        [ -f "$pidfile" ] || exit 3
+        kill -TERM "$(cat "$pidfile")" 2>/dev/null
+        rm -f "$pidfile"
+        ;;
+    bootstrap)
+        args=$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/s/.*<string>\(.*\)<\/string>.*/\1/p' "$3")
+        IFS='
+'
+        # shellcheck disable=SC2086
+        set -- $args
+        "$@" </dev/null >/dev/null 2>&1 &
+        echo $! > "$pidfile"
+        ;;
+esac
+exit 0
+"#;
+
+/// Stops whatever the test started, also when a check failed: the fake
+/// service's process and any supervisor of the bin folder (`cctg.stop`);
+/// on Windows the test's registry key goes.
+struct LocalHub {
+    bin: PathBuf,
+    fake_state: PathBuf,
+    run_key: String,
+    armed: bool,
+}
+
+impl Drop for LocalHub {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(pid) = std::fs::read_to_string(self.fake_state.join("hub.pid")) {
+                let _ = Command::new("kill").args(["-TERM", pid.trim()]).status();
+            }
+            let stop = self.bin.join("cctg.stop");
+            if std::fs::write(&stop, "").is_ok() {
+                for _ in 0..400 {
+                    if !stop.exists() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let _ = std::fs::remove_file(&stop);
+            }
+        }
+        // Only the test's own key, whatever a failed check left in run_key.
+        if cfg!(windows)
+            && self
+                .run_key
+                .starts_with("HKCU\\Software\\cctg-install-e2e-")
+        {
+            let parent = self.run_key.trim_end_matches("\\Run");
+            let _ = Command::new("reg")
+                .args(["delete", parent, "/f"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// The `cctg-hub` value of `key`, read from `reg export` (UTF-16: the
+/// console output of `reg query` garbles a non-ASCII path).
+#[cfg(windows)]
+fn run_value(key: &str) -> Option<String> {
+    let file = std::env::temp_dir().join(format!("cctg-install-e2e-{}.reg", std::process::id()));
+    let exported = Command::new("reg")
+        .args(["export", key])
+        .arg(&file)
+        .arg("/y")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    let bytes = std::fs::read(&file).unwrap_or_default();
+    let _ = std::fs::remove_file(&file);
+    if !exported {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("\"cctg-hub\"=\""))?
+        .trim_end()
+        .strip_suffix('"')?;
+    Some(value.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+/// `--hub --local` (TASK-046) on the system the tests run on: the hub is
+/// installed, registered to start at logon (a stand-in systemctl or
+/// launchctl; on Windows the Run value under a test key, started by the real
+/// Windows Script Host, hidden) and started; `/join` in General answers only
+/// the allowlisted user, and its line installs another device against this
+/// hub, after which the message says the code was used; a second run
+/// restarts the hub on the binary; `--uninstall` stops it and removes the
+/// autostart, hub.env and state stay. The hub folder has a space and
+/// Cyrillic in its name; the proxy stays in hub.env only.
+#[test]
+fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
+    let root = Root::new("local-hub");
+    let dist = root.dir("dist");
+    release(&dist, &this_build());
+    let (base, _) = serve(dist);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let bot = Arc::new(Bot::default());
+    let api = runtime.block_on(serve_bot(bot.clone()));
+
+    let mut run = Run::new(&root);
+    let (agent_port, hook_port) = (free_port(), free_port());
+    let hub_dir = root.0.join("мой hub");
+    std::fs::create_dir_all(&hub_dir).unwrap();
+    let hub_dir_arg = hub_dir.to_string_lossy().into_owned();
+    // The user's own lines: the fake Bot API and loopback ports of the test
+    // (no firewall question on Windows).
+    let mine = format!(
+        "# mine\nCCTG_BOT_API_URL=http://127.0.0.1:{api}\nCCTG_AGENT_LISTEN=127.0.0.1:{agent_port}\nCCTG_HOOK_LISTEN=127.0.0.1:{hook_port}\n"
+    );
+    std::fs::write(hub_dir.join("hub.env"), &mine).unwrap();
+    let fake_state = root.dir("fake-service");
+    let service_log = root.0.join("service.log");
+    let run_key = format!(
+        "HKCU\\Software\\cctg-install-e2e-{}\\Run",
+        std::process::id()
+    );
+    let config_home = run.home.join(".config");
+    run.env("CCTG_INSTALL_BASE_URL", &base)
+        .env("CCTG_BOT_TOKEN", TOKEN)
+        .env("FAKE_LOG", &service_log.to_string_lossy())
+        .env("FAKE_DIR", &fake_state.to_string_lossy())
+        .env("XDG_CONFIG_HOME", &config_home.to_string_lossy())
+        .env("CCTG_INSTALL_RUN_KEY", &run_key);
+    // The proxy comes only from hub.env.
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        run.env_remove(var);
+    }
+    run.fake_program("systemctl", FAKE_SYSTEMCTL);
+    run.fake_program("launchctl", FAKE_LAUNCHCTL);
+    run.fake_program("claude", FAKE_CLAUDE);
+    let mut guard = LocalHub {
+        bin: run.cctg_dir().join("bin"),
+        fake_state: fake_state.clone(),
+        run_key: run_key.clone(),
+        armed: true,
+    };
+    let hub_log = hub_dir.join("hub.log");
+    let log = || std::fs::read_to_string(&hub_log).unwrap_or_default();
+
+    let args = [
+        "--hub",
+        "--local",
+        "--dir",
+        &hub_dir_arg,
+        "--yes",
+        "--chat-id",
+        "-1000000000001",
+        "--users",
+        "1001",
+        "--public-host",
+        "127.0.0.1",
+    ];
+    let first_args = [&args[..], &["--proxy", PROXY]].concat();
+    let (output, text) = run.install(&first_args);
+    assert!(
+        output.status.success(),
+        "{text}\n--- hub log ---\n{}",
+        log()
+    );
+    assert!(!text.contains(TOKEN), "the token was printed: {text}");
+    assert!(!text.contains(PROXY_MARK), "the proxy was printed: {text}");
+    assert!(
+        text.contains("hub started: bot and group checked"),
+        "{text}"
+    );
+    assert!(listening(agent_port) && listening(hook_port), "{}", log());
+    assert!(!log().contains('\u{1b}'), "colour codes in the log file");
+    assert!(log().contains("HTTPS_PROXY of the env file"), "{}", log());
+    assert!(!log().contains(PROXY_MARK), "{}", log());
+
+    let env = std::fs::read_to_string(hub_dir.join("hub.env")).unwrap();
+    assert!(env.starts_with(&mine), "{env}");
+    for line in [
+        format!("CCTG_PUBLIC_AGENT_ADDR=127.0.0.1:{agent_port}"),
+        format!("CCTG_PUBLIC_HOOK_ADDR=127.0.0.1:{hook_port}"),
+        "CCTG_CHAT_ID=-1000000000001".to_owned(),
+        format!("HTTPS_PROXY={PROXY}"),
+    ] {
+        assert!(env.lines().any(|l| l == line), "{line} in {env}");
+    }
+    assert!(
+        env.contains("CCTG_STATE_DIR='") && env.contains("CCTG_TLS_KEY='"),
+        "{env}"
+    );
+    assert_eq!(env.matches("CCTG_AGENT_LISTEN").count(), 1, "{env}");
+    let (_, pin) = cctg::tls::Acceptor::from_files(
+        &hub_dir.join("tls").join("cert.pem"),
+        &hub_dir.join("tls").join("key.pem"),
+    )
+    .expect("the hub's certificate");
+    let pin = pin.to_string().replace(':', "").to_lowercase();
+    // This machine's line: loopback with the pin.
+    let local = text
+        .lines()
+        .find(|line| line.starts_with("curl -fsSL"))
+        .expect("this machine's line");
+    assert!(
+        local.contains(&format!(
+            "| sh -s -- --agent-addr 127.0.0.1:{agent_port} --hook-addr 127.0.0.1:{hook_port} --pin {pin} --join "
+        )),
+        "{local}"
+    );
+
+    // The autostart entry names this binary, hub.env and the log.
+    let exe = run.exe();
+    if cfg!(windows) {
+        #[cfg(windows)]
+        {
+            let value = run_value(&run_key).expect("the Run value");
+            assert!(!value.contains(PROXY_MARK), "{value}");
+            let native = |path: &Path| path.to_string_lossy().replace('/', "\\");
+            assert!(
+                value.ends_with(&format!(
+                    "\\wscript.exe\" //B //Nologo \"{}\" \"{}\" \"{}\" \"{}\"",
+                    native(&hub_dir.join("start-hub.js")),
+                    native(&exe),
+                    native(&hub_dir.join("hub.env")),
+                    native(&hub_log)
+                )),
+                "{value}"
+            );
+        }
+    } else if cfg!(target_os = "macos") {
+        let plist = std::fs::read_to_string(
+            run.home
+                .join("Library/LaunchAgents/io.github.pockerhead.cctg-hub.plist"),
+        )
+        .unwrap();
+        assert!(
+            plist.contains(&format!("<string>{}</string>", exe.display()))
+                && plist.contains(&format!("<string>{}</string>", hub_log.display()))
+                && plist.contains("<string>--log-file</string>")
+                && plist.contains("<key>RunAtLoad</key><true/>"),
+            "{plist}"
+        );
+        assert!(!plist.contains(PROXY_MARK), "{plist}");
+    } else {
+        let unit = std::fs::read_to_string(run.home.join(".config/systemd/user/cctg-hub.service"))
+            .unwrap();
+        assert!(
+            unit.contains(&format!(
+                "ExecStart=\"{}\" supervise --env-file \"{}\" --log-file \"{}\"",
+                exe.display(),
+                hub_dir.join("hub.env").display(),
+                hub_log.display()
+            )) && unit.contains("WantedBy=default.target"),
+            "{unit}"
+        );
+        assert!(!unit.contains(PROXY_MARK), "{unit}");
+        let calls = std::fs::read_to_string(&service_log).unwrap();
+        assert!(calls.contains("--user enable cctg-hub.service"), "{calls}");
+    }
+
+    // /join: a stranger gets nothing, the allowlisted user a line.
+    bot.push_general(999, "/join");
+    bot.push_general(USER, "/join");
+    let lines = || -> Vec<(i64, Value)> {
+        bot.sent()
+            .into_iter()
+            .filter(|(_, body)| {
+                body["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("curl -fsSL"))
+            })
+            .collect()
+    };
+    wait_until("the /join answer", || !lines().is_empty());
+    std::thread::sleep(Duration::from_millis(500));
+    let answers = lines();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    let (join_message, body) = &answers[0];
+    assert!(
+        body.get("message_thread_id").is_none_or(Value::is_null),
+        "{body}"
+    );
+    assert_eq!(body["parse_mode"], "HTML", "{body}");
+    let html = body["text"].as_str().unwrap();
+    let line = html
+        .split("<pre>")
+        .nth(1)
+        .and_then(|rest| rest.split("</pre>").next())
+        .expect("the line in a code block");
+    let tag = cctg::client::release().unwrap_or("main");
+    let prefix = format!(
+        "curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/{tag}/install.sh | sh -s -- "
+    );
+    let device_args: Vec<&str> = line
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("{line}"))
+        .split(' ')
+        .collect();
+    let agent_addr = format!("127.0.0.1:{agent_port}");
+    let hook_addr = format!("127.0.0.1:{hook_port}");
+    assert_eq!(
+        device_args[..7],
+        [
+            "--agent-addr",
+            &agent_addr,
+            "--hook-addr",
+            &hook_addr,
+            "--pin",
+            &pin,
+            "--join"
+        ],
+        "{line}"
+    );
+
+    // The line works: another machine installs with it.
+    let mut device = Run {
+        home: root.dir("device-home"),
+        fake: run.fake.clone(),
+        work: root.dir("device-work"),
+        env: Vec::new(),
+        removed: Vec::new(),
+    };
+    device.env("CCTG_INSTALL_BASE_URL", &base);
+    let device_line = [&["--yes", "--host", "joined-box"][..], &device_args].concat();
+    let (output, text) = device.install(&device_line);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("this device is joined-box ("), "{text}");
+    assert!(text.contains("took the secret"), "cctg doctor: {text}");
+    let code = device_args[7];
+    assert!(!text.contains(code), "{text}");
+    // The /join message now says which device took its code.
+    wait_until("the used mark on the /join message", || {
+        bot.edits().iter().any(|edit| {
+            edit["message_id"].as_i64() == Some(*join_message)
+                && edit["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("использован") && t.contains("joined-box"))
+        })
+    });
+
+    // Again: the same binary, the hub started again on it, one supervisor.
+    let before = log().matches("hub started, polling").count();
+    let (output, text) = run.install(&args);
+    assert!(
+        output.status.success(),
+        "{text}\n--- hub log ---\n{}",
+        log()
+    );
+    assert!(text.contains("binary unchanged"), "{text}");
+    let env = std::fs::read_to_string(hub_dir.join("hub.env")).unwrap();
+    assert!(
+        env.lines().any(|l| l == format!("HTTPS_PROXY={PROXY}")),
+        "the proxy is kept: {env}"
+    );
+    assert_eq!(
+        log().matches("hub started, polling").count(),
+        before + 1,
+        "{}",
+        log()
+    );
+    assert!(listening(agent_port), "{}", log());
+
+    // Uninstall: the hub stops, the autostart goes, the settings stay.
+    let (output, text) = run.install(&["--hub", "--local", "--dir", &hub_dir_arg, "--uninstall"]);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("the hub stopped"),
+        "{text}\n--- hub log ---\n{}",
+        log()
+    );
+    wait_until("the listeners to close", || !listening(agent_port));
+    assert!(hub_dir.join("hub.env").exists() && hub_dir.join("tls").join("key.pem").exists());
+    assert!(!run.cctg_dir().join("bin").join("cctg.local-hub").exists());
+    if cfg!(windows) {
+        #[cfg(windows)]
+        {
+            assert!(run_value(&run_key).is_none(), "{text}");
+            assert!(!hub_dir.join("start-hub.js").exists());
+        }
+    } else if cfg!(target_os = "macos") {
+        assert!(
+            !run.home
+                .join("Library/LaunchAgents/io.github.pockerhead.cctg-hub.plist")
+                .exists()
+        );
+    } else {
+        assert!(
+            !run.home
+                .join(".config/systemd/user/cctg-hub.service")
+                .exists()
+        );
+        let calls = std::fs::read_to_string(&service_log).unwrap();
+        assert!(
+            calls.contains("--user disable --now cctg-hub.service"),
+            "{calls}"
+        );
+    }
+    guard.armed = false;
+    drop(guard);
+    drop(runtime);
 }

@@ -14,8 +14,16 @@
 //! The supervisor is not updated while it runs, so it only starts, waits and
 //! restarts: checking, swapping and rolling back binaries is `cctg deploy`'s
 //! ([`crate::deploy`]). It never reads the hub's env file.
+//!
+//! For a hub started at logon without a console (TASK-046, `install.sh --hub
+//! --local`): one supervisor per binary folder (`cctg.supervise-lock`, an OS
+//! lock; a second one leaves at once), `cctg.stop` stops
+//! hub and supervisor like Ctrl+C (the file goes once both stopped), and
+//! `--log-file` takes the supervisor's and the hub's log. A restart request
+//! also ends the wait between restarts.
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -32,14 +40,18 @@ const HEALTHY: Duration = Duration::from_secs(60);
 /// A stopping hub gets this long to write its registry before it is killed.
 const STOP_WAIT: Duration = Duration::from_secs(30);
 const REQUEST_POLL: Duration = Duration::from_secs(1);
+/// A log file larger than this is moved to `<log>.prev` at start.
+const LOG_KEEP: u64 = 5 << 20;
 
 /// Supervisor settings.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Settings {
     /// The hub binary: `<bin dir>/cctg(.exe)`.
     pub exe: PathBuf,
     /// Extra `cctg hub` arguments (`--env-file <path>`).
     pub hub_args: Vec<OsString>,
+    /// The hub's stderr goes here too ([`open_log`]); `None`: inherited.
+    pub log: Option<File>,
 }
 
 /// `cctg.restart` next to `exe`: a request to restart the hub now.
@@ -50,6 +62,49 @@ pub fn restart_path(exe: &Path) -> PathBuf {
 /// `cctg.hub-started` next to `exe`: `<pid> <unix nanos>` of the last start.
 pub fn started_path(exe: &Path) -> PathBuf {
     sibling(exe, "hub-started")
+}
+
+/// `cctg.stop` next to `exe`: a request to stop the hub and the supervisor.
+pub fn stop_path(exe: &Path) -> PathBuf {
+    sibling(exe, "stop")
+}
+
+/// `cctg.supervise-lock` next to `exe`: held by the running supervisor.
+pub fn lock_path(exe: &Path) -> PathBuf {
+    sibling(exe, "supervise-lock")
+}
+
+/// The supervisor lock of `exe`'s folder; `None`: another supervisor holds
+/// it. Never waits: a second supervisor that waited would take over when
+/// the first is stopped for good (an uninstall). Released when this
+/// process ends, however it ends.
+pub fn lock(exe: &Path) -> io::Result<Option<File>> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(exe))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// Opens `path` for appending, after moving a file larger than
+/// [`LOG_KEEP`] to `<path>.prev`. Call it holding [`lock`]: only then does
+/// nobody else write to the file.
+pub fn open_log(path: &Path) -> io::Result<File> {
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > LOG_KEEP) {
+        let mut prev = path.as_os_str().to_owned();
+        prev.push(".prev");
+        let _ = std::fs::remove_file(&prev);
+        let _ = std::fs::rename(path, &prev);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
 }
 
 fn sibling(exe: &Path, tag: &str) -> PathBuf {
@@ -67,25 +122,41 @@ struct Running {
     since: Instant,
 }
 
-/// Runs the hub until Ctrl+C (Ctrl+Break on Windows, SIGTERM on Unix).
+/// Runs the hub until Ctrl+C (Ctrl+Break on Windows, SIGTERM on Unix) or
+/// `cctg.stop`, which is removed once the hub stopped.
 pub async fn supervise(settings: Settings) -> anyhow::Result<()> {
+    let stop_file = stop_path(&settings.exe);
+    // An old request never stops a new supervisor.
+    let _ = std::fs::remove_file(&stop_file);
+    let result = run(&settings, &stop_file).await;
+    let _ = std::fs::remove_file(&stop_file);
+    result
+}
+
+async fn run(settings: &Settings, stop_file: &Path) -> anyhow::Result<()> {
     let mut stop = pin!(async {
-        let signal = stop_signal().await;
-        info!(signal, "stopping");
+        tokio::select! {
+            signal = stop_signal() => info!(signal, "stopping"),
+            () = appears(stop_file) => info!("stopping: cctg.stop"),
+        }
     });
     let restart = restart_path(&settings.exe);
     let mut backoff = MIN_BACKOFF;
     info!("supervisor started");
     loop {
         let _ = std::fs::remove_file(&restart);
-        let mut hub = match start_hub(&settings) {
+        let mut hub = match start_hub(settings) {
             Ok(hub) => hub,
             Err(error) => {
                 warn!(%error, wait = ?backoff, "cannot start the hub");
-                if stopped_during(stop.as_mut(), backoff).await {
-                    return Ok(());
+                match wait_backoff(stop.as_mut(), backoff, &restart).await {
+                    Waited::Stop => {
+                        info!("supervisor stopped");
+                        return Ok(());
+                    }
+                    Waited::Restart => backoff = MIN_BACKOFF,
+                    Waited::Elapsed => backoff = (backoff * 2).min(MAX_BACKOFF),
                 }
-                backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         };
@@ -115,10 +186,21 @@ pub async fn supervise(settings: Settings) -> anyhow::Result<()> {
             backoff = MIN_BACKOFF;
         }
         warn!(status = %describe(status.ok()), wait = ?backoff, "hub exited; restarting it");
-        if stopped_during(stop.as_mut(), backoff).await {
-            return Ok(());
+        match wait_backoff(stop.as_mut(), backoff, &restart).await {
+            Waited::Stop => {
+                info!("supervisor stopped");
+                return Ok(());
+            }
+            Waited::Restart => backoff = MIN_BACKOFF,
+            Waited::Elapsed => backoff = (backoff * 2).min(MAX_BACKOFF),
         }
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Completes once `path` exists; checks every [`REQUEST_POLL`].
+async fn appears(path: &Path) {
+    while !path.exists() {
+        tokio::time::sleep(REQUEST_POLL).await;
     }
 }
 
@@ -130,6 +212,10 @@ fn start_hub(settings: &Settings) -> io::Result<Running> {
         .arg("--stop-on-stdin")
         .stdin(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(log) = &settings.log {
+        // A file, not a terminal: no colour codes in it.
+        command.stderr(log.try_clone()?).env("NO_COLOR", "1");
+    }
     #[cfg(windows)]
     {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -177,14 +263,25 @@ pub(crate) fn describe(status: Option<ExitStatus>) -> String {
     }
 }
 
-async fn stopped_during(
+/// How a wait between hub starts ended.
+#[derive(Debug, PartialEq)]
+enum Waited {
+    Stop,
+    /// `cctg.restart` appeared: start the hub now (the loop removes the file).
+    Restart,
+    Elapsed,
+}
+
+async fn wait_backoff(
     stop: std::pin::Pin<&mut impl Future<Output = ()>>,
     wait: Duration,
-) -> bool {
+    restart: &Path,
+) -> Waited {
     tokio::select! {
         biased;
-        () = stop => true,
-        () = tokio::time::sleep(wait) => false,
+        () = stop => Waited::Stop,
+        () = appears(restart) => Waited::Restart,
+        () = tokio::time::sleep(wait) => Waited::Elapsed,
     }
 }
 
@@ -229,6 +326,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_supervisor_per_folder_and_a_second_one_leaves() {
+        let dir = crate::hub::testdir::TempDir::new("supervise-lock");
+        let exe = dir.path().join("cctg.exe");
+        let first = lock(&exe).unwrap();
+        assert!(first.is_some());
+        assert!(lock(&exe).unwrap().is_none());
+        drop(first);
+        assert!(lock(&exe).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_large_log_moves_aside_at_start() {
+        let dir = crate::hub::testdir::TempDir::new("supervise-log");
+        let log = dir.path().join("hub.log");
+        std::fs::write(&log, "small\n").unwrap();
+        drop(open_log(&log).unwrap());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "small\n");
+        std::fs::write(&log, vec![b'x'; LOG_KEEP as usize + 1]).unwrap();
+        let mut file = open_log(&log).unwrap();
+        io::Write::write_all(&mut file, b"new\n").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "new\n");
+        let prev = dir.path().join("hub.log.prev");
+        assert_eq!(std::fs::metadata(prev).unwrap().len(), LOG_KEEP + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_request_or_a_stop_ends_the_backoff() {
+        let dir = crate::hub::testdir::TempDir::new("supervise-backoff");
+        let restart = dir.path().join("cctg.restart");
+        let wait = Duration::from_secs(8);
+
+        std::fs::write(&restart, "").unwrap();
+        let begin = tokio::time::Instant::now();
+        let waited = wait_backoff(pin!(std::future::pending::<()>()), wait, &restart).await;
+        assert_eq!(waited, Waited::Restart);
+        assert!(begin.elapsed() < REQUEST_POLL);
+
+        assert_eq!(
+            wait_backoff(pin!(async {}), wait, &restart).await,
+            Waited::Stop,
+            "a stop wins over a restart request"
+        );
+
+        std::fs::remove_file(&restart).unwrap();
+        let begin = tokio::time::Instant::now();
+        let waited = wait_backoff(pin!(std::future::pending::<()>()), wait, &restart).await;
+        assert_eq!(waited, Waited::Elapsed);
+        assert_eq!(begin.elapsed(), wait);
+    }
+
+    #[test]
     fn request_and_stamp_files_sit_next_to_the_binary() {
         let exe = Path::new("bin").join("cctg.exe");
         assert_eq!(restart_path(&exe), Path::new("bin").join("cctg.restart"));
@@ -238,5 +387,10 @@ mod tests {
         );
         let bare = Path::new("bin").join("cctg");
         assert_eq!(restart_path(&bare), Path::new("bin").join("cctg.restart"));
+        assert_eq!(stop_path(&exe), Path::new("bin").join("cctg.stop"));
+        assert_eq!(
+            lock_path(&exe),
+            Path::new("bin").join("cctg.supervise-lock")
+        );
     }
 }

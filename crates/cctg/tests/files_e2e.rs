@@ -407,7 +407,7 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     })
     .unwrap()
     .token;
-    let api = Arc::new(BotApi::with_api_url(&url, &token, CHAT).unwrap());
+    let api = Arc::new(BotApi::with_api_url(&url, &token, CHAT, None).unwrap());
     let fast = BucketConfig {
         capacity: 1000,
         refill_every: Duration::from_millis(1),

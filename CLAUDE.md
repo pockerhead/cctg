@@ -77,7 +77,7 @@ Telegram forum  <-- teloxide -->  hub  <-- tcp/json (localhost / tailscale) --> 
                           transcript reader                          (--dangerously-load-development-channels)
 ```
 
-Установка (TASK-031): `install.sh` в корне, POSIX sh для Linux, macOS и Windows в Git Bash; скрипт тега ставит бинарник того же тега (`RELEASE=` в скрипте, `release.yml` сверяет его с тегом). Клиент: бинарник из GitHub Releases в `~/.cctg/bin`, `~/.cctg/device.env`, `~/.cctg/claude/{mcp.json,settings.json}`, обёртка `~/.local/bin/claude-cctg` (и `.cmd`), проверка `cctg doctor`; `~/.claude/settings.json` и `~/.claude.json` не трогает. `--hub`: hub в Docker на сервере. Для людей `README.md`.
+Установка (TASK-031): `install.sh` в корне, POSIX sh для Linux, macOS и Windows в Git Bash; скрипт тега ставит бинарник того же тега (`RELEASE=` в скрипте, `release.yml` сверяет его с тегом). Клиент: бинарник из GitHub Releases в `~/.cctg/bin`, `~/.cctg/device.env`, `~/.cctg/claude/{mcp.json,settings.json}`, обёртка `~/.local/bin/claude-cctg` (и `.cmd`), проверка `cctg doctor`; `~/.claude/settings.json` и `~/.claude.json` не трогает. `--hub`: hub в Docker на сервере; `--hub --local` (TASK-046): hub на этой машине под `cctg supervise --log-file`, автозапуск при входе без окон (Windows: Run-значение HKCU + скрытый запуск через Windows Script Host; Linux: systemd user unit; macOS: LaunchAgent). `/join` в General даёт строку установки с новым кодом (адрес из `CCTG_PUBLIC_*_ADDR`, pin из сертификата hub). Для людей `README.md`.
 
 ### 1. `cctg hub` — один процесс на "главном" устройстве
 

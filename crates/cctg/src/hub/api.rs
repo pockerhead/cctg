@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::{Value, json};
 
-use super::config::BotToken;
+use super::config::{BotToken, ProxyUrl};
 
 pub const TELEGRAM_API: &str = "https://api.telegram.org";
 
@@ -253,16 +253,26 @@ impl fmt::Debug for BotApi {
 
 impl BotApi {
     pub fn new(token: &BotToken, chat_id: i64) -> Result<Self, ApiError> {
-        Self::with_api_url(TELEGRAM_API, token, chat_id)
+        Self::with_api_url(TELEGRAM_API, token, chat_id, None)
     }
 
-    /// Same as [`BotApi::new`] against another Bot API server (tests, local server).
-    pub fn with_api_url(api_url: &str, token: &BotToken, chat_id: i64) -> Result<Self, ApiError> {
-        let http = reqwest::Client::builder()
+    /// Same as [`BotApi::new`] against another Bot API server (tests, local
+    /// server); `proxy`: the env file's proxy ([`super::config::Config::proxy`]).
+    pub fn with_api_url(
+        api_url: &str,
+        token: &BotToken,
+        chat_id: i64,
+        proxy: Option<&ProxyUrl>,
+    ) -> Result<Self, ApiError> {
+        let mut builder = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(ApiError::http)?;
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(proxy) = proxy {
+            // An explicit proxy turns reqwest's environment proxies off; there
+            // are none then (config::proxy_in_env).
+            builder = builder.proxy(reqwest::Proxy::https(proxy.expose()).map_err(ApiError::http)?);
+        }
+        let http = builder.build().map_err(ApiError::http)?;
         let api_url = api_url.trim_end_matches('/');
         Ok(Self {
             http,
@@ -823,7 +833,7 @@ mod tests {
         })
         .unwrap()
         .token;
-        BotApi::with_api_url(url, &token, -1001).unwrap()
+        BotApi::with_api_url(url, &token, -1001, None).unwrap()
     }
 
     /// A raw HTTP answer with `head` lines, closing the connection.
@@ -1018,7 +1028,7 @@ mod tests {
         })
         .unwrap()
         .token;
-        let api = BotApi::with_api_url("http://127.0.0.1:9", &token, -1001).unwrap();
+        let api = BotApi::with_api_url("http://127.0.0.1:9", &token, -1001, None).unwrap();
 
         let error = api.get_me().await.unwrap_err();
         assert!(matches!(error, ApiError::Http(_)));
