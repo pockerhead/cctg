@@ -1,0 +1,14 @@
+diff --git a/crates/cctg/src/hook.rs b/crates/cctg/src/hook.rs
+index 6ec8723..a763dd2 100644
+--- a/crates/cctg/src/hook.rs
++++ b/crates/cctg/src/hook.rs
+@@ -279,6 +279,9 @@ pub async fn ask(
+     );
+     let io = |error: std::io::Error| PostError::Io(error.kind());
+     let send = async {
++        // PROBE: the first run of a home stalls
++        let marker = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("probe-stalled");
++        if !marker.exists() { let _ = std::fs::write(&marker, ""); tokio::time::sleep(Duration::from_millis(600)).await; }
+         let mut stream = addr.connect().await.map_err(io)?;
+         stream
+             .write_all(&[head.as_bytes(), &body].concat())

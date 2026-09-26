@@ -1,0 +1,15 @@
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+index 96a61e4..16f15af 100644
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -458,7 +458,9 @@ async fn agent_session(
+         files: true,
+         heartbeat: true,
+     };
+-    if events.send(registered).await.is_err() || write_hub_msg(&mut write, &answer).await.is_err() {
++    if write_hub_msg(&mut write, &answer).await.is_err() { return; }
++    tokio::time::sleep(Duration::from_millis(300)).await; // PROBE
++    if events.send(registered).await.is_err() {
+         return;
+     }
+     liveness.said();

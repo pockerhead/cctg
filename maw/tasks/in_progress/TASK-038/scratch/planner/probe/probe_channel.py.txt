@@ -1,0 +1,65 @@
+"""TASK-038 probe channel (copied to <probe folder>/probe_channel.py).
+
+A minimal Claude Code channel over stdio (JSON-RPC 2.0, one object per
+line) that declares the permission relay and only logs what comes in to
+channel_log.jsonl next to itself. It never answers a permission request, so
+the terminal dialog stays the only way to answer.
+"""
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG = os.path.join(HERE, "channel_log.jsonl")
+
+
+def log(**fields):
+    fields["t"] = round(time.time(), 3)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        log(event="bad-line")
+        continue
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "notifications/claude/channel/permission_request":
+        log(event="permission_request", tool_name=params.get("tool_name"),
+            request_id=params.get("request_id"),
+            description=(params.get("description") or "")[:300],
+            input_preview_chars=len(params.get("input_preview") or ""),
+            input_preview_head=(params.get("input_preview") or "")[:300])
+        continue
+    log(event="message", method=method, has_id="id" in msg)
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "protocolVersion": params.get("protocolVersion") or "2025-06-18",
+            "capabilities": {
+                "experimental": {"claude/channel": {}, "claude/channel/permission": {}},
+                "tools": {},
+            },
+            "serverInfo": {"name": "probe", "version": "0"},
+            "instructions": "TASK-038 probe channel. It sends nothing; ignore it.",
+        }})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": []}})
+    elif method == "ping":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+    else:
+        send({"jsonrpc": "2.0", "id": msg["id"],
+              "error": {"code": -32601, "message": "method not found"}})

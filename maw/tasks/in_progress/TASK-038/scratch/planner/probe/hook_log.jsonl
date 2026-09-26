@@ -1,0 +1,46 @@
+{"event": "start", "hook_event_name": "PreToolUse", "tool": "AskUserQuestion", "tool_use_id": true, "agent_id": false, "permission_mode": "default", "top_keys": ["cwd", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_use_id", "transcript_path"], "input": {"keys": ["questions"], "questions": [{"keys": ["header", "multiSelect", "options", "question"], "multiSelect": false, "options": [["description", "label"], ["description", "label"]]}]}, "t": 1790421279.547, "kind": "pre", "pid": 39008}
+{"event": "mode", "mode": "wait 25", "tool": "AskUserQuestion", "t": 1790421279.553, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421280.558, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421281.561, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421282.567, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421283.579, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421284.589, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421285.593, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421286.604, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421287.608, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421288.619, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421289.625, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421290.637, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421291.643, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421292.658, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421293.673, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421294.68, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421295.682, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421296.696, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421297.702, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421298.709, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421299.711, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421300.712, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421301.712, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421302.719, "kind": "pre", "pid": 39008}
+{"event": "alive", "t": 1790421303.72, "kind": "pre", "pid": 39008}
+{"event": "pre-exit", "decision": null, "t": 1790421304.557, "kind": "pre", "pid": 39008}
+{"event": "start", "hook_event_name": "PermissionRequest", "tool": "AskUserQuestion", "tool_use_id": false, "agent_id": false, "permission_mode": "default", "top_keys": ["cwd", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "transcript_path"], "input": {"keys": ["questions"], "questions": [{"keys": ["header", "multiSelect", "options", "question"], "multiSelect": false, "options": [["description", "label"], ["description", "label"]]}]}, "t": 1790421304.659, "kind": "perm", "pid": 19104}
+{"event": "perm", "tool": "AskUserQuestion", "suggestions": 0, "t": 1790421304.659, "kind": "perm", "pid": 19104}
+{"event": "start", "hook_event_name": "PostToolUse", "tool": "AskUserQuestion", "tool_use_id": true, "agent_id": false, "permission_mode": "default", "top_keys": ["cwd", "duration_ms", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_response", "tool_use_id", "transcript_path"], "input": {"keys": ["annotations", "answers", "questions"], "questions": [{"keys": ["header", "multiSelect", "options", "question"], "multiSelect": false, "options": [["description", "label"], ["description", "label"]]}]}, "t": 1790421305.077, "kind": "post", "pid": 29852}
+{"event": "post", "tool": "AskUserQuestion", "response": "{\"questions\": [{\"question\": \"Probe A: pick a color\", \"header\": \"Color\", \"options\": [{\"label\": \"Red\", \"description\": \"Red\"}, {\"label\": \"Blue\", \"description\": \"Blue\"}], \"multiSelect\": false}], \"answers\": {\"Probe A: pick a color\": \"Red\"}, \"annotations\": {}}", "t": 1790421305.077, "kind": "post", "pid": 29852}
+{"event": "start", "hook_event_name": "PreToolUse", "tool": "AskUserQuestion", "tool_use_id": true, "agent_id": false, "permission_mode": "default", "top_keys": ["cwd", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_use_id", "transcript_path"], "input": {"keys": ["questions"], "questions": [{"keys": ["header", "multiSelect", "options", "question"], "multiSelect": true, "options": [["description", "label"], ["description", "label"], ["description", "label"]]}, {"keys": ["header", "multiSelect", "options", "question"], "multiSelect": false, "options": [["description", "label"], ["description", "label"]]}]}, "t": 1790421309.959, "kind": "pre", "pid": 10736}
+{"event": "mode", "mode": "answer", "tool": "AskUserQuestion", "t": 1790421309.964, "kind": "pre", "pid": 10736}
+{"event": "pre-exit", "decision": "allow+answers", "answers": {"Probe B1: pick fruits": "Apple, Plum", "Probe B2: any note": "PROBE-FREE-TEXT typed by hand"}, "t": 1790421309.964, "kind": "pre", "pid": 10736}
+{"event": "start", "hook_event_name": "PostToolUse", "tool": "AskUserQuestion", "tool_use_id": true, "agent_id": false, "permission_mode": "default", "top_keys": ["cwd", "duration_ms", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_response", "tool_use_id", "transcript_path"], "input": {"keys": ["answers", "questions"], "questions": [{"keys": ["header", "multiSelect", "options", "question"], "multiSelect": true, "options": [["description", "label"], ["description", "label"], ["description", "label"]]}, {"keys": ["header", "multiSelect", "options", "question"], "multiSelect": false, "options": [["description", "label"], ["description", "label"]]}]}, "t": 1790421310.046, "kind": "post", "pid": 2084}
+{"event": "post", "tool": "AskUserQuestion", "response": "{\"questions\": [{\"question\": \"Probe B1: pick fruits\", \"header\": \"Fruits\", \"options\": [{\"label\": \"Apple\", \"description\": \"Apple\"}, {\"label\": \"Pear\", \"description\": \"Pear\"}, {\"label\": \"Plum\", \"description\": \"Plum\"}], \"multiSelect\": true}, {\"question\": \"Probe B2: any note\", \"header\": \"Free\", \"options\": [{\"label\": \"Yes\", \"description\": \"Yes\"}, {\"label\": \"No\", \"description\": \"No\"}], \"multiSelect\": false}], \"answers\": {\"Probe B1: pick fruits\": \"Apple, Plum\", \"Probe B2: any note\": \"PROBE-FREE-TEXT typed by hand\"}}", "t": 1790421310.046, "kind": "post", "pid": 2084}
+{"event": "start", "hook_event_name": "PreToolUse", "tool": "AskUserQuestion", "tool_use_id": true, "agent_id": false, "permission_mode": "default", "top_keys": ["cwd", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_use_id", "transcript_path"], "input": {"keys": ["questions"], "questions": [{"keys": ["header", "multiSelect", "options", "question"], "multiSelect": false, "options": [["description", "label"], ["description", "label"]]}]}, "t": 1790421316.216, "kind": "pre", "pid": 37016}
+{"event": "mode", "mode": "wait 45", "tool": "AskUserQuestion", "t": 1790421316.222, "kind": "pre", "pid": 37016}
+{"event": "alive", "t": 1790421317.237, "kind": "pre", "pid": 37016}
+{"event": "alive", "t": 1790421318.248, "kind": "pre", "pid": 37016}
+{"event": "alive", "t": 1790421319.261, "kind": "pre", "pid": 37016}
+{"event": "start", "hook_event_name": "PreToolUse", "tool": "ExitPlanMode", "tool_use_id": true, "agent_id": false, "permission_mode": "plan", "top_keys": ["cwd", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "tool_use_id", "transcript_path"], "input": {"keys": ["plan", "planFilePath"], "plan_chars": 383, "has_planFilePath": true}, "t": 1790421353.055, "kind": "pre", "pid": 40632}
+{"event": "mode", "mode": "wait 0", "tool": "ExitPlanMode", "t": 1790421353.06, "kind": "pre", "pid": 40632}
+{"event": "pre-exit", "decision": null, "t": 1790421353.06, "kind": "pre", "pid": 40632}
+{"event": "start", "hook_event_name": "PermissionRequest", "tool": "ExitPlanMode", "tool_use_id": false, "agent_id": false, "permission_mode": "plan", "top_keys": ["cwd", "effort", "hook_event_name", "permission_mode", "prompt_id", "scratchpad_dir", "session_id", "tool_input", "tool_name", "transcript_path"], "input": {"keys": ["plan", "planFilePath"], "plan_chars": 383, "has_planFilePath": true}, "t": 1790421353.172, "kind": "perm", "pid": 22848}
+{"event": "perm", "tool": "ExitPlanMode", "suggestions": 0, "t": 1790421353.172, "kind": "perm", "pid": 22848}

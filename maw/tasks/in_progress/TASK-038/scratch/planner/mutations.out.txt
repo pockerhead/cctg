@@ -1,0 +1,8 @@
+CAUGHT hook::build_tests::answers_are_claude_code_pre_tool_use_output
+CAUGHT hook::build_tests::questions_carry_their_capped_texts_and_keep_the_input
+CAUGHT hub::slots::tests::permission_requests_of_a_question_get_no_buttons
+CAUGHT hub::slots::tests::a_question_is_answered_with_buttons_and_own_text
+CAUGHT hub::slots::tests::an_unanswered_question_goes_to_the_terminal
+CAUGHT hub::questions::tests::a_multi_select_ticks_and_needs_one
+CAUGHT hub::questions::tests::a_single_choice_answers_and_moves_on
+exit=0

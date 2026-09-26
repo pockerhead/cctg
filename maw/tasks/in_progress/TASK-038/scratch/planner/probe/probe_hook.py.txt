@@ -1,0 +1,116 @@
+"""TASK-038 probe hook (copied to <probe folder>/probe_hook.py by the probe).
+
+usage: python probe_hook.py pre|perm|post
+
+Logs one JSON line per event to hook_log.jsonl next to itself (never the
+cwd or transcript path). `pre` reads mode.txt next to itself:
+  wait N    - sleep N seconds with a heartbeat line every second, print nothing
+  answer    - print allow + updatedInput {questions, answers} at once
+`perm` and `post` only log and print nothing (no decision).
+"""
+import json
+import os
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG = os.path.join(HERE, "hook_log.jsonl")
+KIND = sys.argv[1] if len(sys.argv) > 1 else "?"
+PID = os.getpid()
+
+
+def log(**fields):
+    fields.update(t=round(time.time(), 3), kind=KIND, pid=PID)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def shape(tool_input):
+    """Keys of the input and of its questions and options; no texts."""
+    out = {"keys": sorted(tool_input.keys()) if isinstance(tool_input, dict) else str(type(tool_input))}
+    qs = tool_input.get("questions") if isinstance(tool_input, dict) else None
+    if isinstance(qs, list):
+        out["questions"] = [
+            {
+                "keys": sorted(q.keys()),
+                "multiSelect": q.get("multiSelect"),
+                "options": [sorted(o.keys()) for o in q.get("options", []) if isinstance(o, dict)],
+            }
+            for q in qs if isinstance(q, dict)
+        ]
+    if isinstance(tool_input, dict) and "plan" in tool_input:
+        out["plan_chars"] = len(tool_input.get("plan") or "")
+        out["has_planFilePath"] = bool(tool_input.get("planFilePath"))
+    return out
+
+
+def heartbeat():
+    while True:
+        time.sleep(1)
+        log(event="alive")
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        log(event="bad-stdin", size=len(raw))
+        return
+    tool = data.get("tool_name")
+    tool_input = data.get("tool_input") or {}
+    log(event="start", hook_event_name=data.get("hook_event_name"), tool=tool,
+        tool_use_id=bool(data.get("tool_use_id")), agent_id=bool(data.get("agent_id")),
+        permission_mode=data.get("permission_mode"), top_keys=sorted(data.keys()),
+        input=shape(tool_input))
+    if KIND == "post":
+        resp = data.get("tool_response")
+        log(event="post", tool=tool,
+            response=(json.dumps(resp, ensure_ascii=False)[:1500] if resp is not None else None))
+        return
+    if KIND == "perm":
+        log(event="perm", tool=tool, suggestions=len(data.get("permission_suggestions") or []))
+        return
+    mode = "wait 0"
+    try:
+        mode = open(os.path.join(HERE, "mode.txt"), encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    log(event="mode", mode=mode, tool=tool)
+    if tool != "AskUserQuestion":
+        log(event="pre-exit", decision=None)
+        return
+    if mode.startswith("wait"):
+        seconds = float(mode.split()[1])
+        threading.Thread(target=heartbeat, daemon=True).start()
+        time.sleep(seconds)
+        log(event="pre-exit", decision=None)
+        return
+    if mode == "answer":
+        answers = {}
+        for q in tool_input.get("questions", []):
+            labels = [o.get("label", "") for o in q.get("options", [])]
+            if q.get("multiSelect"):
+                answers[q.get("question", "")] = ", ".join([labels[0], labels[-1]] if len(labels) > 1 else labels)
+            elif "free" in (q.get("header") or "").lower():
+                answers[q.get("question", "")] = "PROBE-FREE-TEXT typed by hand"
+            else:
+                answers[q.get("question", "")] = labels[-1] if labels else ""
+        updated = dict(tool_input)
+        updated["answers"] = answers
+        out = {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "PROBE answered by hook",
+            "updatedInput": updated,
+        }}
+        sys.stdout.write(json.dumps(out))
+        sys.stdout.flush()
+        log(event="pre-exit", decision="allow+answers", answers=answers)
+        return
+    log(event="pre-exit", decision=None, note="unknown mode")
+
+
+main()

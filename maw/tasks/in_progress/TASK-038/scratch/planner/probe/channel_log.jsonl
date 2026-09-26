@@ -1,0 +1,8 @@
+{"event": "message", "method": "server/discover", "has_id": true, "t": 1790421270.574}
+{"event": "message", "method": "initialize", "has_id": true, "t": 1790421270.71}
+{"event": "message", "method": "notifications/initialized", "has_id": false, "t": 1790421270.809}
+{"event": "message", "method": "tools/list", "has_id": true, "t": 1790421270.843}
+{"event": "message", "method": "server/discover", "has_id": true, "t": 1790421339.471}
+{"event": "message", "method": "initialize", "has_id": true, "t": 1790421339.484}
+{"event": "message", "method": "notifications/initialized", "has_id": false, "t": 1790421339.561}
+{"event": "message", "method": "tools/list", "has_id": true, "t": 1790421339.594}

@@ -1,0 +1,471 @@
+"""TASK-038 probe: AskUserQuestion through a PreToolUse hook (run by the
+orchestrator; probes approved by the user).
+
+Answers:
+ (a) does a PreToolUse hook that waits N seconds hold the terminal's
+     AskUserQuestion dialog back until it returns;
+ (b) does allow + updatedInput {questions, answers} make claude take the
+     answer without showing the dialog (single, multiSelect, free text);
+ (c) do PermissionRequest hooks and the channel permission_request fire for
+     AskUserQuestion;
+ (d) what Esc in the terminal does while the hook waits (hook killed? turn
+     interrupted? dialog?);
+ (e) ExitPlanMode: PreToolUse input shape, PermissionRequest hook, channel
+     permission_request (for the follow-up decision only).
+
+Hidden console, own fixed probe folder (%TEMP%\\cctg-t038-probe), CLAUDE* env
+stripped, only the probe's own MCP server (--strict-mcp-config) and hooks
+(--settings), dialogs answered by screen reading, kills only its own tree.
+Writes probe_ask_question.out.txt (plus sanitized hook_log/channel_log copies)
+next to this script.
+
+Run: copy to a .py file anywhere and `python probe_ask_question.py`, or
+`python -c "exec(open(r'<this file>', encoding='utf-8').read())"` with
+__file__ set; the simplest is: python <this file> (Python runs .txt files).
+"""
+import ctypes
+import ctypes.wintypes as wt
+import glob
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location("rs", r"C:\Users\user\.cctg\restart_session.py")
+rs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rs)
+k32 = rs.k32
+
+CLAUDE = r"C:\Users\user\.local\bin\claude.exe"
+PROBE = os.path.join(os.environ["TEMP"], "cctg-t038-probe")
+os.makedirs(PROBE, exist_ok=True)
+for name in os.listdir(PROBE):
+    p = os.path.join(PROBE, name)
+    if os.path.isfile(p):
+        os.remove(p)
+shutil.copyfile(os.path.join(HERE, "probe_hook.py.txt"), os.path.join(PROBE, "probe_hook.py"))
+shutil.copyfile(os.path.join(HERE, "probe_channel.py.txt"), os.path.join(PROBE, "probe_channel.py"))
+HOOK_LOG = os.path.join(PROBE, "hook_log.jsonl")
+CHANNEL_LOG = os.path.join(PROBE, "channel_log.jsonl")
+
+
+def fwd(path):
+    return path.replace("\\", "/")
+
+
+PY = fwd(sys.executable)
+HOOK = fwd(os.path.join(PROBE, "probe_hook.py"))
+
+
+def hook_command(kind):
+    return f'"{PY}" "{HOOK}" {kind}'
+
+
+SETTINGS = {
+    "hooks": {
+        "PreToolUse": [{
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [{"type": "command", "command": hook_command("pre"), "timeout": 120,
+                       "statusMessage": "PROBE-HOOK-WAITING"}],
+        }],
+        "PermissionRequest": [{
+            "hooks": [{"type": "command", "command": hook_command("perm"), "timeout": 30}],
+        }],
+        "PostToolUse": [{
+            "matcher": "AskUserQuestion|ExitPlanMode",
+            "hooks": [{"type": "command", "command": hook_command("post")}],
+        }],
+    }
+}
+MCP = {"mcpServers": {"probe": {"command": sys.executable,
+                                "args": [os.path.join(PROBE, "probe_channel.py")]}}}
+SETTINGS_PATH = os.path.join(PROBE, "settings.json")
+MCP_PATH = os.path.join(PROBE, "mcp.json")
+json.dump(SETTINGS, open(SETTINGS_PATH, "w", encoding="utf-8"), indent=1)
+json.dump(MCP, open(MCP_PATH, "w", encoding="utf-8"), indent=1)
+
+OUT = open(os.path.join(HERE, "probe_ask_question.out.txt"), "w", encoding="utf-8")
+RESULTS = {}
+
+
+def log(msg):
+    OUT.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    OUT.flush()
+
+
+def write(chars):
+    h = k32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+    recs = []
+    for ch in chars:
+        vk = {"\r": 0x0D, "\b": 0x08, "\x1b": 0x1B}.get(ch, 0)
+        for down in (1, 0):
+            r = rs.INPUT_RECORD()
+            r.EventType = 1
+            r.Event.KeyEvent.bKeyDown = down
+            r.Event.KeyEvent.wRepeatCount = 1
+            r.Event.KeyEvent.wVirtualKeyCode = vk
+            r.Event.KeyEvent.uChar.UnicodeChar = ch
+            recs.append(r)
+    arr = (rs.INPUT_RECORD * len(recs))(*recs)
+    n = wt.DWORD(0)
+    k32.WriteConsoleInputW(wt.HANDLE(h), arr, len(recs), ctypes.byref(n))
+    k32.CloseHandle(wt.HANDLE(h))
+
+
+def screen():
+    return rs.screen_lines()
+
+
+def boxed(lines):
+    rules = [i for i, l in enumerate(lines) if len(l.strip()) >= 20 and set(l.strip()) == {"\u2500"}]
+    return len(rules) >= 2
+
+
+def env():
+    return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k != "MSYS_NO_PATHCONV"}
+
+
+def dump(title):
+    lines = screen()
+    log("=== screen: " + title)
+    for l in lines[-30:]:
+        if l.strip():
+            log("  | " + l[:160])
+
+
+def start(mode):
+    args = [CLAUDE, "--permission-mode", mode, "--strict-mcp-config", "--mcp-config", MCP_PATH,
+            "--settings", SETTINGS_PATH, "--dangerously-load-development-channels", "server:probe"]
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    p = subprocess.Popen(args, cwd=PROBE, env=env(), creationflags=subprocess.CREATE_NEW_CONSOLE,
+                         startupinfo=si)
+    time.sleep(2)
+    for _ in range(40):
+        if rs.attach(p.pid):
+            break
+        time.sleep(0.5)
+    # trust and development-channels dialogs, then the input box
+    for _ in range(160):
+        lines = screen()
+        text = "\n".join(lines).lower()
+        if "enter to confirm" in text or "enter to select" in text:
+            selected = next((l for l in lines if "\u276f" in l), "")
+            log("start dialog, selected: " + selected.strip()[:100])
+            low = selected.lower()
+            if " no" in low or "exit" in low or "quit" in low:
+                rs.press(["down"])
+                time.sleep(0.5)
+                continue
+            rs.press(["enter"])
+            time.sleep(3)
+            continue
+        if boxed(lines):
+            break
+        time.sleep(0.5)
+    time.sleep(3)
+    dump(f"started ({mode})")
+    return p
+
+
+def type_prompt(text):
+    write(text)
+    time.sleep(0.8)
+    write("\r")
+
+
+def set_mode(mode):
+    with open(os.path.join(PROBE, "mode.txt"), "w", encoding="utf-8") as f:
+        f.write(mode)
+
+
+def events(path):
+    if not os.path.exists(path):
+        return []
+    out = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def transcript():
+    enc = "".join(c if c.isalnum() else "-" for c in os.path.realpath(PROBE))
+    files = [f for f in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
+             if os.path.basename(os.path.dirname(f)).lower() == enc.lower()]
+    files.sort(key=os.path.getmtime)
+    return files[-1] if files else None
+
+
+def records():
+    path = transcript()
+    if not path:
+        return []
+    out = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def assistant_text_with(marker):
+    for r in records():
+        if r.get("type") != "assistant":
+            continue
+        for b in (r.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text" and marker in b.get("text", ""):
+                return b["text"]
+    return None
+
+
+def last_tool_result(tool):
+    """(tool_result content, toolUseResult) of the last call of `tool`."""
+    ids, found = set(), (None, None)
+    for r in records():
+        for b in (r.get("message") or {}).get("content") or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use" and b.get("name") == tool:
+                ids.add(b.get("id"))
+            if b.get("type") == "tool_result" and b.get("tool_use_id") in ids:
+                found = (b.get("content"), r.get("toolUseResult"))
+    return found
+
+
+def options_visible(lines, first, second):
+    a = any(re.search(r"\b1\.\s+" + re.escape(first) + r"\b", l) for l in lines)
+    b = any(re.search(r"\b2\.\s+" + re.escape(second) + r"\b", l) for l in lines)
+    return a and b
+
+
+def dialog_visible(lines, first, second):
+    text = "\n".join(lines)
+    return options_visible(lines, first, second) or "Type something" in text
+
+
+def wait_idle(seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        tail = "\n".join(screen()[-12:]).lower()
+        if "esc to interrupt" not in tail:
+            return True
+        time.sleep(2)
+    return False
+
+
+def since(evts, t0):
+    return [e for e in evts if e.get("t", 0) >= t0]
+
+
+def relay_facts(t0, tool, tag):
+    perms = [e for e in since(events(HOOK_LOG), t0) if e.get("kind") == "perm" and e.get("event") == "start"]
+    chans = [e for e in since(events(CHANNEL_LOG), t0) if e.get("event") == "permission_request"]
+    log(f"{tag}: PermissionRequest hook calls since start: {[e.get('tool') for e in perms]}")
+    log(f"{tag}: channel permission_request since start: "
+        + json.dumps([{k: e.get(k) for k in ('tool_name', 'description', 'input_preview_chars',
+                                              'input_preview_head')} for e in chans], ensure_ascii=False)[:1500])
+    RESULTS[f"{tag}_permission_hook_fired"] = any(e.get("tool") == tool for e in perms)
+    RESULTS[f"{tag}_channel_relayed"] = any(e.get("tool_name") == tool for e in chans)
+
+
+PA = ("Call the AskUserQuestion tool exactly once, now, with exactly one question: question text "
+      "'Probe A: pick a color', header 'Color', multiSelect false, two options with labels 'Red' and "
+      "'Blue'. Use no other tool. After you get the answer, reply with one line: ANSWER-A= followed "
+      "by the answer exactly as you received it, then end your turn.")
+PB = ("Call the AskUserQuestion tool exactly once, now, with exactly two questions. Question 1: text "
+      "'Probe B1: pick fruits', header 'Fruits', multiSelect true, options 'Apple', 'Pear', 'Plum'. "
+      "Question 2: text 'Probe B2: any note', header 'Free', multiSelect false, options 'Yes' and 'No'. "
+      "Use no other tool. After you get the answers, reply with one line: ANSWER-B= followed by both "
+      "answers exactly as you received them, then end your turn.")
+PD = ("Call the AskUserQuestion tool exactly once, now, with exactly one question: question text "
+      "'Probe D: pick a shape', header 'Shape', multiSelect false, two options 'Circle' and 'Square'. "
+      "Use no other tool. After the answer reply with one line: ANSWER-D= followed by the answer.")
+PE = ("Planning only, do not read or explore anything. The whole plan is: create a file probe.txt "
+      "containing the word hi. Present this plan for approval right away with the ExitPlanMode tool.")
+
+procs = []
+try:
+    log(f"claude --version: {subprocess.run([CLAUDE, '--version'], capture_output=True, text=True, env=env()).stdout.strip()}")
+    p1 = start("default")
+    procs.append(p1)
+    log(f"claude 1 pid {p1.pid}; channel log so far: "
+        + json.dumps([e.get("method") for e in events(CHANNEL_LOG)]))
+
+    # ---- (a) + (c): a hook that waits 25 s, then no decision
+    set_mode("wait 25")
+    t0 = time.time()
+    type_prompt(PA)
+    status_t = dialog_t = pre_start_t = pre_exit_t = None
+    presses, last_press, dumped_wait = 0, 0.0, False
+    end = time.time() + 180
+    while time.time() < end:
+        lines = screen()
+        now = time.time()
+        text = "\n".join(lines)
+        evts = [e for e in since(events(HOOK_LOG), t0) if e.get("kind") == "pre"]
+        if pre_start_t is None:
+            pre_start_t = next((e["t"] for e in evts if e.get("event") == "start"), None)
+        if pre_exit_t is None:
+            pre_exit_t = next((e["t"] for e in evts if e.get("event") == "pre-exit"), None)
+        if status_t is None and "PROBE-HOOK-WAITING" in text:
+            status_t = now
+        if pre_start_t and not dumped_wait and now > pre_start_t + 8:
+            dumped_wait = True
+            dump("A: 8 s into the waiting hook")
+        if dialog_visible(lines, "Red", "Blue"):
+            if dialog_t is None:
+                dialog_t = now
+                dump("A: dialog first seen")
+            if presses < 8 and now - last_press > 1.5:
+                rs.press(["enter"])
+                presses += 1
+                last_press = now
+        elif dialog_t is not None and presses < 8 and now - last_press > 1.5 and "Submit" in text:
+            dump("A: submit screen")
+            rs.press(["enter"])
+            presses += 1
+            last_press = now
+        if assistant_text_with("ANSWER-A="):
+            break
+        time.sleep(0.5)
+    wait_idle(60)
+    dump("A: end")
+    log(f"A: hook start {pre_start_t and round(pre_start_t - t0, 1)} s, hook exit "
+        f"{pre_exit_t and round(pre_exit_t - t0, 1)} s, statusMessage seen "
+        f"{status_t and round(status_t - t0, 1)} s, dialog first seen {dialog_t and round(dialog_t - t0, 1)} s "
+        f"(after the prompt); terminal presses {presses}")
+    log(f"A: reply: {assistant_text_with('ANSWER-A=')!r}")
+    if pre_exit_t and dialog_t:
+        RESULTS["a_dialog_held_back_until_hook_returned"] = dialog_t >= pre_exit_t - 0.2
+    RESULTS["a_status_message_shown_while_waiting"] = status_t is not None
+    relay_facts(t0, "AskUserQuestion", "c_after_no_decision")
+
+    # ---- (b): allow + updatedInput with answers (multiSelect + free text)
+    set_mode("answer")
+    t1 = time.time()
+    type_prompt(PB)
+    dialog_b = None
+    end = time.time() + 150
+    while time.time() < end:
+        lines = screen()
+        if dialog_visible(lines, "Apple", "Pear") or dialog_visible(lines, "Yes", "No"):
+            if dialog_b is None:
+                dialog_b = time.time()
+                dump("B: a dialog showed up (unexpected)")
+            rs.press(["enter"])
+            time.sleep(1.5)
+        if assistant_text_with("ANSWER-B="):
+            break
+        time.sleep(0.5)
+    wait_idle(60)
+    dump("B: end")
+    reply_b = assistant_text_with("ANSWER-B=")
+    content, tur = last_tool_result("AskUserQuestion")
+    log(f"B: reply: {reply_b!r}")
+    log("B: tool_result content: " + json.dumps(content, ensure_ascii=False)[:1500])
+    log("B: toolUseResult: " + json.dumps(tur, ensure_ascii=False)[:1500])
+    posts = [e for e in since(events(HOOK_LOG), t1) if e.get("kind") == "post" and e.get("event") == "post"]
+    log("B: PostToolUse tool_response: " + json.dumps([e.get("response") for e in posts], ensure_ascii=False)[:1500])
+    RESULTS["b_dialog_shown"] = dialog_b is not None
+    RESULTS["b_answer_taken"] = bool(reply_b) and "PROBE-FREE-TEXT" in (reply_b or "") + json.dumps(content or "")
+    relay_facts(t1, "AskUserQuestion", "c_after_allow")
+
+    # ---- (d): Esc while the hook waits
+    set_mode("wait 45")
+    t2 = time.time()
+    type_prompt(PD)
+    pre = None
+    for _ in range(120):
+        pre = next((e for e in since(events(HOOK_LOG), t2) if e.get("kind") == "pre" and e.get("event") == "start"), None)
+        if pre:
+            break
+        time.sleep(0.5)
+    if pre:
+        time.sleep(3)
+        dump("D: before Esc")
+        t_esc = time.time()
+        write("\x1b")
+        dialog_d = None
+        for i in range(30):
+            time.sleep(0.5)
+            if dialog_visible(screen(), "Circle", "Square") and dialog_d is None:
+                dialog_d = time.time()
+                dump("D: dialog after Esc")
+            if i == 4:
+                dump("D: 2.5 s after Esc")
+        dump("D: 15 s after Esc")
+        alive_after = [e for e in since(events(HOOK_LOG), t_esc + 2) if e.get("pid") == pre.get("pid")]
+        exit_d = next((e for e in since(events(HOOK_LOG), t2) if e.get("kind") == "pre" and e.get("event") == "pre-exit"), None)
+        log(f"D: hook lines 2 s+ after Esc: {len(alive_after)}; hook pre-exit logged: {bool(exit_d)}; "
+            f"dialog after Esc: {dialog_d and round(dialog_d - t_esc, 1)} s")
+        RESULTS["d_hook_killed_by_esc"] = len(alive_after) == 0
+        RESULTS["d_dialog_after_esc"] = dialog_d is not None
+        # let whatever is left run out, answering a dialog if one comes
+        end = time.time() + 60
+        while time.time() < end:
+            lines = screen()
+            if dialog_visible(lines, "Circle", "Square"):
+                if dialog_d is None:
+                    dialog_d = time.time()
+                    dump("D: dialog later")
+                write("\x1b")
+                time.sleep(1.5)
+            if wait_idle(1):
+                break
+            time.sleep(1)
+        dump("D: end")
+        tail = [r for r in records() if r.get("type") == "user"][-3:]
+        log("D: last user records: " + json.dumps(
+            [(r.get("message") or {}).get("content") for r in tail], ensure_ascii=False)[:1500])
+    else:
+        log("D: the hook never started")
+
+    # ---- (e): ExitPlanMode in plan mode
+    k32.FreeConsole()
+    subprocess.run(["taskkill", "/PID", str(p1.pid), "/T", "/F"], capture_output=True)
+    time.sleep(2)
+    set_mode("wait 0")
+    p2 = start("plan")
+    procs.append(p2)
+    t3 = time.time()
+    type_prompt(PE)
+    plan_t = None
+    end = time.time() + 180
+    while time.time() < end:
+        text = "\n".join(screen()).lower()
+        if ("would you like to proceed" in text or "keep planning" in text
+                or "ready to code" in text or "approve" in text and "plan" in text):
+            plan_t = time.time()
+            time.sleep(3)
+            dump("E: plan dialog")
+            break
+        time.sleep(1)
+    time.sleep(3)
+    pre_e = [e for e in since(events(HOOK_LOG), t3) if e.get("kind") == "pre" and e.get("event") == "start"]
+    log("E: PreToolUse inputs: " + json.dumps([{k: e.get(k) for k in ("tool", "input", "tool_use_id")} for e in pre_e])[:1500])
+    relay_facts(t3, "ExitPlanMode", "e")
+    if plan_t:
+        write("\x1b")
+        time.sleep(3)
+        dump("E: after Esc on the plan dialog")
+    RESULTS["e_plan_dialog_seen"] = plan_t is not None
+finally:
+    k32.FreeConsole()
+    for p in procs:
+        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True)
+    for src, name in ((HOOK_LOG, "hook_log.jsonl"), (CHANNEL_LOG, "channel_log.jsonl")):
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(HERE, name))
+    log("RESULTS " + json.dumps(RESULTS, indent=1))
+    log("probe done")
+    OUT.close()
