@@ -1752,7 +1752,7 @@ mod tests {
             (
                 request(
                     Some(&bearer),
-                    &good.replace_type("session_start", "pre_compact"),
+                    &good.replace_type("session_start", "post_compact"),
                 ),
                 400,
             ),

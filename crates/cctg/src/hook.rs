@@ -37,6 +37,12 @@
 //! wait for it. It tells the hub which tool call of the main conversation
 //! runs now, for the status message; calls inside subagents are skipped.
 //!
+//! `cctg hook PreCompact` (TASK-053) tells the hub that a compaction starts
+//! and whether `/compact` or Claude Code itself asked for it. The text the
+//! user gave `/compact` (`custom_instructions`) is never read. Like every
+//! hook here it exits 0 with nothing on stdout, so it never blocks the
+//! compaction (exit 2 or `"decision": "block"` would).
+//!
 //! Registration: `docs/hook-settings.json`. Configuration: [`crate::device`].
 
 use std::collections::HashSet;
@@ -649,6 +655,7 @@ pub fn post_timeout(event: &HookEvent, tls: bool) -> Duration {
             | HookEvent::ToolStart { .. }
             | HookEvent::ToolEnd { .. }
             | HookEvent::StatusLine { .. }
+            | HookEvent::PreCompact { .. }
     );
     match (short, tls) {
         (true, false) => PROMPT_POST_TIMEOUT,
@@ -722,6 +729,8 @@ struct Input {
     hook_event_name: Option<String>,
     source: Option<String>,
     reason: Option<String>,
+    /// `PreCompact`: `manual` or `auto`.
+    trigger: Option<String>,
     prompt_id: Option<String>,
     last_assistant_message: Option<String>,
     agent_id: Option<String>,
@@ -874,6 +883,12 @@ pub fn build(event: &str, input: &[u8], probe: &Probe<'_>) -> Result<HookPost, S
                 message: cap_text(message),
             }
         }
+        "PreCompact" => HookEvent::PreCompact {
+            // Only the two documented values go on; anything else is unknown.
+            trigger: input
+                .trigger
+                .filter(|trigger| matches!(trigger.as_str(), "manual" | "auto")),
+        },
         _ => return Err(Skip("unsupported hook event")),
     };
     let live = matches!(
@@ -1841,6 +1856,43 @@ mod build_tests {
     }
 
     #[test]
+    fn a_compaction_carries_its_trigger_and_never_the_users_text() {
+        for trigger in ["manual", "auto"] {
+            let input = serde_json::json!({
+                "session_id": "s",
+                "transcript_path": "/t/s.jsonl",
+                "cwd": "/w",
+                "hook_event_name": "PreCompact",
+                "trigger": trigger,
+                "custom_instructions": "private compact focus",
+            });
+            let v = check(
+                "PreCompact",
+                input.to_string().as_bytes(),
+                OWN,
+                &["type", "trigger"],
+            );
+            assert_eq!(v["event"]["type"], "pre_compact");
+            assert_eq!(v["event"]["trigger"], trigger);
+            assert!(!v.to_string().contains("private compact focus"));
+        }
+        for input in [
+            &br#"{"session_id":"s","trigger":"sideways"}"#[..],
+            br#"{"session_id":"s","custom_instructions":null}"#,
+        ] {
+            let v = check("PreCompact", input, OWN, &["type", "trigger"]);
+            assert_eq!(v["event"]["trigger"], Value::Null);
+        }
+        with_probe(OWN, true, |probe, _| {
+            let other = br#"{"session_id":"s","hook_event_name":"PostCompact","trigger":"auto"}"#;
+            assert_eq!(
+                build("PreCompact", other, probe).unwrap_err(),
+                Skip("input is for another hook event")
+            );
+        });
+    }
+
+    #[test]
     fn nesting_comes_from_the_lineage() {
         let nested = Lineage {
             claude_pid: Some(25388),
@@ -2109,7 +2161,7 @@ mod build_tests {
                 Skip("input is for another hook event")
             );
             assert_eq!(
-                build("PreCompact", br#"{"session_id":"s"}"#, probe).unwrap_err(),
+                build("PostCompact", br#"{"session_id":"s"}"#, probe).unwrap_err(),
                 Skip("unsupported hook event")
             );
         });
@@ -2147,6 +2199,7 @@ mod build_tests {
             HookEvent::ToolEnd {
                 tool_use_id: "t".into(),
             },
+            HookEvent::PreCompact { trigger: None },
             HookEvent::StatusLine {
                 model: None,
                 effort: None,

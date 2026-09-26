@@ -1070,6 +1070,15 @@ pub enum HookEvent {
         #[serde(default)]
         seven_day: Option<u32>,
     },
+    /// Claude Code is about to compact the context (`PreCompact`, TASK-053).
+    /// `trigger`: `manual` (`/compact`) or `auto`; the user's
+    /// `custom_instructions` never leave the hook. The end is the session's
+    /// `SessionStart` with `source: compact`. A hub before TASK-053 answers
+    /// 400 (unknown kind) and the hook drops the event.
+    PreCompact {
+        #[serde(default)]
+        trigger: Option<String>,
+    },
 }
 
 impl HookEvent {
@@ -1085,6 +1094,7 @@ impl HookEvent {
             Self::ToolStart { .. } => "tool_start",
             Self::ToolEnd { .. } => "tool_end",
             Self::StatusLine { .. } => "status_line",
+            Self::PreCompact { .. } => "pre_compact",
         }
     }
 
@@ -1109,6 +1119,7 @@ impl Kinds for HookEvent {
         "tool_start",
         "tool_end",
         "status_line",
+        "pre_compact",
     ];
 }
 
@@ -1520,6 +1531,9 @@ mod tests {
                 context: Some(50),
                 five_hour: Some(3),
                 seven_day: None,
+            },
+            HookEvent::PreCompact {
+                trigger: Some("auto".into()),
             },
         ]
     }
@@ -2177,8 +2191,13 @@ mod tests {
         v2["v"] = json!(2);
         assert_eq!(decode_hook(&body(v2)), Err(WireError::Version));
         assert_eq!(
-            decode_hook(&body(base(json!({ "type": "pre_compact" })))),
+            decode_hook(&body(base(json!({ "type": "post_compact" })))),
             Err(WireError::UnknownKind)
+        );
+        // A compaction without its trigger is still one event.
+        assert_eq!(
+            decode_hook(&body(base(json!({ "type": "pre_compact" })))).map(|p| p.event),
+            Ok(HookEvent::PreCompact { trigger: None })
         );
         assert_eq!(
             decode_hook(&body(base(json!({ "type": "subagent_start" })))),

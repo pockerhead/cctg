@@ -8,6 +8,10 @@
 //! answers the prompt instead of stopping the turn, so ⏹ is never offered
 //! then.
 //!
+//! While Claude Code compacts the context (TASK-053) the first line says so,
+//! with the minutes it takes; the topic gets one silent line when it starts
+//! ([`compacting_line`]) and one when it is done ([`compacted_line`]).
+//!
 //! This module is the pure part: what a session does ([`Activity`], from
 //! hooks, the stream and written keys), how that reads ([`render`]) and the
 //! buttons. The slots actor owns the message, its edits and the presses.
@@ -269,6 +273,12 @@ pub enum Phase {
     },
     Thinking,
     Idle,
+    /// The context is being compacted: `auto` (`None`: trigger unknown) and
+    /// whole minutes since it began.
+    Compacting {
+        auto: Option<bool>,
+        minutes: u64,
+    },
 }
 
 /// What the session of a slot does: an ended session is ended, a waiting
@@ -328,6 +338,8 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
         }
         Phase::Thinking => "💭 Думает".to_owned(),
         Phase::Idle => "💤 Ждёт вас".to_owned(),
+        Phase::Compacting { auto, minutes: 0 } => compacting_line(*auto),
+        Phase::Compacting { auto, minutes } => format!("{} {minutes} мин", compacting_line(*auto)),
     };
     let numbers = metrics.map(Metrics::line).unwrap_or_default();
     let mut text = if numbers.is_empty() {
@@ -356,6 +368,35 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
         json!({ "inline_keyboard": [row] })
     };
     (text, keyboard)
+}
+
+/// The words for how a compaction began.
+fn trigger_words(auto: Option<bool>) -> &'static str {
+    match auto {
+        Some(true) => " (авто)",
+        Some(false) => " (вручную)",
+        None => "",
+    }
+}
+
+/// The topic line (and the status head) of a compaction that began.
+pub fn compacting_line(auto: Option<bool>) -> String {
+    format!("🗜 Сжимаю контекст{}…", trigger_words(auto))
+}
+
+/// The topic line of a compaction that ended after `took`; `before` and
+/// `after`: the context percentages, shown when both are known.
+pub fn compacted_line(took: Duration, before: Option<u32>, after: Option<u32>) -> String {
+    let seconds = took.as_secs();
+    let took = match (seconds / 60, seconds % 60) {
+        (0, seconds) => format!("{seconds} с"),
+        (minutes, 0) => format!("{minutes} мин"),
+        (minutes, seconds) => format!("{minutes} мин {seconds} с"),
+    };
+    match before.zip(after) {
+        Some((before, after)) => format!("🗜 Контекст сжат за {took}: {before}% → {after}%"),
+        None => format!("🗜 Контекст сжат за {took}"),
+    }
 }
 
 #[cfg(test)]
@@ -583,6 +624,54 @@ mod tests {
         );
         assert!(outdated_text(Some("ab12cd34"), "ffee0011").contains("ab12cd34"));
         assert!(outdated_text(None, "ffee0011").contains("ffee0011"));
+    }
+
+    #[test]
+    fn a_compaction_reads_as_its_trigger_time_and_numbers() {
+        let compacting = |auto, minutes| {
+            render(
+                &Phase::Compacting { auto, minutes },
+                None,
+                Buttons::default(),
+            )
+            .0
+        };
+        assert_eq!(compacting(Some(true), 0), "🗜 Сжимаю контекст (авто)…");
+        assert_eq!(
+            compacting(Some(false), 2),
+            "🗜 Сжимаю контекст (вручную)… 2 мин"
+        );
+        assert_eq!(compacting(None, 0), "🗜 Сжимаю контекст…");
+        let (text, _) = render(
+            &Phase::Compacting {
+                auto: Some(true),
+                minutes: 1,
+            },
+            Some(&metrics()),
+            Buttons::default(),
+        );
+        assert_eq!(
+            text,
+            "🗜 Сжимаю контекст (авто)… 1 мин\nOpus 5.5 · high · ctx 50% · 5h 3%"
+        );
+        assert_eq!(compacting_line(Some(false)), "🗜 Сжимаю контекст (вручную)…");
+        let secs = Duration::from_secs;
+        assert_eq!(
+            compacted_line(secs(42), Some(81), Some(12)),
+            "🗜 Контекст сжат за 42 с: 81% → 12%"
+        );
+        assert_eq!(
+            compacted_line(secs(125), Some(81), None),
+            "🗜 Контекст сжат за 2 мин 5 с"
+        );
+        assert_eq!(
+            compacted_line(secs(120), None, Some(12)),
+            "🗜 Контекст сжат за 2 мин"
+        );
+        assert_eq!(
+            compacted_line(Duration::from_millis(300), None, None),
+            "🗜 Контекст сжат за 0 с"
+        );
     }
 
     #[test]

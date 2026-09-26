@@ -100,7 +100,8 @@ cargo build --release -p cctg
       { "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }
     ],
     "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook ToolStatus", "async": true }] }],
-    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PermissionRequest", "timeout": 100 }] }]
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PermissionRequest", "timeout": 100 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "\"<cctg>\" hook PreCompact", "timeout": 5 }] }]
   }
 }
 ```

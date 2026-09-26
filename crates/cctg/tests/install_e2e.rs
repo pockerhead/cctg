@@ -31,10 +31,11 @@ const TOKEN: &str = "123456:install-e2e-token-value";
 const EXE: &str = std::env::consts::EXE_SUFFIX;
 /// The line install.sh adds to the shell's start file (TASK-052).
 const PATH_LINE: &str = "export PATH=\"$HOME/.local/bin:$PATH\" # cctg";
-const EVENTS: [&str; 10] = [
+const EVENTS: [&str; 11] = [
     "PermissionRequest",
     "PostToolUse",
     "PostToolUseFailure",
+    "PreCompact",
     "PreToolUse",
     "SessionEnd",
     "SessionStart",
@@ -457,6 +458,29 @@ fn install_update_and_uninstall_a_device() {
     );
     installed["hooks"][0]["command"] = documented["hooks"][0]["command"].clone();
     assert_eq!(installed, documented);
+    // So is the compaction group (TASK-053), with its short timeout.
+    let documented: Value =
+        serde_json::from_str(include_str!("../../../docs/hook-settings.json")).unwrap();
+    let documented_events: BTreeSet<&str> = documented["hooks"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(documented_events, events);
+    let mut installed = settings["hooks"]["PreCompact"].clone();
+    let hook = &installed[0]["hooks"][0];
+    assert!(
+        hook["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("\" hook PreCompact"),
+        "{hook}"
+    );
+    assert_eq!(hook["timeout"], 5);
+    installed[0]["hooks"][0]["command"] =
+        documented["hooks"]["PreCompact"][0]["hooks"][0]["command"].clone();
+    assert_eq!(installed, documented["hooks"]["PreCompact"]);
 
     let wrapper = std::fs::read_to_string(run.wrapper()).unwrap();
     assert!(
