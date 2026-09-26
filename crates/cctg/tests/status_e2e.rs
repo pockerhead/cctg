@@ -5,10 +5,13 @@
 //! Telegram transport. Button presses come in as the update poll hands them
 //! over (`Control::Callback`); which updates get that far (allowlist, the
 //! bot's own pin notices) is tested in `hub::updates` and `hub::mod`.
+//! The compaction test (TASK-053) runs the real `cctg hook PreCompact`.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,6 +34,8 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+mod common;
 
 const SECRET: &str = "e2e-secret-0123456789abcdef";
 const HOST: &str = "e2ebox";
@@ -991,4 +996,165 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
         "a typed command gets no text answer"
     );
     assert!(agent.quiet().await, "nothing went to the model");
+}
+
+/// A home directory whose `.cctg/device.env` points at `addr`.
+fn hook_home(test: &str, addr: &str) -> PathBuf {
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("status-e2e-{test}"));
+    let dir = home.join(".cctg");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("device.env"),
+        format!("CCTG_HUB_SECRET={SECRET}\nCCTG_HUB_HOOK_ADDR={addr}\nCCTG_HOST={HOST}\n"),
+    )
+    .unwrap();
+    home
+}
+
+/// What the user typed after `/compact`; it must never leave the hook.
+const COMPACT_FOCUS: &str = "private compact focus";
+
+/// Runs the real `cctg hook PreCompact` of session A.
+async fn pre_compact(home: &Path, trigger: &str) -> Output {
+    let input = serde_json::json!({
+        "session_id": A,
+        "transcript_path": "/p/a.jsonl",
+        "cwd": CWD,
+        "hook_event_name": "PreCompact",
+        "trigger": trigger,
+        "custom_instructions": (trigger == "manual").then_some(COMPACT_FOCUS),
+    })
+    .to_string();
+    let home = home.to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut child = common::cctg(&home)
+            .args(["hook", "PreCompact"])
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cctg starts");
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(input.as_bytes());
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap();
+    // Exit 0 and no stdout: the hook never blocks the compaction.
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(COMPACT_FOCUS), "{stderr}");
+    assert!(!stderr.contains(SECRET), "{stderr}");
+    assert!(!stderr.contains("not delivered"), "{stderr}");
+    output
+}
+
+/// Silent topic lines about compactions, in send order.
+fn compact_lines(ops: &[Op]) -> Vec<String> {
+    ops.iter()
+        .filter_map(|op| match op {
+            Op::Send {
+                thread_id: Some(100),
+                text,
+                reply_markup: None,
+                notify: false,
+                ..
+            } if text.starts_with("🗜") => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_from_the_real_hook_shows_in_the_status_and_the_topic() {
+    let hub = start_hub("compact", Duration::from_millis(50)).await;
+    hub.start(A, 10).await;
+    let status = hub.status_message(100).await;
+    hub.numbers(A).await;
+    hub.shows(
+        "numbers shown",
+        status,
+        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
+    )
+    .await;
+    let home = hook_home("compact", &hub.hook_addr);
+
+    // /compact with the user's text: status and one line, no text.
+    pre_compact(&home, "manual").await;
+    hub.shows(
+        "manual compaction in the status",
+        status,
+        shown(&format!("🗜 Сжимаю контекст (вручную)…\n{NUMBERS}"), &[]),
+    )
+    .await;
+    hub.until("its line", |ops| compact_lines(ops).len() == 1)
+        .await;
+    // Done: the status comes back; the line waits for the new percentage.
+    hub.hook(
+        A,
+        HookEvent::SessionStart {
+            source: Some("compact".into()),
+            claude_pid: Some(10),
+            parent_claude_pid: None,
+        },
+    )
+    .await;
+    hub.shows(
+        "status back after the compaction",
+        status,
+        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
+    )
+    .await;
+    hub.hook(
+        A,
+        HookEvent::StatusLine {
+            model: Some("Opus 5.5".into()),
+            effort: Some("high".into()),
+            context: Some(12),
+            five_hour: Some(3),
+            seven_day: Some(92),
+        },
+    )
+    .await;
+    let ops = hub
+        .until("the done line", |ops| compact_lines(ops).len() == 2)
+        .await;
+    let lines = compact_lines(&ops);
+    assert_eq!(lines[0], "🗜 Сжимаю контекст (вручную)…");
+    assert!(
+        lines[1].starts_with("🗜 Контекст сжат за ") && lines[1].ends_with(" с: 50% → 12%"),
+        "{}",
+        lines[1]
+    );
+
+    // Auto, cut by the session's end: no line of success.
+    pre_compact(&home, "auto").await;
+    hub.until("auto compaction in the status", |ops| {
+        edits(ops, status)
+            .last()
+            .is_some_and(|(text, _)| text.starts_with("🗜 Сжимаю контекст (авто)…"))
+    })
+    .await;
+    hub.end(A, 10).await;
+    hub.until("ended", |ops| {
+        edits(ops, status)
+            .last()
+            .is_some_and(|(text, _)| text.starts_with("🏁 Сессия завершена"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ops = hub.fake.ops();
+    assert_eq!(
+        compact_lines(&ops),
+        [
+            lines[0].clone(),
+            lines[1].clone(),
+            "🗜 Сжимаю контекст (авто)…".to_owned()
+        ]
+    );
+    let everything = format!("{ops:?}");
+    assert!(!everything.contains(COMPACT_FOCUS));
 }

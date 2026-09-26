@@ -85,6 +85,73 @@ async fn hub() -> (String, mpsc::Receiver<HookPost>) {
     (addr, rx)
 }
 
+/// A `PreCompact` input of `/compact` with the user's own text.
+fn pre_compact() -> Vec<u8> {
+    serde_json::json!({
+        "session_id": "5e551017-0000-4000-8000-000000000053",
+        "transcript_path": "/p/s.jsonl",
+        "cwd": "/w",
+        "hook_event_name": "PreCompact",
+        "trigger": "manual",
+        "custom_instructions": "private compact focus",
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A hub before TASK-053 does not know the event and answers 400: the hook
+/// still exits 0 with nothing on stdout (the compaction goes on) and keeps
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hub_without_compactions_leaves_the_hook_quiet() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            // The whole request is read first: closing with unread bytes
+            // resets the connection on Windows and the answer is lost.
+            let mut request = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut want = usize::MAX;
+            while request.len() < want {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).into_owned();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    want = end + 4 + length;
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let home = home("old-hub-compact", Some(&addr));
+    let (output, elapsed) =
+        tokio::task::spawn_blocking(move || run_hook(&home, "PreCompact", &pre_compact()))
+            .await
+            .unwrap();
+    assert_quiet(&output, &["private compact focus"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("HTTP 400"), "{stderr}");
+    assert!(!stderr.contains("kept"), "{stderr}");
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn every_event_reaches_the_hub() {
     let (addr, mut events) = hub().await;
@@ -114,6 +181,7 @@ async fn every_event_reaches_the_hub() {
             fixture("post_tool_use_handback"),
             "subagent_handback",
         ),
+        ("PreCompact", pre_compact(), "pre_compact"),
     ];
     for (event, input, kind) in cases {
         let (output, _) = tokio::task::spawn_blocking({
@@ -296,6 +364,7 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
             "PermissionRequest",
             "PostToolUse",
             "PostToolUseFailure",
+            "PreCompact",
             "PreToolUse",
             "SessionEnd",
             "SessionStart",
@@ -338,10 +407,12 @@ fn settings_snippet_registers_every_event_without_secrets_or_paths() {
             assert_eq!(matcher, wanted, "{event}");
             assert_eq!(commands[0]["command"], format!("cctg hook {event}"));
             assert_eq!(commands[0].get("async"), None, "{event}");
-            // Only the waiting hooks need more than Claude Code's default time.
+            // Only the waiting hooks need more than Claude Code's default
+            // time; the compaction waits for its hook, so that one gets less.
             let wait = match event.as_str() {
                 "PermissionRequest" => Some(100),
                 "PreToolUse" => Some(330),
+                "PreCompact" => Some(5),
                 _ => None,
             };
             assert_eq!(timeout, wait, "{event}");
