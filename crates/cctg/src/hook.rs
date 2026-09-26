@@ -54,7 +54,7 @@ use crate::proctree::{self, Lineage};
 use crate::spool;
 use crate::tls::HubAddr;
 use crate::wire::{
-    AskedOption, AskedQuestion, Behavior, HOOK_PATH, HookEvent, HookPost, MAX_OPTIONS,
+    Answered, AskedOption, AskedQuestion, Behavior, HOOK_PATH, HookEvent, HookPost, MAX_OPTIONS,
     MAX_QUESTIONS, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, QUESTION_PATH,
     QUESTION_TOOL, QuestionAnswer, QuestionPost, Secret, VERSION,
 };
@@ -114,9 +114,9 @@ const MAX_QUESTION_TEXT: usize = 2 << 10;
 const MAX_HEADER: usize = 256;
 const MAX_LABEL: usize = 256;
 const MAX_DESCRIPTION: usize = 1 << 10;
-/// Longest hub answer with question answers read: up to four Telegram
-/// messages of the user's own text, JSON-escaped.
-const MAX_QUESTION_ANSWER: u64 = 256 << 10;
+/// Longest hub answer with question answers read: four of the user's own
+/// texts (`hub::questions::MAX_OWN_TEXT`, 16 KiB each), JSON-escaped.
+const MAX_QUESTION_ANSWER: u64 = 512 << 10;
 /// Shown to the user in the terminal (not to Claude) with the answers.
 pub const ANSWERED_REASON: &str = "Answered in Telegram";
 
@@ -375,17 +375,35 @@ pub fn build_question(input: &[u8], host: &str) -> Result<(QuestionPost, Value),
 }
 
 /// Claude Code's `PreToolUse` decision for stdout: `allow` with the call's
-/// own input plus `answers` (question text -> answer). `None` when the hub's
-/// answers do not match the questions one to one.
-pub fn question_json(tool_input: &Value, answers: &[String]) -> Option<String> {
+/// own input plus `answers` (question text -> answer). An answer is the
+/// labels of the chosen options exactly as the input has them, then the
+/// user's own text, joined by `, `. `None` when the hub's answers do not
+/// match the questions one to one, name an option the question lacks or
+/// are empty.
+pub fn question_json(tool_input: &Value, answers: &[Answered]) -> Option<String> {
     let questions = tool_input.get("questions")?.as_array()?;
-    if answers.len() != questions.len() || answers.iter().any(|answer| answer.trim().is_empty()) {
+    if answers.len() != questions.len() {
         return None;
     }
     let mut by_question = serde_json::Map::new();
     for (question, answer) in questions.iter().zip(answers) {
         let text = question.get("question")?.as_str()?;
-        by_question.insert(text.to_owned(), Value::String(answer.clone()));
+        let options = question.get("options")?.as_array()?;
+        let mut parts = answer
+            .options
+            .iter()
+            .map(|index| options.get(*index)?.get("label")?.as_str())
+            .collect::<Option<Vec<&str>>>()?;
+        parts.extend(
+            answer
+                .text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty()),
+        );
+        if parts.is_empty() {
+            return None;
+        }
+        by_question.insert(text.to_owned(), Value::String(parts.join(", ")));
     }
     let mut updated = tool_input.clone();
     updated
@@ -447,9 +465,6 @@ pub fn build_permission(input: &[u8], host: &str) -> Result<PermissionPost, Skip
     if input.tool_name.trim().is_empty() {
         return Err(Skip("permission request without a tool name"));
     }
-    if input.tool_name == QUESTION_TOOL {
-        return Err(Skip("questions are asked by their PreToolUse hook"));
-    }
     let mut tool_input = input.tool_input.unwrap_or(Value::Null);
     let description = tool_input
         .as_object_mut()
@@ -503,7 +518,7 @@ pub async fn ask_question(
     post: &QuestionPost,
     connect_timeout: Duration,
     wait: Duration,
-) -> Result<Option<Vec<String>>, PostError> {
+) -> Result<Option<Vec<Answered>>, PostError> {
     let body = serde_json::to_vec(post).expect("question posts always serialize");
     let answer = hold(
         addr,
@@ -569,7 +584,7 @@ fn parse_answer(answer: &[u8]) -> Result<Option<Behavior>, PostError> {
 }
 
 /// `204`: no answers; `200` with a [`QuestionAnswer`] body: the answers.
-fn parse_question_answer(answer: &[u8]) -> Result<Option<Vec<String>>, PostError> {
+fn parse_question_answer(answer: &[u8]) -> Result<Option<Vec<Answered>>, PostError> {
     held_body(answer)?
         .map(|body| {
             serde_json::from_slice::<QuestionAnswer>(body)
@@ -1373,7 +1388,7 @@ mod tests {
 
     /// A hub whose questions are answered by `decide` (`None`: dropped).
     async fn question_hub(
-        decide: impl Fn(&QuestionPost) -> Option<Option<Vec<String>>> + Send + 'static,
+        decide: impl Fn(&QuestionPost) -> Option<Option<Vec<Answered>>> + Send + 'static,
     ) -> String {
         let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
@@ -1412,7 +1427,11 @@ mod tests {
         });
         let (post, _) = build_question(input.to_string().as_bytes(), "box").unwrap();
         let (connect, wait) = (Duration::from_secs(2), Duration::from_secs(5));
-        let answers = vec!["Red".to_owned(), "Pear".to_owned()];
+        let pick = |index| Answered {
+            options: vec![index],
+            text: None,
+        };
+        let answers = vec![pick(0), pick(0)];
         for (decision, want) in [
             (Some(Some(answers.clone())), Some(answers.clone())),
             (Some(None), None),
@@ -1464,8 +1483,24 @@ mod tests {
             Ok(None)
         );
         assert_eq!(
+            parse_question_answer(
+                b"HTTP/1.1 200 OK\r\n\r\n{\"answers\":[{\"options\":[1]},{\"text\":\"A\"}]}"
+            ),
+            Ok(Some(vec![
+                Answered {
+                    options: vec![1],
+                    text: None
+                },
+                Answered {
+                    options: vec![],
+                    text: Some("A".into())
+                }
+            ]))
+        );
+        // Label answers of the first TASK-038 build are no answers.
+        assert_eq!(
             parse_question_answer(b"HTTP/1.1 200 OK\r\n\r\n{\"answers\":[\"A\"]}"),
-            Ok(Some(vec!["A".to_owned()]))
+            Err(PostError::BadResponse)
         );
         assert_eq!(
             parse_question_answer(b"HTTP/1.1 200 OK\r\n\r\n{\"behavior\":\"allow\"}"),
@@ -2276,24 +2311,27 @@ mod build_tests {
         assert!(build_question(question_input(five).to_string().as_bytes(), "box").is_err());
         assert!(!is_question(br#"{"tool_name":"SubagentHandback"}"#));
         assert!(!is_question(b"not json"));
-        // The permission hook leaves questions to this hook.
+        // The permission hook of a question still goes to the hub: it
+        // tells a client without the question hook (and answers at once).
         let permission = serde_json::json!({
             "session_id": "s",
             "hook_event_name": "PermissionRequest",
             "tool_name": "AskUserQuestion",
             "tool_input": input["tool_input"],
         });
-        assert_eq!(
-            build_permission(permission.to_string().as_bytes(), "box"),
-            Err(Skip("questions are asked by their PreToolUse hook"))
-        );
+        let post = build_permission(permission.to_string().as_bytes(), "box").unwrap();
+        assert_eq!(post.tool_name, QUESTION_TOOL);
     }
 
     #[test]
     fn answers_are_claude_code_pre_tool_use_output() {
         let input = question_input(serde_json::json!({}));
         let tool_input = &input["tool_input"];
-        let answers = vec!["Red".to_owned(), "Apple, my own".to_owned()];
+        let answered = |options: &[usize], text: Option<&str>| Answered {
+            options: options.to_vec(),
+            text: text.map(str::to_owned),
+        };
+        let answers = vec![answered(&[0], None), answered(&[0], Some("my own"))];
         let output: Value =
             serde_json::from_str(&question_json(tool_input, &answers).unwrap()).unwrap();
         let mut updated = tool_input.clone();
@@ -2309,11 +2347,33 @@ mod build_tests {
             }})
         );
         assert_eq!(question_json(tool_input, &answers[..1]), None);
-        assert_eq!(
-            question_json(tool_input, &["Red".to_owned(), " ".to_owned()]),
-            None
-        );
+        for bad in [
+            answered(&[], Some(" ")),
+            answered(&[], None),
+            answered(&[2], None),
+        ] {
+            let answers = [answered(&[1], None), bad.clone()];
+            assert_eq!(question_json(tool_input, &answers), None, "{bad:?}");
+        }
         assert_eq!(question_json(&serde_json::json!({}), &answers), None);
+        // The labels go back exactly as Claude offered them (not trimmed or
+        // capped like the texts sent to the hub); own text as typed.
+        let long = "й".repeat(MAX_LABEL);
+        let mut odd = question_input(serde_json::json!({}));
+        odd["tool_input"]["questions"][0]["options"][0]["label"] = serde_json::json!("  Padded  ");
+        odd["tool_input"]["questions"][1]["options"][1]["label"] = serde_json::json!(long);
+        let (post, tool_input) = build_question(odd.to_string().as_bytes(), "box").unwrap();
+        assert_ne!(post.questions[1].options[1].label, long);
+        let answers = [answered(&[0], None), answered(&[0, 1], Some(" ну и 🍐 "))];
+        let output: Value =
+            serde_json::from_str(&question_json(&tool_input, &answers).unwrap()).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["answers"],
+            serde_json::json!({
+                "Which color?": "  Padded  ",
+                "Which fruits?": format!("Apple, {long},  ну и 🍐 "),
+            })
+        );
     }
 
     #[test]

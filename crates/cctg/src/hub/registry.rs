@@ -351,6 +351,10 @@ pub struct SessionEntry {
     pub agent: Option<u64>,
     #[serde(skip)]
     pub waiting: bool,
+    /// The topic was told once that this session's questions wait in the
+    /// terminal because its client has no question hook (TASK-038).
+    #[serde(skip)]
+    pub question_hint: bool,
     /// The `⇣ nested` block of a nested run in its parent's topic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block: Option<Block>,
@@ -851,6 +855,7 @@ impl Registry {
                 seen,
                 agent: None,
                 waiting: false,
+                question_hint: false,
                 block: None,
                 stream: None,
                 metrics: None,
