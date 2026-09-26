@@ -14,7 +14,9 @@
 //! screen shows is judged by the agent ([`crate::keys`]).
 //!
 //! The ask format is frozen: `cctg run` is not updated while it runs, the
-//! agent is, so every later agent has to speak it.
+//! agent is, so every later agent has to speak it. Asks are only added: an
+//! older `cctg run` answers nothing to an ask it does not know, and the
+//! agent falls back to one it does ([`rows`]).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -25,14 +27,29 @@ use serde::{Deserialize, Serialize};
 /// Longest ask line, in bytes (200 typed characters, JSON-escaped, fit).
 pub const MAX_ASK: usize = 4096;
 
-/// One ask of the agent: `"screen"` or `{"keys":"<text>"}`. The answer is
-/// one JSON line: the rows (`null` when there is no copy) or whether the
-/// bytes were written.
+/// One ask of the agent: `"screen"`, `"rows"` (TASK-057) or
+/// `{"keys":"<text>"}`. The answer is one JSON line: the rows (`null` when
+/// there is no copy), the [`Rows`] (`null` likewise) or whether the bytes
+/// were written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ask {
     Screen,
     Keys(String),
+    Rows,
+}
+
+/// One read of a screen: the visible rows, right trimmed, and, when the
+/// reader can tell, the same rows with faint (SGR 2) cells as spaces.
+/// Claude Code draws its placeholder, its prompt suggestion and the inline
+/// completion after the cursor faint (probe TASK-057, 2.1.283): text in the
+/// input box that nobody typed. A Windows console read cannot tell (its
+/// attribute words carry no faint), so there `solid` is `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Rows {
+    pub lines: Vec<String>,
+    #[serde(default)]
+    pub solid: Option<Vec<String>>,
 }
 
 /// `<state>/run/<run_pid>.sock`.
@@ -81,6 +98,31 @@ impl Screen {
                 .collect(),
         )
     }
+
+    /// [`Screen::lines`] and the same rows without their faint text.
+    pub fn rows(&self) -> Option<Rows> {
+        let screen = self.parser.as_ref()?.screen();
+        let (rows, cols) = screen.size();
+        let solid = (0..rows)
+            .map(|row| {
+                let mut line = String::new();
+                for col in 0..cols {
+                    match screen.cell(row, col) {
+                        Some(cell) if cell.is_wide_continuation() => {}
+                        Some(cell) if cell.has_contents() && !cell.dim() => {
+                            line.push_str(cell.contents())
+                        }
+                        _ => line.push(' '),
+                    }
+                }
+                line.trim_end().to_owned()
+            })
+            .collect();
+        Some(Rows {
+            lines: self.lines()?,
+            solid: Some(solid),
+        })
+    }
 }
 
 /// Answers one [`Ask`] read from `stream`: rows from `screen`, keys through
@@ -106,6 +148,13 @@ pub fn answer<S: Read + Write>(
                 .lines();
             serde_json::to_vec(&lines)?
         }
+        Ask::Rows => {
+            let rows = screen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .rows();
+            serde_json::to_vec(&rows)?
+        }
         Ask::Keys(text) => serde_json::to_vec(&write(text.as_bytes()))?,
     };
     reply.push(b'\n');
@@ -119,6 +168,16 @@ pub fn screen(socket: &Path) -> Option<Vec<String>> {
     serde_json::from_slice::<Option<Vec<String>>>(&ask(socket, &Ask::Screen)?)
         .ok()
         .flatten()
+}
+
+/// The [`Rows`] of the `cctg run` terminal behind `socket`; from a
+/// `cctg run` older than the `rows` ask, its visible rows without `solid`.
+/// `None` when it does not answer.
+pub fn rows(socket: &Path) -> Option<Rows> {
+    ask(socket, &Ask::Rows)
+        .and_then(|reply| serde_json::from_slice::<Option<Rows>>(&reply).ok())
+        .flatten()
+        .or_else(|| screen(socket).map(|lines| Rows { lines, solid: None }))
 }
 
 /// Writes `text` into the input of the claude behind `socket`.
@@ -572,6 +631,39 @@ mod tests {
             serde_json::to_string(&Ask::Keys("\u{1b}".into())).unwrap(),
             r#"{"keys":"\u001b"}"#
         );
+        assert_eq!(serde_json::to_string(&Ask::Rows).unwrap(), r#""rows""#);
+    }
+
+    /// The input box as Claude Code 2.1.283 drew it (probe TASK-057,
+    /// `scratch/probe/conpty.bin`): rules in `promptBorder` grey, the
+    /// placeholder faint after the glyph and its no-break space.
+    const PLACEHOLDER: &str = "\x1b[38;2;136;136;136m────────────────────\x1b[m\r\n\
+        ❯\u{a0}\x1b[2mTry\x1b[1C\"how\x1b[1Cdo\x1b[1CI\x1b[1Clog\x1b[1Can\x1b[1Cerror?\"\
+        \x1b[38;2;136;136;136m\x1b[22m\r\n────────────────────\x1b[m";
+
+    #[test]
+    fn faint_text_is_left_out_of_the_solid_rows() {
+        let mut screen = Screen::new(4, 40);
+        screen.feed(PLACEHOLDER.as_bytes());
+        let rows = screen.rows().unwrap();
+        assert_eq!(rows.lines[1], "❯\u{a0}Try \"how do I log an error?\"");
+        // Right trimmed like the lines: the no-break space goes too.
+        let rule = "─".repeat(20);
+        assert_eq!(
+            rows.solid.as_deref(),
+            Some(&[rule.clone(), "❯".to_owned(), rule, String::new()][..])
+        );
+        assert_eq!(Some(rows.lines), screen.lines());
+        // Typed text replaces the placeholder; an inline completion after
+        // it is faint again; a wide character keeps its place.
+        screen.feed("\x1b[2;3H!ls 日本\x1b[2m -la\x1b[22m\x1b[K".as_bytes());
+        let rows = screen.rows().unwrap();
+        assert_eq!(rows.lines[1], "❯\u{a0}!ls 日本 -la");
+        assert_eq!(rows.solid.as_ref().unwrap()[1], "❯\u{a0}!ls 日本");
+        let typed = crate::keys::typed_box(&rows).unwrap();
+        assert!(crate::keys::box_shows(&typed, "!ls 日本"));
+        let whole = crate::keys::input_box(&rows.lines).unwrap();
+        assert!(!crate::keys::box_shows(&whole, "!ls 日本"));
     }
 
     #[test]
@@ -582,6 +674,11 @@ mod tests {
         assert_eq!(
             ask(b"\"screen\"\n", &screen, &written),
             "[\"❯\u{a0}/cost\",\"\",\"\",\"\"]\n"
+        );
+        assert_eq!(
+            ask(b"\"rows\"\n", &screen, &written),
+            "{\"lines\":[\"❯\u{a0}/cost\",\"\",\"\",\"\"],\
+             \"solid\":[\"❯\u{a0}/cost\",\"\",\"\",\"\"]}\n"
         );
         assert_eq!(ask(br#"{"keys":"/x\r"}"#, &screen, &written), "true\n");
         assert_eq!(written.lock().unwrap().as_slice(), b"/x\r");
@@ -633,11 +730,50 @@ mod tests {
         assert!(socket_path(Path::new("/s"), 42).ends_with("run/42.sock"));
     }
 
+    /// A `cctg run` from before the `rows` ask: it answers `"screen"` and
+    /// closes any other ask unanswered. The agent still gets the rows.
+    #[cfg(unix)]
+    #[test]
+    fn an_old_run_still_gives_its_rows() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("cctg-old-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let old = std::thread::spawn(move || {
+            let mut asks = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = Vec::new();
+                BufReader::new(&mut stream)
+                    .read_until(b'\n', &mut line)
+                    .unwrap();
+                if line == b"\"screen\"\n" {
+                    stream.write_all(b"[\"\xe2\x9d\xaf x\"]\n").unwrap();
+                }
+                asks.push(String::from_utf8(line).unwrap());
+            }
+            asks
+        });
+        assert_eq!(
+            rows(&path),
+            Some(Rows {
+                lines: vec!["❯ x".to_owned()],
+                solid: None,
+            })
+        );
+        assert_eq!(old.join().unwrap(), ["\"rows\"\n", "\"screen\"\n"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn without_unix_sockets_nothing_answers() {
         let path = Path::new("nowhere.sock");
         assert_eq!(screen(path), None);
+        assert_eq!(rows(path), None);
         assert!(!keys(path, "x"));
     }
 }
