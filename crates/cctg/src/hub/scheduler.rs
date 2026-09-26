@@ -319,7 +319,10 @@ impl Transport for BotApi {
                 .send_media_group(*thread_id, items, *photos, *notify)
                 .await
             {
-                Err(error) if *photos && error.is_photo_refusal() => {
+                // Telegram names no item of a refused group, and its text
+                // need not mention the photos (TASK-059 review): any 400
+                // sends the same files once more as documents.
+                Err(ApiError::Telegram { code: 400, .. }) if *photos => {
                     warn!("telegram did not take a photo album; sending it as documents");
                     self.send_media_group(*thread_id, items, false, *notify)
                         .await

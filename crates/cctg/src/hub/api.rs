@@ -926,9 +926,10 @@ mod tests {
         assert_eq!(methods, ["sendPhoto", "sendDocument", "sendPhoto"]);
     }
 
-    /// TASK-059: Telegram refuses a photo album as a whole; the same files
-    /// then go as a document album in the same job. A document album and
-    /// any other refusal are not sent again.
+    /// TASK-059: Telegram refuses a photo album as a whole; on any 400,
+    /// whatever its text, the same files then go as a document album in the
+    /// same job. A document album and a refusal other than 400 are not sent
+    /// again.
     #[tokio::test]
     async fn a_refused_photo_album_goes_again_as_documents() {
         use crate::hub::scheduler::{Op, Outcome, Transport};
@@ -949,7 +950,13 @@ mod tests {
         let (url, seen) = fake_server(vec![
             refused("Bad Request: IMAGE_PROCESS_FAILED"),
             json("200 OK", album),
-            refused("Bad Request: message thread not found"),
+            // A group refusal that names no picture.
+            refused("Bad Request: failed to send the media group"),
+            json("200 OK", album),
+            json(
+                "500 Internal Server Error",
+                r#"{"ok":false,"error_code":500,"description":"Internal Server Error"}"#,
+            ),
             refused("Bad Request: IMAGE_PROCESS_FAILED"),
             // Taken only by a fallback that should not happen.
             json("200 OK", album),
@@ -978,7 +985,11 @@ mod tests {
             Ok(Outcome::Sent(message)) => assert_eq!(message.message_id, 7),
             other => panic!("{other:?}"),
         }
-        assert!(api.execute(&photos).await.is_err(), "a lost topic");
+        match api.execute(&photos).await {
+            Ok(Outcome::Sent(message)) => assert_eq!(message.message_id, 7),
+            other => panic!("any 400 falls back: {other:?}"),
+        }
+        assert!(api.execute(&photos).await.is_err(), "not a 400");
         let documents = Op::SendAlbum {
             thread_id: Some(100),
             items,
@@ -992,7 +1003,7 @@ mod tests {
             .iter()
             .map(|line| line.split(['/', ' ']).nth(3).unwrap_or_default().to_owned())
             .collect();
-        assert_eq!(methods, ["sendMediaGroup"; 4]);
+        assert_eq!(methods, ["sendMediaGroup"; 6]);
     }
 
     #[tokio::test]
