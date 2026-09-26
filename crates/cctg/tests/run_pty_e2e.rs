@@ -216,7 +216,7 @@ mod unix {
                     &raw mut size,
                 )
             };
-            assert_eq!(opened, 0, "openpty");
+            assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
             let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
             // Someone has to read the terminal, or `cctg run` blocks on it.
             let output = Arc::new(Mutex::new(Vec::new()));
@@ -242,14 +242,21 @@ mod unix {
             (&self.master).write_all(bytes).unwrap();
         }
 
-        /// Raw mode is on (no line editing, no echo).
-        fn raw(&self) -> bool {
+        /// Asserts that raw mode (no line editing, no echo) is on or off.
+        /// The mode is read through the master: macOS revokes the slave
+        /// when its session leader, `cctg run`, exits.
+        fn expect_raw(&self, raw: bool, what: &str) {
             let mut modes: libc::termios = unsafe { std::mem::zeroed() };
+            let got = unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut modes) };
+            let error = std::io::Error::last_os_error();
+            assert_eq!(got, 0, "{what}: tcgetattr: {error}");
+            let (lflag, cooked) = (modes.c_lflag, libc::ICANON | libc::ECHO);
             assert_eq!(
-                unsafe { libc::tcgetattr(self.slave.as_raw_fd(), &mut modes) },
-                0
+                lflag & cooked == 0,
+                raw,
+                "{what}: c_lflag {lflag:#x}, ICANON|ECHO {cooked:#x}\nterminal: {}",
+                self.tail()
             );
-            modes.c_lflag & (libc::ICANON | libc::ECHO) == 0
         }
 
         fn resize(&self, rows: u16, cols: u16) {
@@ -266,7 +273,7 @@ mod unix {
                     &size as *const libc::winsize,
                 )
             };
-            assert_eq!(set, 0);
+            assert_eq!(set, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
         }
 
         fn tail(&self) -> String {
@@ -348,7 +355,12 @@ mod unix {
             if got == 0 {
                 return (None, false);
             }
-            assert_eq!(got, self.run);
+            assert_eq!(
+                got,
+                self.run,
+                "waitpid: {}",
+                std::io::Error::last_os_error()
+            );
             if libc::WIFSTOPPED(status) {
                 return (None, true);
             }
@@ -413,7 +425,9 @@ mod unix {
             json!([30, 100]),
             "claude gets the user's size"
         );
-        assert!(scene.terminal.raw(), "the user's terminal is in raw mode");
+        scene
+            .terminal
+            .expect_raw(true, "the user's terminal is in raw mode");
         scene.until_screen(&target, "the box", |lines| box_is(lines, ""));
         let mode = std::fs::metadata(socket.parent().unwrap()).unwrap();
         assert_eq!(
@@ -486,7 +500,9 @@ mod unix {
             assert!(Instant::now() < deadline, "cctg run stops with claude");
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(!scene.terminal.raw(), "the user's mode while stopped");
+        scene
+            .terminal
+            .expect_raw(false, "the user's mode while stopped");
         // claude's last line went out before `cctg run` stopped: nothing
         // can write it while it is stopped.
         let deadline = Instant::now() + WAIT;
@@ -500,7 +516,7 @@ mod unix {
         }
         unsafe { libc::kill(scene.run, libc::SIGCONT) };
         scene.until_count("resumed", 1);
-        assert!(scene.terminal.raw(), "raw again after fg");
+        scene.terminal.expect_raw(true, "raw again after fg");
 
         // "Обновить": the request and `/exit`; `cctg run` starts claude
         // again with `--resume` and answers its dialog again.
@@ -537,7 +553,9 @@ mod unix {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert_eq!(code, 7, "claude's own exit code");
-        assert!(!scene.terminal.raw(), "the terminal mode is restored");
+        scene
+            .terminal
+            .expect_raw(false, "the terminal mode is restored");
         assert!(!socket.exists(), "the socket is removed");
         assert!(
             std::fs::read_dir(state.join("restart"))
