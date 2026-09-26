@@ -767,7 +767,7 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     let mut saving: Option<tokio::task::JoinHandle<HubMsg>> = None;
     let mut leaving: Option<Leaving> = None;
     // The hub's release being downloaded for an `update` (TASK-050).
-    let mut downloading: Option<(u64, Download)> = None;
+    let mut downloading: Option<(u64, Download, Arc<download::Gate>)> = None;
     let mut frames_open = true;
     let answer = |update_id, outcome| {
         let outbox = outbox.clone();
@@ -831,14 +831,23 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
             }
             fetched = async {
                 match downloading.as_mut() {
-                    Some((_, task)) => task.await,
+                    Some((_, task, _)) => task.await,
                     None => std::future::pending().await,
                 }
             }, if downloading.is_some() => {
-                let update_id = downloading.take().map_or(0, |(update_id, _)| update_id);
+                let update_id = downloading.take().map_or(0, |(update_id, ..)| update_id);
                 match (fetched, worker.clone()) {
                     (Ok(Ok(_)), Some(worker)) => {
-                        follow_plan(&worker, update_id, &mut leaving, &answer).await
+                        follow_plan(&worker, update_id, &mut leaving, &answer, None).await
+                    }
+                    // The release did not come, but a build put in place
+                    // otherwise (install.sh, cctg deploy) is still taken.
+                    (
+                        Ok(Err(failure @ (download::Failure::Missing | download::Failure::Download))),
+                        Some(worker),
+                    ) => {
+                        let failed = Some(download_outcome(failure));
+                        follow_plan(&worker, update_id, &mut leaving, &answer, failed).await
                     }
                     (Ok(Err(failure)), _) => {
                         answer(update_id, download_outcome(failure)).await;
@@ -879,13 +888,18 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                         // Claude Code's lines are answered meanwhile.
                         (Some(tag), Some(exe)) if worker.self_update() => {
                             let base = download::base_from_env();
+                            let gate = Arc::new(download::Gate::default());
+                            let task_gate = gate.clone();
                             downloading = Some((
                                 update_id,
-                                tokio::spawn(async move { download::fetch(&base, &tag, &exe).await }),
+                                tokio::spawn(async move {
+                                    download::fetch(&base, &tag, &exe, &task_gate).await
+                                }),
+                                gate,
                             ));
                             Vec::new()
                         }
-                        _ => follow_plan(&worker, update_id, &mut leaving, &answer).await,
+                        _ => follow_plan(&worker, update_id, &mut leaving, &answer, None).await,
                     }
                 }
                 Some(LinkEvent::Message(HubMsg::Released { update_id, session_id })) => {
@@ -1038,9 +1052,13 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         output.flush().await?;
     }
     output.flush().await?;
-    // A swap cut off by the process exit could leave no binary in place.
-    if let Some((_, task)) = downloading {
-        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    // A download that has not begun its swap writes nothing now; a swap
+    // cut off by the process exit could leave no binary in place, so one
+    // that began is waited for (a write and two renames).
+    if let Some((_, task, gate)) = downloading
+        && !gate.close()
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
     }
     Ok(Ended::Input)
 }
@@ -1058,12 +1076,15 @@ fn download_outcome(failure: download::Failure) -> UpdateOutcome {
 
 /// Carries out what `update` leads to ([`Worker::plan`]), after the hub's
 /// release was put in place when it sent one: a hand-over (the lines to
-/// write, [`shim::SWITCH`]), a claude restart, or an answer.
+/// write, [`shim::SWITCH`]), a claude restart, or an answer. When the
+/// release could not be put in place (`failed`), only a hand-over to a
+/// newer file on disk goes on; anything else answers `failed`.
 async fn follow_plan<F, Fut>(
     worker: &Arc<Worker>,
     update_id: u64,
     leaving: &mut Option<Leaving>,
     answer: &F,
+    failed: Option<UpdateOutcome>,
 ) -> Vec<Vec<u8>>
 where
     F: Fn(u64, UpdateOutcome) -> Fut,
@@ -1071,11 +1092,20 @@ where
 {
     let plan = tokio::task::spawn_blocking({
         let worker = worker.clone();
-        move || worker.plan()
+        move || {
+            if let Some(exe) = &worker.exe {
+                download::recover_in(exe);
+            }
+            worker.plan()
+        }
     })
     .await
     .unwrap_or(Plan::Failed);
     info!(?plan, "update asked");
+    if let Some(outcome) = failed.filter(|_| plan != Plan::Reload) {
+        answer(update_id, outcome).await;
+        return Vec::new();
+    }
     match plan {
         Plan::Reload => {
             *leaving = Some(Leaving::Draining { update_id });
