@@ -18,8 +18,8 @@
 //!    in the oldest one's place, foreground when either was), so the
 //!    background queue holds one edit per message and is served oldest
 //!    first: round-robin over the status messages, one slot cannot hog it.
-//! 5. `Message` - `sendMessage`, `sendDocument`, `sendPhoto` and transcript
-//!    stream lines; metered, one FIFO. Permission prompts live here too, so they never
+//! 5. `Message` - `sendMessage`, `sendDocument`, `sendPhoto`, `sendMediaGroup`
+//!    (one token per album) and transcript stream lines; metered, one FIFO. Permission prompts live here too, so they never
 //!    overtake their own topic's ordinary messages; they do overtake its
 //!    stream lines, except its debounced ones (1.).
 //!
@@ -109,6 +109,17 @@ pub enum Op {
         /// As in `Send`.
         notify: bool,
     },
+    /// `sendMediaGroup` (TASK-059): 2-10 files as one album, one message
+    /// token. `photos`: a photo album; when Telegram refuses a picture of
+    /// it (the whole album fails), the same files go again as a document
+    /// album in the same job, as `SendPhoto` does for one picture.
+    SendAlbum {
+        thread_id: Option<i64>,
+        items: Vec<Document>,
+        photos: bool,
+        /// As in `Send`.
+        notify: bool,
+    },
     Edit {
         message_id: i64,
         text: String,
@@ -175,6 +186,7 @@ impl Op {
             Op::Send { .. }
             | Op::SendDocument { .. }
             | Op::SendPhoto { .. }
+            | Op::SendAlbum { .. }
             | Op::Stream { .. } => Lane::Message(0),
             Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit(0),
             Op::Delete { .. } | Op::Pin { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => {
@@ -187,7 +199,11 @@ impl Op {
     fn metered(&self) -> bool {
         matches!(
             self,
-            Op::Send { .. } | Op::SendDocument { .. } | Op::SendPhoto { .. } | Op::Stream { .. }
+            Op::Send { .. }
+                | Op::SendDocument { .. }
+                | Op::SendPhoto { .. }
+                | Op::SendAlbum { .. }
+                | Op::Stream { .. }
         )
     }
 
@@ -222,7 +238,8 @@ impl Op {
         match self {
             Op::Send { thread_id, .. }
             | Op::SendDocument { thread_id, .. }
-            | Op::SendPhoto { thread_id, .. } => Some(*thread_id),
+            | Op::SendPhoto { thread_id, .. }
+            | Op::SendAlbum { thread_id, .. } => Some(*thread_id),
             Op::Stream { thread_id, .. } => Some(Some(*thread_id)),
             _ => None,
         }
@@ -289,6 +306,26 @@ impl Transport for BotApi {
                 Err(error) if error.is_photo_refusal() => {
                     warn!("telegram did not take a picture as a photo; sending it as a document");
                     self.send_document(*thread_id, document, *notify).await
+                }
+                sent => sent,
+            }
+            .map(Outcome::Sent),
+            Op::SendAlbum {
+                thread_id,
+                items,
+                photos,
+                notify,
+            } => match self
+                .send_media_group(*thread_id, items, *photos, *notify)
+                .await
+            {
+                // Telegram names no item of a refused group, and its text
+                // need not mention the photos (TASK-059 review): any 400
+                // sends the same files once more as documents.
+                Err(ApiError::Telegram { code: 400, .. }) if *photos => {
+                    warn!("telegram did not take a photo album; sending it as documents");
+                    self.send_media_group(*thread_id, items, false, *notify)
+                        .await
                 }
                 sent => sent,
             }
@@ -655,9 +692,9 @@ impl<T: Transport> Scheduler<T> {
                     permission,
                     ..
                 } => (*thread_id, *permission),
-                Op::SendDocument { thread_id, .. } | Op::SendPhoto { thread_id, .. } => {
-                    (*thread_id, false)
-                }
+                Op::SendDocument { thread_id, .. }
+                | Op::SendPhoto { thread_id, .. }
+                | Op::SendAlbum { thread_id, .. } => (*thread_id, false),
                 // Stream lines yield to a prompt of their own topic, except
                 // tool-call lines the debounce holds: those came first.
                 Op::Stream {

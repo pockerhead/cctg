@@ -481,7 +481,8 @@ impl Agent {
             agent.next().await,
             Some(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         agent

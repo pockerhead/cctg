@@ -466,11 +466,12 @@ async fn agent_session(
         register,
         to_agent,
     };
-    // This hub takes files from agents (TASK-032) and keeps a heartbeat
-    // with those that want one (TASK-049).
+    // This hub takes files from agents (TASK-032), also as albums (TASK-059),
+    // and keeps a heartbeat with those that want one (TASK-049).
     let answer = HubMsg::Registered {
         files: true,
         heartbeat: true,
+        albums: true,
     };
     if events.send(registered).await.is_err() || write_hub_msg(&mut write, &answer).await.is_err() {
         return;
@@ -1493,7 +1494,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         let Some(AgentEvent::Registered {
@@ -1561,6 +1563,7 @@ mod tests {
             Ok(HubMsg::Registered {
                 files: true,
                 heartbeat: true,
+                albums: true,
             })
         );
         let Some(AgentEvent::Registered { conn, .. }) = within(events.recv()).await else {
@@ -1632,7 +1635,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         let Some(AgentEvent::Registered { to_agent, .. }) = within(events.recv()).await else {
@@ -1651,6 +1655,7 @@ mod tests {
             .send(HubMsg::Registered {
                 files: true,
                 heartbeat: true,
+                albums: true,
             })
             .await
             .unwrap();
@@ -1658,7 +1663,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         peer.raw(second).await;
@@ -1679,7 +1685,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         let _ = within(events.recv()).await;
@@ -1726,7 +1733,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         assert!(matches!(
@@ -2347,7 +2355,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         assert!(matches!(
@@ -2589,7 +2598,8 @@ mod tests {
             peer.recv().await,
             Ok(HubMsg::Registered {
                 files: true,
-                heartbeat: true
+                heartbeat: true,
+                albums: true,
             })
         );
         assert!(matches!(

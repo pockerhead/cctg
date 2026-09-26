@@ -279,6 +279,12 @@ pub enum AgentMsg {
         size: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caption: Option<String>,
+        /// Several files as one album (TASK-059), sent only to a hub whose
+        /// `registered` said `albums`: their bytes follow one another in
+        /// this order, `size` is their sum and `name` the first one's.
+        /// Empty for one file.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<FilePart>,
     },
     /// Bytes of an accepted offer ([`FileChunk`]).
     FileChunk(FileChunk),
@@ -421,6 +427,16 @@ pub struct FileChunk {
     pub transfer_id: u64,
     pub offset: u64,
     pub data: String,
+}
+
+/// Most files of one album (`sendMediaGroup` takes 2-10 items).
+pub const MAX_ALBUM: usize = 10;
+
+/// One file of an album offer ([`AgentMsg::FileOffer`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePart {
+    pub name: String,
+    pub size: u64,
 }
 
 /// What a Telegram message carried, as the agent names the file.
@@ -619,6 +635,11 @@ pub enum HubMsg {
     Registered {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         files: bool,
+        /// The hub takes album offers (`file_offer` with `parts`, TASK-059).
+        /// Hubs built before leave it out: the agent then offers the files
+        /// one by one.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        albums: bool,
         /// The hub keeps the [`Heartbeat`] with an agent that announced
         /// [`Register::heartbeat`] (TASK-049). Hubs built before leave it
         /// out: the agent then sends no pings and waits for the hub as long
@@ -712,6 +733,11 @@ pub enum HubMsg {
     FileAnswer {
         transfer_id: u64,
         outcome: FileOutcome,
+        /// The last answer to an album offer: per file, in the offer's
+        /// order, `sent` or `failed`; `outcome` is then `sent` when any
+        /// went. Empty otherwise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<FileOutcome>,
     },
     /// Sent only to an agent that registered with `session_reads`: read the
     /// files of session `session_id` for `ask` and answer with
@@ -1422,6 +1448,23 @@ mod tests {
                 name: "\u{448}\u{43e}\u{442} \"1\".png".into(),
                 size: 3,
                 caption: Some("see".into()),
+                parts: Vec::new(),
+            },
+            AgentMsg::FileOffer {
+                transfer_id: 2,
+                name: "a.png".into(),
+                size: 5,
+                caption: None,
+                parts: vec![
+                    FilePart {
+                        name: "a.png".into(),
+                        size: 2,
+                    },
+                    FilePart {
+                        name: "b.txt".into(),
+                        size: 3,
+                    },
+                ],
             },
             AgentMsg::FileChunk(FileChunk {
                 transfer_id: 1,
@@ -1483,10 +1526,12 @@ mod tests {
             HubMsg::Registered {
                 files: false,
                 heartbeat: false,
+                albums: false,
             },
             HubMsg::Registered {
                 files: true,
                 heartbeat: true,
+                albums: true,
             },
             HubMsg::Ping,
             HubMsg::Bound {
@@ -1556,6 +1601,12 @@ mod tests {
             HubMsg::FileAnswer {
                 transfer_id: 4,
                 outcome: FileOutcome::Accepted,
+                parts: Vec::new(),
+            },
+            HubMsg::FileAnswer {
+                transfer_id: 4,
+                outcome: FileOutcome::Sent,
+                parts: vec![FileOutcome::Sent, FileOutcome::Failed],
             },
             HubMsg::SessionRead {
                 read_id: 5,
@@ -1890,6 +1941,7 @@ mod tests {
             Ok(HubMsg::Registered {
                 files: true,
                 heartbeat: false,
+                albums: false,
             })
         );
         // An agent before it: no heartbeat.
@@ -1940,6 +1992,7 @@ mod tests {
             Ok(HubMsg::Registered {
                 files: false,
                 heartbeat: false,
+                albums: false,
             })
         );
         let line = br#"{"v":1,"type":"reply","text":"t","later":true}"#;
@@ -2058,18 +2111,21 @@ mod tests {
             Ok(HubMsg::Registered {
                 files: false,
                 heartbeat: false,
+                albums: false,
             })
         );
         assert_eq!(
             encode(&HubMsg::Registered {
                 files: false,
                 heartbeat: false,
+                albums: false,
             }),
             [&legacy[..], b"\n"].concat()
         );
         let newer: Value = serde_json::from_slice(&encode(&HubMsg::Registered {
             files: true,
             heartbeat: false,
+            albums: true,
         }))
         .unwrap();
         assert_eq!((&newer["v"], &newer["files"]), (&json!(1), &json!(true)));
@@ -2091,9 +2147,50 @@ mod tests {
             decode::<HubMsg>(answer),
             Ok(HubMsg::FileAnswer {
                 transfer_id: 1,
-                outcome: FileOutcome::Other
+                outcome: FileOutcome::Other,
+                parts: Vec::new(),
             })
         );
+        // TASK-059: albums are additive. A hub before it says nothing of
+        // them; a single file's offer and answer lines stay as they were.
+        assert!(matches!(
+            decode::<HubMsg>(br#"{"v":1,"type":"registered","files":true}"#),
+            Ok(HubMsg::Registered {
+                files: true,
+                albums: false,
+                ..
+            })
+        ));
+        // An agent before TASK-059 reads `albums` as an unknown field, which
+        // never fails a line: pinned with a field no version knows.
+        assert!(matches!(
+            decode::<HubMsg>(
+                br#"{"v":1,"type":"registered","files":true,"albums":true,"later":[1]}"#
+            ),
+            Ok(HubMsg::Registered {
+                files: true,
+                albums: true,
+                ..
+            })
+        ));
+        let single = encode(&AgentMsg::FileOffer {
+            transfer_id: 1,
+            name: "n".into(),
+            size: 1,
+            caption: None,
+            parts: Vec::new(),
+        });
+        assert_eq!(
+            single,
+            b"{\"v\":1,\"type\":\"file_offer\",\"transfer_id\":1,\"name\":\"n\",\"size\":1}
+"
+        );
+        let sent = encode(&HubMsg::FileAnswer {
+            transfer_id: 1,
+            outcome: FileOutcome::Sent,
+            parts: Vec::new(),
+        });
+        assert!(!String::from_utf8_lossy(&sent).contains("parts"));
         // Both directions carry the same flat chunk line.
         let chunk = FileChunk {
             transfer_id: 2,

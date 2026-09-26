@@ -63,6 +63,7 @@
 //! connects: a nested `claude -p` cannot show up as a routable channel even
 //! when the process tree hides its parent.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -70,7 +71,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -92,8 +93,8 @@ use crate::tls::{HubAddr, ReadTask, Stream};
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
     self, AgentMsg, Beat, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome,
-    Heartbeat, HookEvent, HubMsg, Liveness, Register, Rejection, Secret, SessionAsk, UpdateOutcome,
-    WireError,
+    FilePart, Heartbeat, HookEvent, HubMsg, Liveness, Register, Rejection, Secret, SessionAsk,
+    UpdateOutcome, WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -283,9 +284,10 @@ fn spawn_replay(config: &LinkConfig, running: &mut Option<JoinHandle<()>>) {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkEvent {
     /// Registered with the hub (again, after a reconnect). `files`: the hub
-    /// takes `file_offer` ([`HubMsg::Registered`]).
+    /// takes `file_offer`; `albums`: also album offers ([`HubMsg::Registered`]).
     Up {
         files: bool,
+        albums: bool,
     },
     /// The link dropped; reconnecting.
     Down,
@@ -331,13 +333,14 @@ async fn run(
                 reader,
                 write,
                 files,
+                albums,
                 heartbeat,
             }) => {
                 attempt = 0;
                 last_error.clear();
                 info!("registered with the hub");
                 spawn_replay(&config, &mut replaying);
-                if events.send(LinkEvent::Up { files }).await.is_err() {
+                if events.send(LinkEvent::Up { files, albums }).await.is_err() {
                     return;
                 }
                 let heartbeat =
@@ -393,6 +396,7 @@ struct Linked {
     reader: LinkRead,
     write: LinkWrite,
     files: bool,
+    albums: bool,
     heartbeat: bool,
 }
 
@@ -413,10 +417,15 @@ async fn connect(config: &LinkConfig) -> Result<Linked, ConnectError> {
         let mut line = Vec::new();
         wire::read_line(&mut reader, &mut line).await?;
         match wire::decode::<HubMsg>(&line)? {
-            HubMsg::Registered { files, heartbeat } => Ok(Linked {
+            HubMsg::Registered {
+                files,
+                albums,
+                heartbeat,
+            } => Ok(Linked {
                 reader,
                 write,
                 files,
+                albums,
                 heartbeat,
             }),
             HubMsg::Rejected { reason } => Err(ConnectError::Rejected(reason)),
@@ -920,9 +929,12 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         ),
         Hub::Off(_) => (None, None, None, None),
     };
+    // Whether the hub on line takes albums, read by the sender when a
+    // transfer starts (a call can wait while the link reconnects).
+    let (hub_albums, albums) = watch::channel(false);
     let mut sender = outbox
         .clone()
-        .map(|outbox| spawn_sender(outbox, dirs.work.clone()));
+        .map(|outbox| spawn_sender(outbox, dirs.work.clone(), albums));
     let mut server = channel::Server::new(hub);
     if worker.as_ref().is_some_and(|worker| worker.resumed) {
         server = server.initialized();
@@ -1148,9 +1160,9 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                     }
                     Vec::new()
                 }
-                Some(LinkEvent::Message(HubMsg::FileAnswer { transfer_id, outcome })) => {
+                Some(LinkEvent::Message(HubMsg::FileAnswer { transfer_id, outcome, parts })) => {
                     if let Some(sender) = &sender {
-                        let _ = sender.events.send(Upload::Answer { transfer_id, outcome });
+                        let _ = sender.events.send(Upload::Answer { transfer_id, outcome, parts });
                     }
                     Vec::new()
                 }
@@ -1188,13 +1200,15 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                         None => Vec::new(),
                     }
                 }
-                Some(event @ LinkEvent::Up { files }) => {
+                Some(event @ LinkEvent::Up { files, albums }) => {
                     hub_files = files;
+                    hub_albums.send_replace(files && albums);
                     server.on_link(event)
                 }
                 Some(LinkEvent::Down) => {
                     // A transfer of either way ends with its link.
                     hub_files = false;
+                    hub_albums.send_replace(false);
                     if inbox.take().is_some() {
                         info!("hub link lost; the unfinished file from the topic is dropped");
                     }
@@ -1463,7 +1477,7 @@ pub const SENT_WAIT: Duration = Duration::from_secs(90);
 /// `send_file` calls waiting behind the one being sent.
 const UPLOADS: usize = 4;
 
-/// The one worker that sends `send_file` files to the hub, one at a time.
+/// The one worker that sends `send_file` files to the hub, one call at a time.
 struct Sender {
     calls: mpsc::Sender<FileCall>,
     /// Hub answers and link losses, from the loop.
@@ -1477,6 +1491,7 @@ enum Upload {
     Answer {
         transfer_id: u64,
         outcome: FileOutcome,
+        parts: Vec<FileOutcome>,
     },
     Lost,
 }
@@ -1503,13 +1518,19 @@ fn start_upload(sender: Option<&Sender>, hub_files: bool, call: FileCall) -> Opt
     }
 }
 
-fn spawn_sender(outbox: mpsc::Sender<AgentMsg>, work: Option<PathBuf>) -> Sender {
+/// `albums`: whether the hub on line takes albums, as the loop last heard.
+fn spawn_sender(
+    outbox: mpsc::Sender<AgentMsg>,
+    work: Option<PathBuf>,
+    albums: watch::Receiver<bool>,
+) -> Sender {
     let (calls, mut pending) = mpsc::channel::<FileCall>(UPLOADS);
     let (events, mut uploads) = mpsc::unbounded_channel();
     let (answer, answers) = mpsc::channel(UPLOADS + 1);
     tokio::spawn(async move {
         while let Some(call) = pending.recv().await {
-            let (text, is_error) = upload(&call, &outbox, &mut uploads, work.as_deref()).await;
+            let (text, is_error) =
+                upload(&call, &albums, &outbox, &mut uploads, work.as_deref()).await;
             if answer
                 .send(channel::tool_answer(&call.id, &text, is_error))
                 .await
@@ -1535,7 +1556,8 @@ async fn recv_answer(sender: &mut Option<Sender>) -> Option<Vec<u8>> {
 
 /// What came of waiting for the hub.
 enum Heard {
-    Outcome(FileOutcome),
+    /// An answer, with the per-file outcomes of an album's last one.
+    Outcome(FileOutcome, Vec<FileOutcome>),
     Lost,
     Silence,
 }
@@ -1553,7 +1575,8 @@ async fn hear(
             Ok(Some(Upload::Answer {
                 transfer_id: id,
                 outcome,
-            })) if id == transfer_id => return Heard::Outcome(outcome),
+                parts,
+            })) if id == transfer_id => return Heard::Outcome(outcome, parts),
             Ok(Some(Upload::Answer { .. })) => continue,
             Ok(Some(Upload::Lost)) | Ok(None) => return Heard::Lost,
             Err(_) => return Heard::Silence,
@@ -1573,8 +1596,8 @@ async fn room_or_heard(
         tokio::select! {
             biased;
             event = uploads.recv() => match event {
-                Some(Upload::Answer { transfer_id: id, outcome }) if id == transfer_id => {
-                    return Some(Heard::Outcome(outcome));
+                Some(Upload::Answer { transfer_id: id, outcome, parts }) if id == transfer_id => {
+                    return Some(Heard::Outcome(outcome, parts));
                 }
                 Some(Upload::Answer { .. }) => {}
                 Some(Upload::Lost) | None => return Some(Heard::Lost),
@@ -1585,15 +1608,18 @@ async fn room_or_heard(
 }
 
 const LOST: &str = "The link to the cctg hub dropped during the transfer; the file may not have reached Telegram. Try again.";
+const PENDING: &str = "The file is with the cctg hub; Telegram has not confirmed it yet.";
 
-/// Sends one file; the tool answer text and whether it is an error.
-async fn upload(
-    call: &FileCall,
-    outbox: &mpsc::Sender<AgentMsg>,
-    uploads: &mut mpsc::UnboundedReceiver<Upload>,
-    work: Option<&Path>,
-) -> (String, bool) {
-    let path = match (Path::new(&call.path), work) {
+/// A file read for `send_file`: its name for Telegram and its bytes.
+struct Readable {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+/// Reads `path` (relative to `work` when relative) as [`files::read_upload`]
+/// does; the error is a clause for the tool answer.
+async fn read_file(path: &str, work: Option<&Path>) -> Result<Readable, String> {
+    let path = match (Path::new(path), work) {
         (path, Some(work)) if path.is_relative() => work.join(path),
         (path, _) => path.to_owned(),
     };
@@ -1604,76 +1630,255 @@ async fn upload(
             .unwrap_or_default(),
         "file",
     );
-    let bytes = match tokio::task::spawn_blocking(move || files::read_upload(&path)).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => return (format!("Nothing was sent: {error}."), true),
-        Err(_) => {
-            return (
-                "Nothing was sent: the file could not be read.".to_owned(),
-                true,
-            );
-        }
-    };
+    match tokio::task::spawn_blocking(move || files::read_upload(&path)).await {
+        Ok(Ok(bytes)) => Ok(Readable { name, bytes }),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("the file could not be read".to_owned()),
+    }
+}
+
+/// What came of one transfer.
+enum Transfer {
+    /// Telegram answered: per file of the transfer whether it went.
+    Done(Vec<bool>),
+    /// Everything is with the hub; Telegram has not confirmed it yet.
+    Pending,
+    /// It ended before that; the text says why.
+    Failed(String),
+    /// Several files, but the hub on line takes no album; nothing was sent.
+    NoAlbum,
+}
+
+/// Offers `files` as one transfer, one file or an album (TASK-059), and
+/// sends their bytes. An album goes only while the hub on line takes albums
+/// (`albums`), read after the losses of earlier links are dropped: a link
+/// lost after that ends this transfer before a byte goes to the next hub.
+async fn transfer(
+    outbox: &mpsc::Sender<AgentMsg>,
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    files: &[Readable],
+    caption: Option<String>,
+    albums: &watch::Receiver<bool>,
+) -> Transfer {
     // Answers and losses of earlier transfers mean nothing now.
     while uploads.try_recv().is_ok() {}
+    if files.len() > 1 && !*albums.borrow() {
+        return Transfer::NoAlbum;
+    }
     let transfer_id = wire::random_u64();
+    let (bytes, parts) = match files {
+        [one] => (Cow::Borrowed(one.bytes.as_slice()), Vec::new()),
+        _ => (
+            Cow::Owned(
+                files
+                    .iter()
+                    .map(|file| file.bytes.as_slice())
+                    .collect::<Vec<_>>()
+                    .concat(),
+            ),
+            files
+                .iter()
+                .map(|file| FilePart {
+                    name: file.name.clone(),
+                    size: file.bytes.len() as u64,
+                })
+                .collect(),
+        ),
+    };
     let size = bytes.len() as u64;
-    info!(size, "file offered to the hub");
-    // Without a caption the topic still says what the file is (TASK-051):
-    // a photo shows no name of its own.
-    let caption = call.caption.clone().unwrap_or_else(|| name.clone());
+    info!(size, files = files.len(), "file offered to the hub");
     let offer = AgentMsg::FileOffer {
         transfer_id,
-        name,
+        name: files
+            .first()
+            .map(|file| file.name.clone())
+            .unwrap_or_default(),
         size,
-        caption: Some(caption),
+        caption,
+        parts,
     };
     if outbox.send(offer).await.is_err() {
-        return (
-            "The cctg hub link is gone; nothing was sent.".to_owned(),
-            true,
-        );
+        return Transfer::Failed("The cctg hub link is gone; nothing was sent.".to_owned());
     }
     match hear(uploads, transfer_id, OFFER_WAIT).await {
-        Heard::Outcome(FileOutcome::Accepted) => {}
-        Heard::Outcome(outcome) => return refused(outcome),
-        Heard::Lost => return (LOST.to_owned(), true),
+        Heard::Outcome(FileOutcome::Accepted, _) => {}
+        Heard::Outcome(outcome, _) => return Transfer::Failed(refused(outcome)),
+        Heard::Lost => return Transfer::Failed(LOST.to_owned()),
         Heard::Silence => {
-            return (
-                "The cctg hub did not answer; nothing was sent.".to_owned(),
-                true,
-            );
+            return Transfer::Failed("The cctg hub did not answer; nothing was sent.".to_owned());
         }
     }
     for chunk in files::chunks(transfer_id, &bytes) {
         match room_or_heard(outbox, uploads, transfer_id).await {
-            Some(Heard::Outcome(outcome)) => return refused(outcome),
-            Some(_) => return (LOST.to_owned(), true),
+            Some(Heard::Outcome(outcome, _)) => return Transfer::Failed(refused(outcome)),
+            Some(_) => return Transfer::Failed(LOST.to_owned()),
             None => {}
         }
         if outbox.send(AgentMsg::FileChunk(chunk)).await.is_err() {
-            return (LOST.to_owned(), true);
+            return Transfer::Failed(LOST.to_owned());
         }
     }
     match hear(uploads, transfer_id, SENT_WAIT).await {
-        Heard::Outcome(FileOutcome::Sent) => {
+        Heard::Outcome(FileOutcome::Sent, parts) => {
             info!(size, "file sent to the topic");
-            (
-                "Sent to the Telegram topic of this session.".to_owned(),
-                false,
-            )
+            if parts.len() == files.len() {
+                Transfer::Done(
+                    parts
+                        .iter()
+                        .map(|part| *part == FileOutcome::Sent)
+                        .collect(),
+                )
+            } else {
+                Transfer::Done(vec![true; files.len()])
+            }
         }
-        Heard::Outcome(outcome) => refused(outcome),
-        Heard::Lost => (LOST.to_owned(), true),
-        Heard::Silence => (
-            "The file is with the cctg hub; Telegram has not confirmed it yet.".to_owned(),
-            false,
-        ),
+        Heard::Outcome(outcome, _) => Transfer::Failed(refused(outcome)),
+        Heard::Lost => Transfer::Failed(LOST.to_owned()),
+        Heard::Silence => Transfer::Pending,
     }
 }
 
-/// The tool answer for a hub outcome that is not success.
-fn refused(outcome: FileOutcome) -> (String, bool) {
+/// Sends the files of one call; the tool answer text and whether it is an
+/// error. `albums`: whether the hub on line takes album offers.
+async fn upload(
+    call: &FileCall,
+    albums: &watch::Receiver<bool>,
+    outbox: &mpsc::Sender<AgentMsg>,
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    work: Option<&Path>,
+) -> (String, bool) {
+    let [path] = call.paths.as_slice() else {
+        return upload_several(call, albums, outbox, uploads, work).await;
+    };
+    let file = match read_file(path, work).await {
+        Ok(file) => file,
+        Err(error) => return (format!("Nothing was sent: {error}."), true),
+    };
+    // Without a caption the topic still says what the file is (TASK-051):
+    // a photo shows no name of its own.
+    let caption = call.caption.clone().unwrap_or_else(|| file.name.clone());
+    match transfer(outbox, uploads, &[file], Some(caption), albums).await {
+        Transfer::Done(sent) if sent.iter().all(|&sent| sent) => (
+            "Sent to the Telegram topic of this session.".to_owned(),
+            false,
+        ),
+        Transfer::Done(_) => (refused(FileOutcome::Failed), true),
+        Transfer::Pending => (PENDING.to_owned(), false),
+        Transfer::Failed(text) => (text, true),
+        Transfer::NoAlbum => unreachable!("one file is never an album"),
+    }
+}
+
+/// What became of one file of a `paths` call.
+const SENT: &str = "sent";
+
+/// The files of a `paths` call (TASK-059), in order, in as few groups as
+/// fit ([`wire::MAX_ALBUM`] files and [`files::MAX_UPLOAD`] bytes each, what
+/// the hub holds for Telegram at a time). A group goes as one album offer
+/// while the hub on line takes albums, else one file after another; the
+/// caption goes with the first transfer. A file that cannot be read is left
+/// out; the answer lists what became of each.
+async fn upload_several(
+    call: &FileCall,
+    albums: &watch::Receiver<bool>,
+    outbox: &mpsc::Sender<AgentMsg>,
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    work: Option<&Path>,
+) -> (String, bool) {
+    let mut results = vec![String::new(); call.paths.len()];
+    let mut caption = call.caption.clone();
+    let mut one_by_one = false;
+    let mut group: Vec<(usize, Readable)> = Vec::new();
+    for (index, path) in call.paths.iter().enumerate() {
+        let file = match read_file(path, work).await {
+            Ok(file) => file,
+            Err(error) => {
+                results[index] = format!("not sent: {error}");
+                continue;
+            }
+        };
+        let bytes: u64 = group.iter().map(|(_, file)| file.bytes.len() as u64).sum();
+        if group.len() == wire::MAX_ALBUM || bytes + file.bytes.len() as u64 > files::MAX_UPLOAD {
+            let full = std::mem::take(&mut group);
+            one_by_one |=
+                send_group(full, caption.take(), outbox, uploads, albums, &mut results).await;
+        }
+        group.push((index, file));
+    }
+    if !group.is_empty() {
+        one_by_one |=
+            send_group(group, caption.take(), outbox, uploads, albums, &mut results).await;
+    }
+    let sent = results.iter().filter(|result| *result == SENT).count();
+    let pending = results.iter().filter(|result| *result == PENDING).count();
+    let mut text = format!(
+        "{sent} of {} files sent to the Telegram topic of this session",
+        results.len()
+    );
+    if one_by_one {
+        text.push_str(" (one by one: the cctg hub is older than this agent and sends no albums)");
+    }
+    text.push(':');
+    for (path, result) in call.paths.iter().zip(&results) {
+        text.push_str(&format!("\n- {path}: {result}"));
+    }
+    (text, sent == 0 && pending == 0)
+}
+
+/// Sends one group of a `paths` call and notes what became of each file;
+/// `true` when the hub took no album and the files went one by one.
+async fn send_group(
+    group: Vec<(usize, Readable)>,
+    caption: Option<String>,
+    outbox: &mpsc::Sender<AgentMsg>,
+    uploads: &mut mpsc::UnboundedReceiver<Upload>,
+    albums: &watch::Receiver<bool>,
+    results: &mut [String],
+) -> bool {
+    let (indexes, files): (Vec<usize>, Vec<Readable>) = group.into_iter().unzip();
+    // A lone file says what it is, as with `path` (TASK-051); in an album
+    // the hub names the photos that have no caption.
+    let lone = |file: &Readable, caption: Option<String>| {
+        Some(caption.unwrap_or_else(|| file.name.clone()))
+    };
+    let caption = match files.as_slice() {
+        [one] => lone(one, caption),
+        _ => caption,
+    };
+    let outcome = transfer(outbox, uploads, &files, caption.clone(), albums).await;
+    let outcomes = match outcome {
+        Transfer::NoAlbum => {
+            let mut caption = caption;
+            let mut outcomes = Vec::with_capacity(files.len());
+            for file in &files {
+                let caption = lone(file, caption.take());
+                let outcome =
+                    transfer(outbox, uploads, std::slice::from_ref(file), caption, albums).await;
+                outcomes.push(outcome);
+            }
+            outcomes
+        }
+        outcome => vec![outcome],
+    };
+    let one_by_one = outcomes.len() > 1;
+    for (position, index) in indexes.into_iter().enumerate() {
+        let (outcome, position) = match outcomes.as_slice() {
+            [outcome] => (outcome, position),
+            _ => (&outcomes[position], 0),
+        };
+        results[index] = match outcome {
+            Transfer::Done(sent) if sent.get(position) == Some(&true) => SENT.to_owned(),
+            Transfer::Done(_) => "not sent: Telegram did not take it".to_owned(),
+            Transfer::Pending => PENDING.to_owned(),
+            Transfer::Failed(text) => format!("not sent: {text}"),
+            Transfer::NoAlbum => unreachable!("one file is never an album"),
+        };
+    }
+    one_by_one
+}
+
+/// The tool answer text for a hub outcome that is not success.
+fn refused(outcome: FileOutcome) -> String {
     warn!(?outcome, "file not sent");
     let text = match outcome {
         FileOutcome::NoTopic => {
@@ -1687,7 +1892,7 @@ fn refused(outcome: FileOutcome) -> (String, bool) {
             "The cctg hub gave an answer this agent does not know; the file may not have been sent."
         }
     };
-    (text.to_owned(), true)
+    text.to_owned()
 }
 
 type ReadRequest = (String, Option<u64>);
@@ -2002,13 +2207,20 @@ mod tests {
         };
         let (outbox, mut events) = spawn(config(addr, backoff));
         // The hub says it takes files.
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: true });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: true,
+                albums: true
+            }
+        );
         let (got, to_agent) = registered(&mut hub_rx).await;
         assert_eq!(got, register());
         to_agent
             .send(HubMsg::Registered {
                 files: true,
                 heartbeat: false,
+                albums: true,
             })
             .await
             .unwrap();
@@ -2016,7 +2228,8 @@ mod tests {
             next(&mut events).await,
             LinkEvent::Message(HubMsg::Registered {
                 files: true,
-                heartbeat: false
+                heartbeat: false,
+                albums: true,
             })
         );
 
@@ -2177,11 +2390,18 @@ mod tests {
             &HubMsg::Registered {
                 files: false,
                 heartbeat: false,
+                albums: false,
             },
         )
         .await
         .unwrap();
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: false,
+                albums: false
+            }
+        );
 
         let inbound = HubMsg::Inbound {
             content: "split inbound".repeat(100),
@@ -2270,6 +2490,7 @@ mod tests {
         let registered = HubMsg::Registered {
             files: false,
             heartbeat,
+            albums: false,
         };
         wire::write_msg(&mut write, &registered).await.unwrap();
         (reader, write)
@@ -2285,7 +2506,13 @@ mod tests {
             .unwrap();
         let (_outbox, mut events) = spawn(beating(listener.local_addr().unwrap()));
         let (mut reader, _write) = fake_hub(&listener, true).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: false,
+                albums: false
+            }
+        );
         let up = tokio::time::Instant::now();
         // The agent pings the quiet hub.
         let mut line = Vec::new();
@@ -2298,7 +2525,13 @@ mod tests {
         assert_eq!(next(&mut events).await, LinkEvent::Down);
         assert!(up.elapsed() >= BEAT.timeout, "{:?}", up.elapsed());
         let (_reader, _write) = fake_hub(&listener, true).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: false,
+                albums: false
+            }
+        );
     }
 
     /// A hub before TASK-049 gets no ping and is waited for as long as the
@@ -2313,7 +2546,13 @@ mod tests {
             link.register.heartbeat = agent;
             let (_outbox, mut events) = spawn(link);
             let (mut reader, _write) = fake_hub(&listener, hub).await;
-            assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+            assert_eq!(
+                next(&mut events).await,
+                LinkEvent::Up {
+                    files: false,
+                    albums: false
+                }
+            );
             let mut line = Vec::new();
             let quiet = BEAT.timeout * 2;
             let read = tokio::time::timeout(quiet, wire::read_line(&mut reader, &mut line)).await;
@@ -2341,7 +2580,13 @@ mod tests {
         ));
         let (outbox, mut events) = spawn(beating(addr));
         let (_, to_agent) = registered(&mut hub_rx).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: true });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: true,
+                albums: true
+            }
+        );
 
         // Quiet, and nobody reads the link events.
         let quiet = tokio::time::timeout(BEAT.timeout * 3, hub_rx.recv()).await;
@@ -2663,7 +2908,7 @@ mod tests {
     /// Accepts one agent on `listener` and answers its handshake as a hub
     /// that takes no files.
     async fn raw_hub(listener: &TcpListener) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
-        raw_hub_files(listener, false).await
+        raw_hub_files(listener, false, false).await
     }
 
     async fn agent_line(reader: &mut BufReader<OwnedReadHalf>) -> AgentMsg {
@@ -2693,7 +2938,13 @@ mod tests {
         };
 
         let (mut reader, mut write) = raw_hub(&listener).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: false,
+                albums: false
+            }
+        );
         wire::write_msg(&mut write, &verdict(Some(7)))
             .await
             .unwrap();
@@ -2709,7 +2960,13 @@ mod tests {
         drop((reader, write));
         assert_eq!(next(&mut events).await, LinkEvent::Down);
         let (mut reader, mut write) = raw_hub(&listener).await;
-        assert_eq!(next(&mut events).await, LinkEvent::Up { files: false });
+        assert_eq!(
+            next(&mut events).await,
+            LinkEvent::Up {
+                files: false,
+                albums: false
+            }
+        );
         wire::write_msg(&mut write, &verdict(Some(7)))
             .await
             .unwrap();
@@ -3100,6 +3357,7 @@ mod tests {
     async fn raw_hub_files(
         listener: &TcpListener,
         files: bool,
+        albums: bool,
     ) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
         let (stream, _) = tokio::time::timeout(WAIT, listener.accept())
             .await
@@ -3116,6 +3374,7 @@ mod tests {
             &mut write,
             &HubMsg::Registered {
                 files,
+                albums,
                 heartbeat: false,
             },
         )
@@ -3345,7 +3604,7 @@ mod tests {
             .await
             .unwrap();
         let mut claude = claude_in(listener.local_addr().unwrap(), dir.path()).await;
-        let (mut reader, mut write) = raw_hub_files(&listener, true).await;
+        let (mut reader, mut write) = raw_hub_files(&listener, true, false).await;
         settle(&mut claude, &mut write).await;
         let call = |id: u32, path: &str| {
             serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
@@ -3365,6 +3624,7 @@ mod tests {
             name,
             size,
             caption,
+            parts,
         } = agent_line(&mut reader).await
         else {
             panic!("an offer first");
@@ -3373,9 +3633,11 @@ mod tests {
             (name.as_str(), size, caption.as_deref()),
             ("shot.png", png.len() as u64, Some("look"))
         );
+        assert!(parts.is_empty(), "one file is no album");
         let accepted = HubMsg::FileAnswer {
             transfer_id,
             outcome: FileOutcome::Accepted,
+            parts: Vec::new(),
         };
         wire::write_msg(&mut write, &accepted).await.unwrap();
         let mut assembly = files::Assembly::new(size);
@@ -3391,6 +3653,7 @@ mod tests {
         let sent = HubMsg::FileAnswer {
             transfer_id,
             outcome: FileOutcome::Sent,
+            parts: Vec::new(),
         };
         wire::write_msg(&mut write, &sent).await.unwrap();
         let answer = claude.recv().await;
@@ -3408,6 +3671,7 @@ mod tests {
         let refused = HubMsg::FileAnswer {
             transfer_id,
             outcome: FileOutcome::NoTopic,
+            parts: Vec::new(),
         };
         wire::write_msg(&mut write, &refused).await.unwrap();
         let answer = claude.recv().await;
@@ -3429,6 +3693,7 @@ mod tests {
         let accepted = HubMsg::FileAnswer {
             transfer_id,
             outcome: FileOutcome::Accepted,
+            parts: Vec::new(),
         };
         wire::write_msg(&mut write, &accepted).await.unwrap();
         drop((reader, write));
@@ -3439,7 +3704,7 @@ mod tests {
         );
         assert!(text(&answer).contains("dropped"), "{answer}");
         // A hub that takes no files is not offered one.
-        let (mut reader, mut write) = raw_hub_files(&listener, false).await;
+        let (mut reader, mut write) = raw_hub_files(&listener, false, false).await;
         settle(&mut claude, &mut write).await;
         claude.send(&call(14, "shot.png")).await;
         let answer = claude.recv().await;
@@ -3463,6 +3728,261 @@ mod tests {
         );
     }
 
+    /// As the hub: takes the next offer and all its bytes and answers
+    /// `sent` with `parts`. The offer's name, caption, parts and bytes.
+    async fn take_offer(
+        reader: &mut BufReader<OwnedReadHalf>,
+        write: &mut OwnedWriteHalf,
+        answer: Vec<FileOutcome>,
+    ) -> (String, Option<String>, Vec<FilePart>, Vec<u8>) {
+        let AgentMsg::FileOffer {
+            transfer_id,
+            name,
+            size,
+            caption,
+            parts,
+        } = agent_line(reader).await
+        else {
+            panic!("an offer");
+        };
+        let accepted = HubMsg::FileAnswer {
+            transfer_id,
+            outcome: FileOutcome::Accepted,
+            parts: Vec::new(),
+        };
+        wire::write_msg(write, &accepted).await.unwrap();
+        let mut assembly = files::Assembly::new(size);
+        while !assembly.is_complete() {
+            match agent_line(reader).await {
+                AgentMsg::FileChunk(chunk) => assembly.push(&chunk).unwrap(),
+                other => panic!("{other:?}"),
+            };
+        }
+        let sent = HubMsg::FileAnswer {
+            transfer_id,
+            outcome: FileOutcome::Sent,
+            parts: answer,
+        };
+        wire::write_msg(write, &sent).await.unwrap();
+        (name, caption, parts, assembly.into_bytes())
+    }
+
+    /// TASK-059: `paths` goes as one album offer to a hub that takes albums
+    /// and file after file to one that does not; a file that cannot be read
+    /// is left out, and the answer lists what became of each.
+    #[tokio::test]
+    async fn send_file_with_paths_offers_an_album_or_one_file_after_another() {
+        let dir = crate::hub::testdir::TempDir::new("agent-send-album");
+        std::fs::write(dir.path().join("a.png"), b"\x89PNG\r\n\x1a\na").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"bee").unwrap();
+        std::fs::write(dir.path().join("c.txt"), b"sea").unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let mut claude = claude_in(listener.local_addr().unwrap(), dir.path()).await;
+        let (mut reader, mut write) = raw_hub_files(&listener, true, true).await;
+        settle(&mut claude, &mut write).await;
+        let call = |id: u32, caption: Option<&str>| {
+            let mut arguments =
+                serde_json::json!({"paths": ["a.png", "missing.txt", "b.txt", "c.txt"]});
+            if let Some(caption) = caption {
+                arguments["caption"] = caption.into();
+            }
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"send_file","arguments":arguments}})
+            .to_string()
+        };
+        let text = |answer: &serde_json::Value| {
+            answer["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        claude.send(&call(20, Some("three"))).await;
+        use FileOutcome::{Failed, Sent};
+        let (name, caption, parts, bytes) =
+            take_offer(&mut reader, &mut write, vec![Sent, Sent, Failed]).await;
+        assert_eq!(
+            (name.as_str(), caption.as_deref()),
+            ("a.png", Some("three"))
+        );
+        let names: Vec<(&str, u64)> = parts
+            .iter()
+            .map(|part| (part.name.as_str(), part.size))
+            .collect();
+        assert_eq!(names, [("a.png", 9), ("b.txt", 3), ("c.txt", 3)]);
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\nabeesea");
+        let answer = claude.recv().await;
+        assert_eq!(
+            (answer["id"].clone(), answer["result"]["isError"].clone()),
+            (20.into(), false.into())
+        );
+        let said = text(&answer);
+        assert!(
+            said.starts_with("2 of 4 files sent to the Telegram topic of this session:"),
+            "{said}"
+        );
+        assert!(said.contains("\n- a.png: sent"), "{said}");
+        assert!(said.contains("\n- missing.txt: not sent: "), "{said}");
+        assert!(said.contains("\n- b.txt: sent"), "{said}");
+        assert!(
+            said.contains("\n- c.txt: not sent: Telegram did not take it"),
+            "{said}"
+        );
+        // A hub before TASK-059: one offer per file, the caption on the
+        // first, each other file named by itself.
+        drop((reader, write));
+        let (mut reader, mut write) = raw_hub_files(&listener, true, false).await;
+        settle(&mut claude, &mut write).await;
+        claude.send(&call(21, None)).await;
+        let mut offers = Vec::new();
+        for _ in 0..3 {
+            let (name, caption, parts, _) = take_offer(&mut reader, &mut write, Vec::new()).await;
+            assert!(parts.is_empty());
+            offers.push((name, caption));
+        }
+        let names = |name: &str| (name.to_owned(), Some(name.to_owned()));
+        assert_eq!(offers, [names("a.png"), names("b.txt"), names("c.txt")]);
+        let answer = claude.recv().await;
+        let said = text(&answer);
+        assert_eq!(answer["result"]["isError"], false, "{said}");
+        assert!(said.starts_with("3 of 4 files sent"), "{said}");
+        assert!(said.contains("one by one"), "{said}");
+    }
+
+    /// TASK-059 review: whether a group goes as an album is read when its
+    /// transfer starts. A call queued while an album hub was on line goes
+    /// one by one when the link came back to a hub without albums.
+    #[tokio::test]
+    async fn a_queued_paths_call_follows_the_hub_on_line_when_it_goes() {
+        let dir = crate::hub::testdir::TempDir::new("agent-album-reconnect");
+        for name in ["one.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let mut claude = claude_in(listener.local_addr().unwrap(), dir.path()).await;
+        let (mut reader, mut write) = raw_hub_files(&listener, true, true).await;
+        settle(&mut claude, &mut write).await;
+        let call = |id: u32, arguments: serde_json::Value| {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"send_file","arguments":arguments}})
+            .to_string()
+        };
+        // The first call waits for the hub's answer; the second waits behind it.
+        claude
+            .send(&call(30, serde_json::json!({"path": "one.txt"})))
+            .await;
+        assert!(matches!(
+            agent_line(&mut reader).await,
+            AgentMsg::FileOffer { .. }
+        ));
+        claude
+            .send(&call(31, serde_json::json!({"paths": ["b.txt", "c.txt"]})))
+            .await;
+        // Answered after the call above was queued: lines go in order.
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":32,"method":"tools/list"}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 32);
+        // The album hub goes away; an older one comes.
+        drop((reader, write));
+        let lost = claude.recv().await;
+        assert_eq!(
+            (lost["id"].clone(), lost["result"]["isError"].clone()),
+            (30.into(), true.into())
+        );
+        let (mut reader, mut write) = raw_hub_files(&listener, true, false).await;
+        let mut offers = Vec::new();
+        for _ in 0..2 {
+            let (name, caption, parts, _) = take_offer(&mut reader, &mut write, Vec::new()).await;
+            assert!(parts.is_empty(), "no album to a hub without albums");
+            offers.push((name, caption));
+        }
+        let named = |name: &str| (name.to_owned(), Some(name.to_owned()));
+        assert_eq!(offers, [named("b.txt"), named("c.txt")]);
+        let answer = claude.recv().await;
+        assert_eq!(answer["id"], 31);
+        let said = answer["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(said.starts_with("2 of 2 files sent"), "{said}");
+        assert!(said.contains("one by one"), "{said}");
+    }
+
+    /// TASK-059 review: a group holds at most [`files::MAX_UPLOAD`] bytes;
+    /// the file that would pass it starts the next group, and only the first
+    /// group carries the caption.
+    #[tokio::test]
+    async fn paths_past_the_byte_cap_go_as_several_offers() {
+        let dir = crate::hub::testdir::TempDir::new("agent-album-bytes");
+        let big = std::fs::File::create(dir.path().join("big.bin")).unwrap();
+        big.set_len(files::MAX_UPLOAD - 10).unwrap();
+        drop(big);
+        std::fs::write(dir.path().join("ten.txt"), [7u8; 10]).unwrap();
+        std::fs::write(dir.path().join("one.txt"), [1u8]).unwrap();
+        let call = FileCall {
+            id: serde_json::json!(1),
+            paths: ["big.bin", "ten.txt", "one.txt"]
+                .map(|name| dir.path().join(name).to_string_lossy().into_owned())
+                .to_vec(),
+            caption: Some("see".into()),
+        };
+        let (outbox, mut link) = mpsc::channel(QUEUE);
+        let (events, mut uploads) = mpsc::unbounded_channel();
+        let albums = watch::channel(true).1;
+        let sending =
+            tokio::spawn(async move { upload(&call, &albums, &outbox, &mut uploads, None).await });
+        let mut offers = Vec::new();
+        for _ in 0..2 {
+            let Some(AgentMsg::FileOffer {
+                transfer_id,
+                name,
+                size,
+                caption,
+                parts,
+            }) = tokio::time::timeout(WAIT, link.recv()).await.unwrap()
+            else {
+                panic!("an offer");
+            };
+            let parts: Vec<(String, u64)> = parts
+                .into_iter()
+                .map(|part| (part.name, part.size))
+                .collect();
+            offers.push((name, size, caption, parts));
+            // Refused: no bytes needed to see how the call is split.
+            events
+                .send(Upload::Answer {
+                    transfer_id,
+                    outcome: FileOutcome::Busy,
+                    parts: Vec::new(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            offers,
+            [
+                (
+                    "big.bin".to_owned(),
+                    files::MAX_UPLOAD,
+                    Some("see".to_owned()),
+                    vec![
+                        ("big.bin".to_owned(), files::MAX_UPLOAD - 10),
+                        ("ten.txt".to_owned(), 10)
+                    ]
+                ),
+                (
+                    "one.txt".to_owned(),
+                    1,
+                    Some("one.txt".to_owned()),
+                    Vec::new()
+                ),
+            ]
+        );
+        let (text, is_error) = tokio::time::timeout(WAIT, sending).await.unwrap().unwrap();
+        assert!(is_error, "{text}");
+        assert!(text.starts_with("0 of 3 files sent"), "{text}");
+    }
+
     #[tokio::test]
     async fn a_link_lost_while_chunks_wait_for_room_ends_the_upload_at_once() {
         let dir = crate::hub::testdir::TempDir::new("agent-upload-lost");
@@ -3470,14 +3990,16 @@ mod tests {
         std::fs::write(&file, vec![5u8; files::CHUNK * 8]).unwrap();
         let call = FileCall {
             id: serde_json::json!(1),
-            path: file.to_string_lossy().into_owned(),
+            paths: vec![file.to_string_lossy().into_owned()],
             caption: None,
         };
         // The link queue: the link task stops draining it while it
         // reconnects, so chunks pile up to the sender's share.
         let (outbox, mut link) = mpsc::channel(QUEUE);
         let (events, mut uploads) = mpsc::unbounded_channel();
-        let sending = tokio::spawn(async move { upload(&call, &outbox, &mut uploads, None).await });
+        let albums = watch::channel(false).1;
+        let sending =
+            tokio::spawn(async move { upload(&call, &albums, &outbox, &mut uploads, None).await });
         let Some(AgentMsg::FileOffer { transfer_id, .. }) = link.recv().await else {
             panic!("an offer first");
         };
@@ -3485,6 +4007,7 @@ mod tests {
             .send(Upload::Answer {
                 transfer_id,
                 outcome: FileOutcome::Accepted,
+                parts: Vec::new(),
             })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
