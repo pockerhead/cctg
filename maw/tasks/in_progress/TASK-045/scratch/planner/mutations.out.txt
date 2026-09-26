@@ -1,0 +1,15 @@
+CAUGHT  crates/cctg/src/hub/devices.rs: removed && unix(now) < expires -> removed
+CAUGHT  crates/cctg/src/hub/devices.rs: let removed = std::fs::remove_file(&path).is_ok(); -> let removed = true;
+CAUGHT  crates/cctg/src/hub/devices.rs: .is_some_and(|device| bool::from(device.hash.as_bytes().ct_e -> .is_some_and(|_| !hash.is_empty());
+CAUGHT  crates/cctg/src/hub/ingress.rs: () = revoked(&mut changes, devices, &who) => { -> () = std::future::pending::<()>() => { let _ = &mut changes;
+CAUGHT  crates/cctg/src/hub/ingress.rs: let max = if route == Route::Join {
+        MAX_JOIN_BODY -> let max = if route == Route::Join {
+        MAX_HOOK_BODY
+CAUGHT  crates/cctg/src/hub/ingress.rs: // No fast guessing, as for a wrong secret.
+            toki -> // No fast guessing, as for a wrong secret.
+CAUGHT  crates/cctg/src/join.rs: .filter(|line| !sets_secret(line)) -> .filter(|_| true)
+CAUGHT  crates/cctg/src/hub/roster.rs: Press::Ask(id) => match devices.name(&id) { -> Press::Ask(id) => match devices.revoke(&id).map(|revoked| re
+CAUGHT  crates/cctg/tests/hub_reads_no_files.rs: if raw {
+                i += 1; // the `r`
+                 -> i += 1;
+            while raw && chars.get(i) == Some(&'#') 

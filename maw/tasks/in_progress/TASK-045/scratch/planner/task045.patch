@@ -1,0 +1,3735 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -119,6 +119,7 @@
+ - Gate по `from.id` пользователя, не по чату. Allowlist в hub.
+ - Permission relay только от allowlisted. Кнопки Allow/Deny с `request_id` в callback data.
+ - Секрет hub в `.env`, не в репо. `.cctg/` в gitignore.
++- Секреты устройств (TASK-045, `docs/remote-hub.md` «Устройства и коды»): одноразовый код (`cctg hub code`, 10 минут) `cctg join` меняет на свой секрет устройства `cctgd_<id>_<hex>` в `device.env`; hub хранит только sha256 в `<state>/devices.json`, `/devices` в General отзывает (линк агента рвётся сразу, хуки получают 401). Общий секрет работает, пока `CCTG_SHARED_SECRET` не `off`.
+ - Hub на другой машине (TASK-035, `docs/remote-hub.md`): оба канала по TLS 1.3, устройство держит pin сертификата hub (`CCTG_HUB_CERT_SHA256`); без pin устройство ходит только на loopback. Сборка = коммит (`build.rs`, `CCTG_BUILD_ID` в CI и Docker), hub и клиент одного коммита на разных ОС не «устаревшие».
+ 
+ ## Порядок разработки
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -35,7 +35,7 @@
+ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub
+ ```
+ 
+-Установщик спросит токен бота (не показывается при вводе), id группы, ваш id, адрес сервера и, если Telegram с сервера доступен только через прокси, адрес прокси. Он сам сделает секрет и сертификат, запустит hub в Docker и проверит бота и группу. В конце он печатает строку для установки клиентов. В ней секрет hub: вставляйте её только на своих машинах.
++Установщик спросит токен бота (не показывается при вводе), id группы, ваш id, адрес сервера и, если Telegram с сервера доступен только через прокси, адрес прокси. Он сам сделает секрет и сертификат, запустит hub в Docker и проверит бота и группу. В конце он печатает строку для установки клиента. В ней одноразовый код: он работает один раз и 10 минут, секрета hub в строке нет. Код для следующей машины: `cd ~/cctg-hub && docker compose exec hub cctg hub code`.
+ 
+ Подробности (прокси, обновление, порты): `docs/remote-hub.md`.
+ 
+@@ -44,10 +44,12 @@
+ Выполните строку, которую напечатал hub (в Windows это Git Bash). Она выглядит так:
+ 
+ ```sh
+-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | CCTG_HUB_SECRET='...' sh -s -- --hub-host <сервер> --pin <отпечаток>
++curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub-host <сервер> --pin <отпечаток> --join XXXX-XXXX-XXXX-XXXX
+ ```
+ 
+-Без строки можно так, установщик всё спросит (секрет при вводе не показывается):
++Установщик обменяет код на собственный секрет этой машины и запишет его в `~/.cctg/device.env`, на экран секрет не попадает. Для каждой машины нужен свой код. Список машин и кнопка «Отозвать»: `/devices` в теме General.
++
++Без строки можно так, установщик всё спросит:
+ 
+ ```sh
+ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh
+diff --git a/crates/cctg/src/doctor.rs b/crates/cctg/src/doctor.rs
+--- a/crates/cctg/src/doctor.rs
++++ b/crates/cctg/src/doctor.rs
+@@ -12,6 +12,7 @@
+ use crate::client;
+ use crate::device::DeviceConfig;
+ use crate::hook::{self, PostError};
++use crate::hub::devices::secret_device_id;
+ 
+ /// Per check; a far hub over TLS answers well within it.
+ pub const TIMEOUT: Duration = Duration::from_secs(5);
+@@ -39,7 +40,10 @@
+     };
+     let secret = match &config.secret {
+         Ok(secret) => {
+-            lines.push("secret: set".to_owned());
++            lines.push(match secret_device_id(secret) {
++                Some(id) => format!("secret: set, this device's own (device {id})"),
++                None => "secret: set, the hub's shared secret".to_owned(),
++            });
+             Some(secret)
+         }
+         Err(problem) => {
+@@ -80,7 +84,9 @@
+             Ok(()) => lines.push(format!("hooks {hooks}: reachable, the hub took the secret")),
+             Err(PostError::Status(401)) => fail(
+                 &mut lines,
+-                format!("hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET)"),
++                format!(
++                    "hooks {hooks}: the hub rejected the secret (compare CCTG_HUB_SECRET; a device                      secret may have been revoked: join again with a new code, cctg join)"
++                ),
+             ),
+             // A hub from before `cctg doctor` has no ping route.
+             Err(PostError::Status(404)) => lines.push(format!(
+diff --git a/crates/cctg/src/hub/config.rs b/crates/cctg/src/hub/config.rs
+--- a/crates/cctg/src/hub/config.rs
++++ b/crates/cctg/src/hub/config.rs
+@@ -16,8 +16,13 @@
+ /// Optional: hub state directory (the saved `getUpdates` offset); defaults to `.cctg`.
+ pub const STATE_VAR: &str = "CCTG_STATE_DIR";
+ pub const DEFAULT_STATE_DIR: &str = ".cctg";
+-/// Shared secret of agents and hooks; required by `cctg hub`.
++/// Shared secret of agents and hooks; required by `cctg hub` while
++/// [`SHARED_VAR`] is on.
+ pub const SECRET_VAR: &str = "CCTG_HUB_SECRET";
++/// Optional, `on` (default) or `off`: whether the hub still takes
++/// [`SECRET_VAR`] from agents and hooks. Off once every device has its own
++/// secret (TASK-045, `cctg join`).
++pub const SHARED_VAR: &str = "CCTG_SHARED_SECRET";
+ /// Optional: agent TCP listener `ip:port`; defaults to loopback.
+ pub const AGENT_LISTEN_VAR: &str = "CCTG_AGENT_LISTEN";
+ /// Optional: hook HTTP listener `ip:port`; defaults to loopback.
+@@ -51,6 +56,8 @@
+     EnvFile { path: String, reason: &'static str },
+     #[error("{SECRET_VAR} is invalid: {0}")]
+     Secret(SecretError),
++    #[error("{SHARED_VAR} must be on or off")]
++    Shared,
+     #[error("{0} must be an ip:port address such as 127.0.0.1:47291 (host names are not resolved)")]
+     ListenAddr(&'static str),
+     #[error("{API_URL_VAR} must start with https://, or http:// to a loopback host")]
+@@ -110,8 +117,11 @@
+     pub chat_id: i64,
+     pub allowlist: Allowlist,
+     pub state_dir: PathBuf,
+-    /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start then.
++    /// `None` when `CCTG_HUB_SECRET` is unset; `cctg hub` refuses to start
++    /// then, unless `shared_secret` is off.
+     pub hub_secret: Option<Secret>,
++    /// [`SHARED_VAR`]: agents and hooks may use `hub_secret`.
++    pub shared_secret: bool,
+     /// Loopback unless configured; any other address is an explicit choice.
+     pub agent_listen: SocketAddr,
+     pub hook_listen: SocketAddr,
+@@ -194,6 +204,12 @@
+         let hub_secret = optional(SECRET_VAR)
+             .map(|value| Secret::parse(&value).map_err(ConfigError::Secret))
+             .transpose()?;
++        let shared_secret = match optional(SHARED_VAR).map(|value| value.to_ascii_lowercase()) {
++            None => true,
++            Some(value) if value == "on" => true,
++            Some(value) if value == "off" => false,
++            Some(_) => return Err(ConfigError::Shared),
++        };
+         let listen = |name: &'static str, default: SocketAddr| {
+             optional(name).map_or(Ok(default), |value| {
+                 value.parse().map_err(|_| ConfigError::ListenAddr(name))
+@@ -220,12 +236,30 @@
+             allowlist,
+             state_dir,
+             hub_secret,
++            shared_secret,
+             agent_listen,
+             hook_listen,
+             api_url,
+             tls,
+         })
+     }
++}
++
++/// The hub state directory alone ([`STATE_VAR`], process environment first,
++/// then `env_file` or `./.env`), for `cctg hub code`: it needs neither the
++/// token nor the other settings.
++pub fn state_dir(env_file: Option<&Path>) -> Result<PathBuf, ConfigError> {
++    let file_vars = match env_file {
++        Some(path) => load_env_file(path)?,
++        None if Path::new(".env").is_file() => load_env_file(Path::new(".env"))?,
++        None => HashMap::new(),
++    };
++    let value = std::env::var(STATE_VAR)
++        .ok()
++        .or_else(|| file_vars.get(STATE_VAR).cloned())
++        .map(|value| value.trim().to_owned())
++        .filter(|value| !value.is_empty());
++    Ok(PathBuf::from(value.as_deref().unwrap_or(DEFAULT_STATE_DIR)))
+ }
+ 
+ /// `http://localhost`, `http://127.x.x.x` or `http://[::1]`, any port and path.
+@@ -550,6 +584,25 @@
+     }
+ 
+     #[test]
++    fn the_shared_secret_is_on_unless_turned_off() {
++        let base = [
++            (TOKEN_VAR, "123:abc"),
++            (CHAT_VAR, "-1001"),
++            (ALLOWLIST_VAR, "1"),
++        ];
++        let with = |extra: &[(&'static str, &'static str)]| {
++            let pairs: Vec<_> = base.iter().chain(extra).copied().collect();
++            Config::from_vars(vars(&pairs))
++        };
++        assert!(with(&[]).unwrap().shared_secret);
++        assert!(with(&[(SHARED_VAR, " On ")]).unwrap().shared_secret);
++        assert!(!with(&[(SHARED_VAR, "OFF")]).unwrap().shared_secret);
++        let error = with(&[(SHARED_VAR, "maybe-secret-value")]).unwrap_err();
++        assert_eq!(error, ConfigError::Shared);
++        assert!(!error.to_string().contains("maybe-secret-value"));
++    }
++
++    #[test]
+     fn a_bad_hub_secret_is_named_but_not_echoed() {
+         for (value, reason) in [
+             ("short-sec", SecretError::TooShort),
+diff --git a/crates/cctg/src/hub/devices.rs b/crates/cctg/src/hub/devices.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/hub/devices.rs
+@@ -0,0 +1,826 @@
++//! Device enrollment (TASK-045): one-time join codes and per-device secrets.
++//!
++//! A join code is 16 Crockford base32 characters (80 random bits), shown as
++//! `XXXX-XXXX-XXXX-XXXX`, good once and for [`CODE_TTL`]. `cctg hub code`
++//! (another process, e.g. `docker compose exec hub cctg hub code`) and the
++//! hub itself mint codes into `<state>/join/`: one file per code, named by
++//! the sha256 of the code and holding only its expiry, so the state volume
++//! never holds a usable code. The hub takes a code by removing its file:
++//! of two exchanges of one code only one removal succeeds.
++//!
++//! A device secret is `cctgd_<id>_<64 hex>` (256 random bits); `<id>` (8
++//! hex) is public and names the device. It goes where the shared secret
++//! went (`CCTG_HUB_SECRET` of `device.env`, `hello`, `Authorization`), so
++//! agents and hooks need no change. The hub keeps only its sha256 in
++//! `<state>/devices.json`: a random 256-bit value needs no slow hash.
++//!
++//! [`Devices`] is what the listeners check secrets against: the shared
++//! secret while it is on (`CCTG_SHARED_SECRET`, default on), and the
++//! enrolled devices. A revoke takes effect at once: hooks are checked per
++//! request, and every agent link of a device watches [`Devices::subscribe`].
++//!
++//! Nothing here logs or returns in an error a code or a secret.
++
++use std::collections::HashMap;
++use std::io::{self, Write};
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex, MutexGuard};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use serde::{Deserialize, Serialize};
++use subtle::ConstantTimeEq;
++use tokio::sync::watch;
++use tracing::warn;
++
++use crate::wire::Secret;
++
++/// How long a join code is good.
++pub const CODE_TTL: Duration = Duration::from_secs(10 * 60);
++/// Enrolled devices at most; a join beyond it is refused.
++pub const MAX_DEVICES: usize = 32;
++/// Unused, unexpired codes at most; minting one more fails.
++pub const MAX_CODES: usize = 32;
++pub const DEVICES_FILE: &str = "devices.json";
++const DEVICES_TEMP: &str = "devices.json.tmp";
++pub const CODES_DIR: &str = "join";
++const VERSION: u32 = 1;
++const SECRET_PREFIX: &str = "cctgd_";
++const ID_LEN: usize = 8;
++/// Characters of a code, without the dashes.
++pub const CODE_LEN: usize = 16;
++/// Crockford base32: no I, L, O, U.
++const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
++/// UTF-16-free: characters of a device name kept.
++pub const NAME_LIMIT: usize = 32;
++/// A stale temp file of a code another process was writing.
++const STALE_TEMP: Duration = Duration::from_secs(60);
++
++/// Who a secret belongs to.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Who {
++    /// The shared secret of `CCTG_HUB_SECRET`.
++    Shared,
++    /// An enrolled device, by its id.
++    Device(String),
++}
++
++/// One enrolled device.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct Device {
++    /// 8 hex digits; public, in the device's secret too.
++    pub id: String,
++    pub name: String,
++    /// Unix seconds.
++    pub joined: u64,
++    /// sha256 of the whole secret, hex.
++    hash: String,
++}
++
++#[derive(Serialize, Deserialize)]
++struct Stored {
++    version: u32,
++    #[serde(default)]
++    devices: Vec<Device>,
++}
++
++/// A device as `/devices` shows it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Listed {
++    pub id: String,
++    pub name: String,
++    pub joined: SystemTime,
++    /// The last time its secret was taken since the hub started.
++    pub seen: Option<SystemTime>,
++}
++
++/// What `/devices` shows about the shared secret.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SharedState {
++    Off,
++    /// On; the last time it was taken since the hub started.
++    On(Option<SystemTime>),
++}
++
++/// A new device's secret. `Debug` never shows it.
++pub struct Enrolled {
++    pub id: String,
++    pub name: String,
++    pub secret: Secret,
++}
++
++impl std::fmt::Debug for Enrolled {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Enrolled")
++            .field("id", &self.id)
++            .field("name", &self.name)
++            .finish_non_exhaustive()
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
++pub enum JoinError {
++    /// Unknown, used or expired: one answer for all three.
++    #[error("the join code is not valid")]
++    Refused,
++    #[error("the hub has {MAX_DEVICES} devices already")]
++    Full,
++    #[error("cannot save {DEVICES_FILE} ({0:?})")]
++    Io(io::ErrorKind),
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
++pub enum MintError {
++    #[error("{MAX_CODES} join codes are waiting to be used already; wait until they expire")]
++    Full,
++    #[error("cannot write the join code into the hub state directory ({0:?})")]
++    Io(io::ErrorKind),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
++pub enum LoadError {
++    #[error("cannot read {DEVICES_FILE} ({0:?})")]
++    Read(io::ErrorKind),
++    /// No serde text: it would quote the file.
++    #[error("{DEVICES_FILE} is not a valid device list; fix or move it away")]
++    Invalid,
++    #[error("{DEVICES_FILE} has version {0}, this hub reads version {VERSION}")]
++    Version(u32),
++}
++
++/// A revoke that took effect; `saved`: also in `devices.json`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Revoked {
++    pub name: String,
++    pub saved: bool,
++}
++
++struct Inner {
++    devices: Vec<Device>,
++    seen: HashMap<String, SystemTime>,
++    shared_seen: Option<SystemTime>,
++}
++
++struct Shared {
++    /// `None`: in memory only (tests, a plain shared-secret setup).
++    state_dir: Option<PathBuf>,
++    shared: Option<Secret>,
++    inner: Mutex<Inner>,
++    changes: watch::Sender<u64>,
++}
++
++/// The secrets the hub takes. Cheap to clone.
++#[derive(Clone)]
++pub struct Devices(Arc<Shared>);
++
++impl std::fmt::Debug for Devices {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("Devices(<secrets redacted>)")
++    }
++}
++
++/// The shared secret alone: no device list, no join codes.
++impl From<Secret> for Devices {
++    fn from(secret: Secret) -> Self {
++        Self::in_memory(Some(secret))
++    }
++}
++
++impl Devices {
++    fn in_memory(shared: Option<Secret>) -> Self {
++        Self::with(None, shared, Vec::new())
++    }
++
++    fn with(state_dir: Option<PathBuf>, shared: Option<Secret>, devices: Vec<Device>) -> Self {
++        let (changes, _) = watch::channel(0);
++        Self(Arc::new(Shared {
++            state_dir,
++            shared,
++            inner: Mutex::new(Inner {
++                devices,
++                seen: HashMap::new(),
++                shared_seen: None,
++            }),
++            changes,
++        }))
++    }
++
++    /// The devices of `state_dir`; `shared`: the shared secret, while it is
++    /// on. A missing file is no devices; one that does not parse stops the
++    /// hub (starting without it would lock every enrolled device out).
++    pub fn open(state_dir: &Path, shared: Option<Secret>) -> Result<Self, LoadError> {
++        let devices = match std::fs::read(state_dir.join(DEVICES_FILE)) {
++            Ok(bytes) => {
++                let stored: Stored =
++                    serde_json::from_slice(&bytes).map_err(|_| LoadError::Invalid)?;
++                if stored.version != VERSION {
++                    return Err(LoadError::Version(stored.version));
++                }
++                let mut ids = std::collections::HashSet::new();
++                let valid = stored.devices.iter().all(|device| {
++                    is_id(&device.id) && is_hex(&device.hash, 64) && ids.insert(&device.id)
++                });
++                if !valid {
++                    return Err(LoadError::Invalid);
++                }
++                stored.devices
++            }
++            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
++            Err(error) => return Err(LoadError::Read(error.kind())),
++        };
++        Ok(Self::with(Some(state_dir.to_owned()), shared, devices))
++    }
++
++    fn lock(&self) -> MutexGuard<'_, Inner> {
++        self.0
++            .inner
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++    }
++
++    /// Whose secret `offered` is; `None`: nobody's. Constant time over the
++    /// secret bytes; the device id in it is public.
++    pub fn check(&self, offered: &[u8]) -> Option<Who> {
++        let now = SystemTime::now();
++        if let Some(shared) = &self.0.shared
++            && shared.matches(offered)
++        {
++            self.lock().shared_seen = Some(now);
++            return Some(Who::Shared);
++        }
++        let id = device_id(offered)?;
++        let hash = sha256_hex(offered);
++        let mut inner = self.lock();
++        let known = inner
++            .devices
++            .iter()
++            .find(|device| device.id == id)
++            .is_some_and(|device| bool::from(device.hash.as_bytes().ct_eq(hash.as_bytes())));
++        if !known {
++            return None;
++        }
++        inner.seen.insert(id.to_owned(), now);
++        Some(Who::Device(id.to_owned()))
++    }
++
++    /// Whether `who` still gets in.
++    pub fn is_active(&self, who: &Who) -> bool {
++        match who {
++            Who::Shared => self.0.shared.is_some(),
++            Who::Device(id) => self.lock().devices.iter().any(|device| &device.id == id),
++        }
++    }
++
++    /// Changes on every revoke; a link rechecks [`Devices::is_active`] then.
++    /// Subscribe before [`Devices::check`]: a revoke in between is seen.
++    pub fn subscribe(&self) -> watch::Receiver<u64> {
++        self.0.changes.subscribe()
++    }
++
++    /// Takes `code` and enrolls a device named after `name` (cleaned). A
++    /// code is spent by the attempt that takes it, also when the save then
++    /// fails. Blocking file I/O.
++    pub fn join(&self, code: &str, name: &str) -> Result<Enrolled, JoinError> {
++        let dir = self.0.state_dir.as_deref().ok_or(JoinError::Refused)?;
++        let code = normalize_code(code).ok_or(JoinError::Refused)?;
++        if !take_code(&dir.join(CODES_DIR), &code, SystemTime::now()) {
++            return Err(JoinError::Refused);
++        }
++        self.enroll(name)
++    }
++
++    fn enroll(&self, name: &str) -> Result<Enrolled, JoinError> {
++        let mut inner = self.lock();
++        if inner.devices.len() >= MAX_DEVICES {
++            return Err(JoinError::Full);
++        }
++        let id = loop {
++            let id = hex(&random::<4>());
++            if !inner.devices.iter().any(|device| device.id == id) {
++                break id;
++            }
++        };
++        let token = format!("{SECRET_PREFIX}{id}_{}", hex(&random::<32>()));
++        let device = Device {
++            id: id.clone(),
++            name: clean_name(name),
++            joined: unix(SystemTime::now()),
++            hash: sha256_hex(token.as_bytes()),
++        };
++        let name = device.name.clone();
++        inner.devices.push(device);
++        if let Err(error) = self.save(&inner.devices) {
++            inner.devices.pop();
++            return Err(JoinError::Io(error.kind()));
++        }
++        let secret =
++            Secret::parse(&token).expect("a device secret is visible ASCII, 79 characters");
++        Ok(Enrolled { id, name, secret })
++    }
++
++    /// Removes device `id` at once; `None`: no such device. Blocking file
++    /// I/O.
++    pub fn revoke(&self, id: &str) -> Option<Revoked> {
++        let mut inner = self.lock();
++        let at = inner.devices.iter().position(|device| device.id == id)?;
++        let device = inner.devices.remove(at);
++        inner.seen.remove(id);
++        let saved = match self.save(&inner.devices) {
++            Ok(()) => true,
++            Err(error) => {
++                warn!(device = id, kind = ?error.kind(), "revoked device not saved; it comes back at the next start");
++                false
++            }
++        };
++        drop(inner);
++        self.0.changes.send_modify(|count| *count += 1);
++        Some(Revoked {
++            name: device.name,
++            saved,
++        })
++    }
++
++    /// The devices, oldest first, and the shared secret's state.
++    pub fn list(&self) -> (Vec<Listed>, SharedState) {
++        let inner = self.lock();
++        let devices = inner
++            .devices
++            .iter()
++            .map(|device| Listed {
++                id: device.id.clone(),
++                name: device.name.clone(),
++                joined: UNIX_EPOCH + Duration::from_secs(device.joined),
++                seen: inner.seen.get(&device.id).copied(),
++            })
++            .collect();
++        let shared = match self.0.shared {
++            Some(_) => SharedState::On(inner.shared_seen),
++            None => SharedState::Off,
++        };
++        (devices, shared)
++    }
++
++    /// The name of device `id`.
++    pub fn name(&self, id: &str) -> Option<String> {
++        self.lock()
++            .devices
++            .iter()
++            .find(|device| device.id == id)
++            .map(|device| device.name.clone())
++    }
++
++    /// Temp file, fsync, rename; only the owner may read it.
++    fn save(&self, devices: &[Device]) -> io::Result<()> {
++        let Some(dir) = &self.0.state_dir else {
++            return Ok(());
++        };
++        let bytes = serde_json::to_vec_pretty(&Stored {
++            version: VERSION,
++            devices: devices.to_vec(),
++        })
++        .expect("the device list always serializes");
++        let temp = dir.join(DEVICES_TEMP);
++        let mut file = private_file(&temp)?;
++        file.write_all(&bytes)?;
++        file.sync_all()?;
++        drop(file);
++        std::fs::rename(&temp, dir.join(DEVICES_FILE))
++    }
++}
++
++fn private_file(path: &Path) -> io::Result<std::fs::File> {
++    let mut options = std::fs::OpenOptions::new();
++    options.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    options.open(path)
++}
++
++/// The id of a device secret, when `offered` has that form.
++fn device_id(offered: &[u8]) -> Option<&str> {
++    let rest = std::str::from_utf8(offered)
++        .ok()?
++        .strip_prefix(SECRET_PREFIX)?;
++    let (id, secret) = rest.split_once('_')?;
++    (is_id(id) && is_hex(secret, 64)).then_some(id)
++}
++
++/// Whether `secret` has the form of a device secret (`cctg doctor`, `cctg
++/// join`); its id then.
++pub fn secret_device_id(secret: &Secret) -> Option<&str> {
++    device_id(secret.expose().as_bytes())
++}
++
++fn is_id(id: &str) -> bool {
++    is_hex(id, ID_LEN)
++}
++
++fn is_hex(text: &str, len: usize) -> bool {
++    text.len() == len
++        && text
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++
++fn sha256_hex(bytes: &[u8]) -> String {
++    hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes).as_ref())
++}
++
++/// `N` bytes from the system's secure generator.
++fn random<const N: usize>() -> [u8; N] {
++    let mut bytes = [0u8; N];
++    aws_lc_rs::rand::fill(&mut bytes).expect("the system random generator works");
++    bytes
++}
++
++fn unix(time: SystemTime) -> u64 {
++    time.duration_since(UNIX_EPOCH)
++        .map_or(0, |since| since.as_secs())
++}
++
++/// A device name for `/devices`: whitespace becomes one space, control and
++/// invisible formatting characters go, at most [`NAME_LIMIT`] characters;
++/// `device` when nothing is left.
++pub fn clean_name(raw: &str) -> String {
++    let invisible = |c: char| {
++        matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}'
++            | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}')
++    };
++    let kept: String = raw
++        .chars()
++        .map(|c| if c.is_whitespace() { ' ' } else { c })
++        .filter(|&c| !c.is_control() && !invisible(c))
++        .collect();
++    let name: String = kept
++        .split(' ')
++        .filter(|word| !word.is_empty())
++        .collect::<Vec<_>>()
++        .join(" ")
++        .chars()
++        .take(NAME_LIMIT)
++        .collect();
++    if name.trim().is_empty() {
++        "device".to_owned()
++    } else {
++        name.trim().to_owned()
++    }
++}
++
++// ------------------------------------------------------------ join codes
++
++/// A fresh code as it is shown: `XXXX-XXXX-XXXX-XXXX`.
++fn new_code() -> String {
++    let bytes = random::<10>();
++    let mut bits = 0u128;
++    for byte in bytes {
++        bits = (bits << 8) | u128::from(byte);
++    }
++    let chars: Vec<u8> = (0..CODE_LEN)
++        .map(|index| ALPHABET[((bits >> (75 - 5 * index)) & 31) as usize])
++        .collect();
++    chars
++        .chunks(4)
++        .map(|group| std::str::from_utf8(group).expect("the alphabet is ASCII"))
++        .collect::<Vec<_>>()
++        .join("-")
++}
++
++/// A code as typed: any case, dashes and spaces anywhere, `O` for `0` and
++/// `I`/`L` for `1` (Crockford). `None`: not a code.
++pub fn normalize_code(typed: &str) -> Option<String> {
++    let mut code = String::with_capacity(CODE_LEN);
++    for c in typed.chars() {
++        let c = match c.to_ascii_uppercase() {
++            '-' | ' ' => continue,
++            'O' => '0',
++            'I' | 'L' => '1',
++            c => c,
++        };
++        if !c.is_ascii() || !ALPHABET.contains(&(c as u8)) {
++            return None;
++        }
++        code.push(c);
++    }
++    (code.len() == CODE_LEN).then_some(code)
++}
++
++#[derive(Serialize, Deserialize)]
++struct CodeFile {
++    /// Unix seconds.
++    expires: u64,
++}
++
++fn code_path(dir: &Path, normalized: &str) -> PathBuf {
++    dir.join(format!("{}.json", sha256_hex(normalized.as_bytes())))
++}
++
++/// Mints a join code into `<state_dir>/join/`, good for [`CODE_TTL`] from
++/// `now`. Expired codes are swept first. Blocking file I/O.
++pub fn mint_code(state_dir: &Path, now: SystemTime) -> Result<String, MintError> {
++    let dir = state_dir.join(CODES_DIR);
++    let io = |error: io::Error| MintError::Io(error.kind());
++    std::fs::create_dir_all(&dir).map_err(io)?;
++    if sweep(&dir, now) >= MAX_CODES {
++        return Err(MintError::Full);
++    }
++    let code = new_code();
++    let normalized = normalize_code(&code).expect("a new code is a code");
++    let path = code_path(&dir, &normalized);
++    let temp = path.with_extension("tmp");
++    let body = serde_json::to_vec(&CodeFile {
++        expires: unix(now + CODE_TTL),
++    })
++    .expect("a code file always serializes");
++    let mut file = private_file(&temp).map_err(io)?;
++    file.write_all(&body).map_err(io)?;
++    file.sync_all().map_err(io)?;
++    drop(file);
++    std::fs::rename(&temp, &path).map_err(io)?;
++    Ok(code)
++}
++
++/// Removes expired and unreadable codes and stale temp files; the number
++/// of codes left.
++fn sweep(dir: &Path, now: SystemTime) -> usize {
++    let Ok(entries) = std::fs::read_dir(dir) else {
++        return 0;
++    };
++    let mut left = 0;
++    for entry in entries.filter_map(Result::ok) {
++        let path = entry.path();
++        match path.extension().and_then(|ext| ext.to_str()) {
++            Some("json") => {
++                if expiry(&path).is_some_and(|expires| unix(now) < expires) {
++                    left += 1;
++                } else {
++                    let _ = std::fs::remove_file(&path);
++                }
++            }
++            Some("tmp") => {
++                let stale = entry
++                    .metadata()
++                    .and_then(|meta| meta.modified())
++                    .ok()
++                    .and_then(|at| now.duration_since(at).ok())
++                    .is_some_and(|age| age > STALE_TEMP);
++                if stale {
++                    let _ = std::fs::remove_file(&path);
++                }
++            }
++            _ => {}
++        }
++    }
++    left
++}
++
++fn expiry(path: &Path) -> Option<u64> {
++    let bytes = std::fs::read(path).ok()?;
++    serde_json::from_slice::<CodeFile>(&bytes)
++        .ok()
++        .map(|file| file.expires)
++}
++
++/// Spends `normalized`: true when it was minted, unused and unexpired.
++/// Only one of two racing takes removes the file; an expired code is
++/// removed too.
++fn take_code(dir: &Path, normalized: &str, now: SystemTime) -> bool {
++    let path = code_path(dir, normalized);
++    let Some(expires) = expiry(&path) else {
++        return false;
++    };
++    let removed = std::fs::remove_file(&path).is_ok();
++    sweep(dir, now);
++    removed && unix(now) < expires
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::hub::testdir::TempDir;
++
++    const SHARED: &str = "shared-secret-0123456789";
++
++    fn shared() -> Secret {
++        Secret::parse(SHARED).unwrap()
++    }
++
++    #[test]
++    fn codes_are_crockford_groups_and_normalize() {
++        let code = new_code();
++        assert_eq!(code.len(), CODE_LEN + 3, "{code}");
++        assert_eq!(code.matches('-').count(), 3);
++        let normalized = normalize_code(&code).unwrap();
++        assert_eq!(normalized, code.replace('-', ""));
++        assert_ne!(new_code(), code, "fresh randomness");
++        assert_eq!(
++            normalize_code("abcd-efgh-jkmn-pqrs").as_deref(),
++            Some("ABCDEFGHJKMNPQRS")
++        );
++        assert_eq!(
++            normalize_code(" o0il 1234 5678 9abc ").as_deref(),
++            Some("0011123456789ABC")
++        );
++        for bad in [
++            "",
++            "ABCD-EFGH-JKMN-PQR",
++            "ABCD-EFGH-JKMN-PQRST",
++            "ABCD-EFGH-JKMN-PQRU",
++            "ABCD-EFGH-JKMN-PQRЖ",
++        ] {
++            assert_eq!(normalize_code(bad), None, "{bad}");
++        }
++    }
++
++    #[test]
++    fn a_code_is_good_once_and_only_until_it_expires() {
++        let dir = TempDir::new("devices-codes");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
++        // The state directory holds no usable code.
++        for entry in std::fs::read_dir(dir.path().join(CODES_DIR)).unwrap() {
++            let entry = entry.unwrap();
++            let name = entry.file_name().to_string_lossy().into_owned();
++            let text = std::fs::read_to_string(entry.path()).unwrap();
++            let bare = code.replace('-', "");
++            assert!(
++                !name.contains(&bare) && !text.contains(&bare),
++                "{name} {text}"
++            );
++        }
++        let joined = devices.join(&code.to_lowercase(), "laptop").unwrap();
++        assert_eq!(joined.name, "laptop");
++        assert_eq!(
++            devices.join(&code, "again").unwrap_err(),
++            JoinError::Refused
++        );
++
++        let past = SystemTime::now() - CODE_TTL - Duration::from_secs(1);
++        let old = mint_code(dir.path(), past).unwrap();
++        assert_eq!(devices.join(&old, "late").unwrap_err(), JoinError::Refused);
++        assert_eq!(
++            devices.join("0000-0000-0000-0000", "x").unwrap_err(),
++            JoinError::Refused
++        );
++        assert_eq!(
++            devices.join("not a code", "x").unwrap_err(),
++            JoinError::Refused
++        );
++        assert_eq!(devices.list().0.len(), 1);
++        assert_eq!(
++            std::fs::read_dir(dir.path().join(CODES_DIR))
++                .unwrap()
++                .count(),
++            0,
++            "used and expired codes are gone"
++        );
++    }
++
++    #[test]
++    fn minting_stops_at_the_cap_and_expired_codes_free_places() {
++        let dir = TempDir::new("devices-mint-cap");
++        let past = SystemTime::now() - CODE_TTL - Duration::from_secs(1);
++        for _ in 0..MAX_CODES {
++            mint_code(dir.path(), past).unwrap();
++        }
++        for _ in 0..MAX_CODES {
++            mint_code(dir.path(), SystemTime::now()).unwrap();
++        }
++        assert_eq!(
++            mint_code(dir.path(), SystemTime::now()).unwrap_err(),
++            MintError::Full
++        );
++    }
++
++    #[test]
++    fn a_code_of_an_in_memory_book_is_always_refused() {
++        let devices = Devices::from(shared());
++        assert_eq!(
++            devices.join("0000-0000-0000-0000", "x").unwrap_err(),
++            JoinError::Refused
++        );
++    }
++
++    #[test]
++    fn a_device_secret_gets_in_and_only_its_hash_is_kept() {
++        let dir = TempDir::new("devices-enroll");
++        let devices = Devices::open(dir.path(), Some(shared())).unwrap();
++        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
++        let joined = devices.join(&code, " my\tlaptop\u{202E} ").unwrap();
++        let secret = joined.secret.expose().to_owned();
++        assert!(
++            secret.starts_with("cctgd_") && secret.len() == 79,
++            "{secret}"
++        );
++        assert_eq!(secret_device_id(&joined.secret), Some(joined.id.as_str()));
++        assert_eq!(joined.name, "my laptop");
++        assert!(!format!("{joined:?}").contains(&secret));
++        assert_eq!(
++            devices.check(secret.as_bytes()),
++            Some(Who::Device(joined.id.clone()))
++        );
++        assert_eq!(devices.check(SHARED.as_bytes()), Some(Who::Shared));
++        // A wrong secret of the right shape and id.
++        let last = if secret.ends_with('0') { '1' } else { '0' };
++        let wrong = format!("{}{last}", &secret[..secret.len() - 1]);
++        assert_eq!(devices.check(wrong.as_bytes()), None);
++        assert_eq!(devices.check(b"cctgd_nothexxx_00"), None);
++
++        let file = std::fs::read_to_string(dir.path().join(DEVICES_FILE)).unwrap();
++        assert!(
++            !file.contains(&secret) && !file.contains(&secret[15..]),
++            "{file}"
++        );
++        assert!(file.contains(&sha256_hex(secret.as_bytes())), "{file}");
++
++        // A restarted hub knows the device; the shared secret can be off.
++        let reopened = Devices::open(dir.path(), None).unwrap();
++        assert_eq!(
++            reopened.check(secret.as_bytes()),
++            Some(Who::Device(joined.id.clone()))
++        );
++        assert_eq!(reopened.check(SHARED.as_bytes()), None);
++        assert!(!reopened.is_active(&Who::Shared));
++        let (listed, state) = reopened.list();
++        assert_eq!(state, SharedState::Off);
++        assert_eq!(listed[0].name, "my laptop");
++        assert!(listed[0].seen.is_some());
++    }
++
++    #[tokio::test]
++    async fn a_revoke_shuts_the_device_out_at_once_and_is_announced() {
++        let dir = TempDir::new("devices-revoke");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
++        let joined = devices.join(&code, "old box").unwrap();
++        let who = devices.check(joined.secret.expose().as_bytes()).unwrap();
++        let mut changes = devices.subscribe();
++        assert!(devices.is_active(&who));
++        assert_eq!(
++            devices.revoke(&joined.id),
++            Some(Revoked {
++                name: "old box".into(),
++                saved: true
++            })
++        );
++        assert!(changes.has_changed().unwrap());
++        changes.mark_unchanged();
++        assert!(!devices.is_active(&who));
++        assert_eq!(devices.check(joined.secret.expose().as_bytes()), None);
++        assert_eq!(devices.revoke(&joined.id), None);
++        assert!(!changes.has_changed().unwrap());
++        let reopened = Devices::open(dir.path(), None).unwrap();
++        assert!(reopened.list().0.is_empty());
++    }
++
++    #[test]
++    fn a_full_book_refuses_and_a_bad_file_stops_the_start() {
++        let dir = TempDir::new("devices-full");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        for index in 0..MAX_DEVICES {
++            devices.enroll(&format!("d{index}")).unwrap();
++        }
++        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
++        assert_eq!(
++            devices.join(&code, "one more").unwrap_err(),
++            JoinError::Full
++        );
++
++        std::fs::write(dir.path().join(DEVICES_FILE), "{ not json").unwrap();
++        assert_eq!(
++            Devices::open(dir.path(), None).err(),
++            Some(LoadError::Invalid)
++        );
++        std::fs::write(
++            dir.path().join(DEVICES_FILE),
++            r#"{"version":9,"devices":[]}"#,
++        )
++        .unwrap();
++        assert_eq!(
++            Devices::open(dir.path(), None).err(),
++            Some(LoadError::Version(9))
++        );
++        let twice = format!(
++            r#"{{"version":1,"devices":[{0},{0}]}}"#,
++            r#"{"id":"0123abcd","name":"x","joined":1,"hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#
++        );
++        std::fs::write(dir.path().join(DEVICES_FILE), twice).unwrap();
++        assert_eq!(
++            Devices::open(dir.path(), None).err(),
++            Some(LoadError::Invalid)
++        );
++    }
++
++    #[test]
++    fn names_are_cleaned() {
++        assert_eq!(clean_name("  "), "device");
++        assert_eq!(clean_name("a\u{0}b\nc"), "ab c");
++        assert_eq!(clean_name(&"x".repeat(40)).chars().count(), NAME_LIMIT);
++        assert_eq!(clean_name("Мой ноут"), "Мой ноут");
++    }
++}
+diff --git a/crates/cctg/src/hub/ingress.rs b/crates/cctg/src/hub/ingress.rs
+--- a/crates/cctg/src/hub/ingress.rs
++++ b/crates/cctg/src/hub/ingress.rs
+@@ -1,7 +1,12 @@
+ //! Hub ingress: the agent TCP link and the hook HTTP endpoint.
+ //!
+-//! Both check the shared secret before anything else and hand what they
+-//! accept to the hub over bounded channels ([`AgentEvent`], [`HookPost`]).
++//! Both check the secret before anything else ([`Devices`]: the shared
++//! secret while it is on, and the secrets of enrolled devices, TASK-045)
++//! and hand what they accept to the hub over bounded channels
++//! ([`AgentEvent`], [`HookPost`]). A revoked device loses its agent links
++//! and its waiting hooks at once, its other hooks from the next request on.
++//! `POST /v1/join` is the one request without a secret: its join code is
++//! the credential.
+ //! Either can take its connections over TLS ([`Listener::tls`], TASK-035):
+ //! the handshake runs in the connection's own task, within its time limit,
+ //! so a slow client never holds up accepting others. A connection that
+@@ -23,15 +28,17 @@
+ 
+ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf};
+ use tokio::net::{TcpListener, TcpStream};
+-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
++use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+ use tokio::task::JoinSet;
+ use tracing::{debug, info, warn};
+ 
++use super::devices::{Devices, JoinError, Who};
+ use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
+ use crate::wire::{
+-    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, Liveness,
+-    MAX_HOOK_BODY, PERMISSION_PATH, PING_PATH, PermissionAnswer, PermissionPost, QUESTION_PATH,
+-    QuestionAnswer, QuestionPost, Register, Rejection, Secret, WireError,
++    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, JOIN_PATH,
++    JoinAnswer, Liveness, MAX_HOOK_BODY, MAX_JOIN_BODY, PERMISSION_PATH, PING_PATH,
++    PermissionAnswer, PermissionPost, QUESTION_PATH, QuestionAnswer, QuestionPost, Register,
++    Rejection, WireError,
+ };
+ 
+ /// Time an agent has from its TCP connect to finish the TLS handshake (when
+@@ -50,7 +57,8 @@
+ /// Longest `hello` line: read before the secret is checked. A secret longer
+ /// than about 4000 characters cannot authenticate.
+ const MAX_HELLO_LINE: usize = 4 * 1024;
+-/// A wrong secret is answered only after this pause (both listeners).
++/// A wrong secret or join code is answered only after this pause (both
++/// listeners).
+ const AUTH_FAIL_DELAY: Duration = Duration::from_millis(250);
+ const MAX_HOOK_REQUESTS: usize = 64;
+ /// Hook requests of one peer address still before their secret (the
+@@ -270,16 +278,16 @@
+ /// agent connection, which is what a hub restart looks like to an agent.
+ pub async fn serve_agents(
+     listener: impl Into<Listener>,
+-    secret: Secret,
++    auth: impl Into<Devices>,
+     events: mpsc::Sender<AgentEvent>,
+ ) {
+-    serve_agents_with(listener, secret, events, Heartbeat::default()).await;
++    serve_agents_with(listener, auth, events, Heartbeat::default()).await;
+ }
+ 
+ /// [`serve_agents`] with another [`Heartbeat`] (tests use short ones).
+ pub async fn serve_agents_with(
+     listener: impl Into<Listener>,
+-    secret: Secret,
++    auth: impl Into<Devices>,
+     events: mpsc::Sender<AgentEvent>,
+     heartbeat: Heartbeat,
+ ) {
+@@ -287,7 +295,7 @@
+         tcp: listener,
+         incoming,
+     } = listener.into();
+-    let secret = Arc::new(secret);
++    let devices = auth.into();
+     let slots = Arc::new(Semaphore::new(MAX_AGENTS));
+     let pending = Arc::new(Semaphore::new(MAX_PENDING_AGENTS));
+     let per_peer = PerPeer::new(MAX_PENDING_AGENTS_PER_PEER);
+@@ -320,8 +328,8 @@
+                     continue;
+                 };
+                 let conn = next_conn.fetch_add(1, Ordering::Relaxed);
+-                let (secret, events, incoming, gate) =
+-                    (secret.clone(), events.clone(), incoming.clone(), gate.clone());
++                let (devices, events, incoming, gate) =
++                    (devices.clone(), events.clone(), incoming.clone(), gate.clone());
+                 let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+                 sessions.spawn(async move {
+                     if let Some(stream) = open(&incoming, stream, peer, deadline).await {
+@@ -331,7 +339,7 @@
+                             peer_place,
+                             gate,
+                         };
+-                        agent_session(stream, peer, conn, &secret, &events, handshake, heartbeat)
++                        agent_session(stream, peer, conn, &devices, &events, handshake, heartbeat)
+                             .await;
+                     }
+                     drop(permit);
+@@ -386,7 +394,7 @@
+     stream: Stream,
+     peer: SocketAddr,
+     conn: u64,
+-    secret: &Secret,
++    devices: &Devices,
+     events: &mpsc::Sender<AgentEvent>,
+     pre_auth: Handshake,
+     heartbeat: Heartbeat,
+@@ -394,6 +402,8 @@
+     let (read, mut write) = tokio::io::split(stream);
+     let mut reader = BufReader::new(read);
+     let mut line = Vec::new();
++    // Before the check: a revoke right after it is still seen.
++    let mut changes = devices.subscribe();
+ 
+     let handshake = tokio::time::timeout_at(pre_auth.deadline, async {
+         // Read before the secret is checked: a short line only.
+@@ -403,20 +413,20 @@
+             Err(WireError::Closed) if line.is_empty() => return Ok(None),
+             Err(_) => return Err(Rejection::Protocol),
+         }
+-        let authed = match wire::decode::<AgentMsg>(&line) {
+-            Ok(AgentMsg::Hello { secret: offered }) => secret.matches(offered.expose().as_bytes()),
++        let who = match wire::decode::<AgentMsg>(&line) {
++            Ok(AgentMsg::Hello { secret: offered }) => devices.check(offered.expose().as_bytes()),
+             Err(WireError::Version) => return Err(Rejection::Version),
+-            _ => false,
++            _ => None,
+         };
+-        if !authed {
++        let Some(who) = who else {
+             return Err(Rejection::Auth);
+-        }
++        };
+         line.clear();
+         wire::read_line(&mut reader, &mut line)
+             .await
+             .map_err(|_| Rejection::Protocol)?;
+         let result = match wire::decode::<AgentMsg>(&line) {
+-            Ok(AgentMsg::Register(register)) => Ok(Some(register)),
++            Ok(AgentMsg::Register(register)) => Ok(Some((who, register))),
+             Err(WireError::Version) => Err(Rejection::Version),
+             _ => Err(Rejection::Protocol),
+         };
+@@ -424,8 +434,8 @@
+         result
+     })
+     .await;
+-    let register = match handshake {
+-        Ok(Ok(Some(register))) => register,
++    let (who, register) = match handshake {
++        Ok(Ok(Some(registered))) => registered,
+         Ok(Ok(None)) => {
+             debug!(conn, %peer, "connection closed before its first byte");
+             return;
+@@ -533,6 +543,10 @@
+                     break;
+                 }
+             },
++            () = revoked(&mut changes, devices, &who) => {
++                info!(conn, session, "agent of a revoked device; link closed");
++                break;
++            }
+         }
+     }
+     reader_task.stop().await;
+@@ -560,6 +574,19 @@
+     }
+ }
+ 
++/// Completes when `who` no longer gets in (its device was revoked); never
++/// for the shared secret.
++async fn revoked(changes: &mut watch::Receiver<u64>, devices: &Devices, who: &Who) {
++    loop {
++        if changes.changed().await.is_err() {
++            return std::future::pending().await;
++        }
++        if !devices.is_active(who) {
++            return;
++        }
++    }
++}
++
+ /// First 8 characters: enough to recognise a session in logs.
+ fn short(session_id: &str) -> &str {
+     session_id
+@@ -626,6 +653,7 @@
+     NoContent,
+     BadRequest,
+     Unauthorized,
++    Forbidden,
+     NotFound,
+     MethodNotAllowed,
+     LengthRequired,
+@@ -641,6 +669,7 @@
+             Self::NoContent => 204,
+             Self::BadRequest => 400,
+             Self::Unauthorized => 401,
++            Self::Forbidden => 403,
+             Self::NotFound => 404,
+             Self::MethodNotAllowed => 405,
+             Self::LengthRequired => 411,
+@@ -656,6 +685,7 @@
+             Self::NoContent => "No Content",
+             Self::BadRequest => "Bad Request",
+             Self::Unauthorized => "Unauthorized",
++            Self::Forbidden => "Forbidden",
+             Self::NotFound => "Not Found",
+             Self::MethodNotAllowed => "Method Not Allowed",
+             Self::LengthRequired => "Length Required",
+@@ -697,10 +727,10 @@
+ /// [`serve_hooks_and_permissions`].
+ pub async fn serve_hooks(
+     listener: impl Into<Listener>,
+-    secret: Secret,
++    auth: impl Into<Devices>,
+     events: mpsc::Sender<HookPost>,
+ ) {
+-    serve(listener.into(), secret, events, None).await;
++    serve(listener.into(), auth.into(), events, None).await;
+ }
+ 
+ /// [`serve_hooks`] plus `POST /v1/permission`: each such request goes to
+@@ -709,7 +739,7 @@
+ /// request never holds up other hook requests.
+ pub async fn serve_hooks_and_permissions(
+     listener: impl Into<Listener>,
+-    secret: Secret,
++    auth: impl Into<Devices>,
+     events: mpsc::Sender<HookPost>,
+     asks: mpsc::Sender<PermissionAsk>,
+ ) {
+@@ -718,7 +748,7 @@
+         questions: None,
+         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
+     };
+-    serve(listener.into(), secret, events, Some(waits)).await;
++    serve(listener.into(), auth.into(), events, Some(waits)).await;
+ }
+ 
+ /// [`serve_hooks_and_permissions`] plus `POST /v1/question`: each such
+@@ -727,7 +757,7 @@
+ /// [`MAX_PERMISSION_WAITS`] places.
+ pub async fn serve_hooks_and_asks(
+     listener: impl Into<Listener>,
+-    secret: Secret,
++    auth: impl Into<Devices>,
+     events: mpsc::Sender<HookPost>,
+     asks: mpsc::Sender<PermissionAsk>,
+     questions: mpsc::Sender<QuestionAsk>,
+@@ -737,12 +767,12 @@
+         questions: Some(questions),
+         waiting: Arc::new(Semaphore::new(MAX_PERMISSION_WAITS)),
+     };
+-    serve(listener.into(), secret, events, Some(waits)).await;
++    serve(listener.into(), auth.into(), events, Some(waits)).await;
+ }
+ 
+ async fn serve(
+     listener: Listener,
+-    secret: Secret,
++    devices: Devices,
+     events: mpsc::Sender<HookPost>,
+     waits: Option<PermissionWaits>,
+ ) {
+@@ -750,7 +780,6 @@
+         tcp: listener,
+         incoming,
+     } = listener;
+-    let secret = Arc::new(secret);
+     let dedup = Arc::new(Mutex::new(Dedup::new(DEDUP_MAX, DEDUP_TTL)));
+     let waits = waits.map(Arc::new);
+     let slots = Arc::new(Semaphore::new(MAX_HOOK_REQUESTS));
+@@ -776,8 +805,8 @@
+                     pre_auth!(gate, peer, %peer, "too many hook requests; refused");
+                     continue;
+                 };
+-                let (secret, dedup, events, waits, incoming) = (
+-                    secret.clone(),
++                let (devices, dedup, events, waits, incoming) = (
++                    devices.clone(),
+                     dedup.clone(),
+                     events.clone(),
+                     waits.clone(),
+@@ -794,7 +823,7 @@
+                     };
+                     let waits = waits.as_deref();
+                     hook_request(
+-                        stream, peer, &secret, &dedup, &events, waits, permit, pre_auth, deadline,
++                        stream, peer, &devices, &dedup, &events, waits, permit, pre_auth, deadline,
+                     )
+                     .await;
+                 });
+@@ -816,7 +845,7 @@
+ async fn hook_request(
+     mut stream: Stream,
+     peer: SocketAddr,
+-    secret: &Secret,
++    devices: &Devices,
+     dedup: &Mutex<Dedup>,
+     events: &mpsc::Sender<HookPost>,
+     waits: Option<&PermissionWaits>,
+@@ -824,33 +853,41 @@
+     pre_auth: PreAuth,
+     deadline: tokio::time::Instant,
+ ) {
+-    let read = tokio::time::timeout_at(deadline, read_request(&mut stream, secret)).await;
++    // Before the check: a revoke while a hook waits is seen.
++    let mut changes = devices.subscribe();
++    let read = tokio::time::timeout_at(deadline, read_request(&mut stream, devices)).await;
+     drop(pre_auth.peer_place);
+     let gate = pre_auth.gate;
+     let status = match read {
+-        Ok(Ok((Route::Hook, body))) => accept_hook(&body, dedup, events),
++        Ok(Ok((Route::Hook, body, _))) => accept_hook(&body, dedup, events),
+         // `cctg doctor`: the secret matched; nothing else happens.
+-        Ok(Ok((Route::Ping, _))) => {
++        Ok(Ok((Route::Ping, _, _))) => {
+             debug!(%peer, "ping answered");
+             Status::NoContent
++        }
++        Ok(Ok((Route::Join, body, _))) => {
++            drop(permit);
++            return join_request(stream, peer, &body, devices, &gate).await;
+         }
+         Ok(Err(None)) => {
+             debug!(%peer, "connection closed before its first byte");
+             return;
+         }
+-        Ok(Ok((Route::Permission, body))) => match waits {
+-            Some(waits) => {
++        Ok(Ok((Route::Permission, body, who))) => match (waits, who) {
++            (Some(waits), Some(who)) => {
+                 // A waiting hook takes one of its own places, not a
+                 // hook request place.
+                 drop(permit);
+-                return permission_request(stream, peer, &body, waits).await;
++                let revoked = revoked(&mut changes, devices, &who);
++                return permission_request(stream, peer, &body, waits, revoked).await;
+             }
+-            None => Status::NotFound,
++            _ => Status::NotFound,
+         },
+-        Ok(Ok((Route::Question, body))) => match waits {
+-            Some(waits) if waits.questions.is_some() => {
++        Ok(Ok((Route::Question, body, who))) => match (waits, who) {
++            (Some(waits), Some(who)) if waits.questions.is_some() => {
+                 drop(permit);
+-                return question_request(stream, peer, &body, waits).await;
++                let revoked = revoked(&mut changes, devices, &who);
++                return question_request(stream, peer, &body, waits, revoked).await;
+             }
+             _ => Status::NotFound,
+         },
+@@ -903,6 +940,7 @@
+     peer: SocketAddr,
+     body: &[u8],
+     waits: &PermissionWaits,
++    revoked: impl Future<Output = ()>,
+ ) {
+     let post = match wire::decode_permission(body) {
+         Ok(post) => post,
+@@ -928,7 +966,7 @@
+         );
+         return respond(&mut stream, Status::NoContent, &[]).await;
+     }
+-    let Some(behavior) = wait_for(&mut stream, decided, PERMISSION_WAIT_CAP).await else {
++    let Some(behavior) = wait_for(&mut stream, decided, PERMISSION_WAIT_CAP, revoked).await else {
+         debug!(session, "permission hook went away before an answer");
+         return;
+     };
+@@ -953,6 +991,7 @@
+     peer: SocketAddr,
+     body: &[u8],
+     waits: &PermissionWaits,
++    revoked: impl Future<Output = ()>,
+ ) {
+     let Some(questions) = waits.questions.as_ref() else {
+         return respond(&mut stream, Status::NotFound, &[]).await;
+@@ -981,7 +1020,7 @@
+         );
+         return respond(&mut stream, Status::NoContent, &[]).await;
+     }
+-    let Some(answers) = wait_for(&mut stream, decided, QUESTION_WAIT_CAP).await else {
++    let Some(answers) = wait_for(&mut stream, decided, QUESTION_WAIT_CAP, revoked).await else {
+         debug!(session, "question hook went away before an answer");
+         return;
+     };
+@@ -1000,15 +1039,21 @@
+ }
+ 
+ /// The hub's answer on `decided`, at most `cap` later. `None`: the hook went
+-/// away first; `Some(None)`: no decision (none, dropped, or time ran out).
++/// away first, or its device was revoked (it then gets no answer at all);
++/// `Some(None)`: no decision (none, dropped, or time ran out).
+ async fn wait_for<T>(
+     stream: &mut Stream,
+     decided: oneshot::Receiver<Option<T>>,
+     cap: Duration,
++    revoked: impl Future<Output = ()>,
+ ) -> Option<Option<T>> {
+     tokio::select! {
+         decided = decided => Some(decided.ok().flatten()),
+         () = gone(stream) => None,
++        () = revoked => {
++            info!("hook of a revoked device dropped while it waited");
++            None
++        }
+         () = tokio::time::sleep(cap) => Some(None),
+     }
+ }
+@@ -1021,6 +1066,54 @@
+         match stream.read(&mut byte).await {
+             Ok(0) | Err(_) => return,
+             Ok(_) => {}
++        }
++    }
++}
++
++/// `POST /v1/join` (TASK-045): spends the code and answers the new
++/// device's secret. A refused code gets the same `403` whether it was
++/// unknown, used or expired, after the pause of a wrong secret. Neither the
++/// code nor the secret is logged.
++async fn join_request(
++    mut stream: Stream,
++    peer: SocketAddr,
++    body: &[u8],
++    devices: &Devices,
++    gate: &WarnGate,
++) {
++    let post = match wire::decode_join(body) {
++        Ok(post) => post,
++        Err(error) => {
++            pre_auth!(gate, peer, %peer, %error, "join request rejected");
++            return respond(&mut stream, Status::BadRequest, &[]).await;
++        }
++    };
++    let joining = devices.clone();
++    let joined = tokio::task::spawn_blocking(move || joining.join(&post.code, &post.name)).await;
++    match joined {
++        Ok(Ok(enrolled)) => {
++            info!(%peer, device_id = enrolled.id, "device enrolled with a join code");
++            let answer = JoinAnswer {
++                device_id: enrolled.id,
++                name: enrolled.name,
++                secret: enrolled.secret,
++            };
++            let body = serde_json::to_vec(&answer).expect("a join answer always serializes");
++            respond(&mut stream, Status::Ok, &body).await;
++        }
++        Ok(Err(JoinError::Refused)) => {
++            pre_auth!(gate, peer, %peer, "join code refused");
++            // No fast guessing, as for a wrong secret.
++            tokio::time::sleep(AUTH_FAIL_DELAY).await;
++            respond(&mut stream, Status::Forbidden, &[]).await;
++        }
++        Ok(Err(error)) => {
++            warn!(%peer, %error, "join request not served");
++            respond(&mut stream, Status::Unavailable, &[]).await;
++        }
++        Err(_) => {
++            warn!(%peer, "join request failed");
++            respond(&mut stream, Status::Unavailable, &[]).await;
+         }
+     }
+ }
+@@ -1097,15 +1190,19 @@
+     Permission,
+     Question,
+     Ping,
++    /// The one route without a secret (TASK-045).
++    Join,
+ }
+ 
+ /// Reads a `POST` with `Content-Length` (no chunked bodies, no keep-alive)
+-/// and returns its target and body. The secret is checked before the body
+-/// is read. `Err(None)`: closed before its first byte, nothing to answer.
++/// and returns its target, body and whose secret it carried. The secret is
++/// checked before the body is read; a join request has none (`None`) and a
++/// body of at most [`MAX_JOIN_BODY`]. `Err(None)`: closed before its first
++/// byte, nothing to answer.
+ async fn read_request<S: AsyncRead + Unpin>(
+     stream: &mut S,
+-    secret: &Secret,
+-) -> Result<(Route, Vec<u8>), Option<Status>> {
++    devices: &Devices,
++) -> Result<(Route, Vec<u8>, Option<Who>), Option<Status>> {
+     let mut buf = Vec::with_capacity(1024);
+     let head_end = loop {
+         if let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+@@ -1149,6 +1246,7 @@
+         PERMISSION_PATH => Route::Permission,
+         QUESTION_PATH => Route::Question,
+         PING_PATH => Route::Ping,
++        JOIN_PATH => Route::Join,
+         _ => return Err(Some(Status::NotFound)),
+     };
+ 
+@@ -1180,18 +1278,29 @@
+             if authorized.is_some() {
+                 return Err(Some(Status::BadRequest));
+             }
++            // A join request needs none: its header is not looked at.
+             let token = value
+                 .split_once(' ')
+                 .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                 .map(|(_, token)| token.trim_matches([' ', '\t']));
+-            authorized = Some(token.is_some_and(|token| secret.matches(token.as_bytes())));
+-        }
+-    }
+-    if authorized != Some(true) {
++            authorized = Some(
++                token
++                    .filter(|_| route != Route::Join)
++                    .and_then(|token| devices.check(token.as_bytes())),
++            );
++        }
++    }
++    let who = authorized.flatten();
++    if route != Route::Join && who.is_none() {
+         return Err(Some(Status::Unauthorized));
+     }
+     let length = length.ok_or(Some(Status::LengthRequired))?;
+-    if length > MAX_HOOK_BODY {
++    let max = if route == Route::Join {
++        MAX_JOIN_BODY
++    } else {
++        MAX_HOOK_BODY
++    };
++    if length > max {
+         return Err(Some(Status::PayloadTooLarge));
+     }
+     let mut body = buf.split_off(head_end + 4);
+@@ -1204,7 +1313,7 @@
+         .read_exact(&mut body[received..])
+         .await
+         .map_err(|_| Some(Status::BadRequest))?;
+-    Ok((route, body))
++    Ok((route, body, who))
+ }
+ 
+ fn is_tchar(byte: u8) -> bool {
+@@ -1244,7 +1353,7 @@
+     use tokio::io::AsyncBufReadExt;
+ 
+     use super::*;
+-    use crate::wire::HookEvent;
++    use crate::wire::{HookEvent, Secret};
+ 
+     const SECRET: &str = "0123456789abcdef-secret";
+     const WAIT: Duration = Duration::from_secs(10);
+@@ -2413,7 +2522,7 @@
+             // Parsers of both listeners on arbitrary input: an answer, never
+             // a panic.
+             let mut reader = &input[..];
+-            let _ = read_request(&mut reader, &secret()).await;
++            let _ = read_request(&mut reader, &Devices::from(secret())).await;
+             let _ = wire::decode::<AgentMsg>(&input);
+             let mut line = Vec::new();
+             let mut reader = BufReader::new(&input[..]);
+@@ -2499,4 +2608,253 @@
+         let _ = within(stream.read_to_end(&mut response)).await;
+         response
+     }
+-}
++
++    // ------------------------------------------------ devices (TASK-045)
++
++    use crate::hub::devices::{Devices, mint_code};
++    use crate::hub::testdir::TempDir;
++
++    fn join_request(body: &[u8], auth: Option<&str>) -> Vec<u8> {
++        let mut head = format!(
++            "POST {JOIN_PATH} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n",
++            body.len()
++        );
++        if let Some(auth) = auth {
++            head.push_str(&format!("Authorization: {auth}\r\n"));
++        }
++        head.push_str("\r\n");
++        [head.as_bytes(), body].concat()
++    }
++
++    fn join_body(code: &str) -> Vec<u8> {
++        serde_json::to_vec(&wire::JoinPost {
++            v: wire::VERSION,
++            code: code.into(),
++            name: "laptop".into(),
++        })
++        .unwrap()
++    }
++
++    /// The status and body of one raw exchange.
++    async fn answer(addr: SocketAddr, raw: &[u8]) -> (u16, Vec<u8>) {
++        let response = exchange_raw(addr, raw).await;
++        let head_end = response
++            .windows(4)
++            .position(|window| window == b"\r\n\r\n")
++            .expect("a complete answer");
++        let status = std::str::from_utf8(&response[9..12])
++            .unwrap()
++            .parse()
++            .unwrap();
++        (status, response[head_end + 4..].to_vec())
++    }
++
++    /// Both listeners over one device book of `dir`.
++    async fn device_hub(
++        devices: &Devices,
++    ) -> (
++        SocketAddr,
++        SocketAddr,
++        mpsc::Receiver<AgentEvent>,
++        mpsc::Receiver<HookPost>,
++    ) {
++        let agents = bind(loopback()).await.unwrap();
++        let hooks = bind(loopback()).await.unwrap();
++        let (agent_addr, hook_addr) = (agents.local_addr().unwrap(), hooks.local_addr().unwrap());
++        let (agents_tx, agents_rx) = mpsc::channel(16);
++        let (hooks_tx, hooks_rx) = mpsc::channel(16);
++        tokio::spawn(serve_agents(agents, devices.clone(), agents_tx));
++        tokio::spawn(serve_hooks(hooks, devices.clone(), hooks_tx));
++        (agent_addr, hook_addr, agents_rx, hooks_rx)
++    }
++
++    #[tokio::test]
++    async fn a_join_code_buys_one_device_secret_and_nothing_else() {
++        let dir = TempDir::new("ingress-join");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        let (_, addr, _agents, mut hooks) = device_hub(&devices).await;
++        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
++
++        // Any Authorization header is ignored: the code is the credential.
++        let (status, body) = answer(
++            addr,
++            &join_request(&join_body(&code), Some("Bearer nothing-at-all-000")),
++        )
++        .await;
++        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
++        let joined: JoinAnswer = serde_json::from_slice(&body).unwrap();
++        assert_eq!(joined.name, "laptop");
++        let bearer = format!("Bearer {}", joined.secret.expose());
++        assert_eq!(
++            exchange(addr, &request(Some(&bearer), &body_of_start())).await,
++            204
++        );
++        assert!(within(hooks.recv()).await.is_some());
++
++        // The same code again, a made-up one and an expired one: the same
++        // 403, after the pause of a wrong secret.
++        let old = mint_code(
++            dir.path(),
++            std::time::SystemTime::now() - crate::hub::devices::CODE_TTL - Duration::from_secs(1),
++        )
++        .unwrap();
++        for code in [code.as_str(), "ABCD-EFGH-JKMN-PQRS", old.as_str()] {
++            let started = Instant::now();
++            let (status, body) = answer(addr, &join_request(&join_body(code), None)).await;
++            assert_eq!((status, body.len()), (403, 0), "{code}");
++            assert!(started.elapsed() >= AUTH_FAIL_DELAY);
++        }
++        // A join body is short and must parse; the hook secret is no code.
++        let long = join_body(&"A".repeat(MAX_JOIN_BODY));
++        assert_eq!(answer(addr, &join_request(&long, None)).await.0, 413);
++        assert_eq!(answer(addr, &join_request(b"{}", None)).await.0, 400);
++        assert_eq!(devices.list().0.len(), 1);
++    }
++
++    fn body_of_start() -> Vec<u8> {
++        body(&post(start()))
++    }
++
++    #[tokio::test]
++    async fn a_revoked_device_loses_its_link_and_its_hooks_at_once() {
++        let dir = TempDir::new("ingress-revoke");
++        let shared = Secret::parse(SECRET).unwrap();
++        let devices = Devices::open(dir.path(), Some(shared)).unwrap();
++        let (agent_addr, hook_addr, mut agents, _hooks) = device_hub(&devices).await;
++        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
++        let joined = devices.join(&code, "old box").unwrap();
++
++        let mut device = Peer::connect(agent_addr).await;
++        device
++            .send(&AgentMsg::Hello {
++                secret: joined.secret.clone(),
++            })
++            .await;
++        device.send(&AgentMsg::Register(register())).await;
++        assert!(matches!(device.recv().await, Ok(HubMsg::Registered { .. })));
++        let Some(AgentEvent::Registered { conn, .. }) = within(agents.recv()).await else {
++            panic!("expected registration");
++        };
++        let mut other = Peer::connect(agent_addr).await;
++        other.send(&AgentMsg::Hello { secret: secret() }).await;
++        other.send(&AgentMsg::Register(register())).await;
++        assert!(matches!(other.recv().await, Ok(HubMsg::Registered { .. })));
++        let Some(AgentEvent::Registered {
++            conn: shared_conn, ..
++        }) = within(agents.recv()).await
++        else {
++            panic!("expected registration");
++        };
++
++        assert!(devices.revoke(&joined.id).is_some());
++        assert!(matches!(
++            within(agents.recv()).await,
++            Some(AgentEvent::Disconnected { conn: gone }) if gone == conn
++        ));
++        assert_eq!(device.recv().await, Err(WireError::Closed));
++        let bearer = format!("Bearer {}", joined.secret.expose());
++        assert_eq!(
++            exchange(hook_addr, &request(Some(&bearer), &body_of_start())).await,
++            401
++        );
++        let mut again = Peer::connect(agent_addr).await;
++        again
++            .send(&AgentMsg::Hello {
++                secret: joined.secret.clone(),
++            })
++            .await;
++        again.send(&AgentMsg::Register(register())).await;
++        assert_eq!(
++            again.recv().await,
++            Ok(HubMsg::Rejected {
++                reason: Rejection::Auth
++            })
++        );
++
++        // The shared secret's link stays.
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        assert!(
++            agents.try_recv().is_err(),
++            "shared link {shared_conn} untouched"
++        );
++        assert_eq!(
++            exchange(
++                hook_addr,
++                &request(Some(&format!("Bearer {SECRET}")), &body_of_start())
++            )
++            .await,
++            204
++        );
++    }
++
++    #[tokio::test]
++    async fn with_the_shared_secret_off_only_devices_get_in() {
++        let dir = TempDir::new("ingress-shared-off");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        let (agent_addr, hook_addr, _agents, _hooks) = device_hub(&devices).await;
++        assert_eq!(
++            exchange(
++                hook_addr,
++                &request(Some(&format!("Bearer {SECRET}")), &body_of_start())
++            )
++            .await,
++            401
++        );
++        let mut peer = Peer::connect(agent_addr).await;
++        peer.send(&AgentMsg::Hello { secret: secret() }).await;
++        peer.send(&AgentMsg::Register(register())).await;
++        assert_eq!(
++            peer.recv().await,
++            Ok(HubMsg::Rejected {
++                reason: Rejection::Auth
++            })
++        );
++    }
++
++    #[tokio::test]
++    async fn a_waiting_hook_of_a_revoked_device_is_dropped_unanswered() {
++        let dir = TempDir::new("ingress-revoke-wait");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
++        let joined = devices.join(&code, "box").unwrap();
++        let listener = bind(loopback()).await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (events, _events) = mpsc::channel(4);
++        let (asks_tx, mut asks) = mpsc::channel(4);
++        tokio::spawn(serve_hooks_and_permissions(
++            listener,
++            devices.clone(),
++            events,
++            asks_tx,
++        ));
++        let permission = serde_json::to_vec(&PermissionPost {
++            v: wire::VERSION,
++            host: "box".into(),
++            session_id: "5e551017-0000-4000-8000-000000000001".into(),
++            tool_name: "Bash".into(),
++            description: String::new(),
++            input_preview: String::new(),
++        })
++        .unwrap();
++        let raw = [
++            format!(
++                "POST {PERMISSION_PATH} HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n",
++                joined.secret.expose(),
++                permission.len()
++            )
++            .into_bytes(),
++            permission,
++        ]
++        .concat();
++        let waiting = tokio::spawn(async move { exchange_raw(addr, &raw).await });
++        let ask = within(asks.recv())
++            .await
++            .expect("the hook waits for an answer");
++        devices.revoke(&joined.id).unwrap();
++        assert!(
++            within(waiting).await.unwrap().is_empty(),
++            "no answer at all"
++        );
++        drop(ask);
++    }
++}
+diff --git a/crates/cctg/src/hub/mod.rs b/crates/cctg/src/hub/mod.rs
+--- a/crates/cctg/src/hub/mod.rs
++++ b/crates/cctg/src/hub/mod.rs
+@@ -5,12 +5,14 @@
+ pub mod commands;
+ pub mod config;
+ pub mod console;
++pub mod devices;
+ pub mod fetch;
+ pub mod ingress;
+ pub mod offset;
+ pub mod permissions;
+ pub mod questions;
+ pub mod registry;
++pub mod roster;
+ pub mod scheduler;
+ pub mod slots;
+ pub mod status;
+@@ -30,7 +32,10 @@
+ use tracing::{info, warn};
+ 
+ use api::{ApiError, BotApi, ChatMember, Sticker};
+-use config::{AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, STATE_VAR};
++use config::{
++    AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, SHARED_VAR, STATE_VAR,
++};
++use devices::Devices;
+ use ingress::Listener;
+ use offset::OffsetStore;
+ use registry::{Icons, RegistryStore};
+@@ -62,13 +67,15 @@
+     }
+ }
+ 
+-/// The poll callback: commands go to the command worker's queue; other
+-/// messages, button presses and topic edit notices go to the slot actor. Nothing here waits,
++/// The poll callback: commands go to the command worker's queue, `/devices`
++/// in General and its buttons to the device list's; other messages, button
++/// presses and topic edit notices go to the slot actor. Nothing here waits,
+ /// so a slow command or a slow Telegram never holds up polling. A pin notice
+ /// goes to the slot actor only when this bot (`bot_id`) pinned: a person's
+ /// pin, even of a status message, is theirs to keep.
+ fn route_inbound<'a>(
+     commands: &'a mpsc::UnboundedSender<Inbound>,
++    roster: &'a mpsc::UnboundedSender<roster::Input>,
+     control: &'a mpsc::UnboundedSender<Control>,
+     bot_id: i64,
+ ) -> impl FnMut(Routed) + 'a {
+@@ -76,6 +83,16 @@
+         Routed::Input(input) if commands::is_command(&input) => {
+             if commands.send(input).is_err() {
+                 warn!("command worker stopped; command dropped");
++            }
++        }
++        Routed::Input(input) if roster::is_command(&input) => {
++            if roster.send(roster::Input::Command(input)).is_err() {
++                warn!("device list worker stopped; command dropped");
++            }
++        }
++        Routed::Callback(input) if roster::is_callback(&input) => {
++            if roster.send(roster::Input::Press(input)).is_err() {
++                warn!("device list worker stopped; button press dropped");
+             }
+         }
+         Routed::Input(input) => {
+@@ -188,6 +205,17 @@
+     SocketAddr::new(ip, listen.port())
+ }
+ 
++/// `cctg hub code` (TASK-045): prints a new join code for one device. It
++/// needs only the hub's state directory ([`STATE_VAR`] of the process
++/// environment or `env_file`), so it runs next to a running hub, e.g.
++/// `docker compose exec hub cctg hub code`; the hub takes the code from
++/// there. Only the code goes to stdout.
++pub fn mint_code(env_file: Option<&Path>) -> anyhow::Result<String> {
++    let state_dir = config::state_dir(env_file)?;
++    devices::mint_code(&state_dir, std::time::SystemTime::now())
++        .with_context(|| format!("no join code; check {STATE_VAR}"))
++}
++
+ /// How long a stopping hub waits for the slot actor to write the registry.
+ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+ /// How often the hub asks getMe again after a network error at start.
+@@ -226,9 +254,19 @@
+     let registry = registry_store
+         .load()
+         .with_context(|| format!("cannot load the slot registry from {STATE_VAR}"))?;
+-    let secret = config.hub_secret.clone().with_context(|| {
+-        format!("{SECRET_VAR} is not set; agents and hooks authenticate with it (16+ visible ASCII characters)")
+-    })?;
++    let shared = if config.shared_secret {
++        Some(config.hub_secret.clone().with_context(|| {
++            format!(
++                "{SECRET_VAR} is not set; agents and hooks authenticate with it (16+ visible ASCII characters), \
++                 or with their own secrets once {SHARED_VAR}=off"
++            )
++        })?)
++    } else {
++        info!("{SHARED_VAR}=off: only devices with their own secret get in");
++        None
++    };
++    let devices = Devices::open(&config.state_dir, shared)
++        .with_context(|| format!("cannot load the device list from {STATE_VAR}"))?;
+     let agent_listener = ingress::bind(config.agent_listen)
+         .await
+         .with_context(|| format!("cannot listen for agents; check {AGENT_LISTEN_VAR}"))?;
+@@ -329,20 +367,27 @@
+     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+     tokio::spawn(commands::serve(
+         commands_rx,
++        outbox.clone(),
++        Arc::new(commands::Asks(transcript_asks)),
++        me.username.clone(),
++    ));
++    let (roster_tx, roster_rx) = mpsc::unbounded_channel();
++    tokio::spawn(roster::serve(
++        roster_rx,
+         outbox,
+-        Arc::new(commands::Asks(transcript_asks)),
++        devices.clone(),
+         me.username.clone(),
+     ));
+     let (agents_tx, agents_rx) = mpsc::channel(256);
+     let (hooks_tx, hooks_rx) = mpsc::channel(256);
+     tokio::spawn(ingress::serve_agents(
+         agent_listener,
+-        secret.clone(),
++        devices.clone(),
+         agents_tx,
+     ));
+     tokio::spawn(ingress::serve_hooks_and_asks(
+         hook_listener,
+-        secret,
++        devices,
+         hooks_tx,
+         permission_asks,
+         question_asks,
+@@ -354,7 +399,7 @@
+         api.as_ref(),
+         &config.allowlist,
+         &offsets,
+-        route_inbound(&commands_tx, &control_tx, me.id),
++        route_inbound(&commands_tx, &roster_tx, &control_tx, me.id),
+         stop_requested(stop_on_stdin),
+     )
+     .await;
+@@ -475,11 +520,12 @@
+             tokio::spawn(async move {
+                 let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
+                 let (control_tx, _control_rx) = mpsc::unbounded_channel();
++                let (roster_tx, _roster_rx) = mpsc::unbounded_channel();
+                 updates::poll(
+                     source.as_ref(),
+                     &allowlist,
+                     &store,
+-                    route_inbound(&commands_tx, &control_tx, BOT),
++                    route_inbound(&commands_tx, &roster_tx, &control_tx, BOT),
+                 )
+                 .await;
+             })
+@@ -515,6 +561,7 @@
+     #[test]
+     fn messages_go_to_the_slot_actor_and_commands_do_not() {
+         let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
++        let (roster_tx, mut roster_rx) = mpsc::unbounded_channel();
+         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+         let input = |text: &str| Inbound {
+             message_id: 5,
+@@ -526,9 +573,22 @@
+             media: None,
+             from_name: None,
+         };
+-        let mut route = route_inbound(&commands_tx, &control_tx, BOT);
++        let mut route = route_inbound(&commands_tx, &roster_tx, &control_tx, BOT);
+         route(Routed::Input(input("hello")));
+         route(Routed::Input(input("/brief 2")));
++        // `/devices` is the device list's in General, the session's in a
++        // topic; so are its buttons, wherever they are.
++        route(Routed::Input(Inbound {
++            thread_id: None,
++            ..input("/devices")
++        }));
++        route(Routed::Input(input("/devices")));
++        route(Routed::Callback(updates::CallbackInput {
++            query_id: "d".to_owned(),
++            data: Some("dev:n".to_owned()),
++            message_id: Some(8),
++            from_name: None,
++        }));
+         route(Routed::Input(Inbound {
+             text: None,
+             ..input("")
+@@ -564,9 +624,28 @@
+             Some("/brief 2")
+         );
+         assert!(commands_rx.try_recv().is_err());
++        assert!(matches!(
++            roster_rx.try_recv().unwrap(),
++            roster::Input::Command(Inbound {
++                thread_id: None,
++                ..
++            })
++        ));
++        assert!(matches!(
++            roster_rx.try_recv().unwrap(),
++            roster::Input::Press(updates::CallbackInput {
++                message_id: Some(8),
++                ..
++            })
++        ));
++        assert!(roster_rx.try_recv().is_err());
+         assert_eq!(
+             control_rx.try_recv().unwrap(),
+             Control::Message(input("hello"))
++        );
++        assert_eq!(
++            control_rx.try_recv().unwrap(),
++            Control::Message(input("/devices"))
+         );
+         assert!(matches!(
+             control_rx.try_recv().unwrap(),
+diff --git a/crates/cctg/src/hub/roster.rs b/crates/cctg/src/hub/roster.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/hub/roster.rs
+@@ -0,0 +1,488 @@
++//! `/devices` in General and its «Отозвать» buttons (TASK-045).
++//!
++//! One worker, like the transcript commands: `/devices` sends the list of
++//! enrolled devices with one button per device; a press asks once more
++//! («Да, отозвать» / «Отмена») on the same message, and the confirmation
++//! revokes the device at once ([`Devices::revoke`]) and edits the message
++//! back into the list. Only allowlisted users get here (the poll drops the
++//! rest). Logs carry device ids, never names, codes or secrets.
++
++use std::time::SystemTime;
++
++use serde_json::{Value, json};
++use tokio::sync::mpsc;
++use tracing::{info, warn};
++
++use super::devices::{CODE_TTL, Devices, Listed, SharedState};
++use super::scheduler::{Op, Outbox};
++use super::updates::{CallbackInput, Inbound};
++
++const PREFIX: &str = "dev";
++const ASK: &str = "r";
++const YES: &str = "y";
++const NO: &str = "n";
++
++/// What the worker takes.
++#[derive(Debug)]
++pub enum Input {
++    Command(Inbound),
++    Press(CallbackInput),
++}
++
++/// `/devices` (optionally `@bot`) in General. The same text in a topic is a
++/// message for its session, like every other slash text there (TASK-021).
++pub fn is_command(input: &Inbound) -> bool {
++    input.thread_id.is_none()
++        && input
++            .text
++            .as_deref()
++            .and_then(|text| text.split_whitespace().next())
++            .and_then(|word| word.strip_prefix('/'))
++            .map(|head| head.split_once('@').map_or(head, |(name, _)| name))
++            .is_some_and(|name| name.eq_ignore_ascii_case("devices"))
++}
++
++/// A button of this worker.
++pub fn is_callback(input: &CallbackInput) -> bool {
++    input.data.as_deref().and_then(parse_callback).is_some()
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum Press {
++    Ask(String),
++    Yes(String),
++    No,
++}
++
++fn parse_callback(data: &str) -> Option<Press> {
++    let mut parts = data.split(':');
++    if parts.next()? != PREFIX {
++        return None;
++    }
++    let press = match (parts.next()?, parts.next()) {
++        (ASK, Some(id)) if is_id(id) => Press::Ask(id.to_owned()),
++        (YES, Some(id)) if is_id(id) => Press::Yes(id.to_owned()),
++        (NO, None) => return Some(Press::No),
++        _ => return None,
++    };
++    parts.next().is_none().then_some(press)
++}
++
++fn is_id(id: &str) -> bool {
++    id.len() == 8 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
++}
++
++/// Serves `/devices` and its buttons until `inputs` closes.
++pub async fn serve(
++    mut inputs: mpsc::UnboundedReceiver<Input>,
++    outbox: Outbox,
++    devices: Devices,
++    bot_username: Option<String>,
++) {
++    while let Some(input) = inputs.recv().await {
++        match input {
++            Input::Command(input) => {
++                if addressed_elsewhere(input.text.as_deref(), bot_username.as_deref()) {
++                    continue;
++                }
++                let (text, keyboard) = list(&devices, None);
++                submit(
++                    &outbox,
++                    Op::Send {
++                        thread_id: None,
++                        text,
++                        html: None,
++                        reply_markup: keyboard,
++                        permission: false,
++                        reply_to: None,
++                        notify: false,
++                    },
++                )
++                .await;
++            }
++            Input::Press(press) => on_press(&outbox, &devices, press).await,
++        }
++    }
++}
++
++/// `/devices@other_bot`.
++fn addressed_elsewhere(text: Option<&str>, bot: Option<&str>) -> bool {
++    let target = text
++        .and_then(|text| text.split_whitespace().next())
++        .and_then(|word| word.split_once('@'))
++        .map(|(_, target)| target);
++    matches!((target, bot), (Some(target), Some(bot)) if !target.eq_ignore_ascii_case(bot))
++}
++
++async fn on_press(outbox: &Outbox, devices: &Devices, input: CallbackInput) {
++    let Some(press) = input.data.as_deref().and_then(parse_callback) else {
++        return;
++    };
++    let (answer, edit) = match press {
++        Press::Ask(id) => match devices.name(&id) {
++            Some(name) => (None, confirm(&id, &name)),
++            None => (Some("Этого устройства уже нет."), list(devices, None)),
++        },
++        Press::No => (None, list(devices, None)),
++        Press::Yes(id) => {
++            let revoking = devices.clone();
++            let target = id.clone();
++            let revoked = tokio::task::spawn_blocking(move || revoking.revoke(&target))
++                .await
++                .ok()
++                .flatten();
++            match revoked {
++                Some(revoked) => {
++                    info!(
++                        device_id = id,
++                        saved = revoked.saved,
++                        "device revoked from Telegram"
++                    );
++                    let mut notice = format!("«{}» отозвано", revoked.name);
++                    if let Some(by) = &input.from_name {
++                        notice.push_str(&format!(" ({by})"));
++                    }
++                    notice.push('.');
++                    if !revoked.saved {
++                        notice.push_str(
++                            " Записать это на диск не вышло: после перезапуска hub устройство вернётся, отзовите его ещё раз.",
++                        );
++                    }
++                    (Some("Отозвано"), list(devices, Some(&notice)))
++                }
++                None => (Some("Этого устройства уже нет."), list(devices, None)),
++            }
++        }
++    };
++    submit(
++        outbox,
++        Op::AnswerCallback {
++            query_id: input.query_id,
++            text: answer.map(str::to_owned),
++        },
++    )
++    .await;
++    if let Some(message_id) = input.message_id {
++        let (text, keyboard) = edit;
++        let op = Op::Edit {
++            message_id,
++            text,
++            reply_markup: Some(keyboard.unwrap_or_else(|| json!({ "inline_keyboard": [] }))),
++        };
++        submit(outbox, op).await;
++    }
++}
++
++async fn submit(outbox: &Outbox, op: Op) {
++    match outbox.submit(op).await.await {
++        Ok(Ok(_)) => {}
++        Ok(Err(error)) => warn!(%error, "device list message not delivered"),
++        Err(_) => warn!("device list message dropped: the scheduler stopped"),
++    }
++}
++
++/// The confirmation of a revoke.
++fn confirm(id: &str, name: &str) -> (String, Option<Value>) {
++    let text = format!(
++        "Отозвать «{name}» ({id})? Его агенты сразу потеряют связь с hub, хуки перестанут приниматься. Вернуть устройство можно только новым кодом."
++    );
++    let keyboard = json!({ "inline_keyboard": [[
++        { "text": "Да, отозвать", "callback_data": format!("{PREFIX}:{YES}:{id}") },
++        { "text": "Отмена", "callback_data": format!("{PREFIX}:{NO}") },
++    ]] });
++    (text, Some(keyboard))
++}
++
++/// The list message: `notice` first, the devices, the shared secret's
++/// state and how to add a device; one «Отозвать» button per device.
++fn list(devices: &Devices, notice: Option<&str>) -> (String, Option<Value>) {
++    let (listed, shared) = devices.list();
++    let text = render(&listed, shared, notice, SystemTime::now());
++    let rows: Vec<Value> = listed
++        .iter()
++        .map(|entry| {
++            json!([{
++                "text": format!("Отозвать {}", entry.name),
++                "callback_data": format!("{PREFIX}:{ASK}:{}", entry.id),
++            }])
++        })
++        .collect();
++    let keyboard = (!rows.is_empty()).then(|| json!({ "inline_keyboard": rows }));
++    (text, keyboard)
++}
++
++fn render(listed: &[Listed], shared: SharedState, notice: Option<&str>, now: SystemTime) -> String {
++    let mut text = String::new();
++    if let Some(notice) = notice {
++        text.push_str(notice);
++        text.push_str("\n\n");
++    }
++    if listed.is_empty() {
++        text.push_str("Своих секретов у устройств пока нет.\n");
++    } else {
++        text.push_str(&format!("Устройства ({}):\n", listed.len()));
++    }
++    for (index, entry) in listed.iter().enumerate() {
++        let seen = match entry.seen {
++            Some(at) => format!("на связи {}", ago(now, at)),
++            None => "с запуска hub не появлялось".to_owned(),
++        };
++        text.push_str(&format!(
++            "{}. {} · {} · с {} · {seen}\n",
++            index + 1,
++            entry.name,
++            entry.id,
++            crate::files::date(entry.joined),
++        ));
++    }
++    text.push('\n');
++    text.push_str(&match shared {
++        SharedState::Off => "Общий секрет hub (CCTG_HUB_SECRET) отключён.".to_owned(),
++        SharedState::On(seen) => format!(
++            "Общий секрет hub (CCTG_HUB_SECRET) принимается; {}. Когда все устройства получат свои секреты, отключите его: CCTG_SHARED_SECRET=off в hub.env и перезапуск hub.",
++            match seen {
++                Some(at) => format!("последний вход с ним {}", ago(now, at)),
++                None => "с запуска hub с ним не входили".to_owned(),
++            }
++        ),
++    });
++    text.push_str(&format!(
++        "\n\nНовое устройство: код на {} минут даёт «cctg hub code» на машине hub (в Docker: docker compose exec hub cctg hub code); на устройстве install.sh --join КОД или cctg join КОД.",
++        CODE_TTL.as_secs() / 60
++    ));
++    text
++}
++
++/// «только что», «5 мин назад», «3 ч назад», «2 дн назад».
++fn ago(now: SystemTime, at: SystemTime) -> String {
++    let secs = now.duration_since(at).map_or(0, |since| since.as_secs());
++    match secs {
++        0..60 => "только что".to_owned(),
++        60..3600 => format!("{} мин назад", secs / 60),
++        3600..86_400 => format!("{} ч назад", secs / 3600),
++        _ => format!("{} дн назад", secs / 86_400),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::{Arc, Mutex};
++    use std::time::Duration;
++
++    use super::*;
++    use crate::hub::api::Message;
++    use crate::hub::devices::{MAX_DEVICES, NAME_LIMIT, mint_code};
++    use crate::hub::scheduler::{BucketConfig, Delivery, Outcome, Scheduler, Transport};
++    use crate::hub::testdir::TempDir;
++    use crate::wire::Secret;
++
++    #[derive(Default)]
++    struct Fake(Mutex<Vec<Op>>);
++
++    impl Transport for Fake {
++        async fn execute(&self, op: &Op) -> Delivery {
++            self.0.lock().unwrap().push(op.clone());
++            Ok(Outcome::Sent(Message::default()))
++        }
++    }
++
++    fn command(text: &str, thread_id: Option<i64>) -> Inbound {
++        Inbound {
++            message_id: 1,
++            thread_id,
++            text: Some(text.to_owned()),
++            reply_to: None,
++            quote: None,
++            forwarded: false,
++            media: None,
++            from_name: None,
++        }
++    }
++
++    fn press(data: &str) -> CallbackInput {
++        CallbackInput {
++            query_id: "q".into(),
++            data: Some(data.into()),
++            message_id: Some(77),
++            from_name: Some("Иван".into()),
++        }
++    }
++
++    async fn run(devices: &Devices, inputs: Vec<Input>) -> Vec<Op> {
++        let fake = Arc::new(Fake::default());
++        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
++        let scheduler = tokio::spawn(scheduler.run());
++        let (tx, rx) = mpsc::unbounded_channel();
++        for input in inputs {
++            tx.send(input).unwrap();
++        }
++        drop(tx);
++        serve(rx, outbox, devices.clone(), Some("cctg_bot".into())).await;
++        scheduler.await.unwrap();
++        fake.0.lock().unwrap().clone()
++    }
++
++    fn enroll(dir: &TempDir, devices: &Devices, name: &str) -> (String, Secret) {
++        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
++        let joined = devices.join(&code, name).unwrap();
++        (joined.id, joined.secret)
++    }
++
++    #[test]
++    fn commands_and_buttons_are_recognised() {
++        assert!(is_command(&command("/devices", None)));
++        assert!(is_command(&command("/Devices@cctg_bot", None)));
++        assert!(
++            !is_command(&command("/devices", Some(7))),
++            "a topic's text is the session's"
++        );
++        assert!(!is_command(&command("/brief", None)));
++        assert_eq!(
++            parse_callback("dev:r:0123abcd"),
++            Some(Press::Ask("0123abcd".into()))
++        );
++        assert_eq!(
++            parse_callback("dev:y:0123abcd"),
++            Some(Press::Yes("0123abcd".into()))
++        );
++        assert_eq!(parse_callback("dev:n"), Some(Press::No));
++        for other in [
++            "dev:r:xyz",
++            "dev:y:0123abcd:1",
++            "dev:n:1",
++            "allow:abcde",
++            "status:stop",
++            "dev",
++        ] {
++            assert_eq!(parse_callback(other), None, "{other}");
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn the_list_asks_before_it_revokes_and_the_revoke_cuts_the_device() {
++        let dir = TempDir::new("roster-revoke");
++        let devices = Devices::open(
++            dir.path(),
++            Some(Secret::parse("shared-secret-0123456789").unwrap()),
++        )
++        .unwrap();
++        let (id, secret) = enroll(&dir, &devices, "laptop");
++        let (other, _) = enroll(&dir, &devices, "mac");
++        assert!(devices.check(secret.expose().as_bytes()).is_some());
++
++        let ops = run(
++            &devices,
++            vec![
++                Input::Command(command("/devices", None)),
++                Input::Command(command("/devices@other_bot", None)),
++                Input::Press(press(&format!("dev:r:{id}"))),
++                Input::Press(press("dev:n")),
++                Input::Press(press(&format!("dev:y:{id}"))),
++                Input::Press(press(&format!("dev:y:{id}"))),
++            ],
++        )
++        .await;
++        let Op::Send {
++            thread_id: None,
++            text,
++            reply_markup: Some(keyboard),
++            ..
++        } = &ops[0]
++        else {
++            panic!("{ops:?}");
++        };
++        assert!(text.contains("Устройства (2)") && text.contains("laptop") && text.contains(&id));
++        assert!(text.contains("принимается"), "{text}");
++        assert!(!text.contains(secret.expose()));
++        assert_eq!(
++            keyboard["inline_keyboard"][0][0]["callback_data"],
++            format!("dev:r:{id}")
++        );
++        assert_eq!(
++            keyboard["inline_keyboard"][1][0]["callback_data"],
++            format!("dev:r:{other}")
++        );
++        // `/devices@other_bot` is not ours: nothing sent for it.
++        let edits: Vec<&String> = ops
++            .iter()
++            .filter_map(|op| match op {
++                Op::Edit {
++                    message_id: 77,
++                    text,
++                    ..
++                } => Some(text),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(edits.len(), 4, "{ops:?}");
++        assert!(edits[0].starts_with("Отозвать «laptop»"), "{}", edits[0]);
++        assert!(
++            edits[1].starts_with("Устройства (2)"),
++            "cancel: {}",
++            edits[1]
++        );
++        assert!(
++            edits[2].starts_with("«laptop» отозвано (Иван)."),
++            "{}",
++            edits[2]
++        );
++        assert!(edits[2].contains("Устройства (1)") && !edits[2].contains(&id));
++        assert!(
++            !edits[3].contains("отозвано"),
++            "a second yes changes nothing: {}",
++            edits[3]
++        );
++        let answers: Vec<Option<String>> = ops
++            .iter()
++            .filter_map(|op| match op {
++                Op::AnswerCallback { text, .. } => Some(text.clone()),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            answers,
++            [
++                None,
++                None,
++                Some("Отозвано".into()),
++                Some("Этого устройства уже нет.".into())
++            ]
++        );
++        assert_eq!(devices.check(secret.expose().as_bytes()), None);
++        assert_eq!(Devices::open(dir.path(), None).unwrap().list().0.len(), 1);
++    }
++
++    #[test]
++    fn a_full_list_fits_one_message() {
++        let now = SystemTime::now();
++        let listed: Vec<Listed> = (0..MAX_DEVICES)
++            .map(|index| Listed {
++                id: format!("{index:08x}"),
++                name: "Ж".repeat(NAME_LIMIT),
++                joined: now,
++                seen: Some(now - Duration::from_secs(90_000)),
++            })
++            .collect();
++        let text = render(
++            &listed,
++            SharedState::On(Some(now)),
++            Some(&format!("«{}» отозвано (Иван).", "Ж".repeat(NAME_LIMIT))),
++            now,
++        );
++        assert!(
++            transcript::telegram_len(&text) <= 4096,
++            "{}",
++            transcript::telegram_len(&text)
++        );
++    }
++
++    #[test]
++    fn ages_read_as_words() {
++        let now = SystemTime::now();
++        let ago_by = |secs| ago(now, now - Duration::from_secs(secs));
++        assert_eq!(ago_by(5), "только что");
++        assert_eq!(ago_by(300), "5 мин назад");
++        assert_eq!(ago_by(7200), "2 ч назад");
++        assert_eq!(ago_by(200_000), "2 дн назад");
++    }
++}
+diff --git a/crates/cctg/src/join.rs b/crates/cctg/src/join.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/join.rs
+@@ -0,0 +1,344 @@
++//! `cctg join` (TASK-045): this device trades a one-time join code for its
++//! own secret.
++//!
++//! The hub address and certificate pin come from the device config, as for
++//! the hook ([`DeviceConfig`]): TLS with the pin, or plain TCP to a hub on
++//! this machine only. The request (`POST /v1/join`) carries the code and
++//! this device's host name, no secret. The answer's secret replaces the
++//! `CCTG_HUB_SECRET` line of `~/.cctg/device.env` (file mode 600 on Unix);
++//! it is never printed, and neither is the code.
++
++use std::io::{self, Write};
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++use crate::device::{self, ConfigProblem, DEVICE_ENV, DeviceConfig};
++use crate::hub::config::SECRET_VAR;
++use crate::hub::devices::secret_device_id;
++use crate::tls::HubAddr;
++use crate::wire::{JOIN_PATH, JoinAnswer, JoinPost, Secret, VERSION};
++
++/// The code when it is not an argument (install.sh passes it so).
++pub const CODE_VAR: &str = "CCTG_JOIN_CODE";
++/// The whole exchange, TLS handshake included.
++pub const TIMEOUT: Duration = Duration::from_secs(10);
++/// Longest answer read.
++const MAX_ANSWER: u64 = 4096;
++
++#[derive(Debug, PartialEq, Eq, thiserror::Error)]
++pub enum JoinFailed {
++    #[error("{0}")]
++    Config(ConfigProblem),
++    #[error(
++        "the hub refused the join code: it is wrong, already used or expired. \
++         Ask for a new one (/devices in the Telegram group says how)"
++    )]
++    Refused,
++    #[error(
++        "this hub is older than join codes: update it, or give this device the \
++         shared secret (CCTG_HUB_SECRET)"
++    )]
++    OldHub,
++    #[error(
++        "the hub cannot enroll a device now (its device list is full, or a disk problem; see its log)"
++    )]
++    Unavailable,
++    #[error("the hub answered HTTP {0}")]
++    Status(u16),
++    #[error("the hub did not answer within {0:?}")]
++    Timeout(Duration),
++    #[error("cannot reach the hub: {0:?}")]
++    Io(io::ErrorKind),
++    #[error("the hub's answer is not a join answer")]
++    BadAnswer,
++}
++
++pub async fn run(code: Option<String>) -> i32 {
++    let code = code.or_else(|| std::env::var(CODE_VAR).ok());
++    let Some(code) = code
++        .map(|code| code.trim().to_owned())
++        .filter(|code| !code.is_empty())
++    else {
++        eprintln!("cctg join: no join code: give it as the argument or in {CODE_VAR}");
++        return 2;
++    };
++    let Some(env_file) =
++        device::home_dir(&|name| std::env::var(name).ok()).map(|home| home.join(DEVICE_ENV))
++    else {
++        eprintln!("cctg join: no home directory (HOME / USERPROFILE) for {DEVICE_ENV}");
++        return 1;
++    };
++    let config = DeviceConfig::load();
++    let answer = match join(&config, &code, TIMEOUT).await {
++        Ok(answer) => answer,
++        Err(error) => {
++            eprintln!("cctg join: {error}");
++            return 1;
++        }
++    };
++    if let Err(error) = write_secret(&env_file, &answer.secret) {
++        eprintln!(
++            "cctg join: the hub enrolled this device as {}, but {} cannot be written ({:?}): revoke {} in /devices and join again with a new code",
++            answer.device_id,
++            env_file.display(),
++            error.kind(),
++            answer.device_id
++        );
++        return 1;
++    }
++    println!(
++        "cctg join: this device is {} ({}) on the hub; its secret is in {}",
++        answer.name,
++        answer.device_id,
++        env_file.display()
++    );
++    if let Some(old) = config.secret.as_ref().ok().and_then(secret_device_id) {
++        println!(
++            "cctg join: the secret before it (device {old}) still gets in until it is revoked in /devices"
++        );
++    }
++    if std::env::var(SECRET_VAR).is_ok_and(|value| !value.trim().is_empty()) {
++        println!(
++            "cctg join: note: {SECRET_VAR} of this environment wins over the file; unset it for the new secret to count"
++        );
++    }
++    println!(
++        "cctg join: running claude sessions keep their old secret until they restart; hooks take the new one at once"
++    );
++    0
++}
++
++/// Trades `code` for a device secret at the hub's hook address.
++pub async fn join(
++    config: &DeviceConfig,
++    code: &str,
++    timeout: Duration,
++) -> Result<JoinAnswer, JoinFailed> {
++    let addr = config.hub(&config.hook_addr).map_err(JoinFailed::Config)?;
++    let post = JoinPost {
++        v: VERSION,
++        code: code.to_owned(),
++        name: config.host.clone(),
++    };
++    let body = serde_json::to_vec(&post).expect("a join post always serializes");
++    let answer = tokio::time::timeout(timeout, exchange(&addr, &body))
++        .await
++        .map_err(|_| JoinFailed::Timeout(timeout))??;
++    let (status, body) = split_answer(&answer).ok_or(JoinFailed::BadAnswer)?;
++    match status {
++        200 => {
++            let answer: JoinAnswer =
++                serde_json::from_slice(body).map_err(|_| JoinFailed::BadAnswer)?;
++            // The hub's secret must be one the hook and agent can send.
++            Secret::parse(answer.secret.expose()).map_err(|_| JoinFailed::BadAnswer)?;
++            Ok(answer)
++        }
++        403 => Err(JoinFailed::Refused),
++        404 => Err(JoinFailed::OldHub),
++        503 => Err(JoinFailed::Unavailable),
++        code => Err(JoinFailed::Status(code)),
++    }
++}
++
++async fn exchange(addr: &HubAddr, body: &[u8]) -> Result<Vec<u8>, JoinFailed> {
++    let io = |error: io::Error| JoinFailed::Io(error.kind());
++    let head = format!(
++        "POST {JOIN_PATH} HTTP/1.1\r\nHost: cctg-hub\r\nContent-Type: application/json\r\n\
++         Content-Length: {}\r\nConnection: close\r\n\r\n",
++        body.len()
++    );
++    let mut stream = addr.connect().await.map_err(io)?;
++    stream
++        .write_all(&[head.as_bytes(), body].concat())
++        .await
++        .map_err(io)?;
++    stream.flush().await.map_err(io)?;
++    let mut answer = Vec::new();
++    (&mut stream)
++        .take(MAX_ANSWER)
++        .read_to_end(&mut answer)
++        .await
++        .map_err(io)?;
++    Ok(answer)
++}
++
++/// The status of a complete `HTTP/1.1 NNN ...` answer and its body.
++fn split_answer(answer: &[u8]) -> Option<(u16, &[u8])> {
++    let head_end = answer.windows(4).position(|window| window == b"\r\n\r\n")?;
++    let line_end = answer.windows(2).position(|pair| pair == b"\r\n")?;
++    let rest = answer[..line_end].strip_prefix(b"HTTP/1.1 ")?;
++    let (code, tail) = rest.split_at_checked(3)?;
++    if !code.iter().all(u8::is_ascii_digit) || !(tail.is_empty() || tail[0] == b' ') {
++        return None;
++    }
++    let status = std::str::from_utf8(code).ok()?.parse().ok()?;
++    Some((status, &answer[head_end + 4..]))
++}
++
++/// Puts `CCTG_HUB_SECRET='<secret>'` into `path` in place of every line
++/// that sets it; every other line stays. Temp file and rename, so a
++/// failure leaves the file as it was.
++pub fn write_secret(path: &Path, secret: &Secret) -> io::Result<()> {
++    let old = match std::fs::read_to_string(path) {
++        Ok(text) => text,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
++        Err(error) => return Err(error),
++    };
++    let mut text: String = old
++        .lines()
++        .filter(|line| !sets_secret(line))
++        .flat_map(|line| [line, "\n"])
++        .collect();
++    // A device secret is letters, digits and `_`: nothing to escape.
++    text.push_str(&format!("{SECRET_VAR}='{}'\n", secret.expose()));
++    if let Some(dir) = path.parent() {
++        std::fs::create_dir_all(dir)?;
++    }
++    let temp = temp_path(path);
++    let mut options = std::fs::OpenOptions::new();
++    options.write(true).create(true).truncate(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.mode(0o600);
++    }
++    let mut file = options.open(&temp)?;
++    file.write_all(text.as_bytes())?;
++    file.sync_all()?;
++    drop(file);
++    std::fs::rename(&temp, path)
++}
++
++fn temp_path(path: &Path) -> PathBuf {
++    let mut name = path.file_name().unwrap_or_default().to_os_string();
++    name.push(".join-tmp");
++    path.with_file_name(name)
++}
++
++/// `CCTG_HUB_SECRET=...`, also with `export` and spaces, as dotenv reads it.
++fn sets_secret(line: &str) -> bool {
++    let line = line.trim_start();
++    let line = line
++        .strip_prefix("export")
++        .filter(|rest| rest.starts_with([' ', '\t']))
++        .map_or(line, str::trim_start);
++    line.strip_prefix(SECRET_VAR)
++        .is_some_and(|rest| rest.trim_start().starts_with('='))
++}
++
++#[cfg(test)]
++mod tests {
++    use std::time::SystemTime;
++
++    use tokio::net::TcpListener;
++    use tokio::sync::mpsc;
++
++    use super::*;
++    use crate::device::{AGENT_ADDR_VAR, HOOK_ADDR_VAR, HOST_VAR};
++    use crate::hub::devices::{Devices, mint_code};
++    use crate::hub::ingress;
++    use crate::hub::testdir::TempDir;
++
++    fn config(hook_addr: &str) -> DeviceConfig {
++        let hook_addr = hook_addr.to_owned();
++        DeviceConfig::from_vars(move |name| match name {
++            HOOK_ADDR_VAR => Some(hook_addr.clone()),
++            AGENT_ADDR_VAR => Some("127.0.0.1:1".into()),
++            HOST_VAR => Some("laptop".into()),
++            _ => None,
++        })
++    }
++
++    async fn hub(devices: Devices) -> String {
++        let hooks = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = hooks.local_addr().unwrap().to_string();
++        let (tx, mut rx) = mpsc::channel(8);
++        tokio::spawn(ingress::serve_hooks(hooks, devices, tx));
++        tokio::spawn(async move { while rx.recv().await.is_some() {} });
++        addr
++    }
++
++    #[tokio::test]
++    async fn a_code_is_traded_once_for_a_secret_the_hub_takes() {
++        let dir = TempDir::new("join-client");
++        let devices = Devices::open(dir.path(), None).unwrap();
++        let addr = hub(devices.clone()).await;
++        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
++        let answer = join(&config(&addr), &code, TIMEOUT).await.unwrap();
++        assert_eq!(answer.name, "laptop");
++        assert!(devices.check(answer.secret.expose().as_bytes()).is_some());
++        assert_eq!(
++            join(&config(&addr), &code, TIMEOUT).await.unwrap_err(),
++            JoinFailed::Refused
++        );
++        assert_eq!(
++            join(&config(&addr), "not a code", TIMEOUT)
++                .await
++                .unwrap_err(),
++            JoinFailed::Refused
++        );
++    }
++
++    #[tokio::test]
++    async fn a_remote_hub_without_a_pin_is_never_asked() {
++        assert_eq!(
++            join(&config("203.0.113.9:47292"), "ABCD-EFGH-JKMN-PQRS", TIMEOUT)
++                .await
++                .unwrap_err(),
++            JoinFailed::Config(ConfigProblem::PlainRemote)
++        );
++    }
++
++    #[test]
++    fn the_secret_line_is_replaced_and_the_rest_kept() {
++        let dir = TempDir::new("join-env");
++        let path = dir.path().join(".cctg").join("device.env");
++        let secret = Secret::parse(&format!("cctgd_0123abcd_{}", "a".repeat(64))).unwrap();
++        write_secret(&path, &secret).unwrap();
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            format!("CCTG_HUB_SECRET='{}'\n", secret.expose())
++        );
++        std::fs::write(
++            &path,
++            "# mine\nCCTG_HUB_SECRET=old-shared-secret-000\n  export CCTG_HUB_SECRET = 'x'\nCCTG_HUB_SECRET_OTHER=1\nCCTG_HUB_HOOK_ADDR=h:1",
++        )
++        .unwrap();
++        write_secret(&path, &secret).unwrap();
++        assert_eq!(
++            std::fs::read_to_string(&path).unwrap(),
++            format!(
++                "# mine\nCCTG_HUB_SECRET_OTHER=1\nCCTG_HUB_HOOK_ADDR=h:1\nCCTG_HUB_SECRET='{}'\n",
++                secret.expose()
++            )
++        );
++        // dotenv (the hook's reader) takes the value as written.
++        let vars: std::collections::HashMap<String, String> = dotenvy::from_path_iter(&path)
++            .unwrap()
++            .collect::<Result<_, _>>()
++            .unwrap();
++        assert_eq!(vars[SECRET_VAR], secret.expose());
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
++            assert_eq!(mode & 0o777, 0o600);
++        }
++    }
++
++    #[test]
++    fn answers_are_read_strictly() {
++        assert_eq!(
++            split_answer(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
++            Some((200, &b"{}"[..]))
++        );
++        assert_eq!(
++            split_answer(b"HTTP/1.1 403 Forbidden\r\n\r\n"),
++            Some((403, &b""[..]))
++        );
++        assert_eq!(split_answer(b"HTTP/1.0 200 OK\r\n\r\n"), None);
++        assert_eq!(split_answer(b"HTTP/1.1 200 OK\r\n"), None);
++    }
++}
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -11,6 +11,7 @@
+ pub mod files;
+ pub mod hook;
+ pub mod hub;
++pub mod join;
+ pub mod keys;
+ pub mod proctree;
+ pub mod reads;
+diff --git a/crates/cctg/src/main.rs b/crates/cctg/src/main.rs
+--- a/crates/cctg/src/main.rs
++++ b/crates/cctg/src/main.rs
+@@ -19,11 +19,13 @@
+     /// Run the Telegram hub.
+     Hub {
+         /// Env file with CCTG_* settings; defaults to ./.env when it exists.
+-        #[arg(long)]
++        #[arg(long, global = true)]
+         env_file: Option<PathBuf>,
+         /// Stop gracefully when stdin closes (set by `cctg supervise`).
+         #[arg(long)]
+         stop_on_stdin: bool,
++        #[command(subcommand)]
++        command: Option<HubCommand>,
+     },
+     /// Keep `cctg hub` running from this executable's file; restart it when
+     /// `cctg deploy` asks.
+@@ -79,6 +81,21 @@
+     /// Check this device's hub settings (~/.cctg/device.env): both hub
+     /// links, the certificate pin and the secret. Exit 0 when they work.
+     Doctor,
++    /// Enroll this device with the hub: exchange a one-time join code for
++    /// this device's own secret, written to ~/.cctg/device.env (never
++    /// printed). The hub address and pin come from device.env.
++    Join {
++        /// The join code; else CCTG_JOIN_CODE.
++        code: Option<String>,
++    },
++}
++
++#[derive(Debug, Subcommand)]
++enum HubCommand {
++    /// Print a one-time join code for one device, good for 10 minutes; the
++    /// running hub of the same state directory takes it (`docker compose
++    /// exec hub cctg hub code`).
++    Code,
+ }
+ 
+ #[tokio::main]
+@@ -107,7 +124,13 @@
+     match cli.command {
+         Command::Hub {
+             env_file,
++            command: Some(HubCommand::Code),
++            ..
++        } => println!("{}", cctg::hub::mint_code(env_file.as_deref())?),
++        Command::Hub {
++            env_file,
+             stop_on_stdin,
++            command: None,
+         } => cctg::hub::run(env_file.as_deref(), stop_on_stdin).await?,
+         Command::Supervise { env_file } => {
+             let hub_args = env_file
+@@ -185,6 +208,7 @@
+             std::process::exit(if cctg::hub::healthy().await { 0 } else { 1 });
+         }
+         Command::Doctor => std::process::exit(cctg::doctor::run().await),
++        Command::Join { code } => std::process::exit(cctg::join::run(code).await),
+         Command::AgentInstall => {
+             let exe = std::env::current_exe()?;
+             let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
+@@ -215,7 +239,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Cli, Command};
++    use super::{Cli, Command, HubCommand};
+     use clap::Parser;
+ 
+     #[test]
+@@ -224,8 +248,27 @@
+             Cli::try_parse_from(["cctg", "hub"]).unwrap().command,
+             Command::Hub {
+                 env_file: None,
+-                stop_on_stdin: false
++                stop_on_stdin: false,
++                command: None,
+             }
++        ));
++        for args in [
++            &["cctg", "hub", "code", "--env-file", "x.env"][..],
++            &["cctg", "hub", "--env-file", "x.env", "code"][..],
++        ] {
++            assert!(matches!(
++                Cli::try_parse_from(args).unwrap().command,
++                Command::Hub { env_file: Some(path), command: Some(HubCommand::Code), .. }
++                    if path == std::path::Path::new("x.env")
++            ));
++        }
++        assert!(matches!(
++            Cli::try_parse_from(["cctg", "join", "ABCD-EFGH-JKMN-PQRS"]).unwrap().command,
++            Command::Join { code: Some(code) } if code == "ABCD-EFGH-JKMN-PQRS"
++        ));
++        assert!(matches!(
++            Cli::try_parse_from(["cctg", "join"]).unwrap().command,
++            Command::Join { code: None }
+         ));
+         assert!(matches!(
+             Cli::try_parse_from(["cctg", "hub", "--env-file", "x.env"])
+diff --git a/crates/cctg/src/wire.rs b/crates/cctg/src/wire.rs
+--- a/crates/cctg/src/wire.rs
++++ b/crates/cctg/src/wire.rs
+@@ -1149,6 +1149,56 @@
+     serde_json::from_value(value).map_err(|_| WireError::Malformed)
+ }
+ 
++/// `cctg join` (TASK-045): a [`JoinPost`] without `Authorization`; the code
++/// is the credential. `200` with a [`JoinAnswer`]: the device is enrolled;
++/// `403`: the code is unknown, used or expired (one answer for all);
++/// `503`: the hub cannot enroll now (full, disk); `404`: a hub before it.
++pub const JOIN_PATH: &str = "/v1/join";
++/// Longest join body: it is read before anything is authenticated.
++pub const MAX_JOIN_BODY: usize = 1024;
++
++/// Body of a join request. `name`: what `/devices` calls the device (its
++/// host name); the hub cleans it. `Debug` never shows the code.
++#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct JoinPost {
++    pub v: u32,
++    pub code: String,
++    #[serde(default)]
++    pub name: String,
++}
++
++impl fmt::Debug for JoinPost {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("JoinPost")
++            .field("name", &self.name)
++            .finish_non_exhaustive()
++    }
++}
++
++/// The new device: its id, its cleaned name and its secret (the value of
++/// `CCTG_HUB_SECRET` from now on). `Debug` never shows the secret.
++#[derive(Clone, PartialEq, Serialize, Deserialize)]
++pub struct JoinAnswer {
++    pub device_id: String,
++    pub name: String,
++    pub secret: Secret,
++}
++
++impl fmt::Debug for JoinAnswer {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("JoinAnswer")
++            .field("device_id", &self.device_id)
++            .field("name", &self.name)
++            .finish_non_exhaustive()
++    }
++}
++
++pub fn decode_join(body: &[u8]) -> Result<JoinPost, WireError> {
++    let value: Value = serde_json::from_slice(body).map_err(|_| WireError::Malformed)?;
++    check_version(&value)?;
++    serde_json::from_value(value).map_err(|_| WireError::Malformed)
++}
++
+ /// Claude Code's tool that asks the user multiple-choice questions
+ /// (TASK-038). Its `PreToolUse` hook asks the hub at [`QUESTION_PATH`]; the
+ /// hub shows no Allow/Deny for it and gives its `PermissionRequest` hook no
+@@ -2050,6 +2100,38 @@
+         let hello = AgentMsg::Hello { secret: secret() };
+         assert!(!format!("{hello:?}").contains(SECRET));
+         assert!(!format!("{:?}", secret()).contains(SECRET));
++        let join = JoinPost {
++            v: VERSION,
++            code: SECRET.into(),
++            name: "box".into(),
++        };
++        assert!(!format!("{join:?}").contains(SECRET));
++        let answer = JoinAnswer {
++            device_id: "0123abcd".into(),
++            name: "box".into(),
++            secret: secret(),
++        };
++        assert!(!format!("{answer:?}").contains(SECRET));
++    }
++
++    #[test]
++    fn join_posts_round_trip_and_check_the_version() {
++        let post = JoinPost {
++            v: VERSION,
++            code: "ABCD-EFGH-JKMN-PQRS".into(),
++            name: "box".into(),
++        };
++        assert_eq!(decode_join(&serde_json::to_vec(&post).unwrap()), Ok(post));
++        assert_eq!(
++            decode_join(br#"{"v":1,"code":"X"}"#).map(|post| post.name),
++            Ok(String::new())
++        );
++        assert_eq!(
++            decode_join(br#"{"v":2,"code":"X"}"#),
++            Err(WireError::Version)
++        );
++        assert_eq!(decode_join(br#"{"v":1}"#), Err(WireError::Malformed));
++        assert_eq!(decode_join(b"code"), Err(WireError::Malformed));
+     }
+ 
+     #[test]
+diff --git a/crates/cctg/tests/hub_reads_no_files.rs b/crates/cctg/tests/hub_reads_no_files.rs
+--- a/crates/cctg/tests/hub_reads_no_files.rs
++++ b/crates/cctg/tests/hub_reads_no_files.rs
+@@ -1,6 +1,6 @@
+ //! The hub opens no file of a session's machine (TASK-034): outside its own
+ //! state (`registry.json` through `RegistryStore`, the `getUpdates` offset,
+-//! the `.env` it starts with) and its test helpers, no file API appears in
++//! the device list and join codes (TASK-045), the `.env` it starts with) and its test helpers, no file API appears in
+ //! the non-test code of `src/hub/` (every file, also in subfolders). Session
+ //! files are read by the session's agent (`crate::reads`, `crate::tail`),
+ //! which the hub only asks over the link.
+@@ -8,7 +8,7 @@
+ use std::path::{Path, PathBuf};
+ 
+ /// Files that keep the hub's own state; they may touch files anywhere.
+-const OWN_STATE: [&str; 3] = ["config.rs", "offset.rs", "testdir.rs"];
++const OWN_STATE: [&str; 4] = ["config.rs", "devices.rs", "offset.rs", "testdir.rs"];
+ 
+ /// Items that keep the hub's own state inside other files: the file and the
+ /// first line of the item, which ends at its matching closing brace.
+@@ -105,10 +105,12 @@
+             // A string: `"..."` with escapes, or `r#"..."#` without.
+             let raw = c == 'r';
+             let mut hashes = 0;
+-            i += 1;
+-            while raw && chars.get(i) == Some(&'#') {
+-                hashes += 1;
+-                i += 1;
++            if raw {
++                i += 1; // the `r`
++                while chars.get(i) == Some(&'#') {
++                    hashes += 1;
++                    i += 1;
++                }
+             }
+             i += 1; // the opening quote
+             out.push('"');
+@@ -341,6 +343,8 @@
+         "let u = (\"//\", std::fs::read(p));",
+         "let u = (r#\"a \"// b\"#, std::fs::read(p));",
+         "let c = '\"'; let _ = std::fs::read(p);",
++        // An empty string ends at its second quote (TASK-045).
++        "let e = \"\"; let _ = std::fs::read(p);",
+     ] {
+         let source = format!("fn f() {{ {read} }}\n#[cfg(test)]\nmod tests {{}}\n");
+         assert_eq!(offending("slots.rs", &source).len(), 1, "{read}");
+@@ -365,6 +369,7 @@
+                  fn f(x: &File) { let _ = files::chunks(1, b); let _ = files::MAX_UPLOAD; }\n\
+                  fn g(&mut self) { self.reads.insert(1); let files = true; let _ = \"std::fs\"; }\n\
+                  struct C { reads: bool, files: bool }\n\
++                 fn e() -> [&'static str; 2] { [\"\", \"a device list\"] }\n\
+                  fn h<'a>(x: &'a str) -> char { '\\'' }\n\
+                  /* std::fs::read(p) */\n\
+                  #[cfg(test)]\nmod tests { fn g() { std::fs::read(\"x\"); } }\n";
+diff --git a/crates/cctg/tests/install_e2e.rs b/crates/cctg/tests/install_e2e.rs
+--- a/crates/cctg/tests/install_e2e.rs
++++ b/crates/cctg/tests/install_e2e.rs
+@@ -777,8 +777,10 @@
+     let empty = empty.to_string_lossy().into_owned();
+     let local = ["--agent-addr", "127.0.0.1:9", "--hook-addr", "127.0.0.1:9"];
+     let bad_host = [&local[..], &["--host", "my box"]].concat();
+-    let cases: [(&[&str], Option<&str>, &str); 5] = [
++    let bad_code = [&local[..], &["--join", "ABCD-EFGH;rm -rf"]].concat();
++    let cases: [(&[&str], Option<&str>, &str); 6] = [
+         (&local, None, "no hub secret"),
++        (&bad_code, None, "a join code has letters"),
+         (&bad_host, Some(SECRET), "the host name takes"),
+         (&["--hub-host", "192.0.2.10"], Some(SECRET), "needs --pin"),
+         (
+@@ -799,6 +801,90 @@
+         assert!(text.contains(error), "{args:?}: {text}");
+         assert!(!run.cctg_dir().exists(), "{args:?} wrote: {text}");
+     }
++}
++
++/// A device trades a join code for its own secret (TASK-045): `--join`
++/// writes it into device.env through `cctg join`, prints neither, and a
++/// spent code changes nothing.
++#[test]
++fn a_device_joins_with_a_code() {
++    let root = Root::new("join");
++    let dist = root.dir("dist");
++    release(&dist, &this_build());
++    let (base, _) = serve(dist);
++    let state = root.dir("hub-state");
++    let runtime = tokio::runtime::Runtime::new().unwrap();
++    let devices = cctg::hub::devices::Devices::open(&state, None).unwrap();
++    let (agent_addr, hook_addr) = runtime.block_on(async {
++        let hooks = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let hook_addr = hooks.local_addr().unwrap().to_string();
++        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
++        tokio::spawn(cctg::hub::ingress::serve_hooks(hooks, devices.clone(), tx));
++        tokio::spawn(async move { while rx.recv().await.is_some() {} });
++        let agents = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let agent_addr = agents.local_addr().unwrap().to_string();
++        tokio::spawn(async move {
++            let mut kept = Vec::new();
++            while let Ok((stream, _)) = agents.accept().await {
++                kept.push(stream);
++            }
++        });
++        (agent_addr, hook_addr)
++    });
++    let code = cctg::hub::devices::mint_code(&state, std::time::SystemTime::now()).unwrap();
++    let mut run = Run::new(&root);
++    run.env("CCTG_INSTALL_BASE_URL", &base);
++    run.fake_program("claude", FAKE_CLAUDE);
++    let args = [
++        "--yes",
++        "--agent-addr",
++        &agent_addr,
++        "--hook-addr",
++        &hook_addr,
++        "--host",
++        "joined-box",
++    ];
++    let (output, text) = run.install(&[&args[..], &["--join", &code]].concat());
++    assert!(output.status.success(), "{text}");
++    assert!(text.contains("this device is joined-box ("), "{text}");
++    assert!(text.contains("took the secret"), "cctg doctor: {text}");
++    let env_file = run.cctg_dir().join("device.env");
++    let env = std::fs::read_to_string(&env_file).unwrap();
++    let secret = env
++        .lines()
++        .find_map(|line| line.strip_prefix("CCTG_HUB_SECRET='"))
++        .and_then(|value| value.strip_suffix('\''))
++        .expect("the device's secret");
++    assert!(secret.starts_with("cctgd_"), "{env}");
++    assert!(!text.contains(secret) && !text.contains(&code), "{text}");
++    assert_eq!(devices.list().0[0].name, "joined-box");
++
++    // Again without a code: the device keeps its secret (install.sh puts
++    // its own lines in its own order).
++    let secret = secret.to_owned();
++    let (output, text) = run.install(&args);
++    assert!(output.status.success(), "{text}");
++    let env = std::fs::read_to_string(&env_file).unwrap();
++    assert!(
++        env.contains(&format!(
++            "CCTG_HUB_SECRET='{secret}'
++"
++        )),
++        "{env}"
++    );
++    assert_eq!(env.matches("CCTG_HUB_SECRET").count(), 1, "{env}");
++    // The spent code: refused, device.env as it was.
++    run.env("CCTG_JOIN_CODE", &code);
++    let (output, text) = run.install(&args);
++    assert!(!output.status.success(), "{text}");
++    assert!(text.contains("wrong, already used or expired"), "{text}");
++    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), env);
++    // Uninstall takes the secret line out like the other lines it wrote.
++    run.env.retain(|(key, _)| key != "CCTG_JOIN_CODE");
++    let (output, text) = run.install(&["--uninstall"]);
++    assert!(output.status.success(), "{text}");
++    assert!(!env_file.exists(), "{text}");
++    drop(runtime);
+ }
+ 
+ #[test]
+@@ -926,7 +1012,7 @@
+     // docker: every call goes to docker.log; the hub's log says it started.
+     run.fake_program(
+         "docker",
+-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\ncase \"$*\" in *' logs '*) echo 'hub-1  | INFO hub started, polling bot=x';; esac\nexit 0\n",
++        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\ncase \"$*\" in *' logs '*) echo 'hub-1  | INFO hub started, polling bot=x';; *' exec -T hub cctg hub code'*) echo 'ABCD-EFGH-JKMN-PQRS';; esac\nexit 0\n",
+     );
+     let docker_log = root.0.join("docker.log");
+     let hub_dir = run.home.join("hub");
+@@ -996,22 +1082,24 @@
+         .lines()
+         .find(|line| line.starts_with("curl -fsSL"))
+         .expect("the client line");
++    // A one-time join code of the hub, never the shared secret (TASK-045).
+     assert_eq!(
+         line,
+         format!(
+             "curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/{}/install.sh \
+-             | CCTG_HUB_SECRET='{secret}' sh -s -- --hub-host hub.example.org --pin {pin}",
++             | sh -s -- --hub-host hub.example.org --pin {pin} --join ABCD-EFGH-JKMN-PQRS",
+             release_tag()
+         )
+     );
+-    assert_eq!(
+-        text.matches(&secret).count(),
+-        1,
+-        "the secret only in the line"
++    assert!(
++        !text.contains(&secret),
++        "the shared secret was printed: {text}"
+     );
+     let calls = std::fs::read_to_string(&docker_log).unwrap();
+     assert!(
+-        calls.contains("compose pull hub") && calls.contains("compose up -d --force-recreate hub"),
++        calls.contains("compose pull hub")
++            && calls.contains("compose up -d --force-recreate hub")
++            && calls.contains("compose exec -T hub cctg hub code"),
+         "{calls}"
+     );
+ 
+diff --git a/crates/cctg/tests/join_e2e.rs b/crates/cctg/tests/join_e2e.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/join_e2e.rs
+@@ -0,0 +1,201 @@
++//! Device enrollment end to end (TASK-045), with the real binary on the
++//! device side: `cctg hub code` mints a code into a hub state directory,
++//! a hub (its real listeners, TLS with a certificate made here, in this
++//! process) takes it, `cctg join` trades it for the device's secret and
++//! writes it into a temp `~/.cctg/device.env`, `cctg doctor` gets in with
++//! it, a second use of the code is refused, and after a revoke the device
++//! is out. Neither the code nor the secret reaches any output or the hub's
++//! logs. Its own test binary: it installs a global log subscriber.
++
++use std::io;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::path::{Path, PathBuf};
++use std::process::Output;
++use std::sync::{Arc, Mutex};
++
++use cctg::hub::devices::Devices;
++use cctg::hub::ingress::{self, Listener};
++use cctg::wire::Secret;
++use rustls::pki_types::pem::PemObject;
++use tokio::sync::mpsc;
++
++mod common;
++
++const SHARED: &str = "join-e2e-shared-secret-0123456789";
++
++#[derive(Clone, Default)]
++struct Captured(Arc<Mutex<Vec<u8>>>);
++
++impl io::Write for Captured {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        if let Ok(mut out) = self.0.lock() {
++            out.extend_from_slice(buf);
++        }
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++struct Dir(PathBuf);
++
++impl Dir {
++    fn new(name: &str) -> Self {
++        let path =
++            std::env::temp_dir().join(format!("cctg-join-e2e-{}-{name}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&path);
++        std::fs::create_dir_all(&path).unwrap();
++        Self(path)
++    }
++}
++
++impl Drop for Dir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++fn run(home: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (Output, String) {
++    let mut command = common::cctg(home);
++    command.args(args).current_dir(cwd);
++    for (key, value) in env {
++        command.env(key, value);
++    }
++    let output = command.output().expect("cctg runs");
++    let text = format!(
++        "{}{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++    (output, text)
++}
++
++#[test]
++fn a_device_joins_with_a_code_and_is_out_after_a_revoke() {
++    let captured = Captured::default();
++    let writer = captured.clone();
++    let subscriber = tracing_subscriber::fmt()
++        .without_time()
++        .with_max_level(tracing::Level::TRACE)
++        .with_writer(move || writer.clone())
++        .finish();
++    tracing::subscriber::set_global_default(subscriber).expect("first subscriber");
++
++    let root = Dir::new("root");
++    let (home, state) = (root.0.join("home"), root.0.join("state"));
++    std::fs::create_dir_all(home.join(".cctg")).unwrap();
++    let runtime = tokio::runtime::Runtime::new().unwrap();
++
++    // The hub: TLS on both listeners, the shared secret still on.
++    let rcgen::CertifiedKey { cert, signing_key } =
++        rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
++    let key =
++        rustls::pki_types::PrivateKeyDer::from_pem_slice(signing_key.serialize_pem().as_bytes())
++            .unwrap();
++    let (acceptor, pin) = cctg::tls::Acceptor::new(vec![cert.der().clone()], key).unwrap();
++    let devices = Devices::open(&state, Some(Secret::parse(SHARED).unwrap())).unwrap();
++    let (agent_addr, hook_addr) = runtime.block_on(async {
++        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
++        let agents = ingress::bind(loopback).await.unwrap();
++        let hooks = ingress::bind(loopback).await.unwrap();
++        let addrs = (agents.local_addr().unwrap(), hooks.local_addr().unwrap());
++        let (agents_tx, mut agents_rx) = mpsc::channel(16);
++        let (hooks_tx, mut hooks_rx) = mpsc::channel(16);
++        tokio::spawn(ingress::serve_agents(
++            Listener::tls(agents, acceptor.clone()),
++            devices.clone(),
++            agents_tx,
++        ));
++        tokio::spawn(ingress::serve_hooks(
++            Listener::tls(hooks, acceptor),
++            devices.clone(),
++            hooks_tx,
++        ));
++        tokio::spawn(async move { while agents_rx.recv().await.is_some() {} });
++        tokio::spawn(async move { while hooks_rx.recv().await.is_some() {} });
++        addrs
++    });
++
++    // The device as install.sh leaves it before the join: addresses, pin,
++    // the shared secret, and a line of the user's.
++    let env_file = home.join(".cctg").join("device.env");
++    std::fs::write(
++        &env_file,
++        format!(
++            "# mine\nCCTG_HOST=laptop\nCCTG_HUB_SECRET='{SHARED}'\nCCTG_HUB_AGENT_ADDR={agent_addr}\nCCTG_HUB_HOOK_ADDR={hook_addr}\nCCTG_HUB_CERT_SHA256={pin}\n"
++        ),
++    )
++    .unwrap();
++
++    // `cctg hub code`: only the code on stdout.
++    let state_text = state.to_string_lossy().into_owned();
++    let (output, _) = run(
++        &home,
++        &root.0,
++        &["hub", "code"],
++        &[("CCTG_STATE_DIR", &state_text)],
++    );
++    assert!(output.status.success(), "{output:?}");
++    let code = String::from_utf8(output.stdout).unwrap().trim().to_owned();
++    assert_eq!(code.len(), 19, "{code}");
++
++    let (output, text) = run(&home, &root.0, &["join"], &[("CCTG_JOIN_CODE", &code)]);
++    assert!(output.status.success(), "{text}");
++    assert!(text.contains("this device is laptop ("), "{text}");
++    let written = std::fs::read_to_string(&env_file).unwrap();
++    let secret = written
++        .lines()
++        .find_map(|line| line.strip_prefix("CCTG_HUB_SECRET='"))
++        .and_then(|value| value.strip_suffix('\''))
++        .expect("the new secret line")
++        .to_owned();
++    assert!(secret.starts_with("cctgd_"), "{written}");
++    assert!(
++        !written.contains(SHARED),
++        "the shared secret is gone: {written}"
++    );
++    assert!(
++        written.starts_with("# mine\nCCTG_HOST=laptop\n"),
++        "{written}"
++    );
++    assert!(!text.contains(&secret) && !text.contains(&code), "{text}");
++
++    let (output, text) = run(&home, &root.0, &["doctor"], &[]);
++    assert!(output.status.success(), "{text}");
++    assert!(text.contains("took the secret"), "{text}");
++
++    // The code is spent: a clear refusal, no hint which way.
++    let (output, text) = run(&home, &root.0, &["join", &code.to_lowercase()], &[]);
++    assert_eq!(output.status.code(), Some(1), "{text}");
++    assert!(text.contains("wrong, already used or expired"), "{text}");
++    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), written);
++    let (output, text) = run(&home, &root.0, &["join"], &[]);
++    assert_eq!(output.status.code(), Some(2), "{text}");
++
++    // Revoked: the device is out.
++    let (listed, _) = devices.list();
++    assert_eq!(listed.len(), 1);
++    assert!(devices.revoke(&listed[0].id).is_some());
++    let (output, text) = run(&home, &root.0, &["doctor"], &[]);
++    assert!(!output.status.success(), "{text}");
++    assert!(text.contains("rejected the secret"), "{text}");
++
++    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
++    assert!(logs.contains("device enrolled with a join code"), "{logs}");
++    assert!(logs.contains("join code refused"), "{logs}");
++    let bare = code.replace('-', "");
++    for secret_text in [
++        secret.as_str(),
++        &secret[15..],
++        code.as_str(),
++        bare.as_str(),
++        SHARED,
++    ] {
++        assert!(
++            !logs.contains(secret_text),
++            "{secret_text} in the logs:\n{logs}"
++        );
++    }
++    drop(runtime);
++}
+diff --git a/deploy/hub.env.example b/deploy/hub.env.example
+--- a/deploy/hub.env.example
++++ b/deploy/hub.env.example
+@@ -2,7 +2,12 @@
+ CCTG_BOT_TOKEN=
+ CCTG_CHAT_ID=-100
+ CCTG_ALLOWED_USER_IDS=
+-# 16+ visible ASCII characters; the same value goes into every device.env.
++# 16+ visible ASCII characters. The shared secret of older devices; new
++# devices join with a one-time code and get their own secret
++# (docs/remote-hub.md, "Устройства и коды").
+ CCTG_HUB_SECRET=
++# Once every device has its own secret (/devices in Telegram shows who
++# still uses this one): CCTG_SHARED_SECRET=off, then restart the hub.
++# CCTG_SHARED_SECRET=on
+ # Only when Telegram is reachable just through a proxy (docs/remote-hub.md):
+ # HTTPS_PROXY=http://127.0.0.1:10809
+diff --git a/docs/remote-hub.md b/docs/remote-hub.md
+--- a/docs/remote-hub.md
++++ b/docs/remote-hub.md
+@@ -29,7 +29,7 @@
+ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/<тег>/install.sh | sh -s -- --hub
+ ```
+ 
+-Папка `~/cctg-hub` (другая: `--dir`). Команда спрашивает токен бота (скрытый ввод), id группы, id пользователей, прокси и адрес сервера (или берёт `CCTG_BOT_TOKEN`, `--chat-id`, `--users`, `--proxy`, `--public-host`), делает секрет и сертификат, пишет `hub.env` (600) и `.env` с `COMPOSE_FILE` (с `compose.host.yml`, если прокси на `127.0.0.1` хоста), `CCTG_IMAGE_TAG` (образ того же релиза, что и скрипт) и адресом сервера, запускает hub, ждёт в логе `hub started, polling` (бот, группа и права проверены) и печатает строку установки клиента с адресом, портами из `compose.yml`, pin и секретом. Без терминала адрес сервера обязателен (`--public-host`). Повторный запуск оставляет записанные значения, секрет и сертификат; `compose.yml` в том виде, в каком его записал скрипт, обновляется до версии релиза, а изменённый руками (порты) не перезаписывается, новая версия ложится рядом как `compose.yml.new`. `--hub --uninstall` делает `docker compose down` и убирает compose-файлы, `hub.env`, `tls/` и том остаются. Руками то же самое:
++Папка `~/cctg-hub` (другая: `--dir`). Команда спрашивает токен бота (скрытый ввод), id группы, id пользователей, прокси и адрес сервера (или берёт `CCTG_BOT_TOKEN`, `--chat-id`, `--users`, `--proxy`, `--public-host`), делает секрет и сертификат, пишет `hub.env` (600) и `.env` с `COMPOSE_FILE` (с `compose.host.yml`, если прокси на `127.0.0.1` хоста), `CCTG_IMAGE_TAG` (образ того же релиза, что и скрипт) и адресом сервера, запускает hub, ждёт в логе `hub started, polling` (бот, группа и права проверены) и печатает строку установки клиента с адресом, портами из `compose.yml`, pin и одноразовым кодом (раздел «Устройства и коды»); секрет hub она не печатает. Без терминала адрес сервера обязателен (`--public-host`). Повторный запуск оставляет записанные значения, секрет и сертификат; `compose.yml` в том виде, в каком его записал скрипт, обновляется до версии релиза, а изменённый руками (порты) не перезаписывается, новая версия ложится рядом как `compose.yml.new`. `--hub --uninstall` делает `docker compose down` и убирает compose-файлы, `hub.env`, `tls/` и том остаются. Руками то же самое:
+ 
+ Нужны Docker Engine с плагином compose (2.24 или новее, если нужен `compose.host.yml`) и два открытых наружу TCP-порта (по умолчанию 47291 для агентов и 47292 для хуков, другие номера в разделе «Порты»).
+ 
+@@ -91,7 +91,7 @@
+ `~/.cctg/device.env` каждой машины с сессиями:
+ 
+ ```
+-CCTG_HUB_SECRET=<тот же секрет, что в hub.env>
++CCTG_HUB_SECRET=<свой секрет устройства от cctg join, или общий секрет из hub.env>
+ CCTG_HUB_AGENT_ADDR=hub.example.org:47291
+ CCTG_HUB_HOOK_ADDR=hub.example.org:47292
+ CCTG_HUB_CERT_SHA256=AB:CD:...
+@@ -103,6 +103,25 @@
+ - Хуки над TLS ждут дольше: 900 мс (600 мс для `UserPromptSubmit` и тулов) вместо 500/300. Строка статуса держит свои 80 мс: если до сервера далеко, цифры контекста и лимитов в сообщение статуса не дойдут, строка статуса от этого не тормозит.
+ - Устройство ставит `install.sh` (README, шаг 3): бинарник своего тега из GitHub Releases, этот `device.env`, `~/.cctg/claude/{mcp.json,settings.json}` и обёртку `claude-cctg`. `~/.cctg/bin/cctg doctor` проверяет оба канала, pin и секрет. Руками: бинарник из GitHub Releases того же тега, что образ на сервере (про версии ниже); на Linux и macOS файл из Releases скачивается без права на запуск: `chmod +x` после каждого скачивания, иначе агент и хуки не стартуют (`Permission denied`); регистрация агента и хуков как в `docs/poc.md`: `cctg agent-install`, `docs/hook-settings.json`.
+ - macOS (Apple Silicon): файл `cctg-<тег>-aarch64-apple-darwin` не подписан. После скачивания `chmod +x` и `xattr -d com.apple.quarantine <файл>`. Управление консолью claude (⏹, `!`-команды, панели, перезапуск по «Обновить») на Linux и macOS работает, когда claude запущен через `claude-cctg` в терминале (TASK-044, `docs/poc.md`); вложенные `claude -p`, перепривязка агента после `/clear` и уборка сессий на macOS работают по обходу родителей процесса, как на Linux.
++
++## Устройства и коды
++
++С TASK-045 у каждой машины свой секрет, а общий `CCTG_HUB_SECRET` из `hub.env` на устройства больше не раздаётся.
++
++- Код: 16 знаков Crockford base32 (80 случайных бит), вид `XXXX-XXXX-XXXX-XXXX`, работает один раз и 10 минут. Регистр, дефисы и пробелы не важны, `O` читается как `0`, `I` и `L` как `1`. Код даёт `cctg hub code` рядом с запущенным hub: в Docker `cd ~/cctg-hub && docker compose exec hub cctg hub code`, у hub без Docker `cctg hub --env-file <тот же .env> code` в той же папке, что и hub (ему нужен только `CCTG_STATE_DIR`). `install.sh --hub` печатает один код в строке клиента. В каталоге состояния (`/data/join/`) лежит только sha256 кода и срок, не сам код. Неиспользованных кодов не больше 32 одновременно.
++- Обмен: `install.sh --join КОД` (или `CCTG_JOIN_CODE`) пишет адрес и pin, потом запускает `~/.cctg/bin/cctg join`. `cctg join [КОД]` можно запустить и руками на уже настроенной машине: он берёт адрес и pin из `device.env`, по TLS с pin (или по loopback без pin) шлёт `POST /v1/join` с кодом и именем машины (`CCTG_HOST` или имя системы) и заменяет строку `CCTG_HUB_SECRET` в `device.env` полученным секретом (файл 600 на Linux и macOS). Ни код, ни секрет он не печатает. Отказ один на все случаи: код неверный, уже использован или истёк.
++- Секрет устройства `cctgd_<id>_<64 hex>`: `<id>` (8 hex) публичный и виден в `/devices`, остальное 256 случайных бит. Hub хранит только sha256 секрета в `/data/devices.json` (имя, id, дата). Медленный хеш не нужен: подбирать 256 случайных бит бессмысленно. Устройств не больше 32.
++- `/devices` в теме General (только из allowlist): список устройств с датой и последним входом с запуска hub, состояние общего секрета (когда с ним входили последний раз) и по кнопке «Отозвать» на устройство. Отзыв спрашивает подтверждение. После «Да, отозвать» линки агентов этого устройства закрываются сразу, ждущие хуки разрешений и вопросов обрываются без ответа, следующий хук получает 401, `cctg doctor` пишет «rejected the secret». Отозванное устройство возвращается только с новым кодом. Сессии отозванного устройства в темах остаются «живыми без агента», пока hub не уберёт их по обычным правилам: `SessionEnd` от них больше не принимается.
++- Агент перечитывает `device.env` только при старте: после `cctg join` уже запущенные сессии ходят со старым секретом (общим, пока он включён), новые сессии и все хуки берут новый.
++- До секрета `/v1/join` защищён как остальные запросы хуков (раздел «Защита до секрета»): 2 с на весь запрос, тело не больше 1 КиБ, 16 недочитанных запросов с одного IP, 64 всего, неверный код отвечается через 250 мс. Этого хватает с запасом: за 10 минут жизни кода получается порядка 10^5 попыток против 2^80 вариантов.
++
++### Миграция
++
++1. Hub этой версии поднимается как раньше: общий секрет принимается (`CCTG_SHARED_SECRET` по умолчанию `on`), уже настроенные машины ничего не замечают.
++2. На каждой машине по очереди: код (`docker compose exec hub cctg hub code`), потом `~/.cctg/bin/cctg join КОД` или та же строка `install.sh ... --join КОД`. `cctg doctor` покажет «secret: set, this device's own». Запущенные сессии claude перезапускать не обязательно, но до перезапуска их агенты ходят с общим секретом.
++3. `/devices` показывает все машины и строку «последний вход с общим секретом». Когда она долго не меняется, в `hub.env` дописать `CCTG_SHARED_SECRET=off` и `docker compose up -d`. С этого момента общий секрет не пускает никого; hub с `off` запускается и без `CCTG_HUB_SECRET`.
++
++Откат: `CCTG_SHARED_SECRET=on` (или убрать строку) и перезапуск hub; секреты устройств продолжают работать.
+ 
+ ## Обновление
+ 
+@@ -146,7 +165,8 @@
+ - хук: одно окно 2 с от TCP-соединения на рукопожатие TLS и весь запрос; заголовки до проверки секрета не длиннее 8 КиБ, тело читается только после; одновременно не больше 64 запросов и не больше 16 недочитанных с одного IP;
+ - неверный секрет: сравнение за постоянное время, ответ (у агента `rejected`, у хука 401) только через 250 мс, в логе строка с адресом пира без значения секрета;
+ - неудачное рукопожатие TLS и соединение без единого байта (сканеры, healthcheck) пишутся только на уровне debug;
+-- прочие отказы до секрета (неверный секрет, мусор, чужая версия протокола, таймаут) дают не больше одного warning в минуту с одного IP, остальные строки идут на уровне debug.
++- прочие отказы до секрета (неверный секрет, мусор, чужая версия протокола, таймаут) дают не больше одного warning в минуту с одного IP, остальные строки идут на уровне debug;
++- `POST /v1/join` (TASK-045) единственный запрос без секрета: в тех же 2 с и местах хуков, тело не больше 1 КиБ, неверный, использованный и просроченный код получают одинаковый 403 через 250 мс, в логе строка с адресом пира без кода.
+ 
+ Остаток: адресов у сканеров много, и 4 источника могут занять все 16 мест агентов; настоящие устройства тогда переподключаются с паузой до 30 с. От этого firewall со списком адресов устройств или нестандартный порт. Устройства за одним NAT делят свои 4 места, но место держится только на время рукопожатия, поэтому это заметно только при одновременном переподключении многих сессий (после рестарта hub), и отказанные повторяют попытку сами.
+ 
+@@ -158,4 +178,4 @@
+ 
+ - Образ только x86_64. Клиенты: Windows x86_64, Linux x86_64, macOS arm64.
+ - Смена сертификата требует правки всех устройств и перезапуска их сессий (раздел выше).
+-- Все устройства знают один общий секрет hub; секреты по устройствам это TASK-045.
++- Не больше 32 устройств со своим секретом и 32 неиспользованных кодов. Последний вход устройства hub помнит только до перезапуска.
+diff --git a/install.sh b/install.sh
+--- a/install.sh
++++ b/install.sh
+@@ -19,7 +19,9 @@
+ #   one PATH line (marked "# cctg") in the shell's start file when
+ #   <home>/.local/bin is not in PATH: ~/.zshrc, ~/.bashrc or ~/.profile
+ # It never writes ~/.claude/settings.json or ~/.claude.json and never prints
+-# the hub secret (--hub prints it once, inside the client install line).
++# a secret: with --join the device trades a one-time code for its own secret
++# (cctg join writes it into device.env); --hub prints such a code, inside
++# the client install line.
+ # Running it again updates; --uninstall removes these files.
+ #
+ # The body is one function called on the last line: a download cut short
+@@ -60,6 +62,7 @@
+ hook_addr=
+ pin=
+ secret_file=
++join_code=${CCTG_JOIN_CODE:-}
+ host=
+ from_source=0
+ yes=0
+@@ -77,6 +80,7 @@
+         --hook-addr) need_value "$@"; hook_addr=$2; shift 2 ;;
+         --pin) need_value "$@"; pin=$2; shift 2 ;;
+         --secret-file) need_value "$@"; secret_file=$2; shift 2 ;;
++        --join) need_value "$@"; join_code=$2; shift 2 ;;
+         --host) need_value "$@"; host=$2; shift 2 ;;
+         --from-source) from_source=1; shift ;;
+         -y|--yes) yes=1; shift ;;
+@@ -142,6 +146,7 @@
+ offer_claude
+ install_binary
+ write_device_env
++[ -z "$join_code" ] || join_hub
+ write_claude_files
+ write_wrappers
+ say "installed $("$exe" --version)"
+@@ -164,8 +169,12 @@
+   --hook-addr H:P       the hub's hook address (instead of --hub-host)
+   --pin SHA256          the hub certificate's sha256 (needed for a hub on
+                         another machine; the openssl fingerprint line works)
+-  --secret-file FILE    read the hub secret from the first line of FILE
+-                        (or set CCTG_HUB_SECRET; otherwise it is asked for)
++  --join CODE           a one-time join code of the hub (cctg hub code on
++                        the hub, /devices in Telegram): this device gets
++                        its own secret (or set CCTG_JOIN_CODE)
++  --secret-file FILE    read the hub's shared secret from the first line of
++                        FILE (or set CCTG_HUB_SECRET; without a join code
++                        or a secret the code is asked for)
+   --host NAME           this machine's name in the topic titles (CCTG_HOST);
+                         in a container it is asked for, with --yes taken
+                         from CCTG_HOST
+@@ -320,8 +329,12 @@
+     secret=${CCTG_HUB_SECRET:-}
+     # Nothing started from here gets it: cctg doctor must check the file,
+     # as the sessions will.
+-    unset CCTG_HUB_SECRET
+-    if [ -n "$secret" ]; then
++    unset CCTG_HUB_SECRET CCTG_JOIN_CODE
++    if [ -n "$join_code" ]; then
++        # The device's own secret comes from the hub (join_hub).
++        secret=
++        check_code
++    elif [ -n "$secret" ]; then
+         :
+     elif [ -n "$secret_file" ]; then
+         [ "$os" != windows ] || secret_file=$(cygpath -u "$secret_file")
+@@ -330,15 +343,38 @@
+         secret=$(printf '%s' "$secret" | tr -d '\r')
+         [ -n "$secret" ] || die "$secret_file is empty (the secret is its first line)"
+     elif [ -z "$(old_line CCTG_HUB_SECRET)" ]; then
+-        interactive || die "no hub secret: set CCTG_HUB_SECRET or use --secret-file"
+-        read_hidden "Hub secret (CCTG_HUB_SECRET of the hub, not shown): " \
+-            "set CCTG_HUB_SECRET or use --secret-file"
+-        secret=$hidden
+-        hidden=
+-        [ -n "$secret" ] || die "no hub secret typed"
++        interactive || die "no join code and no hub secret: use --join CODE (or CCTG_HUB_SECRET, --secret-file)"
++        ask "Join code from the hub (empty: type the hub's shared secret instead): "
++        join_code=$answer
++        if [ -n "$join_code" ]; then
++            check_code
++        else
++            read_hidden "Hub secret (CCTG_HUB_SECRET of the hub, not shown): " \
++                "use --join CODE, set CCTG_HUB_SECRET or use --secret-file"
++            secret=$hidden
++            hidden=
++            [ -n "$secret" ] || die "no hub secret typed"
++        fi
+     fi
+     [ -z "$secret" ] || check_secret
+     choose_host
++}
++
++# XXXX-XXXX-XXXX-XXXX as the hub prints it; the hub checks the rest.
++check_code() {
++    case $join_code in
++        *[!A-Za-z0-9\ -]*) die "a join code has letters, digits and dashes only" ;;
++    esac
++}
++
++# The device's own secret for the join code: cctg join asks the hub (the
++# address and pin just written) and puts the secret into device.env; it
++# never prints it. A refused code leaves device.env as it was.
++join_hub() {
++    say "joining the hub with the code"
++    CCTG_JOIN_CODE=$join_code "$exe" join </dev/null \
++        || die "the hub did not enroll this device (above); run this again with a new join code"
++    join_code=
+ }
+ 
+ check_host() {
+@@ -880,11 +916,11 @@
+     case $proxy in
+         *[\ \"\'\$\#\`\\]*) die "the proxy URL has a character hub.env cannot carry" ;;
+     esac
+-    hub_secret=$(value_of "$hub_env" CCTG_HUB_SECRET)
++    # The shared secret: the hub needs one while CCTG_SHARED_SECRET is on;
++    # devices get their own through join codes and never see it.
+     new_secret=
+-    if [ -z "$hub_secret" ]; then
++    if [ -z "$(value_of "$hub_env" CCTG_HUB_SECRET)" ]; then
+         new_secret=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+-        hub_secret=$new_secret
+     fi
+ 
+     old_umask=$(umask)
+@@ -953,9 +989,16 @@
+     else
+         where="--agent-addr $public_host:$agent_port --hook-addr $public_host:$hook_port"
+     fi
+-    say "the hub is up. On each device with Claude Code run (the line carries the hub secret: only your own machines, and clear it from chat history):"
+-    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | CCTG_HUB_SECRET=$(squote "$hub_secret") sh -s -- $where --pin $pin"
+-    hub_secret=
++    # A one-time join code of the running hub (TASK-045).
++    more="cd $hub_dir && docker compose exec hub cctg hub code"
++    code=$(cd "$hub_dir" && docker compose exec -T hub cctg hub code </dev/null) \
++        || die "the hub is up but gave no join code; ask it for one: $more"
++    case $code in
++        ????-????-????-????) ;;
++        *) die "the hub is up but gave no join code; ask it for one: $more" ;;
++    esac
++    say "the hub is up. On a device with Claude Code run this line; its join code works once, for 10 minutes. For every next device a new code: $more (or /devices in Telegram says how)"
++    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | sh -s -- $where --pin $pin --join $code"
+ }
+ 
+ # device_port <hub.env key> <default>: the port devices use for one of the
