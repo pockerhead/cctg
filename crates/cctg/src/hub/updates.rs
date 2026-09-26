@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::api::{ApiError, BotApi, FileInfo, Message, Update};
+use super::api::{ApiError, BotApi, FileInfo, Message, Update, User};
 use super::buffer::Attachment;
 use super::config::Allowlist;
 use super::offset::OffsetStore;
@@ -55,6 +55,9 @@ pub struct Inbound {
     /// A file the message carried and its caption (TASK-032); `text` is
     /// then `None`. Never logged but for its kind and size.
     pub media: Option<Media>,
+    /// The sender's [`author_name`], only when the allowlist is a team
+    /// (TASK-036). Never logged.
+    pub from_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +132,36 @@ pub struct CallbackInput {
     pub query_id: String,
     pub data: Option<String>,
     pub message_id: Option<i64>,
+    /// Who pressed, as [`Inbound::from_name`].
+    pub from_name: Option<String>,
+}
+
+/// UTF-16 units kept of an author's name.
+pub const NAME_LIMIT: usize = 32;
+
+/// How a team member is shown to the session and in signed answers: the
+/// username, else the first name. Line breaks and other whitespace become
+/// one space; control characters, invisible formatting ones (bidi
+/// overrides, zero-width) and `<>"` are dropped; at most [`NAME_LIMIT`].
+/// `None` when nothing is left. Never the user id.
+pub fn author_name(from: &User) -> Option<String> {
+    let invisible = |c: char| {
+        matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}'
+            | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}')
+    };
+    let clean = |raw: &str| {
+        let kept: String = raw
+            .chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .filter(|&c| !c.is_control() && !invisible(c) && !matches!(c, '<' | '>' | '"'))
+            .collect();
+        let name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!name.is_empty()).then(|| cut(&name, NAME_LIMIT))
+    };
+    from.username
+        .as_deref()
+        .and_then(clean)
+        .or_else(|| from.first_name.as_deref().and_then(clean))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +235,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         if !allowlist.contains(from.id) {
             return Routed::Ignored(Ignored::NotAllowed);
         }
+        let from_name = author_name(&from).filter(|_| allowlist.is_team());
         let media = media(&mut message);
         let thread_id = message
             .message_thread_id
@@ -225,6 +259,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             quote,
             forwarded: message.forward_origin.is_some(),
             media,
+            from_name,
         });
     }
 
@@ -246,6 +281,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             query_id: query.id,
             data: query.data,
             message_id: query.message.map(|message| message.message_id),
+            from_name: author_name(&from).filter(|_| allowlist.is_team()),
         });
     }
 
@@ -467,6 +503,7 @@ mod tests {
                 quote: None,
                 forwarded: false,
                 media: None,
+                from_name: None,
             })
         );
 
@@ -492,8 +529,90 @@ mod tests {
                 query_id: "q1".to_owned(),
                 data: Some("allow:abcde".to_owned()),
                 message_id: Some(10),
+                from_name: None,
             })
         );
+    }
+
+    #[test]
+    fn a_team_names_the_author_of_messages_and_presses_and_one_person_does_not() {
+        const MATE: i64 = 1002;
+        let team: Allowlist = [ALLOWED, MATE].into_iter().collect();
+        let route = |update: Value, allowlist: &Allowlist| {
+            let (_, mut routed) = route_batch(vec![update], None, CHAT, allowlist);
+            routed.remove(0)
+        };
+        let from =
+            json!({ "id": MATE, "is_bot": false, "first_name": "Анна", "username": "anna_k" });
+        let mut text = message(MATE, json!({ "text": "hi" }));
+        text["from"] = from.clone();
+        let press = json!({ "update_id": 2, "callback_query": {
+            "id": "q1", "from": from, "chat_instance": "c", "data": "allow:abcde",
+            "message": message(BOT, json!({ "text": "prompt" })),
+        }});
+        let text = json!({ "update_id": 1, "message": text });
+        match route(text.clone(), &team) {
+            Routed::Input(input) => assert_eq!(input.from_name.as_deref(), Some("anna_k")),
+            other => panic!("{other:?}"),
+        }
+        match route(press.clone(), &team) {
+            Routed::Callback(input) => assert_eq!(input.from_name.as_deref(), Some("anna_k")),
+            other => panic!("{other:?}"),
+        }
+        // One person: no names, as before the team mode.
+        let alone: Allowlist = [MATE].into_iter().collect();
+        assert!(matches!(
+            route(text, &alone),
+            Routed::Input(Inbound {
+                from_name: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            route(press, &alone),
+            Routed::Callback(CallbackInput {
+                from_name: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_author_name_is_cleaned_and_bounded() {
+        let user = |username: Option<&str>, first_name: Option<&str>| User {
+            id: 987654321,
+            is_bot: false,
+            username: username.map(str::to_owned),
+            first_name: first_name.map(str::to_owned),
+        };
+        assert_eq!(
+            author_name(&user(Some("anna_k"), Some("Анна"))).as_deref(),
+            Some("anna_k")
+        );
+        assert_eq!(
+            author_name(&user(None, Some("Анна"))).as_deref(),
+            Some("Анна")
+        );
+        // Line breaks, tabs, controls, bidi overrides, zero-width and tag
+        // characters go; runs of spaces become one.
+        assert_eq!(
+            author_name(&user(
+                None,
+                Some("  Иван\n\tПетров\u{0007}\u{202E}\u{200B} <b>\"x\"  ")
+            ))
+            .as_deref(),
+            Some("Иван Петров bx")
+        );
+        // Nothing visible left: the next choice, else no name at all.
+        assert_eq!(
+            author_name(&user(Some("\u{200B}"), Some("Анна"))).as_deref(),
+            Some("Анна")
+        );
+        assert_eq!(author_name(&user(Some(" "), Some("\n"))), None);
+        assert_eq!(author_name(&user(None, None)), None);
+        let long = author_name(&user(None, Some(&"😀".repeat(100)))).unwrap();
+        assert!(transcript::telegram_len(&long) <= NAME_LIMIT, "{long}");
+        assert!(long.ends_with('…'));
     }
 
     #[test]

@@ -672,6 +672,7 @@ async fn e2e_reactions() {
             quote: None,
             forwarded: false,
             media: None,
+            from_name: None,
         }))
         .unwrap();
     wait_for("eyes", 10, || fake.reactions() == [(555, "👀".to_owned())]).await;

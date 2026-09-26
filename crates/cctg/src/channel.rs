@@ -63,6 +63,9 @@ here shows up in the Telegram topic automatically: the text you write, your visi
 line per tool call and the final answer of each turn. Just work and answer normally. You do not \
 need this server's `reply` tool (`mcp__<server>__reply`, normally `mcp__cctg__reply`): it is kept \
 only for compatibility, and a message sent through it repeats what the user already sees. \
+The topic may be shared by a team whose members are all equal users: then each message, and each \
+`---`-separated part of a message made of several, starts with its author's name and a colon, and \
+the tag has a `from_name` attribute when one person wrote all of it. \
 If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
 never ask for permissions through `reply`. A tag with a `file_path` attribute brings a file the user sent \

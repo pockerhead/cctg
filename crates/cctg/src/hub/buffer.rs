@@ -85,6 +85,9 @@ pub struct Parked {
     /// maybe empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<Attachment>,
+    /// See [`crate::hub::updates::Inbound::from_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
 }
 
 /// Heads a forwarded message in the content the session reads.
@@ -92,7 +95,8 @@ pub const FORWARDED: &str = "(переслано)";
 
 impl Parked {
     /// What the session reads: the quoted words as `> ` lines and a blank
-    /// line, then [`FORWARDED`] on its own line for a forward, then the text.
+    /// line, then `Name: ` of a team member (TASK-036), then [`FORWARDED`]
+    /// on its own line for a forward, then the text.
     pub fn content(&self) -> String {
         let mut content = String::new();
         if let Some(quote) = &self.quote {
@@ -101,6 +105,13 @@ impl Parked {
                 content.push('\n');
             }
             content.push('\n');
+        }
+        if let Some(name) = &self.from_name {
+            content.push_str(name);
+            content.push(':');
+            if self.forwarded || !self.text.is_empty() {
+                content.push(' ');
+            }
         }
         if self.forwarded {
             content.push_str(FORWARDED);
@@ -247,6 +258,7 @@ mod tests {
             quote: None,
             forwarded: false,
             file: None,
+            from_name: None,
         }
     }
 
@@ -289,6 +301,50 @@ mod tests {
             ..parked(2)
         };
         assert_eq!(forward.content(), "(переслано)\nчужие\nслова");
+    }
+
+    #[test]
+    fn a_team_member_is_named_before_the_words_and_after_the_quote() {
+        let named = |parked: Parked| Parked {
+            from_name: Some("Анна".into()),
+            ..parked
+        };
+        assert_eq!(named(parked(1)).content(), "Анна: m1");
+        let reply = named(Parked {
+            quote: Some("q".into()),
+            ..parked(2)
+        });
+        assert_eq!(reply.content(), "> q\n\nАнна: m2");
+        let forward = named(Parked {
+            forwarded: true,
+            ..parked(3)
+        });
+        assert_eq!(forward.content(), "Анна: (переслано)\nm3");
+        // A file without a caption.
+        let bare = named(Parked {
+            text: String::new(),
+            ..parked(4)
+        });
+        assert_eq!(bare.content(), "Анна:");
+        // Each part of a burst keeps its own author.
+        let other = Parked {
+            from_name: Some("Иван".into()),
+            ..parked(5)
+        };
+        assert_eq!(
+            burst_content(&[named(parked(1)), other]),
+            "Анна: m1\n\n---\n\nИван: m5"
+        );
+        assert!(
+            !serde_json::to_string(&parked(1))
+                .unwrap()
+                .contains("from_name")
+        );
+        let kept = serde_json::to_string(&named(parked(1))).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Parked>(&kept).unwrap(),
+            named(parked(1))
+        );
     }
 
     #[test]
