@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::agent::LinkEvent;
-use crate::wire::{AgentMsg, Behavior, HubMsg, PermissionRequest};
+use crate::wire::{AgentMsg, Behavior, HubMsg, MAX_ALBUM, PermissionRequest};
 
 pub const SERVER_NAME: &str = "cctg";
 /// The MCP revision answered when the client asks for one we do not know
@@ -72,7 +72,8 @@ never ask for permissions through `reply`. A tag with a `file_path` attribute br
 (a photo, a document, a voice message...): it is saved on this machine at that path; open it with your \
 tools when it matters. To give the user a file of this machine, call this server's `send_file` tool \
 (normally `mcp__cctg__send_file`) with its path and a short caption saying what the file is: \
-pictures arrive as photos, anything else as a document, 50 MB at most.";
+pictures arrive as photos, anything else as a document, 50 MB at most. Several files at once go \
+with `paths` as one album.";
 
 /// Why this agent has no hub link. Shown to Claude when it calls `reply`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,11 +117,12 @@ pub struct Server {
 }
 
 /// A `send_file` call waiting for the agent loop; its answer is
-/// [`tool_answer`] for `id`.
+/// [`tool_answer`] for `id`. `paths`: one file (`path`), or 2 to
+/// [`MAX_ALBUM`] of them (`paths`, TASK-059).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileCall {
     pub id: Value,
-    pub path: String,
+    pub paths: Vec<String>,
     pub caption: Option<String>,
 }
 
@@ -400,12 +402,30 @@ impl Server {
     /// answered at once as tool errors.
     fn send_file(&mut self, id: &Value, arguments: Option<&Value>) -> Option<Vec<u8>> {
         let answer = |text: &str| Some(tool_answer(id, text, true));
-        let path = arguments
-            .and_then(|arguments| arguments.get("path"))
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty());
-        let Some(path) = path else {
-            return answer("send_file needs a non-empty `path` string");
+        let named = |value: &Value| {
+            value
+                .as_str()
+                .filter(|path| !path.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let field = |name: &str| {
+            arguments
+                .and_then(|arguments| arguments.get(name))
+                .filter(|value| !value.is_null())
+        };
+        let paths = match (field("path"), field("paths")) {
+            (Some(_), Some(_)) => return answer("send_file takes `path` or `paths`, not both"),
+            (None, Some(list)) => match list
+                .as_array()
+                .map(|list| list.iter().map(named).collect::<Option<Vec<String>>>())
+            {
+                Some(Some(paths)) if (2..=MAX_ALBUM).contains(&paths.len()) => paths,
+                _ => return answer(BAD_PATHS),
+            },
+            (path, None) => match path.and_then(named) {
+                Some(path) => vec![path],
+                None => return answer("send_file needs a non-empty `path` string"),
+            },
         };
         let caption = match arguments.and_then(|arguments| arguments.get("caption")) {
             None | Some(Value::Null) => None,
@@ -418,7 +438,7 @@ impl Server {
         }
         self.file_calls.push(FileCall {
             id: id.clone(),
-            path: path.to_owned(),
+            paths,
             caption,
         });
         None
@@ -464,6 +484,11 @@ fn cap(mut text: String, max: usize) -> String {
     text
 }
 
+const BAD_PATHS: &str =
+    "`paths` must be a list of 2 to 10 non-empty path strings; for one file use `path`";
+
+/// Exactly one of `path` and `paths` is checked by [`Server::send_file`]:
+/// the Messages API takes no `oneOf` at the top of a tool's input schema.
 fn send_file_tool() -> Value {
     json!({
         "name": SEND_FILE_TOOL,
@@ -471,20 +496,29 @@ fn send_file_tool() -> Value {
             session: a JPEG, PNG or WebP picture of up to 10 MB arrives as a photo, anything \
             else as a document; 50 MB at most. Use it when the user should get the file itself \
             (a screenshot, a report, a build artifact), not for text: what you write reaches \
-            the topic anyway. Answers once Telegram took the file.",
+            the topic anyway. Give either `path` (one file) or `paths` (2 to 10 files, sent \
+            together as one album: pictures as a photo album, the rest as a document album, \
+            pictures first). Answers once Telegram took the files, saying what went and what \
+            did not.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The file: an absolute path, or one relative to the session's working folder.",
+                    "description": "One file: an absolute path, or one relative to the session's working folder. Leave it out when you give `paths`.",
+                },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 2,
+                    "maxItems": MAX_ALBUM,
+                    "description": "Several files, 2 to 10, each like `path`, sent as one album in this order. Leave it out when you give `path`.",
                 },
                 "caption": {
                     "type": "string",
-                    "description": "Always give one: a short text shown with the file, what it is and why you send it (Telegram shows at most 1024 characters). Without it the file name is shown.",
+                    "description": "Always give one: a short text shown with the file, what it is and why you send it (Telegram shows at most 1024 characters). Without it the file name is shown. With `paths` it goes on the first file of the album.",
                 },
             },
-            "required": ["path"],
             "additionalProperties": false,
         },
     })
@@ -897,9 +931,21 @@ mod tests {
         let tools = answer["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[1]["name"], "send_file");
-        assert_eq!(tools[1]["inputSchema"]["required"], json!(["path"]));
+        // `path` or `paths` (TASK-059): the server checks that one is given.
+        let schema = &tools[1]["inputSchema"];
+        assert!(schema.get("required").is_none() && schema.get("oneOf").is_none());
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(
+            (
+                &schema["properties"]["paths"]["type"],
+                &schema["properties"]["paths"]["minItems"],
+                &schema["properties"]["paths"]["maxItems"]
+            ),
+            (&json!("array"), &json!(2), &json!(10))
+        );
         let description = tools[1]["description"].as_str().unwrap();
         assert!(description.contains("as a photo") && description.contains("50 MB"));
+        assert!(description.contains("`paths`") && description.contains("album"));
         // TASK-051: a caption is asked for; the name stands in without one.
         let caption = tools[1]["inputSchema"]["properties"]["caption"]["description"]
             .as_str()
@@ -932,7 +978,10 @@ mod tests {
                 text: "done ✓".into()
             }
         );
-        server.on_link(LinkEvent::Up { files: true });
+        server.on_link(LinkEvent::Up {
+            files: true,
+            albums: true,
+        });
         let answer = one(&mut server, call);
         assert!(
             answer["result"]["content"][0]["text"]
@@ -960,12 +1009,12 @@ mod tests {
             [
                 FileCall {
                     id: json!(4),
-                    path: "C:/x/shot.png".into(),
+                    paths: vec!["C:/x/shot.png".into()],
                     caption: Some("look".into()),
                 },
                 FileCall {
                     id: json!(5),
-                    path: "rel.txt".into(),
+                    paths: vec!["rel.txt".into()],
                     caption: None,
                 },
             ]
@@ -976,6 +1025,12 @@ mod tests {
             json!({ "path": " " }),
             json!({ "path": 7 }),
             json!({ "path": "a", "caption": 1 }),
+            json!({ "paths": ["a"] }),
+            json!({ "paths": ["a", " "] }),
+            json!({ "paths": ["a", 2] }),
+            json!({ "paths": "a" }),
+            json!({ "paths": vec!["a"; 11] }),
+            json!({ "path": "a", "paths": ["b", "c"] }),
         ] {
             let answer = one(&mut server, &call(6, arguments.clone()));
             assert_eq!(answer["id"], 6, "{arguments}");
@@ -983,6 +1038,20 @@ mod tests {
         }
         assert!(server.take_file_calls().is_empty());
         assert!(rx.try_recv().is_err(), "nothing reached the hub");
+        // Several files (TASK-059); a null `path` counts as none.
+        let album = call(
+            9,
+            json!({ "path": null, "paths": ["a.png", "b.txt"], "caption": "two" }),
+        );
+        assert!(server.on_line(album.as_bytes()).is_empty());
+        assert_eq!(
+            server.take_file_calls(),
+            [FileCall {
+                id: json!(9),
+                paths: vec!["a.png".into(), "b.txt".into()],
+                caption: Some("two".into()),
+            }]
+        );
         // Without a hub it says why at once.
         let mut off = Server::new(Hub::Off(NoHub::Headless));
         init(&mut off);
@@ -1110,6 +1179,7 @@ mod tests {
             HubMsg::FileAnswer {
                 transfer_id: 1,
                 outcome: crate::wire::FileOutcome::Sent,
+                parts: Vec::new(),
             },
         ] {
             assert!(server.on_link(LinkEvent::Message(msg)).is_empty());

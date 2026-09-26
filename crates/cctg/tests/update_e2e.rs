@@ -370,6 +370,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     let accepted = HubMsg::FileAnswer {
         transfer_id,
         outcome: FileOutcome::Accepted,
+        parts: Vec::new(),
     };
     to_second.send(accepted).await.unwrap();
     let mut received = 0;
@@ -385,6 +386,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
     let sent = HubMsg::FileAnswer {
         transfer_id,
         outcome: FileOutcome::Sent,
+        parts: Vec::new(),
     };
     to_second.send(sent).await.unwrap();
     wait_for("the send_file answer", answered(121)).await;

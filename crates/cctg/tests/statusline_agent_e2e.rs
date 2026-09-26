@@ -58,6 +58,7 @@ async fn slow_hub(bound: bool) -> (String, mpsc::Receiver<AgentMsg>) {
                 let registered = HubMsg::Registered {
                     files: false,
                     heartbeat: false,
+                    albums: false,
                 };
                 wire::write_msg(&mut write, &registered).await.unwrap();
                 if bound {

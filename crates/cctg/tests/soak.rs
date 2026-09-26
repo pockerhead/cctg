@@ -479,6 +479,18 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             document,
             ..
         } => ("photo", *thread_id, document.file_name.clone(), None),
+        Op::SendAlbum {
+            thread_id, items, ..
+        } => (
+            "album",
+            *thread_id,
+            items
+                .iter()
+                .map(|item| item.file_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            None,
+        ),
         Op::Stream {
             thread_id, text, ..
         } => ("stream", Some(*thread_id), text.clone(), None),

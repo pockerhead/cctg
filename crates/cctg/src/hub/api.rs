@@ -372,6 +372,50 @@ impl BotApi {
             .await
     }
 
+    /// `sendMediaGroup` (TASK-059): 2-10 files as one album, all photos
+    /// (`photos`) or all documents, which Telegram never mixes; each file is
+    /// the multipart field `file<i>`, named by `attach://file<i>`. Answers
+    /// the first message of the album.
+    pub async fn send_media_group(
+        &self,
+        thread_id: Option<i64>,
+        items: &[Document],
+        photos: bool,
+        notify: bool,
+    ) -> Result<Message, ApiError> {
+        let kind = if photos { "photo" } else { "document" };
+        let mut media = Vec::with_capacity(items.len());
+        let mut form = reqwest::multipart::Form::new().text("chat_id", self.chat_id.to_string());
+        for (index, item) in items.iter().enumerate() {
+            let field = format!("file{index}");
+            let mut entry = json!({ "type": kind, "media": format!("attach://{field}") });
+            if let Some(caption) = &item.caption {
+                entry["caption"] = json!(caption);
+            }
+            media.push(entry);
+            let part = reqwest::multipart::Part::bytes(item.bytes.clone())
+                .file_name(item.file_name.clone());
+            form = form.part(field, part);
+        }
+        form = form.text("media", Value::Array(media).to_string());
+        if !notify {
+            form = form.text("disable_notification", "true");
+        }
+        if let Some(thread_id) = thread_id {
+            form = form.text("message_thread_id", thread_id.to_string());
+        }
+        let response = self
+            .http
+            .post(format!("{}/sendMediaGroup", self.base))
+            .multipart(form)
+            .timeout(DOCUMENT_TIMEOUT)
+            .send()
+            .await
+            .map_err(ApiError::http)?;
+        let messages: Vec<Message> = decode(response).await?;
+        Ok(messages.into_iter().next().unwrap_or_default())
+    }
+
     /// One multipart upload: the bytes as field `field` of `method`.
     async fn send_file(
         &self,
@@ -880,6 +924,75 @@ mod tests {
             .map(|line| line.split(['/', ' ']).nth(3).unwrap_or_default().to_owned())
             .collect();
         assert_eq!(methods, ["sendPhoto", "sendDocument", "sendPhoto"]);
+    }
+
+    /// TASK-059: Telegram refuses a photo album as a whole; the same files
+    /// then go as a document album in the same job. A document album and
+    /// any other refusal are not sent again.
+    #[tokio::test]
+    async fn a_refused_photo_album_goes_again_as_documents() {
+        use crate::hub::scheduler::{Op, Outcome, Transport};
+        let json = |status, body: &str| {
+            http_answer(
+                status,
+                &format!("content-length: {}\r\n", body.len()),
+                body.as_bytes(),
+            )
+        };
+        let album = r#"{"ok":true,"result":[{"message_id":7,"chat":{"id":-1001}},{"message_id":8,"chat":{"id":-1001}}]}"#;
+        let refused = |description: &str| {
+            json(
+                "400 Bad Request",
+                &format!(r#"{{"ok":false,"error_code":400,"description":"{description}"}}"#),
+            )
+        };
+        let (url, seen) = fake_server(vec![
+            refused("Bad Request: IMAGE_PROCESS_FAILED"),
+            json("200 OK", album),
+            refused("Bad Request: message thread not found"),
+            refused("Bad Request: IMAGE_PROCESS_FAILED"),
+            // Taken only by a fallback that should not happen.
+            json("200 OK", album),
+        ])
+        .await;
+        let api = test_api(&url);
+        let items = vec![
+            Document {
+                file_name: "a.png".into(),
+                bytes: b"\x89PNG\r\n\x1a\na".to_vec(),
+                caption: Some("two".into()),
+            },
+            Document {
+                file_name: "b.png".into(),
+                bytes: b"\x89PNG\r\n\x1a\nb".to_vec(),
+                caption: None,
+            },
+        ];
+        let photos = Op::SendAlbum {
+            thread_id: Some(100),
+            items: items.clone(),
+            photos: true,
+            notify: false,
+        };
+        match api.execute(&photos).await {
+            Ok(Outcome::Sent(message)) => assert_eq!(message.message_id, 7),
+            other => panic!("{other:?}"),
+        }
+        assert!(api.execute(&photos).await.is_err(), "a lost topic");
+        let documents = Op::SendAlbum {
+            thread_id: Some(100),
+            items,
+            photos: false,
+            notify: false,
+        };
+        assert!(api.execute(&documents).await.is_err());
+        let methods: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| line.split(['/', ' ']).nth(3).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(methods, ["sendMediaGroup"; 4]);
     }
 
     #[tokio::test]
