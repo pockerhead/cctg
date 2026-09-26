@@ -19,7 +19,9 @@
 #   one PATH line (marked "# cctg") in the shell's start file when
 #   <home>/.local/bin is not in PATH: ~/.zshrc, ~/.bashrc or ~/.profile
 # It never writes ~/.claude/settings.json or ~/.claude.json and never prints
-# the hub secret (--hub prints it once, inside the client install line).
+# a secret: with --join the device trades a one-time code for its own secret
+# (cctg join writes it into device.env); --hub prints such a code, inside
+# the client install line.
 # Running it again updates; --uninstall removes these files.
 #
 # The body is one function called on the last line: a download cut short
@@ -60,6 +62,7 @@ agent_addr=
 hook_addr=
 pin=
 secret_file=
+join_code=${CCTG_JOIN_CODE:-}
 host=
 from_source=0
 yes=0
@@ -77,6 +80,7 @@ while [ $# -gt 0 ]; do
         --hook-addr) need_value "$@"; hook_addr=$2; shift 2 ;;
         --pin) need_value "$@"; pin=$2; shift 2 ;;
         --secret-file) need_value "$@"; secret_file=$2; shift 2 ;;
+        --join) need_value "$@"; join_code=$2; shift 2 ;;
         --host) need_value "$@"; host=$2; shift 2 ;;
         --from-source) from_source=1; shift ;;
         -y|--yes) yes=1; shift ;;
@@ -142,6 +146,7 @@ read_settings
 offer_claude
 install_binary
 write_device_env
+[ -z "$join_code" ] || join_hub
 write_claude_files
 write_wrappers
 say "installed $("$exe" --version)"
@@ -164,8 +169,12 @@ Bash): the cctg binary, device.env, Claude Code files and claude-cctg.
   --hook-addr H:P       the hub's hook address (instead of --hub-host)
   --pin SHA256          the hub certificate's sha256 (needed for a hub on
                         another machine; the openssl fingerprint line works)
-  --secret-file FILE    read the hub secret from the first line of FILE
-                        (or set CCTG_HUB_SECRET; otherwise it is asked for)
+  --join CODE           a one-time join code of the hub (cctg hub code on
+                        the hub, /devices in Telegram): this device gets
+                        its own secret (or set CCTG_JOIN_CODE)
+  --secret-file FILE    read the hub's shared secret from the first line of
+                        FILE (or set CCTG_HUB_SECRET; without a join code
+                        or a secret the code is asked for)
   --host NAME           this machine's name in the topic titles (CCTG_HOST);
                         in a container it is asked for, with --yes taken
                         from CCTG_HOST
@@ -320,8 +329,12 @@ read_settings() {
     secret=${CCTG_HUB_SECRET:-}
     # Nothing started from here gets it: cctg doctor must check the file,
     # as the sessions will.
-    unset CCTG_HUB_SECRET
-    if [ -n "$secret" ]; then
+    unset CCTG_HUB_SECRET CCTG_JOIN_CODE
+    if [ -n "$join_code" ]; then
+        # The device's own secret comes from the hub (join_hub).
+        secret=
+        check_code
+    elif [ -n "$secret" ]; then
         :
     elif [ -n "$secret_file" ]; then
         [ "$os" != windows ] || secret_file=$(cygpath -u "$secret_file")
@@ -330,15 +343,38 @@ read_settings() {
         secret=$(printf '%s' "$secret" | tr -d '\r')
         [ -n "$secret" ] || die "$secret_file is empty (the secret is its first line)"
     elif [ -z "$(old_line CCTG_HUB_SECRET)" ]; then
-        interactive || die "no hub secret: set CCTG_HUB_SECRET or use --secret-file"
-        read_hidden "Hub secret (CCTG_HUB_SECRET of the hub, not shown): " \
-            "set CCTG_HUB_SECRET or use --secret-file"
-        secret=$hidden
-        hidden=
-        [ -n "$secret" ] || die "no hub secret typed"
+        interactive || die "no join code and no hub secret: use --join CODE (or CCTG_HUB_SECRET, --secret-file)"
+        ask "Join code from the hub (empty: type the hub's shared secret instead): "
+        join_code=$answer
+        if [ -n "$join_code" ]; then
+            check_code
+        else
+            read_hidden "Hub secret (CCTG_HUB_SECRET of the hub, not shown): " \
+                "use --join CODE, set CCTG_HUB_SECRET or use --secret-file"
+            secret=$hidden
+            hidden=
+            [ -n "$secret" ] || die "no hub secret typed"
+        fi
     fi
     [ -z "$secret" ] || check_secret
     choose_host
+}
+
+# XXXX-XXXX-XXXX-XXXX as the hub prints it; the hub checks the rest.
+check_code() {
+    case $join_code in
+        *[!A-Za-z0-9\ -]*) die "a join code has letters, digits and dashes only" ;;
+    esac
+}
+
+# The device's own secret for the join code: cctg join asks the hub (the
+# address and pin just written) and puts the secret into device.env; it
+# never prints it. A refused code leaves device.env as it was.
+join_hub() {
+    say "joining the hub with the code"
+    CCTG_JOIN_CODE=$join_code "$exe" join </dev/null \
+        || die "the hub did not enroll this device (above); run this again with a new join code"
+    join_code=
 }
 
 check_host() {
@@ -881,11 +917,11 @@ setup_hub() {
     case $proxy in
         *[\ \"\'\$\#\`\\]*) die "the proxy URL has a character hub.env cannot carry" ;;
     esac
-    hub_secret=$(value_of "$hub_env" CCTG_HUB_SECRET)
+    # The shared secret: the hub needs one while CCTG_SHARED_SECRET is on;
+    # devices get their own through join codes and never see it.
     new_secret=
-    if [ -z "$hub_secret" ]; then
+    if [ -z "$(value_of "$hub_env" CCTG_HUB_SECRET)" ]; then
         new_secret=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
-        hub_secret=$new_secret
     fi
 
     old_umask=$(umask)
@@ -954,9 +990,16 @@ setup_hub() {
     else
         where="--agent-addr $public_host:$agent_port --hook-addr $public_host:$hook_port"
     fi
-    say "the hub is up. On each device with Claude Code run (the line carries the hub secret: only your own machines, and clear it from chat history):"
-    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | CCTG_HUB_SECRET=$(squote "$hub_secret") sh -s -- $where --pin $pin"
-    hub_secret=
+    # A one-time join code of the running hub (TASK-045).
+    more="cd $hub_dir && docker compose exec hub cctg hub code"
+    code=$(cd "$hub_dir" && docker compose exec -T hub cctg hub code </dev/null) \
+        || die "the hub is up but gave no join code; ask it for one: $more"
+    case $code in
+        ????-????-????-????) ;;
+        *) die "the hub is up but gave no join code; ask it for one: $more" ;;
+    esac
+    say "the hub is up. On a device with Claude Code run this line; its join code works once, for 10 minutes. For every next device a new code: $more (or /devices in Telegram says how)"
+    printf '\n%s\n\n' "curl -fsSL https://raw.githubusercontent.com/$REPO/$RELEASE/install.sh | sh -s -- $where --pin $pin --join $code"
 }
 
 # device_port <hub.env key> <default>: the port devices use for one of the
