@@ -224,8 +224,8 @@ fn render(listed: &[Listed], shared: SharedState, notice: Option<&str>, now: Sys
     }
     for (index, entry) in listed.iter().enumerate() {
         let seen = match entry.seen {
-            Some(at) => format!("на связи {}", ago(now, at)),
-            None => "с запуска hub не появлялось".to_owned(),
+            Some(at) => format!("последний вход {}", ago(now, at)),
+            None => "с запуска hub не входило".to_owned(),
         };
         text.push_str(&format!(
             "{}. {} · {} · с {} · {seen}\n",

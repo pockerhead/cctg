@@ -859,6 +859,12 @@ async fn hook_request(
     drop(pre_auth.peer_place);
     let gate = pre_auth.gate;
     let status = match read {
+        // Revoked while the body was still coming: the check of its header
+        // no longer holds.
+        Ok(Ok((Route::Hook | Route::Ping, _, Some(who)))) if !devices.is_active(&who) => {
+            debug!(%peer, "hook request of a revoked device");
+            Status::Unauthorized
+        }
         Ok(Ok((Route::Hook, body, _))) => accept_hook(&body, dedup, events),
         // `cctg doctor`: the secret matched; nothing else happens.
         Ok(Ok((Route::Ping, _, _))) => {
@@ -2813,6 +2819,31 @@ mod tests {
             .await,
             204
         );
+    }
+
+    #[tokio::test]
+    async fn a_hook_revoked_between_its_header_and_its_body_is_refused() {
+        let dir = TempDir::new("ingress-revoke-midway");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let (_, hook_addr, _agents, mut hooks) = device_hub(&devices).await;
+        let code = mint_code(dir.path(), std::time::SystemTime::now()).unwrap();
+        let joined = devices.join(&code, "old box").unwrap();
+        let bearer = format!("Bearer {}", joined.secret.expose());
+        let raw = request(Some(&bearer), &body_of_start());
+        let split = raw.len() - 5;
+
+        let mut stream = TcpStream::connect(hook_addr).await.unwrap();
+        stream.write_all(&raw[..split]).await.unwrap();
+        // The header (and its secret) is read by now; the body is not.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(devices.revoke(&joined.id).is_some());
+        stream.write_all(&raw[split..]).await.unwrap();
+        let mut response = Vec::new();
+        within(stream.read_to_end(&mut response)).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 401 "), "{text}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(hooks.try_recv().is_err(), "no event of the revoked device");
     }
 
     #[tokio::test]

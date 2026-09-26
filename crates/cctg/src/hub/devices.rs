@@ -132,6 +132,9 @@ pub enum JoinError {
 pub enum MintError {
     #[error("{MAX_CODES} join codes are waiting to be used already; wait until they expire")]
     Full,
+    /// No `join/` in the state directory: no hub has started with it.
+    #[error("no hub has started with this state directory")]
+    NoHub,
     #[error("cannot write the join code into the hub state directory ({0:?})")]
     Io(io::ErrorKind),
 }
@@ -145,6 +148,8 @@ pub enum LoadError {
     Invalid,
     #[error("{DEVICES_FILE} has version {0}, this hub reads version {VERSION}")]
     Version(u32),
+    #[error("cannot create the {CODES_DIR} directory ({0:?})")]
+    Codes(io::ErrorKind),
 }
 
 /// A revoke that took effect; `saved`: also in `devices.json`.
@@ -207,7 +212,10 @@ impl Devices {
     /// The devices of `state_dir`; `shared`: the shared secret, while it is
     /// on. A missing file is no devices; one that does not parse stops the
     /// hub (starting without it would lock every enrolled device out).
+    /// Creates `<state_dir>/join/`, where [`mint_code`] finds this hub.
     pub fn open(state_dir: &Path, shared: Option<Secret>) -> Result<Self, LoadError> {
+        std::fs::create_dir_all(state_dir.join(CODES_DIR))
+            .map_err(|error| LoadError::Codes(error.kind()))?;
         let devices = match std::fs::read(state_dir.join(DEVICES_FILE)) {
             Ok(bytes) => {
                 let stored: Stored =
@@ -217,7 +225,12 @@ impl Devices {
                 }
                 let mut ids = std::collections::HashSet::new();
                 let valid = stored.devices.iter().all(|device| {
-                    is_id(&device.id) && is_hex(&device.hash, 64) && ids.insert(&device.id)
+                    is_id(&device.id)
+                        && is_hex(&device.hash, 64)
+                        && UNIX_EPOCH
+                            .checked_add(Duration::from_secs(device.joined))
+                            .is_some()
+                        && ids.insert(&device.id)
                 });
                 if !valid {
                     return Err(LoadError::Invalid);
@@ -348,7 +361,10 @@ impl Devices {
             .map(|device| Listed {
                 id: device.id.clone(),
                 name: device.name.clone(),
-                joined: UNIX_EPOCH + Duration::from_secs(device.joined),
+                // Checked at load; a hand-edited value never panics here.
+                joined: UNIX_EPOCH
+                    .checked_add(Duration::from_secs(device.joined))
+                    .unwrap_or(UNIX_EPOCH),
                 seen: inner.seen.get(&device.id).copied(),
             })
             .collect();
@@ -521,11 +537,15 @@ fn code_path(dir: &Path, normalized: &str) -> PathBuf {
 }
 
 /// Mints a join code into `<state_dir>/join/`, good for [`CODE_TTL`] from
-/// `now`. Expired codes are swept first. Blocking file I/O.
+/// `now`. Expired codes are swept first. `join/` must be there already
+/// ([`Devices::open`] of a hub makes it): a code minted anywhere else would
+/// never be taken. Blocking file I/O.
 pub fn mint_code(state_dir: &Path, now: SystemTime) -> Result<String, MintError> {
     let dir = state_dir.join(CODES_DIR);
     let io = |error: io::Error| MintError::Io(error.kind());
-    std::fs::create_dir_all(&dir).map_err(io)?;
+    if !dir.is_dir() {
+        return Err(MintError::NoHub);
+    }
     if sweep(&dir, now) >= MAX_CODES {
         return Err(MintError::Full);
     }
@@ -556,7 +576,7 @@ fn sweep(dir: &Path, now: SystemTime) -> usize {
         let path = entry.path();
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("json") => {
-                if expiry(&path).is_some_and(|expires| unix(now) < expires) {
+                if deadline(&path, now).is_some_and(|until| unix(now) < until) {
                     left += 1;
                 } else {
                     let _ = std::fs::remove_file(&path);
@@ -579,24 +599,42 @@ fn sweep(dir: &Path, now: SystemTime) -> usize {
     left
 }
 
-fn expiry(path: &Path) -> Option<u64> {
+/// Until when a code file is good (Unix seconds): its `expires`, but at
+/// most [`CODE_TTL`] after the file was written (its mtime); a deadline
+/// more than [`CODE_TTL`] after `now` (a minting clock that ran ahead, a
+/// hand-written file) is no deadline at all (0). `None`: unreadable.
+fn deadline(path: &Path, now: SystemTime) -> Option<u64> {
     let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice::<CodeFile>(&bytes)
-        .ok()
-        .map(|file| file.expires)
+    let expires = serde_json::from_slice::<CodeFile>(&bytes).ok()?.expires;
+    let written = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    let ttl = CODE_TTL.as_secs();
+    let until = expires.min(unix(written).saturating_add(ttl));
+    Some(if until > unix(now).saturating_add(ttl) {
+        0
+    } else {
+        until
+    })
 }
 
 /// Spends `normalized`: true when it was minted, unused and unexpired.
-/// Only one of two racing takes removes the file; an expired code is
-/// removed too.
+/// Takes run one at a time: on Windows two racing `remove_file` calls of
+/// one file can both succeed (each deletes through its own handle), so the
+/// removal alone would let one code enroll two devices. One hub takes
+/// codes from its state directory. An expired code is removed too.
 fn take_code(dir: &Path, normalized: &str, now: SystemTime) -> bool {
+    static TAKING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = TAKING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = code_path(dir, normalized);
-    let Some(expires) = expiry(&path) else {
+    let Some(until) = deadline(&path, now) else {
         return false;
     };
     let removed = std::fs::remove_file(&path).is_ok();
     sweep(dir, now);
-    removed && unix(now) < expires
+    removed && unix(now) < until
 }
 
 #[cfg(test)]
@@ -684,6 +722,7 @@ mod tests {
     #[test]
     fn minting_stops_at_the_cap_and_expired_codes_free_places() {
         let dir = TempDir::new("devices-mint-cap");
+        Devices::open(dir.path(), None).unwrap();
         let past = SystemTime::now() - CODE_TTL - Duration::from_secs(1);
         for _ in 0..MAX_CODES {
             mint_code(dir.path(), past).unwrap();
@@ -695,6 +734,119 @@ mod tests {
             mint_code(dir.path(), SystemTime::now()).unwrap_err(),
             MintError::Full
         );
+    }
+
+    #[test]
+    fn a_code_is_minted_only_where_a_hub_keeps_its_state() {
+        let dir = TempDir::new("devices-mint-nohub");
+        assert_eq!(
+            mint_code(dir.path(), SystemTime::now()).unwrap_err(),
+            MintError::NoHub
+        );
+        assert_eq!(
+            mint_code(&dir.path().join("missing"), SystemTime::now()).unwrap_err(),
+            MintError::NoHub
+        );
+        assert!(!dir.path().join(CODES_DIR).exists(), "nothing created");
+        Devices::open(dir.path(), None).unwrap();
+        assert!(mint_code(dir.path(), SystemTime::now()).is_ok());
+    }
+
+    #[test]
+    fn a_code_lives_at_most_ten_minutes_whatever_its_file_says() {
+        let dir = TempDir::new("devices-code-cap");
+        Devices::open(dir.path(), None).unwrap();
+        let codes = dir.path().join(CODES_DIR);
+        let forever = |code: &str| {
+            let path = code_path(&codes, &normalize_code(code).unwrap());
+            std::fs::write(&path, format!(r#"{{"expires":{}}}"#, u64::MAX)).unwrap();
+            path
+        };
+        // Taken in time: good, its own expiry notwithstanding.
+        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
+        forever(&code);
+        let normalized = normalize_code(&code).unwrap();
+        assert!(take_code(&codes, &normalized, SystemTime::now()));
+        // Taken later than 10 minutes after it was written.
+        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
+        forever(&code);
+        let later = SystemTime::now() + CODE_TTL + Duration::from_secs(2);
+        assert!(!take_code(&codes, &normalize_code(&code).unwrap(), later));
+        // Written more than 10 minutes ago.
+        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
+        let path = forever(&code);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - CODE_TTL - Duration::from_secs(2))
+            .unwrap();
+        assert!(!take_code(
+            &codes,
+            &normalize_code(&code).unwrap(),
+            SystemTime::now()
+        ));
+        // Minted by a clock that ran ahead.
+        let ahead = SystemTime::now() + CODE_TTL * 3;
+        let code = mint_code(dir.path(), ahead).unwrap();
+        let path = code_path(&codes, &normalize_code(&code).unwrap());
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(ahead)
+            .unwrap();
+        assert!(!take_code(
+            &codes,
+            &normalize_code(&code).unwrap(),
+            SystemTime::now()
+        ));
+    }
+
+    #[test]
+    fn of_two_racing_takes_of_one_code_one_wins() {
+        let dir = TempDir::new("devices-code-race");
+        Devices::open(dir.path(), None).unwrap();
+        let codes = dir.path().join(CODES_DIR);
+        for _ in 0..20 {
+            let code = normalize_code(&mint_code(dir.path(), SystemTime::now()).unwrap()).unwrap();
+            let start = std::sync::Barrier::new(2);
+            let won = std::thread::scope(|scope| {
+                let takes: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            take_code(&codes, &code, SystemTime::now())
+                        })
+                    })
+                    .collect();
+                takes
+                    .into_iter()
+                    .map(|take| take.join().unwrap())
+                    .filter(|&won| won)
+                    .count()
+            });
+            assert_eq!(won, 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_device_list_and_codes_are_the_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("devices-mode");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let code = mint_code(dir.path(), SystemTime::now()).unwrap();
+        for entry in std::fs::read_dir(dir.path().join(CODES_DIR)).unwrap() {
+            let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        devices.join(&code, "box").unwrap();
+        let mode = std::fs::metadata(dir.path().join(DEVICES_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]
@@ -810,6 +962,17 @@ mod tests {
             r#"{"id":"0123abcd","name":"x","joined":1,"hash":"0000000000000000000000000000000000000000000000000000000000000000"}"#
         );
         std::fs::write(dir.path().join(DEVICES_FILE), twice).unwrap();
+        assert_eq!(
+            Devices::open(dir.path(), None).err(),
+            Some(LoadError::Invalid)
+        );
+        // A join time no clock can hold: refused at load, no panic later.
+        let far = format!(
+            r#"{{"version":1,"devices":[{{"id":"0123abcd","name":"x","joined":{},"hash":"{}"}}]}}"#,
+            u64::MAX,
+            "0".repeat(64)
+        );
+        std::fs::write(dir.path().join(DEVICES_FILE), far).unwrap();
         assert_eq!(
             Devices::open(dir.path(), None).err(),
             Some(LoadError::Invalid)
