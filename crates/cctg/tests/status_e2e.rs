@@ -345,6 +345,7 @@ impl Hub {
                 query_id: format!("q-{data}"),
                 data: Some(data.into()),
                 message_id: Some(message_id),
+                from_name: None,
             }))
             .unwrap();
     }
@@ -943,6 +944,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
                 quote: None,
                 forwarded: false,
                 media: None,
+                from_name: None,
             }))
             .unwrap();
     };

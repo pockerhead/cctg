@@ -2394,6 +2394,7 @@ impl Slots {
                 quote: input.quote,
                 forwarded: input.forwarded,
                 file,
+                from_name: input.from_name,
             },
         );
         self.flush(slot);
@@ -2975,7 +2976,8 @@ impl Slots {
 
     /// Meta `chat_id`, `message_id`, `thread_id`, `reply_to_message_id` for
     /// an explicit reply, `target_agent` for a reply to a block of its
-    /// subagent and `forwarded` for a forward.
+    /// subagent, `forwarded` for a forward and `from_name` for a team
+    /// member's message (TASK-036).
     fn inbound_meta(&self, session: &str, parked: &Parked) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::from([
             ("chat_id".to_owned(), self.options.chat_id.to_string()),
@@ -2984,6 +2986,9 @@ impl Slots {
         ]);
         if parked.forwarded {
             meta.insert("forwarded".to_owned(), "true".to_owned());
+        }
+        if let Some(name) = &parked.from_name {
+            meta.insert("from_name".to_owned(), name.clone());
         }
         if let Some(reply_to) = parked.reply_to {
             meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
@@ -3043,9 +3048,10 @@ impl Slots {
     /// The meta of `parts` going as one inbound (all in one topic and
     /// replying to the same message, see [`Self::burst`]):
     /// [`Self::inbound_meta`] of the last one (its channel record turns them
-    /// all ✍), `message_ids` of all in order when there are several, and
-    /// `forwarded` only when every one is a forward. One part: exactly its
-    /// own meta.
+    /// all ✍), `message_ids` of all in order when there are several,
+    /// `forwarded` only when every one is a forward and `from_name` only
+    /// when one person wrote every part (the content names each part's
+    /// author). One part: exactly its own meta.
     fn burst_meta(&self, session: &str, parts: &[Parked]) -> BTreeMap<String, String> {
         let Some(last) = parts.last() else {
             return BTreeMap::new();
@@ -3055,6 +3061,12 @@ impl Slots {
             meta.insert("forwarded".to_owned(), "true".to_owned());
         } else {
             meta.remove("forwarded");
+        }
+        if parts
+            .iter()
+            .any(|parked| parked.from_name != last.from_name)
+        {
+            meta.remove("from_name");
         }
         if parts.len() > 1 {
             let ids: Vec<String> = parts
@@ -4314,6 +4326,10 @@ impl Slots {
         else {
             return expired;
         };
+        if prompt.state == State::Open {
+            // The press that fixes the answer signs it (TASK-036).
+            prompt.decided_by = input.from_name.clone();
+        }
         if prompt.hook && prompt.state == State::Open {
             return Some(self.press_hook(key, behavior));
         }
@@ -6384,6 +6400,7 @@ mod tests {
             quote: None,
             forwarded: false,
             media: None,
+            from_name: None,
         })
     }
 
@@ -6462,6 +6479,7 @@ mod tests {
                 quote: Some("Удалить build/?".into()),
                 forwarded: false,
                 media: None,
+                from_name: None,
             }))
             .unwrap();
         rig.control
@@ -6473,6 +6491,7 @@ mod tests {
                 quote: None,
                 forwarded: true,
                 media: None,
+                from_name: None,
             }))
             .unwrap();
         // General and a topic that is no slot reach nobody and say nothing.
@@ -7027,6 +7046,7 @@ again"
             query_id: query.into(),
             data: Some(data.into()),
             message_id,
+            from_name: None,
         })
     }
 
@@ -7160,6 +7180,45 @@ again"
         assert_eq!(edits[0].1, Some(permissions::no_keyboard()));
         // No agent got anything: the answer went to the hook only.
         assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_decision_is_signed_by_the_team_member_whose_press_fixed_it() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        let answered = hook_ask(&rig, A, "Bash").await;
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let message_id = prompts(&ops)[0].2;
+        let id = prompt_id(&ops, 0);
+        let named =
+            |query: &str, data: String, name: &str| match press(query, Some(message_id), &data) {
+                Control::Callback(input) => Control::Callback(CallbackInput {
+                    from_name: Some(name.into()),
+                    ..input
+                }),
+                other => other,
+            };
+        rig.control
+            .send(named("q1", format!("deny:{id}"), "Анна"))
+            .unwrap();
+        assert_eq!(hook_answer(answered).await, Some(Behavior::Deny));
+        // A later press of someone else changes neither the answer nor the name.
+        rig.control
+            .send(named("q2", format!("allow:{id}"), "Иван"))
+            .unwrap();
+        let ops = settled(&rig, |ops| {
+            answers(ops).len() == 2 && edits_of(ops, message_id).len() == 1
+        })
+        .await;
+        let edits = edits_of(&ops, message_id);
+        assert!(
+            edits[0].0.ends_with(&format!(
+                "{}{}Анна",
+                permissions::DENIED_MARK,
+                permissions::BY
+            )),
+            "{edits:?}"
+        );
     }
 
     #[tokio::test]
@@ -9842,6 +9901,7 @@ again"
                     quote: None,
                     forwarded: false,
                     media: None,
+                    from_name: None,
                 }))
                 .unwrap();
         }
@@ -13693,6 +13753,7 @@ again"
             quote: None,
             forwarded,
             media: None,
+            from_name: None,
         }
     }
 
@@ -13901,6 +13962,7 @@ again"
                 },
                 caption: caption.map(str::to_owned),
             }),
+            from_name: None,
         })
     }
 
@@ -14580,6 +14642,56 @@ again"
         assert_eq!(stream.parts, [(4, vec![1, 2, 3])]);
         pass(&mut slots, GATHER_MAX).await;
         assert!(inbounds(&mut agent).is_empty(), "it went once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_team_burst_names_each_part_and_its_meta_names_only_a_sole_author() {
+        let dir = TempDir::new("slots-gather-team");
+        let (mut slots, _work, mut agent) = gather_slots(&dir);
+        let by = |id: i64, text: &str, name: &str| Inbound {
+            from_name: Some(name.to_owned()),
+            ..topic_text(id, text, false)
+        };
+        let burst = |slots: &mut Slots, messages: Vec<Inbound>| {
+            for message in messages {
+                slots.on_topic_message(message);
+                slots.pump();
+            }
+        };
+        burst(&mut slots, vec![by(1, "раз", "Анна"), by(2, "два", "Анна")]);
+        pass(&mut slots, GATHER_QUIET).await;
+        burst(
+            &mut slots,
+            vec![by(3, "три", "Анна"), by(4, "четыре", "Иван")],
+        );
+        pass(&mut slots, GATHER_QUIET).await;
+        let got = inbounds(&mut agent);
+        let base = [("chat_id", "-1000000000001"), ("thread_id", "100")];
+        assert_eq!(
+            got,
+            [
+                (
+                    "Анна: раз\n\n---\n\nАнна: два".to_owned(),
+                    meta_of(&[
+                        base[0],
+                        base[1],
+                        ("message_id", "2"),
+                        ("message_ids", "1,2"),
+                        ("from_name", "Анна"),
+                    ]),
+                ),
+                (
+                    "Анна: три\n\n---\n\nИван: четыре".to_owned(),
+                    meta_of(&[
+                        base[0],
+                        base[1],
+                        ("message_id", "4"),
+                        ("message_ids", "3,4"),
+                    ]),
+                ),
+            ]
+        );
+        assert!(got[0].1.keys().all(|key| crate::channel::is_meta_key(key)));
     }
 
     #[tokio::test(start_paused = true)]
