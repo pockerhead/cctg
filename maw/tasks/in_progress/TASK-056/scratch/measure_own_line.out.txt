@@ -1,0 +1,2 @@
+repo: median 50 ms, max 99 ms; line '\x1b[1mOpus\x1b[0m \x1b[36mbr:feature/builtin-statusline*\x1b[0m dir:cctg-056 ctx:12%'
+no repo: median 28 ms, max 79 ms; line '\x1b[1mOpus\x1b[0m dir:Temp ctx:12%'
