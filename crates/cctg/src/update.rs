@@ -78,8 +78,8 @@ pub struct Worker {
     pub run_pid: Option<u32>,
     pub run_args: Vec<String>,
     pub state_dir: Option<PathBuf>,
-    /// This build can type into the claude console.
-    pub keys: bool,
+    /// Where the worker types into claude ([`keys::Target`]), if anywhere.
+    pub console: Option<keys::Target>,
 }
 
 /// What an `update` leads to.
@@ -99,7 +99,7 @@ impl Worker {
         var: impl Fn(&str) -> Option<String>,
         claude_pid: Option<u32>,
         state_dir: Option<PathBuf>,
-        keys: bool,
+        console: Option<keys::Target>,
     ) -> Self {
         let number = |name: &str| var(name).and_then(|value| value.trim().parse::<u64>().ok());
         let small = |name: &str| number(name).and_then(|value| u32::try_from(value).ok());
@@ -115,7 +115,7 @@ impl Worker {
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default(),
             state_dir,
-            keys,
+            console,
         }
     }
 
@@ -126,7 +126,10 @@ impl Worker {
 
     /// `cctg run` can start its claude again.
     pub fn restartable(&self) -> bool {
-        self.run_pid.is_some() && self.keys && self.claude_pid.is_some() && self.state_dir.is_some()
+        self.run_pid.is_some()
+            && self.console.is_some()
+            && self.claude_pid.is_some()
+            && self.state_dir.is_some()
     }
 
     /// Decides; blocking (hashes the executable, looks at config files). A
@@ -158,14 +161,14 @@ impl Worker {
     /// The claude console shows the agent view or a working background
     /// agent ([`keys::agents_on_screen`], TASK-047): no restart now. Blocking.
     pub fn agents_on_screen(&self) -> bool {
-        self.keys && self.claude_pid.is_some_and(keys::agents_on_screen)
+        self.console.as_ref().is_some_and(keys::agents_on_screen)
     }
 
     /// Writes the request for `cctg run` and types `/exit`. The request is
     /// removed again when `/exit` was not sent.
     pub fn restart(&self, session_id: &str) -> Typed {
-        let (Some(state), Some(run_pid), Some(claude_pid)) =
-            (&self.state_dir, self.run_pid, self.claude_pid)
+        let (Some(state), Some(run_pid), Some(console)) =
+            (&self.state_dir, self.run_pid, &self.console)
         else {
             return Typed::Failed;
         };
@@ -179,7 +182,7 @@ impl Worker {
         if write_request(&path, &request).is_err() {
             return Typed::Failed;
         }
-        let typed = keys::type_exit(claude_pid);
+        let typed = keys::type_exit(console);
         if typed != Typed::Sent {
             let _ = std::fs::remove_file(&path);
         }
@@ -427,7 +430,7 @@ mod tests {
             build: Some(client::build_of(exe).unwrap()),
             claude_pid: Some(1),
             state_dir: Some(dir.to_owned()),
-            keys: true,
+            console: Some(keys::Target::Console(1)),
             ..Worker::default()
         }
     }
@@ -590,7 +593,12 @@ mod tests {
             "CCTG_RUN_ARGS" => Some(r#"["--settings","s.json"]"#.to_owned()),
             _ => None,
         };
-        let w = Worker::from_env(env, Some(9), Some(PathBuf::from("/state")), true);
+        let w = Worker::from_env(
+            env,
+            Some(9),
+            Some(PathBuf::from("/state")),
+            Some(keys::Target::Console(9)),
+        );
         assert!(w.resumed);
         assert_eq!(w.shim, Some(1));
         assert_eq!(w.shim_started, Some(1_700_000_000));
@@ -598,7 +606,7 @@ mod tests {
         assert_eq!(w.run_args, ["--settings", "s.json"]);
         assert!(w.restartable());
         assert!(!w.self_update(), "no build yet");
-        let bare = Worker::from_env(|_| None, Some(9), None, true);
+        let bare = Worker::from_env(|_| None, Some(9), None, Some(keys::Target::Console(9)));
         assert!(!bare.resumed && bare.shim.is_none() && !bare.restartable());
     }
 
@@ -627,6 +635,6 @@ mod tests {
         };
         w.withdraw_request();
         assert!(!path.exists());
-        assert_eq!(w.restart("5e55"), Typed::Failed, "no claude pid");
+        assert_eq!(w.restart("5e55"), Typed::Failed, "no terminal");
     }
 }
