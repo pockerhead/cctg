@@ -33,6 +33,12 @@
 //! in claude's console, elsewhere through the `cctg run` that holds claude's
 //! terminal (TASK-044).
 //!
+//! Status line numbers (TASK-058): with a hub that tells the agent which
+//! session it is bound to (`bound`), the link passes on the numbers `cctg
+//! statusline` keeps for that session ([`crate::statusfile`]), looking once
+//! a second, and keeps the file's mark fresh so `cctg statusline` does not
+//! post them itself.
+//!
 //! Session reads (TASK-034): the hub never opens a file of this machine; it
 //! asks with `session_read` and the agent answers from its session's files
 //! ([`crate::reads`]), one read at a time, off the loop.
@@ -60,7 +66,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -80,12 +86,14 @@ use crate::proctree;
 use crate::reads;
 use crate::shim;
 use crate::spool;
+use crate::statusfile;
 use crate::tail;
 use crate::tls::{HubAddr, ReadTask, Stream};
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
     self, AgentMsg, Beat, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome,
-    Heartbeat, HubMsg, Liveness, Register, Rejection, Secret, SessionAsk, UpdateOutcome, WireError,
+    Heartbeat, HookEvent, HubMsg, Liveness, Register, Rejection, Secret, SessionAsk, UpdateOutcome,
+    WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -95,6 +103,8 @@ const QUEUE: usize = 256;
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Verdict ids remembered for dropping a verdict the hub sent again.
 const RECENT_VERDICTS: usize = 256;
+/// How often the link looks at its session's status line numbers.
+const STATUS_POLL: Duration = Duration::from_secs(1);
 
 /// Exponential backoff with "equal jitter": the delay for attempt `n` is
 /// uniform in `[d/2, d]` where `d = min(max, initial * 2^n)`.
@@ -135,6 +145,99 @@ pub struct LinkConfig {
     pub replay: Option<Replay>,
     /// Used when `register.heartbeat` is set and the hub keeps one too.
     pub heartbeat: Heartbeat,
+    /// Where the status line numbers wait ([`crate::statusfile`]); `None`:
+    /// none are passed on. Set together with `register.status_lines`.
+    pub status: Option<StatusWatch>,
+}
+
+/// The status line numbers the link passes on (TASK-058).
+#[derive(Debug, Clone)]
+pub struct StatusWatch {
+    /// `<state>`, holding `status/`.
+    pub state_dir: PathBuf,
+    /// The session of the hub's last `bound`, kept across reconnects; its
+    /// files go when the agent leaves ([`StatusWatch::clean`]).
+    pub bound: Arc<Mutex<Option<String>>>,
+}
+
+impl StatusWatch {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            bound: Arc::default(),
+        }
+    }
+
+    /// The hub bound the link to `session`: the files of the session it was
+    /// bound to before (ended by `/clear`) go.
+    fn bind(&self, session: &str) {
+        let Ok(mut bound) = self.bound.lock() else {
+            return;
+        };
+        if let Some(old) = bound.replace(session.to_owned())
+            && old != session
+        {
+            statusfile::remove(&self.state_dir, &old);
+        }
+    }
+
+    /// Removes the files of the bound session: the agent leaves with it.
+    pub fn clean(&self) {
+        let session = self.bound.lock().ok().and_then(|mut bound| bound.take());
+        if let Some(session) = session {
+            statusfile::remove(&self.state_dir, &session);
+        }
+    }
+}
+
+/// What one connection passes on of its bound session's numbers.
+struct StatusState<'a> {
+    watch: &'a StatusWatch,
+    session: String,
+    /// The numbers last sent on this connection. Compared by content: two
+    /// writes can share one mtime on a coarse file system.
+    sent: Option<HookEvent>,
+    marked: Option<Instant>,
+}
+
+impl StatusState<'_> {
+    /// The numbers to send when they changed since the last ones sent on
+    /// this connection; renews the mark when due. Small local files, read
+    /// inline at most once a second.
+    fn due(&mut self) -> Option<AgentMsg> {
+        if self
+            .marked
+            .is_none_or(|at| at.elapsed() >= statusfile::MARK_EVERY)
+        {
+            self.marked = Some(Instant::now());
+            if let Err(error) = statusfile::mark(&self.watch.state_dir, &self.session) {
+                debug!(kind = ?error.kind(), "status line mark not renewed");
+            }
+        }
+        let numbers = statusfile::read(&self.watch.state_dir, &self.session)?;
+        if self.sent.as_ref() == Some(&numbers) {
+            return None;
+        }
+        self.sent = Some(numbers.clone());
+        let HookEvent::StatusLine {
+            model,
+            effort,
+            context,
+            five_hour,
+            seven_day,
+        } = numbers
+        else {
+            return None;
+        };
+        Some(AgentMsg::StatusLine {
+            session_id: self.session.clone(),
+            model,
+            effort,
+            context,
+            five_hour,
+            seven_day,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -244,7 +347,14 @@ async fn run(
                     write,
                     heartbeat,
                 };
-                let stopped = serve(link, &mut outbox, &events, &mut verdicts).await;
+                let stopped = serve(
+                    link,
+                    &mut outbox,
+                    &events,
+                    &mut verdicts,
+                    config.status.as_ref(),
+                )
+                .await;
                 if stopped || events.send(LinkEvent::Down).await.is_err() {
                     return;
                 }
@@ -328,12 +438,14 @@ struct Link {
 /// Runs one registered link. Returns `true` when the owner is gone (stop),
 /// `false` when the link dropped (reconnect). `verdicts`: ids of verdicts
 /// already passed on, newest last. The hub's pings end here and never
-/// reach the owner, so a busy owner does not hold them up.
+/// reach the owner, so a busy owner does not hold them up; so do its
+/// `bound`s, after which the link sends the numbers of `status` itself.
 async fn serve(
     link: Link,
     outbox: &mut mpsc::Receiver<AgentMsg>,
     events: &mpsc::Sender<LinkEvent>,
     verdicts: &mut VecDeque<u64>,
+    status: Option<&StatusWatch>,
 ) -> bool {
     let Link {
         reader,
@@ -343,15 +455,35 @@ async fn serve(
     let mut liveness = Liveness::new(heartbeat);
     let (frames_tx, mut frames) = mpsc::channel(QUEUE);
     let reader_task = ReadTask::spawn(read_hub_frames(reader, frames_tx));
+    // Nothing is sent before this connection's `bound`.
+    let mut numbers: Option<StatusState> = None;
+    let mut poll = tokio::time::interval(STATUS_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stopped = loop {
         let next_beat = liveness.next();
-        tokio::select! {
+        // What to write to the hub now.
+        let due = tokio::select! {
             frame = frames.recv() => {
                 if frame.is_some() {
                     liveness.heard();
                 }
                 match frame {
-                    Some(Ok(HubMsg::Ping)) => {}
+                    Some(Ok(HubMsg::Ping)) => None,
+                    Some(Ok(HubMsg::Bound { session_id })) => match status {
+                        Some(watch) => {
+                            watch.bind(&session_id);
+                            let mut state = StatusState {
+                                watch,
+                                session: session_id,
+                                sent: None,
+                                marked: None,
+                            };
+                            let due = state.due();
+                            numbers = Some(state);
+                            due
+                        }
+                        None => None,
+                    },
                     Some(Ok(msg)) => {
                         let ack = match &msg {
                             HubMsg::PermissionVerdict { verdict_id, .. } => *verdict_id,
@@ -370,12 +502,7 @@ async fn serve(
                             }
                             verdicts.push_back(verdict_id);
                         }
-                        let ack = AgentMsg::PermissionAck { verdict_id };
-                        if let Err(error) = write_agent_msg(&mut write, &ack).await {
-                            debug!(%error, "write to hub failed");
-                            break false;
-                        }
-                        liveness.said();
+                        Some(AgentMsg::PermissionAck { verdict_id })
                     }
                     Some(Err(WireError::Version)) => {
                         warn!("hub changed protocol version; reconnecting");
@@ -385,35 +512,34 @@ async fn serve(
                         debug!(%error, "hub link ended");
                         break false;
                     }
-                    Some(Err(error)) => warn!(%error, "hub line ignored"),
+                    Some(Err(error)) => {
+                        warn!(%error, "hub line ignored");
+                        None
+                    }
                     None => break false,
                 }
             }
             msg = outbox.recv() => match msg {
-                Some(msg) => {
-                    if let Err(error) = write_agent_msg(&mut write, &msg).await {
-                        debug!(%error, "write to hub failed");
-                        break false;
-                    }
-                    liveness.said();
-                }
+                Some(msg) => Some(msg),
                 None => break true,
             },
+            _ = poll.tick(), if numbers.is_some() => numbers.as_mut().and_then(StatusState::due),
             beat = wire::beat(next_beat) => match beat {
-                Beat::Ping => {
-                    if let Err(error) = write_agent_msg(&mut write, &AgentMsg::Ping).await {
-                        debug!(%error, "write to hub failed");
-                        break false;
-                    }
-                    liveness.said();
-                }
+                Beat::Ping => Some(AgentMsg::Ping),
                 // A frame read meanwhile goes first.
-                Beat::Dead if !frames.is_empty() => {}
+                Beat::Dead if !frames.is_empty() => None,
                 Beat::Dead => {
                     info!("hub silent past the heartbeat timeout; reconnecting");
                     break false;
                 }
             },
+        };
+        if let Some(msg) = due {
+            if let Err(error) = write_agent_msg(&mut write, &msg).await {
+                debug!(%error, "write to hub failed");
+                break false;
+            }
+            liveness.said();
         }
     };
     reader_task.stop().await;
@@ -544,6 +670,13 @@ pub async fn run_stdio() -> i32 {
             self_update: worker.self_update(),
         })
     });
+    // Status line numbers (TASK-058); files of sessions that ended without
+    // their agent go first.
+    let status = config.state_dir.clone().map(StatusWatch::new);
+    if let Some(state) = config.state_dir.clone() {
+        let _ =
+            tokio::task::spawn_blocking(move || statusfile::prune(&state, SystemTime::now())).await;
+    }
     let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
         Ok(plan) => {
             let register = Register {
@@ -558,6 +691,7 @@ pub async fn run_stdio() -> i32 {
                 client,
                 files: true,
                 session_reads: true,
+                status_lines: status.is_some(),
                 heartbeat: true,
             };
             let (outbox, events) = spawn(LinkConfig {
@@ -570,6 +704,7 @@ pub async fn run_stdio() -> i32 {
                     hook_addr: plan.hook,
                 }),
                 heartbeat: Heartbeat::default(),
+                status: status.clone(),
             });
             (Hub::Link(outbox), Some(events))
         }
@@ -601,7 +736,7 @@ pub async fn run_stdio() -> i32 {
         work: std::env::current_dir().ok(),
     };
     let worker = Some(Arc::new(worker));
-    match serve_channel(
+    let ended = serve_channel(
         frames,
         tokio::io::stdout(),
         hub,
@@ -610,8 +745,14 @@ pub async fn run_stdio() -> i32 {
         console,
         worker,
     )
-    .await
+    .await;
+    // A newer worker takes the session and its numbers over.
+    if !matches!(ended, Ok(Ended::Handover))
+        && let Some(status) = status
     {
+        let _ = tokio::task::spawn_blocking(move || status.clean()).await;
+    }
+    match ended {
         Ok(Ended::Handover) => shim::HANDOVER,
         Ok(Ended::Input) => 0,
         Err(error) => {
@@ -1730,6 +1871,7 @@ mod tests {
             client: None,
             files: true,
             session_reads: false,
+            status_lines: false,
             heartbeat: false,
         }
     }
@@ -1742,7 +1884,51 @@ mod tests {
             backoff,
             replay: None,
             heartbeat: Heartbeat::default(),
+            status: None,
         }
+    }
+
+    /// TASK-058 review: a coarse file system gives two writes one mtime;
+    /// the second numbers still go, the same numbers never twice.
+    #[test]
+    fn numbers_written_within_one_mtime_are_sent_too() {
+        let dir = crate::hub::testdir::TempDir::new("agent-status-mtime");
+        let session = register().session_id;
+        let watch = StatusWatch::new(dir.path().to_owned());
+        let mut state = StatusState {
+            watch: &watch,
+            session: session.clone(),
+            sent: None,
+            marked: None,
+        };
+        let numbers = |context| HookEvent::StatusLine {
+            model: Some("Opus".into()),
+            effort: None,
+            context: Some(context),
+            five_hour: None,
+            seven_day: None,
+        };
+        let file = statusfile::dir(dir.path()).join(format!("{session}.json"));
+        let at = |file: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))
+                .unwrap();
+        };
+        let context = |msg: Option<AgentMsg>| match msg {
+            Some(AgentMsg::StatusLine { context, .. }) => context,
+            other => panic!("no numbers: {other:?}"),
+        };
+        statusfile::write(dir.path(), &session, &numbers(10)).unwrap();
+        at(&file);
+        assert_eq!(context(state.due()), Some(10));
+        assert_eq!(state.due(), None);
+        statusfile::write(dir.path(), &session, &numbers(20)).unwrap();
+        at(&file);
+        assert_eq!(context(state.due()), Some(20));
+        assert_eq!(state.due(), None);
     }
 
     /// Rebinding the port of a just-closed listener can fail briefly.

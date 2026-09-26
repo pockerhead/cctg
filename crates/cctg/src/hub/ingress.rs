@@ -490,7 +490,8 @@ async fn agent_session(
                         | AgentMsg::UpdateAnswer { .. }
                         | AgentMsg::FileOffer { .. }
                         | AgentMsg::FileChunk(_)
-                        | AgentMsg::SessionAnswer { .. }),
+                        | AgentMsg::SessionAnswer { .. }
+                        | AgentMsg::StatusLine { .. }),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
@@ -1286,6 +1287,7 @@ mod tests {
             client: None,
             files: false,
             session_reads: false,
+            status_lines: false,
             heartbeat: false,
         }
     }

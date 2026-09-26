@@ -235,6 +235,7 @@ impl Claude {
             client: None,
             files: true,
             session_reads: false,
+            status_lines: false,
             heartbeat: false,
         };
         let (outbox, events) = agent::spawn(LinkConfig {
@@ -247,6 +248,7 @@ impl Claude {
             },
             replay: None,
             heartbeat: Default::default(),
+            status: None,
         });
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 20);
