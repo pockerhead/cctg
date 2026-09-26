@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -96,9 +96,25 @@ impl Fake {
     }
 }
 
+/// A question's buttons are pressed as soon as its send reaches Telegram;
+/// Telegram's answer (the message id) comes back to the hub only this much
+/// later, so every press lands before the hub knows the message (TASK-060).
+const QUESTION_ANSWER_LAG: Duration = Duration::from_millis(300);
+
 impl Transport for Fake {
     async fn execute(&self, op: &Op) -> Delivery {
         self.ops.lock().unwrap().push(op.clone());
+        if let Op::Send {
+            reply_markup: Some(markup),
+            ..
+        } = op
+            && markup["inline_keyboard"][0][0]["callback_data"]
+                .as_str()
+                .and_then(questions::parse_callback)
+                .is_some()
+        {
+            tokio::time::sleep(QUESTION_ANSWER_LAG).await;
+        }
         match op {
             Op::CreateTopic { name, .. } => Ok(Outcome::Topic(ForumTopic {
                 message_thread_id: 100,
@@ -253,7 +269,7 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
 
 /// A home directory whose `.cctg/device.env` points at `addr`.
 fn home(test: &str, addr: &str) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("question-hook-{test}"));
+    let home = common::own_tmp().join(format!("question-hook-{test}"));
     let dir = home.join(".cctg");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -412,6 +428,12 @@ async fn own_text_answers_after_other_or_as_a_reply() {
     say(&hub, 50, "Бирюзовый, как море", None);
     // The second question: a tick, then a reply to the question message.
     press(&hub, message_id, &id, 1, Press::Option(1));
+    // A reply needs the message the user sees: the hub knows its id once it
+    // edits it (a press, unlike a reply, does not wait for that).
+    until("message known", || {
+        hub.fake.last_edit_of(message_id).is_some()
+    })
+    .await;
     say(&hub, 51, "and a fig", Some(message_id));
     let (output, _) = running.await.unwrap();
     assert_clean(&output);

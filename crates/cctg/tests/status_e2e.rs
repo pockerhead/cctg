@@ -1097,7 +1097,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
 
 /// A home directory whose `.cctg/device.env` points at `addr`.
 fn hook_home(test: &str, addr: &str) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("status-e2e-{test}"));
+    let home = common::own_tmp().join(format!("status-e2e-{test}"));
     let dir = home.join(".cctg");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(

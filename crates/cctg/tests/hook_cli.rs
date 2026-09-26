@@ -28,7 +28,7 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// A home directory whose `.cctg/device.env` points at `addr`.
 fn home(test: &str, addr: Option<&str>) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hook-cli-{test}"));
+    let home = common::own_tmp().join(format!("hook-cli-{test}"));
     let dir = home.join(".cctg");
     std::fs::create_dir_all(&dir).unwrap();
     let mut env = String::new();

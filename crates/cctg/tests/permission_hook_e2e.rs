@@ -7,7 +7,7 @@
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -236,7 +236,7 @@ async fn hub(test: &str) -> Hub {
 
 /// A home directory whose `.cctg/device.env` points at `addr`.
 fn home(test: &str, addr: &str) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("permission-hook-{test}"));
+    let home = common::own_tmp().join(format!("permission-hook-{test}"));
     let dir = home.join(".cctg");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(

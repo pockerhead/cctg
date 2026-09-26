@@ -25,7 +25,7 @@ const INPUT: &str = "{\"session_id\":\"5e551017-0000-4000-8000-000000000031\",\"
 /// A home whose `.cctg/device.env` points at `addr` and whose Claude Code
 /// user settings carry `command` as the status line.
 fn home(test: &str, addr: &str, command: Option<&str>) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("statusline-cli-{test}"));
+    let home = common::own_tmp().join(format!("statusline-cli-{test}"));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join(".cctg")).unwrap();
     std::fs::create_dir_all(home.join(".claude")).unwrap();

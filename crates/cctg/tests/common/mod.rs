@@ -7,8 +7,9 @@
 //! process of the tests is therefore started through [`cctg`] or
 //! [`isolate`]; `tests/isolation.rs` checks that.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// `cctg` with `home` as its home directory and no `CCTG_*` or `CLAUDE*`
 /// variable of the environment the tests run in. A test sets what it needs
@@ -44,4 +45,33 @@ pub fn write_program(path: &Path, bytes: &[u8]) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .expect("make the program executable");
     }
+}
+
+/// This test process's own directory under `CARGO_TARGET_TMPDIR`. The
+/// target directory is shared (worktrees, a second `cargo test`), so homes
+/// named only by test would be shared by concurrent runs: one run's
+/// `device.env` then points the other's hooks at the wrong hub, and a spool
+/// left by a failed run is replayed into the next one (TASK-060). Folders
+/// of runs older than an hour are removed on the way.
+#[allow(dead_code, reason = "not every test binary keeps homes there")]
+pub fn own_tmp() -> PathBuf {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let own = std::process::id().to_string();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|at| {
+                    at.elapsed()
+                        .is_ok_and(|age| age > Duration::from_secs(3600))
+                });
+            if name != own && name.bytes().all(|b| b.is_ascii_digit()) && stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    root.join(own)
 }
