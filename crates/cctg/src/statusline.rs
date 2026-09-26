@@ -264,7 +264,23 @@ pub async fn git_branch(cwd: &str) -> Option<String> {
 /// The trimmed output of a successful `git -C <cwd> --no-optional-locks
 /// <args>`; the process is killed after [`GIT_TIMEOUT`].
 async fn git(cwd: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("git")
+    let mut command = tokio::process::Command::new("git");
+    // A repository chosen by the caller's environment would name the wrong
+    // branch for `cwd`.
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(var);
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command
         .arg("-C")
         .arg(cwd)
         .arg("--no-optional-locks")
