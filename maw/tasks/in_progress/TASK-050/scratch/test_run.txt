@@ -1,0 +1,83 @@
+     Running unittests src\lib.rs (target\debug\deps\cctg-42945bdabd174b21.exe)
+test result: ok. 625 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 13.62s
+     Running unittests src\main.rs (target\debug\deps\cctg-5edb6a60dc86943c.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\agent_stdio.rs (target\debug\deps\agent_stdio-402c8b47f3122766.exe)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+     Running tests\buffer_e2e.rs (target\debug\deps\buffer_e2e-b55c40cc2a0b6d65.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+     Running tests\command_logs.rs (target\debug\deps\command_logs-6a8ca7c06ee10b0e.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.63s
+     Running tests\files_e2e.rs (target\debug\deps\files_e2e-911dd4af36507860.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.92s
+     Running tests\formatting_e2e.rs (target\debug\deps\formatting_e2e-e6115d9a824af5de.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests\hook_cli.rs (target\debug\deps\hook_cli-a8985781ec278f5c.exe)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+     Running tests\hub_reads_no_files.rs (target\debug\deps\hub_reads_no_files-779f714964ebf571.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests\ingress_logs.rs (target\debug\deps\ingress_logs-f8a1d8677434f076.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+     Running tests\install_e2e.rs (target\debug\deps\install_e2e-ad131bc916f76dd7.exe)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.65s
+     Running tests\isolation.rs (target\debug\deps\isolation-6fdd69eb845ecf3a.exe)
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.06s
+     Running tests\message_logs.rs (target\debug\deps\message_logs-a2d65b054e0eb408.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s
+     Running tests\overflow_logs.rs (target\debug\deps\overflow_logs-43e943a4f5313514.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+     Running tests\permission_hook_e2e.rs (target\debug\deps\permission_hook_e2e-4cf06c09eaa9cb20.exe)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.21s
+     Running tests\permission_logs.rs (target\debug\deps\permission_logs-b7f68cb977f09b25.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s
+     Running tests\proxy_e2e.rs (target\debug\deps\proxy_e2e-2cf66ba8bf8b8cc1.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.24s
+     Running tests\reads_e2e.rs (target\debug\deps\reads_e2e-fb6cd5f1a3f534df.exe)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+     Running tests\reap_e2e.rs (target\debug\deps\reap_e2e-3885d6374edb4fbc.exe)
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.34s
+     Running tests\routing_logs.rs (target\debug\deps\routing_logs-a03801e61c648a39.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\run_e2e.rs (target\debug\deps\run_e2e-323b7c3fbebc9d85.exe)
+     Running tests\slots_logs.rs (target\debug\deps\slots_logs-b230746d7dbd862e.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+     Running tests\soak.rs (target\debug\deps\soak-0ee27df32d1a86e5.exe)
+     Running tests\spool_e2e.rs (target\debug\deps\spool_e2e-2549aec87a73c08a.exe)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+     Running tests\status_e2e.rs (target\debug\deps\status_e2e-814e4c8f2e2485aa.exe)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.71s
+     Running tests\status_logs.rs (target\debug\deps\status_logs-28c1d5f49ed54864.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s
+     Running tests\statusline_cli.rs (target\debug\deps\statusline_cli-bd687ff0e1e3e552.exe)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+     Running tests\stdout.rs (target\debug\deps\stdout-6225dc6621bda5b3.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+     Running tests\stream_e2e.rs (target\debug\deps\stream_e2e-9a02bfddd8717134.exe)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.44s
+     Running tests\stream_logs.rs (target\debug\deps\stream_logs-612e9a4dd47b7e23.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+     Running tests\supervise_e2e.rs (target\debug\deps\supervise_e2e-5bff76f03f1eb51a.exe)
+     Running tests\tls_e2e.rs (target\debug\deps\tls_e2e-173cc99b25b2fd55.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.84s
+     Running tests\update_e2e.rs (target\debug\deps\update_e2e-3359d64acb4c305a.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.92s
+     Running unittests src\lib.rs (target\debug\deps\transcript-43c48b4f8048728b.exe)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\markdown.rs (target\debug\deps\markdown-86ebfc74e1519715.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+     Running tests\parse_fixtures.rs (target\debug\deps\parse_fixtures-e3c5074e58f0e2d7.exe)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\parse_tolerance.rs (target\debug\deps\parse_tolerance-580bdb9de32653ff.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\purity.rs (target\debug\deps\purity-f83d3eae107f354c.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\render.rs (target\debug\deps\render-e73cb3fa687cf7f5.exe)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+     Running tests\split.rs (target\debug\deps\split-8f59df3ff67037b7.exe)
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests\stream.rs (target\debug\deps\stream-9372ea8ab4a0d861.exe)
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests\subagent.rs (target\debug\deps\subagent-be1576d16eea8f99.exe)
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
