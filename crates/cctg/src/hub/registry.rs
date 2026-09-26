@@ -391,6 +391,10 @@ pub struct Stream {
     /// for their channel record to turn ✍.
     #[serde(default)]
     pub receipts: Vec<i64>,
+    /// Receipts that stand for a burst handed as one inbound (TASK-048):
+    /// receipt -> the burst's other messages, which turn ✍ with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<(i64, Vec<i64>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
