@@ -65,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 claude-cctg
 ```
 
-Все аргументы `claude` работают так же (`claude-cctg --resume`, `claude-cctg "почини тест"`). Claude Code при старте спрашивает про development channels: выберите пункт 1. В Windows в обычной консоли (PowerShell, cmd, Windows Terminal) cctg нажимает за вас; в окне Git Bash (mintty) нет, поэтому сессии в Windows лучше запускать из PowerShell или cmd.
+Все аргументы `claude` работают так же (`claude-cctg --resume`, `claude-cctg "почини тест"`). Claude Code при старте спрашивает про development channels: выберите пункт 1. В Windows в обычной консоли (PowerShell, cmd, Windows Terminal), на Linux и macOS в терминале cctg нажимает за вас; в окне Git Bash (mintty) нет, поэтому сессии в Windows лучше запускать из PowerShell или cmd.
 
 ## Что видно в Telegram
 

@@ -15,17 +15,29 @@
 //! console input: `FreeConsole` + `AttachConsole(claude pid)` + `CONIN$` +
 //! `WriteConsoleInputW`, then `FreeConsole` again. A console is attached per
 //! process, so one press at a time. The agent's stdio are pipes and stay
-//! untouched. Elsewhere nothing is supported yet and the agent does not
-//! announce the capability.
+//! untouched. On Linux and macOS (TASK-044) the agent asks the `cctg run`
+//! that started its claude, which keeps claude in a pseudo-terminal
+//! ([`crate::term`]), for its screen copy and to write into claude's input.
+//! Both ways are a [`Target`]; what to type and when is decided on the same
+//! screen lines for both.
 //!
 //! A successful write says only that the key events are in the console
 //! input buffer (behind any input that waits there), not that Claude Code
 //! read them or that its turn ended.
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use crate::wire::ConsoleKey;
 
-/// Whether this build can press keys at all.
-pub const SUPPORTED: bool = cfg!(windows);
+/// Where the agent presses and types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The console of this claude process (Windows only).
+    Console(u32),
+    /// The terminal of the `cctg run` behind this socket (Unix only).
+    Run(PathBuf),
+}
 
 /// `(virtual key, scan code, character, control key state)` of `key`.
 pub fn key_event(key: ConsoleKey) -> (u16, u16, u16, u32) {
@@ -34,10 +46,17 @@ pub fn key_event(key: ConsoleKey) -> (u16, u16, u16, u32) {
     }
 }
 
-/// Writes `key` (down and up) into the console input of process
-/// `claude_pid`. Blocking and short; `false` when any step failed.
+/// Writes `key` (down and up) into `target`. Blocking and short; `false`
+/// when any step failed.
+pub fn press(target: &Target, key: ConsoleKey) -> bool {
+    match (target, key) {
+        (Target::Console(pid), key) => press_console(*pid, key),
+        (Target::Run(socket), ConsoleKey::Interrupt) => crate::term::keys(socket, "\u{1b}"),
+    }
+}
+
 #[cfg(windows)]
-pub fn press(claude_pid: u32, key: ConsoleKey) -> bool {
+fn press_console(claude_pid: u32, key: ConsoleKey) -> bool {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
     };
@@ -98,32 +117,36 @@ pub fn press(claude_pid: u32, key: ConsoleKey) -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn press(_claude_pid: u32, _key: ConsoleKey) -> bool {
+fn press_console(_claude_pid: u32, _key: ConsoleKey) -> bool {
     false
 }
 
 /// The prompt glyphs of Claude Code's input box: `❯`, or `>` in consoles
 /// that make it fall back to ASCII (seen live in cmd.exe, 2026-09-24).
 const PROMPTS: [char; 2] = ['\u{276f}', '>'];
-/// How long typed keys get before the screen is read back.
-#[cfg(windows)]
-const ECHO_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// How long [`type_command`] watches the screen for a panel after Enter,
-/// how often, and how long a found panel gets to fill in before it is read.
-#[cfg(windows)]
-const PANEL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(windows)]
-const PANEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-#[cfg(windows)]
-const PANEL_SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+/// How long typing waits for the screen: typed keys before the box is read
+/// back; after Enter, a [`panel`] ([`type_command`]) and [`exit_dialog`]
+/// ([`type_exit`]), how often they are looked for, how long a found panel
+/// gets to fill in, and Esc presses to close the dialog at most.
+#[derive(Debug, Clone, Copy)]
+struct Waits {
+    echo: Duration,
+    panel: Duration,
+    poll: Duration,
+    settle: Duration,
+    exit_dialog: Duration,
+    exit_escapes: usize,
+}
 
-/// How long [`type_exit`] watches the screen for [`exit_dialog`] after
-/// Enter, and how many Esc it presses at most to close a found one.
-#[cfg(windows)]
-const EXIT_DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(windows)]
-const EXIT_DIALOG_ESCAPES: usize = 3;
+const WAITS: Waits = Waits {
+    echo: Duration::from_millis(400),
+    panel: Duration::from_secs(2),
+    poll: Duration::from_millis(250),
+    settle: Duration::from_millis(700),
+    exit_dialog: Duration::from_secs(2),
+    exit_escapes: 3,
+};
 
 /// Longest command [`type_line`] types, in characters.
 pub const MAX_LINE_CHARS: usize = 200;
@@ -290,8 +313,8 @@ pub fn panel(screen: &[String]) -> Option<String> {
 /// Types `/exit` with [`type_line`]. When it opens [`exit_dialog`], the
 /// dialog is closed with Esc (never an option picked) and the answer is
 /// [`Typed::Agents`]; [`Typed::Failed`] when it stays open.
-pub fn type_exit(claude_pid: u32) -> Typed {
-    type_and_watch(claude_pid, "/exit", After::ExitDialog).0
+pub fn type_exit(target: &Target) -> Typed {
+    type_and_watch(target, "/exit", After::ExitDialog).0
 }
 
 /// What [`type_and_watch`] looks for once the line went in.
@@ -302,50 +325,75 @@ enum After {
     ExitDialog,
 }
 
-/// Types `text` into the console of `claude_pid`, reads the input box back
-/// and presses Enter only when it shows nothing but `text`; otherwise erases
-/// the typed characters (Backspace deletes before the cursor, where they
-/// went). A text that is not [`typable`] is not typed. Blocking, under a
-/// second.
-pub fn type_line(claude_pid: u32, text: &str) -> Typed {
-    type_and_watch(claude_pid, text, After::Nothing).0
+/// Types `text` into `target`, reads the input box back and presses Enter
+/// only when it shows nothing but `text`; otherwise erases the typed
+/// characters (Backspace deletes before the cursor, where they went). A text
+/// that is not [`typable`] is not typed. Blocking, under a second.
+pub fn type_line(target: &Target, text: &str) -> Typed {
+    type_and_watch(target, text, After::Nothing).0
 }
 
 /// [`type_line`], then, once sent, watches the screen for a [`panel`]; a
 /// panel that shows up is read and closed with Esc (it waits for Esc and
 /// blocks the terminal otherwise). Blocking, up to about three seconds.
-pub fn type_command(claude_pid: u32, text: &str) -> (Typed, Option<String>) {
-    type_and_watch(claude_pid, text, After::Panel)
+pub fn type_command(target: &Target, text: &str) -> (Typed, Option<String>) {
+    type_and_watch(target, text, After::Panel)
 }
 
-#[cfg(windows)]
-fn type_and_watch(claude_pid: u32, text: &str, after: After) -> (Typed, Option<String>) {
-    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
+/// Reads `target` and says whether it shows [`agents_block`]; `false` when
+/// it cannot be read. Blocking and short.
+pub fn agents_on_screen(target: &Target) -> bool {
+    open(target)
+        .and_then(|mut terminal| terminal.lines())
+        .is_some_and(|screen| agents_block(&screen))
+}
 
+/// A claude terminal as typing needs it.
+trait Terminal {
+    /// The visible rows, right trimmed.
+    fn lines(&mut self) -> Option<Vec<String>>;
+    /// Writes `text` as key presses: `\r` is Enter, `\u{8}` Backspace,
+    /// `\u{1b}` Esc.
+    fn write(&mut self, text: &str) -> bool;
+}
+
+fn open(target: &Target) -> Option<Box<dyn Terminal>> {
+    match target {
+        Target::Console(pid) => console(*pid),
+        Target::Run(socket) => Some(Box::new(Run(socket.clone()))),
+    }
+}
+
+fn type_and_watch(target: &Target, text: &str, after: After) -> (Typed, Option<String>) {
     if !typable(text) {
         return (Typed::Failed, None);
     }
-    let _one = one_at_a_time();
-    // SAFETY: plain Win32 calls without pointers; see `press`.
-    unsafe {
-        SetConsoleCtrlHandler(None, 1);
-        FreeConsole();
-        if AttachConsole(claude_pid) == 0 {
-            return (Typed::Failed, None);
-        }
+    match open(target) {
+        Some(mut terminal) => watch(terminal.as_mut(), text, after, WAITS),
+        None => (Typed::Failed, None),
     }
-    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+}
+
+/// The typing of [`type_and_watch`] on an open terminal.
+fn watch(
+    terminal: &mut dyn Terminal,
+    text: &str,
+    after: After,
+    waits: Waits,
+) -> (Typed, Option<String>) {
+    let agents = terminal.lines().is_some_and(|screen| agents_block(&screen));
     let typed = if agents {
         Typed::Agents
-    } else if write_text(text) {
-        std::thread::sleep(ECHO_WAIT);
-        let shown = visible_lines()
+    } else if terminal.write(text) {
+        std::thread::sleep(waits.echo);
+        let shown = terminal
+            .lines()
             .and_then(|screen| input_box(&screen))
             .map(|lines| box_shows(&lines, text));
-        if shown == Some(true) && write_text("\r") {
+        if shown == Some(true) && terminal.write("\r") {
             Typed::Sent
         } else {
-            write_text(&"\u{8}".repeat(text.chars().count()));
+            terminal.write(&"\u{8}".repeat(text.chars().count()));
             match shown {
                 Some(false) => Typed::Draft,
                 _ => Typed::Failed,
@@ -354,64 +402,25 @@ fn type_and_watch(claude_pid: u32, text: &str, after: After) -> (Typed, Option<S
     } else {
         Typed::Failed
     };
-    let (typed, panel) = match (typed, after) {
-        (Typed::Sent, After::Panel) => (typed, close_panel()),
-        (Typed::Sent, After::ExitDialog) => (cancel_exit_dialog(), None),
+    match (typed, after) {
+        (Typed::Sent, After::Panel) => (typed, close_panel(terminal, waits)),
+        (Typed::Sent, After::ExitDialog) => (cancel_exit_dialog(terminal, waits), None),
         _ => (typed, None),
-    };
-    // SAFETY: no arguments.
-    unsafe {
-        FreeConsole();
     }
-    (typed, panel)
 }
 
-#[cfg(not(windows))]
-fn type_and_watch(_claude_pid: u32, _text: &str, _after: After) -> (Typed, Option<String>) {
-    (Typed::Failed, None)
-}
-
-/// Reads the console of `claude_pid` and says whether it shows
-/// [`agents_block`]; `false` when it cannot be read. Blocking and short.
-#[cfg(windows)]
-pub fn agents_on_screen(claude_pid: u32) -> bool {
-    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
-
-    let _one = one_at_a_time();
-    // SAFETY: plain Win32 calls without pointers; see `press`.
-    unsafe {
-        SetConsoleCtrlHandler(None, 1);
-        FreeConsole();
-        if AttachConsole(claude_pid) == 0 {
-            return false;
-        }
-    }
-    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
-    // SAFETY: no arguments.
-    unsafe {
-        FreeConsole();
-    }
-    agents
-}
-
-#[cfg(not(windows))]
-pub fn agents_on_screen(_claude_pid: u32) -> bool {
-    false
-}
-
-/// Waits up to [`PANEL_WAIT`] for a [`panel`] in the attached console; reads
-/// a found one after [`PANEL_SETTLE`] and presses Esc. Esc goes only to a
-/// panel on screen: without one it would interrupt a turn.
-#[cfg(windows)]
-fn close_panel() -> Option<String> {
-    let until = std::time::Instant::now() + PANEL_WAIT;
+/// Waits up to `waits.panel` for a [`panel`]; reads a found one after
+/// `waits.settle` and presses Esc. Esc goes only to a panel on screen:
+/// without one it would interrupt a turn.
+fn close_panel(terminal: &mut dyn Terminal, waits: Waits) -> Option<String> {
+    let until = std::time::Instant::now() + waits.panel;
     while std::time::Instant::now() < until {
-        std::thread::sleep(PANEL_POLL);
-        if visible_lines().as_deref().and_then(panel).is_some() {
-            std::thread::sleep(PANEL_SETTLE);
-            let text = visible_lines().as_deref().and_then(panel);
+        std::thread::sleep(waits.poll);
+        if terminal.lines().as_deref().and_then(panel).is_some() {
+            std::thread::sleep(waits.settle);
+            let text = terminal.lines().as_deref().and_then(panel);
             if text.is_some() {
-                write_text("\u{1b}");
+                terminal.write("\u{1b}");
             }
             return text;
         }
@@ -419,17 +428,16 @@ fn close_panel() -> Option<String> {
     None
 }
 
-/// Watches the attached console up to [`EXIT_DIALOG_WAIT`] after `/exit`
-/// for [`exit_dialog`]. Without one claude is exiting: [`Typed::Sent`]. A
-/// found one gets Esc (cancel, claude stays), again while it is still shown,
-/// at most [`EXIT_DIALOG_ESCAPES`] times: [`Typed::Agents`] once it is
-/// gone, [`Typed::Failed`] when it stays.
-#[cfg(windows)]
-fn cancel_exit_dialog() -> Typed {
-    let shown = || visible_lines().is_some_and(|screen| exit_dialog(&screen));
-    let until = std::time::Instant::now() + EXIT_DIALOG_WAIT;
+/// Watches the terminal up to `waits.exit_dialog` after `/exit` for
+/// [`exit_dialog`]. Without one claude is exiting: [`Typed::Sent`]. A found
+/// one gets Esc (cancel, claude stays), again while it is still shown, at
+/// most `waits.exit_escapes` times: [`Typed::Agents`] once it is gone,
+/// [`Typed::Failed`] when it stays.
+fn cancel_exit_dialog(terminal: &mut dyn Terminal, waits: Waits) -> Typed {
+    let mut shown = || terminal.lines().is_some_and(|screen| exit_dialog(&screen));
+    let until = std::time::Instant::now() + waits.exit_dialog;
     loop {
-        std::thread::sleep(PANEL_POLL);
+        std::thread::sleep(waits.poll);
         if shown() {
             break;
         }
@@ -437,14 +445,96 @@ fn cancel_exit_dialog() -> Typed {
             return Typed::Sent;
         }
     }
-    for _ in 0..EXIT_DIALOG_ESCAPES {
-        write_text("\u{1b}");
-        std::thread::sleep(ECHO_WAIT);
-        if !shown() {
+    for _ in 0..waits.exit_escapes {
+        terminal.write("\u{1b}");
+        std::thread::sleep(waits.echo);
+        if !terminal.lines().is_some_and(|screen| exit_dialog(&screen)) {
             return Typed::Agents;
         }
     }
     Typed::Failed
+}
+
+/// The terminal of a `cctg run` (Linux, macOS): every read and write is one
+/// ask on its socket.
+struct Run(PathBuf);
+
+impl Terminal for Run {
+    fn lines(&mut self) -> Option<Vec<String>> {
+        crate::term::screen(&self.0)
+    }
+
+    /// A terminal sends DEL for Backspace. A text goes in as its first
+    /// character, then the rest: like typing, a leading `!` or `/` reaches
+    /// Claude Code alone (a `!` switches the empty box to bash mode).
+    fn write(&mut self, text: &str) -> bool {
+        let text = text.replace('\u{8}', "\u{7f}");
+        let mut chars = text.chars();
+        let (Some(first), rest) = (chars.next(), chars.as_str()) else {
+            return true;
+        };
+        if first.is_control() || rest.is_empty() {
+            return crate::term::keys(&self.0, &text);
+        }
+        crate::term::keys(&self.0, first.encode_utf8(&mut [0; 4])) && {
+            std::thread::sleep(Duration::from_millis(50));
+            crate::term::keys(&self.0, rest)
+        }
+    }
+}
+
+/// This process attached to a claude console (Windows): detached again and
+/// the lock released when dropped.
+#[cfg(windows)]
+struct Attached {
+    _one: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(windows)]
+fn attach(claude_pid: u32) -> Option<Attached> {
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
+
+    let one = one_at_a_time();
+    // SAFETY: plain Win32 calls without pointers; see `press_console`.
+    unsafe {
+        SetConsoleCtrlHandler(None, 1);
+        FreeConsole();
+        if AttachConsole(claude_pid) == 0 {
+            return None;
+        }
+    }
+    Some(Attached { _one: one })
+}
+
+#[cfg(windows)]
+fn console(claude_pid: u32) -> Option<Box<dyn Terminal>> {
+    attach(claude_pid).map(|console| Box::new(console) as Box<dyn Terminal>)
+}
+
+#[cfg(not(windows))]
+fn console(_claude_pid: u32) -> Option<Box<dyn Terminal>> {
+    None
+}
+
+#[cfg(windows)]
+impl Drop for Attached {
+    fn drop(&mut self) {
+        // SAFETY: no arguments.
+        unsafe {
+            windows_sys::Win32::System::Console::FreeConsole();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Terminal for Attached {
+    fn lines(&mut self) -> Option<Vec<String>> {
+        visible_lines()
+    }
+
+    fn write(&mut self, text: &str) -> bool {
+        write_text(text)
+    }
 }
 
 /// One console attachment at a time in this process: [`press`] and
@@ -837,7 +927,175 @@ mod tests {
         assert!(!typable(&"x".repeat(MAX_LINE_CHARS + 1)));
     }
 
-    // `press` itself is not called here: it detaches the calling process
+    /// A claude stand-in for [`watch`], the typing both platforms share: an
+    /// input box that echoes what is typed after the user's `draft`
+    /// (Backspace erases, the typed text first), Enter submits; `/cost`
+    /// opens a panel, `/exit` opens the background-work dialog while `busy`,
+    /// Esc closes either (unless `stuck`). `view`: the agent view is open.
+    #[derive(Default)]
+    struct Fake {
+        draft: String,
+        input: String,
+        panel: bool,
+        dialog: bool,
+        busy: bool,
+        stuck: bool,
+        view: bool,
+        sent: Vec<String>,
+        escapes: usize,
+    }
+
+    impl Terminal for Fake {
+        fn lines(&mut self) -> Option<Vec<String>> {
+            let mut lines = vec!["\u{25cf} earlier answer".to_owned()];
+            if self.panel {
+                lines.push("\u{2594}".repeat(40));
+                lines.push("   Session".to_owned());
+                lines.push("   Total cost: $0".to_owned());
+            } else if self.dialog {
+                lines.extend(probe_exit_dialog());
+            } else {
+                let shown = format!("{}{}", self.draft, self.input);
+                let shown = if self.view && shown.is_empty() {
+                    "Message @qa\u{2026}".to_owned()
+                } else {
+                    shown
+                };
+                lines.push(RULE.to_owned());
+                lines.push(format!("\u{276f}\u{a0}{shown}"));
+                lines.push(RULE.to_owned());
+            }
+            Some(lines)
+        }
+
+        fn write(&mut self, text: &str) -> bool {
+            for c in text.chars() {
+                match c {
+                    '\r' => {
+                        let line = format!("{}{}", self.draft, self.input);
+                        self.draft.clear();
+                        self.input.clear();
+                        self.panel = line == "/cost";
+                        self.dialog = line == "/exit" && self.busy;
+                        self.sent.push(line);
+                    }
+                    '\u{8}' => {
+                        if self.input.pop().is_none() {
+                            self.draft.pop();
+                        }
+                    }
+                    '\u{1b}' => {
+                        self.escapes += 1;
+                        if !self.stuck {
+                            self.panel = false;
+                            self.dialog = false;
+                        }
+                    }
+                    c => self.input.push(c),
+                }
+            }
+            true
+        }
+    }
+
+    const QUICK: Waits = Waits {
+        echo: Duration::from_millis(1),
+        panel: Duration::from_millis(50),
+        poll: Duration::from_millis(1),
+        settle: Duration::from_millis(1),
+        exit_dialog: Duration::from_millis(50),
+        exit_escapes: 3,
+    };
+
+    #[test]
+    fn a_line_goes_in_only_into_an_empty_box() {
+        let mut claude = Fake::default();
+        let typed = watch(&mut claude, "/model sonnet", After::Nothing, QUICK);
+        assert_eq!(typed, (Typed::Sent, None));
+        assert_eq!(claude.sent, ["/model sonnet"]);
+        // A draft of the user's: the typed text is erased, the draft stays.
+        let mut claude = Fake {
+            draft: "fix the".into(),
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
+            (Typed::Draft, None)
+        );
+        assert!(claude.sent.is_empty());
+        assert_eq!(
+            (claude.draft.as_str(), claude.input.as_str()),
+            ("fix the", "")
+        );
+        // The agent view: nothing is typed at all.
+        let mut claude = Fake {
+            view: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "!ls", After::Nothing, QUICK),
+            (Typed::Agents, None)
+        );
+        assert!(claude.sent.is_empty() && claude.input.is_empty());
+    }
+
+    #[test]
+    fn a_panel_is_read_and_closed_and_esc_goes_only_to_a_panel() {
+        let mut claude = Fake::default();
+        assert_eq!(
+            watch(&mut claude, "/cost", After::Panel, QUICK),
+            (Typed::Sent, Some("Session\nTotal cost: $0".to_owned()))
+        );
+        assert_eq!((claude.panel, claude.escapes), (false, 1));
+        let mut claude = Fake::default();
+        assert_eq!(
+            watch(&mut claude, "/compact", After::Panel, QUICK),
+            (Typed::Sent, None)
+        );
+        assert_eq!(
+            claude.escapes, 0,
+            "no Esc without a panel: it would interrupt"
+        );
+    }
+
+    #[test]
+    fn the_background_work_dialog_of_exit_is_cancelled() {
+        let mut claude = Fake::default();
+        assert_eq!(
+            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
+            (Typed::Sent, None)
+        );
+        assert_eq!(claude.escapes, 0);
+        let mut claude = Fake {
+            busy: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
+            (Typed::Agents, None)
+        );
+        assert_eq!((claude.dialog, claude.escapes), (false, 1));
+        let mut claude = Fake {
+            busy: true,
+            stuck: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
+            (Typed::Failed, None)
+        );
+        assert_eq!(claude.escapes, 3);
+    }
+
+    #[test]
+    fn a_run_terminal_that_does_not_answer_gets_nothing() {
+        let target = Target::Run(std::env::temp_dir().join("cctg-no-such-run.sock"));
+        assert_eq!(type_line(&target, "/cost"), Typed::Failed);
+        assert!(!agents_on_screen(&target));
+        assert!(!press(&target, ConsoleKey::Interrupt));
+    }
+
+    // A console `press` is not called here: it detaches the calling process
     // from its console, which would take the test runner's terminal output
     // with it. The live probe (TASK-029 `scratch/planner/probe`) covers it.
 }
