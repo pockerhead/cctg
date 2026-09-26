@@ -316,6 +316,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         release: crate::client::release().map(str::to_owned),
         gather_quiet: slots::GATHER_QUIET,
         gather_max: slots::GATHER_MAX,
+        inbound_settle: slots::INBOUND_SETTLE,
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
