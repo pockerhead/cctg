@@ -8,7 +8,12 @@
 //! typed while the screen shows Claude Code's agent view or a running
 //! background agent ([`agents_block`]), and a `/exit` that opens Claude
 //! Code's "Background work is running" dialog is cancelled with Esc
-//! ([`exit_dialog`]).
+//! ([`exit_dialog`]). Since TASK-057 the trailing faint run of the input box
+//! (Claude Code's prompt suggestion, placeholder, the rest of an inline
+//! completion) and the completion's first character under the cursor are
+//! not taken for a draft where the screen read tells faint text
+//! ([`typed_box`], [`typed_shows`]), and a typed line wrapped over several
+//! rows of the box is joined back ([`box_shows`]).
 //!
 //! Channels have no command for it, so on Windows the agent (a child of
 //! that claude) attaches to its console and writes the key events into the
@@ -236,6 +241,92 @@ fn panel_edge(line: &str) -> bool {
 /// of `screen`, blank ones left out: Claude Code's input box. `None`
 /// without two rules.
 pub fn input_box(screen: &[String]) -> Option<Vec<String>> {
+    box_rows(screen).map(|rows| non_blank(&screen[rows]))
+}
+
+/// The input box as typing reads it back ([`typed_box`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedBox {
+    /// The non-blank rows of the box without its trailing faint run.
+    pub lines: Vec<String>,
+    /// The faint run starts right after the last character of `lines`, on
+    /// its row: that character may be the first of Claude Code's inline
+    /// completion, drawn solid under the cursor ([`typed_shows`]).
+    pub ghost_follows: bool,
+}
+
+/// [`input_box`] of what was typed, without the box's trailing faint run
+/// where the screen read can tell ([`crate::term::Rows`]): the rest of the
+/// last row with solid text, from where its faint cells start, and the
+/// rows after it (all faint). That run is text nobody typed: Claude Code's
+/// placeholder or prompt suggestion in an empty box, or the rest of its
+/// inline completion after the cursor (probe TASK-057). Faint text with
+/// solid text after it stays (Claude Code dims interim dictation, which is
+/// part of the user's draft), and so does everything when the read cannot
+/// tell faint text.
+pub fn typed_box(rows: &crate::term::Rows) -> Option<TypedBox> {
+    let found = box_rows(&rows.lines)?;
+    let lines = &rows.lines[found.clone()];
+    let whole = TypedBox {
+        lines: non_blank(lines),
+        ghost_follows: false,
+    };
+    let Some(solid) = rows.solid.as_ref().filter(|s| s.len() == rows.lines.len()) else {
+        return Some(whole);
+    };
+    let solid = &solid[found];
+    let Some(last) = solid.iter().rposition(|row| !row.trim().is_empty()) else {
+        return Some(TypedBox {
+            lines: Vec::new(),
+            ghost_follows: false,
+        });
+    };
+    // Every row before the last solid one shows no faint text, and the
+    // last one is solid up to where its faint run starts.
+    if solid[..last] != lines[..last] || !lines[last].starts_with(solid[last].as_str()) {
+        return Some(whole);
+    }
+    let ghost_follows = lines[last][solid[last].len()..]
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace());
+    let mut kept = non_blank(&lines[..last]);
+    kept.push(solid[last].clone());
+    Some(TypedBox {
+        lines: kept,
+        ghost_follows,
+    })
+}
+
+/// The box shows exactly the typed `text` ([`box_shows`]), or `text` and
+/// the first character of Claude Code's inline completion. That character
+/// is drawn under the cursor, plain or inverse, and only the rest of the
+/// completion is faint (Claude Code 2.1.283 `Cursor.render`: the first
+/// grapheme of the ghost text as is or through `invert`, the rest through
+/// `dim`): so one more character right before the trailing faint run, with
+/// no whitespace before it, is taken for it. Enter submits the typed value
+/// without the completion (only Tab accepts it; probe TASK-057).
+pub fn typed_shows(typed: &TypedBox, text: &str) -> bool {
+    box_shows(&typed.lines, text)
+        || typed.ghost_follows
+            && without_cursor_char(&typed.lines).is_some_and(|lines| box_shows(&lines, text))
+}
+
+/// `lines` without the last character of its last row, when a character
+/// other than whitespace stands before it on that row.
+fn without_cursor_char(lines: &[String]) -> Option<Vec<String>> {
+    let (last, rest) = lines.split_last()?;
+    let mut chars = last.chars();
+    chars.next_back()?;
+    let before = chars.as_str();
+    before.chars().next_back().filter(|c| !c.is_whitespace())?;
+    let mut lines = rest.to_vec();
+    lines.push(before.to_owned());
+    Some(lines)
+}
+
+/// The row indexes strictly between the last two rule lines of `screen`.
+fn box_rows(screen: &[String]) -> Option<std::ops::Range<usize>> {
     let rules: Vec<usize> = screen
         .iter()
         .enumerate()
@@ -248,32 +339,59 @@ pub fn input_box(screen: &[String]) -> Option<Vec<String>> {
     let [.., top, bottom] = rules[..] else {
         return None;
     };
-    Some(
-        screen[top + 1..bottom]
-            .iter()
-            .filter(|line| !line.trim().is_empty())
-            .cloned()
-            .collect(),
-    )
+    Some(top + 1..bottom)
+}
+
+fn non_blank(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .cloned()
+        .collect()
 }
 
 /// The box shows exactly the typed `text` and nothing else. Claude Code
 /// puts a no-break space after the prompt glyph (probe TASK-040 P2), which
 /// `str::trim` removes like any Unicode space. A `!` typed into an empty box
 /// switches Claude Code to bash mode, which may show the `!` in place of the
-/// glyph: for a text that starts with `!` that form counts too.
+/// glyph: for a text that starts with `!` that form counts too. A text too
+/// long for one row goes on in the next rows of the box, indented, broken
+/// after a word (the space dropped) or, without one, inside it (probe
+/// TASK-057): the rows are joined back.
 pub fn box_shows(lines: &[String], text: &str) -> bool {
-    let [line] = lines else {
+    let Some((line, rest)) = lines.split_first() else {
         return false;
     };
     let text = text.trim();
-    if line.strip_prefix(PROMPTS).map(str::trim) == Some(text) {
+    let joined = |first: &str, text: &str| {
+        let pieces = std::iter::once(first.trim()).chain(rest.iter().map(|line| line.trim()));
+        !first.trim().is_empty() && joins(pieces, text)
+    };
+    if line
+        .strip_prefix(PROMPTS)
+        .is_some_and(|shown| joined(shown, text))
+    {
         return true;
     }
     match (text.strip_prefix('!'), line.strip_prefix('!')) {
-        (Some(command), Some(shown)) => shown.trim() == command.trim(),
+        (Some(command), Some(shown)) => joined(shown, command.trim()),
         _ => false,
     }
+}
+
+/// `text` is `pieces` one after another, with any whitespace between two.
+fn joins<'a>(pieces: impl Iterator<Item = &'a str>, text: &str) -> bool {
+    let mut rest = text;
+    for (index, piece) in pieces.enumerate() {
+        if index > 0 {
+            rest = rest.trim_start();
+        }
+        let Some(after) = rest.strip_prefix(piece) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
 }
 
 /// The text of the panel on `screen`: what `/cost` or `/usage` open in
@@ -350,8 +468,12 @@ pub fn agents_on_screen(target: &Target) -> bool {
 
 /// A claude terminal as typing needs it.
 trait Terminal {
+    /// The visible rows, right trimmed, with their faint text where known.
+    fn rows(&mut self) -> Option<crate::term::Rows>;
     /// The visible rows, right trimmed.
-    fn lines(&mut self) -> Option<Vec<String>>;
+    fn lines(&mut self) -> Option<Vec<String>> {
+        self.rows().map(|rows| rows.lines)
+    }
     /// Writes `text` as key presses: `\r` is Enter, `\u{8}` Backspace,
     /// `\u{1b}` Esc.
     fn write(&mut self, text: &str) -> bool;
@@ -387,9 +509,9 @@ fn watch(
     } else if terminal.write(text) {
         std::thread::sleep(waits.echo);
         let shown = terminal
-            .lines()
-            .and_then(|screen| input_box(&screen))
-            .map(|lines| box_shows(&lines, text));
+            .rows()
+            .and_then(|rows| typed_box(&rows))
+            .map(|typed| typed_shows(&typed, text));
         if shown == Some(true) && terminal.write("\r") {
             Typed::Sent
         } else {
@@ -460,8 +582,8 @@ fn cancel_exit_dialog(terminal: &mut dyn Terminal, waits: Waits) -> Typed {
 struct Run(PathBuf);
 
 impl Terminal for Run {
-    fn lines(&mut self) -> Option<Vec<String>> {
-        crate::term::screen(&self.0)
+    fn rows(&mut self) -> Option<crate::term::Rows> {
+        crate::term::rows(&self.0)
     }
 
     /// A terminal sends DEL for Backspace. A text goes in as its first
@@ -528,8 +650,11 @@ impl Drop for Attached {
 
 #[cfg(windows)]
 impl Terminal for Attached {
-    fn lines(&mut self) -> Option<Vec<String>> {
-        visible_lines()
+    /// No faint text: the console's attribute words do not carry it (probe
+    /// TASK-057: Claude Code's faint placeholder reads as 0x0007, like typed
+    /// text).
+    fn rows(&mut self) -> Option<crate::term::Rows> {
+        visible_lines().map(|lines| crate::term::Rows { lines, solid: None })
     }
 
     fn write(&mut self, text: &str) -> bool {
@@ -932,10 +1057,21 @@ mod tests {
     /// (Backspace erases, the typed text first), Enter submits; `/cost`
     /// opens a panel, `/exit` opens the background-work dialog while `busy`,
     /// Esc closes either (unless `stuck`). `view`: the agent view is open.
+    /// `ghost`: text Claude Code shows after the input, drawn the way its
+    /// renderer does (probe TASK-057): in an empty box a faint prompt
+    /// suggestion; after typed text an inline completion, its first
+    /// character under the cursor (plain, or inverse when `inverse`), the
+    /// rest faint. `interim`: the draft is drawn faint (interim dictation).
+    /// The screen goes through the vt100 copy of `cctg run`; faint text is
+    /// told apart only when `faint` (a Unix screen, not a Windows console).
     #[derive(Default)]
     struct Fake {
         draft: String,
         input: String,
+        ghost: String,
+        inverse: bool,
+        interim: bool,
+        faint: bool,
         panel: bool,
         dialog: bool,
         busy: bool,
@@ -945,8 +1081,9 @@ mod tests {
         escapes: usize,
     }
 
-    impl Terminal for Fake {
-        fn lines(&mut self) -> Option<Vec<String>> {
+    impl Fake {
+        /// The bytes Claude Code would draw for the screen.
+        fn drawn(&self) -> String {
             let mut lines = vec!["\u{25cf} earlier answer".to_owned()];
             if self.panel {
                 lines.push("\u{2594}".repeat(40));
@@ -955,17 +1092,52 @@ mod tests {
             } else if self.dialog {
                 lines.extend(probe_exit_dialog());
             } else {
-                let shown = format!("{}{}", self.draft, self.input);
-                let shown = if self.view && shown.is_empty() {
-                    "Message @qa\u{2026}".to_owned()
+                let draft = if self.interim && !self.draft.is_empty() {
+                    format!("\x1b[2m{}\x1b[22m", self.draft)
                 } else {
-                    shown
+                    self.draft.clone()
+                };
+                let shown = format!("{draft}{}", self.input);
+                let (shown, ghost) = if self.draft.is_empty() && self.input.is_empty() {
+                    let placeholder = if self.view {
+                        "Message @qa\u{2026}"
+                    } else {
+                        self.ghost.as_str()
+                    };
+                    (String::new(), format!("\x1b[2m{placeholder}\x1b[22m"))
+                } else {
+                    let mut chars = self.ghost.chars();
+                    let first = chars.next().map(String::from).unwrap_or_default();
+                    let under = if self.inverse && !first.is_empty() {
+                        format!("\x1b[7m{first}\x1b[27m")
+                    } else {
+                        first
+                    };
+                    let rest = chars.as_str();
+                    let rest = if rest.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\x1b[2m{rest}\x1b[22m")
+                    };
+                    (shown, format!("{under}{rest}"))
                 };
                 lines.push(RULE.to_owned());
-                lines.push(format!("\u{276f}\u{a0}{shown}"));
+                lines.push(format!("\u{276f}\u{a0}{shown}{ghost}"));
                 lines.push(RULE.to_owned());
             }
-            Some(lines)
+            lines.join("\r\n")
+        }
+    }
+
+    impl Terminal for Fake {
+        fn rows(&mut self) -> Option<crate::term::Rows> {
+            let mut screen = crate::term::Screen::new(16, 140);
+            screen.feed(self.drawn().as_bytes());
+            let rows = screen.rows()?;
+            Some(crate::term::Rows {
+                solid: rows.solid.filter(|_| self.faint),
+                lines: rows.lines,
+            })
         }
 
         fn write(&mut self, text: &str) -> bool {
@@ -1037,6 +1209,210 @@ mod tests {
             (Typed::Agents, None)
         );
         assert!(claude.sent.is_empty() && claude.input.is_empty());
+    }
+
+    /// Types `text` into a [`Fake`] and says what [`watch`] did and what
+    /// was sent.
+    fn typed_into(mut claude: Fake, text: &str) -> (Typed, Vec<String>) {
+        let (typed, _) = watch(&mut claude, text, After::Nothing, QUICK);
+        if typed != Typed::Sent {
+            assert!(claude.input.is_empty(), "typed text left: {typed:?}");
+        }
+        (typed, claude.sent)
+    }
+
+    #[test]
+    fn an_inline_completion_is_not_a_draft() {
+        // An inline completion after the typed text, drawn as Claude Code
+        // 2.1.283 draws it: the first character under the cursor, plain
+        // (hardware cursor) or inverse (painted cursor), the rest faint.
+        // Enter submits only the typed value.
+        let text = "!curl -s localhost/api";
+        for inverse in [false, true] {
+            let claude = Fake {
+                ghost: "/v1/items".into(),
+                inverse,
+                faint: true,
+                ..Fake::default()
+            };
+            assert_eq!(
+                typed_into(claude, text),
+                (Typed::Sent, vec![text.to_owned()]),
+                "inverse {inverse}"
+            );
+        }
+        // A completion that starts with a space: the space is under the
+        // cursor.
+        let claude = Fake {
+            ghost: " -la".into(),
+            faint: true,
+            ..Fake::default()
+        };
+        assert_eq!(typed_into(claude, "!ls"), (Typed::Sent, vec!["!ls".into()]));
+        // A completion of one character has no faint rest to tell it by:
+        // refused, the safe way.
+        let claude = Fake {
+            ghost: "x".into(),
+            faint: true,
+            ..Fake::default()
+        };
+        assert_eq!(typed_into(claude, "!ls"), (Typed::Draft, vec![]));
+        // A screen read that cannot tell faint text (a Windows console, a
+        // `cctg run` older than the `rows` ask) keeps refusing, as before.
+        let claude = Fake {
+            ghost: "/v1/items".into(),
+            ..Fake::default()
+        };
+        assert_eq!(typed_into(claude, text), (Typed::Draft, vec![]));
+    }
+
+    #[test]
+    fn a_draft_still_blocks_with_faint_text_around() {
+        // A draft of the user's before the typed text, a completion after.
+        let claude = Fake {
+            draft: "fix the".into(),
+            ghost: " tests".into(),
+            faint: true,
+            ..Fake::default()
+        };
+        assert_eq!(typed_into(claude, "/exit"), (Typed::Draft, vec![]));
+        // Faint text with solid text after it (Claude Code dims interim
+        // dictation, which is the user's) is a draft, completion or not.
+        for ghost in ["", "/v1/items"] {
+            let claude = Fake {
+                draft: "hello ".into(),
+                interim: true,
+                ghost: ghost.into(),
+                faint: true,
+                ..Fake::default()
+            };
+            assert_eq!(
+                typed_into(claude, "!curl -s localhost/api"),
+                (Typed::Draft, vec![]),
+                "{ghost:?}"
+            );
+        }
+    }
+
+    /// The input box of `drawn` (rules around it) on a vt100 screen of
+    /// `cols` columns, as `cctg run` reads it.
+    fn box_of(drawn: &str, cols: u16) -> TypedBox {
+        let rule = "\u{2500}".repeat(20);
+        let mut screen = crate::term::Screen::new(8, cols);
+        screen.feed(format!("{rule}\r\n{drawn}\r\n{rule}").as_bytes());
+        typed_box(&screen.rows().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn only_the_trailing_faint_run_is_left_out() {
+        const GLYPH: &str = "\u{276f}\u{a0}";
+        let text = "!curl -s localhost/api";
+        let shows = |drawn: &str| typed_shows(&box_of(&format!("{GLYPH}{drawn}"), 60), text);
+        // Our text, then the completion's first character and faint rest.
+        assert!(shows("!curl -s localhost/api/\x1b[2mv1\x1b[22m"));
+        assert!(shows(
+            "!curl -s localhost/api\x1b[7m/\x1b[27m\x1b[2mv1\x1b[22m"
+        ));
+        assert!(shows("!curl -s localhost/api\x1b[2m/v1\x1b[22m"));
+        for drawn in [
+            // Two characters before the faint run: one is the user's.
+            "!curl -s localhost/apiZ/\x1b[2mv1\x1b[22m",
+            // A space before that character: the user's too.
+            "!curl -s localhost/api /\x1b[2mv1\x1b[22m",
+            // One more character and no faint run after it.
+            "!curl -s localhost/apiZ",
+            // Faint text in the middle, solid text after it.
+            "\x1b[2mhello \x1b[22m!curl -s localhost/api",
+            "!curl -s \x1b[2mhello \x1b[22mlocalhost/api",
+        ] {
+            assert!(!shows(drawn), "{drawn:?}");
+        }
+        // With faint cells in the middle, nothing is left out.
+        let kept = box_of(
+            &format!("{GLYPH}ab\x1b[2mcd\x1b[22mef\x1b[2mgh\x1b[22m"),
+            60,
+        );
+        assert_eq!(kept.lines, [format!("{GLYPH}abcdefgh")]);
+        assert!(!kept.ghost_follows);
+        // An empty box with a faint prompt suggestion: nothing typed.
+        let empty = box_of(&format!("{GLYPH}\x1b[2mTry it\x1b[22m"), 60);
+        assert_eq!(empty.lines, ["\u{276f}"]);
+        assert!(!empty.ghost_follows);
+    }
+
+    #[test]
+    fn a_wrapped_line_with_a_completion_is_joined_back() {
+        // 30 columns: the command wraps once (indented, the space at the
+        // break dropped), its last row ends with the completion, whose
+        // faint rest goes on in a row of its own.
+        let text = "!echo alpha beta gamma delta epsilon";
+        let drawn = "!\u{a0}echo alpha beta gamma delta\r\n  epsilon\x1b[7m-\x1b[27m\x1b[2m-flag\x1b[22m\r\n\x1b[2m  other\x1b[22m";
+        let typed = box_of(drawn, 30);
+        assert_eq!(
+            typed.lines,
+            ["!\u{a0}echo alpha beta gamma delta", "  epsilon-"]
+        );
+        assert!(typed.ghost_follows);
+        assert!(typed_shows(&typed, text));
+        // A faint row between two rows of solid text is not left out.
+        let drawn = "!\u{a0}echo alpha beta gamma delta\r\n\x1b[2m  zeta\x1b[22m\r\n  epsilon";
+        assert!(!typed_shows(&box_of(drawn, 30), text));
+    }
+
+    #[test]
+    fn the_typed_box_leaves_out_faint_text_only_where_known() {
+        let lines = screen(&[RULE, "\u{276f}\u{a0}!ls -la", "  more", RULE]);
+        let rows = |solid: Option<&[&str]>| crate::term::Rows {
+            lines: lines.clone(),
+            solid: solid.map(screen),
+        };
+        let whole = Some(TypedBox {
+            lines: screen(&["\u{276f}\u{a0}!ls -la", "  more"]),
+            ghost_follows: false,
+        });
+        assert_eq!(typed_box(&rows(None)), whole);
+        // Solid rows that do not match the screen are not used.
+        assert_eq!(typed_box(&rows(Some(&["\u{276f}\u{a0}!ls"]))), whole);
+        assert_eq!(
+            typed_box(&crate::term::Rows {
+                lines: screen(&["\u{276f} x"]),
+                solid: None
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_line_wrapped_in_the_box_is_joined_back() {
+        // Probe TASK-057 (2.1.283, 120 columns): a bash command broken after
+        // a word, a line without spaces broken inside it.
+        let words = (0..25)
+            .map(|i| format!("word{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (head, tail) = words.split_at(words.find(" word16").unwrap());
+        let command = format!("!echo {words}");
+        let shown = [format!("!\u{a0}echo {head}"), format!(" {tail}")];
+        assert!(box_shows(&shown, &command));
+        let glyph = [format!("\u{276f}\u{a0}echo {head}"), format!(" {tail}")];
+        assert!(box_shows(&glyph, &format!("echo {words}")));
+        let xs = "x".repeat(150);
+        let hard = [
+            format!("\u{276f}\u{a0}{}", &xs[..118]),
+            format!("  {}", &xs[118..]),
+        ];
+        assert!(box_shows(&hard, &xs));
+        // Anything more or less than the typed text still counts as a draft:
+        // a draft line after or before it, a missing piece, a glyph alone.
+        for (lines, text) in [
+            (&["\u{276f}\u{a0}/exit", "  draft"][..], "/exit"),
+            (&["\u{276f}\u{a0}draft", "  /exit"], "/exit"),
+            (&["\u{276f}", "  /exit"], "/exit"),
+            (&["\u{276f}\u{a0}!echo a", "  b"], "!echo a b c"),
+            (&["\u{276f}\u{a0}!echo a", "  bc"], "!echo a b"),
+        ] {
+            assert!(!box_shows(&screen(lines), text), "{lines:?} {text}");
+        }
     }
 
     #[test]
