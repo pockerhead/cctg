@@ -1,0 +1,23 @@
+   Compiling cctg v0.1.0 (C:\Users\user\dev\cctg-045\crates\cctg)
+    Finished `test` profile [unoptimized] target(s) in 5.98s
+     Running tests\statusline_cli.rs (C:/Users/user/dev/cctg/target\debug\deps\statusline_cli-c504c5cd54efdde7.exe)
+
+running 5 tests
+test the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte ... ok
+test a_command_that_prints_too_much_is_cut_without_waiting_for_the_timeout ... ok
+test colours_lines_a_failing_exit_and_empty_output_pass_unchanged ... ok
+test without_a_command_or_inside_one_cctg_prints_its_own_line ... ok
+test a_stopped_hub_adds_well_under_150_ms ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running tests\update_e2e.rs (C:/Users/user/dev/cctg/target\debug\deps\update_e2e-b9fd1d4ff831a768.exe)
+
+running 3 tests
+test a_new_binary_is_taken_without_losing_a_line ... ok
+test the_hubs_release_is_downloaded_checked_and_taken ... ok
+test a_failed_download_leaves_the_old_binary_and_the_agent ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.86s
+
+exit 0
