@@ -231,6 +231,8 @@ const MAX_BODY_READS: usize = 2;
 const BODY_RETRY_WAIT: Duration = Duration::from_secs(60);
 /// While a block text waits for the next agent, the actor looks this often.
 const BODY_RETRY_CHECK: Duration = Duration::from_secs(1);
+/// How soon an agent whose `bound` found its queue full is told again.
+const BOUND_RETRY: Duration = Duration::from_secs(1);
 /// Title reads of one agent that may fail in a row before its session's
 /// title is no longer asked of it (no transcript to find, a refusing
 /// agent); the next agent of the session is asked again.
@@ -828,6 +830,8 @@ struct Conn {
     /// It passes status line numbers on and is told its session
     /// ([`crate::wire::Register::status_lines`]).
     status_lines: bool,
+    /// Its last `bound` found the queue full; told again on a tick.
+    untold: bool,
     /// It is leaving after an update answer: bound to nothing, never
     /// rebound by its claude pid.
     leaving: bool,
@@ -1263,6 +1267,11 @@ impl Slots {
         } else {
             deadline.min(now + BODY_RETRY_CHECK)
         };
+        let deadline = if self.conns.values().any(|bound| bound.untold) {
+            deadline.min(now + BOUND_RETRY)
+        } else {
+            deadline
+        };
         let deadline = self
             .gathers
             .values()
@@ -1332,6 +1341,7 @@ impl Slots {
                         files: register.files,
                         session_reads: register.session_reads,
                         status_lines: register.status_lines,
+                        untold: false,
                         leaving: false,
                     },
                 );
@@ -1463,18 +1473,23 @@ impl Slots {
     }
 
     /// Tells an agent that passes status line numbers on which session
-    /// `conn` is bound to now (TASK-058); a full queue drops it, the next
-    /// registration tells again.
-    fn tell_bound(&self, conn: u64) {
-        let Some(bound) = self.conns.get(&conn).filter(|bound| bound.status_lines) else {
+    /// `conn` is bound to now (TASK-058); a full queue marks it `untold`
+    /// and the tick tells it again ([`BOUND_RETRY`]).
+    fn tell_bound(&mut self, conn: u64) {
+        let Some(bound) = self.conns.get_mut(&conn).filter(|bound| bound.status_lines) else {
             return;
         };
         let told = HubMsg::Bound {
             session_id: bound.session.clone(),
         };
-        if bound.to_agent.try_send(told).is_err() {
-            debug!(conn, "agent queue full; its session not told");
-        }
+        bound.untold = match bound.to_agent.try_send(told) {
+            Ok(()) => false,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(conn, "agent queue full; its session told later");
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        };
     }
 
     /// The newest connection still open for `session` that belongs to the
@@ -6347,6 +6362,15 @@ impl Slots {
         self.check_candidates();
         self.retry_bodies();
         self.check_compactions(now);
+        let untold: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, bound)| bound.untold)
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in untold {
+            self.tell_bound(conn);
+        }
     }
 
     fn ordinal(&self, slot: SlotId) -> u32 {
@@ -9151,6 +9175,69 @@ again"
             }
         )));
         assert!(from_hub.try_recv().is_err(), "no verdict after SessionEnd");
+    }
+
+    /// TASK-058 review: a `bound` that finds the agent queue full after
+    /// `/clear` is not lost; the tick tells the new session once there is
+    /// room.
+    #[tokio::test]
+    async fn a_bound_that_finds_the_queue_full_is_told_again() {
+        let dir = TempDir::new("slots-bound-retry");
+        let (_fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        let (to_agent, mut from_hub) = mpsc::channel(1);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: true,
+                transcript_reads: false,
+                console_keys: false,
+                console_commands: false,
+                client: None,
+                files: false,
+                session_reads: false,
+                status_lines: true,
+                heartbeat: false,
+            },
+            to_agent,
+        });
+        // The queue holds A's `bound` and has no room for B's.
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("clear".into()),
+                claude_pid: Some(10),
+                parent_claude_pid: None,
+            },
+        ));
+        assert_eq!(slots.conns[&1].session, B);
+        assert!(slots.conns[&1].untold);
+        assert!(slots.next_deadline() <= Instant::now() + BOUND_RETRY);
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::Bound { session_id }) if session_id == A
+        ));
+        assert!(from_hub.try_recv().is_err());
+        slots.on_tick();
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::Bound { session_id }) if session_id == B
+        ));
+        assert!(!slots.conns[&1].untold);
+        slots.on_tick();
+        assert!(from_hub.try_recv().is_err(), "told once");
     }
 
     #[tokio::test]

@@ -829,6 +829,12 @@ async fn numbers_over_the_agent_link_show_like_the_hooks_numbers() {
         })
     );
     let status = hub.status_message(100).await;
+    // A live top-level session with its own status message, whose numbers
+    // would show if A's link could send them.
+    let other = "0a16e2e0-0000-4000-8000-000000000293";
+    hub.start(other, 11).await;
+    let other_status = hub.status_message(101).await;
+    assert_ne!(status, other_status);
     let numbers = |session: &str, context| AgentMsg::StatusLine {
         session_id: session.into(),
         model: Some("Opus 5.5".into()),
@@ -837,8 +843,8 @@ async fn numbers_over_the_agent_link_show_like_the_hooks_numbers() {
         five_hour: Some(3),
         seven_day: Some(92),
     };
-    // Another session's numbers first: dropped.
-    agent.send(numbers(B, 77)).await;
+    // Another live session's numbers first: dropped.
+    agent.send(numbers(other, 77)).await;
     agent.send(numbers(A, 50)).await;
     hub.shows(
         "numbers from the link shown",
@@ -852,6 +858,8 @@ async fn numbers_over_the_agent_link_show_like_the_hooks_numbers() {
         ),
     )
     .await;
+    // Frames of one link are handled in order and edits go every 50 ms.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         !hub.fake.ops().iter().any(|op| matches!(
             op,
@@ -891,8 +899,6 @@ async fn numbers_over_the_agent_link_show_like_the_hooks_numbers() {
     })
     .await;
     // An agent built before TASK-058 is never told its session.
-    let other = "0a16e2e0-0000-4000-8000-000000000293";
-    hub.start(other, 11).await;
     let mut old = Agent::connect(&hub, other, 11).await;
     assert!(old.quiet().await);
 }

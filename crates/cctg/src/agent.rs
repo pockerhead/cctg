@@ -194,8 +194,9 @@ impl StatusWatch {
 struct StatusState<'a> {
     watch: &'a StatusWatch,
     session: String,
-    /// The change time of the numbers last sent on this connection.
-    sent: Option<SystemTime>,
+    /// The numbers last sent on this connection. Compared by content: two
+    /// writes can share one mtime on a coarse file system.
+    sent: Option<HookEvent>,
     marked: Option<Instant>,
 }
 
@@ -213,12 +214,11 @@ impl StatusState<'_> {
                 debug!(kind = ?error.kind(), "status line mark not renewed");
             }
         }
-        let changed = statusfile::changed(&self.watch.state_dir, &self.session)?;
-        if self.sent == Some(changed) {
+        let numbers = statusfile::read(&self.watch.state_dir, &self.session)?;
+        if self.sent.as_ref() == Some(&numbers) {
             return None;
         }
-        let (changed, numbers) = statusfile::read(&self.watch.state_dir, &self.session)?;
-        self.sent = Some(changed);
+        self.sent = Some(numbers.clone());
         let HookEvent::StatusLine {
             model,
             effort,
@@ -1886,6 +1886,49 @@ mod tests {
             heartbeat: Heartbeat::default(),
             status: None,
         }
+    }
+
+    /// TASK-058 review: a coarse file system gives two writes one mtime;
+    /// the second numbers still go, the same numbers never twice.
+    #[test]
+    fn numbers_written_within_one_mtime_are_sent_too() {
+        let dir = crate::hub::testdir::TempDir::new("agent-status-mtime");
+        let session = register().session_id;
+        let watch = StatusWatch::new(dir.path().to_owned());
+        let mut state = StatusState {
+            watch: &watch,
+            session: session.clone(),
+            sent: None,
+            marked: None,
+        };
+        let numbers = |context| HookEvent::StatusLine {
+            model: Some("Opus".into()),
+            effort: None,
+            context: Some(context),
+            five_hour: None,
+            seven_day: None,
+        };
+        let file = statusfile::dir(dir.path()).join(format!("{session}.json"));
+        let at = |file: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000))
+                .unwrap();
+        };
+        let context = |msg: Option<AgentMsg>| match msg {
+            Some(AgentMsg::StatusLine { context, .. }) => context,
+            other => panic!("no numbers: {other:?}"),
+        };
+        statusfile::write(dir.path(), &session, &numbers(10)).unwrap();
+        at(&file);
+        assert_eq!(context(state.due()), Some(10));
+        assert_eq!(state.due(), None);
+        statusfile::write(dir.path(), &session, &numbers(20)).unwrap();
+        at(&file);
+        assert_eq!(context(state.due()), Some(20));
+        assert_eq!(state.due(), None);
     }
 
     /// Rebinding the port of a just-closed listener can fail briefly.
