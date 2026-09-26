@@ -1,0 +1,6 @@
+CAUGHT keys::tests::a_line_goes_in_only_into_an_empty_box
+CAUGHT keys::tests::a_panel_is_read_and_closed
+CAUGHT keys::tests::the_background_work_dialog_of_exit_is_cancelled
+CAUGHT term::tests::asks_are_answered_one_line_each
+CAUGHT proctree::tests::a_native_claude_on_macos_is_named_claude
+exit=0

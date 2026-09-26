@@ -1,0 +1,79 @@
+planner patch (96097be + scratch/planner/task044.patch):
+== x86_64-unknown-linux-gnu
+error: the function `libc::openpty` doesn't need a mutable reference
+   --> src\term.rs:334:21
+    |
+334 |                     &mut modes,
+    |                     ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#unnecessary_mut_passed
+    = note: `-D clippy::unnecessary-mut-passed` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_mut_passed)]`
+help: remove this `mut`
+    |
+334 -                     &mut modes,
+334 +                     &modes,
+    |
+
+error: the function `libc::openpty` doesn't need a mutable reference
+   --> src\term.rs:335:21
+    |
+335 |                     &mut size,
+    |                     ^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+    |
+335 -                     &mut size,
+335 +                     &size,
+    |
+
+error: could not compile `cctg` (lib) due to 2 previous errors
+== x86_64-unknown-linux-musl
+error: the function `libc::openpty` doesn't need a mutable reference
+   --> src\term.rs:334:21
+    |
+334 |                     &mut modes,
+    |                     ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#unnecessary_mut_passed
+    = note: `-D clippy::unnecessary-mut-passed` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_mut_passed)]`
+help: remove this `mut`
+    |
+334 -                     &mut modes,
+334 +                     &modes,
+    |
+
+error: the function `libc::openpty` doesn't need a mutable reference
+   --> src\term.rs:335:21
+    |
+335 |                     &mut size,
+    |                     ^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.95.0/index.html#unnecessary_mut_passed
+help: remove this `mut`
+    |
+335 -                     &mut size,
+335 +                     &size,
+    |
+
+error: could not compile `cctg` (lib) due to 2 previous errors
+== aarch64-apple-darwin
+error[E0433]: cannot find module or crate `common` in this scope
+   --> tests\run_pty_e2e.rs:373:27
+    |
+373 |         let mut command = common::cctg(&home);
+    |                           ^^^^^^ use of unresolved module or unlinked crate `common`
+    |
+help: to make use of source file tests\common\mod.rs, use `mod common` in this file to declare the module
+    |
+ 13 + mod common;
+    |
+help: consider importing this module
+    |
+ 35 +     use crate::common;
+    |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `cctg` (test "run_pty_e2e") due to 1 previous error

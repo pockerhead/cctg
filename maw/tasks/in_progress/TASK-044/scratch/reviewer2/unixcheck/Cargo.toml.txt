@@ -1,0 +1,14 @@
+[package]
+name = "cctg"
+version = "0.0.0"
+edition = "2024"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std"] }
+vt100 = "0.16"
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[[test]]
+name = "run_pty_e2e"
+harness = false
