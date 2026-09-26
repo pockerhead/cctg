@@ -126,6 +126,7 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
         client: None,
         files: false,
         session_reads: false,
+        status_lines: false,
         heartbeat: false,
     };
     let mut lines = wire::encode(&AgentMsg::Hello {

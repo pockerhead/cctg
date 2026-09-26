@@ -216,6 +216,7 @@ async fn hub(test: &str) -> Hub {
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,

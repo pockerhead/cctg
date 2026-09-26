@@ -233,6 +233,7 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,

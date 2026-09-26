@@ -17,6 +17,7 @@ pub mod reads;
 pub mod run;
 pub mod shim;
 pub mod spool;
+pub mod statusfile;
 pub mod statusline;
 pub mod supervise;
 pub mod tail;

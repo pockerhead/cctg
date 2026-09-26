@@ -242,10 +242,11 @@ impl Server {
             }
             // Transcript and session reads, console keys and commands,
             // updates and files are the agent loop's, not the channel's;
-            // pings end in the link task.
+            // pings and `bound` end in the link task.
             LinkEvent::Message(
                 HubMsg::Registered { .. }
                 | HubMsg::Ping
+                | HubMsg::Bound { .. }
                 | HubMsg::Rejected { .. }
                 | HubMsg::TranscriptRead { .. }
                 | HubMsg::SessionRead { .. }

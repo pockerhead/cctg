@@ -825,6 +825,9 @@ struct Conn {
     files: bool,
     /// It reads its session's files ([`crate::wire::Register::session_reads`]).
     session_reads: bool,
+    /// It passes status line numbers on and is told its session
+    /// ([`crate::wire::Register::status_lines`]).
+    status_lines: bool,
     /// It is leaving after an update answer: bound to nothing, never
     /// rebound by its claude pid.
     leaving: bool,
@@ -1328,9 +1331,11 @@ impl Slots {
                         client: register.client,
                         files: register.files,
                         session_reads: register.session_reads,
+                        status_lines: register.status_lines,
                         leaving: false,
                     },
                 );
+                self.tell_bound(conn);
                 // A link that came back takes the answers that wait for it.
                 self.push_selected(Some(&session));
                 self.sync_waiting(&session);
@@ -1392,6 +1397,31 @@ impl Slots {
                     AgentMsg::SessionAnswer { read_id, answer } => {
                         self.on_session_answer(conn, read_id, answer);
                     }
+                    AgentMsg::StatusLine {
+                        session_id,
+                        model,
+                        effort,
+                        context,
+                        five_hour,
+                        seven_day,
+                    } if session_id == session => {
+                        let Some(host) = self.conns.get(&conn).map(|bound| bound.host.clone())
+                        else {
+                            return;
+                        };
+                        // The same event `cctg statusline` posts without an
+                        // agent (TASK-058).
+                        let numbers = HookEvent::StatusLine {
+                            model,
+                            effort,
+                            context,
+                            five_hour,
+                            seven_day,
+                        };
+                        let post =
+                            HookPost::new(host, session, String::new(), String::new(), numbers);
+                        self.on_hook(&post);
+                    }
                     _ => debug!(conn, "agent message not routed"),
                 }
             }
@@ -1429,6 +1459,21 @@ impl Slots {
                     }
                 }
             }
+        }
+    }
+
+    /// Tells an agent that passes status line numbers on which session
+    /// `conn` is bound to now (TASK-058); a full queue drops it, the next
+    /// registration tells again.
+    fn tell_bound(&self, conn: u64) {
+        let Some(bound) = self.conns.get(&conn).filter(|bound| bound.status_lines) else {
+            return;
+        };
+        let told = HubMsg::Bound {
+            session_id: bound.session.clone(),
+        };
+        if bound.to_agent.try_send(told).is_err() {
+            debug!(conn, "agent queue full; its session not told");
         }
     }
 
@@ -1551,6 +1596,7 @@ impl Slots {
                 "agent follows its claude process to a new session"
             );
         }
+        self.tell_bound(conn);
     }
 
     fn on_hook(&mut self, post: &HookPost) {
@@ -7079,6 +7125,7 @@ mod tests {
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             };
             self.agents
@@ -9078,6 +9125,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -9871,6 +9919,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -9962,6 +10011,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -10987,6 +11037,7 @@ again"
             client: None,
             files: false,
             session_reads: true,
+            status_lines: false,
             heartbeat: false,
         }
     }
@@ -13016,6 +13067,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             };
             self.agents
@@ -13406,6 +13458,7 @@ again"
                     client: None,
                     files: false,
                     session_reads: false,
+                    status_lines: false,
                     heartbeat: false,
                 },
                 to_agent,
@@ -13457,6 +13510,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -13501,6 +13555,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -13557,6 +13612,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -14359,6 +14415,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -14521,6 +14578,7 @@ again"
                 client,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -15194,6 +15252,7 @@ again"
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
@@ -15447,6 +15506,7 @@ again"
                 client: None,
                 files,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
