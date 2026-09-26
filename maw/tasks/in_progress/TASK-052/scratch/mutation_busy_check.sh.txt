@@ -1,0 +1,11 @@
+#!/bin/sh
+# TASK-052 self-check (kept as .txt): the "no notice during a turn" test
+# must fail when expect_taken ignores a running turn. Run from the repo root
+# in Git Bash; restores slots.rs afterwards. Observed 2026-09-26: FAILED as
+# expected (a_message_during_a_turn_or_one_taken_tells_nothing).
+set -u
+export CARGO_TARGET_DIR=C:/Users/user/dev/cctg/target CARGO_PROFILE_DEV_DEBUG=0
+cp crates/cctg/src/hub/slots.rs /tmp/slots.bak
+sed -i 's/            || self.busy(session)$/            || false/' crates/cctg/src/hub/slots.rs
+cargo test -j 1 -p cctg --lib -- slots::tests::a_message_during 2>&1 | tail -8
+cp /tmp/slots.bak crates/cctg/src/hub/slots.rs
