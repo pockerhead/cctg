@@ -211,8 +211,8 @@ use crate::channel::is_request_id;
 use crate::files;
 use crate::wire::{
     AgentMsg, Answered, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome,
-    HookEvent, HookPost, HubMsg, PermissionPost, PermissionRequest, QUESTION_TOOL, SessionAnswer,
-    SessionAsk, StreamItem, StreamLine, UpdateOutcome,
+    FilePart, HookEvent, HookPost, HubMsg, MAX_ALBUM, PermissionPost, PermissionRequest,
+    QUESTION_TOOL, SessionAnswer, SessionAsk, StreamItem, StreamLine, UpdateOutcome,
 };
 
 /// The longest text one session read may bring, as the agent sends at most
@@ -463,9 +463,31 @@ struct Upload {
     transfer_id: u64,
     name: String,
     caption: Option<String>,
+    /// The files of an album offer, in order (TASK-059); empty for one file.
+    parts: Vec<FilePart>,
     assembly: files::Assembly,
     /// When it was accepted or its last chunk came.
     touched: Instant,
+}
+
+/// A `file_offer` as it came.
+struct Offer {
+    transfer_id: u64,
+    name: String,
+    size: u64,
+    caption: Option<String>,
+    parts: Vec<FilePart>,
+}
+
+/// An offer's parts, if any, are 2 to [`MAX_ALBUM`] files of 1 byte to
+/// [`files::MAX_UPLOAD`] each that add up to its size.
+fn album_fits(parts: &[FilePart], size: u64) -> bool {
+    parts.is_empty()
+        || ((2..=MAX_ALBUM).contains(&parts.len())
+            && parts
+                .iter()
+                .all(|part| part.size > 0 && part.size <= files::MAX_UPLOAD)
+            && parts.iter().map(|part| part.size).sum::<u64>() == size)
 }
 
 impl Default for Options {
@@ -593,6 +615,14 @@ enum Done {
         size: u64,
         delivery: Option<Delivery>,
     },
+    /// A message of an album offer.
+    Album {
+        conn: u64,
+        transfer_id: u64,
+        size: u64,
+        parts: Vec<usize>,
+        delivery: Option<Delivery>,
+    },
 }
 
 /// A call about a slot's status message; at most one per slot in flight,
@@ -700,6 +730,14 @@ enum Purpose {
     Body { input: BodyInput, text: String },
 }
 
+/// The messages of an album offer on their way to Telegram (TASK-059).
+struct Album {
+    /// Per file of the offer: whether Telegram took it.
+    sent: Vec<bool>,
+    /// Messages not answered yet.
+    left: usize,
+}
+
 /// A job for the dispatch task.
 #[derive(Debug)]
 enum Work {
@@ -735,6 +773,13 @@ enum Work {
         conn: u64,
         transfer_id: u64,
         size: u64,
+    },
+    /// One message of an album offer: the files `parts` of it (TASK-059).
+    Album {
+        conn: u64,
+        transfer_id: u64,
+        size: u64,
+        parts: Vec<usize>,
     },
 }
 
@@ -990,6 +1035,8 @@ pub struct Slots {
     uploads: HashMap<u64, Upload>,
     /// Bytes of [`Self::uploads`] and of files waiting for Telegram.
     file_bytes: u64,
+    /// Album offers waiting for Telegram, by `(conn, transfer_id)`.
+    albums: HashMap<(u64, u64), Album>,
     pin_warned: bool,
     grace_until: Instant,
     next_retry: Instant,
@@ -1076,6 +1123,7 @@ impl Slots {
             transfers: 0,
             uploads: HashMap::new(),
             file_bytes: 0,
+            albums: HashMap::new(),
             pin_warned: false,
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
@@ -1421,7 +1469,17 @@ impl Slots {
                         name,
                         size,
                         caption,
-                    } => self.on_file_offer(conn, &session, transfer_id, name, size, caption),
+                        parts,
+                    } => {
+                        let offer = Offer {
+                            transfer_id,
+                            name,
+                            size,
+                            caption,
+                            parts,
+                        };
+                        self.on_file_offer(conn, &session, offer);
+                    }
                     AgentMsg::FileChunk(chunk) => self.on_file_chunk(conn, &session, &chunk),
                     AgentMsg::SessionAnswer { read_id, answer } => {
                         self.on_session_answer(conn, read_id, answer);
@@ -3176,15 +3234,14 @@ impl Slots {
     /// one of a slot with a topic, the size is one Telegram takes and less
     /// than [`MAX_FILE_BYTES`] would wait. A new offer drops an unfinished
     /// file of the same link and any file idle for [`UPLOAD_IDLE`].
-    fn on_file_offer(
-        &mut self,
-        conn: u64,
-        frame_session: &str,
-        transfer_id: u64,
-        name: String,
-        size: u64,
-        caption: Option<String>,
-    ) {
+    fn on_file_offer(&mut self, conn: u64, frame_session: &str, offer: Offer) {
+        let Offer {
+            transfer_id,
+            name,
+            size,
+            caption,
+            parts,
+        } = offer;
         if let Some(old) = self.uploads.remove(&conn) {
             self.file_bytes = self.file_bytes.saturating_sub(old.assembly.size());
             debug!(
@@ -3215,7 +3272,7 @@ impl Slots {
             });
         let outcome = if target.is_none() {
             FileOutcome::NoTopic
-        } else if size == 0 || size > files::MAX_UPLOAD {
+        } else if size == 0 || size > files::MAX_UPLOAD || !album_fits(&parts, size) {
             FileOutcome::Failed
         } else if self.file_bytes + size > MAX_FILE_BYTES
             || self.queued_messages >= MAX_QUEUED_MESSAGES
@@ -3224,7 +3281,13 @@ impl Slots {
         } else {
             FileOutcome::Accepted
         };
-        info!(conn, size, ?outcome, "file offered by an agent");
+        info!(
+            conn,
+            size,
+            files = parts.len().max(1),
+            ?outcome,
+            "file offered by an agent"
+        );
         if outcome == FileOutcome::Accepted {
             self.file_bytes += size;
             self.uploads.insert(
@@ -3233,6 +3296,7 @@ impl Slots {
                     transfer_id,
                     name,
                     caption,
+                    parts,
                     assembly: files::Assembly::new(size),
                     touched: Instant::now(),
                 },
@@ -3287,6 +3351,10 @@ impl Slots {
             self.answer_file(conn, upload.transfer_id, outcome);
             return;
         };
+        if !upload.parts.is_empty() {
+            self.send_album(conn, slot, thread_id, upload);
+            return;
+        }
         let bytes = upload.assembly.into_bytes();
         let photo = size <= files::MAX_PHOTO && files::is_photo(&bytes);
         let document = Document {
@@ -3347,10 +3415,175 @@ impl Slots {
         self.answer_file(conn, transfer_id, outcome);
     }
 
+    /// The files of a complete album offer (TASK-059) go to the topic:
+    /// the pictures as a photo album, then the rest as a document album
+    /// (Telegram never mixes the two); a kind with one file goes alone, as
+    /// with `path`. The caption goes on the first file; without one each
+    /// photo shows its file name (TASK-051). One message token per message.
+    fn send_album(&mut self, conn: u64, slot: SlotId, thread_id: i64, upload: Upload) {
+        let size = upload.assembly.size();
+        let bytes = upload.assembly.into_bytes();
+        let mut photos = Vec::new();
+        let mut others = Vec::new();
+        let mut offset = 0usize;
+        for (index, part) in upload.parts.iter().enumerate() {
+            let end = offset + part.size as usize;
+            let bytes = bytes[offset..end].to_vec();
+            offset = end;
+            let photo = part.size <= files::MAX_PHOTO && files::is_photo(&bytes);
+            let file_name = files::clean_name(&part.name, "file");
+            let caption = match &upload.caption {
+                Some(_) => None,
+                None if photo => Some(cut(&file_name, CAPTION_LIMIT)),
+                None => None,
+            };
+            let document = Document {
+                file_name,
+                bytes,
+                caption,
+            };
+            if photo {
+                photos.push((index, document));
+            } else {
+                others.push((index, document));
+            }
+        }
+        let mut ops: Vec<(Vec<usize>, u64, Op)> = Vec::new();
+        for (group, photo) in [(photos, true), (others, false)] {
+            if group.is_empty() {
+                continue;
+            }
+            let bytes = group.iter().map(|(_, doc)| doc.bytes.len() as u64).sum();
+            let (parts, mut items): (Vec<usize>, Vec<Document>) = group.into_iter().unzip();
+            if ops.is_empty()
+                && let (Some(caption), Some(first)) = (&upload.caption, items.first_mut())
+            {
+                first.caption = Some(cut(caption, CAPTION_LIMIT));
+            }
+            let thread_id = Some(thread_id);
+            let op = match items.len() {
+                1 => {
+                    let document = items.remove(0);
+                    if photo {
+                        Op::SendPhoto {
+                            thread_id,
+                            document,
+                            notify: false,
+                        }
+                    } else {
+                        Op::SendDocument {
+                            thread_id,
+                            document,
+                            notify: false,
+                        }
+                    }
+                }
+                _ => Op::SendAlbum {
+                    thread_id,
+                    items,
+                    photos: photo,
+                    notify: false,
+                },
+            };
+            ops.push((parts, bytes, op));
+        }
+        // `album_fits` checked that the sizes add up to the bytes.
+        debug_assert_eq!(offset as u64, size);
+        self.queued_messages += ops.len();
+        info!(
+            ordinal = self.ordinal(slot),
+            size,
+            files = upload.parts.len(),
+            messages = ops.len(),
+            "album from the session queued for its topic"
+        );
+        self.albums.insert(
+            (conn, upload.transfer_id),
+            Album {
+                sent: vec![false; upload.parts.len()],
+                left: ops.len(),
+            },
+        );
+        for (parts, bytes, op) in ops {
+            self.hand_off(
+                Work::Album {
+                    conn,
+                    transfer_id: upload.transfer_id,
+                    size: bytes,
+                    parts,
+                },
+                op,
+            );
+        }
+    }
+
+    /// Telegram answered one message of an album offer; after the last one
+    /// the agent hears which files went.
+    fn on_album_done(
+        &mut self,
+        conn: u64,
+        transfer_id: u64,
+        size: u64,
+        parts: &[usize],
+        delivery: Option<Delivery>,
+    ) {
+        self.queued_messages = self.queued_messages.saturating_sub(1);
+        if self.queued_messages == 0 {
+            self.overflow_warned = false;
+        }
+        self.file_bytes = self.file_bytes.saturating_sub(size);
+        let went = matches!(delivery, Some(Ok(_)));
+        match delivery {
+            Some(Ok(_)) => info!(
+                conn,
+                size, "album message from the session sent to its topic"
+            ),
+            Some(Err(error)) => warn!(%error, size, "album message from the session not delivered"),
+            None => warn!(size, "album message from the session got no answer"),
+        }
+        let Some(album) = self.albums.get_mut(&(conn, transfer_id)) else {
+            return;
+        };
+        for &part in parts {
+            if let Some(sent) = album.sent.get_mut(part) {
+                *sent = went;
+            }
+        }
+        album.left = album.left.saturating_sub(1);
+        if album.left > 0 {
+            return;
+        }
+        let Some(album) = self.albums.remove(&(conn, transfer_id)) else {
+            return;
+        };
+        let parts: Vec<FileOutcome> = album
+            .sent
+            .iter()
+            .map(|&sent| {
+                if sent {
+                    FileOutcome::Sent
+                } else {
+                    FileOutcome::Failed
+                }
+            })
+            .collect();
+        let outcome = if album.sent.contains(&true) {
+            FileOutcome::Sent
+        } else {
+            FileOutcome::Failed
+        };
+        self.answer(conn, transfer_id, outcome, parts);
+    }
+
     fn answer_file(&self, conn: u64, transfer_id: u64, outcome: FileOutcome) {
+        self.answer(conn, transfer_id, outcome, Vec::new());
+    }
+
+    fn answer(&self, conn: u64, transfer_id: u64, outcome: FileOutcome, parts: Vec<FileOutcome>) {
         let answer = HubMsg::FileAnswer {
             transfer_id,
             outcome,
+            parts,
         };
         if self
             .conns
@@ -6583,6 +6816,13 @@ impl Slots {
                 size,
                 delivery,
             } => self.on_file_done(conn, transfer_id, size, delivery),
+            Done::Album {
+                conn,
+                transfer_id,
+                size,
+                parts,
+                delivery,
+            } => self.on_album_done(conn, transfer_id, size, &parts, delivery),
         }
     }
 
@@ -6988,6 +7228,18 @@ async fn dispatch_loop(
                     conn,
                     transfer_id,
                     size,
+                    delivery,
+                },
+                Work::Album {
+                    conn,
+                    transfer_id,
+                    size,
+                    parts,
+                } => Done::Album {
+                    conn,
+                    transfer_id,
+                    size,
+                    parts,
                     delivery,
                 },
             });
@@ -16444,6 +16696,7 @@ again"
             if let HubMsg::FileAnswer {
                 transfer_id,
                 outcome,
+                ..
             } = msg
             {
                 answers.push((transfer_id, outcome));
@@ -16466,6 +16719,7 @@ again"
             name: name.into(),
             size,
             caption: Some("see".into()),
+            parts: Vec::new(),
         };
         from_agent(slots, conn, msg);
     }
@@ -16586,6 +16840,215 @@ again"
         slots.on_agent(AgentEvent::Disconnected { conn: 2 });
         assert_eq!(slots.file_bytes, 0);
         assert!(slots.uploads.is_empty());
+    }
+
+    /// The last answers with their per-file outcomes (TASK-059).
+    fn album_answers(
+        from_hub: &mut mpsc::Receiver<HubMsg>,
+    ) -> Vec<(u64, FileOutcome, Vec<FileOutcome>)> {
+        let mut answers = Vec::new();
+        while let Ok(msg) = from_hub.try_recv() {
+            if let HubMsg::FileAnswer {
+                transfer_id,
+                outcome,
+                parts,
+            } = msg
+            {
+                answers.push((transfer_id, outcome, parts));
+            }
+        }
+        answers
+    }
+
+    fn album_offer(
+        slots: &mut Slots,
+        transfer_id: u64,
+        files: &[(&str, &[u8])],
+        caption: Option<&str>,
+    ) {
+        let parts: Vec<FilePart> = files
+            .iter()
+            .map(|(name, bytes)| FilePart {
+                name: (*name).into(),
+                size: bytes.len() as u64,
+            })
+            .collect();
+        let msg = AgentMsg::FileOffer {
+            transfer_id,
+            name: files[0].0.into(),
+            size: parts.iter().map(|part| part.size).sum(),
+            caption: caption.map(str::to_owned),
+            parts,
+        };
+        from_agent(slots, 1, msg);
+    }
+
+    #[tokio::test]
+    async fn an_album_goes_as_a_photo_album_and_a_document_album_and_says_what_went() {
+        let dir = TempDir::new("slots-file-album");
+        let (mut slots, mut work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
+        let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
+        let png: &[u8] = b"\x89PNG\r\n\x1a\npng";
+        let jpeg: &[u8] = b"\xFF\xD8\xFF\xE0jpeg";
+        let files: [(&str, &[u8]); 4] = [
+            ("a.png", png),
+            ("notes.txt", b"notes"),
+            ("b.jpg", jpeg),
+            ("../log.txt", b"log"),
+        ];
+        album_offer(&mut slots, 1, &files, Some("two kinds"));
+        assert_eq!(
+            album_answers(&mut agent),
+            [(1, FileOutcome::Accepted, Vec::new())]
+        );
+        let bytes: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+        send_bytes(&mut slots, 1, 1, &bytes);
+        // Pictures first, as one photo album with the caption on its first.
+        let (job, op) = work.try_recv().expect("the photo album");
+        let Work::Album { parts, size, .. } = job else {
+            panic!("{job:?}");
+        };
+        assert_eq!((parts, size), (vec![0, 2], (png.len() + jpeg.len()) as u64));
+        match op {
+            Op::SendAlbum {
+                thread_id: Some(100),
+                items,
+                photos: true,
+                notify: false,
+            } => {
+                let names: Vec<_> = items.iter().map(|item| item.file_name.as_str()).collect();
+                assert_eq!(names, ["a.png", "b.jpg"]);
+                assert_eq!(items[0].caption.as_deref(), Some("two kinds"));
+                assert_eq!(items[1].caption, None);
+                assert_eq!(
+                    (items[0].bytes.as_slice(), items[1].bytes.as_slice()),
+                    (png, jpeg)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let (job, op) = work.try_recv().expect("the document album");
+        let Work::Album { parts, .. } = job else {
+            panic!("{job:?}");
+        };
+        assert_eq!(parts, [1, 3]);
+        match op {
+            Op::SendAlbum {
+                items,
+                photos: false,
+                ..
+            } => {
+                let names: Vec<_> = items.iter().map(|item| item.file_name.as_str()).collect();
+                assert_eq!(names, ["notes.txt", "log.txt"]);
+                assert!(items.iter().all(|item| item.caption.is_none()));
+                assert_eq!(items[1].bytes, b"log");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(work.try_recv().is_err(), "two messages");
+        assert_eq!(
+            (slots.file_bytes, slots.queued_messages),
+            (bytes.len() as u64, 2)
+        );
+        slots.on_done(Done::Album {
+            conn: 1,
+            transfer_id: 1,
+            size: (png.len() + jpeg.len()) as u64,
+            parts: vec![0, 2],
+            delivery: Some(Ok(Outcome::Sent(Message::default()))),
+        });
+        assert!(
+            album_answers(&mut agent).is_empty(),
+            "one message still waits"
+        );
+        slots.on_done(Done::Album {
+            conn: 1,
+            transfer_id: 1,
+            size: 8,
+            parts: vec![1, 3],
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: file is empty".into(),
+            })),
+        });
+        use FileOutcome::{Accepted, Failed, Sent};
+        assert_eq!(
+            album_answers(&mut agent),
+            [(1, Sent, vec![Sent, Failed, Sent, Failed])]
+        );
+        assert_eq!((slots.file_bytes, slots.queued_messages), (0, 0));
+        assert!(slots.albums.is_empty());
+
+        // One of each kind and no caption: each goes alone, the photo named.
+        album_offer(&mut slots, 2, &[("c.txt", b"c"), ("d.png", png)], None);
+        send_bytes(&mut slots, 1, 2, &[b"c".as_slice(), png].concat());
+        let (_, op) = work.try_recv().unwrap();
+        assert!(
+            matches!(op, Op::SendPhoto { ref document, .. }
+                if document.caption.as_deref() == Some("d.png")),
+            "{op:?}"
+        );
+        let (_, op) = work.try_recv().unwrap();
+        assert!(
+            matches!(op, Op::SendDocument { ref document, .. }
+                if document.file_name == "c.txt" && document.caption.is_none()),
+            "{op:?}"
+        );
+        for (parts, size) in [(vec![1], png.len() as u64), (vec![0], 1)] {
+            slots.on_done(Done::Album {
+                conn: 1,
+                transfer_id: 2,
+                size,
+                parts,
+                delivery: None,
+            });
+        }
+        assert_eq!(
+            album_answers(&mut agent),
+            [(2, Accepted, Vec::new()), (2, Failed, vec![Failed, Failed])]
+        );
+
+        // Offers whose parts do not fit are refused before any byte.
+        let one: [(&str, &[u8]); 1] = [("a", b"a")];
+        album_offer(&mut slots, 3, &one, None);
+        let eleven = [("a", b"a".as_slice()); 11];
+        album_offer(&mut slots, 4, &eleven, None);
+        let mut wrong = AgentMsg::FileOffer {
+            transfer_id: 5,
+            name: "a".into(),
+            size: 3,
+            caption: None,
+            parts: vec![
+                FilePart {
+                    name: "a".into(),
+                    size: 1,
+                },
+                FilePart {
+                    name: "b".into(),
+                    size: 1,
+                },
+            ],
+        };
+        from_agent(&mut slots, 1, wrong.clone());
+        if let AgentMsg::FileOffer {
+            transfer_id, parts, ..
+        } = &mut wrong
+        {
+            *transfer_id = 6;
+            parts[1].size = 0;
+            parts[0].size = 3;
+        }
+        from_agent(&mut slots, 1, wrong);
+        assert_eq!(
+            album_answers(&mut agent),
+            [
+                (3, Failed, Vec::new()),
+                (4, Failed, Vec::new()),
+                (5, Failed, Vec::new()),
+                (6, Failed, Vec::new())
+            ]
+        );
+        assert_eq!(slots.file_bytes, 0);
     }
 
     #[tokio::test(start_paused = true)]
