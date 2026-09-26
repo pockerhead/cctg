@@ -235,6 +235,7 @@ impl Claude {
             client: None,
             files: true,
             session_reads: false,
+            heartbeat: false,
         };
         let (outbox, events) = agent::spawn(LinkConfig {
             addr: cctg::tls::HubAddr::plain(addr.to_string()),
@@ -245,6 +246,7 @@ impl Claude {
                 max: Duration::from_millis(100),
             },
             replay: None,
+            heartbeat: Default::default(),
         });
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 20);
@@ -605,7 +607,10 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         .unwrap();
     assert_eq!(
         hub_line(&mut reader, &captured).await,
-        HubMsg::Registered { files: true }
+        HubMsg::Registered {
+            files: true,
+            heartbeat: true
+        }
     );
     // `registered` goes out before the actor binds the agent. A topic
     // message that overtakes the binding waits in the slot until it
