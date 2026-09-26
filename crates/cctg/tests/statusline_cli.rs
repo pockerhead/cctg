@@ -48,9 +48,19 @@ fn home(test: &str, addr: &str, command: Option<&str>) -> PathBuf {
 
 /// Runs `cctg statusline`; the exit code is left to the caller.
 fn run(home: &Path, extra_env: &[(&str, &str)]) -> (Output, Duration) {
+    run_input(home, extra_env, INPUT)
+}
+
+/// Runs `cctg statusline` in `home` with `input` on stdin. An input
+/// without a folder of its own shows `home`'s name, and git looks for no
+/// repository above `home` (the test target directory may sit inside a
+/// clone).
+fn run_input(home: &Path, extra_env: &[(&str, &str)], input: &str) -> (Output, Duration) {
     let started = Instant::now();
     let mut command = common::cctg(home);
     command
+        .current_dir(home)
+        .env("GIT_CEILING_DIRECTORIES", home.parent().unwrap())
         .arg("statusline")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -59,9 +69,9 @@ fn run(home: &Path, extra_env: &[(&str, &str)]) -> (Output, Duration) {
         command.env(name, value);
     }
     let mut child = command.spawn().expect("cctg starts");
-    let mut input = child.stdin.take().unwrap();
-    input.write_all(INPUT.as_bytes()).unwrap();
-    drop(input);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains(SECRET), "{stderr}");
@@ -150,9 +160,11 @@ async fn without_a_command_or_inside_one_cctg_prints_its_own_line() {
     let home = home("own", &addr, None);
     let output = in_blocking(home, Vec::new()).await;
     assert_eq!(output.status.code(), Some(0));
+    // No repository, no Claude Code login: no branch, no account.
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "Опус 5.5 · ctx 50% · 5h 3% · 7d 92%"
+        "\x1b[1mОпус 5.5\x1b[0m [high] dir:statusline-cli-own ctx:50%\n\
+         5h:3% \x1b[33m7d:92%\x1b[0m"
     );
     tokio::time::timeout(Duration::from_secs(5), events.recv())
         .await
@@ -162,13 +174,83 @@ async fn without_a_command_or_inside_one_cctg_prints_its_own_line() {
     let output = in_blocking(home, vec![("CCTG_STATUSLINE", "1")]).await;
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "Опус 5.5 · ctx 50% · 5h 3% · 7d 92%"
+        "\x1b[1mОпус 5.5\x1b[0m [high] dir:statusline-cli-nested ctx:50%\n\
+         5h:3% \x1b[33m7d:92%\x1b[0m"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(500), events.recv())
             .await
             .is_err()
     );
+}
+
+/// `git` in `dir`, for setting up a repository.
+fn git(dir: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_own_line_shows_the_branch_and_the_account_and_the_hub_never_gets_the_email() {
+    const EMAIL: &str = "statusline-cli@example.invalid";
+    let (addr, mut events) = hub().await;
+    let home = home("account", &addr, None);
+    std::fs::write(
+        home.join(".claude.json"),
+        serde_json::json!({ "numStartups": 1, "oauthAccount": { "emailAddress": EMAIL } })
+            .to_string(),
+    )
+    .unwrap();
+    let repo = home.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let _ = std::fs::remove_file(repo.join("new.txt"));
+    if !git(&repo, &["init", "-q", "-b", "topic"]) {
+        eprintln!("no git: skipped");
+        return;
+    }
+    let mut input: serde_json::Value = serde_json::from_str(INPUT).unwrap();
+    input["workspace"] = serde_json::json!({ "current_dir": repo.to_str().unwrap() });
+    let input = input.to_string();
+    let line = |dirty: &str| {
+        format!(
+            "\x1b[1mОпус 5.5\x1b[0m [high] \x1b[36mbr:topic{dirty}\x1b[0m dir:repo ctx:50%\n\
+             acc:{EMAIL} 5h:3% \x1b[33m7d:92%\x1b[0m"
+        )
+    };
+
+    // A clean work tree (nothing committed yet), then an untracked file.
+    for (dirty, file) in [("", false), ("*", true)] {
+        if file {
+            std::fs::write(repo.join("new.txt"), "x").unwrap();
+        }
+        let (output, took) = {
+            let (home, input) = (home.clone(), input.clone());
+            tokio::task::spawn_blocking(move || run_input(&home, &[], &input))
+                .await
+                .unwrap()
+        };
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), line(dirty));
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("example.invalid"),
+            "the email went to the log"
+        );
+        // git runs under a timeout: the line stays quick.
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        let post = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("hub got the numbers")
+            .unwrap();
+        let body = serde_json::to_string(&post).unwrap();
+        assert!(!body.contains("example.invalid"), "{body}");
+        assert!(!format!("{post:?}").contains("example.invalid"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
