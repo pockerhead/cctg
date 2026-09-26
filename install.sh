@@ -31,7 +31,7 @@ set -eu
 REPO=pockerhead/cctg
 # The release this script belongs to. Bumped in the commit that gets the
 # tag; release.yml refuses a tag that differs.
-RELEASE=v0.1.6
+RELEASE=v0.1.7
 # Marks every wrapper this script writes; --uninstall removes only those.
 MARK=cctg-install
 # device.env keys this script sets; other lines of the file are kept.
@@ -620,7 +620,8 @@ EOF
       { "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }
     ],
     "PostToolUseFailure": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook ToolStatus", "async": true }] }],
-    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PermissionRequest", "timeout": 100 }] }]
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PermissionRequest", "timeout": 100 }] }],
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "\"$c\" hook PreCompact", "timeout": 5 }] }]
   }
 }
 EOF

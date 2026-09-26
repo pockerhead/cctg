@@ -85,6 +85,17 @@
 //! `console_keys` for the live current session of that very slot is asked,
 //! never while a permission prompt of that session waits (Esc would answer
 //! the prompt), and a written Esc is shown as sent, not as the turn's end.
+//! A compaction (TASK-053: the `PreCompact` hook, ended by the session's
+//! `SessionStart` with `source: compact`) shows in the status message with
+//! its minutes and gives the topic two silent lines: one when it begins, one
+//! when it is done, with the context percentages before and after when the
+//! status line sends the new one within [`COMPACT_NUMBERS_WAIT`]. One that
+//! does not end (the session ends, [`COMPACT_MAX`] passes) leaves the status
+//! with no line. A cancelled or failed one never sends `SessionStart`: a
+//! prompt, a tool start, a `Stop` or a written Esc of that session after the
+//! `PreCompact` ends its status at once, and a late `SessionStart(compact)`
+//! within [`COMPACT_GRACE`] after that still gives the done line (the hooks
+//! are separate POSTs and can arrive in either order).
 //!
 //! Client updates (TASK-040): an agent registers with its cctg build. A
 //! live current session whose agent runs another build than the hub (or is
@@ -268,6 +279,14 @@ const CAPTION_LIMIT: usize = 1024;
 /// A status message is edited at most this often (edits have no published
 /// limit, but a busy session changes every second).
 pub const STATUS_EVERY: Duration = Duration::from_secs(5);
+/// A compaction that has not ended after this is forgotten (TASK-053).
+pub const COMPACT_MAX: Duration = Duration::from_secs(15 * 60);
+/// The line of an ended compaction waits this long for the status line's
+/// new context percentage, then goes without the percentages.
+pub const COMPACT_NUMBERS_WAIT: Duration = Duration::from_secs(10);
+/// After the session showed activity while a compaction ran, its
+/// `SessionStart(compact)` is still taken this long (TASK-053).
+pub const COMPACT_GRACE: Duration = Duration::from_secs(30);
 /// Agents one update press asks at most: the first, the one after a
 /// hand-over, the one after a claude restart.
 pub const UPDATE_ROUNDS: u8 = 3;
@@ -913,6 +932,9 @@ pub struct Slots {
     reactions: usize,
     /// What live top-level sessions do, for their status messages.
     activity: HashMap<String, Activity>,
+    /// Compactions of live top-level sessions, running or ended and waiting
+    /// for their numbers.
+    compactions: HashMap<String, Compaction>,
     /// Status messages by slot.
     shown: HashMap<SlotId, Shown>,
     /// Keys agents were asked to press, by key id.
@@ -1015,6 +1037,7 @@ impl Slots {
             reaction_warned: false,
             reactions: 0,
             activity: HashMap::new(),
+            compactions: HashMap::new(),
             shown: HashMap::new(),
             key_asks: HashMap::new(),
             command_asks: HashMap::new(),
@@ -1208,6 +1231,11 @@ impl Slots {
             .flatten()
             .filter(|at| *at > now);
         let deadline = status.fold(deadline, Instant::min);
+        let deadline = self
+            .compaction_deadlines(now)
+            .into_iter()
+            .filter(|at| *at > now)
+            .fold(deadline, Instant::min);
         let deadline = self
             .updates
             .values()
@@ -1600,6 +1628,15 @@ impl Slots {
             {
                 self.reports.insert(agent_id.clone(), message.clone());
             }
+            HookEvent::PreCompact { trigger } => self.compact_started(session, trigger.as_deref()),
+            HookEvent::SessionStart {
+                source: Some(source),
+                ..
+            } if source == "compact" => self.compact_ended(session),
+            HookEvent::StatusLine { context, .. } => self.compact_numbers(session, *context),
+            HookEvent::UserPromptSubmit { .. }
+            | HookEvent::ToolStart { .. }
+            | HookEvent::Stop { .. } => self.compact_settled(session),
             _ => {}
         }
         self.track_activity(session, &post.event);
@@ -1608,6 +1645,8 @@ impl Slots {
         // the reaper) drops what it did.
         let registry = &self.registry;
         self.activity
+            .retain(|session, _| registry.is_live_top_level(session));
+        self.compactions
             .retain(|session, _| registry.is_live_top_level(session));
         self.started_agents
             .retain(|_, (session, _)| registry.is_live_top_level(session));
@@ -1620,6 +1659,183 @@ impl Slots {
         if let Some((session, path)) = followup.read_title {
             self.read_title(session, path);
         }
+    }
+
+    /// `PreCompact` of the live current session of a slot with a topic: the
+    /// status says so and the topic gets one line. A repeat while one runs
+    /// changes nothing; the line of an ended one that still waits for its
+    /// numbers goes first, without them.
+    fn compact_started(&mut self, session: &str, trigger: Option<&str>) {
+        match self.compactions.get(session) {
+            Some(compaction) if compaction.done.is_none() && compaction.settled.is_none() => {
+                return;
+            }
+            Some(compaction) if compaction.done.is_some() => self.compact_told(session, None),
+            _ => {}
+        }
+        let Some(slot) = self.current_slot(session) else {
+            debug!(
+                session = short(session),
+                "compaction of a session that is not the live one of its slot; not shown"
+            );
+            return;
+        };
+        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+            return;
+        };
+        let auto = match trigger {
+            Some("auto") => Some(true),
+            Some("manual") => Some(false),
+            _ => None,
+        };
+        let before = self
+            .registry
+            .sessions
+            .get(session)
+            .and_then(|entry| entry.metrics.as_ref())
+            .and_then(|metrics| metrics.context);
+        info!(session = short(session), ?auto, "compaction started");
+        self.compactions.insert(
+            session.to_owned(),
+            Compaction {
+                auto,
+                started: Instant::now(),
+                before,
+                settled: None,
+                done: None,
+            },
+        );
+        self.send_messages(vec![message_op(thread_id, status::compacting_line(auto))]);
+    }
+
+    /// `SessionStart` with `source: compact`: the compaction is done, also
+    /// when activity came first, within [`COMPACT_GRACE`]. Its line waits for
+    /// the new context percentage when one was known before.
+    fn compact_ended(&mut self, session: &str) {
+        // The last percentage before the end: a status line sent while it
+        // ran is still the old context.
+        let last = self
+            .registry
+            .sessions
+            .get(session)
+            .and_then(|entry| entry.metrics.as_ref())
+            .and_then(|metrics| metrics.context);
+        let now = Instant::now();
+        let Some(compaction) = self.compactions.get_mut(session).filter(|compaction| {
+            compaction.done.is_none()
+                && compaction
+                    .settled
+                    .is_none_or(|settled| now < settled + COMPACT_GRACE)
+        }) else {
+            return;
+        };
+        let took = now.saturating_duration_since(compaction.started);
+        info!(
+            session = short(session),
+            took_s = took.as_secs(),
+            "compaction ended"
+        );
+        compaction.done = Some((took, now + COMPACT_NUMBERS_WAIT));
+        compaction.before = last.or(compaction.before);
+        if compaction.before.is_none() {
+            self.compact_told(session, None);
+        }
+    }
+
+    /// Activity of `session` after its `PreCompact`: a compaction that did
+    /// not end yet was cancelled or failed, or its end is late. The status
+    /// stops showing it at once; its end is still taken for a while.
+    fn compact_settled(&mut self, session: &str) {
+        if let Some(compaction) = self
+            .compactions
+            .get_mut(session)
+            .filter(|compaction| compaction.done.is_none() && compaction.settled.is_none())
+        {
+            debug!(
+                session = short(session),
+                "activity while a compaction ran; its status ends"
+            );
+            compaction.settled = Some(Instant::now());
+        }
+    }
+
+    /// A status line: the percentage after an ended compaction, once it is
+    /// below the one before (a line sent before the end can still arrive
+    /// after it, and a compaction never grows the context).
+    fn compact_numbers(&mut self, session: &str, context: Option<u32>) {
+        let Some(context) = context else {
+            return;
+        };
+        if self.compactions.get(session).is_some_and(|compaction| {
+            compaction.done.is_some() && compaction.before.is_some_and(|before| context < before)
+        }) {
+            self.compact_told(session, Some(context));
+        }
+    }
+
+    /// Sends the line of the ended compaction of `session` and forgets it.
+    fn compact_told(&mut self, session: &str, after: Option<u32>) {
+        let Some(compaction) = self.compactions.remove(session) else {
+            return;
+        };
+        let Some((took, _)) = compaction.done else {
+            return;
+        };
+        let Some(thread_id) = self
+            .current_slot(session)
+            .and_then(|slot| self.registry.slot(slot))
+            .and_then(|slot| slot.topic_id)
+        else {
+            return;
+        };
+        let line = status::compacted_line(took, compaction.before, after);
+        self.send_messages(vec![message_op(thread_id, line)]);
+    }
+
+    /// Compactions that never ended (in time, or within the grace after the
+    /// session moved on) are forgotten; ended ones whose numbers did not come
+    /// are told without them.
+    fn check_compactions(&mut self, now: Instant) {
+        self.compactions.retain(|session, compaction| {
+            let lost = compaction.done.is_none()
+                && (now >= compaction.started + COMPACT_MAX
+                    || compaction
+                        .settled
+                        .is_some_and(|settled| now >= settled + COMPACT_GRACE));
+            if lost {
+                info!(
+                    session = short(session),
+                    "compaction did not end in time; forgotten"
+                );
+            }
+            !lost
+        });
+        let late: Vec<String> = self
+            .compactions
+            .iter()
+            .filter(|(_, compaction)| compaction.done.is_some_and(|(_, until)| now >= until))
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in late {
+            self.compact_told(&session, None);
+        }
+    }
+
+    /// When the compactions need the actor next: the wait for numbers, the
+    /// limit, and the next whole minute of a running one (its status).
+    fn compaction_deadlines(&self, now: Instant) -> Vec<Instant> {
+        self.compactions
+            .values()
+            .map(|compaction| match (compaction.done, compaction.settled) {
+                (Some((_, until)), _) => until,
+                (None, Some(settled)) => settled + COMPACT_GRACE,
+                (None, None) => {
+                    let minutes = now.saturating_duration_since(compaction.started).as_secs() / 60;
+                    let next_minute = compaction.started + Duration::from_secs((minutes + 1) * 60);
+                    next_minute.min(compaction.started + COMPACT_MAX)
+                }
+            })
+            .collect()
     }
 
     /// What a live top-level session does, for its status message. Events of
@@ -5474,6 +5690,8 @@ impl Slots {
             if let Some(activity) = self.activity.get_mut(&ask.session) {
                 activity.interrupt_written();
             }
+            // Esc cancels a running compaction.
+            self.compact_settled(&ask.session);
             if let Some(update) = self.updates.get_mut(&ask.session) {
                 update.interrupted = true;
             }
@@ -5666,7 +5884,17 @@ impl Slots {
             .sessions
             .get(session)
             .and_then(|entry| entry.metrics.as_ref());
-        let phase = status::phase(activity, ended, waiting);
+        let compacting = self
+            .compactions
+            .get(session)
+            .filter(|compaction| compaction.done.is_none() && compaction.settled.is_none());
+        let phase = match compacting {
+            Some(compaction) if !ended && !waiting => status::Phase::Compacting {
+                auto: compaction.auto,
+                minutes: now.saturating_duration_since(compaction.started).as_secs() / 60,
+            },
+            _ => status::phase(activity, ended, waiting),
+        };
         let keys = !ended
             && self
                 .live_agent(slot)
@@ -6072,6 +6300,7 @@ impl Slots {
         }
         self.check_candidates();
         self.retry_bodies();
+        self.check_compactions(now);
     }
 
     fn ordinal(&self, slot: SlotId) -> u32 {
@@ -6486,6 +6715,22 @@ fn stream_chunks(text: &str, format: Format) -> Vec<(String, Option<String>)> {
 /// `text` as one monospace block of Telegram HTML.
 fn pre(text: &str) -> String {
     format!("<pre>{}</pre>", escape_html(text))
+}
+
+/// A compaction of a live top-level session (TASK-053).
+struct Compaction {
+    /// `Some(true)`: auto, `Some(false)`: `/compact`, `None`: not known.
+    auto: Option<bool>,
+    started: Instant,
+    /// The context percentage of the status line when it began, and the
+    /// last one before its end once it ended.
+    before: Option<u32>,
+    /// Not ended, but the session showed activity since: not shown any more,
+    /// its end is still taken until [`COMPACT_GRACE`] after this.
+    settled: Option<Instant>,
+    /// Ended: how long it took, and until when its line waits for the new
+    /// percentage.
+    done: Option<(Duration, Instant)>,
 }
 
 /// A plain message without a sound.
@@ -8514,6 +8759,301 @@ again"
         assert_eq!(
             slots.registry.slots[0].pending_separator.as_deref(),
             Some("── session cccccccc · new ──")
+        );
+    }
+
+    fn context(percent: u32) -> HookEvent {
+        HookEvent::StatusLine {
+            model: None,
+            effort: None,
+            context: Some(percent),
+            five_hour: None,
+            seven_day: None,
+        }
+    }
+
+    fn compact(trigger: &str) -> HookEvent {
+        HookEvent::PreCompact {
+            trigger: Some(trigger.into()),
+        }
+    }
+
+    fn compacted(pid: u32) -> HookEvent {
+        HookEvent::SessionStart {
+            source: Some("compact".into()),
+            claude_pid: Some(pid),
+            parent_claude_pid: None,
+        }
+    }
+
+    /// The first line of the status message of slot 0 at `at`.
+    fn status_head(slots: &Slots, session: &str, at: Instant) -> String {
+        let (text, _) = slots.status_view(SlotId(0), session, at);
+        text.lines().next().unwrap_or_default().to_owned()
+    }
+
+    /// Topic lines about compactions, in send order.
+    async fn compact_lines(fake: &Fake) -> Vec<String> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fake.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    thread_id: Some(100),
+                    text,
+                    notify: false,
+                    ..
+                } if text.starts_with("🗜") => Some(text),
+                Op::Send { text, .. } if text.starts_with("🗜") => {
+                    panic!("a compaction line with a sound: {text}")
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_compaction_shows_in_the_status_and_its_end_is_one_line() {
+        let dir = TempDir::new("slots-compact");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.on_hook(&hook(A, context(80)));
+        slots.on_hook(&hook(A, compact("auto")));
+        let now = Instant::now();
+        assert_eq!(status_head(&slots, A, now), "🗜 Сжимаю контекст (авто)…");
+        assert_eq!(
+            status_head(&slots, A, now + Duration::from_secs(125)),
+            "🗜 Сжимаю контекст (авто)… 2 мин"
+        );
+        // A repeat while it runs changes nothing; a status line sent while it
+        // runs is still the old context.
+        slots.on_hook(&hook(A, compact("manual")));
+        slots.on_hook(&hook(A, context(83)));
+        assert_eq!(status_head(&slots, A, now), "🗜 Сжимаю контекст (авто)…");
+        assert_eq!(compact_lines(&fake).await, ["🗜 Сжимаю контекст (авто)…"]);
+
+        slots.on_hook(&hook(A, compacted(10)));
+        assert_eq!(status_head(&slots, A, Instant::now()), "💤 Ждёт вас");
+        // The old percentage again is not the new one.
+        slots.on_hook(&hook(A, context(83)));
+        assert_eq!(compact_lines(&fake).await.len(), 1);
+        slots.on_hook(&hook(A, context(12)));
+        assert_eq!(
+            compact_lines(&fake).await,
+            [
+                "🗜 Сжимаю контекст (авто)…",
+                "🗜 Контекст сжат за 0 с: 83% → 12%"
+            ]
+        );
+        assert!(slots.compactions.is_empty());
+        // A second SessionStart(compact) with nothing running says nothing.
+        slots.on_hook(&hook(A, compacted(10)));
+        assert_eq!(compact_lines(&fake).await.len(), 2);
+
+        // Ended, and no new percentage comes: the line goes without numbers.
+        slots.on_hook(&hook(A, compact("manual")));
+        slots.on_hook(&hook(A, compacted(10)));
+        slots.check_compactions(Instant::now());
+        assert!(!slots.compactions.is_empty(), "waits for the numbers");
+        slots.check_compactions(Instant::now() + COMPACT_NUMBERS_WAIT);
+        assert!(slots.compactions.is_empty());
+        let lines = compact_lines(&fake).await;
+        assert_eq!(
+            lines[2..],
+            ["🗜 Сжимаю контекст (вручную)…", "🗜 Контекст сжат за 0 с"]
+        );
+
+        // One that never ends is forgotten after COMPACT_MAX, with no line.
+        slots.on_hook(&hook(A, compact("auto")));
+        slots.check_compactions(Instant::now() + COMPACT_MAX);
+        assert!(slots.compactions.is_empty());
+        assert_eq!(status_head(&slots, A, Instant::now()), "💤 Ждёт вас");
+        // And one cut by the session's end leaves no line either.
+        slots.on_hook(&hook(A, compact("auto")));
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        assert!(slots.compactions.is_empty());
+        slots.on_hook(&hook(A, compacted(10)));
+        let lines = compact_lines(&fake).await;
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(lines[4..].iter().all(|line| line.starts_with("🗜 Сжимаю")));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_without_a_status_line_is_told_at_once() {
+        let dir = TempDir::new("slots-compact-plain");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        // No topic yet: nothing to show.
+        slots.on_hook(&hook(A, compact("manual")));
+        assert!(slots.compactions.is_empty());
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.on_hook(&hook(A, HookEvent::PreCompact { trigger: None }));
+        assert_eq!(status_head(&slots, A, Instant::now()), "🗜 Сжимаю контекст…");
+        slots.on_hook(&hook(A, compacted(10)));
+        assert!(slots.compactions.is_empty());
+        assert_eq!(
+            compact_lines(&fake).await,
+            ["🗜 Сжимаю контекст…", "🗜 Контекст сжат за 0 с"]
+        );
+        // A nested run's compaction is not the slot's.
+        slots.on_hook(&hook(
+            B,
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(20),
+                parent_claude_pid: Some(10),
+            },
+        ));
+        slots.on_hook(&hook(B, compact("auto")));
+        assert!(slots.compactions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activity_after_a_compaction_ends_its_status_and_a_late_end_still_counts() {
+        let dir = TempDir::new("slots-compact-cancel");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.on_hook(&hook(A, context(80)));
+
+        // Cancelled (Esc, an error): the next prompt ends the status at once,
+        // and without a SessionStart(compact) no line comes.
+        slots.on_hook(&hook(A, compact("manual")));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        assert!(!status_head(&slots, A, Instant::now()).starts_with("🗜"));
+        // A repeat PreCompact after it is a new compaction.
+        slots.on_hook(&hook(A, compact("auto")));
+        assert_eq!(
+            status_head(&slots, A, Instant::now()),
+            "🗜 Сжимаю контекст (авто)…"
+        );
+        // A tool start ends it too; the grace runs out with no line.
+        slots.on_hook(&hook(
+            A,
+            HookEvent::ToolStart {
+                tool_use_id: "t1".into(),
+                line: "Bash: ls".into(),
+            },
+        ));
+        assert!(!status_head(&slots, A, Instant::now()).starts_with("🗜"));
+        slots.check_compactions(Instant::now());
+        assert!(!slots.compactions.is_empty(), "its end is still taken");
+        slots.check_compactions(Instant::now() + COMPACT_GRACE);
+        assert!(slots.compactions.is_empty());
+        slots.on_hook(&hook(A, compacted(10)));
+        assert_eq!(
+            compact_lines(&fake).await,
+            ["🗜 Сжимаю контекст (вручную)…", "🗜 Сжимаю контекст (авто)…"]
+        );
+
+        // Activity first, then a late SessionStart(compact) within the grace:
+        // the done line still goes.
+        slots.on_hook(&hook(A, compact("auto")));
+        slots.on_hook(&stop(A, None));
+        assert!(!status_head(&slots, A, Instant::now()).starts_with("🗜"));
+        slots.on_hook(&hook(A, compacted(10)));
+        slots.on_hook(&hook(A, context(20)));
+        assert!(slots.compactions.is_empty());
+        let lines = compact_lines(&fake).await;
+        assert_eq!(
+            lines[2..],
+            [
+                "🗜 Сжимаю контекст (авто)…",
+                "🗜 Контекст сжат за 0 с: 80% → 20%"
+            ]
+        );
+
+        // The usual order: the end, then activity; activity changes nothing.
+        slots.on_hook(&hook(A, compact("auto")));
+        slots.on_hook(&hook(A, compacted(10)));
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        slots.on_hook(&hook(A, context(9)));
+        let lines = compact_lines(&fake).await;
+        assert_eq!(
+            lines[4..],
+            [
+                "🗜 Сжимаю контекст (авто)…",
+                "🗜 Контекст сжат за 0 с: 20% → 9%"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_smaller_context_is_the_one_after_a_compaction() {
+        let dir = TempDir::new("slots-compact-after");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.on_hook(&hook(A, context(80)));
+        slots.on_hook(&hook(A, compact("auto")));
+        slots.on_hook(&hook(A, compacted(10)));
+        // A line sent while it ran, arriving late: higher, not the new one.
+        slots.on_hook(&hook(A, context(83)));
+        assert!(!slots.compactions.is_empty(), "still waits");
+        slots.on_hook(&hook(A, context(15)));
+        assert!(slots.compactions.is_empty());
+        assert_eq!(
+            compact_lines(&fake).await,
+            [
+                "🗜 Сжимаю контекст (авто)…",
+                "🗜 Контекст сжат за 0 с: 80% → 15%"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_compaction_tells_the_one_waiting_for_its_numbers_first() {
+        let dir = TempDir::new("slots-compact-twice");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.on_hook(&hook(A, context(80)));
+        slots.on_hook(&hook(A, compact("manual")));
+        slots.on_hook(&hook(A, compacted(10)));
+        slots.on_hook(&hook(A, compact("auto")));
+        assert_eq!(
+            status_head(&slots, A, Instant::now()),
+            "🗜 Сжимаю контекст (авто)…"
+        );
+        assert_eq!(
+            compact_lines(&fake).await,
+            [
+                "🗜 Сжимаю контекст (вручную)…",
+                "🗜 Контекст сжат за 0 с",
+                "🗜 Сжимаю контекст (авто)…"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compaction_without_a_context_percentage_is_told_at_once() {
+        let dir = TempDir::new("slots-compact-nocontext");
+        let (fake, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots.on_hook(&hook(
+            A,
+            HookEvent::StatusLine {
+                model: Some("opus".into()),
+                effort: None,
+                context: None,
+                five_hour: None,
+                seven_day: None,
+            },
+        ));
+        slots.on_hook(&hook(A, compact("auto")));
+        slots.on_hook(&hook(A, compacted(10)));
+        assert!(slots.compactions.is_empty(), "told at once");
+        assert_eq!(
+            compact_lines(&fake).await,
+            ["🗜 Сжимаю контекст (авто)…", "🗜 Контекст сжат за 0 с"]
         );
     }
 
