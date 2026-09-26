@@ -40,11 +40,15 @@ pub enum Ask {
 }
 
 /// One read of a screen: the visible rows, right trimmed, and, when the
-/// reader can tell, the same rows with faint (SGR 2) cells as spaces.
-/// Claude Code draws its placeholder, its prompt suggestion and the inline
-/// completion after the cursor faint (probe TASK-057, 2.1.283): text in the
-/// input box that nobody typed. A Windows console read cannot tell (its
-/// attribute words carry no faint), so there `solid` is `None`.
+/// reader can tell, the same rows with faint (SGR 2) cells as spaces, cell
+/// for cell (a faint cell of several code points becomes one space). Claude
+/// Code draws its placeholder and prompt suggestion faint, and its inline
+/// completion faint except the first character, which stands solid under
+/// the cursor (probe TASK-057, 2.1.283): text in the input box that nobody
+/// typed. Which faint text counts as that is judged by
+/// [`crate::keys::typed_box`]. A Windows console read cannot tell (its
+/// attribute words carry no faint), so there `solid` is `None`. vt100 keeps
+/// one intensity per cell: bold and faint together read as bold only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rows {
     pub lines: Vec<String>,
@@ -654,14 +658,17 @@ mod tests {
             Some(&[rule.clone(), "❯".to_owned(), rule, String::new()][..])
         );
         assert_eq!(Some(rows.lines), screen.lines());
-        // Typed text replaces the placeholder; an inline completion after
-        // it is faint again; a wide character keeps its place.
-        screen.feed("\x1b[2;3H!ls 日本\x1b[2m -la\x1b[22m\x1b[K".as_bytes());
+        // Typed text replaces the placeholder. An inline completion after it
+        // is drawn as Claude Code's `Cursor.render` does: its first
+        // character under the cursor (inverse here), the rest faint. A wide
+        // character keeps its place.
+        screen.feed("\x1b[2;3H!ls 日本\x1b[7m-\x1b[27m\x1b[2mla\x1b[22m\x1b[K".as_bytes());
         let rows = screen.rows().unwrap();
-        assert_eq!(rows.lines[1], "❯\u{a0}!ls 日本 -la");
-        assert_eq!(rows.solid.as_ref().unwrap()[1], "❯\u{a0}!ls 日本");
+        assert_eq!(rows.lines[1], "❯\u{a0}!ls 日本-la");
+        assert_eq!(rows.solid.as_ref().unwrap()[1], "❯\u{a0}!ls 日本-");
         let typed = crate::keys::typed_box(&rows).unwrap();
-        assert!(crate::keys::box_shows(&typed, "!ls 日本"));
+        assert!(typed.ghost_follows);
+        assert!(crate::keys::typed_shows(&typed, "!ls 日本"));
         let whole = crate::keys::input_box(&rows.lines).unwrap();
         assert!(!crate::keys::box_shows(&whole, "!ls 日本"));
     }
