@@ -1,0 +1,2744 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -57,6 +57,12 @@
+ version = "1.0.104"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
++
++[[package]]
++name = "arrayvec"
++version = "0.7.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+ 
+ [[package]]
+ name = "asn1-rs"
+@@ -207,6 +213,7 @@
+  "tracing",
+  "tracing-subscriber",
+  "transcript",
++ "vt100",
+  "windows-sys 0.61.2",
+ ]
+ 
+@@ -1701,6 +1708,12 @@
+ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+ 
+ [[package]]
++name = "unicode-width"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
++
++[[package]]
+ name = "untrusted"
+ version = "0.7.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -1741,6 +1754,27 @@
+ version = "0.1.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
++
++[[package]]
++name = "vt100"
++version = "0.16.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
++dependencies = [
++ "itoa",
++ "unicode-width",
++ "vte",
++]
++
++[[package]]
++name = "vte"
++version = "0.15.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
++dependencies = [
++ "arrayvec",
++ "memchr",
++]
+ 
+ [[package]]
+ name = "walkdir"
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -65,7 +65,7 @@
+ claude-cctg
+ ```
+ 
+-Все аргументы `claude` работают так же (`claude-cctg --resume`, `claude-cctg "почини тест"`). Claude Code при старте спрашивает про development channels: выберите пункт 1. В Windows в обычной консоли (PowerShell, cmd, Windows Terminal) cctg нажимает за вас; в окне Git Bash (mintty) нет, поэтому сессии в Windows лучше запускать из PowerShell или cmd.
++Все аргументы `claude` работают так же (`claude-cctg --resume`, `claude-cctg "почини тест"`). Claude Code при старте спрашивает про development channels: выберите пункт 1. В Windows в обычной консоли (PowerShell, cmd, Windows Terminal), на Linux и macOS в терминале cctg нажимает за вас; в окне Git Bash (mintty) нет, поэтому сессии в Windows лучше запускать из PowerShell или cmd.
+ 
+ ## Что видно в Telegram
+ 
+diff --git a/crates/cctg/Cargo.toml b/crates/cctg/Cargo.toml
+--- a/crates/cctg/Cargo.toml
++++ b/crates/cctg/Cargo.toml
+@@ -29,6 +29,15 @@
+ tracing.workspace = true
+ tracing-subscriber.workspace = true
+ transcript = { path = "../transcript" }
++# Screen copy of the terminal `cctg run` holds for claude on Linux and macOS
++# (TASK-044). Pure Rust; built on every platform so its tests run everywhere.
++vt100 = "0.16"
++
++# The pseudo-terminal of `cctg run`, raw mode, signals, the macOS process
++# walk (TASK-044); install_e2e's setsid. Already in the lock file through
++# tokio; no new download.
++[target.'cfg(unix)'.dependencies]
++libc = "0.2"
+ 
+ # Process snapshot for the hook's nesting check (CreateToolhelp32Snapshot);
+ # console key presses of the agent (TASK-029: AttachConsole, CreateFileW
+@@ -41,11 +50,6 @@
+ tokio = { workspace = true, features = ["test-util"] }
+ # Self-signed certificates for the TLS tests (TASK-035).
+ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+-
+-# install_e2e runs install.sh in a session of its own (setsid): no terminal.
+-# Already in the lock file through tokio; no new download.
+-[target.'cfg(unix)'.dev-dependencies]
+-libc = "0.2"
+ 
+ # The supervisor e2e test stops the supervisor with Ctrl+Break
+ # (GenerateConsoleCtrlEvent).
+@@ -69,3 +73,9 @@
+ [[test]]
+ name = "run_e2e"
+ harness = false
++
++# The TASK-044 test of `cctg run` in a terminal (Linux, macOS): it is also
++# the claude stand-in in the pseudo-terminal.
++[[test]]
++name = "run_pty_e2e"
++harness = false
+diff --git a/crates/cctg/src/agent.rs b/crates/cctg/src/agent.rs
+--- a/crates/cctg/src/agent.rs
++++ b/crates/cctg/src/agent.rs
+@@ -26,10 +26,12 @@
+ //! endpoint: a session that started while the hub was down becomes known as
+ //! soon as the hub is back, without waiting for its next hook.
+ //!
+-//! On Windows the agent also presses Esc in its claude's console when the
+-//! hub asks (`console_key`, see [`crate::keys`]) and answers whether the key
+-//! events were written, and types a one-line command into its input box
+-//! (`console_command`, TASK-043) and answers what became of it.
++//! The agent also presses Esc in its claude's terminal when the hub asks
++//! (`console_key`, see [`crate::keys`]) and answers whether the key events
++//! were written, and types a one-line command into its input box
++//! (`console_command`, TASK-043) and answers what became of it: on Windows
++//! in claude's console, elsewhere through the `cctg run` that holds claude's
++//! terminal (TASK-044).
+ //!
+ //! Session reads (TASK-034): the hub never opens a file of this machine; it
+ //! asks with `session_read` and the agent answers from its session's files
+@@ -491,18 +493,15 @@
+     // claude, or unset (TASK-004). The shim between claude and this worker
+     // is no claude and the walk passes it.
+     let claude_pid = proctree::current_lineage(None, None, "").claude_pid;
+-    let console = claude_pid.filter(|_| keys::SUPPORTED).map(|pid| Console {
+-        press: Arc::new(move |key| keys::press(pid, key)),
+-        type_line: Arc::new(move |text: &str| keys::type_command(pid, text)),
+-    });
+     let mut worker = Worker::from_env(
+         |name| std::env::var(name).ok(),
+         claude_pid,
+         config.state_dir.clone(),
+-        console.is_some(),
++        None,
+     );
+-    // Only the `cctg run` that started this claude restarts it; an inherited
+-    // `CCTG_RUN` of another session's terminal does not count.
++    // Only the `cctg run` that started this claude restarts it (and, off
++    // Windows, holds its terminal); an inherited `CCTG_RUN` of another
++    // session's terminal does not count.
+     if let (Some(run), Some(claude)) = (worker.run_pid, claude_pid) {
+         let chain = tokio::task::spawn_blocking(move || proctree::ancestors(claude))
+             .await
+@@ -514,6 +513,14 @@
+             worker.run_pid = None;
+         }
+     }
++    worker.console = console_target(claude_pid, worker.run_pid, worker.state_dir.clone()).await;
++    let console = worker.console.clone().map(|target| {
++        let pressed = target.clone();
++        Console {
++            press: Arc::new(move |key| keys::press(&pressed, key)),
++            type_line: Arc::new(move |text: &str| keys::type_command(&target, text)),
++        }
++    });
+     // The file hash is this process's own file (the shim's copy); a new
+     // build shows up in the file the copy came from. The hub is told the
+     // build's source (TASK-035), which needs the hash only without a clean
+@@ -614,6 +621,29 @@
+     }
+ }
+ 
++/// Where this agent presses and types: its claude's console on Windows;
++/// elsewhere the terminal of the `cctg run` that started its claude, when
++/// that one answers on its socket ([`crate::term`], TASK-044). `None`: no
++/// console keys or commands.
++async fn console_target(
++    claude_pid: Option<u32>,
++    run_pid: Option<u32>,
++    state_dir: Option<PathBuf>,
++) -> Option<keys::Target> {
++    if cfg!(windows) {
++        return claude_pid.map(keys::Target::Console);
++    }
++    let socket = crate::term::socket_path(&state_dir?, run_pid?);
++    let probe = socket.clone();
++    let answers = tokio::task::spawn_blocking(move || crate::term::screen(&probe).is_some())
++        .await
++        .unwrap_or(false);
++    if !answers {
++        info!("cctg run keeps no terminal for this claude; no console keys");
++    }
++    answers.then_some(keys::Target::Run(socket))
++}
++
+ /// How this agent talks to the hub: as which session, and where.
+ #[derive(Debug)]
+ pub struct LinkPlan {
+diff --git a/crates/cctg/src/hub/console.rs b/crates/cctg/src/hub/console.rs
+--- a/crates/cctg/src/hub/console.rs
++++ b/crates/cctg/src/hub/console.rs
+@@ -34,7 +34,8 @@
+ без переводов строки, управляющих символов и эмодзи.";
+ pub const OFFLINE_NOTICE: &str = "Команда для терминала не набрана: сессия не на связи.";
+ pub const NO_CONSOLE_NOTICE: &str = "Команда для терминала не набрана: клиент этой сессии \
+-не умеет набирать команды (нужен свежий cctg на Windows).";
++не умеет набирать команды. Нужен свежий cctg и claude, запущенный через claude-cctg \
++(на Linux и macOS в терминале, без перенаправления ввода и вывода).";
+ pub const BUSY_NOTICE: &str = "Сессия занята: команда не набрана, повторите после хода.";
+ pub const WAITING_NOTICE: &str =
+     "Сессия ждёт ответа на запрос разрешения: команда не набрана, повторите после него.";
+diff --git a/crates/cctg/src/keys.rs b/crates/cctg/src/keys.rs
+--- a/crates/cctg/src/keys.rs
++++ b/crates/cctg/src/keys.rs
+@@ -15,17 +15,29 @@
+ //! console input: `FreeConsole` + `AttachConsole(claude pid)` + `CONIN$` +
+ //! `WriteConsoleInputW`, then `FreeConsole` again. A console is attached per
+ //! process, so one press at a time. The agent's stdio are pipes and stay
+-//! untouched. Elsewhere nothing is supported yet and the agent does not
+-//! announce the capability.
++//! untouched. On Linux and macOS (TASK-044) the agent asks the `cctg run`
++//! that started its claude, which keeps claude in a pseudo-terminal
++//! ([`crate::term`]), for its screen copy and to write into claude's input.
++//! Both ways are a [`Target`]; what to type and when is decided on the same
++//! screen lines for both.
+ //!
+ //! A successful write says only that the key events are in the console
+ //! input buffer (behind any input that waits there), not that Claude Code
+ //! read them or that its turn ended.
+ 
++use std::path::PathBuf;
++use std::time::Duration;
++
+ use crate::wire::ConsoleKey;
+ 
+-/// Whether this build can press keys at all.
+-pub const SUPPORTED: bool = cfg!(windows);
++/// Where the agent presses and types.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Target {
++    /// The console of this claude process (Windows only).
++    Console(u32),
++    /// The terminal of the `cctg run` behind this socket (Unix only).
++    Run(PathBuf),
++}
+ 
+ /// `(virtual key, scan code, character, control key state)` of `key`.
+ pub fn key_event(key: ConsoleKey) -> (u16, u16, u16, u32) {
+@@ -34,10 +46,17 @@
+     }
+ }
+ 
+-/// Writes `key` (down and up) into the console input of process
+-/// `claude_pid`. Blocking and short; `false` when any step failed.
++/// Writes `key` (down and up) into `target`. Blocking and short; `false`
++/// when any step failed.
++pub fn press(target: &Target, key: ConsoleKey) -> bool {
++    match (target, key) {
++        (Target::Console(pid), key) => press_console(*pid, key),
++        (Target::Run(socket), ConsoleKey::Interrupt) => crate::term::keys(socket, "\u{1b}"),
++    }
++}
++
+ #[cfg(windows)]
+-pub fn press(claude_pid: u32, key: ConsoleKey) -> bool {
++fn press_console(claude_pid: u32, key: ConsoleKey) -> bool {
+     use windows_sys::Win32::Foundation::{
+         CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+     };
+@@ -98,32 +117,36 @@
+ }
+ 
+ #[cfg(not(windows))]
+-pub fn press(_claude_pid: u32, _key: ConsoleKey) -> bool {
++fn press_console(_claude_pid: u32, _key: ConsoleKey) -> bool {
+     false
+ }
+ 
+ /// The prompt glyphs of Claude Code's input box: `❯`, or `>` in consoles
+ /// that make it fall back to ASCII (seen live in cmd.exe, 2026-09-24).
+ const PROMPTS: [char; 2] = ['\u{276f}', '>'];
+-/// How long typed keys get before the screen is read back.
+-#[cfg(windows)]
+-const ECHO_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+-
+-/// How long [`type_command`] watches the screen for a panel after Enter,
+-/// how often, and how long a found panel gets to fill in before it is read.
+-#[cfg(windows)]
+-const PANEL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+-#[cfg(windows)]
+-const PANEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+-#[cfg(windows)]
+-const PANEL_SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+-
+-/// How long [`type_exit`] watches the screen for [`exit_dialog`] after
+-/// Enter, and how many Esc it presses at most to close a found one.
+-#[cfg(windows)]
+-const EXIT_DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+-#[cfg(windows)]
+-const EXIT_DIALOG_ESCAPES: usize = 3;
++
++/// How long typing waits for the screen: typed keys before the box is read
++/// back; after Enter, a [`panel`] ([`type_command`]) and [`exit_dialog`]
++/// ([`type_exit`]), how often they are looked for, how long a found panel
++/// gets to fill in, and Esc presses to close the dialog at most.
++#[derive(Debug, Clone, Copy)]
++struct Waits {
++    echo: Duration,
++    panel: Duration,
++    poll: Duration,
++    settle: Duration,
++    exit_dialog: Duration,
++    exit_escapes: usize,
++}
++
++const WAITS: Waits = Waits {
++    echo: Duration::from_millis(400),
++    panel: Duration::from_secs(2),
++    poll: Duration::from_millis(250),
++    settle: Duration::from_millis(700),
++    exit_dialog: Duration::from_secs(2),
++    exit_escapes: 3,
++};
+ 
+ /// Longest command [`type_line`] types, in characters.
+ pub const MAX_LINE_CHARS: usize = 200;
+@@ -290,8 +313,8 @@
+ /// Types `/exit` with [`type_line`]. When it opens [`exit_dialog`], the
+ /// dialog is closed with Esc (never an option picked) and the answer is
+ /// [`Typed::Agents`]; [`Typed::Failed`] when it stays open.
+-pub fn type_exit(claude_pid: u32) -> Typed {
+-    type_and_watch(claude_pid, "/exit", After::ExitDialog).0
++pub fn type_exit(target: &Target) -> Typed {
++    type_and_watch(target, "/exit", After::ExitDialog).0
+ }
+ 
+ /// What [`type_and_watch`] looks for once the line went in.
+@@ -302,149 +325,216 @@
+     ExitDialog,
+ }
+ 
+-/// Types `text` into the console of `claude_pid`, reads the input box back
+-/// and presses Enter only when it shows nothing but `text`; otherwise erases
+-/// the typed characters (Backspace deletes before the cursor, where they
+-/// went). A text that is not [`typable`] is not typed. Blocking, under a
+-/// second.
+-pub fn type_line(claude_pid: u32, text: &str) -> Typed {
+-    type_and_watch(claude_pid, text, After::Nothing).0
++/// Types `text` into `target`, reads the input box back and presses Enter
++/// only when it shows nothing but `text`; otherwise erases the typed
++/// characters (Backspace deletes before the cursor, where they went). A text
++/// that is not [`typable`] is not typed. Blocking, under a second.
++pub fn type_line(target: &Target, text: &str) -> Typed {
++    type_and_watch(target, text, After::Nothing).0
+ }
+ 
+ /// [`type_line`], then, once sent, watches the screen for a [`panel`]; a
+ /// panel that shows up is read and closed with Esc (it waits for Esc and
+ /// blocks the terminal otherwise). Blocking, up to about three seconds.
+-pub fn type_command(claude_pid: u32, text: &str) -> (Typed, Option<String>) {
+-    type_and_watch(claude_pid, text, After::Panel)
+-}
+-
+-#[cfg(windows)]
+-fn type_and_watch(claude_pid: u32, text: &str, after: After) -> (Typed, Option<String>) {
+-    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
+-
++pub fn type_command(target: &Target, text: &str) -> (Typed, Option<String>) {
++    type_and_watch(target, text, After::Panel)
++}
++
++/// Reads `target` and says whether it shows [`agents_block`]; `false` when
++/// it cannot be read. Blocking and short.
++pub fn agents_on_screen(target: &Target) -> bool {
++    open(target)
++        .and_then(|mut terminal| terminal.lines())
++        .is_some_and(|screen| agents_block(&screen))
++}
++
++/// A claude terminal as typing needs it.
++trait Terminal {
++    /// The visible rows, right trimmed.
++    fn lines(&mut self) -> Option<Vec<String>>;
++    /// Writes `text` as key presses: `\r` is Enter, `\u{8}` Backspace,
++    /// `\u{1b}` Esc.
++    fn write(&mut self, text: &str) -> bool;
++}
++
++fn open(target: &Target) -> Option<Box<dyn Terminal>> {
++    match target {
++        Target::Console(pid) => console(*pid),
++        Target::Run(socket) => Some(Box::new(Run(socket.clone()))),
++    }
++}
++
++fn type_and_watch(target: &Target, text: &str, after: After) -> (Typed, Option<String>) {
+     if !typable(text) {
+         return (Typed::Failed, None);
+     }
+-    let _one = one_at_a_time();
+-    // SAFETY: plain Win32 calls without pointers; see `press`.
++    match open(target) {
++        Some(mut terminal) => watch(terminal.as_mut(), text, after, WAITS),
++        None => (Typed::Failed, None),
++    }
++}
++
++/// The typing of [`type_and_watch`] on an open terminal.
++fn watch(
++    terminal: &mut dyn Terminal,
++    text: &str,
++    after: After,
++    waits: Waits,
++) -> (Typed, Option<String>) {
++    let agents = terminal.lines().is_some_and(|screen| agents_block(&screen));
++    let typed = if agents {
++        Typed::Agents
++    } else if terminal.write(text) {
++        std::thread::sleep(waits.echo);
++        let shown = terminal
++            .lines()
++            .and_then(|screen| input_box(&screen))
++            .map(|lines| box_shows(&lines, text));
++        if shown == Some(true) && terminal.write("\r") {
++            Typed::Sent
++        } else {
++            terminal.write(&"\u{8}".repeat(text.chars().count()));
++            match shown {
++                Some(false) => Typed::Draft,
++                _ => Typed::Failed,
++            }
++        }
++    } else {
++        Typed::Failed
++    };
++    match (typed, after) {
++        (Typed::Sent, After::Panel) => (typed, close_panel(terminal, waits)),
++        (Typed::Sent, After::ExitDialog) => (cancel_exit_dialog(terminal, waits), None),
++        _ => (typed, None),
++    }
++}
++
++/// Waits up to `waits.panel` for a [`panel`]; reads a found one after
++/// `waits.settle` and presses Esc. Esc goes only to a panel on screen:
++/// without one it would interrupt a turn.
++fn close_panel(terminal: &mut dyn Terminal, waits: Waits) -> Option<String> {
++    let until = std::time::Instant::now() + waits.panel;
++    while std::time::Instant::now() < until {
++        std::thread::sleep(waits.poll);
++        if terminal.lines().as_deref().and_then(panel).is_some() {
++            std::thread::sleep(waits.settle);
++            let text = terminal.lines().as_deref().and_then(panel);
++            if text.is_some() {
++                terminal.write("\u{1b}");
++            }
++            return text;
++        }
++    }
++    None
++}
++
++/// Watches the terminal up to `waits.exit_dialog` after `/exit` for
++/// [`exit_dialog`]. Without one claude is exiting: [`Typed::Sent`]. A found
++/// one gets Esc (cancel, claude stays), again while it is still shown, at
++/// most `waits.exit_escapes` times: [`Typed::Agents`] once it is gone,
++/// [`Typed::Failed`] when it stays.
++fn cancel_exit_dialog(terminal: &mut dyn Terminal, waits: Waits) -> Typed {
++    let mut shown = || terminal.lines().is_some_and(|screen| exit_dialog(&screen));
++    let until = std::time::Instant::now() + waits.exit_dialog;
++    loop {
++        std::thread::sleep(waits.poll);
++        if shown() {
++            break;
++        }
++        if std::time::Instant::now() >= until {
++            return Typed::Sent;
++        }
++    }
++    for _ in 0..waits.exit_escapes {
++        terminal.write("\u{1b}");
++        std::thread::sleep(waits.echo);
++        if !terminal.lines().is_some_and(|screen| exit_dialog(&screen)) {
++            return Typed::Agents;
++        }
++    }
++    Typed::Failed
++}
++
++/// The terminal of a `cctg run` (Linux, macOS): every read and write is one
++/// ask on its socket.
++struct Run(PathBuf);
++
++impl Terminal for Run {
++    fn lines(&mut self) -> Option<Vec<String>> {
++        crate::term::screen(&self.0)
++    }
++
++    /// A terminal sends DEL for Backspace. A text goes in as its first
++    /// character, then the rest: like typing, a leading `!` or `/` reaches
++    /// Claude Code alone (a `!` switches the empty box to bash mode).
++    fn write(&mut self, text: &str) -> bool {
++        let text = text.replace('\u{8}', "\u{7f}");
++        let mut chars = text.chars();
++        let (Some(first), rest) = (chars.next(), chars.as_str()) else {
++            return true;
++        };
++        if first.is_control() || rest.is_empty() {
++            return crate::term::keys(&self.0, &text);
++        }
++        crate::term::keys(&self.0, first.encode_utf8(&mut [0; 4])) && {
++            std::thread::sleep(Duration::from_millis(50));
++            crate::term::keys(&self.0, rest)
++        }
++    }
++}
++
++/// This process attached to a claude console (Windows): detached again and
++/// the lock released when dropped.
++#[cfg(windows)]
++struct Attached {
++    _one: std::sync::MutexGuard<'static, ()>,
++}
++
++#[cfg(windows)]
++fn attach(claude_pid: u32) -> Option<Attached> {
++    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
++
++    let one = one_at_a_time();
++    // SAFETY: plain Win32 calls without pointers; see `press_console`.
+     unsafe {
+         SetConsoleCtrlHandler(None, 1);
+         FreeConsole();
+         if AttachConsole(claude_pid) == 0 {
+-            return (Typed::Failed, None);
+-        }
+-    }
+-    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+-    let typed = if agents {
+-        Typed::Agents
+-    } else if write_text(text) {
+-        std::thread::sleep(ECHO_WAIT);
+-        let shown = visible_lines()
+-            .and_then(|screen| input_box(&screen))
+-            .map(|lines| box_shows(&lines, text));
+-        if shown == Some(true) && write_text("\r") {
+-            Typed::Sent
+-        } else {
+-            write_text(&"\u{8}".repeat(text.chars().count()));
+-            match shown {
+-                Some(false) => Typed::Draft,
+-                _ => Typed::Failed,
+-            }
+-        }
+-    } else {
+-        Typed::Failed
+-    };
+-    let (typed, panel) = match (typed, after) {
+-        (Typed::Sent, After::Panel) => (typed, close_panel()),
+-        (Typed::Sent, After::ExitDialog) => (cancel_exit_dialog(), None),
+-        _ => (typed, None),
+-    };
+-    // SAFETY: no arguments.
+-    unsafe {
+-        FreeConsole();
+-    }
+-    (typed, panel)
++            return None;
++        }
++    }
++    Some(Attached { _one: one })
++}
++
++#[cfg(windows)]
++fn console(claude_pid: u32) -> Option<Box<dyn Terminal>> {
++    attach(claude_pid).map(|console| Box::new(console) as Box<dyn Terminal>)
+ }
+ 
+ #[cfg(not(windows))]
+-fn type_and_watch(_claude_pid: u32, _text: &str, _after: After) -> (Typed, Option<String>) {
+-    (Typed::Failed, None)
+-}
+-
+-/// Reads the console of `claude_pid` and says whether it shows
+-/// [`agents_block`]; `false` when it cannot be read. Blocking and short.
++fn console(_claude_pid: u32) -> Option<Box<dyn Terminal>> {
++    None
++}
++
+ #[cfg(windows)]
+-pub fn agents_on_screen(claude_pid: u32) -> bool {
+-    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, SetConsoleCtrlHandler};
+-
+-    let _one = one_at_a_time();
+-    // SAFETY: plain Win32 calls without pointers; see `press`.
+-    unsafe {
+-        SetConsoleCtrlHandler(None, 1);
+-        FreeConsole();
+-        if AttachConsole(claude_pid) == 0 {
+-            return false;
+-        }
+-    }
+-    let agents = visible_lines().is_some_and(|screen| agents_block(&screen));
+-    // SAFETY: no arguments.
+-    unsafe {
+-        FreeConsole();
+-    }
+-    agents
+-}
+-
+-#[cfg(not(windows))]
+-pub fn agents_on_screen(_claude_pid: u32) -> bool {
+-    false
+-}
+-
+-/// Waits up to [`PANEL_WAIT`] for a [`panel`] in the attached console; reads
+-/// a found one after [`PANEL_SETTLE`] and presses Esc. Esc goes only to a
+-/// panel on screen: without one it would interrupt a turn.
++impl Drop for Attached {
++    fn drop(&mut self) {
++        // SAFETY: no arguments.
++        unsafe {
++            windows_sys::Win32::System::Console::FreeConsole();
++        }
++    }
++}
++
+ #[cfg(windows)]
+-fn close_panel() -> Option<String> {
+-    let until = std::time::Instant::now() + PANEL_WAIT;
+-    while std::time::Instant::now() < until {
+-        std::thread::sleep(PANEL_POLL);
+-        if visible_lines().as_deref().and_then(panel).is_some() {
+-            std::thread::sleep(PANEL_SETTLE);
+-            let text = visible_lines().as_deref().and_then(panel);
+-            if text.is_some() {
+-                write_text("\u{1b}");
+-            }
+-            return text;
+-        }
+-    }
+-    None
+-}
+-
+-/// Watches the attached console up to [`EXIT_DIALOG_WAIT`] after `/exit`
+-/// for [`exit_dialog`]. Without one claude is exiting: [`Typed::Sent`]. A
+-/// found one gets Esc (cancel, claude stays), again while it is still shown,
+-/// at most [`EXIT_DIALOG_ESCAPES`] times: [`Typed::Agents`] once it is
+-/// gone, [`Typed::Failed`] when it stays.
+-#[cfg(windows)]
+-fn cancel_exit_dialog() -> Typed {
+-    let shown = || visible_lines().is_some_and(|screen| exit_dialog(&screen));
+-    let until = std::time::Instant::now() + EXIT_DIALOG_WAIT;
+-    loop {
+-        std::thread::sleep(PANEL_POLL);
+-        if shown() {
+-            break;
+-        }
+-        if std::time::Instant::now() >= until {
+-            return Typed::Sent;
+-        }
+-    }
+-    for _ in 0..EXIT_DIALOG_ESCAPES {
+-        write_text("\u{1b}");
+-        std::thread::sleep(ECHO_WAIT);
+-        if !shown() {
+-            return Typed::Agents;
+-        }
+-    }
+-    Typed::Failed
++impl Terminal for Attached {
++    fn lines(&mut self) -> Option<Vec<String>> {
++        visible_lines()
++    }
++
++    fn write(&mut self, text: &str) -> bool {
++        write_text(text)
++    }
+ }
+ 
+ /// One console attachment at a time in this process: [`press`] and
+@@ -837,7 +927,175 @@
+         assert!(!typable(&"x".repeat(MAX_LINE_CHARS + 1)));
+     }
+ 
+-    // `press` itself is not called here: it detaches the calling process
++    /// A claude stand-in for [`watch`], the typing both platforms share: an
++    /// input box that echoes what is typed after the user's `draft`
++    /// (Backspace erases, the typed text first), Enter submits; `/cost`
++    /// opens a panel, `/exit` opens the background-work dialog while `busy`,
++    /// Esc closes either (unless `stuck`). `view`: the agent view is open.
++    #[derive(Default)]
++    struct Fake {
++        draft: String,
++        input: String,
++        panel: bool,
++        dialog: bool,
++        busy: bool,
++        stuck: bool,
++        view: bool,
++        sent: Vec<String>,
++        escapes: usize,
++    }
++
++    impl Terminal for Fake {
++        fn lines(&mut self) -> Option<Vec<String>> {
++            let mut lines = vec!["\u{25cf} earlier answer".to_owned()];
++            if self.panel {
++                lines.push("\u{2594}".repeat(40));
++                lines.push("   Session".to_owned());
++                lines.push("   Total cost: $0".to_owned());
++            } else if self.dialog {
++                lines.extend(probe_exit_dialog());
++            } else {
++                let shown = format!("{}{}", self.draft, self.input);
++                let shown = if self.view && shown.is_empty() {
++                    "Message @qa\u{2026}".to_owned()
++                } else {
++                    shown
++                };
++                lines.push(RULE.to_owned());
++                lines.push(format!("\u{276f}\u{a0}{shown}"));
++                lines.push(RULE.to_owned());
++            }
++            Some(lines)
++        }
++
++        fn write(&mut self, text: &str) -> bool {
++            for c in text.chars() {
++                match c {
++                    '\r' => {
++                        let line = format!("{}{}", self.draft, self.input);
++                        self.draft.clear();
++                        self.input.clear();
++                        self.panel = line == "/cost";
++                        self.dialog = line == "/exit" && self.busy;
++                        self.sent.push(line);
++                    }
++                    '\u{8}' => {
++                        if self.input.pop().is_none() {
++                            self.draft.pop();
++                        }
++                    }
++                    '\u{1b}' => {
++                        self.escapes += 1;
++                        if !self.stuck {
++                            self.panel = false;
++                            self.dialog = false;
++                        }
++                    }
++                    c => self.input.push(c),
++                }
++            }
++            true
++        }
++    }
++
++    const QUICK: Waits = Waits {
++        echo: Duration::from_millis(1),
++        panel: Duration::from_millis(50),
++        poll: Duration::from_millis(1),
++        settle: Duration::from_millis(1),
++        exit_dialog: Duration::from_millis(50),
++        exit_escapes: 3,
++    };
++
++    #[test]
++    fn a_line_goes_in_only_into_an_empty_box() {
++        let mut claude = Fake::default();
++        let typed = watch(&mut claude, "/model sonnet", After::Nothing, QUICK);
++        assert_eq!(typed, (Typed::Sent, None));
++        assert_eq!(claude.sent, ["/model sonnet"]);
++        // A draft of the user's: the typed text is erased, the draft stays.
++        let mut claude = Fake {
++            draft: "fix the".into(),
++            ..Fake::default()
++        };
++        assert_eq!(
++            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
++            (Typed::Draft, None)
++        );
++        assert!(claude.sent.is_empty());
++        assert_eq!(
++            (claude.draft.as_str(), claude.input.as_str()),
++            ("fix the", "")
++        );
++        // The agent view: nothing is typed at all.
++        let mut claude = Fake {
++            view: true,
++            ..Fake::default()
++        };
++        assert_eq!(
++            watch(&mut claude, "!ls", After::Nothing, QUICK),
++            (Typed::Agents, None)
++        );
++        assert!(claude.sent.is_empty() && claude.input.is_empty());
++    }
++
++    #[test]
++    fn a_panel_is_read_and_closed_and_esc_goes_only_to_a_panel() {
++        let mut claude = Fake::default();
++        assert_eq!(
++            watch(&mut claude, "/cost", After::Panel, QUICK),
++            (Typed::Sent, Some("Session\nTotal cost: $0".to_owned()))
++        );
++        assert_eq!((claude.panel, claude.escapes), (false, 1));
++        let mut claude = Fake::default();
++        assert_eq!(
++            watch(&mut claude, "/compact", After::Panel, QUICK),
++            (Typed::Sent, None)
++        );
++        assert_eq!(
++            claude.escapes, 0,
++            "no Esc without a panel: it would interrupt"
++        );
++    }
++
++    #[test]
++    fn the_background_work_dialog_of_exit_is_cancelled() {
++        let mut claude = Fake::default();
++        assert_eq!(
++            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
++            (Typed::Sent, None)
++        );
++        assert_eq!(claude.escapes, 0);
++        let mut claude = Fake {
++            busy: true,
++            ..Fake::default()
++        };
++        assert_eq!(
++            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
++            (Typed::Agents, None)
++        );
++        assert_eq!((claude.dialog, claude.escapes), (false, 1));
++        let mut claude = Fake {
++            busy: true,
++            stuck: true,
++            ..Fake::default()
++        };
++        assert_eq!(
++            watch(&mut claude, "/exit", After::ExitDialog, QUICK),
++            (Typed::Failed, None)
++        );
++        assert_eq!(claude.escapes, 3);
++    }
++
++    #[test]
++    fn a_run_terminal_that_does_not_answer_gets_nothing() {
++        let target = Target::Run(std::env::temp_dir().join("cctg-no-such-run.sock"));
++        assert_eq!(type_line(&target, "/cost"), Typed::Failed);
++        assert!(!agents_on_screen(&target));
++        assert!(!press(&target, ConsoleKey::Interrupt));
++    }
++
++    // A console `press` is not called here: it detaches the calling process
+     // from its console, which would take the test runner's terminal output
+     // with it. The live probe (TASK-029 `scratch/planner/probe`) covers it.
+ }
+diff --git a/crates/cctg/src/lib.rs b/crates/cctg/src/lib.rs
+--- a/crates/cctg/src/lib.rs
++++ b/crates/cctg/src/lib.rs
+@@ -20,6 +20,7 @@
+ pub mod statusline;
+ pub mod supervise;
+ pub mod tail;
++pub mod term;
+ pub mod tls;
+ pub mod update;
+ pub mod wire;
+diff --git a/crates/cctg/src/proctree.rs b/crates/cctg/src/proctree.rs
+--- a/crates/cctg/src/proctree.rs
++++ b/crates/cctg/src/proctree.rs
+@@ -9,7 +9,8 @@
+ //! Windows reads one ToolHelp snapshot (about 7 ms for ~450 processes on the
+ //! dev host), then queries only the processes in the current ancestry for
+ //! their image path and creation time. Linux follows `/proc/<pid>/stat`
+-//! upward; other systems report no chain. Nothing here spawns a process.
++//! upward, macOS `proc_pidinfo` (TASK-044); other systems report no chain.
++//! Nothing here spawns a process.
+ 
+ #[cfg(any(windows, test))]
+ use std::collections::HashMap;
+@@ -35,8 +36,8 @@
+ }
+ 
+ /// Longest chain followed; real chains are under 20 processes. Unused on
+-/// systems without a process source (macOS: TASK-044).
+-#[cfg(any(windows, target_os = "linux", test))]
++/// systems without a process source.
++#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+ const MAX_DEPTH: usize = 64;
+ 
+ // Filled by the Windows snapshot and by tests; Linux reads /proc directly.
+@@ -201,7 +202,12 @@
+     linux::processes()
+ }
+ 
+-#[cfg(not(any(windows, target_os = "linux")))]
++#[cfg(target_os = "macos")]
++fn platform_processes() -> Option<Vec<(u32, String)>> {
++    macos::processes()
++}
++
++#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+ fn platform_processes() -> Option<Vec<(u32, String)>> {
+     None
+ }
+@@ -249,7 +255,12 @@
+     Some(linux::ancestors(pid))
+ }
+ 
+-#[cfg(not(any(windows, target_os = "linux")))]
++#[cfg(target_os = "macos")]
++fn platform_ancestors(pid: u32) -> Option<Vec<Proc>> {
++    Some(macos::ancestors(pid))
++}
++
++#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+ fn platform_ancestors(_pid: u32) -> Option<Vec<Proc>> {
+     None
+ }
+@@ -459,6 +470,154 @@
+             }
+         }
+         Some(out)
++    }
++}
++
++#[cfg(target_os = "macos")]
++mod macos {
++    use super::{MAX_DEPTH, Proc};
++
++    struct Info {
++        parent: u32,
++        name: String,
++        image_path: Option<String>,
++        /// Start time (seconds, microseconds).
++        started: (u64, u64),
++    }
++
++    fn info(pid: u32) -> Option<Info> {
++        // SAFETY: an all-zero `proc_bsdinfo` is valid plain data.
++        let mut bsd: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
++        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
++        // SAFETY: the buffer is a live `proc_bsdinfo` of `size` bytes.
++        let got = unsafe {
++            libc::proc_pidinfo(
++                pid as libc::c_int,
++                libc::PROC_PIDTBSDINFO,
++                0,
++                (&mut bsd as *mut libc::proc_bsdinfo).cast(),
++                size,
++            )
++        };
++        if got != size {
++            return None;
++        }
++        let name = c_text(&bsd.pbi_name)
++            .filter(|name| !name.is_empty())
++            .or_else(|| c_text(&bsd.pbi_comm))?;
++        let image_path = image_path(pid);
++        Some(Info {
++            parent: bsd.pbi_ppid,
++            name: super::process_name(&name, image_path.as_deref()),
++            image_path,
++            started: (bsd.pbi_start_tvsec, bsd.pbi_start_tvusec),
++        })
++    }
++
++    fn c_text(chars: &[libc::c_char]) -> Option<String> {
++        let bytes: Vec<u8> = chars
++            .iter()
++            .take_while(|&&c| c != 0)
++            .map(|&c| c as u8)
++            .collect();
++        String::from_utf8(bytes).ok()
++    }
++
++    fn image_path(pid: u32) -> Option<String> {
++        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
++        // SAFETY: a live buffer of the length given.
++        let len = unsafe {
++            libc::proc_pidpath(
++                pid as libc::c_int,
++                buf.as_mut_ptr().cast(),
++                buf.len() as u32,
++            )
++        };
++        if len <= 0 {
++            return None;
++        }
++        buf.truncate(len as usize);
++        String::from_utf8(buf).ok()
++    }
++
++    /// Follows `proc_pidinfo` upward. A parent that started after its
++    /// child is a reused pid: the chain ends before it.
++    pub fn ancestors(pid: u32) -> Vec<Proc> {
++        let mut chain = Vec::new();
++        let mut current = pid;
++        let mut child_started = None;
++        while chain.len() < MAX_DEPTH {
++            let Some(info) = info(current) else {
++                break;
++            };
++            if chain.iter().any(|proc: &Proc| proc.pid == current)
++                || child_started.is_some_and(|child| info.started > child)
++            {
++                break;
++            }
++            chain.push(Proc {
++                pid: current,
++                name: info.name,
++                image_path: info.image_path,
++            });
++            if info.parent == 0 || info.parent == current {
++                break;
++            }
++            child_started = Some(info.started);
++            current = info.parent;
++        }
++        chain
++    }
++
++    /// Every process this user can query, as (pid, name). `None` when the
++    /// pid list cannot be read.
++    pub fn processes() -> Option<Vec<(u32, String)>> {
++        // SAFETY: a null buffer asks for the count only.
++        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
++        if count <= 0 {
++            return None;
++        }
++        // Room for processes started since the count.
++        let mut pids: Vec<libc::c_int> = vec![0; count as usize + 64];
++        let bytes = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
++        // SAFETY: a live buffer of `bytes` bytes.
++        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
++        if got <= 0 {
++            return None;
++        }
++        pids.truncate(got as usize);
++        Some(
++            pids.into_iter()
++                .filter(|&pid| pid > 0)
++                .filter_map(|pid| {
++                    let pid = pid as u32;
++                    info(pid).map(|info| (pid, info.name))
++                })
++                .collect(),
++        )
++    }
++}
++
++/// The name a process goes by here. macOS names a process after the file it
++/// runs, and the native Claude Code install runs
++/// `~/.local/share/claude/versions/<version>` through the link
++/// `~/.local/bin/claude` (Activity Monitor shows "2.0.53",
++/// anthropics/claude-code#12433): a file in a `claude/versions` folder is
++/// `claude`.
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn process_name(name: &str, image_path: Option<&str>) -> String {
++    let versioned = image_path.is_some_and(|path| {
++        let mut parts = std::path::Path::new(path).components().rev();
++        parts.next().is_some()
++            && parts
++                .next()
++                .is_some_and(|dir| dir.as_os_str() == "versions")
++            && parts.next().is_some_and(|dir| dir.as_os_str() == "claude")
++    });
++    if versioned {
++        "claude".to_owned()
++    } else {
++        name.to_owned()
+     }
+ }
+ 
+@@ -836,7 +995,25 @@
+         assert_eq!(claude_pids(many), None, "an overlong list is no list");
+     }
+ 
+-    #[cfg(any(windows, target_os = "linux"))]
++    #[test]
++    fn a_native_claude_on_macos_is_named_claude() {
++        let version = "/Users/u/.local/share/claude/versions/2.1.282";
++        assert_eq!(process_name("2.1.282", Some(version)), "claude");
++        assert_eq!(
++            process_name("claude", Some("/opt/homebrew/bin/claude")),
++            "claude"
++        );
++        for (name, path) in [
++            ("2.1.282", None),
++            ("node", Some("/usr/local/bin/node")),
++            ("1.0", Some("/Users/u/app/versions/1.0")),
++            ("versions", Some("claude/versions")),
++        ] {
++            assert_eq!(process_name(name, path), name, "{path:?}");
++        }
++    }
++
++    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+     #[test]
+     fn the_live_list_is_readable_here() {
+         // Whatever runs here, the call works and stays bounded.
+@@ -844,7 +1021,7 @@
+         assert!(pids.len() <= MAX_LIVE_PIDS);
+     }
+ 
+-    #[cfg(any(windows, target_os = "linux"))]
++    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+     #[test]
+     fn the_live_chain_starts_at_this_process() {
+         let chain = ancestors(std::process::id()).expect("supported platform");
+diff --git a/crates/cctg/src/run.rs b/crates/cctg/src/run.rs
+--- a/crates/cctg/src/run.rs
++++ b/crates/cctg/src/run.rs
+@@ -15,12 +15,19 @@
+ //! selected. Without a request
+ //! `cctg run` exits with claude's exit code.
+ //!
++//! On Linux and macOS (TASK-044), when stdin and stdout are terminals,
++//! claude runs in a pseudo-terminal `cctg run` holds ([`crate::term`]):
++//! same window, every key relayed as it is typed, the window size followed,
++//! a claude that suspends itself (Ctrl+Z) suspends `cctg run` with it; the
++//! agent reads that terminal and types into it through a socket. Without a
++//! terminal (piped, `-p`) claude runs as before, without console keys.
++//!
+ //! Not updated while it runs, so nothing else lives here: no versions, no
+ //! network, no protocol, no knowledge of claude's options.
+ 
+-use std::ffi::OsString;
++use std::ffi::{OsStr, OsString};
+ use std::path::PathBuf;
+-use std::process::Command;
++use std::process::{Child, Command};
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, Instant};
+@@ -43,12 +50,132 @@
+             while signal.recv().await.is_some() {}
+         }
+     });
+-    tokio::task::spawn_blocking(move || run_claude(args, state_dir))
+-        .await
+-        .unwrap_or(1)
+-}
+-
+-fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>) -> i32 {
++    let place = Place::new(state_dir.as_deref());
++    #[cfg(unix)]
++    if let Place::Pty(host) = &place {
++        follow_signals(host);
++    }
++    let code = tokio::task::spawn_blocking({
++        let place = place.clone();
++        move || run_claude(args, state_dir, &place)
++    })
++    .await
++    .unwrap_or(1);
++    place.finish();
++    code
++}
++
++/// Where claude runs: in this console (Windows, or wherever `cctg run` has
++/// no terminal to hold), or in the pseudo-terminal of `cctg run` (Unix).
++#[derive(Clone)]
++enum Place {
++    Console,
++    #[cfg(unix)]
++    Pty(Arc<crate::term::Host>),
++}
++
++impl Place {
++    #[cfg(unix)]
++    fn new(state_dir: Option<&std::path::Path>) -> Self {
++        let socket = state_dir.map(|state| crate::term::socket_path(state, std::process::id()));
++        crate::term::Host::start(socket).map_or(Place::Console, Place::Pty)
++    }
++
++    #[cfg(not(unix))]
++    fn new(_state_dir: Option<&std::path::Path>) -> Self {
++        Place::Console
++    }
++
++    fn command(&self, program: &OsStr) -> std::io::Result<Command> {
++        match self {
++            Place::Console => Ok(Command::new(program)),
++            #[cfg(unix)]
++            Place::Pty(host) => host.command(program),
++        }
++    }
++
++    /// claude's exit code.
++    fn wait(&self, mut child: Child) -> i32 {
++        match self {
++            Place::Console => child
++                .wait()
++                .ok()
++                .and_then(|status| status.code())
++                .unwrap_or(1),
++            #[cfg(unix)]
++            Place::Pty(host) => host.wait(child.id()),
++        }
++    }
++
++    fn lines(&self) -> Option<Vec<String>> {
++        match self {
++            Place::Console => crate::keys::visible_lines(),
++            #[cfg(unix)]
++            Place::Pty(host) => host.lines(),
++        }
++    }
++
++    fn enter(&self) -> bool {
++        match self {
++            Place::Console => crate::keys::write_text("\r"),
++            #[cfg(unix)]
++            Place::Pty(host) => host.write(b"\r"),
++        }
++    }
++
++    /// `cctg run` was told to stop (SIGTERM, SIGHUP): no restart.
++    fn stopping(&self) -> bool {
++        match self {
++            Place::Console => false,
++            #[cfg(unix)]
++            Place::Pty(host) => host.stopping(),
++        }
++    }
++
++    /// A line of `cctg run` on stderr (in raw mode a line needs its `\r`).
++    fn say(&self, text: &str) {
++        match self {
++            Place::Console => eprintln!("{text}"),
++            #[cfg(unix)]
++            Place::Pty(_) => eprint!("{text}\r\n"),
++        }
++    }
++
++    fn finish(&self) {
++        #[cfg(unix)]
++        if let Place::Pty(host) = self {
++            host.finish();
++        }
++    }
++}
++
++/// The user's window size goes to claude's terminal; SIGTERM and SIGHUP
++/// reach claude as SIGHUP (its terminal is gone) and end `cctg run` after it.
++#[cfg(unix)]
++fn follow_signals(host: &Arc<crate::term::Host>) {
++    use tokio::signal::unix::{SignalKind, signal};
++
++    if let Ok(mut resized) = signal(SignalKind::window_change()) {
++        let host = host.clone();
++        tokio::spawn(async move {
++            while resized.recv().await.is_some() {
++                host.sync_size();
++            }
++        });
++    }
++    for kind in [SignalKind::terminate(), SignalKind::hangup()] {
++        if let Ok(mut stop) = signal(kind) {
++            let host = host.clone();
++            tokio::spawn(async move {
++                while stop.recv().await.is_some() {
++                    host.hang_up();
++                }
++            });
++        }
++    }
++}
++
++fn run_claude(args: Vec<String>, state_dir: Option<PathBuf>, place: &Place) -> i32 {
+     let request = state_dir.map(|state| update::request_path(&state, std::process::id()));
+     if let Some(stale) = &request {
+         let _ = std::fs::remove_file(stale);
+@@ -57,33 +184,35 @@
+     let run_args = serde_json::to_string(&args).unwrap_or_default();
+     let mut claude_args = args;
+     loop {
+-        let mut child = match Command::new(&program)
+-            .args(&claude_args)
+-            .env(RUN_VAR, std::process::id().to_string())
+-            .env(RUN_ARGS_VAR, &run_args)
+-            .spawn()
+-        {
++        let spawned = place.command(&program).and_then(|mut command| {
++            command
++                .args(&claude_args)
++                .env(RUN_VAR, std::process::id().to_string())
++                .env(RUN_ARGS_VAR, &run_args)
++                .spawn()
++        });
++        let child = match spawned {
+             Ok(child) => child,
+             Err(error) => {
+-                eprintln!("cctg run: cannot start claude: {error}");
++                place.say(&format!("cctg run: cannot start claude: {error}"));
+                 return 1;
+             }
+         };
+         let running = Arc::new(AtomicBool::new(true));
+         {
+             let running = running.clone();
+-            std::thread::spawn(move || answer_channels_dialog(&running));
+-        }
+-        let code = child
+-            .wait()
+-            .ok()
+-            .and_then(|status| status.code())
+-            .unwrap_or(1);
++            let place = place.clone();
++            std::thread::spawn(move || answer_channels_dialog(&running, &place));
++        }
++        let code = place.wait(child);
+         running.store(false, Ordering::Relaxed);
++        if place.stopping() {
++            return code;
++        }
+         let Some(next) = request.as_ref().and_then(take_request) else {
+             return code;
+         };
+-        eprintln!("cctg run: starting claude again");
++        place.say("cctg run: starting claude again");
+         claude_args = next;
+     }
+ }
+@@ -112,22 +241,22 @@
+     Some(selected.contains("1.") && selected.contains("local development"))
+ }
+ 
+-/// Watches this console until the dialog shows (Enter when option 1 is
++/// Watches claude's screen until the dialog shows (Enter when option 1 is
+ /// selected), claude exits or [`DIALOG_WAIT`] passes.
+-fn answer_channels_dialog(running: &AtomicBool) {
++fn answer_channels_dialog(running: &AtomicBool, place: &Place) {
+     let until = Instant::now() + DIALOG_WAIT;
+     while running.load(Ordering::Relaxed) && Instant::now() < until {
+         std::thread::sleep(DIALOG_POLL);
+-        let Some(screen) = crate::keys::visible_lines() else {
++        let Some(screen) = place.lines() else {
+             return;
+         };
+         match channels_dialog(&screen) {
+             Some(true) => {
+-                crate::keys::write_text("\r");
++                place.enter();
+                 return;
+             }
+             Some(false) => {
+-                eprintln!("cctg run: the channels dialog has another option selected; left to you");
++                place.say("cctg run: the channels dialog has another option selected; left to you");
+                 return;
+             }
+             None => {}
+diff --git a/crates/cctg/src/shim.rs b/crates/cctg/src/shim.rs
+--- a/crates/cctg/src/shim.rs
++++ b/crates/cctg/src/shim.rs
+@@ -396,9 +396,8 @@
+         assert!(left.is_empty(), "the link goes with the shim: {left:?}");
+     }
+ 
+-    // Needs a process source (`proctree::ancestors`); macOS has none yet
+-    // (TASK-044) and keeps every link.
+-    #[cfg(any(windows, target_os = "linux"))]
++    // Needs a process source (`proctree::ancestors`).
++    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+     #[test]
+     fn only_links_of_shims_that_are_gone_are_removed() {
+         let dir = TempDir::new("shim-links");
+diff --git a/crates/cctg/src/term.rs b/crates/cctg/src/term.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/src/term.rs
+@@ -0,0 +1,639 @@
++//! The terminal `cctg run` keeps for its claude on Linux and macOS
++//! (TASK-044), and the agent's way into it.
++//!
++//! On Windows the agent reaches its claude's console itself
++//! ([`crate::keys`]). A Unix terminal has no such door, so `cctg run`, when
++//! both its stdin and stdout are terminals, starts claude in a
++//! pseudo-terminal of its own ([`Host`]): the user's terminal goes to raw
++//! mode and bytes are relayed both ways unchanged (Ctrl+C, Ctrl+Z and every
++//! other key reach claude as bytes), the window size follows the user's
++//! terminal, and a copy of the screen is kept with a terminal emulator
++//! ([`Screen`]). A socket `<state>/run/<cctg run pid>.sock` in a 0700
++//! directory takes one [`Ask`] per connection: the visible rows, or text
++//! written into claude's input. That is all `cctg run` knows: what the
++//! screen shows is judged by the agent ([`crate::keys`]).
++//!
++//! The ask format is frozen: `cctg run` is not updated while it runs, the
++//! agent is, so every later agent has to speak it.
++
++use std::io::{BufRead, BufReader, Read, Write};
++use std::path::{Path, PathBuf};
++use std::sync::Mutex;
++
++use serde::{Deserialize, Serialize};
++
++/// Longest ask line, in bytes (200 typed characters, JSON-escaped, fit).
++pub const MAX_ASK: usize = 4096;
++
++/// One ask of the agent: `"screen"` or `{"keys":"<text>"}`. The answer is
++/// one JSON line: the rows (`null` when there is no copy) or whether the
++/// bytes were written.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum Ask {
++    Screen,
++    Keys(String),
++}
++
++/// `<state>/run/<run_pid>.sock`.
++pub fn socket_path(state_dir: &Path, run_pid: u32) -> PathBuf {
++    state_dir.join("run").join(format!("{run_pid}.sock"))
++}
++
++/// The screen copy: a terminal emulator fed with everything claude writes.
++pub struct Screen {
++    /// `None` after the emulator panicked on some output: no copy anymore,
++    /// the relay goes on.
++    parser: Option<vt100::Parser>,
++}
++
++impl Screen {
++    pub fn new(rows: u16, cols: u16) -> Self {
++        Self {
++            parser: Some(vt100::Parser::new(rows.max(1), cols.max(1), 0)),
++        }
++    }
++
++    pub fn feed(&mut self, bytes: &[u8]) {
++        let Some(parser) = self.parser.as_mut() else {
++            return;
++        };
++        let fed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes)));
++        if fed.is_err() {
++            self.parser = None;
++        }
++    }
++
++    pub fn resize(&mut self, rows: u16, cols: u16) {
++        if let Some(parser) = self.parser.as_mut() {
++            parser.screen_mut().set_size(rows.max(1), cols.max(1));
++        }
++    }
++
++    /// The visible rows, right trimmed, like the Windows console read.
++    pub fn lines(&self) -> Option<Vec<String>> {
++        let screen = self.parser.as_ref()?.screen();
++        let (_, cols) = screen.size();
++        Some(
++            screen
++                .rows(0, cols)
++                .map(|row| row.trim_end().to_owned())
++                .collect(),
++        )
++    }
++}
++
++/// Answers one [`Ask`] read from `stream`: rows from `screen`, keys through
++/// `write`. A line that is too long or no ask gets no answer.
++pub fn answer<S: Read + Write>(
++    mut stream: S,
++    screen: &Mutex<Screen>,
++    write: &dyn Fn(&[u8]) -> bool,
++) -> std::io::Result<()> {
++    let mut line = Vec::new();
++    BufReader::new((&mut stream).take(MAX_ASK as u64 + 1)).read_until(b'\n', &mut line)?;
++    if line.len() > MAX_ASK {
++        return Ok(());
++    }
++    let Ok(ask) = serde_json::from_slice::<Ask>(&line) else {
++        return Ok(());
++    };
++    let mut reply = match ask {
++        Ask::Screen => {
++            let lines = screen
++                .lock()
++                .unwrap_or_else(|poisoned| poisoned.into_inner())
++                .lines();
++            serde_json::to_vec(&lines)?
++        }
++        Ask::Keys(text) => serde_json::to_vec(&write(text.as_bytes()))?,
++    };
++    reply.push(b'\n');
++    stream.write_all(&reply)?;
++    stream.flush()
++}
++
++/// The visible rows of the `cctg run` terminal behind `socket`; `None`
++/// when it does not answer.
++pub fn screen(socket: &Path) -> Option<Vec<String>> {
++    serde_json::from_slice::<Option<Vec<String>>>(&ask(socket, &Ask::Screen)?)
++        .ok()
++        .flatten()
++}
++
++/// Writes `text` into the input of the claude behind `socket`.
++pub fn keys(socket: &Path, text: &str) -> bool {
++    ask(socket, &Ask::Keys(text.to_owned()))
++        .and_then(|reply| serde_json::from_slice::<bool>(&reply).ok())
++        .unwrap_or(false)
++}
++
++#[cfg(unix)]
++fn ask(socket: &Path, ask: &Ask) -> Option<Vec<u8>> {
++    use std::os::unix::net::UnixStream;
++    const WAIT: std::time::Duration = std::time::Duration::from_secs(2);
++
++    let mut stream = UnixStream::connect(socket).ok()?;
++    stream.set_read_timeout(Some(WAIT)).ok()?;
++    stream.set_write_timeout(Some(WAIT)).ok()?;
++    let mut line = serde_json::to_vec(ask).ok()?;
++    line.push(b'\n');
++    stream.write_all(&line).ok()?;
++    let mut reply = Vec::new();
++    BufReader::new(stream.take(1 << 20))
++        .read_until(b'\n', &mut reply)
++        .ok()?;
++    Some(reply)
++}
++
++#[cfg(not(unix))]
++fn ask(_socket: &Path, _ask: &Ask) -> Option<Vec<u8>> {
++    None
++}
++
++#[cfg(unix)]
++pub use host::Host;
++
++#[cfg(unix)]
++mod host {
++    use std::fs::File;
++    use std::io::{Read, Write};
++    use std::os::fd::{AsRawFd, FromRawFd};
++    use std::os::unix::process::CommandExt;
++    use std::path::{Path, PathBuf};
++    use std::process::Command;
++    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
++    use std::sync::{Arc, Mutex};
++
++    use super::Screen;
++
++    /// The terminal side of one `cctg run`, shared by its threads. Every
++    /// claude gets a pseudo-terminal of its own as its controlling terminal:
++    /// macOS revokes a controlling terminal when its session leader exits,
++    /// so one cannot serve the next claude.
++    pub struct Host {
++        /// The master of the current claude's pseudo-terminal: keys go in
++        /// here (the user's, the agent's, the channels dialog's Enter), one
++        /// write at a time.
++        master: Mutex<Option<File>>,
++        /// One copy for every claude of this run, like a console that keeps
++        /// the frame of the claude that exited.
++        screen: Arc<Mutex<Screen>>,
++        /// The claude running now (its process group), 0 between runs.
++        claude: AtomicI32,
++        /// SIGTERM or SIGHUP came: no restart.
++        stopping: AtomicBool,
++        /// The user's terminal mode before raw mode.
++        saved: libc::termios,
++        /// The socket, once bound.
++        socket: Mutex<Option<PathBuf>>,
++    }
++
++    fn window_size(fd: i32) -> libc::winsize {
++        let mut size = libc::winsize {
++            ws_row: 0,
++            ws_col: 0,
++            ws_xpixel: 0,
++            ws_ypixel: 0,
++        };
++        // SAFETY: a live winsize for the ioctl to fill.
++        let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut size as *mut libc::winsize) };
++        if ok != 0 || size.ws_row == 0 || size.ws_col == 0 {
++            size.ws_row = 24;
++            size.ws_col = 80;
++        }
++        size
++    }
++
++    fn close_on_exec(fd: i32) {
++        // SAFETY: plain fcntl on a descriptor this process owns.
++        unsafe {
++            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
++        }
++    }
++
++    impl Host {
++        /// The user's terminal in raw mode, its keys relayed, the socket
++        /// served. `None` unless stdin and stdout are terminals.
++        /// [`Host::finish`] undoes it.
++        pub fn start(socket: Option<PathBuf>) -> Option<Arc<Host>> {
++            // SAFETY: isatty takes any descriptor.
++            if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
++                return None;
++            }
++            // SAFETY: zeroed termios is valid plain data; tcgetattr fills it.
++            let mut saved: libc::termios = unsafe { std::mem::zeroed() };
++            if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
++                return None;
++            }
++            let size = window_size(0);
++            let host = Arc::new(Host {
++                master: Mutex::new(None),
++                screen: Arc::new(Mutex::new(Screen::new(size.ws_row, size.ws_col))),
++                claude: AtomicI32::new(0),
++                stopping: AtomicBool::new(false),
++                saved,
++                socket: Mutex::new(None),
++            });
++            if let Some(path) = socket
++                && host.serve(&path)
++            {
++                *host.socket.lock().unwrap_or_else(|p| p.into_inner()) = Some(path);
++            }
++            host.raw();
++            std::thread::spawn({
++                let host = host.clone();
++                move || relay_input(&host)
++            });
++            Some(host)
++        }
++
++        /// Back to the terminal mode `cctg run` found.
++        fn restore(&self) {
++            // SAFETY: fd 0 and a termios read from it.
++            unsafe {
++                libc::tcsetattr(0, libc::TCSANOW, &self.saved);
++            }
++        }
++
++        /// Raw mode: every key goes to claude as it is typed.
++        fn raw(&self) {
++            let mut raw = self.saved;
++            // SAFETY: a live termios copy; fd 0.
++            unsafe {
++                libc::cfmakeraw(&mut raw);
++                libc::tcsetattr(0, libc::TCSANOW, &raw);
++            }
++        }
++
++        /// When `cctg run` ends: claude's last output gets a moment to reach
++        /// the terminal, then the terminal mode is restored and the socket
++        /// removed.
++        pub fn finish(&self) {
++            std::thread::sleep(std::time::Duration::from_millis(100));
++            self.restore();
++            if let Some(socket) = self.socket.lock().unwrap_or_else(|p| p.into_inner()).take() {
++                let _ = std::fs::remove_file(socket);
++            }
++        }
++
++        /// Writes `bytes` into the current claude's input.
++        pub fn write(&self, bytes: &[u8]) -> bool {
++            let mut master = self.master.lock().unwrap_or_else(|p| p.into_inner());
++            master
++                .as_mut()
++                .is_some_and(|master| master.write_all(bytes).is_ok())
++        }
++
++        pub fn lines(&self) -> Option<Vec<String>> {
++            self.screen
++                .lock()
++                .unwrap_or_else(|p| p.into_inner())
++                .lines()
++        }
++
++        /// The pseudo-terminal takes the user's window size (the kernel
++        /// tells claude with SIGWINCH).
++        pub fn sync_size(&self) {
++            let size = window_size(0);
++            if let Some(master) = self
++                .master
++                .lock()
++                .unwrap_or_else(|p| p.into_inner())
++                .as_ref()
++            {
++                // SAFETY: a live winsize; the master descriptor is open.
++                unsafe {
++                    libc::ioctl(
++                        master.as_raw_fd(),
++                        libc::TIOCSWINSZ as _,
++                        &size as *const libc::winsize,
++                    );
++                }
++            }
++            self.screen
++                .lock()
++                .unwrap_or_else(|p| p.into_inner())
++                .resize(size.ws_row, size.ws_col);
++        }
++
++        /// `program` in a new pseudo-terminal of the user's terminal mode
++        /// and size: its stdin, stdout, stderr and controlling terminal, in
++        /// a session of its own. Its output is relayed from now on.
++        pub fn command(&self, program: &std::ffi::OsStr) -> std::io::Result<Command> {
++            let mut modes = self.saved;
++            let mut size = window_size(0);
++            let (mut master, mut slave) = (-1, -1);
++            // SAFETY: out pointers to live locals; the pseudo-terminal
++            // starts with the user's terminal mode and size, as `script`'s.
++            let opened = unsafe {
++                libc::openpty(
++                    &mut master,
++                    &mut slave,
++                    std::ptr::null_mut(),
++                    &raw mut modes,
++                    &raw mut size,
++                )
++            };
++            if opened != 0 {
++                return Err(std::io::Error::last_os_error());
++            }
++            // Neither end may leak into claude's children: a leaked master
++            // keeps the terminal open after `cctg run` is gone.
++            close_on_exec(master);
++            close_on_exec(slave);
++            // SAFETY: openpty returned two fresh descriptors owned here.
++            let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
++            let reader = master.try_clone()?;
++            let mut command = Command::new(program);
++            command
++                .stdin(slave.try_clone()?)
++                .stdout(slave.try_clone()?)
++                .stderr(slave);
++            // SAFETY: only async-signal-safe calls between fork and exec.
++            unsafe {
++                command.pre_exec(|| {
++                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
++                        return Err(std::io::Error::last_os_error());
++                    }
++                    Ok(())
++                });
++            }
++            self.screen
++                .lock()
++                .unwrap_or_else(|p| p.into_inner())
++                .resize(size.ws_row, size.ws_col);
++            *self.master.lock().unwrap_or_else(|p| p.into_inner()) = Some(master);
++            std::thread::spawn({
++                let screen = self.screen.clone();
++                move || relay_output(reader, &screen)
++            });
++            Ok(command)
++        }
++
++        /// Waits for claude `pid` to exit; its exit code (128 + signal when
++        /// a signal ended it). When claude stops itself (Ctrl+Z: Claude Code
++        /// sends itself SIGSTOP), this process stops the same way, the
++        /// user's terminal back in its own mode, and both go on together
++        /// after `fg`. SIGSTOP, not SIGTSTP: claude's process group has no
++        /// parent in its session, so the kernel would drop a SIGTSTP.
++        pub fn wait(&self, pid: u32) -> i32 {
++            let pid = pid as libc::pid_t;
++            self.claude.store(pid, Ordering::SeqCst);
++            if self.stopping() {
++                // SIGTERM or SIGHUP came while this claude was being
++                // started: [`Host::hang_up`] found no claude to tell.
++                // SAFETY: a signal to claude's own process group.
++                unsafe {
++                    libc::kill(-pid, libc::SIGHUP);
++                }
++            }
++            let code = loop {
++                let mut status = 0;
++                // SAFETY: waits for this process's own child.
++                if unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) } == -1 {
++                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
++                        continue;
++                    }
++                    break 1;
++                }
++                if libc::WIFEXITED(status) {
++                    break libc::WEXITSTATUS(status);
++                }
++                if libc::WIFSIGNALED(status) {
++                    break 128 + libc::WTERMSIG(status);
++                }
++                if libc::WIFSTOPPED(status) {
++                    // What claude wrote before it stopped (its terminal
++                    // modes undone, the "suspended" line) reaches the
++                    // terminal before the shell takes it back.
++                    std::thread::sleep(std::time::Duration::from_millis(100));
++                    self.restore();
++                    // SAFETY: a signal to this process.
++                    unsafe {
++                        libc::kill(libc::getpid(), libc::SIGSTOP);
++                    }
++                    self.raw();
++                    self.sync_size();
++                    // SAFETY: a signal to claude's own process group.
++                    unsafe {
++                        libc::kill(-pid, libc::SIGCONT);
++                    }
++                }
++            };
++            self.claude.store(0, Ordering::SeqCst);
++            code
++        }
++
++        /// SIGTERM or SIGHUP for `cctg run`: claude gets SIGHUP, as when its
++        /// terminal closes, and is not started again.
++        pub fn hang_up(&self) {
++            self.stopping.store(true, Ordering::SeqCst);
++            let pid = self.claude.load(Ordering::SeqCst);
++            if pid > 0 {
++                // SAFETY: a signal to claude's own process group.
++                unsafe {
++                    libc::kill(-pid, libc::SIGHUP);
++                }
++            }
++        }
++
++        pub fn stopping(&self) -> bool {
++            self.stopping.load(Ordering::SeqCst)
++        }
++
++        /// Binds the socket (directory 0700, socket 0600) and answers asks
++        /// on a thread; `false` when it cannot be bound.
++        fn serve(self: &Arc<Self>, path: &Path) -> bool {
++            use std::os::unix::fs::PermissionsExt;
++            use std::os::unix::net::UnixListener;
++
++            let Some(dir) = path.parent() else {
++                return false;
++            };
++            if std::fs::create_dir_all(dir).is_err()
++                || std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err()
++            {
++                return false;
++            }
++            let _ = std::fs::remove_file(path);
++            let listener = match UnixListener::bind(path) {
++                Ok(listener) => listener,
++                Err(error) => {
++                    eprintln!("cctg run: no terminal socket for cctg: {error}");
++                    return false;
++                }
++            };
++            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
++            let host = self.clone();
++            std::thread::spawn(move || {
++                for stream in listener.incoming() {
++                    // A failing accept (no descriptors left) is retried
++                    // later, not in a busy loop.
++                    let Ok(stream) = stream else {
++                        std::thread::sleep(std::time::Duration::from_millis(100));
++                        continue;
++                    };
++                    let wait = Some(std::time::Duration::from_secs(2));
++                    let _ = stream.set_read_timeout(wait);
++                    let _ = stream.set_write_timeout(wait);
++                    let _ = super::answer(stream, &host.screen, &|bytes| host.write(bytes));
++                }
++            });
++            true
++        }
++    }
++
++    /// One claude's output to the user's terminal and into the screen copy,
++    /// until its pseudo-terminal has no process left (EOF on macOS, EIO on
++    /// Linux).
++    fn relay_output(mut master: File, screen: &Mutex<Screen>) {
++        let mut buf = [0u8; 8192];
++        let mut out = std::io::stdout();
++        loop {
++            let n = match master.read(&mut buf) {
++                Ok(0) => return,
++                Ok(n) => n,
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
++                Err(_) => return,
++            };
++            let _ = out.write_all(&buf[..n]);
++            let _ = out.flush();
++            screen
++                .lock()
++                .unwrap_or_else(|p| p.into_inner())
++                .feed(&buf[..n]);
++        }
++    }
++
++    /// The user's keys to the current claude, as they come.
++    fn relay_input(host: &Host) {
++        let mut buf = [0u8; 4096];
++        let mut input = std::io::stdin();
++        loop {
++            match input.read(&mut buf) {
++                Ok(0) => return,
++                Ok(n) => {
++                    host.write(&buf[..n]);
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
++                Err(_) => return,
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// One ask in, the answer out, in memory.
++    struct Duplex {
++        input: std::io::Cursor<Vec<u8>>,
++        output: Vec<u8>,
++    }
++
++    impl Read for Duplex {
++        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
++            self.input.read(buf)
++        }
++    }
++
++    impl Write for Duplex {
++        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++            self.output.write(buf)
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn ask(line: &[u8], screen: &Mutex<Screen>, written: &Mutex<Vec<u8>>) -> String {
++        let mut duplex = Duplex {
++            input: std::io::Cursor::new(line.to_vec()),
++            output: Vec::new(),
++        };
++        answer(&mut duplex, screen, &|bytes| {
++            written.lock().unwrap().extend_from_slice(bytes);
++            true
++        })
++        .unwrap();
++        String::from_utf8(duplex.output).unwrap()
++    }
++
++    #[test]
++    fn the_ask_format_is_frozen() {
++        assert_eq!(serde_json::to_string(&Ask::Screen).unwrap(), r#""screen""#);
++        assert_eq!(
++            serde_json::to_string(&Ask::Keys("\u{1b}".into())).unwrap(),
++            r#"{"keys":"\u001b"}"#
++        );
++    }
++
++    #[test]
++    fn asks_are_answered_one_line_each() {
++        let screen = Mutex::new(Screen::new(4, 20));
++        screen.lock().unwrap().feed("❯\u{a0}/cost\r\n".as_bytes());
++        let written = Mutex::new(Vec::new());
++        assert_eq!(
++            ask(b"\"screen\"\n", &screen, &written),
++            "[\"❯\u{a0}/cost\",\"\",\"\",\"\"]\n"
++        );
++        assert_eq!(ask(br#"{"keys":"/x\r"}"#, &screen, &written), "true\n");
++        assert_eq!(written.lock().unwrap().as_slice(), b"/x\r");
++        // Garbage and overlong asks get nothing, nothing is written.
++        for bad in [&b"\"typo\"\n"[..], &b"{}"[..], &b""[..]] {
++            assert_eq!(ask(bad, &screen, &written), "", "{bad:?}");
++        }
++        let long = format!("{{\"keys\":\"{}\"}}\n", "x".repeat(MAX_ASK));
++        assert_eq!(ask(long.as_bytes(), &screen, &written), "");
++        assert_eq!(written.lock().unwrap().len(), 3);
++    }
++
++    #[test]
++    fn the_copy_follows_redraws_like_the_terminal() {
++        let mut screen = Screen::new(5, 40);
++        // An Ink-like frame, then a redraw of the box in place: cursor up
++        // a line, erase it, new content.
++        screen
++            .feed("hello\r\n────────────────────\r\n❯\u{a0}dra\r\n────────────────────".as_bytes());
++        screen.feed("\x1b[1A\r\x1b[2K❯\u{a0}/cost\x1b[1B\r".as_bytes());
++        let lines = screen.lines().unwrap();
++        assert_eq!(
++            lines,
++            [
++                "hello",
++                "────────────────────",
++                "❯\u{a0}/cost",
++                "────────────────────",
++                ""
++            ]
++        );
++        let found = crate::keys::input_box(&lines).unwrap();
++        assert!(crate::keys::box_shows(&found, "/cost"));
++        // Wide characters and a resize keep working.
++        screen.feed("\x1b[5;1H日本".as_bytes());
++        screen.resize(6, 30);
++        assert_eq!(screen.lines().unwrap()[4], "日本");
++        assert_eq!(screen.lines().unwrap().len(), 6);
++    }
++
++    #[test]
++    fn the_copy_can_be_shared_by_the_relay_threads() {
++        fn shared<T: Send + Sync>() {}
++        shared::<Mutex<Screen>>();
++    }
++
++    #[test]
++    fn the_socket_is_named_after_the_run() {
++        assert!(socket_path(Path::new("/s"), 42).ends_with("run/42.sock"));
++    }
++
++    #[cfg(not(unix))]
++    #[test]
++    fn without_unix_sockets_nothing_answers() {
++        let path = Path::new("nowhere.sock");
++        assert_eq!(screen(path), None);
++        assert!(!keys(path, "x"));
++    }
++}
+diff --git a/crates/cctg/src/update.rs b/crates/cctg/src/update.rs
+--- a/crates/cctg/src/update.rs
++++ b/crates/cctg/src/update.rs
+@@ -78,8 +78,8 @@
+     pub run_pid: Option<u32>,
+     pub run_args: Vec<String>,
+     pub state_dir: Option<PathBuf>,
+-    /// This build can type into the claude console.
+-    pub keys: bool,
++    /// Where the worker types into claude ([`keys::Target`]), if anywhere.
++    pub console: Option<keys::Target>,
+ }
+ 
+ /// What an `update` leads to.
+@@ -99,7 +99,7 @@
+         var: impl Fn(&str) -> Option<String>,
+         claude_pid: Option<u32>,
+         state_dir: Option<PathBuf>,
+-        keys: bool,
++        console: Option<keys::Target>,
+     ) -> Self {
+         let number = |name: &str| var(name).and_then(|value| value.trim().parse::<u64>().ok());
+         let small = |name: &str| number(name).and_then(|value| u32::try_from(value).ok());
+@@ -115,7 +115,7 @@
+                 .and_then(|json| serde_json::from_str(&json).ok())
+                 .unwrap_or_default(),
+             state_dir,
+-            keys,
++            console,
+         }
+     }
+ 
+@@ -126,7 +126,10 @@
+ 
+     /// `cctg run` can start its claude again.
+     pub fn restartable(&self) -> bool {
+-        self.run_pid.is_some() && self.keys && self.claude_pid.is_some() && self.state_dir.is_some()
++        self.run_pid.is_some()
++            && self.console.is_some()
++            && self.claude_pid.is_some()
++            && self.state_dir.is_some()
+     }
+ 
+     /// Decides; blocking (hashes the executable, looks at config files). A
+@@ -158,14 +161,14 @@
+     /// The claude console shows the agent view or a working background
+     /// agent ([`keys::agents_on_screen`], TASK-047): no restart now. Blocking.
+     pub fn agents_on_screen(&self) -> bool {
+-        self.keys && self.claude_pid.is_some_and(keys::agents_on_screen)
++        self.console.as_ref().is_some_and(keys::agents_on_screen)
+     }
+ 
+     /// Writes the request for `cctg run` and types `/exit`. The request is
+     /// removed again when `/exit` was not sent.
+     pub fn restart(&self, session_id: &str) -> Typed {
+-        let (Some(state), Some(run_pid), Some(claude_pid)) =
+-            (&self.state_dir, self.run_pid, self.claude_pid)
++        let (Some(state), Some(run_pid), Some(console)) =
++            (&self.state_dir, self.run_pid, &self.console)
+         else {
+             return Typed::Failed;
+         };
+@@ -179,7 +182,7 @@
+         if write_request(&path, &request).is_err() {
+             return Typed::Failed;
+         }
+-        let typed = keys::type_exit(claude_pid);
++        let typed = keys::type_exit(console);
+         if typed != Typed::Sent {
+             let _ = std::fs::remove_file(&path);
+         }
+@@ -427,7 +430,7 @@
+             build: Some(client::build_of(exe).unwrap()),
+             claude_pid: Some(1),
+             state_dir: Some(dir.to_owned()),
+-            keys: true,
++            console: Some(keys::Target::Console(1)),
+             ..Worker::default()
+         }
+     }
+@@ -590,7 +593,12 @@
+             "CCTG_RUN_ARGS" => Some(r#"["--settings","s.json"]"#.to_owned()),
+             _ => None,
+         };
+-        let w = Worker::from_env(env, Some(9), Some(PathBuf::from("/state")), true);
++        let w = Worker::from_env(
++            env,
++            Some(9),
++            Some(PathBuf::from("/state")),
++            Some(keys::Target::Console(9)),
++        );
+         assert!(w.resumed);
+         assert_eq!(w.shim, Some(1));
+         assert_eq!(w.shim_started, Some(1_700_000_000));
+@@ -598,7 +606,7 @@
+         assert_eq!(w.run_args, ["--settings", "s.json"]);
+         assert!(w.restartable());
+         assert!(!w.self_update(), "no build yet");
+-        let bare = Worker::from_env(|_| None, Some(9), None, true);
++        let bare = Worker::from_env(|_| None, Some(9), None, Some(keys::Target::Console(9)));
+         assert!(!bare.resumed && bare.shim.is_none() && !bare.restartable());
+     }
+ 
+@@ -627,6 +635,6 @@
+         };
+         w.withdraw_request();
+         assert!(!path.exists());
+-        assert_eq!(w.restart("5e55"), Typed::Failed, "no claude pid");
+-    }
+-}
++        assert_eq!(w.restart("5e55"), Typed::Failed, "no terminal");
++    }
++}
+diff --git a/crates/cctg/tests/reap_e2e.rs b/crates/cctg/tests/reap_e2e.rs
+--- a/crates/cctg/tests/reap_e2e.rs
++++ b/crates/cctg/tests/reap_e2e.rs
+@@ -4,7 +4,7 @@
+ //! real process named `claude(.exe)` that was killed, the live one is still
+ //! running.
+ 
+-#![cfg(any(windows, target_os = "linux"))]
++#![cfg(any(windows, target_os = "linux", target_os = "macos"))]
+ 
+ use std::io::Write;
+ use std::net::{Ipv4Addr, SocketAddr};
+diff --git a/crates/cctg/tests/run_pty_e2e.rs b/crates/cctg/tests/run_pty_e2e.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/cctg/tests/run_pty_e2e.rs
+@@ -0,0 +1,551 @@
++//! `cctg run` in a terminal on Linux and macOS (TASK-044), with real
++//! processes. This test binary is the user's terminal (a pseudo-terminal it
++//! opens, `cctg run` its session leader) and the claude stand-in
++//! (`RUN_PTY_ROLE=claude`) that `cctg run` starts in its own
++//! pseudo-terminal. The stand-in draws the development channels dialog and
++//! then an input box that echoes keys; `/cost` opens a panel, `/view` the
++//! agent view, `/busy` makes `/exit` open the background-work dialog, Esc
++//! closes any of them, Ctrl+Z stops it with SIGSTOP as Claude Code does,
++//! `/exit` ends it (code 7 once resumed). The test drives it the way the
++//! agent does, through `cctg::keys` on the `cctg run` socket, and the way
++//! the user does, through its terminal. No window, temp home and state.
++
++#[cfg(unix)]
++mod common;
++
++fn main() {
++    #[cfg(unix)]
++    {
++        if std::env::var("RUN_PTY_ROLE").as_deref() == Ok("claude") {
++            unix::fake_claude();
++        }
++        if std::env::args().any(|arg| arg == "--list") {
++            println!("run_pty_e2e: test");
++            return;
++        }
++        unix::scenario();
++        println!("run_pty_e2e: ok");
++    }
++    #[cfg(not(unix))]
++    println!("run_pty_e2e: Linux and macOS only");
++}
++
++#[cfg(unix)]
++mod unix {
++    use std::fs::File;
++    use std::io::{Read, Write};
++    use std::os::fd::{AsRawFd, FromRawFd};
++    use std::os::unix::process::CommandExt;
++    use std::path::PathBuf;
++    use std::process::Stdio;
++    use std::sync::{Arc, Mutex};
++    use std::time::{Duration, Instant};
++
++    use cctg::keys::{self, Target, Typed};
++    use cctg::update::Worker;
++    use cctg::wire::ConsoleKey;
++    use serde_json::{Value, json};
++
++    const SESSION: &str = "5e550000-0000-4000-8000-000000000pty";
++    const RULE: &str = "────────────────────────────────────────";
++    const WAIT: Duration = Duration::from_secs(20);
++    const SUSPENDED: &str = "fake claude suspended; fg to resume";
++
++    fn log(event: Value) {
++        let mut file = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(std::env::var("RUN_PTY_LOG").unwrap())
++            .unwrap();
++        writeln!(file, "{event}").unwrap();
++    }
++
++    fn size_of(fd: i32) -> (u16, u16) {
++        let mut size = libc::winsize {
++            ws_row: 0,
++            ws_col: 0,
++            ws_xpixel: 0,
++            ws_ypixel: 0,
++        };
++        unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut size as *mut libc::winsize) };
++        (size.ws_row, size.ws_col)
++    }
++
++    fn draw(lines: &[String]) {
++        let mut out = std::io::stdout();
++        write!(out, "\x1b[H\x1b[2J{}", lines.join("\r\n")).unwrap();
++        out.flush().unwrap();
++    }
++
++    /// The claude stand-in.
++    pub fn fake_claude() -> ! {
++        let args: Vec<String> = std::env::args().skip(1).collect();
++        let resumed = args.iter().any(|arg| arg == "--resume");
++        let mut modes: libc::termios = unsafe { std::mem::zeroed() };
++        unsafe {
++            libc::tcgetattr(0, &mut modes);
++            libc::cfmakeraw(&mut modes);
++            libc::tcsetattr(0, libc::TCSANOW, &modes);
++        }
++        log(json!({
++            "start": args,
++            "run": std::env::var("CCTG_RUN").unwrap_or_default(),
++            "size": size_of(0),
++        }));
++        draw(
++            &[
++                " WARNING: Loading development channels",
++                "",
++                "  Channels: server:cctg",
++                "",
++                "  \u{276f} 1. I am using this for local development",
++                "    2. Exit",
++                "",
++                "  Enter to confirm \u{b7} Esc to cancel",
++            ]
++            .map(str::to_owned),
++        );
++        let mut stdin = std::io::stdin();
++        let mut buf = [0u8; 1024];
++        loop {
++            let n = stdin.read(&mut buf).unwrap();
++            if n == 0 {
++                std::process::exit(1);
++            }
++            if buf[..n].contains(&b'\r') {
++                break;
++            }
++        }
++        log(json!({ "dialog": true }));
++        let (mut input, mut panel, mut view, mut busy, mut dialog) =
++            (String::new(), false, false, false, false);
++        let mut size = size_of(0);
++        loop {
++            let mut lines = vec!["\u{25cf} ready".to_owned()];
++            if panel {
++                lines.push("\u{2594}".repeat(40));
++                lines.push("   Session".into());
++                lines.push("   Total cost: $0".into());
++            } else if dialog {
++                lines.push("\u{2594}".repeat(40));
++                lines.push("   Background work is running".into());
++                lines.push("   \u{276f} 1. Exit and stop tasks".into());
++                lines.push("     3. Stay".into());
++            } else {
++                let shown = if view && input.is_empty() {
++                    "Message @qa\u{2026}".to_owned()
++                } else {
++                    input.clone()
++                };
++                lines.push(RULE.into());
++                lines.push(format!("\u{276f}\u{a0}{shown}"));
++                lines.push(RULE.into());
++            }
++            draw(&lines);
++            log(json!({ "drawn": input }));
++            let n = stdin.read(&mut buf).unwrap();
++            if n == 0 {
++                std::process::exit(1);
++            }
++            if size_of(0) != size {
++                size = size_of(0);
++                log(json!({ "size": size }));
++            }
++            for c in String::from_utf8_lossy(&buf[..n]).chars() {
++                match c {
++                    '\r' => {
++                        let line = std::mem::take(&mut input);
++                        log(json!({ "submit": line }));
++                        match line.as_str() {
++                            "/cost" => panel = true,
++                            "/view" => view = true,
++                            "/busy" => busy = true,
++                            "/idle" => busy = false,
++                            "/exit" if busy => dialog = true,
++                            "/exit" => {
++                                log(json!({ "exit": true }));
++                                std::process::exit(if resumed { 7 } else { 0 });
++                            }
++                            _ => {}
++                        }
++                    }
++                    '\u{7f}' => {
++                        input.pop();
++                    }
++                    '\u{1b}' => {
++                        log(json!({ "esc": true }));
++                        (panel, view, dialog) = (false, false, false);
++                    }
++                    '\u{3}' => log(json!({ "ctrl_c": true })),
++                    '\u{1a}' => {
++                        log(json!({ "suspend": true }));
++                        // Like Claude Code: a last line, then SIGSTOP.
++                        print!("{SUSPENDED}\r\n");
++                        std::io::stdout().flush().unwrap();
++                        unsafe { libc::kill(libc::getpid(), libc::SIGSTOP) };
++                        log(json!({ "resumed": true }));
++                    }
++                    c => input.push(c),
++                }
++            }
++        }
++    }
++
++    /// The user's side: the terminal `cctg run` runs in.
++    struct Terminal {
++        master: File,
++        slave: File,
++        output: Arc<Mutex<Vec<u8>>>,
++    }
++
++    impl Terminal {
++        fn open() -> Self {
++            let (mut master, mut slave) = (-1, -1);
++            let mut size = libc::winsize {
++                ws_row: 30,
++                ws_col: 100,
++                ws_xpixel: 0,
++                ws_ypixel: 0,
++            };
++            let opened = unsafe {
++                libc::openpty(
++                    &mut master,
++                    &mut slave,
++                    std::ptr::null_mut(),
++                    std::ptr::null_mut::<libc::termios>(),
++                    &raw mut size,
++                )
++            };
++            assert_eq!(opened, 0, "openpty");
++            let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
++            // Someone has to read the terminal, or `cctg run` blocks on it.
++            let output = Arc::new(Mutex::new(Vec::new()));
++            let mut reader = master.try_clone().unwrap();
++            let sink = output.clone();
++            std::thread::spawn(move || {
++                let mut buf = [0u8; 8192];
++                while let Ok(n) = reader.read(&mut buf) {
++                    if n == 0 {
++                        break;
++                    }
++                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
++                }
++            });
++            Self {
++                master,
++                slave,
++                output,
++            }
++        }
++
++        fn type_keys(&self, bytes: &[u8]) {
++            (&self.master).write_all(bytes).unwrap();
++        }
++
++        /// Raw mode is on (no line editing, no echo).
++        fn raw(&self) -> bool {
++            let mut modes: libc::termios = unsafe { std::mem::zeroed() };
++            assert_eq!(
++                unsafe { libc::tcgetattr(self.slave.as_raw_fd(), &mut modes) },
++                0
++            );
++            modes.c_lflag & (libc::ICANON | libc::ECHO) == 0
++        }
++
++        fn resize(&self, rows: u16, cols: u16) {
++            let size = libc::winsize {
++                ws_row: rows,
++                ws_col: cols,
++                ws_xpixel: 0,
++                ws_ypixel: 0,
++            };
++            let set = unsafe {
++                libc::ioctl(
++                    self.master.as_raw_fd(),
++                    libc::TIOCSWINSZ as _,
++                    &size as *const libc::winsize,
++                )
++            };
++            assert_eq!(set, 0);
++        }
++
++        fn tail(&self) -> String {
++            let output = self.output.lock().unwrap();
++            String::from_utf8_lossy(&output[output.len().saturating_sub(2000)..]).into_owned()
++        }
++    }
++
++    struct Scene {
++        log: PathBuf,
++        terminal: Terminal,
++        run: i32,
++    }
++
++    impl Scene {
++        fn events(&self) -> Vec<Value> {
++            std::fs::read_to_string(&self.log)
++                .unwrap_or_default()
++                .lines()
++                .filter_map(|line| serde_json::from_str(line).ok())
++                .collect()
++        }
++
++        fn count(&self, key: &str) -> usize {
++            self.events()
++                .iter()
++                .filter(|event| event.get(key).is_some())
++                .count()
++        }
++
++        /// Waits until `done` holds for the stand-in's log.
++        fn until(&self, what: &str, done: impl Fn(&[Value]) -> bool) {
++            let deadline = Instant::now() + WAIT;
++            while !done(&self.events()) {
++                assert!(
++                    Instant::now() < deadline,
++                    "{what}\nlog: {:?}\nterminal: {}",
++                    self.events(),
++                    self.terminal.tail()
++                );
++                std::thread::sleep(Duration::from_millis(50));
++            }
++        }
++
++        fn until_count(&self, key: &str, count: usize) {
++            self.until(key, |events| {
++                events
++                    .iter()
++                    .filter(|event| event.get(key).is_some())
++                    .count()
++                    >= count
++            });
++        }
++
++        fn until_screen(&self, target: &Target, what: &str, done: impl Fn(&[String]) -> bool) {
++            let Target::Run(socket) = target else {
++                unreachable!()
++            };
++            let deadline = Instant::now() + WAIT;
++            loop {
++                if cctg::term::screen(socket).is_some_and(|lines| done(&lines)) {
++                    return;
++                }
++                assert!(
++                    Instant::now() < deadline,
++                    "{what}\nterminal: {}",
++                    self.terminal.tail()
++                );
++                std::thread::sleep(Duration::from_millis(50));
++            }
++        }
++
++        /// The state of `cctg run`: `Some(code)` once it exited, `None`
++        /// while it runs; `stopped` when it is stopped now.
++        fn status(&self) -> (Option<i32>, bool) {
++            let mut status = 0;
++            let got =
++                unsafe { libc::waitpid(self.run, &mut status, libc::WNOHANG | libc::WUNTRACED) };
++            if got == 0 {
++                return (None, false);
++            }
++            assert_eq!(got, self.run);
++            if libc::WIFSTOPPED(status) {
++                return (None, true);
++            }
++            (Some(libc::WEXITSTATUS(status)), false)
++        }
++    }
++
++    fn box_is(lines: &[String], text: &str) -> bool {
++        keys::input_box(lines).is_some_and(|found| {
++            found.len() == 1 && found[0].trim_start_matches('\u{276f}').trim() == text
++        })
++    }
++
++    #[allow(
++        clippy::zombie_processes,
++        reason = "cctg run is reaped with waitpid, which also reports its stop"
++    )]
++    pub fn scenario() {
++        let root = std::env::temp_dir().join(format!("cctg-pty-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&root);
++        let (state, home) = (root.join("state"), root.join("home"));
++        std::fs::create_dir_all(&state).unwrap();
++        std::fs::create_dir_all(&home).unwrap();
++        let log = root.join("claude.log");
++        let terminal = Terminal::open();
++        let mut command = super::common::cctg(&home);
++        command
++            .args(["run", "--", "--first"])
++            .env("CCTG_CLAUDE", std::env::current_exe().unwrap())
++            .env("RUN_PTY_ROLE", "claude")
++            .env("RUN_PTY_LOG", &log)
++            .env("CCTG_STATE_DIR", &state)
++            .stdin(Stdio::from(terminal.slave.try_clone().unwrap()))
++            .stdout(Stdio::from(terminal.slave.try_clone().unwrap()))
++            .stderr(Stdio::from(terminal.slave.try_clone().unwrap()));
++        // The terminal is `cctg run`'s controlling terminal, as a shell's is.
++        unsafe {
++            command.pre_exec(|| {
++                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                Ok(())
++            });
++        }
++        let child = command.spawn().expect("cctg run starts");
++        let scene = Scene {
++            log: log.clone(),
++            terminal,
++            run: child.id() as i32,
++        };
++        let socket = cctg::term::socket_path(&state, child.id());
++        let target = Target::Run(socket.clone());
++
++        // The channels dialog is answered by `cctg run` itself.
++        scene.until_count("dialog", 1);
++        let events = scene.events();
++        let first = &events[0];
++        assert_eq!(first["start"], json!(["--first"]));
++        assert_eq!(first["run"], child.id().to_string(), "CCTG_RUN");
++        assert_eq!(
++            first["size"],
++            json!([30, 100]),
++            "claude gets the user's size"
++        );
++        assert!(scene.terminal.raw(), "the user's terminal is in raw mode");
++        scene.until_screen(&target, "the box", |lines| box_is(lines, ""));
++        let mode = std::fs::metadata(socket.parent().unwrap()).unwrap();
++        assert_eq!(
++            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o777,
++            0o700
++        );
++
++        // A panel command: typed, read, closed with Esc.
++        let (typed, panel) = keys::type_command(&target, "/cost");
++        assert_eq!(typed, Typed::Sent);
++        assert!(panel.is_some_and(|text| text.contains("Total cost: $0")));
++        scene.until_count("esc", 1);
++
++        // A draft of the user's: nothing is sent, the draft stays.
++        scene.terminal.type_keys(b"wip");
++        scene.until_screen(&target, "the draft", |lines| box_is(lines, "wip"));
++        assert_eq!(keys::type_line(&target, "/model x"), Typed::Draft);
++        scene.until_screen(&target, "the draft stays", |lines| box_is(lines, "wip"));
++        scene.terminal.type_keys(b"\x7f\x7f\x7f");
++        scene.until_screen(&target, "the box again", |lines| box_is(lines, ""));
++        assert!(
++            !scene
++                .events()
++                .iter()
++                .any(|event| event["submit"] == json!("/model x")),
++            "nothing sent over a draft"
++        );
++
++        // Esc from the topic (⏹), Ctrl+C from the keyboard: bytes for claude.
++        assert!(keys::press(&target, ConsoleKey::Interrupt));
++        scene.until_count("esc", 2);
++        scene.terminal.type_keys(b"\x03");
++        scene.until_count("ctrl_c", 1);
++        assert_eq!(
++            scene.status(),
++            (None, false),
++            "Ctrl+C does not end cctg run"
++        );
++
++        // The window size follows the user's terminal.
++        scene.terminal.resize(40, 120);
++        std::thread::sleep(Duration::from_millis(300));
++        scene.terminal.type_keys(b"z\x7f");
++        scene.until("the new size", |events| {
++            events.iter().any(|event| event["size"] == json!([40, 120]))
++        });
++        scene.until_screen(&target, "a copy of 40 rows", |lines| lines.len() == 40);
++
++        // TASK-047: the agent view blocks typing; `/exit` over background
++        // work opens a dialog, which is cancelled.
++        assert_eq!(keys::type_line(&target, "/view"), Typed::Sent);
++        scene.until_screen(&target, "the agent view", keys::agents_block);
++        assert!(keys::agents_on_screen(&target));
++        assert_eq!(keys::type_line(&target, "/x"), Typed::Agents);
++        assert!(keys::press(&target, ConsoleKey::Interrupt));
++        scene.until_screen(&target, "the view closed", |lines| box_is(lines, ""));
++        assert_eq!(keys::type_line(&target, "/busy"), Typed::Sent);
++        scene.until_screen(&target, "busy", |lines| box_is(lines, ""));
++        assert_eq!(keys::type_exit(&target), Typed::Agents);
++        assert_eq!(scene.count("exit"), 0, "claude stays");
++        assert_eq!(keys::type_line(&target, "/idle"), Typed::Sent);
++
++        // Ctrl+Z: claude stops itself, `cctg run` stops with it and gives the
++        // terminal back in its own mode; `fg` (SIGCONT) resumes both.
++        scene.until_screen(&target, "idle", |lines| box_is(lines, ""));
++        scene.terminal.type_keys(b"\x1a");
++        scene.until_count("suspend", 1);
++        let deadline = Instant::now() + WAIT;
++        while scene.status() != (None, true) {
++            assert!(Instant::now() < deadline, "cctg run stops with claude");
++            std::thread::sleep(Duration::from_millis(50));
++        }
++        assert!(!scene.terminal.raw(), "the user's mode while stopped");
++        // claude's last line went out before `cctg run` stopped: nothing
++        // can write it while it is stopped.
++        let deadline = Instant::now() + WAIT;
++        while !scene.terminal.tail().contains(SUSPENDED) {
++            assert!(
++                Instant::now() < deadline,
++                "claude's last line before the stop: {}",
++                scene.terminal.tail()
++            );
++            std::thread::sleep(Duration::from_millis(50));
++        }
++        unsafe { libc::kill(scene.run, libc::SIGCONT) };
++        scene.until_count("resumed", 1);
++        assert!(scene.terminal.raw(), "raw again after fg");
++
++        // "Обновить": the request and `/exit`; `cctg run` starts claude
++        // again with `--resume` and answers its dialog again.
++        let worker = Worker {
++            claude_pid: Some(1),
++            run_pid: Some(child.id()),
++            run_args: vec!["--first".to_owned()],
++            state_dir: Some(state.clone()),
++            console: Some(target.clone()),
++            ..Worker::default()
++        };
++        assert!(worker.restartable());
++        assert_eq!(worker.restart(SESSION), Typed::Sent);
++        scene.until_count("dialog", 2);
++        let second = scene
++            .events()
++            .into_iter()
++            .filter(|event| event.get("start").is_some())
++            .nth(1)
++            .unwrap();
++        assert_eq!(second["start"], json!(["--first", "--resume", SESSION]));
++        assert_eq!(second["size"], json!([40, 120]));
++        scene.until_screen(&target, "the second box", |lines| box_is(lines, ""));
++
++        // The second claude exits with 7: so does `cctg run`, the terminal
++        // back in its own mode, the socket gone.
++        assert_eq!(keys::type_exit(&target), Typed::Sent);
++        let deadline = Instant::now() + WAIT;
++        let code = loop {
++            if let (Some(code), _) = scene.status() {
++                break code;
++            }
++            assert!(Instant::now() < deadline, "cctg run ends");
++            std::thread::sleep(Duration::from_millis(50));
++        };
++        assert_eq!(code, 7, "claude's own exit code");
++        assert!(!scene.terminal.raw(), "the terminal mode is restored");
++        assert!(!socket.exists(), "the socket is removed");
++        assert!(
++            std::fs::read_dir(state.join("restart"))
++                .unwrap()
++                .next()
++                .is_none(),
++            "the request was taken"
++        );
++        let _ = std::fs::remove_dir_all(&root);
++    }
++}
+diff --git a/docs/poc.md b/docs/poc.md
+--- a/docs/poc.md
++++ b/docs/poc.md
+@@ -104,7 +104,7 @@
+ 
+ `statusLine` и `ToolStatus` нужны для закреплённого сообщения статуса в теме (что делает сессия, модель, контекст и лимиты, кнопка ⏹). `ToolStatus` помечен `"async": true`: Claude Code его не ждёт, один вызов инструмента стоит два коротких процесса в фоне. `cctg statusline` на каждом вызове читает `statusLine.command` из ваших пользовательских настроек (`$CLAUDE_CONFIG_DIR/settings.json` или `~/.claude/settings.json`), запускает его с тем же stdin через Git Bash (на Windows без Git Bash через PowerShell) и печатает его вывод байт в байт, так что строка в терминале остаётся вашей; без своей команды печатается короткая строка cctg. Если в вашем `statusLine` есть `padding`, `refreshInterval` или `hideVimModeIndicator`, скопируйте их в `statusLine` этого файла: `--settings` заменяет `statusLine` целиком, и без них строка будет выглядеть или обновляться иначе. Цифры уходят в hub параллельно вашей команде с таймаутом 80 мс (при остановленном hub строка появляется на столько же позже).
+ 
+-Кнопка ⏹ (с подтверждением вторым нажатием за 10 с) работает только на Windows: агент пишет Esc во входной буфер консоли своего claude (`WriteConsoleInputW`; проверено в обычной консоли conhost, в Windows Terminal не проверено, в mintty без консоли не работает, тогда в тему приходит одно уведомление). После этого статус показывает «⏹ Esc отправлен в терминал», а не «ждёт вас»: запись в буфер не значит, что ход остановлен. Конец хода статус узнаёт из `Stop`, заметки о прерывании в транскрипте, следующего промпта или конца сессии; прерывание во время размышления не даёт ни того, ни другого, тогда статус сменится со следующим промптом. Пока ждёт запрос разрешения, ⏹ не показывается: Esc в этот момент отвечает на запрос, а не останавливает ход, поэтому сначала нажмите Allow или Deny.
++Кнопка ⏹ (с подтверждением вторым нажатием за 10 с) работает на Windows: агент пишет Esc во входной буфер консоли своего claude (`WriteConsoleInputW`; проверено в обычной консоли conhost, в Windows Terminal не проверено, в mintty без консоли не работает, тогда в тему приходит одно уведомление). На Linux и macOS она работает, когда claude запущен через `claude-cctg` в терминале: Esc уходит в псевдотерминал `cctg run` (TASK-044). После этого статус показывает «⏹ Esc отправлен в терминал», а не «ждёт вас»: запись в буфер не значит, что ход остановлен. Конец хода статус узнаёт из `Stop`, заметки о прерывании в транскрипте, следующего промпта или конца сессии; прерывание во время размышления не даёт ни того, ни другого, тогда статус сменится со следующим промптом. Пока ждёт запрос разрешения, ⏹ не показывается: Esc в этот момент отвечает на запрос, а не останавливает ход, поэтому сначала нажмите Allow или Deny.
+ 
+ `PermissionRequest` ждёт ответа из Telegram до 90 с (кнопки для диалогов, которые канал не пересылает, например проверка безопасности auto mode), поэтому ему нужен свой `"timeout": 100`. Запрос, который уже пришёл через канал, хук отпускает без решения за ~1.5 с.
+ 
+@@ -184,6 +184,8 @@
+ 
+ `cctg run` запускает `claude` дочерним процессом в той же консоли и ждёт его: окно, ввод и вывод те же, Ctrl+C получает claude, `/exit` завершает и `cctg run` с кодом claude. По заявке агента (файл `<state>/restart/<pid cctg run>.json`, `<state>` это `CCTG_STATE_DIR` или `~/.cctg`) он запускает claude ещё раз в том же окне с аргументами из заявки и сам отвечает Enter на вопрос про development channels. Аргументы собирает агент: те же опции, без `-c`, `-r`, `--session-id`, `--fork-session` и без промпта, переданного аргументом (он не уходит второй раз), плюс `--resume <сессия>`. Заявку принимает только тот `cctg run`, который сам запустил этого claude.
+ 
++На Linux и macOS (TASK-044) `cctg run` в терминале держит claude в своём псевдотерминале: терминал переходит в raw-режим, каждая клавиша (Ctrl+C, Esc, Ctrl+Z) уходит claude как есть, размер окна повторяется, Ctrl+Z приостанавливает claude вместе с `cctg run` до `fg`. Копию экрана и ввод агент получает через сокет `<state>/run/<pid cctg run>.sock` (папка 0700): так работают ⏹, `!`- и `/`-команды из темы, панели `/cost` и `/usage` и перезапуск по «Обновить». Если ввод или вывод `cctg run` перенаправлен (`claude-cctg -p ... | jq`), claude запускается как раньше, без псевдотерминала и без этих кнопок.
++
+ ### Обновление клиента
+ 
+ Агент сессии и hub знают свою сборку (sha256 бинарника). Если агент работает на другой сборке, чем hub (обычно после `cctg deploy`), в тему один раз на сборку hub приходит предупреждение с кнопкой «⬆️ Обновить», а в закреплённом статусе появляются строка «⬆️ Клиент cctg устарел» и та же кнопка. Само ничего не обновляется. После нажатия (если идёт ход, после его конца; ⏹ прервёт ход):
+@@ -202,7 +204,7 @@
+ 
+ 1. В группе появилась тема `[<host>] <папка> · <начало id сессии>`, иконка "живая".
+ 2. Текст в этой теме доходит в сессию как `<channel source="cctg" ...>`, финальный ответ хода приходит в ту же тему сам (из хука `Stop`), даже если Claude не вызвал `reply`. Инструкции канала просят вызывать `reply` только для дополнительных сообщений по ходу работы; если Claude всё же отправит финальный ответ и через `reply`, он придёт дважды. В тему уходит финальный ответ каждого хода живой top-level сессии слота, в том числе ходов, начатых из терминала. Длинный ответ приходит несколькими сообщениями по порядку или одним файлом.
+-3. `/brief` в теме отвечает транскриптом и не попадает в сессию. `!echo hi` и другие слэш-команды (`/compact`, `/cost`) агент набирает в терминале claude, как с клавиатуры (только Windows, пока не идёт ход и поле ввода пустое): сообщение получает 👀, вывод приходит в тему через поток (`> ! echo hi` и блок кода), иначе ответ, почему команда не набрана.
++3. `/brief` в теме отвечает транскриптом и не попадает в сессию. `!echo hi` и другие слэш-команды (`/compact`, `/cost`) агент набирает в терминале claude, как с клавиатуры (Windows, а на Linux и macOS claude, запущенный через `claude-cctg` в терминале; пока не идёт ход и поле ввода пустое): сообщение получает 👀, вывод приходит в тему через поток (`> ! echo hi` и блок кода), иначе ответ, почему команда не набрана.
+ 4. `/clear` в терминале: в теме разделитель `── session <id> · new ──`, следующее сообщение из темы доходит в новую сессию.
+ 5. Выход из Claude Code: иконка "мёртвая"; сообщение в тему даёт ответ "Сессия этой темы не на связи, сообщение не доставлено." Несколько сообщений подряд дают один такой ответ в минуту.
+ 6. Сообщение в General никуда не уходит.
+diff --git a/docs/remote-hub.md b/docs/remote-hub.md
+--- a/docs/remote-hub.md
++++ b/docs/remote-hub.md
+@@ -102,7 +102,7 @@
+ - Адрес может быть именем или IP.
+ - Хуки над TLS ждут дольше: 900 мс (600 мс для `UserPromptSubmit` и тулов) вместо 500/300. Строка статуса держит свои 80 мс: если до сервера далеко, цифры контекста и лимитов в сообщение статуса не дойдут, строка статуса от этого не тормозит.
+ - Устройство ставит `install.sh` (README, шаг 3): бинарник своего тега из GitHub Releases, этот `device.env`, `~/.cctg/claude/{mcp.json,settings.json}` и обёртку `claude-cctg`. `~/.cctg/bin/cctg doctor` проверяет оба канала, pin и секрет. Руками: бинарник из GitHub Releases того же тега, что образ на сервере (про версии ниже); на Linux и macOS файл из Releases скачивается без права на запуск: `chmod +x` после каждого скачивания, иначе агент и хуки не стартуют (`Permission denied`); регистрация агента и хуков как в `docs/poc.md`: `cctg agent-install`, `docs/hook-settings.json`.
+-- macOS (Apple Silicon): файл `cctg-<тег>-aarch64-apple-darwin` не подписан. После скачивания `chmod +x` и `xattr -d com.apple.quarantine <файл>`. На macOS пока не работают (TASK-044): управление консолью claude (⏹, `!`-команды, панели, перезапуск по «Обновить»), распознавание вложенных `claude -p` (у них появляется своя тема), перепривязка агента после `/clear` (новая сессия показывается «без канала» до перезапуска claude) и уборка сессий, чей claude умер без `SessionEnd`.
++- macOS (Apple Silicon): файл `cctg-<тег>-aarch64-apple-darwin` не подписан. После скачивания `chmod +x` и `xattr -d com.apple.quarantine <файл>`. Управление консолью claude (⏹, `!`-команды, панели, перезапуск по «Обновить») на Linux и macOS работает, когда claude запущен через `claude-cctg` в терминале (TASK-044, `docs/poc.md`); вложенные `claude -p`, перепривязка агента после `/clear` и уборка сессий на macOS работают по обходу родителей процесса, как на Linux.
+ 
+ ## Обновление
+ 
