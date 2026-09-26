@@ -4850,7 +4850,9 @@ impl Slots {
     }
 
     /// A question button. Only the question of that message and its current
-    /// step count; a press after the hook left closes the question.
+    /// step count; a press after the hook left closes the question. A press
+    /// that beats Telegram's answer to the send (the message id is not known
+    /// yet) counts for the one question with its id still in flight.
     fn press_question(
         &mut self,
         message_id: Option<i64>,
@@ -4858,7 +4860,9 @@ impl Slots {
         question: usize,
         press: questions::Press,
     ) -> Option<&'static str> {
-        let Some(key) = message_id.and_then(|message_id| self.questions.by_message(message_id))
+        let Some(key) = message_id
+            .and_then(|message_id| self.questions.by_message(message_id))
+            .or_else(|| self.questions.in_flight(id))
         else {
             debug!("button of a question this hub does not know");
             return Some(questions::ANSWER_STALE);
@@ -11398,14 +11402,33 @@ again"
             "Internal text.",
         ))
         .await;
-        let ops = settled(&rig, |ops| {
-            count(ops, |op| matches!(op, Op::Edit { .. })) == 3
+        // Each finished block gets its "закончил" reply (TASK-033). Replies
+        // are metered sends, one per `min_gap` (1 s), so they trail the edits
+        // by seconds and used to race the quiet window below (TASK-060).
+        let all = settled(&rig, |ops| {
+            count(ops, |op| matches!(op, Op::Edit { .. })) == 3 && replies(ops).len() == 3
         })
         .await;
-        // Well past every window: nothing more comes.
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        // Past every window and past `min_gap`, so a pending metered send
+        // would have shown: nothing more comes.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         let ops_later = rig.fake.ops();
-        assert_eq!(ops_later.len(), ops.len(), "{ops_later:?}");
+        assert_eq!(ops_later.len(), all.len(), "{ops_later:?}");
+        let mut replied: Vec<i64> = replies(&all).iter().map(|reply| reply.1).collect();
+        replied.sort_unstable();
+        assert_eq!(replied, [1000, 1001, 1002], "{all:?}");
+        let ops: Vec<Op> = all
+            .into_iter()
+            .filter(|op| {
+                !matches!(
+                    op,
+                    Op::Send {
+                        reply_to: Some(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
 
         assert_eq!(count(&ops, is_create), 1);
         let texts = shown(&ops);

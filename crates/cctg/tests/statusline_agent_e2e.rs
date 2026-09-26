@@ -89,7 +89,7 @@ fn counting_hook() -> (String, Arc<AtomicUsize>) {
 }
 
 fn home(test: &str, agent_addr: &str, hook_addr: &str) -> PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("statusline-agent-{test}"));
+    let home = common::own_tmp().join(format!("statusline-agent-{test}"));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join(".cctg")).unwrap();
     std::fs::write(

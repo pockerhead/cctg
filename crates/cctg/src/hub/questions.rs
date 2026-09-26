@@ -473,6 +473,18 @@ impl Asks {
             .map(|(key, _)| *key)
     }
 
+    /// The one ask with id `id` whose message is on its way to Telegram:
+    /// its buttons can be pressed before Telegram's answer with the message
+    /// id reaches the hub. `None` when no or several asks match.
+    pub fn in_flight(&self, id: &str) -> Option<u64> {
+        let mut found = self
+            .asks
+            .iter()
+            .filter(|(_, ask)| ask.sending && ask.message_id.is_none() && ask.id == id);
+        let (key, _) = found.next()?;
+        found.next().is_none().then_some(*key)
+    }
+
     /// The open ask of topic `thread_id` a text message answers: the one it
     /// replies to; a plain message (no reply) answers the newest one waiting
     /// for typed text. A reply to any other message answers nothing.
@@ -788,6 +800,27 @@ mod tests {
             );
         }
         assert_eq!(book.open(ask(vec![question("D?", false, &["z"])])), None);
+    }
+
+    /// TASK-060: a press can arrive before Telegram's answer to the send;
+    /// only a single ask with that id still in flight takes it.
+    #[test]
+    fn a_press_before_the_message_id_finds_the_ask_in_flight() {
+        let mut book = Asks::default();
+        let mut sending = ask(vec![question("A?", false, &["x"])]);
+        sending.sending = true;
+        let key = book.open(sending).unwrap();
+        assert_eq!(book.in_flight("abcde"), Some(key));
+        assert_eq!(book.in_flight("bcdef"), None);
+        let mut twin = ask(vec![question("B?", false, &["y"])]);
+        twin.session = "t".into();
+        twin.sending = true;
+        let twin = book.open(twin).unwrap();
+        assert_eq!(book.in_flight("abcde"), None, "ambiguous");
+        book.get_mut(twin).unwrap().message_id = Some(6);
+        assert_eq!(book.in_flight("abcde"), Some(key));
+        book.get_mut(key).unwrap().sending = false;
+        assert_eq!(book.in_flight("abcde"), None, "not handed to Telegram");
     }
 
     /// The review's repro: ✏️ Другое armed, then a reply to some other bot
