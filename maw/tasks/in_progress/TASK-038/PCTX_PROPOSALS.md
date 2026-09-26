@@ -18,3 +18,8 @@
 ## 2026-09-26 — (implementer) the probe resolved the open items of the first proposal
 
 Проба оркестратора (`scratch/planner/probe/probe_ask_question.out.txt`, 2.1.283) закрыла варианты «да/нет» в первом предложении: ждущий `PreToolUse` держит диалог, `statusMessage` виден; `allow` + `updatedInput` с `answers` принят без диалога, после него нет ни `PermissionRequest`, ни канального `permission_request`; без решения стреляет `PermissionRequest` хук на `AskUserQuestion`, канал его не релеит; Esc убивает ждущий хук, вызов отклонён, ход прерван, диалога нет. Эти факты уже записаны строкой в CLAUDE.md (раздел Hooks); в `domains/hooks.md` их стоит перенести в том же виде.
+
+
+## 2026-09-26 — (fixer) the shared cargo target is also shared between worktrees
+
+С общим `CARGO_TARGET_DIR` сборка другого worktree того же workspace (сейчас главное дерево на `feature/team-mode`) даёт тот же metadata-хеш крейта `cctg` и перезаписывает тестовый бинарник: `cargo test` писал `Finished`, а гонял чужой код (`--list` без `hub::questions`). Предлагаю в Universal invariants (правило про общий target) добавить: перед прогоном тестов в worktree делать `touch crates/cctg/src/lib.rs` (и проверять `--list` на свои новые тесты), иначе зелёный прогон может быть чужим.

@@ -1,0 +1,108 @@
+p='crates/cctg/src/hook.rs'
+s=open(p,encoding='utf-8',newline='').read()
+BS='\\'
+def rep(a,b,cnt=1):
+    global s
+    a=a.replace('<BS>',BS); b=b.replace('<BS>',BS)
+    assert s.count(a)==cnt,(a,s.count(a))
+    s=s.replace(a,b)
+rep("""        let answers = vec!["Red".to_owned(), "Pear".to_owned()];""",
+"""        let pick = |index| Answered {
+            options: vec![index],
+            text: None,
+        };
+        let answers = vec![pick(0), pick(0)];""")
+rep("""            parse_question_answer(b"HTTP/1.1 200 OK<BS>r<BS>n<BS>r<BS>n{<BS>"answers<BS>":[<BS>"A<BS>"]}"),
+            Ok(Some(vec!["A".to_owned()]))
+        );""","""            parse_question_answer(
+                b"HTTP/1.1 200 OK<BS>r<BS>n<BS>r<BS>n{<BS>"answers<BS>":[{<BS>"options<BS>":[1]},{<BS>"text<BS>":<BS>"A<BS>"}]}"
+            ),
+            Ok(Some(vec![
+                Answered {
+                    options: vec![1],
+                    text: None
+                },
+                Answered {
+                    options: vec![],
+                    text: Some("A".into())
+                }
+            ]))
+        );
+        // Label answers of the first TASK-038 build are no answers.
+        assert_eq!(
+            parse_question_answer(b"HTTP/1.1 200 OK<BS>r<BS>n<BS>r<BS>n{<BS>"answers<BS>":[<BS>"A<BS>"]}"),
+            Err(PostError::BadResponse)
+        );""")
+rep("""        // The permission hook leaves questions to this hook.
+        let permission = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "AskUserQuestion",
+            "tool_input": input["tool_input"],
+        });
+        assert_eq!(
+            build_permission(permission.to_string().as_bytes(), "box"),
+            Err(Skip("questions are asked by their PreToolUse hook"))
+        );""","""        // The permission hook of a question still goes to the hub: it
+        // tells a client without the question hook (and answers at once).
+        let permission = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "AskUserQuestion",
+            "tool_input": input["tool_input"],
+        });
+        let post = build_permission(permission.to_string().as_bytes(), "box").unwrap();
+        assert_eq!(post.tool_name, QUESTION_TOOL);""")
+rep("""        let answers = vec!["Red".to_owned(), "Apple, my own".to_owned()];
+        let output: Value =
+            serde_json::from_str(&question_json(tool_input, &answers).unwrap()).unwrap();
+        let mut updated = tool_input.clone();
+        updated["answers"] =
+            serde_json::json!({ "Which color?": "Red", "Which fruits?": "Apple, my own" });""",
+"""        let answered = |options: &[usize], text: Option<&str>| Answered {
+            options: options.to_vec(),
+            text: text.map(str::to_owned),
+        };
+        let answers = vec![answered(&[0], None), answered(&[0], Some("my own"))];
+        let output: Value =
+            serde_json::from_str(&question_json(tool_input, &answers).unwrap()).unwrap();
+        let mut updated = tool_input.clone();
+        updated["answers"] =
+            serde_json::json!({ "Which color?": "Red", "Which fruits?": "Apple, my own" });""")
+rep("""        assert_eq!(question_json(tool_input, &answers[..1]), None);
+        assert_eq!(
+            question_json(tool_input, &["Red".to_owned(), " ".to_owned()]),
+            None
+        );
+        assert_eq!(question_json(&serde_json::json!({}), &answers), None);
+    }""","""        assert_eq!(question_json(tool_input, &answers[..1]), None);
+        for bad in [
+            answered(&[], Some(" ")),
+            answered(&[], None),
+            answered(&[2], None),
+        ] {
+            let answers = [answered(&[1], None), bad.clone()];
+            assert_eq!(question_json(tool_input, &answers), None, "{bad:?}");
+        }
+        assert_eq!(question_json(&serde_json::json!({}), &answers), None);
+        // The labels go back exactly as Claude offered them (not trimmed or
+        // capped like the texts sent to the hub); own text as typed.
+        let long = "й".repeat(MAX_LABEL);
+        let mut odd = question_input(serde_json::json!({}));
+        odd["tool_input"]["questions"][0]["options"][0]["label"] = serde_json::json!("  Padded  ");
+        odd["tool_input"]["questions"][1]["options"][1]["label"] = serde_json::json!(long);
+        let (post, tool_input) = build_question(odd.to_string().as_bytes(), "box").unwrap();
+        assert_ne!(post.questions[1].options[1].label, long);
+        let answers = [answered(&[0], None), answered(&[0, 1], Some(" ну и 🍐 "))];
+        let output: Value =
+            serde_json::from_str(&question_json(&tool_input, &answers).unwrap()).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["updatedInput"]["answers"],
+            serde_json::json!({
+                "Which color?": "  Padded  ",
+                "Which fruits?": format!("Apple, {long},  ну и 🍐 "),
+            })
+        );
+    }""")
+open(p,'w',encoding='utf-8',newline='').write(s)
+print("ok")

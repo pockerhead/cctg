@@ -1,0 +1,30 @@
+        assert_eq!(book.open(ask(vec![question("D?", false, &["z"])])), None);
+    }
+}
+
+#[cfg(test)]
+mod crev_repro {
+    use super::*;
+    use crate::wire::{AskedOption, AskedQuestion};
+
+    #[test]
+    fn reply_to_another_message_is_taken_while_typing() {
+        let q = AskedQuestion {
+            question: "Q?".into(),
+            header: String::new(),
+            multi_select: false,
+            options: vec![AskedOption { label: "  Padded label  ".into(), description: String::new() }],
+        };
+        let mut ask = Ask::new("s".into(), "abcde".into(), vec![q.clone()]);
+        ask.thread_id = Some(100);
+        ask.message_id = Some(5);
+        ask.press(0, Press::Other);
+        let mut book = Asks::default();
+        let key = book.open(ask).unwrap();
+        // 777 is some other bot message (a subagent block, an older answer).
+        assert_eq!(book.text_target(100, Some(777)), Some(key));
+        let mut plain = Ask::new("s".into(), "bcdef".into(), vec![q]);
+        plain.press(0, Press::Option(0));
+        assert_eq!(plain.answers(), Some(vec!["Padded label".to_owned()]));
+    }
+}

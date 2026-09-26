@@ -1,0 +1,132 @@
+p='crates/cctg/src/hub/questions.rs'
+s=open(p,encoding='utf-8',newline='').read()
+BS='\\'
+def rep(a,b,cnt=1):
+    global s
+    a=a.replace('<NL>',BS+'n'); b=b.replace('<NL>',BS+'n')
+    assert s.count(a)==cnt,(a,s.count(a))
+    s=s.replace(a,b)
+rep("use crate::wire::AskedQuestion;","use crate::wire::{Answered, AskedQuestion};")
+rep("""const OPTION_TEXT: usize = 300;
+""","""const OPTION_TEXT: usize = 300;
+/// Bytes of the user's own answer kept (more than one Telegram message).
+pub const MAX_OWN_TEXT: usize = 16 << 10;
+""")
+rep("""    pub step: usize,
+    pub answers: Vec<String>,""","""    pub step: usize,
+    pub answers: Vec<Answered>,""")
+rep("""                } else {
+                    let label = current.options[index].label.trim().to_owned();
+                    Some(self.advance(label))
+                }""","""                } else {
+                    Some(self.advance(Answered {
+                        options: vec![index],
+                        text: None,
+                    }))
+                }""")
+rep("""                let answer = self.picked_labels().join(", ");
+                Some(self.advance(answer))""","""                let options = self.picked.iter().copied().collect();
+                Some(self.advance(Answered {
+                    options,
+                    text: None,
+                }))""")
+rep("""    /// The user's own text for the current question. A multiSelect
+    /// question keeps its ticked options in front of it. `false`: nothing
+    /// taken (ended, or a blank text).
+    pub fn type_answer(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if !self.is_open() || text.is_empty() || self.step >= self.questions.len() {
+            return false;
+        }
+        let mut parts = self.picked_labels();
+        parts.push(text.to_owned());
+        self.advance(parts.join(", "));
+        true
+    }
+
+    fn picked_labels(&self) -> Vec<String> {
+        let Some(current) = self.questions.get(self.step) else {
+            return Vec::new();
+        };
+        self.picked
+            .iter()
+            .filter_map(|index| current.options.get(*index))
+            .map(|option| option.label.trim().to_owned())
+            .collect()
+    }
+
+    fn advance(&mut self, answer: String) -> &'static str {""","""    /// The user's own text for the current question, as typed (at most
+    /// [`MAX_OWN_TEXT`] bytes). A multiSelect question keeps its ticked
+    /// options in front of it. `false`: nothing taken (ended, or a blank
+    /// text).
+    pub fn type_answer(&mut self, text: &str) -> bool {
+        if !self.is_open() || text.trim().is_empty() || self.step >= self.questions.len() {
+            return false;
+        }
+        let mut end = text.len().min(MAX_OWN_TEXT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let options = self.picked.iter().copied().collect();
+        self.advance(Answered {
+            options,
+            text: Some(text[..end].to_owned()),
+        });
+        true
+    }
+
+    /// How the message shows the answer to question `index`.
+    fn shown_answer(&self, index: usize) -> String {
+        let (Some(question), Some(answer)) = (self.questions.get(index), self.answers.get(index))
+        else {
+            return String::new();
+        };
+        let mut parts: Vec<&str> = answer
+            .options
+            .iter()
+            .filter_map(|option| question.options.get(*option))
+            .map(|option| option.label.trim())
+            .collect();
+        parts.extend(answer.text.as_deref().map(str::trim));
+        parts.join(", ")
+    }
+
+    fn advance(&mut self, answer: Answered) -> &'static str {""")
+rep("""    pub fn answers(&self) -> Option<Vec<String>> {""","""    pub fn answers(&self) -> Option<Vec<Answered>> {""")
+rep("""        for (index, question) in self.questions.iter().enumerate() {
+            text.push_str("<NL><NL>");
+            text.push_str(&cut(question.question.trim(), QUESTION_TEXT));
+            if let Some(answer) = self
+                .answers
+                .get(index)
+                .filter(|_| self.state == State::Answered)
+            {
+                text.push_str("<NL>→ ");
+                text.push_str(answer);
+            }
+        }""","""        for (index, question) in self.questions.iter().enumerate() {
+            text.push_str("<NL><NL>");
+            text.push_str(&cut(question.question.trim(), QUESTION_TEXT));
+            if self.state == State::Answered && index < self.answers.len() {
+                text.push_str("<NL>→ ");
+                text.push_str(&self.shown_answer(index));
+            }
+        }""")
+rep("""        for (question, answer) in self.questions.iter().zip(&self.answers) {
+            let name = if question.header.trim().is_empty() {
+                cut(question.question.trim(), BUTTON_LABEL)
+            } else {
+                question.header.trim().to_owned()
+            };
+            text.push_str(&format!("<NL>✓ {name}: {}", cut(answer, OPTION_TEXT)));
+        }""","""        for (index, question) in self.questions.iter().enumerate().take(self.answers.len()) {
+            let name = if question.header.trim().is_empty() {
+                cut(question.question.trim(), BUTTON_LABEL)
+            } else {
+                question.header.trim().to_owned()
+            };
+            let answer = self.shown_answer(index);
+            text.push_str(&format!("<NL>✓ {name}: {}", cut(&answer, OPTION_TEXT)));
+        }""")
+open(p,'w',encoding='utf-8',newline='').write(s)
+print("ok")
