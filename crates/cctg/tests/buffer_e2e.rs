@@ -207,7 +207,8 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         got[0],
         HubMsg::Registered {
             files: true,
-            heartbeat: true
+            heartbeat: true,
+            albums: true,
         }
     );
     let kept: Vec<(String, String)> = got[1..]

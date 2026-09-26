@@ -1,6 +1,7 @@
 //! Files both ways between a topic and its session (TASK-032), over the
 //! real pieces: the real `BotApi` and `Scheduler` against a fake Telegram
-//! HTTP server (getFile, file downloads, sendPhoto, sendDocument), the
+//! HTTP server (getFile, file downloads, sendPhoto, sendDocument,
+//! sendMediaGroup), the
 //! real `Slots` actor with its download task, the real `serve_agents` TCP
 //! link, and the real agent link and channel loop (`agent::spawn`,
 //! `serve_channel`) with this test as Claude Code. A second session's agent
@@ -59,7 +60,8 @@ impl io::Write for Captured {
 type Seen = Arc<Mutex<Vec<(String, String)>>>;
 
 /// Telegram's files by id; `huge` is too big for a bot. Topics are 100 and
-/// 101; a photo whose bytes hold `REFUSE-PHOTO` is refused by sendPhoto.
+/// 101; a photo whose bytes hold `REFUSE-PHOTO` is refused by sendPhoto, and
+/// a photo album with such a photo by sendMediaGroup (as a whole).
 async fn fake_telegram(files: BTreeMap<String, Vec<u8>>, seen: Seen) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -164,6 +166,10 @@ fn answer(
         "sendPhoto" if text.contains("REFUSE-PHOTO") => {
             refused("Bad Request: PHOTO_INVALID_DIMENSIONS")
         }
+        "sendMediaGroup" if text.contains("REFUSE-PHOTO") && text.contains(r#""type":"photo""#) => {
+            refused("Bad Request: PHOTO_INVALID_DIMENSIONS")
+        }
+        "sendMediaGroup" => ok(json!([message, message])),
         "createForumTopic" => {
             let mut next = topics.lock().unwrap();
             let topic = *next;
@@ -580,6 +586,80 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     assert!(photos[0].contains(&caption(&format!("outbound caption {marker}"))));
     assert!(documents[0].contains(&caption("notes")));
 
+    // TASK-059: several files at once. Two pictures and two other files
+    // are two albums, pictures first, each one request, the caption on the
+    // first picture.
+    let png = |text: &str| [b"\x89PNG\r\n\x1a\n".as_slice(), text.as_bytes()].concat();
+    let album = [
+        (format!("album-one-{marker}.png"), png("one")),
+        ("album-data.csv".to_owned(), b"a,b".to_vec()),
+        ("album-two.png".to_owned(), png("two")),
+        ("album-notes.txt".to_owned(), b"album notes".to_vec()),
+    ];
+    for (name, bytes) in &album {
+        std::fs::write(work.join(name), bytes).unwrap();
+    }
+    let paths: Vec<&str> = album.iter().map(|(name, _)| name.as_str()).collect();
+    let call = json!({"jsonrpc":"2.0","id":16,"method":"tools/call","params":{
+        "name":"send_file","arguments":{"paths":paths,"caption":format!("album caption {marker}")}}});
+    claude.send(&call.to_string()).await;
+    let answer = claude.recv().await;
+    assert_eq!(answer["id"], 16, "{answer}");
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+    let said = answer["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(said.starts_with("4 of 4 files sent"), "{said}");
+    let groups = seen_methods(&seen, "sendMediaGroup");
+    assert_eq!(groups.len(), 2, "one request per album");
+    let field = |name: &str, value: &str| format!("name=\"{name}\"\r\n\r\n{value}\r\n");
+    assert!(groups[0].contains(&field("message_thread_id", "100")));
+    assert!(
+        groups[0].contains(&format!(
+            r#"{{"caption":"album caption {marker}","media":"attach://file0","type":"photo"}}"#
+        )),
+        "{}",
+        groups[0]
+    );
+    assert!(groups[0].contains(r#"{"media":"attach://file1","type":"photo"}"#));
+    assert!(groups[0].contains(&format!("filename=\"album-one-{marker}.png\"")));
+    assert!(groups[0].contains("filename=\"album-two.png\""));
+    assert!(groups[1].contains(r#"{"media":"attach://file0","type":"document"}"#));
+    assert!(groups[1].contains(r#"{"media":"attach://file1","type":"document"}"#));
+    assert!(groups[1].contains("filename=\"album-data.csv\""));
+    assert!(groups[1].contains("filename=\"album-notes.txt\""));
+    assert!(!groups[1].contains("caption"));
+    assert_eq!(
+        (
+            seen_methods(&seen, "sendPhoto").len(),
+            seen_methods(&seen, "sendDocument").len()
+        ),
+        (3, 3),
+        "no single sends"
+    );
+    // A photo album Telegram refuses goes again as documents; a file that
+    // cannot be read does not stop the others and the answer names it.
+    std::fs::write(work.join("album-odd.png"), png("REFUSE-PHOTO")).unwrap();
+    let call = json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{
+        "name":"send_file","arguments":{"paths":["album-odd.png", "album-gone.txt", "album-two.png"]}}});
+    claude.send(&call.to_string()).await;
+    let answer = claude.recv().await;
+    assert_eq!(answer["id"], 17, "{answer}");
+    assert_eq!(answer["result"]["isError"], false, "{answer}");
+    let said = answer["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(said.starts_with("2 of 3 files sent"), "{said}");
+    assert!(said.contains("\n- album-gone.txt: not sent: "), "{said}");
+    assert!(said.contains("\n- album-odd.png: sent"), "{said}");
+    let groups = seen_methods(&seen, "sendMediaGroup");
+    assert_eq!(groups.len(), 4, "the refused photo album and its documents");
+    assert!(groups[2].contains(r#""type":"photo""#));
+    assert!(groups[3].contains(r#""type":"document""#) && !groups[3].contains(r#""type":"photo""#));
+    // Without a caption each photo shows its own name.
+    assert!(
+        groups[2]
+            .contains(r#"{"caption":"album-odd.png","media":"attach://file0","type":"photo"}"#),
+        "{}",
+        groups[2]
+    );
+
     // The session ends: a photo waits as its reference and goes to the
     // agent of the resumed session.
     hooks
@@ -648,7 +728,8 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         hub_line(&mut reader, &captured).await,
         HubMsg::Registered {
             files: true,
-            heartbeat: true
+            heartbeat: true,
+            albums: true,
         }
     );
     // `registered` goes out before the actor binds the agent. A topic
@@ -698,6 +779,9 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         "inbox",
         "bare-shot.png",
         "report.txt",
+        "album-data.csv",
+        "album-notes.txt",
+        "album-gone.txt",
     ] {
         assert!(!logs.contains(private), "{private} in the logs:\n{logs}");
     }
