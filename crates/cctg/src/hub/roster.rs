@@ -305,6 +305,7 @@ mod tests {
             query_id: "q".into(),
             data: Some(data.into()),
             message_id: Some(77),
+            thread_id: None,
             from_name: Some("Иван".into()),
         }
     }

@@ -1,0 +1,14 @@
+
+running 9 tests
+test settings_snippet_registers_every_event_without_secrets_or_paths ... ok
+test bad_hook_arguments_still_exit_zero ... ok
+test a_hub_without_compactions_leaves_the_hook_quiet ... ok
+test an_open_silent_stdin_does_not_hold_the_hook ... ok
+test broken_input_and_missing_config_exit_zero_quietly ... ok
+test an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure ... ok
+test a_silent_hub_keeps_session_end_well_inside_its_budget ... ok
+test every_event_reaches_the_hub ... ok
+test no_hub_listening_is_quiet_and_fast ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+

@@ -1,0 +1,29 @@
+
+running 6 tests
+test colours_lines_a_failing_exit_and_empty_output_pass_unchanged ... ok
+test a_command_that_prints_too_much_is_cut_without_waiting_for_the_timeout ... ok
+test without_a_command_or_inside_one_cctg_prints_its_own_line ... FAILED
+test the_own_line_shows_the_branch_and_the_account_and_the_hub_never_gets_the_email ... ok
+test a_stopped_hub_adds_well_under_150_ms ... ok
+test the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte ... FAILED
+
+failures:
+
+---- without_a_command_or_inside_one_cctg_prints_its_own_line stdout ----
+
+thread 'without_a_command_or_inside_one_cctg_prints_its_own_line' (37896) panicked at crates\cctg\tests\statusline_cli.rs:180:5:
+assertion failed: tokio::time::timeout(Duration::from_millis(500), events.recv()).await.is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte stdout ----
+
+thread 'the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte' (21760) panicked at crates\cctg\tests\statusline_cli.rs:123:10:
+hub got the numbers: Elapsed(())
+
+
+failures:
+    the_users_command_gets_the_same_stdin_and_its_output_passes_byte_for_byte
+    without_a_command_or_inside_one_cctg_prints_its_own_line
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.31s
+

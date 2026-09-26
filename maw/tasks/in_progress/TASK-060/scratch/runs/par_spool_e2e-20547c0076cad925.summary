@@ -1,0 +1,4 @@
+test a_silent_hub_costs_a_hook_one_budget_however_much_is_kept ... FAILED
+thread 'a_silent_hub_costs_a_hook_one_budget_however_much_is_kept' (42468) panicked at crates\cctg\tests\spool_e2e.rs:435:5:
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+pass=7 fail=1

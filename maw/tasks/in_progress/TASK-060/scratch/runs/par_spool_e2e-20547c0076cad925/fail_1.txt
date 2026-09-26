@@ -1,0 +1,23 @@
+
+running 4 tests
+test a_silent_hub_costs_a_hook_one_budget_however_much_is_kept ... FAILED
+test the_agent_delivers_its_sessions_kept_start_when_it_registers ... ok
+test a_missed_session_start_reaches_the_hub_before_the_next_hook ... ok
+test the_spool_holds_no_text_and_is_bounded ... ok
+
+failures:
+
+---- a_silent_hub_costs_a_hook_one_budget_however_much_is_kept stdout ----
+
+thread 'a_silent_hub_costs_a_hook_one_budget_however_much_is_kept' (42468) panicked at crates\cctg\tests\spool_e2e.rs:435:5:
+assertion `left == right` failed
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    a_silent_hub_costs_a_hook_one_budget_however_much_is_kept
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+

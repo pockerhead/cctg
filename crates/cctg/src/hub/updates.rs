@@ -132,6 +132,9 @@ pub struct CallbackInput {
     pub query_id: String,
     pub data: Option<String>,
     pub message_id: Option<i64>,
+    /// The topic of the pressed message, as [`Inbound::thread_id`]: `None`
+    /// in General or when Telegram did not say.
+    pub thread_id: Option<i64>,
     /// Who pressed, as [`Inbound::from_name`].
     pub from_name: Option<String>,
 }
@@ -277,10 +280,16 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         if !allowlist.contains(from.id) {
             return Routed::Ignored(Ignored::NotAllowed);
         }
+        let thread_id = query.message.as_ref().and_then(|message| {
+            message
+                .message_thread_id
+                .filter(|_| message.is_topic_message)
+        });
         return Routed::Callback(CallbackInput {
             query_id: query.id,
             data: query.data,
             message_id: query.message.map(|message| message.message_id),
+            thread_id,
             from_name: author_name(&from).filter(|_| allowlist.is_team()),
         });
     }
@@ -529,6 +538,7 @@ mod tests {
                 query_id: "q1".to_owned(),
                 data: Some("allow:abcde".to_owned()),
                 message_id: Some(10),
+                thread_id: Some(7),
                 from_name: None,
             })
         );

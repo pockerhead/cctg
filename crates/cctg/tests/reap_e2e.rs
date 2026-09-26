@@ -39,7 +39,9 @@ fn stand_in() {
 }
 
 fn root() -> PathBuf {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("reap-e2e");
+    // Per process: the target dir, and so this folder, is shared by
+    // concurrent runs (TASK-060).
+    let root = common::own_tmp().join("reap-e2e");
     std::fs::create_dir_all(root.join(".cctg")).unwrap();
     root
 }

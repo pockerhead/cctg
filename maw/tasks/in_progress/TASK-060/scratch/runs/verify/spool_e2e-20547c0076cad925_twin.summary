@@ -1,0 +1,4 @@
+test a_missed_session_start_reaches_the_hub_before_the_next_hook ... FAILED
+thread 'a_missed_session_start_reaches_the_hub_before_the_next_hook' (26216) panicked at crates\cctg\tests\spool_e2e.rs:137:10:
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.45s
+pass=19 fail=1

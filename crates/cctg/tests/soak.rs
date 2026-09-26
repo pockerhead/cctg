@@ -827,6 +827,7 @@ impl Soak {
                 query_id: query,
                 data: Some(data.to_owned()),
                 message_id: Some(message_id),
+                thread_id: None,
                 from_name: None,
             }));
             return;
