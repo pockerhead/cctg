@@ -444,6 +444,11 @@ struct Agent {
 
 impl Agent {
     async fn connect(hub: &Hub, session: &str, pid: u32) -> Self {
+        Self::connect_with(hub, session, pid, false).await
+    }
+
+    /// `status_lines`: the agent passes status line numbers on (TASK-058).
+    async fn connect_with(hub: &Hub, session: &str, pid: u32, status_lines: bool) -> Self {
         let stream = TcpStream::connect(hub.agent_addr).await.unwrap();
         let (read, mut write) = stream.into_split();
         let hello = AgentMsg::Hello {
@@ -462,6 +467,7 @@ impl Agent {
             client: None,
             files: false,
             session_reads: false,
+            status_lines,
             heartbeat: false,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
@@ -805,6 +811,96 @@ async fn a_restarted_hub_keeps_its_status_message_and_the_numbers() {
     let ops = hub.fake.ops();
     assert!(status_sends(&ops).is_empty(), "{ops:#?}");
     assert!(pins(&ops).is_empty(), "{ops:#?}");
+}
+
+/// TASK-058: an agent that announces `status_lines` is told its session,
+/// again after `/clear`, and the numbers it sends for that session show
+/// like the hook's; numbers for another session are dropped. An agent
+/// without it is never told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn numbers_over_the_agent_link_show_like_the_hooks_numbers() {
+    let hub = start_hub("link-numbers", Duration::from_millis(50)).await;
+    hub.start(A, 10).await;
+    let mut agent = Agent::connect_with(&hub, A, 10, true).await;
+    assert_eq!(
+        agent.next().await,
+        Some(HubMsg::Bound {
+            session_id: A.into()
+        })
+    );
+    let status = hub.status_message(100).await;
+    // A live top-level session with its own status message, whose numbers
+    // would show if A's link could send them.
+    let other = "0a16e2e0-0000-4000-8000-000000000293";
+    hub.start(other, 11).await;
+    let other_status = hub.status_message(101).await;
+    assert_ne!(status, other_status);
+    let numbers = |session: &str, context| AgentMsg::StatusLine {
+        session_id: session.into(),
+        model: Some("Opus 5.5".into()),
+        effort: Some("high".into()),
+        context: Some(context),
+        five_hour: Some(3),
+        seven_day: Some(92),
+    };
+    // Another live session's numbers first: dropped.
+    agent.send(numbers(other, 77)).await;
+    agent.send(numbers(A, 50)).await;
+    hub.shows(
+        "numbers from the link shown",
+        status,
+        shown(
+            &format!(
+                "💤 Ждёт вас
+{NUMBERS}"
+            ),
+            &[],
+        ),
+    )
+    .await;
+    // Frames of one link are handled in order and edits go every 50 ms.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !hub.fake.ops().iter().any(|op| matches!(
+            op,
+            Op::Send { text, .. } | Op::Edit { text, .. } if text.contains("ctx 77%")
+        )),
+        "numbers of another session shown"
+    );
+    // `/clear`: the same claude process runs a new session.
+    hub.hook(
+        A,
+        HookEvent::SessionEnd {
+            reason: Some("clear".into()),
+            claude_pid: Some(10),
+        },
+    )
+    .await;
+    hub.hook(
+        B,
+        HookEvent::SessionStart {
+            source: Some("clear".into()),
+            claude_pid: Some(10),
+            parent_claude_pid: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        agent.next().await,
+        Some(HubMsg::Bound {
+            session_id: B.into()
+        })
+    );
+    agent.send(numbers(B, 60)).await;
+    hub.until("the new session's numbers shown", |ops| {
+        ops.iter().any(|op| {
+            matches!(op, Op::Send { text, .. } | Op::Edit { text, .. } if text.contains("ctx 60%"))
+        })
+    })
+    .await;
+    // An agent built before TASK-058 is never told its session.
+    let mut old = Agent::connect(&hub, other, 11).await;
+    assert!(old.quiet().await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

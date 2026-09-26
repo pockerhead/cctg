@@ -175,6 +175,7 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
                 client: None,
                 files: false,
                 session_reads: false,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,

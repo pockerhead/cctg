@@ -162,6 +162,7 @@ async fn command_logs_carry_no_paths() {
                 client: None,
                 files: false,
                 session_reads: true,
+                status_lines: false,
                 heartbeat: false,
             },
             to_agent,
