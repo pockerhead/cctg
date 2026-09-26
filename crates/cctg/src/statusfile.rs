@@ -122,11 +122,10 @@ pub fn write(state_dir: &Path, session: &str, numbers: &HookEvent) -> std::io::R
         })
 }
 
-/// When the numbers of `session` last changed, and the numbers; `None`
-/// without a readable file of that session.
-pub fn read(state_dir: &Path, session: &str) -> Option<(SystemTime, HookEvent)> {
+/// The numbers of `session`; `None` without a readable file of that
+/// session.
+pub fn read(state_dir: &Path, session: &str) -> Option<HookEvent> {
     let path = numbers_path(state_dir, session)?;
-    let changed = std::fs::metadata(&path).ok()?.modified().ok()?;
     let mut body = Vec::new();
     std::io::Read::read_to_end(
         &mut std::io::Read::take(std::fs::File::open(&path).ok()?, MAX_FILE + 1),
@@ -138,13 +137,7 @@ pub fn read(state_dir: &Path, session: &str) -> Option<(SystemTime, HookEvent)> 
     }
     let file: StatusFile = serde_json::from_slice(&body).ok()?;
     (file.session_id == session && matches!(file.numbers, HookEvent::StatusLine { .. }))
-        .then_some((changed, file.numbers))
-}
-
-/// When the numbers file of `session` last changed; `None` without one.
-pub fn changed(state_dir: &Path, session: &str) -> Option<SystemTime> {
-    let path = numbers_path(state_dir, session)?;
-    std::fs::metadata(path).ok()?.modified().ok()
+        .then_some(file.numbers)
 }
 
 /// Renews the agent's mark for `session`.
@@ -238,16 +231,20 @@ mod tests {
         let state = state("replace");
         assert_eq!(read(&state, S), None);
         write(&state, S, &numbers(10)).unwrap();
-        let (first, got) = read(&state, S).unwrap();
-        assert_eq!(got, numbers(10));
+        assert_eq!(read(&state, S), Some(numbers(10)));
         write(&state, S, &numbers(20)).unwrap();
-        assert_eq!(read(&state, S).unwrap().1, numbers(20));
-        assert!(changed(&state, S).unwrap() >= first);
+        assert_eq!(read(&state, S), Some(numbers(20)));
         // The same numbers leave the file as it is.
-        let before = changed(&state, S).unwrap();
+        let changed = || {
+            std::fs::metadata(dir(&state).join(format!("{S}.json")))
+                .unwrap()
+                .modified()
+                .unwrap()
+        };
+        let before = changed();
         std::thread::sleep(Duration::from_millis(20));
         write(&state, S, &numbers(20)).unwrap();
-        assert_eq!(changed(&state, S).unwrap(), before);
+        assert_eq!(changed(), before);
         // Another session's name, a file of another session, bad names.
         assert_eq!(read(&state, "other"), None);
         std::fs::copy(

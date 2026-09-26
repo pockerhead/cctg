@@ -559,10 +559,7 @@ mod tests {
         let (session, _, _, numbers) = event(&sample()).unwrap();
         // A hub on another machine is never posted to, agent or not.
         assert!(!hand_over(&config("hub.example:47292"), &session, &numbers));
-        assert_eq!(
-            statusfile::read(&state, &session).map(|(_, kept)| kept),
-            Some(numbers.clone())
-        );
+        assert_eq!(statusfile::read(&state, &session), Some(numbers.clone()));
         // A hub on this machine: posted to until an agent marks the session.
         assert!(hand_over(&config("127.0.0.1:47292"), &session, &numbers));
         statusfile::mark(&state, &session).unwrap();
