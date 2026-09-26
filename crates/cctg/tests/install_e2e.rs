@@ -29,6 +29,8 @@ mod common;
 const SECRET: &str = r#"in'st$HOME#"x\y`z-0123456789"#;
 const TOKEN: &str = "123456:install-e2e-token-value";
 const EXE: &str = std::env::consts::EXE_SUFFIX;
+/// The line install.sh adds to the shell's start file (TASK-052).
+const PATH_LINE: &str = "export PATH=\"$HOME/.local/bin:$PATH\" # cctg";
 const EVENTS: [&str; 10] = [
     "PermissionRequest",
     "PostToolUse",
@@ -339,6 +341,14 @@ fn install_update_and_uninstall_a_device() {
     std::fs::create_dir_all(run.wrapper().parent().unwrap()).unwrap();
     std::fs::write(run.wrapper(), "#!/bin/sh\necho handmade\n").unwrap();
     let claude_json = run.home.join(".claude.json");
+    // The user's shell start file: the PATH line joins it once and leaves
+    // it as it was (Git Bash: ~/.bashrc whatever the shell).
+    run.env("SHELL", "/bin/zsh");
+    let rc = run
+        .home
+        .join(if cfg!(windows) { ".bashrc" } else { ".zshrc" });
+    let rc_mine = "# mine\nalias ll='ls -l'\n";
+    std::fs::write(&rc, rc_mine).unwrap();
     let untouched = || {
         assert_eq!(
             std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
@@ -370,6 +380,12 @@ fn install_update_and_uninstall_a_device() {
     );
     assert_eq!(std::fs::read(run.exe()).unwrap(), this_build());
     untouched();
+    assert_eq!(
+        std::fs::read_to_string(&rc).unwrap(),
+        format!("{rc_mine}{PATH_LINE}\n"),
+        "{text}"
+    );
+    assert!(text.contains("to PATH in "), "{text}");
 
     let conf = run.cctg_dir().join("claude");
     let mcp: Value =
@@ -470,6 +486,7 @@ fn install_update_and_uninstall_a_device() {
         run.cctg_dir().join("device.env"),
         run.wrapper(),
         run.exe(),
+        rc.clone(),
     ];
     let before: Vec<_> = files.iter().map(|file| modified(file)).collect();
     std::thread::sleep(Duration::from_millis(1100));
@@ -562,6 +579,7 @@ fn install_update_and_uninstall_a_device() {
     );
     assert!(run.cctg_dir().join("keep.txt").exists());
     untouched();
+    assert_eq!(std::fs::read_to_string(&rc).unwrap(), rc_mine, "{text}");
 }
 
 /// A hub that drops every connection: `cctg doctor` fails at once.
@@ -632,6 +650,91 @@ fn uninstall_keeps_what_the_script_did_not_write() {
     assert!(run.wrapper().parent().unwrap().is_dir());
 }
 
+/// In a container the host name is its id (TASK-052): with --yes the name
+/// comes from CCTG_HOST, and --host replaces whatever is there.
+#[test]
+fn a_container_gets_its_host_name_written() {
+    let root = Root::new("container");
+    let dist = root.dir("dist");
+    release(&dist, &this_build());
+    let (base, _) = serve(dist);
+    let hub = closed_hub();
+    let mut run = Run::new(&root);
+    run.env("CCTG_INSTALL_BASE_URL", &base)
+        .env("CCTG_HUB_SECRET", SECRET)
+        // What Podman and systemd-nspawn put in a container's environment.
+        .env("container", "docker");
+    run.fake_program("claude", FAKE_CLAUDE);
+    let args = ["--yes", "--agent-addr", &hub, "--hook-addr", &hub];
+    let with_host = [&args[..], &["--host", "box-2"]].concat();
+    let device_env = run.cctg_dir().join("device.env");
+    let env = || std::fs::read_to_string(&device_env).unwrap();
+    let hosts = |env: &str| -> Vec<String> {
+        env.lines()
+            .filter(|line| line.contains("CCTG_HOST"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    if cfg!(target_os = "macos") {
+        // A Mac is never a container: the sign is ignored and the Mac's
+        // own name is written, as without it.
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("warning: in a container"), "{text}");
+        let hosts = hosts(&env());
+        assert_eq!(hosts.len(), 2, "{hosts:?}");
+        assert_eq!(
+            hosts[0],
+            "# the CCTG_HOST line below: written by install.sh (macOS gives cctg no host name)"
+        );
+    } else {
+        // No name anywhere: a warning, nothing written.
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("warning: in a container"), "{text}");
+        assert!(hosts(&env()).is_empty(), "{}", env());
+
+        run.env("CCTG_HOST", "dev-box");
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(!text.contains("warning: in a container"), "{text}");
+        assert_eq!(
+            hosts(&env()),
+            [
+                "# the CCTG_HOST line below: written by install.sh (in a container the host name is its id)",
+                "CCTG_HOST=dev-box"
+            ]
+        );
+        // Once written it stays.
+        run.env("CCTG_HOST", "other-name");
+        let (output, text) = run.install(&args);
+        assert!(output.status.success(), "{text}");
+        assert!(env().contains("CCTG_HOST=dev-box\n"), "{}", env());
+    }
+
+    // --host replaces our line, and a line the user wrote as well.
+    let mine = format!("{}CCTG_HOST=mine\n", env());
+    std::fs::write(&device_env, mine).unwrap();
+    let (output, text) = run.install(&with_host);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(
+        hosts(&env()),
+        [
+            "# the CCTG_HOST line below: written by install.sh (--host)",
+            "CCTG_HOST=box-2"
+        ]
+    );
+    let again = env();
+    let (output, text) = run.install(&with_host);
+    assert!(output.status.success(), "{text}");
+    assert_eq!(env(), again, "the same --host changed the file");
+
+    let (output, text) = run.install(&["--uninstall"]);
+    assert!(output.status.success(), "{text}");
+    assert!(!device_env.exists(), "{text}");
+}
+
 #[test]
 fn missing_or_bad_settings_without_a_terminal_write_nothing() {
     let root = Root::new("refused");
@@ -642,8 +745,10 @@ fn missing_or_bad_settings_without_a_terminal_write_nothing() {
     std::fs::write(&empty, "\nthe secret on line two\n").unwrap();
     let empty = empty.to_string_lossy().into_owned();
     let local = ["--agent-addr", "127.0.0.1:9", "--hook-addr", "127.0.0.1:9"];
-    let cases: [(&[&str], Option<&str>, &str); 4] = [
+    let bad_host = [&local[..], &["--host", "my box"]].concat();
+    let cases: [(&[&str], Option<&str>, &str); 5] = [
         (&local, None, "no hub secret"),
+        (&bad_host, Some(SECRET), "the host name takes"),
         (&["--hub-host", "192.0.2.10"], Some(SECRET), "needs --pin"),
         (
             &["--hub-host", "192.0.2.10", "--pin", "0123abcd"],

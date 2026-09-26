@@ -317,6 +317,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         gather_quiet: slots::GATHER_QUIET,
         gather_max: slots::GATHER_MAX,
         inbound_settle: slots::INBOUND_SETTLE,
+        channel_wait: slots::CHANNEL_WAIT,
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);

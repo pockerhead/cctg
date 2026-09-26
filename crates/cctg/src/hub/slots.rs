@@ -137,6 +137,15 @@
 //! while the slot had no live session, or left behind by a full link queue
 //! before the burst began, go one by one as before, without waiting for it.
 //!
+//! Channel off (TASK-052): Claude Code drops channel messages silently when
+//! it was started without the channel flag or its dialog was not confirmed.
+//! Texts handed to a streamed session while no turn runs expect a sign that
+//! Claude took them: a channel record in the stream, a turn in the stream or
+//! a `UserPromptSubmit`, `PreToolUse` or `Stop` hook. When the stream has
+//! read the transcript to its end `Options::channel_wait` after the hand-over
+//! and none came, the topic gets [`CHANNEL_OFF_NOTICE`], once per session
+//! until one of its channel records shows up.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
 
@@ -278,6 +287,16 @@ const MAX_GATHER_BYTES: usize = 128 * 1024;
 /// hub at once (whether `UserPromptSubmit` fires for a channel message is not
 /// verified), and a command typed into it would mix with it.
 pub const INBOUND_SETTLE: Duration = Duration::from_secs(3);
+/// Topic texts handed to a session with no turn running that show no sign
+/// of being taken within this long mean its channel is off (TASK-052).
+pub const CHANNEL_WAIT: Duration = Duration::from_secs(20);
+/// Told once per session when its messages go nowhere (TASK-052).
+pub const CHANNEL_OFF_NOTICE: &str = "Сообщение передано в сессию, но Claude его не получил: \
+похоже, канал cctg в этой сессии не включён (claude запущен без флага \
+--dangerously-load-development-channels, то есть не через claude-cctg, или при запуске не \
+подтверждён диалог development channels). Выйдите из claude (/exit), запустите claude-cctg \
+--continue в той же папке и подтвердите диалог при запуске. Сообщения, отправленные до этого, \
+пришлите ещё раз.";
 
 /// The channel message after a restart that cut off work or stopped the
 /// background subagents `agents` (TASK-047).
@@ -352,6 +371,9 @@ pub struct Options {
     /// [`INBOUND_SETTLE`] in the hub; `ZERO`: a command right after a text
     /// is typed.
     pub inbound_settle: Duration,
+    /// [`CHANNEL_WAIT`] in the hub; `ZERO`: the channel is never reported
+    /// off.
+    pub channel_wait: Duration,
 }
 
 /// A burst of topic messages of a slot being gathered into one inbound
@@ -423,6 +445,7 @@ impl Default for Options {
             gather_quiet: Duration::ZERO,
             gather_max: Duration::ZERO,
             inbound_settle: Duration::ZERO,
+            channel_wait: Duration::ZERO,
         }
     }
 }
@@ -852,6 +875,12 @@ pub struct Slots {
     /// When topic texts last went to a session, within
     /// `Options::inbound_settle`.
     handed_at: HashMap<String, Instant>,
+    /// Streamed sessions that got topic texts while no turn ran, since
+    /// when, until a sign that Claude took them (see [`Self::check_channel`]).
+    unseen: HashMap<String, Instant>,
+    /// Sessions whose topic got [`CHANNEL_OFF_NOTICE`]; told again only
+    /// after one of their channel records showed up.
+    channel_off_told: HashSet<String>,
     /// Transfers to agents of this run.
     transfers: u64,
     /// Files coming from agents, one per connection.
@@ -933,6 +962,8 @@ impl Slots {
             link_losses: HashMap::new(),
             gathers: HashMap::new(),
             handed_at: HashMap::new(),
+            unseen: HashMap::new(),
+            channel_off_told: HashSet::new(),
             transfers: 0,
             uploads: HashMap::new(),
             file_bytes: 0,
@@ -1437,6 +1468,16 @@ impl Slots {
         ) {
             self.prompts.quiet(session);
         }
+        if matches!(
+            post.event,
+            HookEvent::Stop { .. }
+                | HookEvent::UserPromptSubmit { .. }
+                | HookEvent::ToolStart { .. }
+        ) {
+            // A turn runs or ran: texts handed to the session were taken or
+            // wait in Claude Code's queue behind it.
+            self.unseen.remove(session);
+        }
         if let HookEvent::Stop {
             last_assistant_message: Some(answer),
             ..
@@ -1480,6 +1521,10 @@ impl Slots {
             .retain(|session, _| registry.is_live_top_level(session));
         self.started_agents
             .retain(|_, (session, _)| registry.is_live_top_level(session));
+        self.unseen
+            .retain(|session, _| registry.is_live_top_level(session));
+        self.channel_off_told
+            .retain(|session| registry.is_live_top_level(session));
         self.close_prompts(&followup.ended_sessions);
         self.end_blocks(&followup.ended_sessions);
         if let Some((session, path)) = followup.read_title {
@@ -2489,6 +2534,7 @@ impl Slots {
                         break;
                     }
                     self.mark_handed(&session);
+                    self.expect_taken(&session);
                     (parts, true)
                 }
             };
@@ -3531,6 +3577,8 @@ impl Slots {
             for held in held {
                 self.release(session, held);
             }
+            // Nor any channel record.
+            self.check_channel(session);
             return;
         }
         live.missing_warned = false;
@@ -3577,6 +3625,10 @@ impl Slots {
         let mut read_to = to;
         let mut stopped = false;
         let mut interrupted = false;
+        // Signs that texts handed to the session were taken (TASK-052): a
+        // channel record (any: the channel works) or a turn typed here.
+        let mut channel_seen = false;
+        let mut turn_seen = false;
         for (index, line) in lines.iter().enumerate() {
             // The first line always goes (the read was asked with room); the
             // rest wait in the file while Telegram is behind.
@@ -3598,6 +3650,10 @@ impl Slots {
                     }
                 }
             }
+            channel_seen |= line
+                .items
+                .iter()
+                .any(|item| matches!(item, StreamItem::Channel { .. }));
             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
                 match step {
                     Step::Send {
@@ -3629,7 +3685,10 @@ impl Slots {
                             actions.push(Action::React(part));
                         }
                     }
-                    Step::NewTurn => live.lapse_ends(now + hold),
+                    Step::NewTurn => {
+                        turn_seen = true;
+                        live.lapse_ends(now + hold);
+                    }
                     // The held answer goes right after the lines of its turn.
                     Step::TurnEnd => {
                         if let Some(held) = live.turn_end(line.end) {
@@ -3671,6 +3730,14 @@ impl Slots {
             // Esc ended the turn like Stop does, also at an open prompt.
             self.prompts.quiet(session);
             self.sync_waiting(session);
+        }
+        if channel_seen {
+            self.channel_off_told.remove(session);
+        }
+        if channel_seen || turn_seen {
+            self.unseen.remove(session);
+        } else if !more && !stopped {
+            self.check_channel(session);
         }
         self.stream_answered(session);
     }
@@ -4811,6 +4878,53 @@ impl Slots {
         let now = Instant::now();
         self.handed_at.retain(|_, at| now < *at + settle);
         self.handed_at.insert(session.to_owned(), now);
+    }
+
+    /// Topic texts went to `session` now. Unless a turn runs (they wait in
+    /// Claude Code's queue then), a sign that Claude took them is expected
+    /// within `Options::channel_wait` (TASK-052): their channel record in
+    /// the stream, or a turn. Only a streamed session can show the record,
+    /// and a session already told waits for a record first.
+    fn expect_taken(&mut self, session: &str) {
+        if self.options.channel_wait.is_zero()
+            || self.busy(session)
+            || self.channel_off_told.contains(session)
+            || self.stream_target(session).is_none()
+        {
+            return;
+        }
+        self.unseen
+            .entry(session.to_owned())
+            .or_insert_with(Instant::now);
+    }
+
+    /// The stream of `session` has just read its transcript to the end:
+    /// texts handed to it `Options::channel_wait` ago and still without a
+    /// sign that Claude took them mean Claude Code drops the channel's
+    /// messages (started without the channel flag, or its dialog not
+    /// confirmed). The topic is told once.
+    fn check_channel(&mut self, session: &str) {
+        let Some(&since) = self.unseen.get(session) else {
+            return;
+        };
+        if Instant::now() < since + self.options.channel_wait {
+            return;
+        }
+        let Some(slot) = self.current_slot(session) else {
+            return;
+        };
+        let Some(thread_id) = self.registry.slot(slot).and_then(|entry| entry.topic_id) else {
+            return;
+        };
+        if self.send_messages(vec![message_op(thread_id, CHANNEL_OFF_NOTICE.to_owned())]) {
+            self.unseen.remove(session);
+            self.channel_off_told.insert(session.to_owned());
+            info!(
+                ordinal = self.ordinal(slot),
+                session = short(session),
+                "session took no forwarded message; the topic is told its channel seems off"
+            );
+        }
     }
 
     /// A permission prompt of the session waits.
@@ -11564,6 +11678,102 @@ again"
         append(&path, &typed("later"));
         stream_texts(&rig, 100, 2).await;
         assert_eq!(reactions(&rig.fake.ops()).len(), 2);
+    }
+
+    fn channel_off_options() -> Options {
+        Options {
+            channel_wait: Duration::from_millis(300),
+            ..stream_options()
+        }
+    }
+
+    fn channel_off_notices(ops: &[Op]) -> usize {
+        topic_texts(ops, 100)
+            .iter()
+            .filter(|text| *text == CHANNEL_OFF_NOTICE)
+            .count()
+    }
+
+    /// TASK-052: messages Claude Code drops (no channel) give the topic one
+    /// notice, and another only after a message of the session was taken.
+    #[tokio::test]
+    async fn a_message_nobody_takes_tells_the_topic_once_until_one_is_taken() {
+        let dir = TempDir::new("slots-channel-off");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), channel_off_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let mut kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+
+        rig.control.send(say(Some(100), 42, Some("hi"))).unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        let asked = std::time::Instant::now();
+        settled(&rig, |ops| channel_off_notices(ops) == 1).await;
+        assert!(asked.elapsed() >= Duration::from_millis(250), "told early");
+
+        // More messages that go nowhere: no second notice.
+        rig.control.send(say(Some(100), 43, Some("again"))).unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(channel_off_notices(&rig.fake.ops()), 1);
+
+        // The channel works again (claude-cctg --continue): its record ends
+        // the told period; the next message that goes nowhere is told again.
+        append(&path, &channel_record(44));
+        rig.control.send(say(Some(100), 44, Some("back"))).unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        settled(&rig, |ops| {
+            reactions(ops).contains(&(44, stream::WORKING.to_owned()))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(channel_off_notices(&rig.fake.ops()), 1);
+        rig.control.send(say(Some(100), 45, Some("lost"))).unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        settled(&rig, |ops| channel_off_notices(ops) == 2).await;
+    }
+
+    /// TASK-052: a message handed during a turn waits in Claude Code's queue,
+    /// and a turn or a channel record after a hand-over means it was taken.
+    #[tokio::test]
+    async fn a_message_during_a_turn_or_one_taken_tells_nothing() {
+        let dir = TempDir::new("slots-channel-on");
+        let path = transcript_file(&dir, A);
+        let mut rig = stream_rig(Fake::default(), channel_off_options(), dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        rig.ops_after(1).await;
+        let mut kept = rig.reader(1, A, 10).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
+
+        // A long turn runs: the message waits in its queue.
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        rig.control
+            .send(say(Some(100), 50, Some("queued")))
+            .unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        rig.hook(stop(A, None)).await;
+
+        // Taken: its channel record shows up.
+        rig.control.send(say(Some(100), 51, Some("taken"))).unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        append(&path, &channel_record(51));
+        settled(&rig, |ops| {
+            reactions(ops).contains(&(51, stream::WORKING.to_owned()))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(channel_off_notices(&rig.fake.ops()), 0);
+
+        // Taken: a turn starts (its UserPromptSubmit).
+        rig.control.send(say(Some(100), 52, Some("turn"))).unwrap();
+        assert!(matches!(kept.recv().await, Some(HubMsg::Inbound { .. })));
+        rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
+            .await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(channel_off_notices(&rig.fake.ops()), 0);
     }
 
     #[tokio::test]
