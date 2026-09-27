@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cctg::hub::api::{ApiError, ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -209,6 +210,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
     for message_id in 1..=3 {
         control
             .send(Control::TopicEdited {
+                chat: Chat::Group,
                 thread_id: Some(100),
                 message_id,
             })

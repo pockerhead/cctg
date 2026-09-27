@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
 use cctg::hub::buffer::{RESUMED_TEXT, resume_text};
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress::serve_agents;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -81,6 +82,7 @@ fn post(event: HookEvent) -> HookPost {
 
 fn say(message_id: i64, text: &str) -> Control {
     Control::Message(Inbound {
+        chat: Chat::Group,
         message_id,
         thread_id: Some(100),
         text: Some(text.into()),
@@ -111,7 +113,6 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
     let store = RegistryStore::open(&state).expect("store");
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: -1000000000001,
         ..Options::default()
     };
     let slots = Slots::new(store.load().expect("load"), store, outbox, options);
@@ -279,7 +280,6 @@ async fn a_burst_reaches_a_live_session_over_tcp_as_one_inbound() {
     let store = RegistryStore::open(&state).expect("store");
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: -1000000000001,
         gather_quiet: GATHER_QUIET,
         gather_max: GATHER_MAX,
         ..Options::default()

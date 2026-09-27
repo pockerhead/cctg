@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "seq": 5,
+  "slots": [
+    {
+      "host": "box",
+      "folder_key": "c:/work/project",
+      "folder_name": "Project",
+      "ordinal": 1,
+      "topic_id": 100,
+      "current_session": "aaaaaaaa-0000-4000-8000-000000000001",
+      "applied_title": "[box] Project · aaaaaaaa",
+      "applied_icon": "5357121491508928442",
+      "pending_separator": null,
+      "buffer": {
+        "messages": [
+          {
+            "message_id": 7,
+            "thread_id": 100,
+            "text": "kept",
+            "reply_to": 6,
+            "quote": "q",
+            "forwarded": true,
+            "from_name": "mate"
+          },
+          {
+            "message_id": 8,
+            "thread_id": 100,
+            "text": "",
+            "file": {
+              "kind": "photo",
+              "file_id": "f1",
+              "size": 10
+            }
+          }
+        ],
+        "overflow_told": false,
+        "queued_told": true,
+        "resume": {
+          "session": "aaaaaaaa-0000-4000-8000-000000000001",
+          "number": 1,
+          "message_id": 900
+        },
+        "resume_asked": false
+      },
+      "status": {
+        "message_id": 500,
+        "pinned": true
+      }
+    },
+    {
+      "host": "box",
+      "folder_key": "c:/work/project",
+      "folder_name": "Project",
+      "ordinal": 2,
+      "topic_id": 101,
+      "current_session": "bbbbbbbb-0000-4000-8000-000000000002",
+      "applied_title": "[box] Project #2 · bbbbbbbb",
+      "applied_icon": "5357121491508928442",
+      "pending_separator": "── session bbbbbbbb · resumed ──"
+    },
+    {
+      "host": "box",
+      "folder_key": "/work/other",
+      "folder_name": "other",
+      "ordinal": 1,
+      "topic_id": null,
+      "current_session": "eeeeeeee-0000-4000-8000-00000000000e",
+      "applied_title": null,
+      "applied_icon": null,
+      "pending_separator": null
+    }
+  ],
+  "sessions": {
+    "aaaaaaaa-0000-4000-8000-000000000001": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 0,
+      "transcript_path": "/t/aaaaaaaa-0000-4000-8000-000000000001.jsonl",
+      "claude_pid": 10,
+      "title": "Some title",
+      "ended": false,
+      "seen": 1,
+      "stream": {
+        "offset": 4096,
+        "calls": [
+          {
+            "id": "toolu_1",
+            "line": "• Bash: ls",
+            "done": true
+          }
+        ],
+        "receipts": [
+          5,
+          8
+        ],
+        "parts": [
+          [
+            8,
+            [
+              6,
+              7
+            ]
+          ]
+        ]
+      }
+    },
+    "bbbbbbbb-0000-4000-8000-000000000002": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 1,
+      "transcript_path": "/t/bbbbbbbb-0000-4000-8000-000000000002.jsonl",
+      "claude_pid": 11,
+      "title": null,
+      "ended": false,
+      "seen": 2,
+      "stream": {
+        "offset": 0,
+        "calls": [],
+        "receipts": []
+      }
+    },
+    "dddddddd-0000-4000-8000-000000000009": {
+      "host": "box",
+      "kind": {
+        "kind": "nested",
+        "parent": "aaaaaaaa-0000-4000-8000-000000000001"
+      },
+      "slot": 0,
+      "transcript_path": "/t/dddddddd-0000-4000-8000-000000000009.jsonl",
+      "claude_pid": 20,
+      "title": null,
+      "ended": false,
+      "seen": 3,
+      "block": {
+        "header": "⇣ nested dddddddd",
+        "thread_id": 100,
+        "message_id": 502,
+        "pending": null,
+        "running": true,
+        "sending": false
+      }
+    },
+    "eeeeeeee-0000-4000-8000-00000000000e": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 2,
+      "transcript_path": "/t/eeeeeeee-0000-4000-8000-00000000000e.jsonl",
+      "claude_pid": 30,
+      "title": null,
+      "ended": false,
+      "seen": 4,
+      "stream": {
+        "offset": 0,
+        "calls": [],
+        "receipts": []
+      }
+    }
+  },
+  "subagents": {
+    "a1": {
+      "parent_session": "aaaaaaaa-0000-4000-8000-000000000001",
+      "slot": 0,
+      "block": {
+        "header": "↳ Explore a1: look",
+        "thread_id": 100,
+        "message_id": 501,
+        "pending": "↳ Explore a1: look\ndone",
+        "running": false,
+        "sending": false
+      },
+      "seen": 5
+    }
+  },
+  "pids": {
+    "box/10": "aaaaaaaa-0000-4000-8000-000000000001",
+    "box/11": "bbbbbbbb-0000-4000-8000-000000000002",
+    "box/20": "dddddddd-0000-4000-8000-000000000009",
+    "box/30": "eeeeeeee-0000-4000-8000-00000000000e"
+  }
+}

@@ -118,7 +118,6 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     let store = RegistryStore::open(&state).expect("store");
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: CHAT,
         ..Options::default()
     };
     let slots = Slots::new(store.load().expect("load"), store, outbox, options);
@@ -186,6 +185,10 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         !saved.contains(&USER.to_string()),
         "no user id in the saved buffer"
     );
+    assert!(
+        !saved.contains(&CHAT.to_string()),
+        "no chat id in the saved buffer"
+    );
     let (to_agent, mut to_agent_rx) = mpsc::channel(4);
     agents
         .send(AgentEvent::Registered {
@@ -216,6 +219,17 @@ async fn message_logs_carry_no_text_and_no_user_id() {
     assert!(
         matches!(got, Some(HubMsg::Inbound { ref content, .. }) if *content == offline_text),
         "{got:?}"
+    );
+    // TASK-061: the session learns the place, never a chat id.
+    let Some(HubMsg::Inbound { meta, .. }) = &got else {
+        panic!("{got:?}");
+    };
+    assert_eq!(meta.get("place").map(String::as_str), Some("group"));
+    assert!(!meta.contains_key("chat_id"), "{meta:?}");
+    assert!(
+        meta.values()
+            .all(|value| !value.contains(&CHAT.unsigned_abs().to_string())),
+        "{meta:?}"
     );
     control
         .send(topic_message(2, &inbound_text))
@@ -323,6 +337,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         forwarded_text.as_str(),
         "private",
         &USER.to_string(),
+        &CHAT.unsigned_abs().to_string(),
     ] {
         assert!(!logs.contains(private), "{private} in logs: {logs}");
     }

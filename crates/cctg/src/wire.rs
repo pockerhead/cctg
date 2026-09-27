@@ -568,6 +568,10 @@ pub enum StreamItem {
     },
     Channel {
         message_id: i64,
+        /// Its tag says `place="private"` (TASK-061); absent for the group,
+        /// so a group record reads as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        private: bool,
     },
     Note {
         text: String,
@@ -1399,7 +1403,10 @@ mod tests {
                     end: 20,
                     items: vec![
                         StreamItem::Prompt { text: "p".into() },
-                        StreamItem::Channel { message_id: 7 },
+                        StreamItem::Channel {
+                            message_id: 7,
+                            private: false,
+                        },
                         StreamItem::Note { text: "n".into() },
                         StreamItem::Call {
                             id: "t1".into(),
@@ -1907,7 +1914,13 @@ mod tests {
                 to: 9,
                 lines: vec![StreamLine {
                     end: 9,
-                    items: vec![StreamItem::Other, StreamItem::Channel { message_id: 3 }],
+                    items: vec![
+                        StreamItem::Other,
+                        StreamItem::Channel {
+                            message_id: 3,
+                            private: false,
+                        }
+                    ],
                 }],
                 missing: false,
                 more: false,
@@ -2540,5 +2553,31 @@ mod tests {
         }
         assert!(EventId::try_from("A".repeat(32)).is_err());
         assert!(EventId::try_from("a".repeat(31)).is_err());
+    }
+
+    /// TASK-061: a channel record of the group goes on the wire as before
+    /// (old hubs read it), a private one names itself, and an old agent's
+    /// record reads as the group.
+    #[test]
+    fn a_channel_item_is_the_group_unless_it_says_private() {
+        let group = StreamItem::Channel {
+            message_id: 7,
+            private: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&group).unwrap(),
+            r#"{"kind":"channel","message_id":7}"#
+        );
+        let private = StreamItem::Channel {
+            message_id: 7,
+            private: true,
+        };
+        let text = serde_json::to_string(&private).unwrap();
+        assert_eq!(text, r#"{"kind":"channel","message_id":7,"private":true}"#);
+        assert_eq!(serde_json::from_str::<StreamItem>(&text).unwrap(), private);
+        assert_eq!(
+            serde_json::from_str::<StreamItem>(r#"{"kind":"channel","message_id":7}"#).unwrap(),
+            group
+        );
     }
 }

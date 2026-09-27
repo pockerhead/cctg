@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 use transcript::{SplitOptions, split_for_telegram};
 
 use super::api::{ApiError, Document};
+use super::chat::Place;
 use super::registry::{Registry, SessionKind};
 use super::scheduler::{Op, Outbox, Outcome};
 use super::updates::Inbound;
@@ -183,7 +184,7 @@ fn caption(command: &TranscriptCommand, short: &str) -> String {
 pub trait TranscriptSource: Send + Sync + 'static {
     fn prepare(
         &self,
-        thread_id: Option<i64>,
+        place: Place,
         command: TranscriptCommand,
     ) -> impl Future<Output = Prepared> + Send;
 }
@@ -192,7 +193,8 @@ pub trait TranscriptSource: Send + Sync + 'static {
 /// answered exactly once through `answer`.
 #[derive(Debug)]
 pub struct TranscriptAsk {
-    pub thread_id: Option<i64>,
+    /// Where the command was written.
+    pub place: Place,
     pub command: TranscriptCommand,
     pub answer: oneshot::Sender<Prepared>,
 }
@@ -202,10 +204,10 @@ pub struct TranscriptAsk {
 pub struct Asks(pub mpsc::Sender<TranscriptAsk>);
 
 impl TranscriptSource for Asks {
-    async fn prepare(&self, thread_id: Option<i64>, command: TranscriptCommand) -> Prepared {
+    async fn prepare(&self, place: Place, command: TranscriptCommand) -> Prepared {
         let (answer, answered) = oneshot::channel();
         let ask = TranscriptAsk {
-            thread_id,
+            place,
             command,
             answer,
         };
@@ -223,11 +225,7 @@ impl TranscriptSource for Asks {
 /// else the current session of the slot topic it was sent in, else (General,
 /// a topic that is no slot) the newest running top-level session. `Err`:
 /// the notice for the user. Only sessions the hub knows are found.
-pub fn resolve(
-    registry: &Registry,
-    thread_id: Option<i64>,
-    prefix: Option<&str>,
-) -> Result<String, String> {
+pub fn resolve(registry: &Registry, place: Place, prefix: Option<&str>) -> Result<String, String> {
     if let Some(prefix) = prefix {
         let mut found: Vec<_> = registry
             .sessions
@@ -258,7 +256,7 @@ pub fn resolve(
             }
         };
     }
-    if let Some(slot) = thread_id.and_then(|thread_id| registry.slot_by_topic(thread_id)) {
+    if let Some(slot) = registry.slot_by_topic(place) {
         return registry
             .slot(slot)
             .and_then(|slot| slot.current_session.clone())
@@ -374,13 +372,10 @@ async fn submit(outbox: &Outbox, op: Op) -> Result<Outcome, DeliveryError> {
         .map_err(DeliveryError::from)
 }
 
-pub async fn send_text(
-    outbox: &Outbox,
-    thread_id: Option<i64>,
-    text: String,
-) -> Result<(), DeliveryError> {
+pub async fn send_text(outbox: &Outbox, place: Place, text: String) -> Result<(), DeliveryError> {
     let op = Op::Send {
-        thread_id,
+        chat: place.chat,
+        thread_id: place.thread,
         text,
         html: None,
         reply_markup: None,
@@ -393,7 +388,7 @@ pub async fn send_text(
 
 async fn send_document(
     outbox: &Outbox,
-    thread_id: Option<i64>,
+    place: Place,
     reply: &Reply,
     text: String,
 ) -> Result<(), DeliveryError> {
@@ -405,7 +400,8 @@ async fn send_document(
     submit(
         outbox,
         Op::SendDocument {
-            thread_id,
+            chat: place.chat,
+            thread_id: place.thread,
             document,
             notify: false,
         },
@@ -423,17 +419,11 @@ fn is_too_long(error: &DeliveryError) -> bool {
     )
 }
 
-async fn send_delivery_failure_notice(
-    outbox: &Outbox,
-    thread_id: Option<i64>,
-    error: &DeliveryError,
-) {
+async fn send_delivery_failure_notice(outbox: &Outbox, place: Place, error: &DeliveryError) {
     if is_too_long(error) {
         return;
     }
-    if let Err(notice_error) =
-        send_text(outbox, thread_id, DELIVERY_FAILURE_NOTICE.to_owned()).await
-    {
+    if let Err(notice_error) = send_text(outbox, place, DELIVERY_FAILURE_NOTICE.to_owned()).await {
         warn!(%notice_error, "delivery failure notice failed");
     }
 }
@@ -442,17 +432,13 @@ async fn send_delivery_failure_notice(
 /// for it. When Telegram rejects a chunk as too long, the rest (that chunk and
 /// everything after it) goes as one document; that switch happens once and the
 /// document is never retried as text.
-pub async fn deliver(
-    outbox: &Outbox,
-    thread_id: Option<i64>,
-    reply: &Reply,
-) -> Result<(), DeliveryError> {
+pub async fn deliver(outbox: &Outbox, place: Place, reply: &Reply) -> Result<(), DeliveryError> {
     let split = split_for_telegram(&reply.body, SplitOptions::default());
     if split.prefer_file {
-        return send_document(outbox, thread_id, reply, reply.body.clone()).await;
+        return send_document(outbox, place, reply, reply.body.clone()).await;
     }
     for (index, chunk) in split.chunks.iter().enumerate() {
-        match send_text(outbox, thread_id, chunk.clone()).await {
+        match send_text(outbox, place, chunk.clone()).await {
             Ok(()) => {}
             Err(error) if is_too_long(&error) => {
                 warn!(
@@ -460,7 +446,7 @@ pub async fn deliver(
                     "telegram rejected a chunk as too long; sending the rest as a document"
                 );
                 let rest = split.chunks[index..].concat();
-                return send_document(outbox, thread_id, reply, rest).await;
+                return send_document(outbox, place, reply, rest).await;
             }
             Err(error) => return Err(error),
         }
@@ -479,7 +465,7 @@ pub async fn handle<S: TranscriptSource>(
     let Some(text) = input.text.as_deref() else {
         return;
     };
-    let thread_id = input.thread_id;
+    let place = input.place();
     let command = match parse(text, bot_username) {
         Parsed::NotOurs => {
             if text.trim_start().starts_with('/') {
@@ -488,9 +474,9 @@ pub async fn handle<S: TranscriptSource>(
             return;
         }
         Parsed::Usage => {
-            if let Err(error) = send_text(outbox, thread_id, USAGE.to_owned()).await {
+            if let Err(error) = send_text(outbox, place, USAGE.to_owned()).await {
                 warn!(%error, "usage reply failed");
-                send_delivery_failure_notice(outbox, thread_id, &error).await;
+                send_delivery_failure_notice(outbox, place, &error).await;
             }
             return;
         }
@@ -498,13 +484,13 @@ pub async fn handle<S: TranscriptSource>(
     };
     let view = command.view;
     let prompts = command.prompts;
-    let prepared = source.prepare(thread_id, command).await;
+    let prepared = source.prepare(place, command).await;
     let (result, session) = match &prepared {
         Prepared::Transcript(reply) => (
-            deliver(outbox, thread_id, reply).await,
+            deliver(outbox, place, reply).await,
             Some(reply.short_id.as_str()),
         ),
-        Prepared::Notice(notice) => (send_text(outbox, thread_id, notice.clone()).await, None),
+        Prepared::Notice(notice) => (send_text(outbox, place, notice.clone()).await, None),
     };
     match result {
         Ok(()) => info!(
@@ -515,7 +501,7 @@ pub async fn handle<S: TranscriptSource>(
         ),
         Err(error) => {
             warn!(?view, %error, "transcript command reply failed");
-            send_delivery_failure_notice(outbox, thread_id, &error).await;
+            send_delivery_failure_notice(outbox, place, &error).await;
         }
     }
 }
@@ -534,9 +520,17 @@ pub async fn serve<S: TranscriptSource>(
 
 #[cfg(test)]
 mod tests {
+    use crate::hub::chat::{Chat, Place};
+
+    const GENERAL: Place = Place {
+        chat: Chat::Group,
+        thread: None,
+    };
+
     #[test]
     fn only_our_commands_are_commands() {
         let input = |text: &str| crate::hub::updates::Inbound {
+            chat: Chat::Group,
             message_id: 1,
             thread_id: Some(2),
             text: Some(text.to_owned()),
@@ -653,7 +647,7 @@ mod tests {
     struct Rendered(String);
 
     impl TranscriptSource for Rendered {
-        async fn prepare(&self, _: Option<i64>, command: TranscriptCommand) -> Prepared {
+        async fn prepare(&self, _: Place, command: TranscriptCommand) -> Prepared {
             let body = expected(&self.0, command.view, command.prompts);
             transcript_reply(&command, SESSION, body)
         }
@@ -666,6 +660,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         for text in texts {
             tx.send(Inbound {
+                chat: Chat::Group,
                 message_id: 1,
                 thread_id: THREAD,
                 text: Some((*text).to_owned()),
@@ -745,6 +740,7 @@ mod tests {
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::SendDocument {
+                chat: Chat::Group,
                 thread_id,
                 document,
                 notify: false,
@@ -819,7 +815,7 @@ mod tests {
             session_prefix: None,
         };
         assert_eq!(
-            Asks(tx).prepare(None, command).await,
+            Asks(tx).prepare(GENERAL, command).await,
             Prepared::Notice(NO_ACTOR.to_owned())
         );
     }
@@ -852,32 +848,38 @@ mod tests {
         const N: &str = "cccccccc-0000-4000-8000-000000000003";
         let mut registry = Registry::default();
         assert_eq!(
-            resolve(&registry, None, None),
+            resolve(&registry, GENERAL, None),
             Err("Запущенных сессий нет.".to_owned())
         );
         registry.apply_hook(&start(A, 10, None));
-        registry.slots[0].topic_id = Some(100);
+        registry.slots[0].views[0].topic_id = Some(100);
         registry.apply_hook(&start(B, 11, None));
         registry.apply_hook(&start(N, 12, Some(10)));
         registry.set_title(A, "Private title");
         // A slot topic: its current session; General: the newest running
         // top-level one (the nested run is newer but not top-level).
-        assert_eq!(resolve(&registry, Some(100), None), Ok(A.to_owned()));
-        assert_eq!(resolve(&registry, None, None), Ok(B.to_owned()));
-        assert_eq!(resolve(&registry, Some(555), None), Ok(B.to_owned()));
-        // A prefix, anywhere, among every known session.
         assert_eq!(
-            resolve(&registry, Some(100), Some("aaaab")),
+            resolve(&registry, Place::topic(Chat::Group, 100), None),
+            Ok(A.to_owned())
+        );
+        assert_eq!(resolve(&registry, GENERAL, None), Ok(B.to_owned()));
+        assert_eq!(
+            resolve(&registry, Place::topic(Chat::Group, 555), None),
             Ok(B.to_owned())
         );
-        assert_eq!(resolve(&registry, None, Some("cc")), Ok(N.to_owned()));
-        let ambiguous = resolve(&registry, None, Some("aaaa")).unwrap_err();
+        // A prefix, anywhere, among every known session.
+        assert_eq!(
+            resolve(&registry, Place::topic(Chat::Group, 100), Some("aaaab")),
+            Ok(B.to_owned())
+        );
+        assert_eq!(resolve(&registry, GENERAL, Some("cc")), Ok(N.to_owned()));
+        let ambiguous = resolve(&registry, GENERAL, Some("aaaa")).unwrap_err();
         assert_eq!(
             ambiguous,
             "Под это начало id подходят 2 сессий, уточните:\naaaabbbb · идёт\naaaaaaaa · идёт · Private title"
         );
         assert_eq!(
-            resolve(&registry, None, Some("dead")),
+            resolve(&registry, GENERAL, Some("dead")),
             Err("Нет известной hub сессии с таким началом id.".to_owned())
         );
         registry.apply_hook(&hook(
@@ -887,7 +889,7 @@ mod tests {
                 claude_pid: None,
             },
         ));
-        assert_eq!(resolve(&registry, None, None), Ok(A.to_owned()));
+        assert_eq!(resolve(&registry, GENERAL, None), Ok(A.to_owned()));
     }
 
     #[test]

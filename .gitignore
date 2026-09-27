@@ -3,6 +3,7 @@ target/
 *.log
 .cctg/
 registry.json
+registry.v1.json
 .claude/
 .agent/
 deploy/hub.env

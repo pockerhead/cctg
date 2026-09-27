@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::chat::{MessageKey, Place};
 use super::registry::{PendingCall, Stream};
 use super::scheduler::Op;
 use crate::wire::StreamItem;
@@ -74,7 +75,7 @@ pub enum Step {
         format: Format,
     },
     /// Mark this Telegram message ✍.
-    Working(i64),
+    Working(MessageKey),
     /// A turn ended here: a held answer may go now.
     TurnEnd,
     /// A prompt typed in the terminal starts a turn.
@@ -94,7 +95,7 @@ pub enum Format {
 /// Applies the items of one line to the calls still open and the receipts.
 pub fn apply_line(
     calls: &mut Vec<PendingCall>,
-    receipts: &mut Vec<i64>,
+    receipts: &mut Vec<MessageKey>,
     items: &[StreamItem],
 ) -> Vec<Step> {
     let mut steps = Vec::new();
@@ -130,10 +131,16 @@ pub fn apply_line(
                 flush(calls, &mut steps);
                 steps.push(Step::TurnEnd);
             }
-            StreamItem::Channel { message_id } => {
-                if let Some(at) = receipts.iter().position(|id| id == message_id) {
-                    receipts.remove(at);
-                    steps.push(Step::Working(*message_id));
+            // A session has one owner: its private receipts are of one chat.
+            StreamItem::Channel {
+                message_id,
+                private,
+            } => {
+                let found = receipts.iter().position(|known| {
+                    known.id == *message_id && known.chat.is_private() == *private
+                });
+                if let Some(at) = found {
+                    steps.push(Step::Working(receipts.remove(at)));
                 }
             }
             StreamItem::Call { id, line } => {
@@ -201,14 +208,14 @@ fn finished(call: &PendingCall) -> Step {
 }
 
 /// A message handed to the session's agent now shows 👀 and waits for ✍.
-pub fn receipt(stream: &mut Stream, message_id: i64) {
-    if stream.receipts.contains(&message_id) {
+pub fn receipt(stream: &mut Stream, message: MessageKey) {
+    if stream.receipts.contains(&message) {
         return;
     }
     if stream.receipts.len() >= MAX_RECEIPTS {
         stream.receipts.remove(0);
     }
-    stream.receipts.push(message_id);
+    stream.receipts.push(message);
     let receipts = &stream.receipts;
     stream.parts.retain(|(key, _)| receipts.contains(key));
 }
@@ -216,8 +223,8 @@ pub fn receipt(stream: &mut Stream, message_id: i64) {
 /// Messages handed to the session's agent as one inbound (TASK-048), in
 /// order: the last one, whose id the inbound's `message_id` carries, waits
 /// for ✍ like [`receipt`]; the others turn ✍ with it ([`take_parts`]).
-pub fn receipt_parts(stream: &mut Stream, message_ids: &[i64]) {
-    let Some((&key, others)) = message_ids.split_last() else {
+pub fn receipt_parts(stream: &mut Stream, messages: &[MessageKey]) {
+    let Some((&key, others)) = messages.split_last() else {
         return;
     };
     receipt(stream, key);
@@ -228,7 +235,7 @@ pub fn receipt_parts(stream: &mut Stream, message_ids: &[i64]) {
 }
 
 /// The other messages of the burst whose receipt `key` turned ✍.
-pub fn take_parts(stream: &mut Stream, key: i64) -> Vec<i64> {
+pub fn take_parts(stream: &mut Stream, key: MessageKey) -> Vec<MessageKey> {
     match stream.parts.iter().position(|(known, _)| *known == key) {
         Some(at) => stream.parts.remove(at).1,
         None => Vec::new(),
@@ -238,7 +245,8 @@ pub fn take_parts(stream: &mut Stream, key: i64) -> Vec<i64> {
 /// A turn answer held until the stream lines before it are handed out.
 #[derive(Debug)]
 pub struct Held {
-    pub thread_id: i64,
+    /// The topic it goes to.
+    pub place: Place,
     /// Blank for a `Stop` without text: it only takes its turn end.
     pub answer: String,
     pub until: Instant,
@@ -259,7 +267,7 @@ enum Entry {
         answer: Option<Held>,
         /// What went to the scheduler, to send again when the stream cannot
         /// read any more.
-        op: Op,
+        op: Box<Op>,
     },
     /// Everything before it read: the offset and the calls open there.
     Barrier { to: u64, calls: Vec<PendingCall> },
@@ -478,7 +486,7 @@ impl Live {
             number: self.next,
             state: Answer::Waiting,
             answer,
-            op: op.clone(),
+            op: Box::new(op.clone()),
         });
         self.next
     }
@@ -497,7 +505,7 @@ impl Live {
             } = entry
             {
                 *state = Answer::Waiting;
-                let mut op = op.clone();
+                let mut op = Op::clone(op);
                 if again.is_empty()
                     && let Op::Stream { restart, .. } = &mut op
                 {
@@ -701,6 +709,7 @@ impl Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::chat::Chat;
 
     /// A stream message; its text does not matter here.
     fn any_op() -> Op {
@@ -709,6 +718,7 @@ mod tests {
 
     fn stream_op(text: &str) -> Op {
         Op::Stream {
+            chat: Chat::Group,
             thread_id: 100,
             text: text.into(),
             html: None,
@@ -863,52 +873,98 @@ mod tests {
         assert_eq!(calls[0].id, "t2");
     }
 
+    /// A message of the group.
+    fn key(id: i64) -> MessageKey {
+        MessageKey::new(Chat::Group, id)
+    }
+
+    fn keys(ids: &[i64]) -> Vec<MessageKey> {
+        ids.iter().copied().map(key).collect()
+    }
+
     #[test]
     fn only_a_received_message_turns_to_working_and_only_once() {
         let mut stream = Stream::default();
-        receipt(&mut stream, 7);
-        receipt(&mut stream, 7);
+        receipt(&mut stream, key(7));
+        receipt(&mut stream, key(7));
         let steps = apply_line(
             &mut Vec::new(),
             &mut stream.receipts,
             &[
-                StreamItem::Channel { message_id: 8 },
-                StreamItem::Channel { message_id: 7 },
-                StreamItem::Channel { message_id: 7 },
+                StreamItem::Channel {
+                    message_id: 8,
+                    private: false,
+                },
+                StreamItem::Channel {
+                    message_id: 7,
+                    private: false,
+                },
+                StreamItem::Channel {
+                    message_id: 7,
+                    private: false,
+                },
             ],
         );
-        assert_eq!(steps, [Step::Working(7)]);
+        assert_eq!(steps, [Step::Working(key(7))]);
         assert!(stream.receipts.is_empty());
         for id in 0..(MAX_RECEIPTS as i64 + 5) {
-            receipt(&mut stream, id);
+            receipt(&mut stream, key(id));
         }
         assert_eq!(stream.receipts.len(), MAX_RECEIPTS);
-        assert_eq!(stream.receipts[0], 5);
+        assert_eq!(stream.receipts[0], key(5));
+    }
+
+    /// TASK-061: the same message id in the group and in the owner's
+    /// private chat are two receipts; a record turns only its own place's.
+    #[test]
+    fn a_record_turns_only_the_receipt_of_its_place() {
+        let private = MessageKey::new(
+            Chat::Private(crate::hub::chat::PrivateChat::of_user(7_319_402_518)),
+            7,
+        );
+        let mut stream = Stream::default();
+        receipt(&mut stream, key(7));
+        receipt(&mut stream, private);
+        let record = |private| StreamItem::Channel {
+            message_id: 7,
+            private,
+        };
+        let steps = apply_line(&mut Vec::new(), &mut stream.receipts, &[record(true)]);
+        assert_eq!(steps, [Step::Working(private)]);
+        assert_eq!(stream.receipts, [key(7)]);
+        let steps = apply_line(&mut Vec::new(), &mut stream.receipts, &[record(true)]);
+        assert!(steps.is_empty(), "the group's receipt stays");
+        let steps = apply_line(&mut Vec::new(), &mut stream.receipts, &[record(false)]);
+        assert_eq!(steps, [Step::Working(key(7))]);
+        assert!(stream.receipts.is_empty());
     }
 
     #[test]
     fn a_burst_waits_on_its_last_message_and_its_parts_go_with_it_once() {
         let mut stream = Stream::default();
-        receipt_parts(&mut stream, &[1, 2, 3]);
-        receipt_parts(&mut stream, &[4]);
-        assert_eq!(stream.receipts, [3, 4]);
-        assert_eq!(stream.parts, [(3, vec![1, 2])]);
+        receipt_parts(&mut stream, &keys(&[1, 2, 3]));
+        receipt_parts(&mut stream, &keys(&[4]));
+        assert_eq!(stream.receipts, keys(&[3, 4]));
+        assert_eq!(stream.parts, [(key(3), keys(&[1, 2]))]);
         let steps = apply_line(
             &mut Vec::new(),
             &mut stream.receipts,
-            &[StreamItem::Channel { message_id: 3 }],
+            &[StreamItem::Channel {
+                message_id: 3,
+                private: false,
+            }],
         );
-        assert_eq!(steps, [Step::Working(3)]);
-        assert_eq!(take_parts(&mut stream, 3), [1, 2]);
-        assert!(take_parts(&mut stream, 3).is_empty(), "only once");
+        assert_eq!(steps, [Step::Working(key(3))]);
+        assert_eq!(take_parts(&mut stream, key(3)), keys(&[1, 2]));
+        assert!(take_parts(&mut stream, key(3)).is_empty(), "only once");
         assert!(
-            take_parts(&mut stream, 4).is_empty(),
+            take_parts(&mut stream, key(4)).is_empty(),
             "a lone message has none"
         );
         // Parts leave with their receipt when newer ones push it out.
-        receipt_parts(&mut stream, &[10, 11]);
+        receipt_parts(&mut stream, &keys(&[10, 11]));
         for id in 100..(100 + MAX_RECEIPTS as i64) {
-            receipt(&mut stream, id);
+            receipt(&mut stream, key(id));
         }
         assert!(stream.parts.is_empty());
     }
@@ -963,7 +1019,7 @@ mod tests {
     fn a_rewind_holds_again_the_answers_not_in_the_topic_before_the_held_ones() {
         let now = Instant::now();
         let held = |answer: &str| Held {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             answer: answer.into(),
             until: now,
             end: None,
@@ -1014,7 +1070,7 @@ mod tests {
     fn an_answer_gone_by_its_timeout_keeps_its_turn_end() {
         let now = Instant::now();
         let held = |answer: &str| Held {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             answer: answer.into(),
             until: now,
             end: Some(40),
@@ -1056,7 +1112,7 @@ mod tests {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
         live.held.push_back(Held {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             answer: "a file".into(),
             until: now,
             end: None,
@@ -1071,7 +1127,7 @@ mod tests {
         assert!(live.stuck());
         live.rewind(Some(0), Vec::new(), now, Duration::ZERO);
         live.held.push_back(Held {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             answer: "next".into(),
             until: now,
             end: None,
@@ -1094,7 +1150,7 @@ mod tests {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
         live.held.push_back(Held {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             answer: "first".into(),
             until: now,
             end: None,
@@ -1179,7 +1235,7 @@ mod tests {
 
     fn unpaired(answer: &str, now: Instant) -> Held {
         Held {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             answer: answer.into(),
             until: now,
             end: None,

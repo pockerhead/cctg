@@ -190,6 +190,7 @@ use transcript::{
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Attachment, Parked, ResumeNote};
+use super::chat::{Chat, MessageKey, Place};
 use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
 use super::console;
 use super::fetch::{self, Fetch, Fetched};
@@ -197,7 +198,7 @@ use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAs
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
 use super::registry::{
-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
+    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, Slot, SlotId, SlotState,
     StatusMessage, TopicJob, cut,
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
@@ -366,8 +367,6 @@ pub const PROMPT_SETTLE: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone)]
 pub struct Options {
     pub icons: Icons,
-    /// The forum supergroup, passed to Claude as `chat_id` meta.
-    pub chat_id: i64,
     /// The bot may delete service messages (`can_delete_messages`).
     pub can_delete: bool,
     /// A slot gets the text-only notice at most once per this long; a burst
@@ -433,7 +432,7 @@ pub struct Options {
 struct Gather {
     /// Its first message; texts kept in front of it are older and do not
     /// wait for it.
-    start: i64,
+    start: MessageKey,
     first: Instant,
     /// The burst goes then, or at once when that passed (a file or a
     /// command ended it, or the link queue had no room).
@@ -444,7 +443,7 @@ struct Gather {
 #[derive(Debug, Clone, Copy)]
 struct Fetching {
     transfer_id: u64,
-    message_id: i64,
+    message: MessageKey,
     /// The link it goes to: it counts only while that is still the
     /// slot's live agent.
     conn: u64,
@@ -500,7 +499,6 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             icons: Icons::default(),
-            chat_id: 0,
             can_delete: true,
             notice_every: Duration::from_secs(60),
             // Longer than the agent's 30 s maximum reconnect backoff.
@@ -535,6 +533,7 @@ impl Default for Options {
 pub enum Control {
     /// A `forum_topic_edited` service message.
     TopicEdited {
+        chat: Chat,
         thread_id: Option<i64>,
         message_id: i64,
     },
@@ -544,7 +543,11 @@ pub enum Control {
     Callback(CallbackInput),
     /// A `pinned_message` service message (`message_id`) about message
     /// `pinned`, sent by this bot.
-    Pinned { message_id: i64, pinned: i64 },
+    Pinned {
+        chat: Chat,
+        message_id: i64,
+        pinned: i64,
+    },
     /// The hub stops: [`Slots::run`] handles what already came in, writes
     /// the registry and returns.
     Stop,
@@ -585,10 +588,11 @@ enum Done {
     /// A button answer, the edit of an expired prompt or of a Resume
     /// message whose period ended.
     Callback(Option<Delivery>),
-    /// The Resume message of `slot` sent as number `number`.
+    /// The Resume message of `slot` sent as number `number` to `chat`.
     Resume {
         slot: SlotId,
         number: u64,
+        chat: Chat,
         delivery: Option<Delivery>,
     },
     Block {
@@ -636,17 +640,17 @@ enum Done {
 #[derive(Debug, Clone)]
 enum StatusJob {
     Create {
-        thread_id: i64,
+        place: Place,
         text: String,
         keyboard: serde_json::Value,
     },
     Edit {
-        message_id: i64,
+        message: MessageKey,
         text: String,
         keyboard: serde_json::Value,
     },
     Pin {
-        message_id: i64,
+        message: MessageKey,
     },
 }
 
@@ -689,7 +693,8 @@ struct CommandAsk {
     slot: SlotId,
     session: String,
     conn: u64,
-    thread_id: i64,
+    /// The topic message of the command.
+    place: Place,
     message_id: i64,
     until: Instant,
 }
@@ -764,6 +769,7 @@ enum Work {
     Resume {
         slot: SlotId,
         number: u64,
+        chat: Chat,
     },
     Block(BlockJob),
     Stream {
@@ -803,11 +809,12 @@ struct AfterSeparator {
 
 /// The messages of [`Slots::send_text`]: the chunks of
 /// `split_markdown_for_telegram`, or one document when it prefers a file.
-fn text_ops(thread_id: i64, session: &str, text: &str, kind: &str, notify: bool) -> Vec<Op> {
+fn text_ops(place: Place, session: &str, text: &str, kind: &str, notify: bool) -> Vec<Op> {
     let split = split_markdown_for_telegram(text, SplitOptions::default());
     if split.prefer_file {
         vec![Op::SendDocument {
-            thread_id: Some(thread_id),
+            chat: place.chat,
+            thread_id: place.thread,
             document: Document {
                 file_name: format!("{kind}-{}.txt", short(session)),
                 bytes: text.as_bytes().to_vec(),
@@ -820,7 +827,8 @@ fn text_ops(thread_id: i64, session: &str, text: &str, kind: &str, notify: bool)
             .chunks
             .into_iter()
             .map(|chunk| Op::Send {
-                thread_id: Some(thread_id),
+                chat: place.chat,
+                thread_id: place.thread,
                 text: chunk.text,
                 html: Some(chunk.html),
                 reply_markup: None,
@@ -1069,7 +1077,7 @@ pub struct Slots {
     fetching: HashMap<SlotId, Fetching>,
     /// Hand-overs of the slot's front file (by message id) cut by a closed
     /// link, in a row.
-    link_losses: HashMap<SlotId, (i64, u32)>,
+    link_losses: HashMap<SlotId, (MessageKey, u32)>,
     /// Bursts of topic messages being gathered, by slot.
     gathers: HashMap<SlotId, Gather>,
     /// When topic texts last went to a session, within
@@ -1882,7 +1890,7 @@ impl Slots {
             );
             return;
         };
-        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+        let Some(place) = self.registry.place(slot) else {
             return;
         };
         let auto = match trigger {
@@ -1907,7 +1915,7 @@ impl Slots {
                 done: None,
             },
         );
-        self.send_messages(vec![message_op(thread_id, status::compacting_line(auto))]);
+        self.send_messages(vec![message_op(place, status::compacting_line(auto))]);
     }
 
     /// `SessionStart` with `source: compact`: the compaction is done, also
@@ -1983,15 +1991,14 @@ impl Slots {
         let Some((took, _)) = compaction.done else {
             return;
         };
-        let Some(thread_id) = self
+        let Some(place) = self
             .current_slot(session)
-            .and_then(|slot| self.registry.slot(slot))
-            .and_then(|slot| slot.topic_id)
+            .and_then(|slot| self.registry.place(slot))
         else {
             return;
         };
         let line = status::compacted_line(took, compaction.before, after);
-        self.send_messages(vec![message_op(thread_id, line)]);
+        self.send_messages(vec![message_op(place, line)]);
     }
 
     /// Compactions that never ended (in time, or within the grace after the
@@ -2444,18 +2451,18 @@ impl Slots {
     fn finish_block(&mut self, key: BlockKey, text: String) {
         let (shown, whole) = subagents::fit(text);
         if let Some(whole) = whole {
-            let thread_id = self
+            let place = self
                 .registry
                 .block_slot(&key)
-                .and_then(|slot| self.registry.slot(slot))
-                .and_then(|slot| slot.topic_id);
-            if let Some(thread_id) = thread_id {
+                .and_then(|slot| self.registry.place(slot));
+            if let Some(place) = place {
                 let (kind, id) = match &key {
                     BlockKey::Agent(id) => ("subagent", id),
                     BlockKey::Nested(id) => ("nested", id),
                 };
                 self.send_messages(vec![Op::SendDocument {
-                    thread_id: Some(thread_id),
+                    chat: place.chat,
+                    thread_id: place.thread,
                     document: Document {
                         file_name: format!("{kind}-{}.txt", short(id)),
                         bytes: whole.into_bytes(),
@@ -2749,7 +2756,7 @@ impl Slots {
     /// the notice why it cannot.
     fn on_transcript_ask(&mut self, ask: TranscriptAsk) {
         let prefix = ask.command.session_prefix.as_deref();
-        let session = match commands::resolve(&self.registry, ask.thread_id, prefix) {
+        let session = match commands::resolve(&self.registry, ask.place, prefix) {
             Ok(session) => session,
             Err(notice) => {
                 let _ = ask.answer.send(Prepared::Notice(notice));
@@ -2801,43 +2808,50 @@ impl Slots {
     }
 
     fn on_control(&mut self, control: Control) {
-        let (thread_id, message_id) = match control {
+        let (chat, thread_id, message_id) = match control {
             Control::TopicEdited {
+                chat,
                 thread_id,
                 message_id,
-            } => (thread_id, message_id),
+            } => (chat, thread_id, message_id),
             Control::Message(input) => return self.on_topic_message(input),
             Control::Callback(input) => return self.on_callback(input),
-            Control::Pinned { message_id, pinned } => return self.on_pinned(message_id, pinned),
+            Control::Pinned {
+                chat,
+                message_id,
+                pinned,
+            } => return self.on_pinned(chat, message_id, pinned),
             // Handled by `run`.
             Control::Stop => return,
         };
         if !self.options.can_delete
-            || thread_id
-                .and_then(|t| self.registry.slot_by_topic(t))
+            || self
+                .registry
+                .slot_by_topic(Place::new(chat, thread_id))
                 .is_none()
         {
             return;
         }
-        self.hand_off(Work::Delete, Op::Delete { message_id });
+        self.hand_off(Work::Delete, Op::Delete { chat, message_id });
     }
 
     /// The service message about pinning a slot's status message goes, like
     /// `forum_topic_edited`; other pins are the users' business.
-    fn on_pinned(&mut self, message_id: i64, pinned: i64) {
-        if self.options.can_delete && self.status_slot(pinned).is_some() {
-            self.hand_off(Work::Delete, Op::Delete { message_id });
+    fn on_pinned(&mut self, chat: Chat, message_id: i64, pinned: i64) {
+        if self.options.can_delete && self.status_slot(MessageKey::new(chat, pinned)).is_some() {
+            self.hand_off(Work::Delete, Op::Delete { chat, message_id });
         }
     }
 
-    /// The slot whose status message is `message_id`.
-    fn status_slot(&self, message_id: i64) -> Option<SlotId> {
+    /// The slot whose status message is `message`.
+    fn status_slot(&self, message: MessageKey) -> Option<SlotId> {
         self.registry
             .slots
             .iter()
             .position(|slot| {
-                slot.status
-                    .is_some_and(|status| status.message_id == message_id)
+                slot.views
+                    .iter()
+                    .any(|view| view.status_message() == Some(message))
             })
             .map(SlotId)
     }
@@ -2850,17 +2864,19 @@ impl Slots {
             debug!("message outside a topic; not forwarded");
             return;
         };
-        let Some(input) = self.hold(thread_id, input) else {
+        let (place, key) = (input.place(), input.key());
+
+        let Some(input) = self.hold(Place::topic(input.chat, thread_id), input) else {
             return;
         };
         // An answer to an open question never goes to the session.
         if let Some(text) = input.text.as_deref()
             && !input.forwarded
-            && self.answer_question(thread_id, input.reply_to, text)
+            && self.answer_question(input.place(), input.reply_to, text)
         {
             return;
         }
-        let Some(slot) = self.registry.slot_by_topic(thread_id) else {
+        let Some(slot) = self.registry.slot_by_topic(place) else {
             debug!("message in a topic without a slot; not forwarded");
             return;
         };
@@ -2875,13 +2891,13 @@ impl Slots {
                         size,
                         "file from the topic larger than a bot may download"
                     );
-                    self.notify(slot, thread_id, buffer::TOO_BIG_NOTICE);
+                    self.notify(slot, place, buffer::TOO_BIG_NOTICE);
                     return;
                 }
                 (media.caption.unwrap_or_default(), Some(media.file))
             }
             (None, None) => {
-                self.notify(slot, thread_id, buffer::UNSUPPORTED_NOTICE);
+                self.notify(slot, place, buffer::UNSUPPORTED_NOTICE);
                 return;
             }
         };
@@ -2894,17 +2910,18 @@ impl Slots {
             // The burst gathered before the command goes first.
             self.end_gather(slot);
             self.flush(slot);
-            self.on_console_command(slot, thread_id, input.message_id, command);
+            self.on_console_command(slot, place, input.message_id, command);
             return;
         }
         if file.is_some() {
             self.end_gather(slot);
         } else {
-            self.gather(slot, input.message_id);
+            self.gather(slot, key);
         }
         self.park(
             slot,
             Parked {
+                chat: input.chat,
                 message_id: input.message_id,
                 thread_id,
                 text,
@@ -2922,7 +2939,7 @@ impl Slots {
     /// burst being gathered there or starts one; a burst already due is not
     /// held back again. No burst without `Options::gather_quiet` or a live
     /// agent.
-    fn gather(&mut self, slot: SlotId, message_id: i64) {
+    fn gather(&mut self, slot: SlotId, message: MessageKey) {
         let quiet = self.options.gather_quiet;
         if quiet.is_zero() || self.live_agent(slot).is_none() {
             return;
@@ -2936,7 +2953,7 @@ impl Slots {
                 self.gathers.insert(
                     slot,
                     Gather {
-                        start: message_id,
+                        start: message,
                         first: now,
                         due: now + quiet.min(max),
                     },
@@ -2960,7 +2977,7 @@ impl Slots {
         let ordinal = self.ordinal(slot);
         let offline = self.live_agent(slot).is_none();
         let dead = self.registry.state(slot) == SlotState::Dead;
-        let thread_id = parked.thread_id;
+        let place = parked.place();
         let Some(entry) = self.registry.slot_mut(slot) else {
             return;
         };
@@ -2979,10 +2996,7 @@ impl Slots {
             debug!(ordinal, "slot buffer full; its oldest message dropped");
         }
         if tell_overflow
-            && self.send_messages(vec![message_op(
-                thread_id,
-                buffer::OVERFLOW_NOTICE.to_owned(),
-            )])
+            && self.send_messages(vec![message_op(place, buffer::OVERFLOW_NOTICE.to_owned())])
         {
             info!(ordinal, "slot buffer full; the topic is told once");
             if let Some(entry) = self.registry.slot_mut(slot) {
@@ -2990,10 +3004,7 @@ impl Slots {
             }
         }
         if tell_queued
-            && self.send_messages(vec![message_op(
-                thread_id,
-                buffer::QUEUED_NOTICE.to_owned(),
-            )])
+            && self.send_messages(vec![message_op(place, buffer::QUEUED_NOTICE.to_owned())])
             && let Some(entry) = self.registry.slot_mut(slot)
         {
             entry.buffer.queued_told = true;
@@ -3076,7 +3087,7 @@ impl Slots {
                 continue;
             }
             handed += taken.len();
-            let ids: Vec<i64> = taken.iter().map(|parked| parked.message_id).collect();
+            let ids: Vec<MessageKey> = taken.iter().map(Parked::key).collect();
             if let Some(stream) = self
                 .registry
                 .sessions
@@ -3120,8 +3131,8 @@ impl Slots {
                 "kept messages handed to the slot's session; offline period over"
             );
         }
-        if let Some(message_id) = note.and_then(|note| note.message_id) {
-            self.drop_resume_button(message_id);
+        if let Some(message) = note.and_then(|note| note.message) {
+            self.drop_resume_button(message);
         }
     }
 
@@ -3155,7 +3166,7 @@ impl Slots {
                 return FileStep::Wait;
             }
             info!(ordinal, kind, "agent takes no files; the file is dropped");
-            self.notify(slot, parked.thread_id, buffer::OLD_AGENT_NOTICE);
+            self.notify(slot, parked.place(), buffer::OLD_AGENT_NOTICE);
             return FileStep::Gone {
                 delivered: !parked.text.is_empty(),
             };
@@ -3168,7 +3179,7 @@ impl Slots {
                 ordinal,
                 kind, "no download task; a file from the topic is dropped"
             );
-            self.notify(slot, parked.thread_id, buffer::FETCH_FAILED_NOTICE);
+            self.notify(slot, parked.place(), buffer::FETCH_FAILED_NOTICE);
             return FileStep::Gone { delivered: false };
         };
         let transfer_id = self.transfers + 1;
@@ -3189,7 +3200,7 @@ impl Slots {
             slot,
             Fetching {
                 transfer_id,
-                message_id: parked.message_id,
+                message: parked.key(),
                 conn,
             },
         );
@@ -3218,7 +3229,7 @@ impl Slots {
             return;
         };
         self.fetching.remove(&slot);
-        let message_id = fetching.message_id;
+        let message = fetching.message;
         let ordinal = self.ordinal(slot);
         let to_live = self
             .live_agent(slot)
@@ -3235,11 +3246,11 @@ impl Slots {
             }
             Fetched::LinkClosed => {
                 let losses = match self.link_losses.get(&slot) {
-                    Some(&(id, losses)) if id == message_id => losses + 1,
+                    Some(&(id, losses)) if id == message => losses + 1,
                     _ => 1,
                 };
                 if losses < MAX_LINK_LOSSES {
-                    self.link_losses.insert(slot, (message_id, losses));
+                    self.link_losses.insert(slot, (message, losses));
                     debug!(
                         ordinal,
                         losses,
@@ -3261,8 +3272,8 @@ impl Slots {
             .registry
             .slot(slot)
             .and_then(|entry| entry.buffer.messages.front())
-            .map(|parked| (parked.message_id, parked.thread_id));
-        let Some((_, thread_id)) = front.filter(|(id, _)| *id == message_id) else {
+            .map(|parked| (parked.key(), parked.place()));
+        let Some((_, place)) = front.filter(|(key, _)| *key == message) else {
             return;
         };
         if let Some(entry) = self.registry.slot_mut(slot) {
@@ -3282,13 +3293,13 @@ impl Slots {
                         .get_mut(&session)
                         .and_then(|entry| entry.stream.as_mut())
                 {
-                    stream::receipt(stream, message_id);
+                    stream::receipt(stream, message);
                 }
-                self.react(message_id, stream::ACCEPTED);
+                self.react(message, stream::ACCEPTED);
             }
-            Fetched::TooBig => self.notify(slot, thread_id, buffer::TOO_BIG_NOTICE),
-            Fetched::Failed => self.notify(slot, thread_id, buffer::FETCH_FAILED_NOTICE),
-            Fetched::LinkClosed => self.notify(slot, thread_id, buffer::LINK_LOST_NOTICE),
+            Fetched::TooBig => self.notify(slot, place, buffer::TOO_BIG_NOTICE),
+            Fetched::Failed => self.notify(slot, place, buffer::FETCH_FAILED_NOTICE),
+            Fetched::LinkClosed => self.notify(slot, place, buffer::LINK_LOST_NOTICE),
         }
         // The next kept message goes, or the offline period ends.
         self.flush(slot);
@@ -3329,11 +3340,7 @@ impl Slots {
         }
         let target = self
             .live_reply_slot(conn, frame_session)
-            .filter(|(_, slot)| {
-                self.registry
-                    .slot(*slot)
-                    .is_some_and(|entry| entry.topic_id.is_some())
-            });
+            .filter(|(_, slot)| self.registry.place(*slot).is_some());
         let outcome = if target.is_none() {
             FileOutcome::NoTopic
         } else if size == 0 || size > files::MAX_UPLOAD || !album_fits(&parts, size) {
@@ -3399,16 +3406,13 @@ impl Slots {
         }
         let target = self
             .live_reply_slot(conn, frame_session)
-            .and_then(|(_, slot)| {
-                let thread_id = self.registry.slot(slot)?.topic_id?;
-                Some((slot, thread_id))
-            });
+            .and_then(|(_, slot)| Some((slot, self.registry.place(slot)?)));
         let refused = match target {
             None => Some(FileOutcome::NoTopic),
             Some(_) if self.queued_messages >= MAX_QUEUED_MESSAGES => Some(FileOutcome::Busy),
             Some(_) => None,
         };
-        let (Some((slot, thread_id)), None) = (target, refused) else {
+        let (Some((slot, place)), None) = (target, refused) else {
             self.file_bytes = self.file_bytes.saturating_sub(size);
             let outcome = refused.unwrap_or(FileOutcome::NoTopic);
             info!(conn, size, ?outcome, "file from an agent not sent");
@@ -3416,7 +3420,7 @@ impl Slots {
             return;
         };
         if !upload.parts.is_empty() {
-            self.send_album(conn, slot, thread_id, upload);
+            self.send_album(conn, slot, place, upload);
             return;
         }
         let bytes = upload.assembly.into_bytes();
@@ -3426,16 +3430,17 @@ impl Slots {
             bytes,
             caption: upload.caption.map(|caption| cut(&caption, CAPTION_LIMIT)),
         };
-        let thread_id = Some(thread_id);
         let op = if photo {
             Op::SendPhoto {
-                thread_id,
+                chat: place.chat,
+                thread_id: place.thread,
                 document,
                 notify: false,
             }
         } else {
             Op::SendDocument {
-                thread_id,
+                chat: place.chat,
+                thread_id: place.thread,
                 document,
                 notify: false,
             }
@@ -3484,7 +3489,7 @@ impl Slots {
     /// (Telegram never mixes the two); a kind with one file goes alone, as
     /// with `path`. The caption goes on the first file; without one each
     /// photo shows its file name (TASK-051). One message token per message.
-    fn send_album(&mut self, conn: u64, slot: SlotId, thread_id: i64, upload: Upload) {
+    fn send_album(&mut self, conn: u64, slot: SlotId, place: Place, upload: Upload) {
         let size = upload.assembly.size();
         let bytes = upload.assembly.into_bytes();
         let mut photos = Vec::new();
@@ -3524,18 +3529,20 @@ impl Slots {
             {
                 first.caption = Some(cut(caption, CAPTION_LIMIT));
             }
-            let thread_id = Some(thread_id);
+            let thread_id = place.thread;
             let op = match items.len() {
                 1 => {
                     let document = items.remove(0);
                     if photo {
                         Op::SendPhoto {
+                            chat: place.chat,
                             thread_id,
                             document,
                             notify: false,
                         }
                     } else {
                         Op::SendDocument {
+                            chat: place.chat,
                             thread_id,
                             document,
                             notify: false,
@@ -3543,6 +3550,7 @@ impl Slots {
                     }
                 }
                 _ => Op::SendAlbum {
+                    chat: place.chat,
                     thread_id,
                     items,
                     photos: photo,
@@ -3678,13 +3686,15 @@ impl Slots {
         }
     }
 
-    /// Meta `chat_id`, `message_id`, `thread_id`, `reply_to_message_id` for
+    /// Meta `place` (`group` or `private`, never a chat id: a private chat's
+    /// id is its user's, TASK-061), `message_id`, `thread_id`,
+    /// `reply_to_message_id` for
     /// an explicit reply, `target_agent` for a reply to a block of its
     /// subagent, `forwarded` for a forward and `from_name` for a team
     /// member's message (TASK-036).
     fn inbound_meta(&self, session: &str, parked: &Parked) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::from([
-            ("chat_id".to_owned(), self.options.chat_id.to_string()),
+            ("place".to_owned(), parked.chat.label().to_owned()),
             ("message_id".to_owned(), parked.message_id.to_string()),
             ("thread_id".to_owned(), parked.thread_id.to_string()),
         ]);
@@ -3700,7 +3710,7 @@ impl Slots {
             // subagent; Claude forwards it (channel instructions).
             if let Some(agent_id) =
                 self.registry
-                    .subagent_of_message(parked.thread_id, reply_to, session)
+                    .subagent_of_message(parked.place(), reply_to, session)
             {
                 meta.insert("target_agent".to_owned(), agent_id.to_owned());
             }
@@ -3710,11 +3720,11 @@ impl Slots {
 
     /// The front text of `slot` was kept before its burst's first message
     /// `start`, which still waits behind it.
-    fn before_burst(&self, slot: SlotId, start: i64) -> bool {
+    fn before_burst(&self, slot: SlotId, start: MessageKey) -> bool {
         self.registry.slot(slot).is_some_and(|entry| {
             let mut kept = entry.buffer.messages.iter();
-            kept.next().is_some_and(|front| front.message_id != start)
-                && kept.any(|parked| parked.message_id == start)
+            kept.next().is_some_and(|front| front.key() != start)
+                && kept.any(|parked| parked.key() == start)
         })
     }
 
@@ -3736,7 +3746,7 @@ impl Slots {
             .take_while(|parked| parked.file.is_none())
         {
             if parts.first().is_some_and(|first| {
-                (first.thread_id, first.reply_to) != (parked.thread_id, parked.reply_to)
+                (first.place(), first.reply_to) != (parked.place(), parked.reply_to)
             }) {
                 break;
             }
@@ -3810,7 +3820,8 @@ impl Slots {
             {
                 continue;
             }
-            let (Some(thread_id), Some(session)) = (entry.topic_id, entry.current_session.clone())
+            let (Some(place), Some(session)) =
+                (self.registry.place(slot), entry.current_session.clone())
             else {
                 continue;
             };
@@ -3829,7 +3840,7 @@ impl Slots {
             self.registry.slots[index].buffer.resume = Some(ResumeNote {
                 session: session.clone(),
                 number,
-                message_id: None,
+                message: None,
             });
             self.registry.dirty = true;
             self.queued_messages += 1;
@@ -3839,9 +3850,14 @@ impl Slots {
                 "Resume button offered for the slot's kept messages"
             );
             self.hand_off(
-                Work::Resume { slot, number },
+                Work::Resume {
+                    slot,
+                    number,
+                    chat: place.chat,
+                },
                 Op::Send {
-                    thread_id: Some(thread_id),
+                    chat: place.chat,
+                    thread_id: place.thread,
                     text: buffer::resume_text(&session),
                     html: None,
                     reply_markup,
@@ -3855,11 +3871,12 @@ impl Slots {
 
     /// The Resume message of a period that is over loses its button. One
     /// try: a press on a button that stayed gets a fitting answer anyway.
-    fn drop_resume_button(&mut self, message_id: i64) {
+    fn drop_resume_button(&mut self, message: MessageKey) {
         self.hand_off(
             Work::Callback,
             Op::Edit {
-                message_id,
+                chat: message.chat,
+                message_id: message.id,
                 text: buffer::RESUMED_TEXT.to_owned(),
                 reply_markup: Some(permissions::no_keyboard()),
                 background: false,
@@ -3870,20 +3887,28 @@ impl Slots {
     /// Telegram answered Resume message `number` of `slot`: its id is kept
     /// for the edit at the end of the period, or, when that period is over
     /// already, the button goes now.
-    fn on_resume_done(&mut self, slot: SlotId, number: u64, delivery: Option<Delivery>) {
+    fn on_resume_done(
+        &mut self,
+        slot: SlotId,
+        number: u64,
+        chat: Chat,
+        delivery: Option<Delivery>,
+    ) {
         self.queued_messages = self.queued_messages.saturating_sub(1);
         if self.queued_messages == 0 {
             self.overflow_warned = false;
         }
-        let message_id = match &delivery {
-            Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => Some(message.message_id),
+        let message = match &delivery {
+            Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                Some(MessageKey::new(chat, message.message_id))
+            }
             Some(Err(error)) => {
                 warn!(%error, "Resume message not delivered; offered again in the next offline period");
                 None
             }
             _ => None,
         };
-        let Some(message_id) = message_id else {
+        let Some(message) = message else {
             return;
         };
         let waiting = self.registry.slot_mut(slot).and_then(|entry| {
@@ -3891,14 +3916,14 @@ impl Slots {
                 .buffer
                 .resume
                 .as_mut()
-                .filter(|note| note.number == number && note.message_id.is_none())
+                .filter(|note| note.number == number && note.message.is_none())
         });
         match waiting {
             Some(note) => {
-                note.message_id = Some(message_id);
+                note.message = Some(message);
                 self.registry.dirty = true;
             }
-            None => self.drop_resume_button(message_id),
+            None => self.drop_resume_button(message),
         }
     }
 
@@ -4002,7 +4027,7 @@ impl Slots {
             return;
         };
         let ordinal = self.ordinal(slot);
-        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+        let Some(place) = self.registry.place(slot) else {
             info!(
                 ordinal,
                 "turn answer for a slot without a topic yet; not sent"
@@ -4012,7 +4037,7 @@ impl Slots {
         if let Some(live) = self.streams.get_mut(session).filter(|_| streamed) {
             let now = Instant::now();
             let mut held = Held {
-                thread_id,
+                place,
                 answer: answer.to_owned(),
                 until: now + self.options.hold_answer,
                 end: None,
@@ -4044,10 +4069,10 @@ impl Slots {
             return;
         }
         if self.behind_drain(slot, Instant::now()) {
-            self.hold_after_separator(slot, thread_id, session, answer, "answer", true);
+            self.hold_after_separator(slot, place, session, answer, "answer", true);
             return;
         }
-        if let Some(parts) = self.send_text(thread_id, session, answer, "answer", true) {
+        if let Some(parts) = self.send_text(place, session, answer, "answer", true) {
             info!(
                 ordinal,
                 session = short(session),
@@ -4078,7 +4103,7 @@ impl Slots {
         if held.answer.trim().is_empty() {
             return;
         }
-        if let Some(parts) = self.send_text(held.thread_id, session, &held.answer, "answer", true) {
+        if let Some(parts) = self.send_text(held.place, session, &held.answer, "answer", true) {
             info!(session = short(session), parts, "turn answer queued");
         }
     }
@@ -4104,7 +4129,7 @@ impl Slots {
 
     /// Sets the bot's reaction on a topic message; failures are only logged.
     /// At most [`MAX_REACTIONS`] wait for Telegram; one more is skipped.
-    fn react(&mut self, message_id: i64, emoji: &str) {
+    fn react(&mut self, message: MessageKey, emoji: &str) {
         if self.reactions >= MAX_REACTIONS {
             debug!("too many reactions wait for Telegram; one skipped");
             return;
@@ -4113,7 +4138,8 @@ impl Slots {
         self.hand_off(
             Work::Reaction,
             Op::React {
-                message_id,
+                chat: message.chat,
+                message_id: message.id,
                 emoji: emoji.to_owned(),
             },
         );
@@ -4124,8 +4150,8 @@ impl Slots {
     /// session separator is out, with a bound agent that reads transcripts.
     fn stream_target(&self, session: &str) -> Option<(u64, String)> {
         let slot = self.current_slot(session)?;
-        let slot = self.registry.slot(slot)?;
-        if slot.topic_id.is_none() || slot.pending_separator.is_some() {
+        let view = self.registry.slot(slot)?.primary()?;
+        if view.topic_id.is_none() || view.pending_separator.is_some() {
             return None;
         }
         let entry = self.registry.sessions.get(session)?;
@@ -4335,10 +4361,10 @@ impl Slots {
     /// after the drain, or [`Options::stream_retry`] after the first such
     /// message began to wait.
     fn behind_drain(&mut self, slot: SlotId, now: Instant) -> bool {
-        let Some(entry) = self.registry.slot(slot) else {
+        let Some(view) = self.registry.slot(slot).and_then(Slot::primary) else {
             return false;
         };
-        if entry.topic_id.is_none() || entry.pending_separator.is_none() || entry.failed.is_some() {
+        if view.topic_id.is_none() || view.pending_separator.is_none() || view.failed.is_some() {
             return false;
         }
         let draining: Vec<String> = self
@@ -4370,13 +4396,13 @@ impl Slots {
     fn hold_after_separator(
         &mut self,
         slot: SlotId,
-        thread_id: i64,
+        place: Place,
         session: &str,
         text: &str,
         kind: &'static str,
         notify: bool,
     ) {
-        let parts = text_ops(thread_id, session, text, kind, notify).len();
+        let parts = text_ops(place, session, text, kind, notify).len();
         if self.queued_messages + parts > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
@@ -4426,8 +4452,7 @@ impl Slots {
                 );
                 continue;
             }
-            let Some(thread_id) = self.registry.slot(held.slot).and_then(|slot| slot.topic_id)
-            else {
+            let Some(place) = self.registry.place(held.slot) else {
                 debug!(
                     session = short(&held.session),
                     "held text for a slot without a topic now; not sent"
@@ -4435,7 +4460,7 @@ impl Slots {
                 continue;
             };
             if let Some(parts) =
-                self.send_text(thread_id, &held.session, &held.text, held.kind, held.notify)
+                self.send_text(place, &held.session, &held.text, held.kind, held.notify)
             {
                 info!(
                     session = short(&held.session),
@@ -4462,15 +4487,14 @@ impl Slots {
             Stream(u64, Op),
             Answer(Vec<(u64, Op)>),
             Release(Held),
-            React(i64),
+            React(MessageKey),
         }
         let now = Instant::now();
         let every = self.options.stream_every;
         let hold = self.options.hold_answer;
-        let thread_id = self
+        let place = self
             .current_slot(session)
-            .and_then(|slot| self.registry.slot(slot))
-            .and_then(|slot| slot.topic_id);
+            .and_then(|slot| self.registry.place(slot));
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
@@ -4483,7 +4507,11 @@ impl Slots {
         };
         live.reading = None;
         live.next_read = Some(now + every);
-        let Some(thread_id) = thread_id else {
+        let Some(Place {
+            chat,
+            thread: Some(thread_id),
+        }) = place
+        else {
             return;
         };
         if live.rewind_at.is_some() {
@@ -4622,6 +4650,7 @@ impl Slots {
                         for (text, html) in chunks {
                             queued += 1;
                             let op = Op::Stream {
+                                chat,
                                 thread_id,
                                 text,
                                 html,
@@ -4801,15 +4830,15 @@ impl Slots {
             return;
         };
         let ordinal = self.ordinal(slot);
-        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+        let Some(place) = self.registry.place(slot) else {
             warn!(ordinal, "reply for a slot without a topic yet; dropped");
             return;
         };
         if self.behind_drain(slot, Instant::now()) {
-            self.hold_after_separator(slot, thread_id, &session, text, "reply", false);
+            self.hold_after_separator(slot, place, &session, text, "reply", false);
             return;
         }
-        if let Some(parts) = self.send_text(thread_id, &session, text, "reply", false) {
+        if let Some(parts) = self.send_text(place, &session, text, "reply", false) {
             info!(
                 ordinal,
                 session = short(&session),
@@ -4825,13 +4854,13 @@ impl Slots {
     /// The number of parts, or `None` when the message cap refused them.
     fn send_text(
         &mut self,
-        thread_id: i64,
+        place: Place,
         session: &str,
         text: &str,
         kind: &str,
         notify: bool,
     ) -> Option<usize> {
-        let ops = text_ops(thread_id, session, text, kind, notify);
+        let ops = text_ops(place, session, text, kind, notify);
         let parts = ops.len();
         self.send_messages(ops).then_some(parts)
     }
@@ -5112,11 +5141,12 @@ impl Slots {
             session = short(&gone.session),
             "oldest open permission prompt expired to make room"
         );
-        if let Some(message_id) = gone.message_id {
+        if let Some(message) = gone.message() {
             self.hand_off(
                 Work::Callback,
                 Op::Edit {
-                    message_id,
+                    chat: message.chat,
+                    message_id: message.id,
                     text: permissions::ANSWER_EXPIRED.to_owned(),
                     reply_markup: Some(permissions::no_keyboard()),
                     background: false,
@@ -5141,7 +5171,7 @@ impl Slots {
         let Some(slot) = self.current_slot(session) else {
             return;
         };
-        let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) else {
+        let Some(place) = self.registry.place(slot) else {
             return;
         };
         if self
@@ -5153,7 +5183,7 @@ impl Slots {
             return;
         }
         if self.send_messages(vec![message_op(
-            thread_id,
+            place,
             questions::NO_HOOK_NOTICE.to_owned(),
         )]) {
             if let Some(entry) = self.registry.sessions.get_mut(session) {
@@ -5167,9 +5197,9 @@ impl Slots {
     }
 
     /// The topic of `session`'s slot, if it has one.
-    fn session_topic(&self, session: &str) -> Option<i64> {
+    fn session_topic(&self, session: &str) -> Option<Place> {
         let slot = self.registry.sessions.get(session)?.slot?;
-        self.registry.slot(slot)?.topic_id
+        self.registry.place(slot)
     }
 
     /// An `AskUserQuestion` hook asks. Only a live top-level session whose
@@ -5290,10 +5320,10 @@ impl Slots {
             let Some(ask) = self.questions.get(key) else {
                 continue;
             };
-            if !ask.is_open() || ask.thread_id.is_some() {
+            if !ask.is_open() || ask.place.is_some() {
                 continue;
             }
-            let Some(thread_id) = self.session_topic(&ask.session) else {
+            let Some(place) = self.session_topic(&ask.session) else {
                 // Nowhere to show it: the terminal dialog, not a silent wait.
                 self.end_question(key, questions::State::Expired);
                 continue;
@@ -5310,7 +5340,8 @@ impl Slots {
                 continue;
             };
             let op = Op::Send {
-                thread_id: Some(thread_id),
+                chat: place.chat,
+                thread_id: place.thread,
                 text: ask.text(),
                 html: None,
                 reply_markup: Some(ask.keyboard()),
@@ -5320,7 +5351,7 @@ impl Slots {
             };
             let version = ask.version;
             if let Some(ask) = self.questions.get_mut(key) {
-                ask.thread_id = Some(thread_id);
+                ask.place = Some(place);
                 ask.sending = true;
             }
             self.hand_off(Work::Question { key, version }, op);
@@ -5333,7 +5364,7 @@ impl Slots {
             let Some(ask) = self.questions.get_mut(key) else {
                 continue;
             };
-            let Some(message_id) = ask.message_id.filter(|_| ask.edit_due()) else {
+            let Some(message) = ask.message().filter(|_| ask.edit_due()) else {
                 continue;
             };
             ask.editing = true;
@@ -5341,7 +5372,8 @@ impl Slots {
             self.hand_off(
                 Work::QuestionEdit { key, version },
                 Op::Edit {
-                    message_id,
+                    chat: message.chat,
+                    message_id: message.id,
                     text,
                     reply_markup: Some(keyboard),
                     background: false,
@@ -5418,9 +5450,9 @@ impl Slots {
         press: questions::Press,
     ) -> Option<&'static str> {
         let Some(key) = input
-            .message_id
-            .and_then(|message_id| self.questions.by_message(message_id))
-            .or_else(|| self.questions.in_flight(id, input.thread_id))
+            .message()
+            .and_then(|message| self.questions.by_message(message))
+            .or_else(|| self.questions.in_flight(id, input.topic()))
         else {
             debug!("button of a question this hub does not know");
             return Some(questions::ANSWER_STALE);
@@ -5452,17 +5484,16 @@ impl Slots {
     /// reply to a message the hub cannot match, in a topic with such a
     /// question (TASK-060). Later messages of that topic wait behind it, so
     /// the session gets them in order. `Some`: it goes on now.
-    fn hold(&mut self, thread_id: i64, input: Inbound) -> Option<Inbound> {
-        let behind = self
-            .held
-            .iter()
-            .any(|held| held.thread_id == Some(thread_id));
+    fn hold(&mut self, place: Place, input: Inbound) -> Option<Inbound> {
+        let behind = self.held.iter().any(|held| held.place() == place);
         let unknown_reply = input.text.is_some()
             && !input.forwarded
-            && input
-                .reply_to
-                .is_some_and(|reply_to| self.questions.by_message(reply_to).is_none())
-            && self.questions.sending_in(thread_id);
+            && input.reply_to.is_some_and(|reply_to| {
+                self.questions
+                    .by_message(MessageKey::new(place.chat, reply_to))
+                    .is_none()
+            })
+            && self.questions.sending_in(place);
         if !(behind || unknown_reply) || self.held.len() >= MAX_HELD {
             return Some(input);
         }
@@ -5479,11 +5510,11 @@ impl Slots {
         }
     }
 
-    /// A text message in topic `thread_id` that answers an open question:
+    /// A text message in topic `place` that answers an open question:
     /// a reply to its message, or the next text after ✏️ Другое. `false`:
     /// it is no answer and goes on as usual.
-    fn answer_question(&mut self, thread_id: i64, reply_to: Option<i64>, text: &str) -> bool {
-        let Some(key) = self.questions.text_target(thread_id, reply_to) else {
+    fn answer_question(&mut self, place: Place, reply_to: Option<i64>, text: &str) -> bool {
+        let Some(key) = self.questions.text_target(place, reply_to) else {
             return false;
         };
         let listening = self
@@ -5564,10 +5595,7 @@ impl Slots {
                 continue;
             }
             let slot = entry.slot;
-            let thread_id = slot
-                .and_then(|slot| self.registry.slot(slot))
-                .and_then(|slot| slot.topic_id);
-            let Some(thread_id) = thread_id else {
+            let Some(place) = slot.and_then(|slot| self.registry.place(slot)) else {
                 continue;
             };
             if slot.is_some_and(|slot| self.behind_drain(slot, Instant::now())) {
@@ -5577,7 +5605,8 @@ impl Slots {
                 continue;
             };
             let op = Op::Send {
-                thread_id: Some(thread_id),
+                chat: place.chat,
+                thread_id: place.thread,
                 text: prompt.text.clone(),
                 html: None,
                 reply_markup: Some(permissions::keyboard(&prompt.request_id)),
@@ -5587,7 +5616,7 @@ impl Slots {
             };
             if let Some(prompt) = self.prompts.get_mut(key) {
                 prompt.sent = true;
-                prompt.thread_id = Some(thread_id);
+                prompt.place = Some(place);
             }
             self.hand_off(Work::Permission(key), op);
         }
@@ -5600,14 +5629,15 @@ impl Slots {
             let Some(prompt) = self.prompts.get_mut(key) else {
                 continue;
             };
-            let (Some(message_id), Some(text)) = (prompt.message_id, prompt.final_text()) else {
+            let (Some(message), Some(text)) = (prompt.message(), prompt.final_text()) else {
                 continue;
             };
             prompt.edit = Edit::InFlight;
             self.hand_off(
                 Work::PromptEdit(key),
                 Op::Edit {
-                    message_id,
+                    chat: message.chat,
+                    message_id: message.id,
                     text,
                     reply_markup: Some(permissions::no_keyboard()),
                     background: false,
@@ -5637,7 +5667,7 @@ impl Slots {
             return Some(self.press_resume(session));
         }
         if let Some(press) = input.data.as_deref().and_then(status::parse_callback) {
-            return Some(self.press_status(input.message_id, press));
+            return Some(self.press_status(input.message(), press));
         }
         if let Some(session) = input.data.as_deref().and_then(status::parse_update) {
             let session = session.to_owned();
@@ -5659,9 +5689,9 @@ impl Slots {
         // is not known yet) counts for the one prompt of that topic with its
         // id still in flight (TASK-060).
         let Some(key) = input
-            .message_id
-            .and_then(|message_id| self.prompts.by_message(message_id))
-            .or_else(|| self.prompts.in_flight(request_id, input.thread_id))
+            .message()
+            .and_then(|message| self.prompts.by_message(message))
+            .or_else(|| self.prompts.in_flight(request_id, input.topic()))
         else {
             debug!("button of a prompt this hub does not know");
             return expired;
@@ -5714,8 +5744,8 @@ impl Slots {
     /// agent that presses keys. ⏹ asks for a second press within
     /// [`status::CONFIRM_FOR`]; while a permission prompt of the session
     /// waits it sends nothing.
-    fn press_status(&mut self, message_id: Option<i64>, press: Press) -> &'static str {
-        let Some(slot) = message_id.and_then(|id| self.status_slot(id)) else {
+    fn press_status(&mut self, message: Option<MessageKey>, press: Press) -> &'static str {
+        let Some(slot) = message.and_then(|message| self.status_slot(message)) else {
             debug!("status button of a message that is no status message");
             return status::ANSWER_STALE;
         };
@@ -5795,7 +5825,7 @@ impl Slots {
         };
         for index in 0..self.registry.slots.len() {
             let slot = SlotId(index);
-            let Some(thread_id) = self.registry.slots[index].topic_id else {
+            let Some(place) = self.registry.place(slot) else {
                 continue;
             };
             let Some((session, conn)) = self.live_agent(slot) else {
@@ -5818,7 +5848,8 @@ impl Slots {
                 .and_then(|bound| bound.client.as_ref())
                 .map(|client| crate::client::short(&client.build));
             let op = Op::Send {
-                thread_id: Some(thread_id),
+                chat: place.chat,
+                thread_id: place.thread,
                 text: status::outdated_text(agent.as_deref(), &crate::client::short(&hub)),
                 html: None,
                 reply_markup: Some(keyboard),
@@ -5916,10 +5947,10 @@ impl Slots {
                 }
                 if tell
                     && let Some(slot) = self.current_slot(&session)
-                    && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+                    && let Some(place) = self.registry.place(slot)
                 {
                     info!(session = short(&session), "update held back: subagents run");
-                    self.notify(slot, thread_id, status::UPDATE_AGENTS_NOTICE);
+                    self.notify(slot, place, status::UPDATE_AGENTS_NOTICE);
                 }
                 continue;
             }
@@ -5931,9 +5962,9 @@ impl Slots {
                 }
                 if !told
                     && let Some(slot) = self.current_slot(&session)
-                    && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+                    && let Some(place) = self.registry.place(slot)
                 {
-                    self.notify(slot, thread_id, status::UPDATE_WAITS_NOTICE);
+                    self.notify(slot, place, status::UPDATE_WAITS_NOTICE);
                 }
                 continue;
             }
@@ -6057,9 +6088,9 @@ impl Slots {
             self.keep_agent(conn, session);
             if tell
                 && let Some(slot) = self.current_slot(session)
-                && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+                && let Some(place) = self.registry.place(slot)
             {
-                self.notify(slot, thread_id, status::UPDATE_AGENTS_NOTICE);
+                self.notify(slot, place, status::UPDATE_AGENTS_NOTICE);
             }
             return;
         }
@@ -6124,9 +6155,9 @@ impl Slots {
             return;
         }
         if let Some(slot) = self.current_slot(session)
-            && let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id)
+            && let Some(place) = self.registry.place(slot)
         {
-            self.notify(slot, thread_id, notice);
+            self.notify(slot, place, notice);
         }
         if let Some(slot) = self.current_slot(session)
             && let Some(shown) = self.shown.get_mut(&slot)
@@ -6181,10 +6212,12 @@ impl Slots {
             let Some((_, conn)) = self.live_agent(slot).filter(|(live, _)| *live == session) else {
                 continue;
             };
-            let mut meta =
-                BTreeMap::from([("chat_id".to_owned(), self.options.chat_id.to_string())]);
-            if let Some(thread_id) = self.registry.slot(slot).and_then(|slot| slot.topic_id) {
-                meta.insert("thread_id".to_owned(), thread_id.to_string());
+            let mut meta = BTreeMap::new();
+            if let Some(view) = self.registry.slot(slot).and_then(Slot::primary) {
+                meta.insert("place".to_owned(), view.chat.label().to_owned());
+                if let Some(thread_id) = view.topic_id {
+                    meta.insert("thread_id".to_owned(), thread_id.to_string());
+                }
             }
             let agents = self
                 .registry
@@ -6280,10 +6313,10 @@ impl Slots {
         let Some(slot) = self.current_slot(session) else {
             return;
         };
-        let Some(thread_id) = self.registry.slot(slot).and_then(|entry| entry.topic_id) else {
+        let Some(place) = self.registry.place(slot) else {
             return;
         };
-        if self.send_messages(vec![message_op(thread_id, CHANNEL_OFF_NOTICE.to_owned())]) {
+        if self.send_messages(vec![message_op(place, CHANNEL_OFF_NOTICE.to_owned())]) {
             self.unseen.remove(session);
             self.channel_off_told.insert(session.to_owned());
             info!(
@@ -6385,8 +6418,8 @@ impl Slots {
             return;
         }
         warn!(conn, session = short(&ask.session), "Esc not written");
-        if let Some(thread_id) = self.registry.slot(ask.slot).and_then(|slot| slot.topic_id) {
-            self.notify(ask.slot, thread_id, status::KEY_FAILED_NOTICE);
+        if let Some(place) = self.registry.place(ask.slot) {
+            self.notify(ask.slot, place, status::KEY_FAILED_NOTICE);
         }
     }
 
@@ -6395,7 +6428,7 @@ impl Slots {
     fn on_console_command(
         &mut self,
         slot: SlotId,
-        thread_id: i64,
+        place: Place,
         message_id: i64,
         command: Result<String, console::Invalid>,
     ) {
@@ -6431,7 +6464,7 @@ impl Slots {
                             slot,
                             session: session.clone(),
                             conn,
-                            thread_id,
+                            place,
                             message_id,
                             until: Instant::now() + console::COMMAND_WAIT,
                         },
@@ -6449,7 +6482,7 @@ impl Slots {
             }
         };
         info!(ordinal, "console command refused");
-        self.answer_command(thread_id, message_id, refusal);
+        self.answer_command(place, message_id, refusal);
     }
 
     fn remember_command(&mut self, command_id: u64, ask: CommandAsk) {
@@ -6468,8 +6501,8 @@ impl Slots {
     }
 
     /// An answer to the topic message `message_id` of a console command.
-    fn answer_command(&mut self, thread_id: i64, message_id: i64, text: &str) {
-        let mut op = message_op(thread_id, text.to_owned());
+    fn answer_command(&mut self, place: Place, message_id: i64, text: &str) {
+        let mut op = message_op(place, text.to_owned());
         if let Op::Send { reply_to, .. } = &mut op {
             *reply_to = Some(message_id);
         }
@@ -6478,7 +6511,7 @@ impl Slots {
 
     /// The text of a panel a console command opened, monospace, in reply to
     /// the command; one message, cut to the Telegram limit.
-    fn answer_panel(&mut self, thread_id: i64, message_id: i64, panel: &str) {
+    fn answer_panel(&mut self, place: Place, message_id: i64, panel: &str) {
         let Some(text) = split_for_telegram(panel, SplitOptions::default())
             .chunks
             .into_iter()
@@ -6486,7 +6519,7 @@ impl Slots {
         else {
             return;
         };
-        let mut op = message_op(thread_id, text);
+        let mut op = message_op(place, text);
         if let Op::Send {
             text,
             html,
@@ -6535,19 +6568,22 @@ impl Slots {
         );
         match outcome {
             CommandOutcome::Sent => {
-                self.react(ask.message_id, stream::ACCEPTED);
+                self.react(
+                    MessageKey::new(ask.place.chat, ask.message_id),
+                    stream::ACCEPTED,
+                );
                 if let Some(panel) = panel.filter(|panel| !panel.trim().is_empty()) {
-                    self.answer_panel(ask.thread_id, ask.message_id, &panel);
+                    self.answer_panel(ask.place, ask.message_id, &panel);
                 }
             }
             CommandOutcome::Draft => {
-                self.answer_command(ask.thread_id, ask.message_id, console::DRAFT_NOTICE);
+                self.answer_command(ask.place, ask.message_id, console::DRAFT_NOTICE);
             }
             CommandOutcome::AgentsRunning => {
-                self.answer_command(ask.thread_id, ask.message_id, console::AGENTS_NOTICE);
+                self.answer_command(ask.place, ask.message_id, console::AGENTS_NOTICE);
             }
             CommandOutcome::Failed | CommandOutcome::Other => {
-                self.answer_command(ask.thread_id, ask.message_id, console::FAILED_NOTICE);
+                self.answer_command(ask.place, ask.message_id, console::FAILED_NOTICE);
             }
         }
     }
@@ -6612,12 +6648,16 @@ impl Slots {
         for index in 0..self.registry.slots.len() {
             let slot = SlotId(index);
             let entry = &self.registry.slots[index];
-            let (Some(thread_id), Some(session)) = (entry.topic_id, entry.current_session.clone())
+            let (Some(view), Some(session)) = (entry.primary(), entry.current_session.clone())
             else {
                 continue;
             };
-            let message = entry.status;
-            let separated = entry.pending_separator.is_none();
+            let Some(place) = view.place() else {
+                continue;
+            };
+            let message = view.status;
+            let status = view.status_message();
+            let separated = view.pending_separator.is_none();
             let (in_flight, urgent) = self
                 .shown
                 .get(&slot)
@@ -6642,21 +6682,24 @@ impl Slots {
                         continue;
                     }
                     StatusJob::Create {
-                        thread_id,
+                        place,
                         text,
                         keyboard,
                     }
                 }
-                Some(StatusMessage {
-                    message_id,
-                    pinned: false,
-                }) if can_pin && !shown.pin_failed => {
+                Some(StatusMessage { pinned: false, .. }) if can_pin && !shown.pin_failed => {
                     if in_flight > 0 {
                         continue;
                     }
-                    StatusJob::Pin { message_id }
+                    let Some(message) = status else {
+                        continue;
+                    };
+                    StatusJob::Pin { message }
                 }
-                Some(StatusMessage { message_id, .. }) => {
+                Some(_) => {
+                    let Some(message) = status else {
+                        continue;
+                    };
                     let current = Some((text.clone(), keyboard.clone()));
                     if shown.content == current {
                         shown.urgent = false;
@@ -6666,7 +6709,7 @@ impl Slots {
                         continue;
                     }
                     StatusJob::Edit {
-                        message_id,
+                        message,
                         text,
                         keyboard,
                     }
@@ -6681,11 +6724,12 @@ impl Slots {
             };
             let op = match &job {
                 StatusJob::Create {
-                    thread_id,
+                    place,
                     text,
                     keyboard,
                 } => Op::Send {
-                    thread_id: Some(*thread_id),
+                    chat: place.chat,
+                    thread_id: place.thread,
                     text: text.clone(),
                     html: None,
                     reply_markup: Some(keyboard.clone()),
@@ -6694,17 +6738,19 @@ impl Slots {
                     notify: false,
                 },
                 StatusJob::Edit {
-                    message_id,
+                    message,
                     text,
                     keyboard,
                 } => Op::Edit {
-                    message_id: *message_id,
+                    chat: message.chat,
+                    message_id: message.id,
                     text: text.clone(),
                     reply_markup: Some(keyboard.clone()),
                     background,
                 },
-                StatusJob::Pin { message_id } => Op::Pin {
-                    message_id: *message_id,
+                StatusJob::Pin { message } => Op::Pin {
+                    chat: message.chat,
+                    message_id: message.id,
                 },
             };
             self.hand_off(Work::Status { slot, job }, op);
@@ -6717,8 +6763,11 @@ impl Slots {
         let every = self.options.status_every.unwrap_or(STATUS_EVERY);
         let retry_every = self.options.retry_every;
         let ordinal = self.ordinal(slot);
-        let topic_id = self.registry.slot(slot).and_then(|slot| slot.topic_id);
-        let message = self.registry.slot(slot).and_then(|slot| slot.status);
+        let topic = self.registry.place(slot);
+        let message = self
+            .registry
+            .slot(slot)
+            .and_then(|slot| slot.primary()?.status);
         let shown = self.shown.entry(slot).or_default();
         shown.in_flight = shown.in_flight.saturating_sub(1);
         if matches!(delivery, Some(Ok(Outcome::Superseded))) {
@@ -6727,21 +6776,25 @@ impl Slots {
         }
         match job {
             StatusJob::Create {
-                thread_id,
+                place,
                 text,
                 keyboard,
             } => match delivery {
                 Some(Ok(Outcome::Sent(sent))) if sent.message_id != 0 => {
                     // A message for a topic the slot no longer has stays there.
-                    if topic_id != Some(thread_id) || message.is_some() {
+                    if topic != Some(place) || message.is_some() {
                         return;
                     }
                     shown.content = Some((text, keyboard));
                     shown.next_at = Some(now + every);
                     shown.retry_at = None;
                     shown.send_warned = false;
-                    if let Some(entry) = self.registry.slot_mut(slot) {
-                        entry.status = Some(StatusMessage {
+                    if let Some(view) = self
+                        .registry
+                        .slot_mut(slot)
+                        .and_then(|entry| entry.view_mut(place.chat))
+                    {
+                        view.status = Some(StatusMessage {
                             message_id: sent.message_id,
                             pinned: false,
                         });
@@ -6769,7 +6822,7 @@ impl Slots {
                 }
             },
             StatusJob::Edit {
-                message_id,
+                message,
                 text,
                 keyboard,
             } => {
@@ -6800,12 +6853,13 @@ impl Slots {
                 } else if gone {
                     // Deleted in Telegram: a new one is sent and pinned.
                     shown.content = None;
-                    if let Some(entry) = self.registry.slot_mut(slot)
-                        && entry
-                            .status
-                            .is_some_and(|status| status.message_id == message_id)
+                    if let Some(view) = self
+                        .registry
+                        .slot_mut(slot)
+                        .and_then(|entry| entry.view_mut(message.chat))
+                        && view.status_message() == Some(message)
                     {
-                        entry.status = None;
+                        view.status = None;
                         self.registry.dirty = true;
                         info!(ordinal, "status message is gone; sending a new one");
                     }
@@ -6813,13 +6867,14 @@ impl Slots {
                     debug!(%error, ordinal, "status edit failed; tried again later");
                 }
             }
-            StatusJob::Pin { message_id } => match delivery {
+            StatusJob::Pin { message } => match delivery {
                 Some(Ok(_)) => {
-                    if let Some(entry) = self.registry.slot_mut(slot)
-                        && let Some(status) = entry
-                            .status
-                            .as_mut()
-                            .filter(|status| status.message_id == message_id)
+                    if let Some(status) = self
+                        .registry
+                        .slot_mut(slot)
+                        .and_then(|entry| entry.view_mut(message.chat))
+                        .and_then(|view| view.status.as_mut())
+                        .filter(|status| status.message_id == message.id)
                     {
                         status.pinned = true;
                         self.registry.dirty = true;
@@ -6955,7 +7010,7 @@ impl Slots {
 
     /// Sends `notice` to the slot's topic unless the slot got it within
     /// `notice_every`.
-    fn notify(&mut self, slot: SlotId, thread_id: i64, notice: &'static str) {
+    fn notify(&mut self, slot: SlotId, place: Place, notice: &'static str) {
         let now = Instant::now();
         if self
             .notices
@@ -6968,7 +7023,7 @@ impl Slots {
             );
             return;
         }
-        if self.send_messages(vec![message_op(thread_id, notice.to_owned())]) {
+        if self.send_messages(vec![message_op(place, notice.to_owned())]) {
             self.notices.insert((slot, notice), now);
         }
     }
@@ -7103,8 +7158,9 @@ impl Slots {
             Done::Resume {
                 slot,
                 number,
+                chat,
                 delivery,
-            } => self.on_resume_done(slot, number, delivery),
+            } => self.on_resume_done(slot, number, chat, delivery),
             Done::Block { job, delivery } => self.on_block_done(job, delivery),
             Done::Stream {
                 session,
@@ -7193,7 +7249,8 @@ impl Slots {
             // At most once: the block is marked notified whether or not
             // this send goes through.
             self.send_messages(vec![Op::Send {
-                thread_id: Some(notice.thread_id),
+                chat: notice.place.chat,
+                thread_id: notice.place.thread,
                 text: notice.text,
                 html: None,
                 reply_markup: None,
@@ -7237,22 +7294,26 @@ impl Slots {
         let Some(delivery) = delivery else {
             // The scheduler stopped: handing the job out again would come
             // back at once, so it waits for the retry tick like a failure.
-            let (TopicJob::Create { slot, .. }
-            | TopicJob::Edit { slot, .. }
-            | TopicJob::Separator { slot, .. }) = job;
+            let (slot, chat) = job.view();
             warn!(
                 ordinal = self.ordinal(slot),
                 "topic call got no answer; retrying later"
             );
-            self.registry.topic_failed(slot, icons);
+            self.registry.topic_failed(slot, chat, icons);
             return;
         };
         match job {
-            TopicJob::Create { slot, name, icon } => match delivery {
+            TopicJob::Create {
+                slot,
+                chat,
+                name,
+                icon,
+            } => match delivery {
                 Ok(Outcome::Topic(topic)) if topic.message_thread_id != 0 => {
                     info!(ordinal = self.ordinal(slot), "forum topic created");
                     self.registry.topic_created(
                         slot,
+                        chat,
                         topic.message_thread_id,
                         &name,
                         icon.as_deref(),
@@ -7260,7 +7321,7 @@ impl Slots {
                 }
                 Ok(_) => {
                     warn!("createForumTopic answered without a topic id");
-                    self.registry.topic_failed(slot, icons);
+                    self.registry.topic_failed(slot, chat, icons);
                 }
                 Err(error) => {
                     // Known limitation (TASK-011 review I3): createForumTopic
@@ -7268,44 +7329,51 @@ impl Slots {
                     // the answer was lost (or the hub died before saving it),
                     // the retry makes a second one and the first is orphaned.
                     warn!(%error, ordinal = self.ordinal(slot), "cannot create a forum topic; retrying later");
-                    self.registry.topic_failed(slot, icons);
+                    self.registry.topic_failed(slot, chat, icons);
                 }
             },
             TopicJob::Edit {
                 slot,
+                chat,
                 thread_id,
                 name,
                 icon,
             } => {
                 if delivery.is_ok() || not_modified(&delivery) {
-                    self.registry
-                        .topic_edited(slot, thread_id, name.as_deref(), icon.as_deref());
+                    self.registry.topic_edited(
+                        slot,
+                        chat,
+                        thread_id,
+                        name.as_deref(),
+                        icon.as_deref(),
+                    );
                 } else if topic_gone(&delivery) {
                     warn!(
                         ordinal = self.ordinal(slot),
                         "forum topic is gone; creating a replacement"
                     );
-                    self.registry.topic_invalid(slot, thread_id);
+                    self.registry.topic_invalid(slot, chat, thread_id);
                 } else {
                     if let Err(error) = &delivery {
                         warn!(%error, ordinal = self.ordinal(slot), "cannot edit a forum topic; retrying later");
                     }
-                    self.registry.topic_failed(slot, icons);
+                    self.registry.topic_failed(slot, chat, icons);
                 }
             }
             TopicJob::Separator {
                 slot,
+                chat,
                 thread_id,
                 text,
             } => {
                 if delivery.is_ok() {
-                    self.registry.topic_separated(slot, thread_id, &text);
+                    self.registry.topic_separated(slot, chat, thread_id, &text);
                 } else if topic_gone(&delivery) {
                     warn!(
                         ordinal = self.ordinal(slot),
                         "forum topic is gone; creating a replacement"
                     );
-                    self.registry.topic_invalid(slot, thread_id);
+                    self.registry.topic_invalid(slot, chat, thread_id);
                 } else {
                     // Known limitation (TASK-011 QA O1): a separator that
                     // always fails is retried every tick and holds back the
@@ -7313,7 +7381,7 @@ impl Slots {
                     if let Err(error) = &delivery {
                         warn!(%error, ordinal = self.ordinal(slot), "session separator not delivered; retrying later");
                     }
-                    self.registry.topic_failed(slot, icons);
+                    self.registry.topic_failed(slot, chat, icons);
                 }
             }
         }
@@ -7336,23 +7404,32 @@ impl Slots {
             .topic_work_except(&self.options.icons, edits, &draining)
         {
             let op = match &job {
-                TopicJob::Create { name, icon, .. } => Op::CreateTopic {
+                TopicJob::Create {
+                    chat, name, icon, ..
+                } => Op::CreateTopic {
+                    chat: *chat,
                     name: name.clone(),
                     icon_custom_emoji_id: icon.clone(),
                 },
                 TopicJob::Edit {
+                    chat,
                     thread_id,
                     name,
                     icon,
                     ..
                 } => Op::EditTopic {
+                    chat: *chat,
                     thread_id: *thread_id,
                     name: name.clone(),
                     icon_custom_emoji_id: icon.clone(),
                 },
                 TopicJob::Separator {
-                    thread_id, text, ..
+                    chat,
+                    thread_id,
+                    text,
+                    ..
                 } => Op::Send {
+                    chat: *chat,
                     thread_id: Some(*thread_id),
                     text: text.clone(),
                     html: None,
@@ -7369,13 +7446,10 @@ impl Slots {
         for job in self.registry.block_work(room) {
             self.block_jobs += 1;
             let op = match &job {
-                BlockJob::Send {
-                    thread_id, text, ..
-                } => message_op(*thread_id, text.clone()),
-                BlockJob::Edit {
-                    message_id, text, ..
-                } => Op::Edit {
-                    message_id: *message_id,
+                BlockJob::Send { place, text, .. } => message_op(*place, text.clone()),
+                BlockJob::Edit { message, text, .. } => Op::Edit {
+                    chat: message.chat,
+                    message_id: message.id,
                     text: text.clone(),
                     reply_markup: None,
                     background: false,
@@ -7417,13 +7491,21 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         live.answered_outside(&held);
         return Err(held);
     }
-    let thread_id = held.thread_id;
+    let Place {
+        chat,
+        thread: Some(thread_id),
+    } = held.place
+    else {
+        live.answered_outside(&held);
+        return Err(held);
+    };
     let mut chunks = split.chunks;
     let Some(last) = chunks.pop() else {
         live.answered_outside(&held);
         return Ok(Vec::new());
     };
     let op = |live: &mut Live, chunk: HtmlChunk| Op::Stream {
+        chat,
         thread_id,
         text: chunk.text,
         html: Some(chunk.html),
@@ -7483,9 +7565,10 @@ struct Compaction {
 }
 
 /// A plain message without a sound.
-fn message_op(thread_id: i64, text: String) -> Op {
+fn message_op(place: Place, text: String) -> Op {
     Op::Send {
-        thread_id: Some(thread_id),
+        chat: place.chat,
+        thread_id: place.thread,
         text,
         html: None,
         reply_markup: None,
@@ -7524,9 +7607,10 @@ async fn dispatch_loop(
                     delivery,
                 },
                 Work::Callback => Done::Callback(delivery),
-                Work::Resume { slot, number } => Done::Resume {
+                Work::Resume { slot, number, chat } => Done::Resume {
                     slot,
                     number,
+                    chat,
                     delivery,
                 },
                 Work::Block(job) => Done::Block { job, delivery },
@@ -7882,10 +7966,9 @@ mod tests {
         }
     }
 
-    const CHAT: i64 = -1000000000001;
-
     fn say(thread_id: Option<i64>, message_id: i64, text: Option<&str>) -> Control {
         Control::Message(Inbound {
+            chat: Chat::Group,
             message_id,
             thread_id,
             text: text.map(str::to_owned),
@@ -7898,10 +7981,7 @@ mod tests {
     }
 
     fn message_options() -> Options {
-        Options {
-            chat_id: CHAT,
-            ..options()
-        }
+        Options { ..options() }
     }
 
     /// What agent `index` (in registration order) received, after a pause.
@@ -7965,6 +8045,7 @@ mod tests {
         rig.control.send(say(Some(101), 42, Some("hi B"))).unwrap();
         rig.control
             .send(Control::Message(Inbound {
+                chat: Chat::Group,
                 message_id: 43,
                 thread_id: Some(101),
                 text: Some("again".into()),
@@ -7977,6 +8058,7 @@ mod tests {
             .unwrap();
         rig.control
             .send(Control::Message(Inbound {
+                chat: Chat::Group,
                 message_id: 46,
                 thread_id: Some(101),
                 text: Some("чужие слова".into()),
@@ -8006,7 +8088,7 @@ mod tests {
                 HubMsg::Inbound {
                     content: "hi B".into(),
                     meta: meta(&[
-                        ("chat_id", "-1000000000001"),
+                        ("place", "group"),
                         ("message_id", "42"),
                         ("thread_id", "101"),
                     ]),
@@ -8017,7 +8099,7 @@ mod tests {
 again"
                         .into(),
                     meta: meta(&[
-                        ("chat_id", "-1000000000001"),
+                        ("place", "group"),
                         ("message_id", "43"),
                         ("reply_to_message_id", "40"),
                         ("thread_id", "101"),
@@ -8028,7 +8110,7 @@ again"
 чужие слова"
                         .into(),
                     meta: meta(&[
-                        ("chat_id", "-1000000000001"),
+                        ("place", "group"),
                         ("forwarded", "true"),
                         ("message_id", "46"),
                         ("thread_id", "101"),
@@ -8047,7 +8129,11 @@ again"
         let after: Vec<(i64, &str)> = ops[before..]
             .iter()
             .map(|op| match op {
-                Op::React { message_id, emoji } => (*message_id, emoji.as_str()),
+                Op::React {
+                    chat: Chat::Group,
+                    message_id,
+                    emoji,
+                } => (*message_id, emoji.as_str()),
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
@@ -8187,7 +8273,7 @@ again"
         })
         .await;
         assert!(ops.iter().any(|op| matches!(op,
-            Op::SendDocument { thread_id: Some(100), document, notify: false } if document.bytes == huge.as_bytes())));
+            Op::SendDocument { chat: Chat::Group, thread_id: Some(100), document, notify: false } if document.bytes == huge.as_bytes())));
     }
 
     #[tokio::test]
@@ -8207,7 +8293,9 @@ again"
         let dir = TempDir::new("slots-late-reply");
         let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.on_hook(&hook(
             A,
@@ -8234,7 +8322,9 @@ again"
         let dir = TempDir::new("slots-duplicate-reply");
         let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         connect(&mut slots, 2, A, Some(10));
 
@@ -8302,7 +8392,9 @@ again"
         let dir = TempDir::new("slots-clear-reply");
         let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, None);
         slots.on_hook(&hook(
             A,
@@ -8402,7 +8494,7 @@ again"
         })
         .await;
         assert!(ops.iter().any(|op| matches!(op,
-            Op::SendDocument { thread_id: Some(100), document, notify: true }
+            Op::SendDocument { chat: Chat::Group, thread_id: Some(100), document, notify: true }
                 if document.bytes == huge.as_bytes() && document.file_name == "answer-aaaaaaaa.txt")));
     }
 
@@ -8414,7 +8506,9 @@ again"
         // No topic yet.
         slots.on_hook(&stop(A, Some("before the topic")));
         assert_eq!(slots.queued_messages, 0);
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         // Absent, empty and blank answers.
         for answer in [None, Some(""), Some(" \n\t ")] {
             slots.on_hook(&stop(A, answer));
@@ -8464,7 +8558,9 @@ again"
         let dir = TempDir::new("slots-answer-cap");
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
         let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
@@ -8536,6 +8632,7 @@ again"
 
     fn press(query: &str, message_id: Option<i64>, data: &str) -> Control {
         Control::Callback(CallbackInput {
+            chat: Some(Chat::Group),
             query_id: query.into(),
             data: Some(data.into()),
             message_id,
@@ -8774,6 +8871,7 @@ again"
         let id = question_id(&ops, 0);
         rig.control
             .send(Control::Message(Inbound {
+                chat: Chat::Group,
                 message_id: 51,
                 thread_id: Some(100),
                 text: Some("Green".into()),
@@ -9328,7 +9426,7 @@ again"
             .collect();
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert!(
-            matches!(edits[0], Op::Edit { message_id: id, text: edited, reply_markup: Some(markup), background: false }
+            matches!(edits[0], Op::Edit { chat: Chat::Group, message_id: id, text: edited, reply_markup: Some(markup), background: false }
             if *id == message_id
                 && *edited == format!("{text}{}", permissions::ALLOWED_MARK)
                 && *markup == permissions::no_keyboard())
@@ -9381,6 +9479,40 @@ again"
         assert_eq!(answers(&ops), [expired, expired, expired, None, expired]);
         assert!(verdicts(&received(&mut rig, 0).await).is_empty());
         assert!(!ops.iter().any(|op| matches!(op, Op::Edit { .. })));
+    }
+
+    /// TASK-061: message ids are numbered per chat. A press on the same
+    /// message id in a private chat is not a press on the group's prompt,
+    /// neither by its id nor as the one prompt in flight in that topic id.
+    #[tokio::test]
+    async fn a_press_on_the_same_message_id_in_another_chat_decides_nothing() {
+        let mut rig = rig(Fake::default(), message_options());
+        two_live_slots(&mut rig, false).await;
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        let ops = settled(&rig, |ops| prompts(ops).len() == 1).await;
+        let (thread, _, message_id) = prompts(&ops).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(7_319_402_518));
+        let elsewhere = Control::Callback(CallbackInput {
+            chat: Some(private),
+            query_id: "q1".into(),
+            data: Some("allow:abcde".into()),
+            message_id: Some(message_id),
+            thread_id: Some(thread),
+            from_name: None,
+        });
+        rig.control.send(elsewhere).unwrap();
+        let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
+        assert_eq!(answers(&ops), [Some(permissions::ANSWER_EXPIRED)]);
+        assert!(verdicts(&received(&mut rig, 0).await).is_empty());
+        rig.control
+            .send(press("q2", Some(message_id), "allow:abcde"))
+            .unwrap();
+        settled(&rig, |ops| answers(ops).len() == 2).await;
+        assert_eq!(
+            verdicts(&received(&mut rig, 0).await),
+            [("abcde".to_owned(), Behavior::Allow)]
+        );
     }
 
     // ---- TASK-014 review 2: lifecycle defects of the planner reference ----
@@ -9479,7 +9611,9 @@ again"
         let dir = TempDir::new("slots-reap");
         let (_fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
         assert!(slots.activity.contains_key(A));
@@ -9525,7 +9659,9 @@ again"
         assert!(!block.running, "the nested block is finished");
         assert_eq!(slots.registry.slots[0].current_session.as_deref(), Some(C));
         assert_eq!(
-            slots.registry.slots[0].pending_separator.as_deref(),
+            slots.registry.slots[0].views[0]
+                .pending_separator
+                .as_deref(),
             Some("── session cccccccc · new ──")
         );
     }
@@ -9585,7 +9721,9 @@ again"
         let dir = TempDir::new("slots-compact");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
         slots.on_hook(&hook(A, compact("auto")));
         let now = Instant::now();
@@ -9661,7 +9799,9 @@ again"
         // No topic yet: nothing to show.
         slots.on_hook(&hook(A, compact("manual")));
         assert!(slots.compactions.is_empty());
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&hook(A, HookEvent::PreCompact { trigger: None }));
         assert_eq!(status_head(&slots, A, Instant::now()), "🗜 Сжимаю контекст…");
         slots.on_hook(&hook(A, compacted(10)));
@@ -9688,7 +9828,9 @@ again"
         let dir = TempDir::new("slots-compact-cancel");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
 
         // Cancelled (Esc, an error): the next prompt ends the status at once,
@@ -9758,7 +9900,9 @@ again"
         let dir = TempDir::new("slots-compact-after");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
         slots.on_hook(&hook(A, compact("auto")));
         slots.on_hook(&hook(A, compacted(10)));
@@ -9781,7 +9925,9 @@ again"
         let dir = TempDir::new("slots-compact-twice");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
         slots.on_hook(&hook(A, compact("manual")));
         slots.on_hook(&hook(A, compacted(10)));
@@ -9805,7 +9951,9 @@ again"
         let dir = TempDir::new("slots-compact-nocontext");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&hook(
             A,
             HookEvent::StatusLine {
@@ -9830,7 +9978,9 @@ again"
         let dir = TempDir::new("slots-late-permission");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -9882,7 +10032,9 @@ again"
         let dir = TempDir::new("slots-bound-retry");
         let (_fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(1);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -9942,7 +10094,9 @@ again"
         let dir = TempDir::new("slots-clear-frame-binding");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         let queued = permission(1, "abcde", "before clear");
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -10010,10 +10164,14 @@ again"
         let dir = TempDir::new("slots-clear-prune-prompt");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.on_agent(permission(1, "abcde", "p"));
-        slots.prompts.get_mut(0).unwrap().sent = true;
+        let shown = slots.prompts.get_mut(0).unwrap();
+        shown.sent = true;
+        shown.place = Some(Place::topic(Chat::Group, 100));
         slots.prompts.delivered(0, 500);
 
         for i in 0..crate::hub::registry::MAX_SESSIONS - 1 {
@@ -10140,7 +10298,9 @@ again"
             },
         ));
         slots.on_hook(&start(B, 11));
-        slots.registry.topic_created(SlotId(0), 100, "t", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
         slots.pump();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -10506,7 +10666,9 @@ again"
         {
             slots.on_agent(permission(1, &request_id(key), "p"));
             let key = key as u64;
-            slots.prompts.get_mut(key).unwrap().sent = true;
+            let shown = slots.prompts.get_mut(key).unwrap();
+            shown.sent = true;
+            shown.place = Some(Place::topic(Chat::Group, 100));
             slots.prompts.delivered(key, 500 + key as i64);
             slots.finish(key, State::Closed);
             slots.on_prompt_edit_done(
@@ -10527,14 +10689,18 @@ again"
         let dir = TempDir::new("slots-prompt-book");
         let (fake, mut slots) = live_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         for n in 0..permissions::MAX_PROMPTS {
             slots.on_agent(permission(1, &request_id(n), "p"));
         }
         // All shown (no pump: nothing else goes out).
         for key in 0..permissions::MAX_PROMPTS as u64 {
-            slots.prompts.get_mut(key).unwrap().sent = true;
+            let shown = slots.prompts.get_mut(key).unwrap();
+            shown.sent = true;
+            shown.place = Some(Place::topic(Chat::Group, 100));
             slots.prompts.delivered(key, 5000 + key as i64);
         }
         slots.on_agent(permission(1, "zzzzz", "p"));
@@ -10616,7 +10782,9 @@ again"
         let dir = TempDir::new("slots-atomic-reply");
         let (fake, mut slots) = stalled_slots_with_fake(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
         let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
@@ -10731,8 +10899,12 @@ again"
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
         slots.on_hook(&start(B, 11));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
-        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
         for i in 0..10 {
             slots.on_control(say(Some(100), i, None));
         }
@@ -10818,7 +10990,9 @@ again"
         let dir = TempDir::new("slots-buffer-cap");
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&end(A, 10));
         for i in 0..60 {
             slots.on_control(say(Some(100), i, Some("x")));
@@ -10857,7 +11031,9 @@ again"
         let dir = TempDir::new("slots-buffer-queue");
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         for i in 0..6 {
             slots.on_control(say(Some(100), i, Some("x")));
         }
@@ -10876,7 +11052,9 @@ again"
             let dir = TempDir::new("slots-revival");
             let mut slots = stalled_slots(&dir, message_options());
             slots.on_hook(&start(A, 10));
-            slots.registry.topic_created(SlotId(0), 100, "a", None);
+            slots
+                .registry
+                .topic_created(SlotId(0), Chat::Group, 100, "a", None);
             let mut next = match how {
                 // `/clear` with no agent on line: the slot never looked dead.
                 "clear" => {
@@ -10939,7 +11117,9 @@ again"
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
         slots.on_hook(&start(B, 11));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&end(A, 10));
         for i in 0..3 {
             slots.on_control(say(Some(100), i, Some("x")));
@@ -10991,7 +11171,9 @@ again"
         };
         let mut slots = stalled_slots(&dir, options);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "t", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
         // Photos: each asks for a text-only notice.
         for i in 0..MAX_QUEUED_MESSAGES as i64 + 50 {
             slots.on_control(say(Some(100), i, None));
@@ -11009,7 +11191,9 @@ again"
         let dir = TempDir::new("slots-buffer-old-run");
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let mut old_run = connect_queue(&mut slots, 1, A, Some(10), 64);
         slots.on_hook(&end(A, 10));
         for i in 0..3 {
@@ -11040,8 +11224,12 @@ again"
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
         slots.on_hook(&start(B, 11));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
-        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
         let mut agent_b = connect_queue(&mut slots, 2, B, Some(11), 64);
         slots.on_hook(&end(A, 10));
         for i in 0..3 {
@@ -11166,14 +11354,16 @@ again"
         {
             let mut slots = stalled_slots(&dir, message_options());
             slots.on_hook(&start(A, 10));
-            slots.registry.topic_created(SlotId(0), 100, "a", None);
+            slots
+                .registry
+                .topic_created(SlotId(0), Chat::Group, 100, "a", None);
             slots.on_hook(&end(A, 10));
             for i in 1..=3 {
                 slots.on_control(say(Some(100), i, Some(&format!("m{i}"))));
             }
             slots.offer_resume();
             if let Some(note) = slots.registry.slots[0].buffer.resume.as_mut() {
-                note.message_id = Some(900);
+                note.message = Some(MessageKey::new(Chat::Group, 900));
             }
             let store = RegistryStore::open(dir.path()).unwrap();
             store.save(&RegistryStore::encode(&slots.registry)).unwrap();
@@ -11247,6 +11437,7 @@ again"
         slots.on_done(Done::Resume {
             slot: SlotId(0),
             number,
+            chat: Chat::Group,
             delivery: Some(Ok(Outcome::Sent(Message {
                 message_id,
                 ..Message::default()
@@ -11272,7 +11463,9 @@ again"
         work: &mut mpsc::UnboundedReceiver<(Work, Op)>,
     ) -> u64 {
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         slots.on_hook(&end(A, 10));
         slots.on_control(say(Some(100), 1, Some("m1")));
         slots.pump();
@@ -11329,10 +11522,13 @@ again"
             "the first period is over"
         );
         let note = |slots: &Slots| slots.registry.slots[0].buffer.resume.clone().unwrap();
-        assert_eq!(note(&slots).message_id, None);
+        assert_eq!(note(&slots).message, None);
         resume_sent(&mut slots, second, 902);
         assert!(handed(&mut work).1.is_empty(), "the live button stays");
-        assert_eq!(note(&slots).message_id, Some(902));
+        assert_eq!(
+            note(&slots).message,
+            Some(MessageKey::new(Chat::Group, 902))
+        );
         assert_eq!(buffered(&slots, 0), [2]);
     }
 
@@ -11504,7 +11700,7 @@ again"
         let ops = rig.ops_after(1).await;
         assert_eq!(ops.len(), 1);
         assert!(
-            matches!(&ops[0], Op::CreateTopic { name, icon_custom_emoji_id }
+            matches!(&ops[0], Op::CreateTopic { chat: Chat::Group, name, icon_custom_emoji_id }
             if name == "[box] Project · aaaaaaaa" && icon_custom_emoji_id.as_deref() == Some(ICON_NO_CHANNEL))
         );
 
@@ -11517,6 +11713,7 @@ again"
         for (thread, message_id) in [(Some(100), 55), (Some(999), 56), (None, 57)] {
             rig.control
                 .send(Control::TopicEdited {
+                    chat: Chat::Group,
                     thread_id: thread,
                     message_id,
                 })
@@ -11524,7 +11721,13 @@ again"
         }
         let ops = rig.ops_after(3).await;
         assert_eq!(ops.len(), 3, "{ops:?}");
-        assert!(matches!(ops[2], Op::Delete { message_id: 55 }));
+        assert!(matches!(
+            ops[2],
+            Op::Delete {
+                chat: Chat::Group,
+                message_id: 55
+            }
+        ));
 
         rig.hook(hook(
             A,
@@ -11582,7 +11785,7 @@ again"
         let saved = tokio::time::timeout(WAIT, saved_b).await.expect("B saved");
         assert_eq!(saved.slots.len(), 1);
         assert_eq!(saved.slots[0].current_session.as_deref(), Some(B));
-        assert_eq!(saved.slots[0].topic_id, Some(100));
+        assert_eq!(saved.slots[0].views[0].topic_id, Some(100));
     }
 
     #[tokio::test]
@@ -11644,7 +11847,7 @@ again"
         let ops = rig.ops_after(2).await;
         assert_eq!(count(&ops, is_create), 2);
         assert!(
-            matches!(&ops[1], Op::CreateTopic { name, icon_custom_emoji_id }
+            matches!(&ops[1], Op::CreateTopic { chat: Chat::Group, name, icon_custom_emoji_id }
             if name == "[box] Project #2 · bbbbbbbb" && icon_custom_emoji_id.as_deref() == Some(ICON_ALIVE))
         );
     }
@@ -12203,6 +12406,7 @@ again"
         for (message_id, reply_to) in [(50, block), (51, nested), (52, 999)] {
             rig.control
                 .send(Control::Message(Inbound {
+                    chat: Chat::Group,
                     message_id,
                     thread_id: Some(100),
                     text: Some("hi".into()),
@@ -12299,8 +12503,11 @@ again"
         registry.apply_hook(&start(B, 11));
         let jobs = registry.topic_work(&Icons::default(), true);
         for (job, topic) in jobs.into_iter().zip([100, 101]) {
-            if let TopicJob::Create { slot, name, icon } = job {
-                registry.topic_created(slot, topic, &name, icon.as_deref());
+            if let TopicJob::Create {
+                slot, name, icon, ..
+            } = job
+            {
+                registry.topic_created(slot, Chat::Group, topic, &name, icon.as_deref());
             }
         }
         registry.confirm_subagent(S1, A, format!("↳ Explore {S1}"));
@@ -12391,8 +12598,11 @@ again"
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, 10));
         for job in registry.topic_work(&Icons::default(), true) {
-            if let TopicJob::Create { slot, name, icon } = job {
-                registry.topic_created(slot, 100, &name, icon.as_deref());
+            if let TopicJob::Create {
+                slot, name, icon, ..
+            } = job
+            {
+                registry.topic_created(slot, Chat::Group, 100, &name, icon.as_deref());
             }
         }
         for agent in agents {
@@ -12759,7 +12969,9 @@ again"
         let mut slots = stalled_slots(&dir, subagent_options());
         slots.on_hook(&start(A, 10));
         let slot = slots.registry.sessions[A].slot.unwrap();
-        slots.registry.topic_created(slot, 100, "t", None);
+        slots
+            .registry
+            .topic_created(slot, Chat::Group, 100, "t", None);
         for i in 0..100 {
             let agent = format!("a{i:016}");
             slots
@@ -12810,7 +13022,7 @@ again"
     ) -> oneshot::Receiver<Prepared> {
         let (answer, answered) = oneshot::channel();
         slots.on_transcript_ask(TranscriptAsk {
-            thread_id: None,
+            place: Place::new(Chat::Group, None),
             command: commands::TranscriptCommand {
                 view,
                 prompts,
@@ -13318,7 +13530,7 @@ again"
         let ops = rig.ops_after(4).await;
         assert_eq!(ops.len(), 4, "{ops:?}");
         assert!(
-            matches!(&ops[3], Op::CreateTopic { name, icon_custom_emoji_id }
+            matches!(&ops[3], Op::CreateTopic { chat: Chat::Group, name, icon_custom_emoji_id }
             if name == "[box] Project · aaaaaaaa" && icon_custom_emoji_id.as_deref() == Some(ICON_ALIVE))
         );
         // Topic 101 of the other slot was never touched.
@@ -13364,6 +13576,7 @@ again"
         rig.ops_after(1).await;
         rig.control
             .send(Control::TopicEdited {
+                chat: Chat::Group,
                 thread_id: Some(100),
                 message_id: 5,
             })
@@ -13381,8 +13594,11 @@ again"
         registry.apply_hook(&start(A, 10));
         registry.agent_connected(A, 1);
         for job in registry.topic_work(&Icons::default(), true) {
-            if let TopicJob::Create { slot, name, icon } = job {
-                registry.topic_created(slot, 100, &name, icon.as_deref());
+            if let TopicJob::Create {
+                slot, name, icon, ..
+            } = job
+            {
+                registry.topic_created(slot, Chat::Group, 100, &name, icon.as_deref());
             }
         }
         store.save(&RegistryStore::encode(&registry)).unwrap();
@@ -13718,7 +13934,6 @@ again"
 
     fn stream_options() -> Options {
         Options {
-            chat_id: CHAT,
             stream_every: Duration::from_millis(20),
             hold_answer: Duration::from_millis(400),
             ..options()
@@ -13911,7 +14126,11 @@ again"
     fn reactions(ops: &[Op]) -> Vec<(i64, String)> {
         ops.iter()
             .filter_map(|op| match op {
-                Op::React { message_id, emoji } => Some((*message_id, emoji.clone())),
+                Op::React {
+                    chat: Chat::Group,
+                    message_id,
+                    emoji,
+                } => Some((*message_id, emoji.clone())),
                 _ => None,
             })
             .collect()
@@ -14297,7 +14516,9 @@ again"
         let path = transcript_file(&dir, A);
         let mut slots = stalled_slots(&dir, stream_options());
         slots.on_hook(&start_with(A, 10, &path, "startup"));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -14342,7 +14563,9 @@ again"
         let path = transcript_file(&dir, A);
         let mut slots = stalled_slots(&dir, stream_options());
         slots.on_hook(&start_with(A, 10, &path, "startup"));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -14399,7 +14622,9 @@ again"
         let path = transcript_file(dir, A);
         let mut slots = stalled_slots(dir, stream_options());
         slots.on_hook(&start_with(A, 10, &path, "startup"));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -14757,26 +14982,32 @@ again"
         let path = transcript_file(&dir, B);
         slots.on_hook(&start_with(B, 11, &path, "startup"));
         // The stalled scheduler never answers the title edit of A's start.
-        slots.registry.slots[0].busy = false;
+        slots.registry.slots[0].views[0].busy = false;
         let slot = &slots.registry.slots[0];
         assert_eq!(slot.current_session.as_deref(), Some(B));
-        assert!(slot.pending_separator.is_some());
+        assert!(slot.views[0].pending_separator.is_some());
         slots.pump();
         assert!(slots.streams.contains_key(A), "kept: its line is not out");
         assert_eq!(slots.queued_messages, 0, "not before its retry");
-        assert!(!slots.registry.slots[0].busy, "the separator waits");
+        assert!(
+            !slots.registry.slots[0].views[0].busy,
+            "the separator waits"
+        );
         // The retry is due: the line goes again, the separator still waits.
         slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
         slots.pump();
         assert_eq!(slots.queued_messages, 1);
         assert_eq!(slots.streams[A].unanswered(), 1);
         assert_eq!(slots.streams[A].resends, 1);
-        assert!(!slots.registry.slots[0].busy);
+        assert!(!slots.registry.slots[0].views[0].busy);
         slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
         assert_eq!(stream_offset(&slots), Some(10), "the line is in the topic");
         slots.pump();
         assert!(!slots.streams.contains_key(A), "forgotten once all is out");
-        assert!(slots.registry.slots[0].busy, "the separator goes now");
+        assert!(
+            slots.registry.slots[0].views[0].busy,
+            "the separator goes now"
+        );
     }
 
     /// TASK-024 item 1: a refused line of an ended session that keeps
@@ -14802,11 +15033,11 @@ again"
         let path = transcript_file(&dir, B);
         slots.on_hook(&start_with(B, 11, &path, "startup"));
         // The stalled scheduler never answers the title edit of A's start.
-        slots.registry.slots[0].busy = false;
+        slots.registry.slots[0].views[0].busy = false;
         for _ in 0..stream::MAX_RESENDS {
             slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
             slots.pump();
-            assert!(!slots.registry.slots[0].busy);
+            assert!(!slots.registry.slots[0].views[0].busy);
             slots.on_stream_done(A, 1, bad_gateway());
         }
         slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
@@ -14814,7 +15045,7 @@ again"
         assert!(!slots.streams.contains_key(A), "given up");
         assert_eq!(slots.queued_messages, 0);
         slots.pump();
-        assert!(slots.registry.slots[0].busy, "the separator goes");
+        assert!(slots.registry.slots[0].views[0].busy, "the separator goes");
     }
 
     fn stream_chunk(session: &str, from: u64, lines: Vec<StreamLine>) -> AgentEvent {
@@ -14948,15 +15179,18 @@ again"
         let path = transcript_file(&dir, B);
         slots.on_hook(&start_with(B, 11, &path, "startup"));
         // The stalled scheduler never answers the title edit of A's start.
-        slots.registry.slots[0].busy = false;
+        slots.registry.slots[0].views[0].busy = false;
         slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
         slots.pump();
         assert_eq!(slots.streams[A].resends, 1);
-        assert!(!slots.registry.slots[0].busy, "the separator waits");
+        assert!(
+            !slots.registry.slots[0].views[0].busy,
+            "the separator waits"
+        );
         slots.on_stream_done(A, 1, topic_gone_error());
         assert!(!slots.streams.contains_key(A), "given up at once");
         slots.pump();
-        assert!(slots.registry.slots[0].busy, "the separator goes");
+        assert!(slots.registry.slots[0].views[0].busy, "the separator goes");
     }
 
     /// TASK-024 review, missing coverage: a session that ends with nothing
@@ -14976,13 +15210,19 @@ again"
         slots.on_hook(&session_end(A, 10));
         let path = transcript_file(&dir, B);
         slots.on_hook(&start_with(B, 11, &path, "startup"));
-        slots.registry.slots[0].busy = false;
+        slots.registry.slots[0].views[0].busy = false;
         slots.pump();
-        assert!(!slots.registry.slots[0].busy, "behind the line in flight");
+        assert!(
+            !slots.registry.slots[0].views[0].busy,
+            "behind the line in flight"
+        );
         slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
         assert_eq!(slots.queued_messages, 0, "nothing sent again");
         slots.pump();
-        assert!(slots.registry.slots[0].busy, "the separator goes now");
+        assert!(
+            slots.registry.slots[0].views[0].busy,
+            "the separator goes now"
+        );
         assert!(!slots.streams.contains_key(A));
     }
 
@@ -15096,7 +15336,7 @@ again"
         let path = transcript_file(dir, B);
         slots.on_hook(&start_with(B, 11, &path, "startup"));
         // The stalled scheduler never answers the title edit of A's start.
-        slots.registry.slots[0].busy = false;
+        slots.registry.slots[0].views[0].busy = false;
         slots
     }
 
@@ -15124,7 +15364,7 @@ again"
         assert_eq!(slots.queued_messages, 1, "only A's line");
         slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
         slots.pump();
-        assert!(slots.registry.slots[0].busy, "C's separator goes");
+        assert!(slots.registry.slots[0].views[0].busy, "C's separator goes");
         assert_eq!(slots.queued_messages, 0, "no answer of B");
     }
 
@@ -15141,7 +15381,7 @@ again"
         slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
         assert_eq!(slots.after_separator.len(), 1, "still waits");
         slots.pump();
-        assert!(slots.registry.slots[0].busy, "B's separator goes");
+        assert!(slots.registry.slots[0].views[0].busy, "B's separator goes");
         assert!(slots.after_separator.is_empty(), "right behind it");
         assert_eq!(slots.queued_messages, 1, "B's answer handed out");
     }
@@ -15793,7 +16033,9 @@ again"
     fn keyed_slots(dir: &TempDir, options: Options) -> (Slots, mpsc::Receiver<HubMsg>) {
         let (_fake, mut slots) = live_slots(dir, options);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, from_hub) = mpsc::channel(8);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -15866,17 +16108,17 @@ again"
     async fn a_written_esc_is_shown_at_once_whatever_the_edit_pace() {
         let dir = TempDir::new("slots-status-written");
         let (mut slots, mut from_hub) = keyed_slots(&dir, status_options());
-        slots.registry.slots[0].status = Some(StatusMessage {
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
             pinned: true,
         });
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
         assert_eq!(
-            slots.press_status(Some(500), Press::Stop),
+            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Stop),
             status::ANSWER_CONFIRM
         );
         assert_eq!(
-            slots.press_status(Some(500), Press::Confirm),
+            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Confirm),
             status::ANSWER_INTERRUPTING
         );
         let Some(HubMsg::ConsoleKey { key_id, .. }) = from_hub.recv().await else {
@@ -15910,7 +16152,7 @@ again"
     async fn a_stop_question_replaces_a_waiting_refresh_and_gets_its_whole_wait_once_shown() {
         let dir = TempDir::new("slots-status-late-question");
         let (mut slots, mut from_hub) = keyed_slots(&dir, status_options());
-        slots.registry.slots[0].status = Some(StatusMessage {
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
             pinned: true,
         });
@@ -15933,7 +16175,7 @@ again"
         );
         // ⏹: the question goes next to it as a foreground edit.
         assert_eq!(
-            slots.press_status(Some(500), Press::Stop),
+            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Stop),
             status::ANSWER_CONFIRM
         );
         slots.pump();
@@ -15958,7 +16200,7 @@ again"
         // 14 s after the press, 5 s after it showed: still the second press.
         tokio::time::advance(Duration::from_secs(5)).await;
         assert_eq!(
-            slots.press_status(Some(500), Press::Confirm),
+            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Confirm),
             status::ANSWER_INTERRUPTING
         );
         assert!(matches!(
@@ -16293,7 +16535,9 @@ again"
         };
         let (fake, mut slots) = live_slots(dir, options);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         (fake, slots)
     }
 
@@ -16365,7 +16609,9 @@ again"
         };
         let (fake, mut slots) = live_slots(&dir, options);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let windows = windows_client.clone().unwrap();
         let _same = register_client(&mut slots, 1, client(&windows, true));
         slots.pump();
@@ -16492,7 +16738,9 @@ again"
         };
         let (fake, mut slots) = live_slots(&dir, options);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
         let failures = [
             (
@@ -16953,7 +17201,9 @@ again"
         let dir = TempDir::new("slots-update-unknown");
         let (fake, mut slots) = live_slots(&dir, options());
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let _agent = register_client(&mut slots, 1, None);
         slots.pump();
         assert!(sent_texts(&fake).await.is_empty());
@@ -16975,7 +17225,9 @@ again"
     ) -> (Arc<Fake>, Slots, mpsc::Receiver<HubMsg>) {
         let (fake, mut slots) = live_slots(dir, options);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let (to_agent, from_hub) = mpsc::channel(8);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -17001,6 +17253,7 @@ again"
 
     fn topic_text(message_id: i64, text: &str, forwarded: bool) -> Inbound {
         Inbound {
+            chat: Chat::Group,
             message_id,
             thread_id: Some(100),
             text: Some(text.into()),
@@ -17071,7 +17324,7 @@ again"
         );
         let reached = async {
             while !fake.ops().iter().any(
-                |op| matches!(op, Op::React { message_id: 11, emoji } if emoji == stream::ACCEPTED),
+                |op| matches!(op, Op::React { chat: Chat::Group, message_id: 11, emoji } if emoji == stream::ACCEPTED),
             ) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -17202,6 +17455,7 @@ again"
 
     fn photo(message_id: i64, file_id: &str, caption: Option<&str>, size: Option<u64>) -> Control {
         Control::Message(Inbound {
+            chat: Chat::Group,
             message_id,
             thread_id: Some(100),
             text: None,
@@ -17273,7 +17527,9 @@ again"
         slots.fetch_files(Arc::new(files));
         let done = slots.done_rx.take().unwrap();
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         (slots, work, done)
     }
 
@@ -17301,7 +17557,7 @@ again"
                     meta,
                     ..
                 } => {
-                    assert!(meta.contains_key("message_id") && meta.contains_key("chat_id"));
+                    assert!(meta.contains_key("message_id") && meta["place"] == "group");
                     let assembly = files::Assembly::new(size);
                     if assembly.is_complete() {
                         got.push(format!("file {name} {content}"));
@@ -17663,6 +17919,7 @@ again"
         ));
         match op {
             Op::SendPhoto {
+                chat: Chat::Group,
                 thread_id: Some(100),
                 document,
                 notify: false,
@@ -17823,6 +18080,7 @@ again"
         assert_eq!((parts, size), (vec![0, 2], (png.len() + jpeg.len()) as u64));
         match op {
             Op::SendAlbum {
+                chat: Chat::Group,
                 thread_id: Some(100),
                 items,
                 photos: true,
@@ -18016,7 +18274,9 @@ again"
         let mut first = connect_files(&mut slots, 1, A, Some(10), true);
         // A second session in the same folder: slot #2 with its own topic.
         slots.on_hook(&start(B, 12));
-        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        slots
+            .registry
+            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
         let mut second = connect_files(&mut slots, 2, B, Some(12), true);
         offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
         assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
@@ -18045,7 +18305,9 @@ again"
         let (mut slots, _work, _done) = file_slots(&dir, TelegramFiles(HashMap::new()));
         let mut first = connect_files(&mut slots, 1, A, Some(10), true);
         slots.on_hook(&start(B, 12));
-        slots.registry.topic_created(SlotId(1), 101, "b", None);
+        slots
+            .registry
+            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
         let mut second = connect_files(&mut slots, 2, B, Some(12), true);
         offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
         assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
@@ -18076,7 +18338,9 @@ again"
         let mut slots = stalled_slots(dir, gather_options());
         let work = capture_dispatch(&mut slots);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let agent = connect_queue(&mut slots, 1, A, Some(10), 64);
         slots.pump();
         (slots, work, agent)
@@ -18140,7 +18404,7 @@ again"
                  (переслано)\nчужое 3\n\n---\n\nчто скажешь?"
                     .to_owned(),
                 meta_of(&[
-                    ("chat_id", "-1000000000001"),
+                    ("place", "group"),
                     ("message_id", "4"),
                     ("message_ids", "1,2,3,4"),
                     ("thread_id", "100"),
@@ -18151,8 +18415,9 @@ again"
         assert_eq!(topic_ops(&mut work).1, [1, 2, 3, 4], "👀 on every message");
         assert!(slots.registry.slots[0].buffer.is_idle());
         let stream = slots.registry.sessions[A].stream.as_ref().unwrap();
-        assert_eq!(stream.receipts, [4]);
-        assert_eq!(stream.parts, [(4, vec![1, 2, 3])]);
+        let key = |id| MessageKey::new(Chat::Group, id);
+        assert_eq!(stream.receipts, [key(4)]);
+        assert_eq!(stream.parts, [(key(4), vec![key(1), key(2), key(3)])]);
         pass(&mut slots, GATHER_MAX).await;
         assert!(inbounds(&mut agent).is_empty(), "it went once");
     }
@@ -18179,7 +18444,7 @@ again"
         );
         pass(&mut slots, GATHER_QUIET).await;
         let got = inbounds(&mut agent);
-        let base = [("chat_id", "-1000000000001"), ("thread_id", "100")];
+        let base = [("place", "group"), ("thread_id", "100")];
         assert_eq!(
             got,
             [
@@ -18221,7 +18486,7 @@ again"
             [(
                 "один".to_owned(),
                 meta_of(&[
-                    ("chat_id", "-1000000000001"),
+                    ("place", "group"),
                     ("message_id", "1"),
                     ("thread_id", "100"),
                 ]),
@@ -18257,7 +18522,9 @@ again"
         )));
         let mut done = slots.done_rx.take().unwrap();
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
         slots.pump();
         let mut bytes = Vec::new();
@@ -18438,7 +18705,7 @@ again"
                 parent_session: A.to_owned(),
                 slot: Some(SlotId(0)),
                 block: crate::hub::registry::Block {
-                    thread_id: Some(100),
+                    place: Some(Place::topic(Chat::Group, 100)),
                     message_id: Some(900),
                     ..Default::default()
                 },
@@ -18456,7 +18723,7 @@ again"
         pass(&mut slots, GATHER_QUIET - ms(1)).await;
         assert!(inbounds(&mut agent).is_empty(), "one window for all");
         pass(&mut slots, ms(1)).await;
-        let chat = ("chat_id", "-1000000000001");
+        let chat = ("place", "group");
         let topic = ("thread_id", "100");
         assert_eq!(
             inbounds(&mut agent),
@@ -18506,7 +18773,9 @@ again"
         let mut slots = stalled_slots(&dir, gather_options());
         let _work = capture_dispatch(&mut slots);
         slots.on_hook(&start(A, 10));
-        slots.registry.topic_created(SlotId(0), 100, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
         // Kept while A had no agent; its agent's queue then takes one.
         slots.on_topic_message(topic_text(1, "one", false));
         slots.on_topic_message(topic_text(2, "two", false));
@@ -18579,8 +18848,45 @@ again"
         assert_eq!(topic_ops(&mut work).1, [1, 2, 3], "👀 on every message");
         // Both channel records turn their parts ✍.
         let stream = slots.registry.sessions[A].stream.as_ref().unwrap();
-        assert_eq!(stream.receipts, [2, 3]);
-        assert_eq!(stream.parts, [(2, vec![1])]);
+        let key = |id| MessageKey::new(Chat::Group, id);
+        assert_eq!(stream.receipts, [key(2), key(3)]);
+        assert_eq!(stream.parts, [(key(2), vec![key(1)])]);
         assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// TASK-061: the session learns where a message was written by the
+    /// label `place`, never by a chat id: not the group's, not a private
+    /// chat's (that is its user's id). Also for a burst and a continuation.
+    #[tokio::test]
+    async fn meta_names_the_place_and_never_a_chat_id() {
+        use crate::hub::chat::PrivateChat;
+        const OWNER: i64 = 7_319_402_518;
+        let dir = TempDir::new("slots-meta-place");
+        let (_, mut slots) = live_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        let private = Chat::Private(PrivateChat::of_user(OWNER));
+        let parked = |chat, message_id| Parked {
+            chat,
+            message_id,
+            thread_id: 100,
+            text: "hi".into(),
+            reply_to: Some(3),
+            quote: None,
+            forwarded: false,
+            file: None,
+            from_name: None,
+        };
+        for (chat, label) in [(Chat::Group, "group"), (private, "private")] {
+            let meta = slots.burst_meta(A, &[parked(chat, 5), parked(chat, 6)]);
+            assert_eq!(meta["place"], label);
+            assert_eq!(meta["message_id"], "6");
+            assert_eq!(meta["message_ids"], "5,6");
+            assert_eq!(meta["thread_id"], "100");
+            assert!(!meta.contains_key("chat_id"), "{meta:?}");
+            for value in meta.values() {
+                assert!(!value.contains(&OWNER.to_string()), "{meta:?}");
+                assert!(!value.contains("1000000000001"), "{meta:?}");
+            }
+        }
     }
 }

@@ -418,7 +418,6 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     let store = RegistryStore::open(&state).unwrap();
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: CHAT,
         ..Options::default()
     };
     let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);

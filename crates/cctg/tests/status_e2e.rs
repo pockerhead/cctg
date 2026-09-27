@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use cctg::hook;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress::{bind, serve_agents, serve_hooks};
 use cctg::hub::registry::{ICON_ALIVE, RegistryStore};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -128,7 +129,10 @@ fn prompts(ops: &[Op]) -> Vec<(i64, String)> {
 fn pins(ops: &[Op]) -> Vec<i64> {
     ops.iter()
         .filter_map(|op| match op {
-            Op::Pin { message_id } => Some(*message_id),
+            Op::Pin {
+                chat: Chat::Group,
+                message_id,
+            } => Some(*message_id),
             _ => None,
         })
         .collect()
@@ -348,6 +352,7 @@ impl Hub {
     fn press(&self, message_id: i64, data: &str) {
         self.control
             .send(Control::Callback(CallbackInput {
+                chat: Some(Chat::Group),
                 query_id: format!("q-{data}"),
                 data: Some(data.into()),
                 message_id: Some(message_id),
@@ -552,26 +557,38 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     // another message stays.
     hub.control
         .send(Control::Pinned {
+            chat: Chat::Group,
             message_id: 5000,
             pinned: status,
         })
         .unwrap();
     hub.control
         .send(Control::Pinned {
+            chat: Chat::Group,
             message_id: 5001,
             pinned: 777,
         })
         .unwrap();
     let ops = hub
         .until("pin notice deleted", |ops| {
-            ops.iter()
-                .any(|op| matches!(op, Op::Delete { message_id: 5000 }))
+            ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Delete {
+                        chat: Chat::Group,
+                        message_id: 5000
+                    }
+                )
+            })
         })
         .await;
-    assert!(
-        !ops.iter()
-            .any(|op| matches!(op, Op::Delete { message_id: 5001 }))
-    );
+    assert!(!ops.iter().any(|op| matches!(
+        op,
+        Op::Delete {
+            chat: Chat::Group,
+            message_id: 5001
+        }
+    )));
 
     hub.numbers(A).await;
     hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
@@ -1041,6 +1058,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
     let say = |message_id: i64, text: &str| {
         hub.control
             .send(Control::Message(Inbound {
+                chat: Chat::Group,
                 message_id,
                 thread_id: Some(100),
                 text: Some(text.into()),
@@ -1076,7 +1094,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
     let ops = hub
         .until("both answers handled", |ops| {
             let reacted = ops.iter().any(|op| {
-                matches!(op, Op::React { message_id: 41, emoji } if emoji == stream::ACCEPTED)
+                matches!(op, Op::React { chat: Chat::Group, message_id: 41, emoji } if emoji == stream::ACCEPTED)
             });
             let told = ops.iter().any(|op| {
                 matches!(op, Op::Send { reply_to: Some(42), text, .. } if text == console::DRAFT_NOTICE)

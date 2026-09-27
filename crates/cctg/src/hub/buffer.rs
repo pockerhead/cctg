@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::chat::{Chat, MessageKey, Place};
 use super::permissions::MAX_CALLBACK_DATA;
 use super::registry::cut;
 use crate::wire::FileKind;
@@ -70,6 +71,8 @@ pub struct Attachment {
 /// One topic message as the agent will get it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parked {
+    /// The chat it was written in; its ids are ids of this chat.
+    pub chat: Chat,
     pub message_id: i64,
     pub thread_id: i64,
     pub text: String,
@@ -94,6 +97,15 @@ pub struct Parked {
 pub const FORWARDED: &str = "(переслано)";
 
 impl Parked {
+    /// The topic it was written in.
+    pub fn place(&self) -> Place {
+        Place::topic(self.chat, self.thread_id)
+    }
+
+    pub fn key(&self) -> MessageKey {
+        MessageKey::new(self.chat, self.message_id)
+    }
+
     /// What the session reads: the quoted words as `> ` lines and a blank
     /// line, then `Name: ` of a team member (TASK-036), then [`FORWARDED`]
     /// on its own line for a forward, then the text.
@@ -147,7 +159,7 @@ pub struct ResumeNote {
     /// `None` while the send is out, or when Telegram gave no id; such a
     /// button is never edited away.
     #[serde(default)]
-    pub message_id: Option<i64>,
+    pub message: Option<MessageKey>,
 }
 
 /// What a slot keeps between an offline period's first message and the
@@ -251,6 +263,7 @@ mod tests {
 
     fn parked(message_id: i64) -> Parked {
         Parked {
+            chat: Chat::Group,
             message_id,
             thread_id: 100,
             text: format!("m{message_id}"),
@@ -373,13 +386,16 @@ mod tests {
             resume: Some(ResumeNote {
                 session: A.into(),
                 number: 1,
-                message_id: Some(7),
+                message: Some(MessageKey::new(Chat::Group, 7)),
             }),
             ..Buffer::default()
         };
         assert!(!buffer.is_idle());
         let note = buffer.close();
-        assert_eq!(note.and_then(|note| note.message_id), Some(7));
+        assert_eq!(
+            note.and_then(|note| note.message),
+            Some(MessageKey::new(Chat::Group, 7))
+        );
         assert!(buffer.is_idle());
     }
 
@@ -425,9 +441,11 @@ mod tests {
     fn an_old_file_without_a_buffer_and_a_full_one_both_load() {
         let old: Buffer = serde_json::from_str("{}").unwrap();
         assert!(old.is_idle());
-        // A message kept before quotes and forwards were read.
+        // A message kept before quotes and forwards were read (its chat
+        // comes from the version 1 migration, TASK-061).
         let old: Parked =
-            serde_json::from_str(r#"{"message_id":1,"thread_id":100,"text":"m1"}"#).unwrap();
+            serde_json::from_str(r#"{"chat":"group","message_id":1,"thread_id":100,"text":"m1"}"#)
+                .unwrap();
         assert_eq!(old, parked(1));
         let plain = serde_json::to_string(&parked(1)).unwrap();
         assert!(
@@ -453,7 +471,7 @@ mod tests {
         buffer.resume = Some(ResumeNote {
             session: A.into(),
             number: 3,
-            message_id: None,
+            message: None,
         });
         buffer.push(
             Parked {

@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 use transcript::TELEGRAM_TEXT_LIMIT;
 
+use super::chat::{MessageKey, Place};
 use super::permissions::no_keyboard;
 use super::registry::cut;
 use crate::channel::is_request_id;
@@ -145,9 +146,10 @@ pub struct Ask {
     pub typing: bool,
     pub state: State,
     /// The topic it went to; `None` until it is handed to Telegram.
-    pub thread_id: Option<i64>,
+    pub place: Option<Place>,
     /// Handed to Telegram, no answer yet.
     pub sending: bool,
+    /// An id of `place`'s chat.
     pub message_id: Option<i64>,
     /// Bumped by every change of what the message should show.
     pub version: u64,
@@ -171,7 +173,7 @@ impl Ask {
             picked: BTreeSet::new(),
             typing: false,
             state: State::Open,
-            thread_id: None,
+            place: None,
             sending: false,
             message_id: None,
             version: 1,
@@ -180,6 +182,11 @@ impl Ask {
             retry: false,
             edit_failures: 0,
         }
+    }
+
+    /// Its message, once Telegram took it.
+    pub fn message(&self) -> Option<MessageKey> {
+        Some(MessageKey::new(self.place?.chat, self.message_id?))
     }
 
     pub fn is_open(&self) -> bool {
@@ -466,45 +473,40 @@ impl Asks {
         self.asks.keys().copied().collect()
     }
 
-    pub fn by_message(&self, message_id: i64) -> Option<u64> {
+    pub fn by_message(&self, message: MessageKey) -> Option<u64> {
         self.asks
             .iter()
-            .find(|(_, ask)| ask.message_id == Some(message_id))
+            .find(|(_, ask)| ask.message() == Some(message))
             .map(|(key, _)| *key)
     }
 
     /// The one ask with id `id` whose message is on its way to Telegram in
-    /// topic `thread_id`: its buttons can be pressed before Telegram's
+    /// topic `place`: its buttons can be pressed before Telegram's
     /// answer with the message id reaches the hub. `None` when no or several
     /// asks match, or the topic is unknown.
-    pub fn in_flight(&self, id: &str, thread_id: Option<i64>) -> Option<u64> {
-        let thread_id = thread_id?;
+    pub fn in_flight(&self, id: &str, place: Option<Place>) -> Option<u64> {
+        let place = place?;
         let mut found = self.asks.iter().filter(|(_, ask)| {
-            ask.sending
-                && ask.message_id.is_none()
-                && ask.id == id
-                && ask.thread_id == Some(thread_id)
+            ask.sending && ask.message_id.is_none() && ask.id == id && ask.place == Some(place)
         });
         let (key, _) = found.next()?;
         found.next().is_none().then_some(*key)
     }
 
-    /// Topic `thread_id` has an open ask whose message id is not known yet:
+    /// Topic `place` has an open ask whose message id is not known yet:
     /// a reply there may answer it before the hub can tell.
-    pub fn sending_in(&self, thread_id: i64) -> bool {
+    pub fn sending_in(&self, place: Place) -> bool {
         self.asks.values().any(|ask| {
-            ask.is_open()
-                && ask.sending
-                && ask.message_id.is_none()
-                && ask.thread_id == Some(thread_id)
+            ask.is_open() && ask.sending && ask.message_id.is_none() && ask.place == Some(place)
         })
     }
 
-    /// The open ask of topic `thread_id` a text message answers: the one it
-    /// replies to; a plain message (no reply) answers the newest one waiting
-    /// for typed text. A reply to any other message answers nothing.
-    pub fn text_target(&self, thread_id: i64, reply_to: Option<i64>) -> Option<u64> {
-        let open = |ask: &Ask| ask.is_open() && ask.thread_id == Some(thread_id);
+    /// The open ask of topic `place` a text message answers: the one it
+    /// replies to (`reply_to`, an id of `place`'s chat); a plain message (no
+    /// reply) answers the newest one waiting for typed text. A reply to any
+    /// other message answers nothing.
+    pub fn text_target(&self, place: Place, reply_to: Option<i64>) -> Option<u64> {
+        let open = |ask: &Ask| ask.is_open() && ask.place == Some(place);
         let found = match reply_to {
             Some(reply_to) => self
                 .asks
@@ -551,6 +553,7 @@ impl Asks {
 
 #[cfg(test)]
 mod tests {
+    use crate::hub::chat::Chat;
     use transcript::telegram_len;
 
     use super::*;
@@ -784,30 +787,57 @@ mod tests {
     fn the_book_finds_asks_by_message_and_text() {
         let mut book = Asks::default();
         let mut first = ask(vec![question("A?", false, &["x"])]);
-        first.thread_id = Some(100);
+        first.place = Some(Place::topic(Chat::Group, 100));
         first.message_id = Some(5);
         let mut second = ask(vec![question("B?", false, &["y"])]);
         second.id = "bcdef".into();
-        second.thread_id = Some(100);
+        second.place = Some(Place::topic(Chat::Group, 100));
         second.message_id = Some(6);
         let first = book.open(first).unwrap();
         let second = book.open(second).unwrap();
-        assert_eq!(book.by_message(6), Some(second));
-        assert_eq!(book.text_target(100, Some(5)), Some(first));
-        assert_eq!(book.text_target(100, None), None);
-        assert_eq!(book.text_target(100, Some(9)), None);
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 6)),
+            Some(second)
+        );
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            Some(first)
+        );
+        assert_eq!(book.text_target(Place::topic(Chat::Group, 100), None), None);
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(9)),
+            None
+        );
         book.get_mut(first).unwrap().press(0, Press::Other);
-        assert_eq!(book.text_target(100, None), Some(first));
-        assert_eq!(book.text_target(101, None), None);
-        assert_eq!(book.text_target(100, Some(6)), Some(second));
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), None),
+            Some(first)
+        );
+        assert_eq!(book.text_target(Place::topic(Chat::Group, 101), None), None);
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(6)),
+            Some(second)
+        );
         assert!(book.waiting("s") && book.id_taken("s", "abcde") && !book.id_taken("t", "abcde"));
         book.get_mut(first).unwrap().end(State::Gone);
-        assert_eq!(book.text_target(100, Some(5)), None);
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            None
+        );
         // With ✏️ Другое armed, a reply to any other message is no answer.
         book.get_mut(second).unwrap().press(0, Press::Other);
-        assert_eq!(book.text_target(100, None), Some(second));
-        assert_eq!(book.text_target(100, Some(6)), Some(second));
-        assert_eq!(book.text_target(100, Some(777)), None);
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), None),
+            Some(second)
+        );
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(6)),
+            Some(second)
+        );
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(777)),
+            None
+        );
         for _ in book.len()..MAX_ASKS {
             assert!(
                 book.open(ask(vec![question("C?", false, &["z"])]))
@@ -824,29 +854,100 @@ mod tests {
         let mut book = Asks::default();
         let mut sending = ask(vec![question("A?", false, &["x"])]);
         sending.sending = true;
-        sending.thread_id = Some(100);
+        sending.place = Some(Place::topic(Chat::Group, 100));
         let key = book.open(sending).unwrap();
-        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
-        assert!(book.sending_in(100));
-        assert_eq!(book.in_flight("bcdef", Some(100)), None);
-        assert_eq!(book.in_flight("abcde", Some(101)), None, "other topic");
-        assert!(!book.sending_in(101));
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            Some(key)
+        );
+        assert!(book.sending_in(Place::topic(Chat::Group, 100)));
+        assert_eq!(
+            book.in_flight("bcdef", Some(Place::topic(Chat::Group, 100))),
+            None
+        );
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 101))),
+            None,
+            "other topic"
+        );
+        assert!(!book.sending_in(Place::topic(Chat::Group, 101)));
         assert_eq!(book.in_flight("abcde", None), None, "topic unknown");
         let mut twin = ask(vec![question("B?", false, &["y"])]);
         twin.session = "t".into();
         twin.sending = true;
-        twin.thread_id = Some(100);
+        twin.place = Some(Place::topic(Chat::Group, 100));
         let twin = book.open(twin).unwrap();
-        assert_eq!(book.in_flight("abcde", Some(100)), None, "ambiguous");
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            None,
+            "ambiguous"
+        );
         book.get_mut(twin).unwrap().message_id = Some(6);
-        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            Some(key)
+        );
         book.get_mut(key).unwrap().sending = false;
         assert_eq!(
-            book.in_flight("abcde", Some(100)),
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
             None,
             "not handed to Telegram"
         );
-        assert!(!book.sending_in(100));
+        assert!(!book.sending_in(Place::topic(Chat::Group, 100)));
+    }
+
+    /// TASK-061: message and topic ids are numbered per chat. An ask in the
+    /// group and one in a private chat with the same message and topic ids
+    /// are found apart by press, in flight and by a typed answer.
+    #[test]
+    fn asks_with_one_id_in_two_chats_are_found_apart() {
+        let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(7_319_402_518));
+        let mut book = Asks::default();
+        let mut group = ask(vec![question("A?", false, &["x"])]);
+        group.place = Some(Place::topic(Chat::Group, 100));
+        group.message_id = Some(5);
+        let mut own = ask(vec![question("B?", false, &["y"])]);
+        own.session = "t".into();
+        own.place = Some(Place::topic(private, 100));
+        own.message_id = Some(5);
+        let group = book.open(group).unwrap();
+        let own = book.open(own).unwrap();
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 5)),
+            Some(group)
+        );
+        assert_eq!(book.by_message(MessageKey::new(private, 5)), Some(own));
+        assert_eq!(
+            book.text_target(Place::topic(private, 100), Some(5)),
+            Some(own)
+        );
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            Some(group)
+        );
+        book.get_mut(own).unwrap().press(0, Press::Other);
+        assert_eq!(book.text_target(Place::topic(Chat::Group, 100), None), None);
+        assert_eq!(
+            book.text_target(Place::topic(private, 100), None),
+            Some(own)
+        );
+        // In flight.
+        let mut sending = ask(vec![question("C?", false, &["z"])]);
+        sending.session = "u".into();
+        sending.id = "fghij".into();
+        sending.sending = true;
+        sending.place = Some(Place::topic(private, 200));
+        let sending = book.open(sending).unwrap();
+        assert!(book.sending_in(Place::topic(private, 200)));
+        assert!(!book.sending_in(Place::topic(Chat::Group, 200)));
+        assert_eq!(
+            book.in_flight("fghij", Some(Place::topic(Chat::Group, 200))),
+            None
+        );
+        assert_eq!(
+            book.in_flight("fghij", Some(Place::topic(private, 200))),
+            Some(sending)
+        );
     }
 
     /// The review's repro: ✏️ Другое armed, then a reply to some other bot
@@ -856,14 +957,23 @@ mod tests {
     fn a_reply_to_another_message_is_no_answer_while_typing() {
         let q = question("Q?", false, &["  Padded label  "]);
         let mut typing = ask(vec![q.clone()]);
-        typing.thread_id = Some(100);
+        typing.place = Some(Place::topic(Chat::Group, 100));
         typing.message_id = Some(5);
         typing.press(0, Press::Other);
         let mut book = Asks::default();
         let key = book.open(typing).unwrap();
-        assert_eq!(book.text_target(100, Some(777)), None);
-        assert_eq!(book.text_target(100, Some(5)), Some(key));
-        assert_eq!(book.text_target(100, None), Some(key));
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(777)),
+            None
+        );
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            Some(key)
+        );
+        assert_eq!(
+            book.text_target(Place::topic(Chat::Group, 100), None),
+            Some(key)
+        );
         let mut plain = ask(vec![q]);
         plain.press(0, Press::Option(0));
         assert_eq!(plain.answers(), Some(vec![answered(&[0], None)]));

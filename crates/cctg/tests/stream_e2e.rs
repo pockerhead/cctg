@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use cctg::device::canonical_cwd;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress::serve_agents;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -152,7 +153,11 @@ impl Fake {
         self.recs()
             .into_iter()
             .filter_map(|r| match r.op {
-                Op::React { message_id, emoji } => Some((message_id, emoji)),
+                Op::React {
+                    chat: Chat::Group,
+                    message_id,
+                    emoji,
+                } => Some((message_id, emoji)),
                 _ => None,
             })
             .collect()
@@ -675,6 +680,7 @@ async fn e2e_reactions() {
     wait_for("stream up", 20, || !fake.topic_lines().is_empty()).await;
     hub.control
         .send(Control::Message(Inbound {
+            chat: Chat::Group,
             message_id: 555,
             thread_id: Some(THREAD),
             text: Some("from telegram".into()),

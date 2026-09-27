@@ -129,7 +129,6 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
     let store = RegistryStore::open(&state).expect("store");
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: CHAT,
         ..Options::default()
     };
     let slots = Slots::new(store.load().expect("load"), store, outbox, options);

@@ -73,14 +73,18 @@ use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
 use super::api::{ApiError, BotApi, Document, ForumTopic, Message};
+use super::chat::{Chat, MessageKey, Place};
 
 const QUEUE_CAPACITY: usize = 1024;
 const MAX_CONSECUTIVE_UNMETERED: usize = 4;
 const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 
+/// Every op but a callback answer names its chat (TASK-061): topics and
+/// messages are numbered per chat.
 #[derive(Debug, Clone)]
 pub enum Op {
     Send {
+        chat: Chat,
         thread_id: Option<i64>,
         /// Plain text; the fallback when `html` is set and refused.
         text: String,
@@ -96,6 +100,7 @@ pub enum Op {
         notify: bool,
     },
     SendDocument {
+        chat: Chat,
         thread_id: Option<i64>,
         document: Document,
         /// As in `Send`.
@@ -104,6 +109,7 @@ pub enum Op {
     /// `sendPhoto` (TASK-032); a picture Telegram refuses as a photo (400:
     /// dimensions, format) goes as a document in the same job.
     SendPhoto {
+        chat: Chat,
         thread_id: Option<i64>,
         document: Document,
         /// As in `Send`.
@@ -114,6 +120,7 @@ pub enum Op {
     /// it (the whole album fails), the same files go again as a document
     /// album in the same job, as `SendPhoto` does for one picture.
     SendAlbum {
+        chat: Chat,
         thread_id: Option<i64>,
         items: Vec<Document>,
         photos: bool,
@@ -121,6 +128,7 @@ pub enum Op {
         notify: bool,
     },
     Edit {
+        chat: Chat,
         message_id: i64,
         text: String,
         reply_markup: Option<Value>,
@@ -134,17 +142,21 @@ pub enum Op {
         text: Option<String>,
     },
     Delete {
+        chat: Chat,
         message_id: i64,
     },
     /// `pinChatMessage` without a notification.
     Pin {
+        chat: Chat,
         message_id: i64,
     },
     CreateTopic {
+        chat: Chat,
         name: String,
         icon_custom_emoji_id: Option<String>,
     },
     EditTopic {
+        chat: Chat,
         thread_id: i64,
         name: Option<String>,
         icon_custom_emoji_id: Option<String>,
@@ -154,6 +166,7 @@ pub enum Op {
     /// `restart`: the first line of a stream (again); it ends a break of its
     /// topic's stream.
     Stream {
+        chat: Chat,
         thread_id: i64,
         text: String,
         /// As in `Send`.
@@ -166,6 +179,7 @@ pub enum Op {
     /// `setMessageReaction` with one emoji; a newer one for the same message
     /// replaces a queued one.
     React {
+        chat: Chat,
         message_id: i64,
         emoji: String,
     },
@@ -227,20 +241,44 @@ impl Op {
     /// replaces the older one.
     fn replaces(&self, other: &Op) -> bool {
         match (self, other) {
-            (Op::Edit { message_id: a, .. }, Op::Edit { message_id: b, .. })
-            | (Op::React { message_id: a, .. }, Op::React { message_id: b, .. }) => a == b,
+            (Op::Edit { .. }, Op::Edit { .. }) | (Op::React { .. }, Op::React { .. }) => {
+                self.message().is_some() && self.message() == other.message()
+            }
             _ => false,
         }
     }
 
-    /// The topic of a new message.
-    fn thread(&self) -> Option<Option<i64>> {
+    /// The message an edit or a reaction is for.
+    fn message(&self) -> Option<MessageKey> {
         match self {
-            Op::Send { thread_id, .. }
-            | Op::SendDocument { thread_id, .. }
-            | Op::SendPhoto { thread_id, .. }
-            | Op::SendAlbum { thread_id, .. } => Some(*thread_id),
-            Op::Stream { thread_id, .. } => Some(Some(*thread_id)),
+            Op::Edit {
+                chat, message_id, ..
+            }
+            | Op::React {
+                chat, message_id, ..
+            } => Some(MessageKey::new(*chat, *message_id)),
+            _ => None,
+        }
+    }
+
+    /// The chat and topic of a new message.
+    fn place(&self) -> Option<Place> {
+        match self {
+            Op::Send {
+                chat, thread_id, ..
+            }
+            | Op::SendDocument {
+                chat, thread_id, ..
+            }
+            | Op::SendPhoto {
+                chat, thread_id, ..
+            }
+            | Op::SendAlbum {
+                chat, thread_id, ..
+            } => Some(Place::new(*chat, *thread_id)),
+            Op::Stream {
+                chat, thread_id, ..
+            } => Some(Place::topic(*chat, *thread_id)),
             _ => None,
         }
     }
@@ -270,6 +308,7 @@ impl Transport for BotApi {
     async fn execute(&self, op: &Op) -> Delivery {
         match op {
             Op::Send {
+                chat,
                 thread_id,
                 text,
                 html,
@@ -280,7 +319,7 @@ impl Transport for BotApi {
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
                 self.send_message(
-                    *thread_id,
+                    Place::new(*chat, *thread_id),
                     text,
                     reply_markup.as_ref(),
                     parse_mode,
@@ -291,32 +330,39 @@ impl Transport for BotApi {
                 .map(Outcome::Sent)
             }
             Op::SendDocument {
+                chat,
                 thread_id,
                 document,
                 notify,
             } => self
-                .send_document(*thread_id, document, *notify)
+                .send_document(Place::new(*chat, *thread_id), document, *notify)
                 .await
                 .map(Outcome::Sent),
             Op::SendPhoto {
+                chat,
                 thread_id,
                 document,
                 notify,
-            } => match self.send_photo(*thread_id, document, *notify).await {
+            } => match self
+                .send_photo(Place::new(*chat, *thread_id), document, *notify)
+                .await
+            {
                 Err(error) if error.is_photo_refusal() => {
                     warn!("telegram did not take a picture as a photo; sending it as a document");
-                    self.send_document(*thread_id, document, *notify).await
+                    self.send_document(Place::new(*chat, *thread_id), document, *notify)
+                        .await
                 }
                 sent => sent,
             }
             .map(Outcome::Sent),
             Op::SendAlbum {
+                chat,
                 thread_id,
                 items,
                 photos,
                 notify,
             } => match self
-                .send_media_group(*thread_id, items, *photos, *notify)
+                .send_media_group(Place::new(*chat, *thread_id), items, *photos, *notify)
                 .await
             {
                 // Telegram names no item of a refused group, and its text
@@ -324,49 +370,58 @@ impl Transport for BotApi {
                 // sends the same files once more as documents.
                 Err(ApiError::Telegram { code: 400, .. }) if *photos => {
                     warn!("telegram did not take a photo album; sending it as documents");
-                    self.send_media_group(*thread_id, items, false, *notify)
+                    self.send_media_group(Place::new(*chat, *thread_id), items, false, *notify)
                         .await
                 }
                 sent => sent,
             }
             .map(Outcome::Sent),
             Op::Edit {
+                chat,
                 message_id,
                 text,
                 reply_markup,
                 ..
             } => self
-                .edit_message_text(*message_id, text, reply_markup.as_ref())
+                .edit_message_text(*chat, *message_id, text, reply_markup.as_ref())
                 .await
                 .map(|()| Outcome::Done),
             Op::AnswerCallback { query_id, text } => self
                 .answer_callback_query(query_id, text.as_deref())
                 .await
                 .map(|()| Outcome::Done),
-            Op::Delete { message_id } => self
-                .delete_message(*message_id)
+            Op::Delete { chat, message_id } => self
+                .delete_message(*chat, *message_id)
                 .await
                 .map(|()| Outcome::Done),
-            Op::Pin { message_id } => self
-                .pin_chat_message(*message_id)
+            Op::Pin { chat, message_id } => self
+                .pin_chat_message(*chat, *message_id)
                 .await
                 .map(|()| Outcome::Done),
             Op::CreateTopic {
+                chat,
                 name,
                 icon_custom_emoji_id,
             } => self
-                .create_forum_topic(name, icon_custom_emoji_id.as_deref())
+                .create_forum_topic(*chat, name, icon_custom_emoji_id.as_deref())
                 .await
                 .map(Outcome::Topic),
             Op::EditTopic {
+                chat,
                 thread_id,
                 name,
                 icon_custom_emoji_id,
             } => self
-                .edit_forum_topic(*thread_id, name.as_deref(), icon_custom_emoji_id.as_deref())
+                .edit_forum_topic(
+                    *chat,
+                    *thread_id,
+                    name.as_deref(),
+                    icon_custom_emoji_id.as_deref(),
+                )
                 .await
                 .map(|()| Outcome::Done),
             Op::Stream {
+                chat,
                 thread_id,
                 text,
                 html,
@@ -374,12 +429,23 @@ impl Transport for BotApi {
                 ..
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
-                self.send_message(Some(*thread_id), text, None, parse_mode, None, *notify)
-                    .await
-                    .map(Outcome::Sent)
+                self.send_message(
+                    Place::topic(*chat, *thread_id),
+                    text,
+                    None,
+                    parse_mode,
+                    None,
+                    *notify,
+                )
+                .await
+                .map(Outcome::Sent)
             }
-            Op::React { message_id, emoji } => self
-                .set_message_reaction(*message_id, emoji)
+            Op::React {
+                chat,
+                message_id,
+                emoji,
+            } => self
+                .set_message_reaction(*chat, *message_id, emoji)
                 .await
                 .map(|()| Outcome::Done),
         }
@@ -601,7 +667,7 @@ pub struct Scheduler<T> {
     /// next; they take turns.
     topic_turn: bool,
     /// Topics whose stream broke: their lines wait for a `restart` line.
-    broken: HashSet<i64>,
+    broken: HashSet<Place>,
     edit: VecDeque<Job>,
     topic: VecDeque<Job>,
     message: VecDeque<Job>,
@@ -686,54 +752,44 @@ impl<T: Transport> Scheduler<T> {
         // The first stream line of each topic and whether it is `merge`.
         let mut first_lines = HashMap::new();
         for (index, job) in self.message.iter().enumerate() {
-            let (thread_id, permission) = match &job.op {
-                Op::Send {
-                    thread_id,
-                    permission,
-                    ..
-                } => (*thread_id, *permission),
-                Op::SendDocument { thread_id, .. }
-                | Op::SendPhoto { thread_id, .. }
-                | Op::SendAlbum { thread_id, .. } => (*thread_id, false),
+            let Some(place) = job.op.place() else {
+                continue;
+            };
+            let permission = match &job.op {
+                Op::Send { permission, .. } => *permission,
+                Op::SendDocument { .. } | Op::SendPhoto { .. } | Op::SendAlbum { .. } => false,
                 // Stream lines yield to a prompt of their own topic, except
                 // tool-call lines the debounce holds: those came first.
-                Op::Stream {
-                    thread_id, merge, ..
-                } => {
-                    first_lines
-                        .entry(Some(*thread_id))
-                        .or_insert((index, *merge));
+                Op::Stream { merge, .. } => {
+                    first_lines.entry(place).or_insert((index, *merge));
                     continue;
                 }
                 _ => continue,
             };
-            if permission && !busy_topics.contains(&thread_id) {
-                return match first_lines.get(&thread_id) {
+            if permission && !busy_topics.contains(&place) {
+                return match first_lines.get(&place) {
                     Some(&(line, true)) if !self.debounce.is_zero() => Some(line),
                     _ => Some(index),
                 };
             }
-            busy_topics.insert(thread_id);
+            busy_topics.insert(place);
         }
         None
     }
 
     fn enqueue(&mut self, job: Job) {
-        if let Op::Stream {
-            thread_id, restart, ..
-        } = &job.op
-        {
+        if let (Op::Stream { restart, .. }, Some(place)) = (&job.op, job.op.place()) {
             if *restart {
-                self.broken.remove(thread_id);
-            } else if self.broken.contains(thread_id) {
+                self.broken.remove(&place);
+            } else if self.broken.contains(&place) {
                 // Dropped unsent: its receiver closes without an answer.
                 return;
             }
         }
-        if let Op::React { message_id, emoji } = &job.op
-            && let Some(queued) = self.edit.iter_mut().find(
-                |queued| matches!(queued.op, Op::React { message_id: id, .. } if id == *message_id),
-            )
+        if let Op::React { emoji, .. } = &job.op
+            && let Some(queued) = self.edit.iter_mut().find(|queued| {
+                matches!(queued.op, Op::React { .. }) && queued.op.message() == job.op.message()
+            })
         {
             if let Op::React {
                 emoji: queued_emoji,
@@ -747,15 +803,15 @@ impl<T: Transport> Scheduler<T> {
             return;
         }
         if let Op::Edit {
-            message_id,
             text,
             reply_markup,
             background,
+            ..
         } = &job.op
         {
-            let pending = self.edit.iter_mut().find(
-                |queued| matches!(queued.op, Op::Edit { message_id: id, .. } if id == *message_id),
-            );
+            let pending = self.edit.iter_mut().find(|queued| {
+                matches!(queued.op, Op::Edit { .. }) && queued.op.message() == job.op.message()
+            });
             if let Some(queued) = pending {
                 if let Op::Edit {
                     text: queued_text,
@@ -844,7 +900,7 @@ impl<T: Transport> Scheduler<T> {
         let mut topics = HashSet::new();
         let mut soonest: Option<(Instant, usize)> = None;
         for (index, job) in self.message.iter().enumerate() {
-            if !topics.insert(job.op.thread()) {
+            if !topics.insert(job.op.place()) {
                 continue;
             }
             let due = self.due(index);
@@ -866,7 +922,6 @@ impl<T: Transport> Scheduler<T> {
     fn due(&self, index: usize) -> Instant {
         let job = &self.message[index];
         let Op::Stream {
-            thread_id,
             merge: true,
             notify,
             ..
@@ -874,12 +929,13 @@ impl<T: Transport> Scheduler<T> {
         else {
             return job.queued_at;
         };
+        let place = job.op.place();
         if self.debounce.is_zero() || job.plain_retry {
             return job.queued_at;
         }
         let mut last = job.queued_at;
         for later in self.message.iter().skip(index + 1) {
-            if later.op.thread() != Some(Some(*thread_id)) {
+            if later.op.place() != place {
                 continue;
             }
             match &later.op {
@@ -961,10 +1017,11 @@ impl<T: Transport> Scheduler<T> {
             }
             result => {
                 let accepted = result.is_ok();
-                if let (Op::Stream { thread_id, .. }, Err(error)) = (&job.op, &result)
+                if let (Op::Stream { .. }, Some(place), Err(error)) =
+                    (&job.op, job.op.place(), &result)
                     && !matches!(error, ApiError::Telegram { code, .. } if (400..500).contains(code))
                 {
-                    self.break_stream(*thread_id);
+                    self.break_stream(place);
                 }
                 let _ = job.reply.send(result);
                 // A refused message carried its merged lines with it: their
@@ -978,24 +1035,20 @@ impl<T: Transport> Scheduler<T> {
         }
     }
 
-    /// Drops the queued lines of `thread_id`'s stream up to its next
+    /// Drops the queued lines of `place`'s stream up to its next
     /// `restart` line, and every later one until such a line comes.
-    fn break_stream(&mut self, thread_id: i64) {
-        self.broken.insert(thread_id);
+    fn break_stream(&mut self, place: Place) {
+        self.broken.insert(place);
         let mut broken = true;
         self.message.retain(|job| match &job.op {
-            Op::Stream {
-                thread_id: thread,
-                restart,
-                ..
-            } if *thread == thread_id => {
+            Op::Stream { restart, .. } if job.op.place() == Some(place) => {
                 broken &= !*restart;
                 !broken
             }
             _ => true,
         });
         if !broken {
-            self.broken.remove(&thread_id);
+            self.broken.remove(&place);
         }
     }
 
@@ -1006,8 +1059,8 @@ impl<T: Transport> Scheduler<T> {
         if job.plain_retry {
             return;
         }
+        let place = job.op.place();
         let Op::Stream {
-            thread_id,
             text,
             html,
             merge: true,
@@ -1024,7 +1077,7 @@ impl<T: Transport> Scheduler<T> {
         let mut index = 0;
         while index < self.message.len() {
             let queued = &self.message[index].op;
-            if queued.thread() != Some(Some(*thread_id)) {
+            if queued.place() != place {
                 index += 1;
                 continue;
             }
@@ -1161,6 +1214,7 @@ mod tests {
 
     fn send(thread: i64, text: &str) -> Op {
         Op::Send {
+            chat: Chat::Group,
             thread_id: Some(thread),
             text: text.to_owned(),
             html: None,
@@ -1173,6 +1227,7 @@ mod tests {
 
     fn edit(message_id: i64, text: &str) -> Op {
         Op::Edit {
+            chat: Chat::Group,
             message_id,
             text: text.to_owned(),
             reply_markup: None,
@@ -1183,6 +1238,7 @@ mod tests {
     /// A periodic status refresh.
     fn refresh(message_id: i64, text: &str) -> Op {
         Op::Edit {
+            chat: Chat::Group,
             message_id,
             text: text.to_owned(),
             reply_markup: None,
@@ -1270,6 +1326,7 @@ mod tests {
         let fake = Fake::new(&[]);
         let mut ops: Vec<Op> = (0..10).map(|i| send(1, &format!("m{i}"))).collect();
         ops.push(Op::Send {
+            chat: Chat::Group,
             thread_id: Some(2),
             text: "permission".to_owned(),
             html: None,
@@ -1343,15 +1400,20 @@ mod tests {
         let mut ops: Vec<Op> = (0..6).map(|i| send(1, &format!("m{i}"))).collect();
         for i in 0..10 {
             ops.push(Op::CreateTopic {
+                chat: Chat::Group,
                 name: format!("t{i}"),
                 icon_custom_emoji_id: None,
             });
             ops.push(Op::EditTopic {
+                chat: Chat::Group,
                 thread_id: i,
                 name: None,
                 icon_custom_emoji_id: Some("5".to_owned()),
             });
-            ops.push(Op::Delete { message_id: i });
+            ops.push(Op::Delete {
+                chat: Chat::Group,
+                message_id: i,
+            });
             ops.push(edit(100 + i, "e"));
         }
         run(&fake, ops).await;
@@ -1373,6 +1435,7 @@ mod tests {
             send(1, "first"),
             send(1, "second"),
             Op::CreateTopic {
+                chat: Chat::Group,
                 name: "topic".to_owned(),
                 icon_custom_emoji_id: None,
             },
@@ -1417,6 +1480,7 @@ mod tests {
 
     fn permission(thread: i64, text: &str) -> Op {
         Op::Send {
+            chat: Chat::Group,
             thread_id: Some(thread),
             text: text.to_owned(),
             html: None,
@@ -1438,6 +1502,7 @@ mod tests {
     async fn permission_never_overtakes_its_own_topic() {
         let fake = Fake::new(&[]);
         let document = Op::SendDocument {
+            chat: Chat::Group,
             thread_id: Some(7),
             document: Document {
                 file_name: "doc".to_owned(),
@@ -1535,6 +1600,7 @@ mod tests {
 
     fn line(thread: i64, text: &str) -> Op {
         Op::Stream {
+            chat: Chat::Group,
             thread_id: thread,
             text: text.to_owned(),
             html: None,
@@ -1695,6 +1761,7 @@ mod tests {
 
     fn stream_op(thread: i64, text: &str, restart: bool) -> Op {
         Op::Stream {
+            chat: Chat::Group,
             thread_id: thread,
             text: text.to_owned(),
             html: None,
@@ -1796,6 +1863,7 @@ mod tests {
         let fake = Fake::new(&[]);
         let mut ops: Vec<Op> = (0..8)
             .map(|i| Op::Stream {
+                chat: Chat::Group,
                 thread_id: 1,
                 text: format!("s{i}"),
                 html: None,
@@ -1813,6 +1881,7 @@ mod tests {
     async fn reactions_are_unmetered_and_the_newest_one_per_message_wins() {
         let fake = Fake::new(&[]);
         let react = |id: i64, emoji: &str| Op::React {
+            chat: Chat::Group,
             message_id: id,
             emoji: emoji.to_owned(),
         };
@@ -1824,7 +1893,11 @@ mod tests {
             .calls()
             .iter()
             .filter_map(|call| match &call.op {
-                Op::React { message_id, emoji } => Some((*message_id, emoji.clone(), call.at)),
+                Op::React {
+                    chat: Chat::Group,
+                    message_id,
+                    emoji,
+                } => Some((*message_id, emoji.clone(), call.at)),
                 _ => None,
             })
             .collect();
@@ -1866,6 +1939,7 @@ mod tests {
 
     fn formatted_send(text: &str, html: &str) -> Op {
         Op::Send {
+            chat: Chat::Group,
             thread_id: Some(1),
             text: text.to_owned(),
             html: Some(html.to_owned()),
@@ -1896,6 +1970,7 @@ mod tests {
         let answer = outbox.submit(formatted_send("**a**", "<b>a</b>")).await;
         let line = outbox
             .submit(Op::Stream {
+                chat: Chat::Group,
                 thread_id: 1,
                 text: "_b_".to_owned(),
                 html: Some("<i>b</i>".to_owned()),
@@ -1948,6 +2023,7 @@ mod tests {
     async fn a_formatted_line_merged_with_plain_lines_makes_one_html_message() {
         let fake = Fake::new(&[]);
         let formatted = Op::Stream {
+            chat: Chat::Group,
             thread_id: 1,
             text: "\u{1F4AD} **x**".to_owned(),
             html: Some("\u{1F4AD} <b>x</b>".to_owned()),
@@ -1986,6 +2062,7 @@ mod tests {
         let mut receivers = Vec::new();
         for i in 0..5 {
             let op = Op::Stream {
+                chat: Chat::Group,
                 thread_id: 1,
                 text: format!("**l{i}**"),
                 html: Some(format!("<b>l{i}</b>")),
@@ -2249,6 +2326,7 @@ mod tests {
             ops.push((
                 0,
                 Op::React {
+                    chat: Chat::Group,
                     message_id: 1000 + i,
                     emoji: "👀".to_owned(),
                 },
@@ -2256,6 +2334,7 @@ mod tests {
             ops.push((
                 0,
                 Op::EditTopic {
+                    chat: Chat::Group,
                     thread_id: i,
                     name: None,
                     icon_custom_emoji_id: Some("5".to_owned()),
@@ -2377,21 +2456,30 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
         let ops = [
             Op::CreateTopic {
+                chat: Chat::Group,
                 name: "new session".to_owned(),
                 icon_custom_emoji_id: None,
             },
             edit(900, "✅ Разрешено"),
             Op::EditTopic {
+                chat: Chat::Group,
                 thread_id: 5,
                 name: None,
                 icon_custom_emoji_id: Some("5".to_owned()),
             },
             Op::React {
+                chat: Chat::Group,
                 message_id: 901,
                 emoji: "👀".to_owned(),
             },
-            Op::Pin { message_id: 902 },
-            Op::Delete { message_id: 903 },
+            Op::Pin {
+                chat: Chat::Group,
+                message_id: 902,
+            },
+            Op::Delete {
+                chat: Chat::Group,
+                message_id: 903,
+            },
             edit(904, "↳ Explore: итог"),
         ];
         // One at a time, at uneven moments, for three minutes.
@@ -2437,6 +2525,7 @@ mod tests {
             receivers.push(
                 outbox
                     .submit(Op::Pin {
+                        chat: Chat::Group,
                         message_id: 900 + i,
                     })
                     .await,
@@ -2451,7 +2540,10 @@ mod tests {
             .calls()
             .iter()
             .filter_map(|call| match &call.op {
-                Op::Pin { message_id } if *message_id >= 900 => Some('T'),
+                Op::Pin {
+                    chat: Chat::Group,
+                    message_id,
+                } if *message_id >= 900 => Some('T'),
                 Op::Edit {
                     message_id,
                     background: false,
@@ -2548,5 +2640,104 @@ mod tests {
         );
         assert!(matches!(answers[0], Some(Ok(Outcome::Superseded))));
         assert!(matches!(answers[1], Some(Ok(Outcome::Done))));
+    }
+
+    /// TASK-061: ids are numbered per chat. Edits, reactions and topics of
+    /// the same number in the group and in a private chat never mix.
+    fn private() -> Chat {
+        Chat::Private(crate::hub::chat::PrivateChat::of_user(7_319_402_518))
+    }
+
+    fn in_chat(chat: Chat, mut op: Op) -> Op {
+        match &mut op {
+            Op::Send { chat: at, .. }
+            | Op::Edit { chat: at, .. }
+            | Op::Stream { chat: at, .. }
+            | Op::React { chat: at, .. } => *at = chat,
+            _ => unreachable!("not used here"),
+        }
+        op
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edits_and_reactions_of_one_id_in_two_chats_stay_two() {
+        let fake = Fake::new(&[]);
+        let react = |chat, emoji: &str| Op::React {
+            chat,
+            message_id: 7,
+            emoji: emoji.to_owned(),
+        };
+        let results = run(
+            &fake,
+            vec![
+                edit(7, "group a"),
+                in_chat(private(), edit(7, "private")),
+                edit(7, "group b"),
+                react(Chat::Group, "👀"),
+                react(private(), "👀"),
+                react(Chat::Group, "✍"),
+            ],
+        )
+        .await;
+        let calls = fake.calls();
+        let edits: Vec<(Chat, &str)> = calls
+            .iter()
+            .filter_map(|call| match &call.op {
+                Op::Edit { chat, text, .. } => Some((*chat, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edits, [(Chat::Group, "group b"), (private(), "private")]);
+        let reactions: Vec<(Chat, &str)> = calls
+            .iter()
+            .filter_map(|call| match &call.op {
+                Op::React { chat, emoji, .. } => Some((*chat, emoji.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reactions, [(Chat::Group, "✍"), (private(), "👀")]);
+        assert!(matches!(results[0], Ok(Outcome::Superseded)));
+        assert!(matches!(results[1], Ok(Outcome::Done)));
+        assert!(matches!(results[4], Ok(Outcome::Done)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn topics_of_one_id_in_two_chats_keep_their_own_order_and_stream() {
+        // A prompt waits for older messages of its own topic only.
+        let fake = Fake::new(&[]);
+        run(
+            &fake,
+            vec![
+                send(7, "group"),
+                in_chat(private(), permission(7, "private prompt")),
+            ],
+        )
+        .await;
+        assert_eq!(texts(&fake), ["private prompt", "group"]);
+
+        // A refused line breaks the stream of its own topic only.
+        let fake = Fake::refusing("g-1");
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let handle = tokio::spawn(scheduler.run());
+        let mut answers = Vec::new();
+        for op in [
+            stream_op(1, "g-0", true),
+            stream_op(1, "g-1", false),
+            stream_op(1, "g-2", false),
+            in_chat(private(), stream_op(1, "p-0", false)),
+        ] {
+            answers.push(outbox.submit(op).await);
+        }
+        let mut delivered = Vec::new();
+        for answer in answers {
+            delivered.push(answer.await.ok());
+        }
+        drop(outbox);
+        assert!(handle.await.is_ok());
+        assert!(delivered[2].is_none(), "g-2 dropped with its broken stream");
+        assert!(
+            matches!(delivered[3], Some(Ok(Outcome::Sent(_)))),
+            "the private topic 1 goes on"
+        );
     }
 }
