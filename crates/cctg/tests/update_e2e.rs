@@ -122,6 +122,14 @@ fn build_of(path: &Path) -> String {
 /// commit, so the copy gets it rewritten (same length, other characters);
 /// otherwise the build comes from the file hash, which a tail changes.
 fn write_newer(path: &Path, original: &[u8]) -> String {
+    // The test binary is published as the release: over the download cap
+    // every download here fails, which reads like a bug in the update.
+    assert!(
+        original.len() < cctg::download::MAX_BINARY,
+        "the cctg under test is {} bytes, over the {} bytes a download takes: build tests without debug info (CARGO_PROFILE_DEV_DEBUG=0)",
+        original.len(),
+        cctg::download::MAX_BINARY
+    );
     let source = cctg::client::SOURCE;
     if source.is_empty() || source.ends_with("-dirty") {
         let mut newer = original.to_vec();
