@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress::{self, AgentEvent};
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -164,7 +165,6 @@ async fn hub(test: &str) -> Hub {
     let store = RegistryStore::open(&state).unwrap();
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: -1000000000001,
         ..Options::default()
     };
     let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
@@ -332,6 +332,7 @@ fn assert_clean(output: &Output) {
 fn press(hub: &Hub, message_id: i64, data: String) {
     hub.control
         .send(Control::Callback(CallbackInput {
+            chat: Some(Chat::Group),
             query_id: "q".into(),
             data: Some(data),
             message_id: Some(message_id),

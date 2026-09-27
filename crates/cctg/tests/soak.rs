@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use cctg::device::canonical_cwd;
 use cctg::hub::api::{ApiError, BotApi, ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::config::{Allowlist, BotToken, Config};
 use cctg::hub::ingress::{serve_agents, serve_hooks};
 use cctg::hub::offset::OffsetStore;
@@ -459,6 +460,7 @@ struct Call {
 fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
     match op {
         Op::Send {
+            chat: Chat::Group,
             thread_id,
             text,
             permission,
@@ -470,17 +472,22 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             None,
         ),
         Op::SendDocument {
+            chat: Chat::Group,
             thread_id,
             document,
             ..
         } => ("document", *thread_id, document.file_name.clone(), None),
         Op::SendPhoto {
+            chat: Chat::Group,
             thread_id,
             document,
             ..
         } => ("photo", *thread_id, document.file_name.clone(), None),
         Op::SendAlbum {
-            thread_id, items, ..
+            chat: Chat::Group,
+            thread_id,
+            items,
+            ..
         } => (
             "album",
             *thread_id,
@@ -492,17 +499,38 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             None,
         ),
         Op::Stream {
-            thread_id, text, ..
+            chat: Chat::Group,
+            thread_id,
+            text,
+            ..
         } => ("stream", Some(*thread_id), text.clone(), None),
         Op::Edit {
-            message_id, text, ..
+            chat: Chat::Group,
+            message_id,
+            text,
+            ..
         } => ("edit", None, text.clone(), Some(*message_id)),
-        Op::React { message_id, emoji } => ("react", None, emoji.clone(), Some(*message_id)),
+        Op::React {
+            chat: Chat::Group,
+            message_id,
+            emoji,
+        } => ("react", None, emoji.clone(), Some(*message_id)),
         Op::AnswerCallback { query_id, .. } => ("callback", None, query_id.clone(), None),
-        Op::Delete { message_id } => ("delete", None, String::new(), Some(*message_id)),
-        Op::Pin { message_id } => ("pin", None, String::new(), Some(*message_id)),
-        Op::CreateTopic { name, .. } => ("create_topic", None, name.clone(), None),
+        Op::Delete {
+            chat: Chat::Group,
+            message_id,
+        } => ("delete", None, String::new(), Some(*message_id)),
+        Op::Pin {
+            chat: Chat::Group,
+            message_id,
+        } => ("pin", None, String::new(), Some(*message_id)),
+        Op::CreateTopic {
+            chat: Chat::Group,
+            name,
+            ..
+        } => ("create_topic", None, name.clone(), None),
         Op::EditTopic {
+            chat: Chat::Group,
             thread_id,
             name,
             icon_custom_emoji_id,
@@ -516,6 +544,8 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             ),
             None,
         ),
+        // TASK-061: a hub without private chats writes only to the group.
+        other => panic!("an op outside the group: {other:?}"),
     }
 }
 
@@ -701,7 +731,8 @@ impl UpdateSource for Updates {
 struct Soak {
     live: bool,
     /// Live only: for deleting this run's topics at the end.
-    token: Option<BotToken>,
+    /// Live only, with the group's id.
+    token: Option<(BotToken, i64)>,
     root: PathBuf,
     home: PathBuf,
     config_dir: PathBuf,
@@ -775,6 +806,7 @@ impl Soak {
                         .push((service.thread_id, service.message_id));
                 }
                 let _ = router.send(Control::TopicEdited {
+                    chat: Chat::Group,
                     thread_id: service.thread_id,
                     message_id: service.message_id,
                 });
@@ -811,6 +843,7 @@ impl Soak {
         let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
         if self.live {
             let _ = hub.control.send(Control::Message(Inbound {
+                chat: Chat::Group,
                 message_id,
                 thread_id: Some(thread),
                 text: Some(text.to_owned()),
@@ -836,6 +869,7 @@ impl Soak {
         let query = format!("{SYNTHETIC_QUERY}{message_id}");
         if self.live {
             let _ = hub.control.send(Control::Callback(updates::CallbackInput {
+                chat: Some(Chat::Group),
                 query_id: query,
                 data: Some(data.to_owned()),
                 message_id: Some(message_id),
@@ -1024,7 +1058,10 @@ async fn soak(live: bool) -> String {
         // The run creates topics, deletes their service messages and at the
         // end the topics themselves.
         let me = api.get_me().await.expect("getMe");
-        let member = api.get_chat_member(me.id).await.expect("getChatMember");
+        let member = api
+            .get_chat_member(Chat::Group, me.id)
+            .await
+            .expect("getChatMember");
         assert!(
             member.status == "creator" || (member.can_manage_topics && member.can_delete_messages),
             "the bot needs can_manage_topics and can_delete_messages"
@@ -1049,20 +1086,18 @@ async fn soak(live: bool) -> String {
                 .expect("icons");
         let options = Options {
             icons,
-            chat_id: config.chat_id,
             grace: Duration::ZERO,
             ..Options::default()
         };
         (
             Some(api),
-            Some(config.token),
+            Some((config.token, config.chat_id)),
             options,
             BucketConfig::default(),
             config.allowlist,
         )
     } else {
         let options = Options {
-            chat_id: FAKE_CHAT,
             grace: Duration::ZERO,
             retry_every: Duration::from_secs(2),
             stream_every: Duration::from_millis(100),
@@ -1122,7 +1157,7 @@ async fn soak(live: bool) -> String {
         tokio::spawn(async move { scenario(&soak, started).await }).await
     };
     let undeleted = match &soak.token {
-        Some(token) => delete_topics(token, soak.options.chat_id, &created_topics(&soak.tg)).await,
+        Some((token, chat_id)) => delete_topics(token, *chat_id, &created_topics(&soak.tg)).await,
         None => Vec::new(),
     };
     // Stand-ins close their agents (up to 3 s) and exit; then the copy of
@@ -1669,7 +1704,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         ["pids", "seq", "sessions", "slots", "subagents", "version"],
         "no other durable state"
     );
-    assert_eq!(registry["version"], 1);
+    assert_eq!(registry["version"], 2);
     assert!(registry["seq"].as_u64().is_some_and(|seq| seq > 0));
     assert_eq!(registry["subagents"], json!({}), "no subagent records");
     let slots = registry["slots"].as_array().expect("slots");
@@ -1683,28 +1718,40 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         assert_eq!(slot["folder_name"], folder_name(folder));
         assert_eq!(slot["folder_key"], cctg::hub::registry::folder_key(folder));
         assert_eq!(slot["ordinal"], ordinal);
-        assert_eq!(slot["topic_id"], thread);
         assert_eq!(slot["current_session"], current);
-        assert_eq!(slot["pending_separator"], Value::Null);
-        assert_eq!(
-            slot["applied_title"],
-            topic_title(HOST, &folder_name(folder), ordinal, Some(short(current)))
-        );
-        assert_eq!(slot["applied_icon"], json!(alive), "{current} alive");
         assert_eq!(
             keys(slot),
             [
-                "applied_icon",
-                "applied_title",
                 "current_session",
                 "folder_key",
                 "folder_name",
                 "host",
                 "ordinal",
-                "pending_separator",
-                "topic_id"
+                "views"
             ],
             "no kept messages, nothing else"
+        );
+        // TASK-061: one view, the group's, with what the slot had.
+        let views = slot["views"].as_array().expect("views");
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view["chat"], "group");
+        assert_eq!(view["topic_id"], thread);
+        assert_eq!(view["pending_separator"], Value::Null);
+        assert_eq!(
+            view["applied_title"],
+            topic_title(HOST, &folder_name(folder), ordinal, Some(short(current)))
+        );
+        assert_eq!(view["applied_icon"], json!(alive), "{current} alive");
+        assert_eq!(
+            keys(view),
+            [
+                "applied_icon",
+                "applied_title",
+                "chat",
+                "pending_separator",
+                "topic_id"
+            ]
         );
     }
     let sessions = registry["sessions"].as_object().expect("sessions");
@@ -1754,10 +1801,13 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             .len();
         assert_eq!(entry["stream"]["offset"], written, "{id}: stream offset");
         assert_eq!(entry["stream"]["calls"], json!([]), "{id}: open calls");
+        // TASK-061: a receipt is a message of the group.
         assert!(
             entry["stream"]["receipts"]
                 .as_array()
-                .is_some_and(|ids| ids.iter().all(Value::is_i64)),
+                .is_some_and(|keys| keys
+                    .iter()
+                    .all(|key| key["chat"] == "group" && key["id"].is_i64())),
             "{id}: receipts"
         );
     }
@@ -1799,7 +1849,8 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let block = &nested["block"];
     assert_eq!(block["header"], nested_header(NESTED));
     assert_eq!(
-        block["thread_id"], t_a,
+        block["place"],
+        json!({"chat": "group", "thread": t_a}),
         "the block is in the parent's topic"
     );
     assert!(block["message_id"].is_i64());

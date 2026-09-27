@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use cctg::device::canonical_cwd;
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::commands::{self, Asks};
 use cctg::hub::ingress::serve_agents;
 use cctg::hub::registry::RegistryStore;
@@ -188,6 +189,7 @@ impl Hub {
     fn command(&self, thread: Option<i64>, text: &str) {
         self.commands
             .send(Inbound {
+                chat: Chat::Group,
                 message_id: 1,
                 thread_id: thread,
                 text: Some(text.to_owned()),

@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod buffer;
+pub mod chat;
 pub mod commands;
 pub mod config;
 pub mod console;
@@ -32,6 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use api::{ApiError, BotApi, ChatMember, Sticker};
+use chat::Chat;
 use config::{
     AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, SHARED_VAR, STATE_VAR,
 };
@@ -107,6 +109,7 @@ fn route_inbound<'a>(
         }
         Routed::Service(service) if service.kind == ServiceKind::TopicEdited => {
             let edited = Control::TopicEdited {
+                chat: service.chat,
                 thread_id: service.thread_id,
                 message_id: service.message_id,
             };
@@ -115,13 +118,18 @@ fn route_inbound<'a>(
             }
         }
         Routed::Service(updates::ServiceMessage {
+            chat,
             kind: ServiceKind::Pinned(pinned),
             message_id,
             from: Some(from),
             ..
         }) if from == bot_id => {
             if control
-                .send(Control::Pinned { message_id, pinned })
+                .send(Control::Pinned {
+                    chat,
+                    message_id,
+                    pinned,
+                })
                 .is_err()
             {
                 warn!("slot actor stopped; service message kept");
@@ -319,7 +327,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
             answer => break answer.context("getMe failed; check CCTG_BOT_TOKEN")?,
         }
     };
-    let member = api.get_chat_member(me.id).await.context(
+    let member = api.get_chat_member(Chat::Group, me.id).await.context(
         "getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group",
     )?;
     check_topic_rights(&member)?;
@@ -354,7 +362,6 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     tokio::spawn(scheduler.run());
     let options = slots::Options {
         icons,
-        chat_id: config.chat_id,
         can_delete,
         can_pin,
         status_every: Some(slots::STATUS_EVERY),
@@ -480,7 +487,7 @@ mod tests {
     }
 
     impl TranscriptSource for Gated {
-        async fn prepare(&self, _: Option<i64>, command: TranscriptCommand) -> Prepared {
+        async fn prepare(&self, _: chat::Place, command: TranscriptCommand) -> Prepared {
             let _ = self.gate.lock().await.recv().await;
             let turns = transcript::parse(&self.jsonl);
             let body = match command.view {
@@ -572,6 +579,7 @@ mod tests {
         let (roster_tx, mut roster_rx) = mpsc::unbounded_channel();
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let input = |text: &str| Inbound {
+            chat: Chat::Group,
             message_id: 5,
             thread_id: Some(100),
             text: Some(text.to_owned()),
@@ -596,6 +604,7 @@ mod tests {
             ..input("/join")
         }));
         route(Routed::Callback(updates::CallbackInput {
+            chat: Some(Chat::Group),
             query_id: "d".to_owned(),
             data: Some("dev:n".to_owned()),
             message_id: Some(8),
@@ -607,6 +616,7 @@ mod tests {
             ..input("")
         }));
         let press = updates::CallbackInput {
+            chat: Some(Chat::Group),
             query_id: "q".to_owned(),
             data: Some("allow:abcde".to_owned()),
             message_id: Some(9),
@@ -616,6 +626,7 @@ mod tests {
         route(Routed::Callback(press.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {
             route(Routed::Service(updates::ServiceMessage {
+                chat: Chat::Group,
                 kind,
                 message_id: 9,
                 thread_id: Some(100),
@@ -626,6 +637,7 @@ mod tests {
         // by nobody known stay; only the bot's own pin notice goes on.
         for from in [Some(ALLOWED), Some(BOT + 1), None, Some(BOT)] {
             route(Routed::Service(updates::ServiceMessage {
+                chat: Chat::Group,
                 kind: ServiceKind::Pinned(1000),
                 message_id: 11,
                 thread_id: Some(100),
@@ -673,6 +685,7 @@ mod tests {
         assert_eq!(
             control_rx.try_recv().unwrap(),
             Control::Pinned {
+                chat: Chat::Group,
                 message_id: 11,
                 pinned: 1000
             }

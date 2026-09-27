@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use transcript::{TELEGRAM_TEXT_LIMIT, telegram_len};
 
+use super::chat::{MessageKey, Place};
 use super::registry::cut;
 use super::updates::NAME_LIMIT;
 use crate::channel::is_request_id;
@@ -194,8 +195,8 @@ pub struct Prompt {
     /// Handed to Telegram (the send may still be in flight).
     pub sent: bool,
     /// The topic it was handed to.
-    pub thread_id: Option<i64>,
-    /// Set once Telegram accepted the message.
+    pub place: Option<Place>,
+    /// Set once Telegram accepted the message; an id of `place`'s chat.
     pub message_id: Option<i64>,
     pub state: State,
     /// Counts for the session's waiting icon. Stop and UserPromptSubmit
@@ -230,7 +231,7 @@ impl Prompt {
             request_id: request.request_id.clone(),
             text: prompt_text(request),
             sent: false,
-            thread_id: None,
+            place: None,
             message_id: None,
             state: State::Open,
             waits: true,
@@ -240,6 +241,11 @@ impl Prompt {
             opened: Instant::now(),
             decided_by: None,
         }
+    }
+
+    /// Its message, once Telegram accepted it.
+    pub fn message(&self) -> Option<MessageKey> {
+        Some(MessageKey::new(self.place?.chat, self.message_id?))
     }
 
     /// What Telegram should show once the prompt ended; `None` while active.
@@ -287,7 +293,7 @@ pub struct Prompts {
     next: u64,
     order: VecDeque<u64>,
     prompts: HashMap<u64, Prompt>,
-    by_message: HashMap<i64, u64>,
+    by_message: HashMap<MessageKey, u64>,
 }
 
 impl Prompts {
@@ -327,10 +333,10 @@ impl Prompts {
     pub fn remove(&mut self, key: u64) -> Option<Prompt> {
         self.order.retain(|known| *known != key);
         let gone = self.prompts.remove(&key)?;
-        if let Some(message_id) = gone.message_id
-            && self.by_message.get(&message_id) == Some(&key)
+        if let Some(message) = gone.message()
+            && self.by_message.get(&message) == Some(&key)
         {
-            self.by_message.remove(&message_id);
+            self.by_message.remove(&message);
         }
         Some(gone)
     }
@@ -351,7 +357,9 @@ impl Prompts {
             if !prompt.state.is_active() {
                 prompt.edit = Edit::Due;
             }
-            self.by_message.insert(message_id, key);
+            if let Some(message) = prompt.message() {
+                self.by_message.insert(message, key);
+            }
         }
     }
 
@@ -373,21 +381,21 @@ impl Prompts {
         true
     }
 
-    pub fn by_message(&self, message_id: i64) -> Option<u64> {
-        self.by_message.get(&message_id).copied()
+    pub fn by_message(&self, message: MessageKey) -> Option<u64> {
+        self.by_message.get(&message).copied()
     }
 
     /// The one prompt with `request_id` whose message is on its way to
-    /// Telegram in topic `thread_id`: its buttons can be pressed before
+    /// Telegram in topic `place`: its buttons can be pressed before
     /// Telegram's answer with the message id reaches the hub (TASK-060).
     /// `None` when no or several prompts match, or the topic is unknown.
-    pub fn in_flight(&self, request_id: &str, thread_id: Option<i64>) -> Option<u64> {
-        let thread_id = thread_id?;
+    pub fn in_flight(&self, request_id: &str, place: Option<Place>) -> Option<u64> {
+        let place = place?;
         let mut found = self.prompts.iter().filter(|(_, prompt)| {
             prompt.sent
                 && prompt.message_id.is_none()
                 && prompt.request_id == request_id
-                && prompt.thread_id == Some(thread_id)
+                && prompt.place == Some(place)
         });
         let (key, _) = found.next()?;
         found.next().is_none().then_some(*key)
@@ -501,6 +509,7 @@ impl Prompts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::chat::Chat;
 
     fn request(preview: &str) -> PermissionRequest {
         PermissionRequest {
@@ -524,10 +533,60 @@ mod tests {
         }
     }
 
-    /// Shown in Telegram as `message_id`.
+    /// Shown in Telegram as `message_id` of the group's topic 100.
     fn shown(book: &mut Prompts, key: u64, message_id: i64) {
-        book.get_mut(key).unwrap().sent = true;
+        shown_in(book, key, Place::topic(Chat::Group, 100), message_id);
+    }
+
+    fn shown_in(book: &mut Prompts, key: u64, place: Place, message_id: i64) {
+        let prompt = book.get_mut(key).unwrap();
+        prompt.sent = true;
+        prompt.place = Some(place);
         book.delivered(key, message_id);
+    }
+
+    /// TASK-061: message and topic ids are numbered per chat. A prompt in
+    /// the group and one in a private chat with the same message id (and in
+    /// topics with the same id) are found apart, by press and in flight.
+    #[test]
+    fn prompts_with_one_id_in_two_chats_are_found_apart() {
+        let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(7_319_402_518));
+        let mut book = Prompts::default();
+        let group = added(book.open(prompt("A", "abcde")));
+        let own = added(book.open(prompt("B", "abcde")));
+        shown_in(&mut book, group, Place::topic(Chat::Group, 100), 10);
+        shown_in(&mut book, own, Place::topic(private, 100), 10);
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 10)),
+            Some(group)
+        );
+        assert_eq!(book.by_message(MessageKey::new(private, 10)), Some(own));
+        assert!(book.finish(own, State::Closed));
+        book.edit_done(own);
+        assert!(book.remove(own).is_some());
+        assert_eq!(book.by_message(MessageKey::new(private, 10)), None);
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 10)),
+            Some(group),
+            "the group's prompt stays found"
+        );
+        // In flight: the same request id and topic id in the other chat is
+        // another prompt, never an ambiguous pair.
+        let a = added(book.open(prompt("C", "fghij")));
+        let b = added(book.open(prompt("D", "fghij")));
+        for (key, chat) in [(a, Chat::Group), (b, private)] {
+            let sending = book.get_mut(key).unwrap();
+            sending.sent = true;
+            sending.place = Some(Place::topic(chat, 200));
+        }
+        assert_eq!(
+            book.in_flight("fghij", Some(Place::topic(Chat::Group, 200))),
+            Some(a)
+        );
+        assert_eq!(
+            book.in_flight("fghij", Some(Place::topic(private, 200))),
+            Some(b)
+        );
     }
 
     #[test]
@@ -645,8 +704,14 @@ mod tests {
         let other = added(book.open(prompt("B", "abcde")));
         shown(&mut book, first, 10);
         shown(&mut book, other, 11);
-        assert_eq!(book.by_message(10), Some(first));
-        assert_eq!(book.by_message(11), Some(other));
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 10)),
+            Some(first)
+        );
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 11)),
+            Some(other)
+        );
         // Once A's prompt ended, the same id may ask again.
         assert!(book.finish(first, State::Closed));
         added(book.open(prompt("A", "abcde")));
@@ -688,23 +753,48 @@ mod tests {
     fn a_press_before_the_message_id_finds_the_prompt_in_flight() {
         let mut book = Prompts::default();
         let key = added(book.open(prompt("A", "abcde")));
-        assert_eq!(book.in_flight("abcde", Some(100)), None, "not handed out");
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            None,
+            "not handed out"
+        );
         let sending = book.get_mut(key).unwrap();
         sending.sent = true;
-        sending.thread_id = Some(100);
-        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
-        assert_eq!(book.in_flight("bcdef", Some(100)), None);
-        assert_eq!(book.in_flight("abcde", Some(101)), None, "other topic");
+        sending.place = Some(Place::topic(Chat::Group, 100));
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            Some(key)
+        );
+        assert_eq!(
+            book.in_flight("bcdef", Some(Place::topic(Chat::Group, 100))),
+            None
+        );
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 101))),
+            None,
+            "other topic"
+        );
         assert_eq!(book.in_flight("abcde", None), None, "topic unknown");
         let twin = added(book.open(prompt("B", "abcde")));
         let sending = book.get_mut(twin).unwrap();
         sending.sent = true;
-        sending.thread_id = Some(100);
-        assert_eq!(book.in_flight("abcde", Some(100)), None, "ambiguous");
+        sending.place = Some(Place::topic(Chat::Group, 100));
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            None,
+            "ambiguous"
+        );
         book.delivered(twin, 11);
-        assert_eq!(book.in_flight("abcde", Some(100)), Some(key));
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            Some(key)
+        );
         book.delivered(key, 10);
-        assert_eq!(book.in_flight("abcde", Some(100)), None, "id known");
+        assert_eq!(
+            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            None,
+            "id known"
+        );
     }
 
     #[test]
@@ -806,7 +896,7 @@ mod tests {
         let Opened::Added { expired: None, .. } = book.open(prompt("B", "abcde")) else {
             panic!("a finished prompt makes room");
         };
-        assert_eq!(book.by_message(100), None);
+        assert_eq!(book.by_message(MessageKey::new(Chat::Group, 100)), None);
         // Then the oldest open one expires; a selected one never does.
         book.get_mut(keys[1]).unwrap().state = State::Selected {
             behavior: Behavior::Deny,
@@ -820,8 +910,11 @@ mod tests {
             panic!("an open prompt makes room");
         };
         assert_eq!(gone.message_id, Some(102));
-        assert_eq!(book.by_message(102), None);
-        assert_eq!(book.by_message(101), Some(keys[1]));
+        assert_eq!(book.by_message(MessageKey::new(Chat::Group, 102)), None);
+        assert_eq!(
+            book.by_message(MessageKey::new(Chat::Group, 101)),
+            Some(keys[1])
+        );
         assert_eq!(book.len(), MAX_PROMPTS);
         // Nothing expirable left: every other prompt is selected.
         for key in book.active() {

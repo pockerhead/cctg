@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::commands::{Asks, handle};
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
@@ -62,6 +63,7 @@ impl Transport for Fake {
 
 fn input(text: &str) -> Inbound {
     Inbound {
+        chat: Chat::Group,
         message_id: 1,
         thread_id: None,
         text: Some(text.to_owned()),

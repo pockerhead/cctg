@@ -139,6 +139,20 @@ Hub, поставленный `install.sh --hub`, закреплён на обр
 
 Hub останавливается по SIGTERM: дописывает `registry.json` в том и выходит (`stop_grace_period: 30s`). Агенты переподключаются сами, хуки на эти секунды складывают `SessionStart`/`SessionEnd` в спул.
 
+`registry.json` версии 2 (TASK-061, после v0.1.12): тема слота, её имя, иконка, разделитель и статус переехали в «вид» слота в группе, у сохранённых id сообщений появился чат. Новый hub читает файл v0.1.12 и старше (версия 1), сначала кладёт его байт в байт рядом как `registry.v1.json` (не вышло, значит hub не стартует и `registry.json` не трогает: `cannot keep the version 1 registry.json as registry.v1.json`) и при первом же сохранении переписывает `registry.json` как версию 2. Hub v0.1.12 и старше на файле версии 2 не стартует (`registry.json has version 2, this hub reads version 1` или `registry.json is not a valid registry`) и темы не плодит.
+
+Откат на v0.1.12 (или старше) после плохого релиза: остановить hub, вернуть копию, запустить старый образ.
+
+```sh
+docker compose stop hub
+docker compose run --rm --no-deps --entrypoint cp hub /data/registry.v1.json /data/registry.json
+# в .env рядом с compose.yml: CCTG_IMAGE_TAG=0.1.12 (так же закрепляет образ от watchtower)
+docker compose up -d
+```
+
+Hub без Docker (`cctg supervise`): остановить его, в папке состояния (`CCTG_STATE_DIR`, по умолчанию `.cctg`) скопировать `registry.v1.json` поверх `registry.json`, запустить старый бинарник. Копия это реестр на момент обновления: слоты и темы, появившиеся после него, старый hub не знает и для таких папок создаст темы заново; `offset` остаётся как есть. Следующее обновление снова мигрирует файл и перезапишет `registry.v1.json` его новой копией.
+
+
 ## Смена сертификата
 
 Pin это хеш сертификата, поэтому новый сертификат (истёк срок, утёк ключ) это новый pin на всех устройствах:

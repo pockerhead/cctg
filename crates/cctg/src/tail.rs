@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use transcript::StreamEvent;
+use transcript::{ChannelPlace, StreamEvent};
 
 use crate::wire::{AgentMsg, StreamItem, StreamLine};
 
@@ -389,7 +389,10 @@ fn skip_line(reader: &mut impl BufRead) -> Option<u64> {
 fn item(event: StreamEvent) -> Option<StreamItem> {
     Some(match event {
         StreamEvent::Prompt(text) => StreamItem::Prompt { text: cap(text) },
-        StreamEvent::Channel { message_id } => StreamItem::Channel { message_id },
+        StreamEvent::Channel { place, message_id } => StreamItem::Channel {
+            message_id,
+            private: place == ChannelPlace::Private,
+        },
         StreamEvent::Note(text) => StreamItem::Note { text: cap(text) },
         StreamEvent::Thinking(text) => StreamItem::Thinking { text: cap(text) },
         StreamEvent::Call { id, line } if id.len() <= MAX_ID => StreamItem::Call {

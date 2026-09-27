@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Control, MAX_QUEUED_MESSAGES, Options, Slots};
@@ -138,6 +139,7 @@ async fn one_overflow_warning_per_episode() {
     let say = |message_id: i64| {
         control
             .send(Control::Message(Inbound {
+                chat: Chat::Group,
                 message_id,
                 thread_id: Some(100),
                 text: None,

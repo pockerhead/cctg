@@ -6,6 +6,10 @@
 //! forever; sessions succeed each other inside it. Nested runs and subagents
 //! never get a slot, they only point at their parent's.
 //!
+//! A slot shows in one or more chats, each its own [`View`] with its own
+//! topic, name, icon, separator and status message (TASK-061). Today every
+//! slot has exactly one view, the group's.
+//!
 //! Paths, folder names and titles are private: nothing here logs them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -17,10 +21,14 @@ use serde::{Deserialize, Serialize};
 use transcript::telegram_len;
 
 use super::buffer::Buffer;
+use super::chat::{Chat, MessageKey, Place};
 use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
 
-pub const VERSION: u32 = 1;
+/// 2 since TASK-061 (a slot's topic moved into its views, stored message ids
+/// carry their chat). Version 1 files are migrated on load
+/// ([`migrate_v1`]); a hub older than 2 refuses a version 2 file.
+pub const VERSION: u32 = 2;
 /// Telegram limit for a topic name. Measured in UTF-16 units, which is never
 /// less than the character count.
 pub const MAX_TITLE: usize = 128;
@@ -37,6 +45,9 @@ const REAP_GRACE: Duration = Duration::from_secs(5);
 
 const FILE_NAME: &str = "registry.json";
 const TEMP_NAME: &str = "registry.json.tmp";
+/// A version 1 file as the migration found it, for a rollback (TASK-061).
+const V1_COPY_NAME: &str = "registry.v1.json";
+const V1_COPY_TEMP_NAME: &str = "registry.v1.json.tmp";
 
 /// Preferred icons, from `getForumTopicIconStickers` (2026-09-23, 112
 /// stickers). Used only while Telegram offers them, see [`Icons::from_offered`].
@@ -283,9 +294,34 @@ pub struct Slot {
     pub folder_name: String,
     pub ordinal: u32,
     #[serde(default)]
-    pub topic_id: Option<i64>,
-    #[serde(default)]
     pub current_session: Option<String>,
+    /// Topic messages no session of the slot could take yet (TASK-017).
+    #[serde(default, skip_serializing_if = "Buffer::is_idle")]
+    pub buffer: Buffer,
+    /// The chats the slot shows in, at most one view per chat, the primary
+    /// one first: its topic gets the session's answers and messages. Never
+    /// empty (the loader refuses a slot without one).
+    pub views: Vec<View>,
+}
+
+impl Slot {
+    /// The view the slot's session is answered in (TASK-061: the group's).
+    pub fn primary(&self) -> Option<&View> {
+        self.views.first()
+    }
+
+    /// The caller sets [`Registry::dirty`] when it changes a saved field.
+    pub fn view_mut(&mut self, chat: Chat) -> Option<&mut View> {
+        self.views.iter_mut().find(|view| view.chat == chat)
+    }
+}
+
+/// A slot in one chat: its topic there and what Telegram shows of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct View {
+    pub chat: Chat,
+    #[serde(default)]
+    pub topic_id: Option<i64>,
     /// Name and icon Telegram shows now, as far as the hub knows.
     #[serde(default)]
     pub applied_title: Option<String>,
@@ -294,19 +330,42 @@ pub struct Slot {
     /// Separator to post once the topic exists.
     #[serde(default)]
     pub pending_separator: Option<String>,
-    /// Topic messages no session of the slot could take yet (TASK-017).
-    #[serde(default, skip_serializing_if = "Buffer::is_idle")]
-    pub buffer: Buffer,
-    /// The slot's status message in its topic (TASK-029).
+    /// The status message in the topic (TASK-029); its id is one of `chat`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusMessage>,
-    /// A topic call for this slot is in flight.
+    /// A topic call for this view is in flight.
     #[serde(skip)]
     pub busy: bool,
     /// Name and icon a call already failed with; not retried until they
     /// change or [`Registry::retry_failed`] runs.
     #[serde(skip)]
     pub failed: Option<(String, Option<String>)>,
+}
+
+impl View {
+    pub fn new(chat: Chat) -> Self {
+        Self {
+            chat,
+            topic_id: None,
+            applied_title: None,
+            applied_icon: None,
+            pending_separator: None,
+            status: None,
+            busy: false,
+            failed: None,
+        }
+    }
+
+    /// Its topic, once it has one.
+    pub fn place(&self) -> Option<Place> {
+        self.topic_id.map(|topic| Place::topic(self.chat, topic))
+    }
+
+    /// Its status message, once it has one.
+    pub fn status_message(&self) -> Option<MessageKey> {
+        self.status
+            .map(|status| MessageKey::new(self.chat, status.message_id))
+    }
 }
 
 /// The status message of a slot: sent once per topic, pinned once.
@@ -394,11 +453,11 @@ pub struct Stream {
     /// Telegram messages handed to the session's agent that show 👀 and wait
     /// for their channel record to turn ✍.
     #[serde(default)]
-    pub receipts: Vec<i64>,
+    pub receipts: Vec<MessageKey>,
     /// Receipts that stand for a burst handed as one inbound (TASK-048):
     /// receipt -> the burst's other messages, which turn ✍ with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parts: Vec<(i64, Vec<i64>)>,
+    pub parts: Vec<(MessageKey, Vec<MessageKey>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,7 +497,8 @@ pub struct Block {
     pub header: String,
     /// The topic the message went to.
     #[serde(default)]
-    pub thread_id: Option<i64>,
+    pub place: Option<Place>,
+    /// The message there, an id of `place`'s chat.
     #[serde(default)]
     pub message_id: Option<i64>,
     /// Text to send or edit to; `None` once Telegram shows it.
@@ -467,6 +527,11 @@ pub struct Block {
 }
 
 impl Block {
+    /// Its message, once Telegram took it.
+    pub fn message(&self) -> Option<MessageKey> {
+        Some(MessageKey::new(self.place?.chat, self.message_id?))
+    }
+
     fn running(header: String) -> Self {
         Self {
             pending: Some(format!("{header}\n{BLOCK_RUNNING}")),
@@ -481,7 +546,7 @@ impl Block {
 /// topic gets a notification (an edit gives none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockNotice {
-    pub thread_id: i64,
+    pub place: Place,
     pub reply_to: i64,
     pub text: String,
 }
@@ -500,27 +565,30 @@ pub enum BlockKey {
 pub enum BlockJob {
     Send {
         key: BlockKey,
-        thread_id: i64,
+        place: Place,
         text: String,
     },
     Edit {
         key: BlockKey,
-        message_id: i64,
+        message: MessageKey,
         text: String,
     },
 }
 
-/// A topic call the actor should make. At most one per slot is in flight: the
-/// slot is marked busy until the matching `topic_*` result comes back.
+/// A topic call the actor should make for the view of `chat`. At most one per
+/// view is in flight: the view is marked busy until the matching `topic_*`
+/// result comes back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopicJob {
     Create {
         slot: SlotId,
+        chat: Chat,
         name: String,
         icon: Option<String>,
     },
     Edit {
         slot: SlotId,
+        chat: Chat,
         thread_id: i64,
         /// `None` keeps the current name or icon.
         name: Option<String>,
@@ -528,9 +596,21 @@ pub enum TopicJob {
     },
     Separator {
         slot: SlotId,
+        chat: Chat,
         thread_id: i64,
         text: String,
     },
+}
+
+impl TopicJob {
+    /// The slot and view it is for.
+    pub fn view(&self) -> (SlotId, Chat) {
+        match self {
+            Self::Create { slot, chat, .. }
+            | Self::Edit { slot, chat, .. }
+            | Self::Separator { slot, chat, .. } => (*slot, *chat),
+        }
+    }
 }
 
 /// What a hook event or an agent registration asks of the actor.
@@ -611,11 +691,18 @@ impl Registry {
         self.slots.get_mut(id.0)
     }
 
-    pub fn slot_by_topic(&self, thread_id: i64) -> Option<SlotId> {
+    /// The slot of topic `place`; General (no topic) is no slot's.
+    pub fn slot_by_topic(&self, place: Place) -> Option<SlotId> {
+        place.thread?;
         self.slots
             .iter()
-            .position(|slot| slot.topic_id == Some(thread_id))
+            .position(|slot| slot.views.iter().any(|view| view.place() == Some(place)))
             .map(SlotId)
+    }
+
+    /// The topic of the slot's primary view, where its session's messages go.
+    pub fn place(&self, id: SlotId) -> Option<Place> {
+        self.slot(id)?.primary()?.place()
     }
 
     /// A slot is free when no session that is still running holds it.
@@ -720,15 +807,9 @@ impl Registry {
             folder_key: key,
             folder_name: folder_name(cwd),
             ordinal,
-            topic_id: None,
             current_session: None,
-            applied_title: None,
-            applied_icon: None,
-            pending_separator: None,
             buffer: Buffer::default(),
-            status: None,
-            busy: false,
-            failed: None,
+            views: vec![View::new(Chat::Group)],
         });
         SlotId(self.slots.len() - 1)
     }
@@ -738,7 +819,10 @@ impl Registry {
         match slot.current_session.as_deref() {
             Some(current) if current == session => {}
             Some(_) => {
-                slot.pending_separator = Some(separator(session, resumed));
+                let text = separator(session, resumed);
+                for view in &mut slot.views {
+                    view.pending_separator = Some(text.clone());
+                }
                 slot.current_session = Some(session.to_owned());
             }
             None => slot.current_session = Some(session.to_owned()),
@@ -1184,9 +1268,9 @@ impl Registry {
             entry.agent = None;
             entry.waiting = false;
         }
-        for slot in &mut self.slots {
-            slot.busy = false;
-            slot.failed = None;
+        for view in self.slots.iter_mut().flat_map(|slot| &mut slot.views) {
+            view.busy = false;
+            view.failed = None;
         }
         for block in self.blocks_mut() {
             block.busy = false;
@@ -1371,10 +1455,7 @@ impl Registry {
             if jobs.len() >= limit {
                 break;
             }
-            let topic = self
-                .block_slot(&key)
-                .and_then(|slot| self.slot(slot))
-                .and_then(|slot| slot.topic_id);
+            let topic = self.block_slot(&key).and_then(|slot| self.place(slot));
             let Some(block) = self.block_mut(&key) else {
                 continue;
             };
@@ -1384,14 +1465,10 @@ impl Registry {
             let Some(text) = block.pending.clone() else {
                 continue;
             };
-            match block.message_id {
-                Some(message_id) => {
+            match block.message() {
+                Some(message) => {
                     block.busy = true;
-                    jobs.push(BlockJob::Edit {
-                        key,
-                        message_id,
-                        text,
-                    });
+                    jobs.push(BlockJob::Edit { key, message, text });
                 }
                 None if block.sending => {
                     block.pending = None;
@@ -1399,18 +1476,14 @@ impl Registry {
                     self.dirty = true;
                 }
                 None => {
-                    let Some(thread_id) = topic else {
+                    let Some(place) = topic else {
                         continue;
                     };
                     block.busy = true;
                     block.sending = true;
-                    block.thread_id = Some(thread_id);
+                    block.place = Some(place);
                     self.dirty = true;
-                    jobs.push(BlockJob::Send {
-                        key,
-                        thread_id,
-                        text,
-                    });
+                    jobs.push(BlockJob::Send { key, place, text });
                 }
             }
         }
@@ -1440,7 +1513,7 @@ impl Registry {
         if block.notified || block.running || block.pending.is_some() {
             return None;
         }
-        let (thread_id, reply_to) = (block.thread_id?, block.message_id?);
+        let (place, reply_to) = (block.place?, block.message_id?);
         let lost = text
             == format!(
                 "{}
@@ -1450,7 +1523,7 @@ impl Registry {
         let label = block_label(key, &block.header);
         self.block_mut(key)?.notified = true;
         Some(BlockNotice {
-            thread_id,
+            place,
             reply_to,
             text: if lost {
                 format!("✗ {label} {BLOCK_LOST}")
@@ -1491,11 +1564,11 @@ impl Registry {
         }
     }
 
-    /// The agent id of the subagent block `message_id` in `thread_id`, when
+    /// The agent id of the subagent block `message_id` in topic `place`, when
     /// that subagent belongs to `session`.
     pub fn subagent_of_message(
         &self,
-        thread_id: i64,
+        place: Place,
         message_id: i64,
         session: &str,
     ) -> Option<&str> {
@@ -1504,7 +1577,7 @@ impl Registry {
             .find(|(_, entry)| {
                 entry.parent_session == session
                     && entry.block.message_id == Some(message_id)
-                    && entry.block.thread_id == Some(thread_id)
+                    && entry.block.place == Some(place)
             })
             .map(|(id, _)| id.as_str())
     }
@@ -1559,67 +1632,80 @@ impl Registry {
         let mut jobs = Vec::new();
         for index in 0..self.slots.len() {
             let id = SlotId(index);
-            if self.slots[index].busy {
-                continue;
-            }
             let name = self.desired_title(id);
             let icon = icons.for_state(self.state(id)).map(str::to_owned);
             let wanted = (name.clone(), icon.clone());
-            let slot = &mut self.slots[index];
-            if slot.failed.as_ref() == Some(&wanted) {
-                continue;
-            }
-            let Some(thread_id) = slot.topic_id else {
-                slot.busy = true;
-                jobs.push(TopicJob::Create {
-                    slot: id,
-                    name,
-                    icon,
-                });
-                continue;
-            };
-            // One call per slot at a time; the separator stays pending until
-            // Telegram took it.
-            if let Some(text) = slot.pending_separator.clone() {
-                if draining.contains(&id) {
+            for view in &mut self.slots[index].views {
+                if view.busy || view.failed.as_ref() == Some(&wanted) {
                     continue;
                 }
-                slot.busy = true;
-                jobs.push(TopicJob::Separator {
-                    slot: id,
-                    thread_id,
-                    text,
-                });
-                continue;
-            }
-            if !edits {
-                continue;
-            }
-            let slot = &mut self.slots[index];
-            let new_name = (slot.applied_title.as_deref() != Some(name.as_str())).then_some(name);
-            let new_icon = icon.filter(|icon| slot.applied_icon.as_deref() != Some(icon.as_str()));
-            if new_name.is_some() || new_icon.is_some() {
-                slot.busy = true;
-                jobs.push(TopicJob::Edit {
-                    slot: id,
-                    thread_id,
-                    name: new_name,
-                    icon: new_icon,
-                });
+                let chat = view.chat;
+                let (name, icon) = wanted.clone();
+                let Some(thread_id) = view.topic_id else {
+                    view.busy = true;
+                    jobs.push(TopicJob::Create {
+                        slot: id,
+                        chat,
+                        name,
+                        icon,
+                    });
+                    continue;
+                };
+                // One call per view at a time; the separator stays pending
+                // until Telegram took it.
+                if let Some(text) = view.pending_separator.clone() {
+                    if draining.contains(&id) {
+                        continue;
+                    }
+                    view.busy = true;
+                    jobs.push(TopicJob::Separator {
+                        slot: id,
+                        chat,
+                        thread_id,
+                        text,
+                    });
+                    continue;
+                }
+                if !edits {
+                    continue;
+                }
+                let new_name =
+                    (view.applied_title.as_deref() != Some(name.as_str())).then_some(name);
+                let new_icon =
+                    icon.filter(|icon| view.applied_icon.as_deref() != Some(icon.as_str()));
+                if new_name.is_some() || new_icon.is_some() {
+                    view.busy = true;
+                    jobs.push(TopicJob::Edit {
+                        slot: id,
+                        chat,
+                        thread_id,
+                        name: new_name,
+                        icon: new_icon,
+                    });
+                }
             }
         }
         jobs
     }
 
-    pub fn topic_created(&mut self, id: SlotId, thread_id: i64, name: &str, icon: Option<&str>) {
-        let slot = &mut self.slots[id.0];
-        slot.busy = false;
-        slot.failed = None;
-        slot.topic_id = Some(thread_id);
-        slot.applied_title = Some(name.to_owned());
-        slot.applied_icon = icon.map(str::to_owned);
+    pub fn topic_created(
+        &mut self,
+        id: SlotId,
+        chat: Chat,
+        thread_id: i64,
+        name: &str,
+        icon: Option<&str>,
+    ) {
+        let Some(view) = self.slots[id.0].view_mut(chat) else {
+            return;
+        };
+        view.busy = false;
+        view.failed = None;
+        view.topic_id = Some(thread_id);
+        view.applied_title = Some(name.to_owned());
+        view.applied_icon = icon.map(str::to_owned);
         // A new topic starts with its first session: nothing to separate.
-        slot.pending_separator = None;
+        view.pending_separator = None;
         self.dirty = true;
     }
 
@@ -1628,35 +1714,40 @@ impl Registry {
     pub fn topic_edited(
         &mut self,
         id: SlotId,
+        chat: Chat,
         thread_id: i64,
         name: Option<&str>,
         icon: Option<&str>,
     ) {
-        let slot = &mut self.slots[id.0];
-        if slot.topic_id != Some(thread_id) {
+        let Some(view) = self.slots[id.0]
+            .view_mut(chat)
+            .filter(|view| view.topic_id == Some(thread_id))
+        else {
             return;
-        }
-        slot.busy = false;
-        slot.failed = None;
+        };
+        view.busy = false;
+        view.failed = None;
         if let Some(name) = name {
-            slot.applied_title = Some(name.to_owned());
+            view.applied_title = Some(name.to_owned());
         }
         if let Some(icon) = icon {
-            slot.applied_icon = Some(icon.to_owned());
+            view.applied_icon = Some(icon.to_owned());
         }
         self.dirty = true;
     }
 
     /// The separator `text` reached `thread_id`. A stale result changes nothing.
-    pub fn topic_separated(&mut self, id: SlotId, thread_id: i64, text: &str) {
-        let slot = &mut self.slots[id.0];
-        if slot.topic_id != Some(thread_id) {
+    pub fn topic_separated(&mut self, id: SlotId, chat: Chat, thread_id: i64, text: &str) {
+        let Some(view) = self.slots[id.0]
+            .view_mut(chat)
+            .filter(|view| view.topic_id == Some(thread_id))
+        else {
             return;
-        }
-        slot.busy = false;
-        slot.failed = None;
-        if slot.pending_separator.as_deref() == Some(text) {
-            slot.pending_separator = None;
+        };
+        view.busy = false;
+        view.failed = None;
+        if view.pending_separator.as_deref() == Some(text) {
+            view.pending_separator = None;
             self.dirty = true;
         }
     }
@@ -1664,43 +1755,141 @@ impl Registry {
     /// A create, edit or separator failed for another reason than a gone
     /// topic: the slot's work is not tried again until its name or icon
     /// changes or [`Registry::retry_failed`] runs.
-    pub fn topic_failed(&mut self, id: SlotId, icons: &Icons) {
+    pub fn topic_failed(&mut self, id: SlotId, chat: Chat, icons: &Icons) {
         let wanted = (
             self.desired_title(id),
             icons.for_state(self.state(id)).map(str::to_owned),
         );
-        let slot = &mut self.slots[id.0];
-        slot.busy = false;
-        slot.failed = Some(wanted);
+        if let Some(view) = self.slots[id.0].view_mut(chat) {
+            view.busy = false;
+            view.failed = Some(wanted);
+        }
     }
 
     /// Telegram says `thread_id` is gone. Only the slot still bound to that
     /// topic forgets it, once; the next [`Registry::topic_work`] creates
     /// exactly one replacement. A late report of an old topic changes
     /// nothing, not even `busy`: the replacement may be in flight.
-    pub fn topic_invalid(&mut self, id: SlotId, thread_id: i64) {
-        let slot = &mut self.slots[id.0];
-        if slot.topic_id == Some(thread_id) {
-            slot.busy = false;
-            slot.topic_id = None;
-            slot.applied_title = None;
-            slot.applied_icon = None;
-            slot.pending_separator = None;
+    pub fn topic_invalid(&mut self, id: SlotId, chat: Chat, thread_id: i64) {
+        if let Some(view) = self.slots[id.0]
+            .view_mut(chat)
+            .filter(|view| view.topic_id == Some(thread_id))
+        {
             // Its status message went with the topic.
-            slot.status = None;
-            slot.failed = None;
+            *view = View::new(chat);
             self.dirty = true;
         }
     }
 
     pub fn retry_failed(&mut self) {
-        for slot in &mut self.slots {
-            slot.failed = None;
+        for view in self.slots.iter_mut().flat_map(|slot| &mut slot.views) {
+            view.failed = None;
         }
         for block in self.blocks_mut() {
             block.failed = false;
         }
     }
+}
+
+/// Turns a version 1 `registry.json` into version 2, as JSON: a slot's
+/// topic, name, icon, separator and status message move into its group
+/// view, and the stored ids of messages (stream receipts, block messages,
+/// kept messages, Resume messages) get their chat, the group, the only one
+/// a version 1 hub knew. `None`: not the shape of a version 1 file.
+fn migrate_v1(registry: &mut serde_json::Value) -> Option<()> {
+    use serde_json::{Map, Value, json};
+    let group = || json!("group");
+    let key = |id: Value| json!({ "chat": "group", "id": id });
+    let block = |block: &mut Map<String, Value>| {
+        if let Some(thread) = block.remove("thread_id").filter(|thread| !thread.is_null()) {
+            block.insert("place".into(), json!({ "chat": "group", "thread": thread }));
+        }
+    };
+    let root = registry.as_object_mut()?;
+    for slot in root
+        .get_mut("slots")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let slot = slot.as_object_mut()?;
+        let mut view = Map::from_iter([("chat".to_owned(), group())]);
+        for field in [
+            "topic_id",
+            "applied_title",
+            "applied_icon",
+            "pending_separator",
+            "status",
+        ] {
+            if let Some(value) = slot.remove(field) {
+                view.insert(field.to_owned(), value);
+            }
+        }
+        slot.insert("views".into(), json!([view]));
+        let Some(buffer) = slot.get_mut("buffer") else {
+            continue;
+        };
+        let buffer = buffer.as_object_mut()?;
+        for parked in buffer
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            parked.as_object_mut()?.insert("chat".into(), group());
+        }
+        if let Some(resume) = buffer.get_mut("resume").and_then(Value::as_object_mut)
+            && let Some(id) = resume.remove("message_id").filter(|id| !id.is_null())
+        {
+            resume.insert("message".into(), key(id));
+        }
+    }
+    for entry in root
+        .get_mut("sessions")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|sessions| sessions.values_mut())
+    {
+        let entry = entry.as_object_mut()?;
+        if let Some(found) = entry.get_mut("block").and_then(Value::as_object_mut) {
+            block(found);
+        }
+        let Some(stream) = entry.get_mut("stream").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if let Some(receipts) = stream.get_mut("receipts").and_then(Value::as_array_mut) {
+            for receipt in receipts.iter_mut() {
+                *receipt = key(receipt.take());
+            }
+        }
+        if let Some(parts) = stream.get_mut("parts").and_then(Value::as_array_mut) {
+            for part in parts.iter_mut() {
+                let [receipt, others] = part.as_array_mut()?.as_mut_slice() else {
+                    return None;
+                };
+                *receipt = key(receipt.take());
+                for other in others.as_array_mut()? {
+                    *other = key(other.take());
+                }
+            }
+        }
+    }
+    for agent in root
+        .get_mut("subagents")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|agents| agents.values_mut())
+    {
+        if let Some(found) = agent
+            .as_object_mut()?
+            .get_mut("block")
+            .and_then(Value::as_object_mut)
+        {
+            block(found);
+        }
+    }
+    root.insert("version".into(), json!(VERSION));
+    Some(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1719,6 +1908,10 @@ pub enum LoadError {
     Invalid,
     #[error("{FILE_NAME} has version {0}, this hub reads version {VERSION}")]
     Version(u32),
+    /// The version 1 file could not be kept for a rollback; nothing is
+    /// migrated then.
+    #[error("cannot keep the version 1 {FILE_NAME} as {V1_COPY_NAME} ({0:?})")]
+    KeepV1(io::ErrorKind),
 }
 
 /// `registry.json` in the hub state directory.
@@ -1737,26 +1930,44 @@ impl RegistryStore {
 
     /// An empty registry when there is no file. A file that does not parse
     /// is an error: starting empty would create a second topic per folder.
+    /// A version 1 file (v0.1.12 and older) is migrated ([`migrate_v1`]) and
+    /// marked dirty, so the actor writes it as version 2 at once; before
+    /// that its bytes are kept as `registry.v1.json`, which a rollback to an
+    /// older hub puts back (docs/remote-hub.md).
     pub fn load(&self) -> Result<Registry, LoadError> {
         let bytes = match std::fs::read(self.dir.join(FILE_NAME)) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
             Err(error) => return Err(LoadError::Read(error.kind())),
         };
-        let mut registry: Registry =
+        let mut value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| LoadError::Invalid)?;
-        if registry.version != VERSION {
-            return Err(LoadError::Version(registry.version));
-        }
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(LoadError::Invalid)?;
+        let migrated = match version {
+            1 => {
+                migrate_v1(&mut value).ok_or(LoadError::Invalid)?;
+                true
+            }
+            2 => false,
+            other => return Err(LoadError::Version(u32::try_from(other).unwrap_or(u32::MAX))),
+        };
+        let mut registry: Registry =
+            serde_json::from_value(value).map_err(|_| LoadError::Invalid)?;
         let slots = registry.slots.len();
         let bad_slot = |slot: Option<SlotId>| slot.is_some_and(|id| id.0 >= slots);
-        let mut topic_ids = BTreeSet::new();
+        let mut topics = HashSet::new();
         let mut identities = BTreeSet::new();
         let duplicate_slot = registry.slots.iter().any(|slot| {
+            let mut chats = HashSet::new();
             !identities.insert((&slot.host, &slot.folder_key, slot.ordinal))
-                || slot
-                    .topic_id
-                    .is_some_and(|topic_id| !topic_ids.insert(topic_id))
+                || slot.views.is_empty()
+                || slot.views.iter().any(|view| {
+                    !chats.insert(view.chat)
+                        || view.place().is_some_and(|place| !topics.insert(place))
+                })
         });
         if registry.sessions.values().any(|entry| bad_slot(entry.slot))
             || registry
@@ -1772,7 +1983,12 @@ impl RegistryStore {
         registry
             .subagents
             .retain(|_, agent| !agent.block.header.is_empty());
+        if migrated {
+            self.replace(V1_COPY_TEMP_NAME, V1_COPY_NAME, &bytes)
+                .map_err(|error| LoadError::KeepV1(error.kind()))?;
+        }
         registry.after_restart();
+        registry.dirty = migrated;
         Ok(registry)
     }
 
@@ -1783,12 +1999,17 @@ impl RegistryStore {
 
     /// Temp file, fsync, rename: an interrupted save leaves the previous file.
     pub fn save(&self, bytes: &[u8]) -> io::Result<()> {
-        let temp = self.dir.join(TEMP_NAME);
+        self.replace(TEMP_NAME, FILE_NAME, bytes)
+    }
+
+    /// Writes `bytes` to `temp`, fsyncs it and renames it over `name`.
+    fn replace(&self, temp: &str, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let temp = self.dir.join(temp);
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, self.dir.join(FILE_NAME))
+        std::fs::rename(&temp, self.dir.join(name))
     }
 }
 
@@ -1877,8 +2098,10 @@ mod tests {
         let jobs = registry.topic_work(&Icons::default(), true);
         for job in &jobs {
             match job {
-                TopicJob::Create { slot, name, icon } => {
-                    registry.topic_created(*slot, *next_topic, name, icon.as_deref());
+                TopicJob::Create {
+                    slot, name, icon, ..
+                } => {
+                    registry.topic_created(*slot, Chat::Group, *next_topic, name, icon.as_deref());
                     *next_topic += 1;
                 }
                 TopicJob::Edit {
@@ -1886,12 +2109,20 @@ mod tests {
                     thread_id,
                     name,
                     icon,
-                } => registry.topic_edited(*slot, *thread_id, name.as_deref(), icon.as_deref()),
+                    ..
+                } => registry.topic_edited(
+                    *slot,
+                    Chat::Group,
+                    *thread_id,
+                    name.as_deref(),
+                    icon.as_deref(),
+                ),
                 TopicJob::Separator {
                     slot,
                     thread_id,
                     text,
-                } => registry.topic_separated(*slot, *thread_id, text),
+                    ..
+                } => registry.topic_separated(*slot, Chat::Group, *thread_id, text),
             }
         }
         jobs
@@ -2173,7 +2404,7 @@ mod tests {
             jobs,
             [BlockJob::Send {
                 key: BlockKey::Nested(N.to_owned()),
-                thread_id: 100,
+                place: Place::topic(Chat::Group, 100),
                 text: format!("⇣ nested dddddddd\n{BLOCK_RUNNING}"),
             }]
         );
@@ -2190,7 +2421,7 @@ mod tests {
             jobs,
             [BlockJob::Edit {
                 key: BlockKey::Nested(N.to_owned()),
-                message_id: 500,
+                message: MessageKey::new(Chat::Group, 500),
                 text: format!("⇣ nested dddddddd\n{BLOCK_LOST}"),
             }]
         );
@@ -2236,7 +2467,7 @@ mod tests {
             jobs,
             [BlockJob::Edit {
                 key: BlockKey::Agent("a1".into()),
-                message_id: 500,
+                message: MessageKey::new(Chat::Group, 500),
                 text: "↳ Explore a1\ndone".into(),
             }]
         );
@@ -2250,7 +2481,7 @@ mod tests {
             jobs,
             [BlockJob::Edit {
                 key: BlockKey::Agent("a2".into()),
-                message_id: 501,
+                message: MessageKey::new(Chat::Group, 501),
                 text: format!("↳ Explore a2\n{BLOCK_LOST}"),
             }]
         );
@@ -2274,7 +2505,7 @@ mod tests {
 
     fn notice(reply_to: i64, text: &str) -> BlockNotice {
         BlockNotice {
-            thread_id: 100,
+            place: Place::topic(Chat::Group, 100),
             reply_to,
             text: text.to_owned(),
         }
@@ -2498,10 +2729,11 @@ mod tests {
         settle(&mut registry, &mut topic);
         registry.confirm_subagent("a1", A, "↳ Explore a1".into());
         settle_blocks(&mut registry, &mut message);
-        assert_eq!(registry.subagent_of_message(100, 500, A), Some("a1"));
-        assert_eq!(registry.subagent_of_message(100, 500, B), None);
-        assert_eq!(registry.subagent_of_message(101, 500, A), None);
-        assert_eq!(registry.subagent_of_message(100, 501, A), None);
+        let topic = |id| Place::topic(Chat::Group, id);
+        assert_eq!(registry.subagent_of_message(topic(100), 500, A), Some("a1"));
+        assert_eq!(registry.subagent_of_message(topic(100), 500, B), None);
+        assert_eq!(registry.subagent_of_message(topic(101), 500, A), None);
+        assert_eq!(registry.subagent_of_message(topic(100), 501, A), None);
     }
 
     #[test]
@@ -2981,6 +3213,7 @@ mod tests {
             jobs,
             [TopicJob::Edit {
                 slot: id,
+                chat: Chat::Group,
                 thread_id: 100,
                 name: None,
                 icon: Some(ICON_DEAD.to_owned())
@@ -3033,17 +3266,17 @@ mod tests {
         registry.apply_hook(&start(B, CWD, Some(11), None));
         settle(&mut registry, &mut topic); // topics 100 and 101
         let id = slot_of(&registry, A).unwrap();
-        registry.topic_invalid(id, 100);
-        registry.topic_invalid(id, 100); // a second failure report of the same topic
+        registry.topic_invalid(id, Chat::Group, 100);
+        registry.topic_invalid(id, Chat::Group, 100); // a second failure report of the same topic
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(creates(&jobs), 1);
-        registry.topic_created(id, 200, "x", None);
-        registry.topic_invalid(id, 100); // late report of the old topic
-        assert_eq!(registry.slots[id.0].topic_id, Some(200));
+        registry.topic_created(id, Chat::Group, 200, "x", None);
+        registry.topic_invalid(id, Chat::Group, 100); // late report of the old topic
+        assert_eq!(registry.slots[id.0].views[0].topic_id, Some(200));
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 0);
         // The other slot keeps its topic.
         assert_eq!(
-            registry.slots[slot_of(&registry, B).unwrap().0].topic_id,
+            registry.slots[slot_of(&registry, B).unwrap().0].views[0].topic_id,
             Some(101)
         );
     }
@@ -3060,22 +3293,22 @@ mod tests {
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(jobs.len(), 1, "one call per slot: {jobs:?}");
         assert_eq!(separators(&jobs).len(), 1);
-        registry.topic_invalid(id, 100);
+        registry.topic_invalid(id, Chat::Group, 100);
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(creates(&jobs), 1);
         // Late reports about topic 100 while the replacement is in flight.
-        registry.topic_invalid(id, 100);
-        registry.topic_edited(id, 100, Some("x"), None);
-        registry.topic_separated(id, 100, "x");
-        assert!(registry.slots[id.0].busy);
+        registry.topic_invalid(id, Chat::Group, 100);
+        registry.topic_edited(id, Chat::Group, 100, Some("x"), None);
+        registry.topic_separated(id, Chat::Group, 100, "x");
+        assert!(registry.slots[id.0].views[0].busy);
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
-        registry.topic_created(id, 200, "y", None);
+        registry.topic_created(id, Chat::Group, 200, "y", None);
         let mut total = 1;
         for _ in 0..3 {
             total += creates(&settle(&mut registry, &mut topic));
         }
         assert_eq!(total, 1);
-        assert_eq!(registry.slots[id.0].topic_id, Some(200));
+        assert_eq!(registry.slots[id.0].views[0].topic_id, Some(200));
     }
 
     #[test]
@@ -3094,22 +3327,22 @@ mod tests {
         assert_eq!(jobs.len(), 1, "the edit waits for the separator: {jobs:?}");
         // In flight, it is still what a save writes.
         assert_eq!(
-            registry.slots[id.0].pending_separator.as_deref(),
+            registry.slots[id.0].views[0].pending_separator.as_deref(),
             Some(text)
         );
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         // Refused: kept, not repeated until the retry.
-        registry.topic_failed(id, &Icons::default());
+        registry.topic_failed(id, Chat::Group, &Icons::default());
         assert_eq!(
-            registry.slots[id.0].pending_separator.as_deref(),
+            registry.slots[id.0].views[0].pending_separator.as_deref(),
             Some(text)
         );
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         registry.retry_failed();
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(separators(&jobs), [text]);
-        registry.topic_separated(id, 100, text);
-        assert_eq!(registry.slots[id.0].pending_separator, None);
+        registry.topic_separated(id, Chat::Group, 100, text);
+        assert_eq!(registry.slots[id.0].views[0].pending_separator, None);
         let jobs = registry.topic_work(&Icons::default(), true);
         assert!(separators(&jobs).is_empty());
         assert!(
@@ -3129,7 +3362,7 @@ mod tests {
             registry.topic_work(&Icons::default(), true).is_empty(),
             "busy"
         );
-        registry.topic_failed(slot, &Icons::default());
+        registry.topic_failed(slot, Chat::Group, &Icons::default());
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         registry.retry_failed();
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
@@ -3252,7 +3485,7 @@ mod tests {
         assert!(loaded.recent_starts.is_empty(), "never saved");
         loaded.recent_starts.clone_from(&registry.recent_starts);
         assert_eq!(loaded, registry);
-        assert_eq!(loaded.slots[0].topic_id, Some(100));
+        assert_eq!(loaded.slots[0].views[0].topic_id, Some(100));
 
         store
             .save(&RegistryStore::encode(&Registry::default()))
@@ -3269,12 +3502,12 @@ mod tests {
         registry.apply_hook(&start(A, CWD, Some(10), None));
         registry.agent_connected(A, 3);
         registry.set_waiting(A, true);
-        registry.slots[0].busy = true;
+        registry.slots[0].views[0].busy = true;
         store.save(&RegistryStore::encode(&registry)).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.sessions[A].agent, None);
         assert!(!loaded.sessions[A].waiting);
-        assert!(!loaded.slots[0].busy);
+        assert!(!loaded.slots[0].views[0].busy);
         assert_eq!(loaded.state(SlotId(0)), SlotState::NoChannel);
     }
 
@@ -3302,6 +3535,7 @@ mod tests {
         let buffer = &mut registry.slots[0].buffer;
         buffer.push(
             Parked {
+                chat: Chat::Group,
                 message_id: 5,
                 thread_id: 100,
                 text: "kept".into(),
@@ -3317,7 +3551,7 @@ mod tests {
         buffer.resume = Some(ResumeNote {
             session: A.into(),
             number: 1,
-            message_id: Some(900),
+            message: Some(MessageKey::new(Chat::Group, 900)),
         });
         store.save(&RegistryStore::encode(&registry)).unwrap();
         let loaded = store.load().unwrap();
@@ -3341,8 +3575,8 @@ mod tests {
         let error = store.load().unwrap_err();
         assert!(matches!(error, LoadError::Invalid));
         assert!(!error.to_string().contains("private-name"));
-        std::fs::write(dir.path().join(FILE_NAME), b"{\"version\":2}").unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Version(2))));
+        std::fs::write(dir.path().join(FILE_NAME), b"{\"version\":3}").unwrap();
+        assert!(matches!(store.load(), Err(LoadError::Version(3))));
         std::fs::write(
             dir.path().join(FILE_NAME),
             b"{\"version\":1,\"sessions\":{\"s\":{\"host\":\"h\",\"kind\":{\"kind\":\"top_level\"},\"slot\":3}}}",
@@ -3358,14 +3592,206 @@ mod tests {
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, CWD, Some(10), None));
         registry.apply_hook(&start(B, CWD, Some(11), None));
-        registry.slots[0].topic_id = Some(100);
-        registry.slots[1].topic_id = Some(100);
+        registry.slots[0].views[0].topic_id = Some(100);
+        registry.slots[1].views[0].topic_id = Some(100);
         store.save(&RegistryStore::encode(&registry)).unwrap();
         assert!(matches!(store.load(), Err(LoadError::Invalid)));
 
-        registry.slots[1].topic_id = Some(101);
+        registry.slots[1].views[0].topic_id = Some(101);
         registry.slots[1].ordinal = registry.slots[0].ordinal;
         store.save(&RegistryStore::encode(&registry)).unwrap();
         assert!(matches!(store.load(), Err(LoadError::Invalid)));
+    }
+
+    /// The `registry.json` the v0.1.12 encoder wrote for a registry that
+    /// uses every stored topic and message id (TASK-061 planner, generated on
+    /// main b0457d0).
+    const V1: &str = include_str!("../../tests/fixtures/registry-v0.1.12.json");
+
+    /// TASK-061: a v0.1.12 file loads into group views and group message
+    /// keys, is marked for saving, saves as version 2 without the old keys
+    /// and loads again unchanged.
+    #[test]
+    fn a_v0_1_12_registry_migrates_into_group_views() {
+        let dir = TempDir::new("registry-v1");
+        std::fs::write(dir.path().join(FILE_NAME), V1).unwrap();
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.dirty, "written as version 2 at once");
+        // The old file stays, byte for byte, for a rollback.
+        let copy = dir.path().join(V1_COPY_NAME);
+        assert_eq!(std::fs::read(&copy).unwrap(), V1.as_bytes());
+        assert!(!dir.path().join(V1_COPY_TEMP_NAME).exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(FILE_NAME)).unwrap(),
+            V1.as_bytes()
+        );
+        assert_eq!(loaded.version, 2);
+        let group = |id| MessageKey::new(Chat::Group, id);
+        let topic = |id| Place::topic(Chat::Group, id);
+
+        let views = &loaded.slots[0].views;
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert_eq!(view.chat, Chat::Group);
+        assert_eq!(view.place(), Some(topic(100)));
+        assert_eq!(
+            view.applied_title.as_deref(),
+            Some("[box] Project · aaaaaaaa")
+        );
+        assert_eq!(view.applied_icon.as_deref(), Some(ICON_NO_CHANNEL));
+        assert_eq!(view.status_message(), Some(group(500)));
+        assert!(view.status.is_some_and(|status| status.pinned));
+        assert_eq!(view.pending_separator, None);
+        let second = &loaded.slots[1].views[0];
+        assert_eq!(second.place(), Some(topic(101)));
+        assert_eq!(
+            second.pending_separator.as_deref(),
+            Some("── session bbbbbbbb · resumed ──")
+        );
+        assert_eq!(loaded.slots[2].views, [View::new(Chat::Group)]);
+        assert_eq!(loaded.place(SlotId(1)), Some(topic(101)));
+        assert_eq!(loaded.slot_by_topic(topic(101)), Some(SlotId(1)));
+
+        let buffer = &loaded.slots[0].buffer;
+        assert_eq!(buffer.messages.len(), 2);
+        assert_eq!(buffer.messages[0].key(), group(7));
+        assert_eq!(buffer.messages[0].place(), topic(100));
+        assert_eq!(buffer.messages[0].reply_to, Some(6));
+        assert!(buffer.messages[1].file.is_some());
+        assert!(buffer.queued_told);
+        let resume = buffer.resume.as_ref().unwrap();
+        assert_eq!((resume.number, resume.message), (1, Some(group(900))));
+
+        let stream = loaded.sessions[A].stream.as_ref().unwrap();
+        assert_eq!(stream.offset, Some(4096));
+        assert_eq!(stream.calls.len(), 1);
+        assert_eq!(stream.receipts, [group(5), group(8)]);
+        assert_eq!(stream.parts, [(group(8), vec![group(6), group(7)])]);
+        let nested = loaded.sessions["dddddddd-0000-4000-8000-000000000009"]
+            .block
+            .as_ref()
+            .unwrap();
+        assert_eq!(nested.place, Some(topic(100)));
+        assert_eq!(nested.message(), Some(group(502)));
+        let agent = &loaded.subagents["a1"].block;
+        assert_eq!(agent.message(), Some(group(501)));
+        assert_eq!(agent.pending.as_deref(), Some("↳ Explore a1: look\ndone"));
+        assert_eq!(loaded.subagent_of_message(topic(100), 501, A), Some("a1"));
+        assert_eq!(loaded.pids.len(), 4);
+
+        store.save(&RegistryStore::encode(&loaded)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["version"], 2);
+        for old in [
+            "topic_id",
+            "applied_title",
+            "applied_icon",
+            "pending_separator",
+            "status",
+        ] {
+            assert!(value["slots"][0].get(old).is_none(), "{old} left the slot");
+        }
+        assert_eq!(value["slots"][0]["views"][0]["chat"], "group");
+        assert!(
+            value["subagents"]["a1"]["block"].get("thread_id").is_none(),
+            "{text}"
+        );
+        std::fs::remove_file(&copy).unwrap();
+        let again = store.load().unwrap();
+        assert!(!again.dirty, "a version 2 file is not written again");
+        assert!(!copy.exists(), "only a version 1 file is kept");
+        assert_eq!(again.slots, loaded.slots);
+        assert_eq!(again.sessions, loaded.sessions);
+        assert_eq!(again.subagents, loaded.subagents);
+    }
+
+    /// A version 1 file of another shape is refused, never half migrated;
+    /// so is a slot without a view or with two views of one chat.
+    #[test]
+    fn a_broken_old_file_or_a_slot_without_one_view_per_chat_is_refused() {
+        let dir = TempDir::new("registry-v1-broken");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        // A checkout with core.autocrlf gives the fixture CRLF line ends.
+        let v1 = V1.replace("\r\n", "\n");
+        let parts = v1.replacen("[\n            8,\n            [", "[\n            [", 1);
+        assert_ne!(parts, v1);
+        for text in [parts, v1.replacen("\"slots\": [", "\"slots\": [7, ", 1)] {
+            std::fs::write(dir.path().join(FILE_NAME), text).unwrap();
+            assert!(matches!(store.load(), Err(LoadError::Invalid)));
+        }
+        assert!(
+            !dir.path().join(V1_COPY_NAME).exists(),
+            "a file that is not migrated is not kept"
+        );
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.slots[0].views.clear();
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        assert!(matches!(store.load(), Err(LoadError::Invalid)));
+        registry.slots[0].views = vec![View::new(Chat::Group), View::new(Chat::Group)];
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        assert!(matches!(store.load(), Err(LoadError::Invalid)));
+    }
+
+    /// TASK-061: a version 1 file that cannot be kept for a rollback is not
+    /// migrated: the hub does not start, `registry.json` stays as it was.
+    #[test]
+    fn a_v1_file_that_cannot_be_kept_is_not_migrated() {
+        let dir = TempDir::new("registry-v1-keep");
+        std::fs::write(dir.path().join(FILE_NAME), V1).unwrap();
+        // A folder in the copy's place: the rename onto it fails everywhere.
+        std::fs::create_dir_all(dir.path().join(V1_COPY_NAME).join("x")).unwrap();
+        let store = RegistryStore::open(dir.path()).unwrap();
+        assert!(matches!(store.load(), Err(LoadError::KeepV1(_))));
+        assert_eq!(
+            std::fs::read(dir.path().join(FILE_NAME)).unwrap(),
+            V1.as_bytes()
+        );
+        // The next start, with the way cleared, migrates and keeps the copy.
+        std::fs::remove_dir_all(dir.path().join(V1_COPY_NAME)).unwrap();
+        assert!(store.load().unwrap().dirty);
+        assert_eq!(
+            std::fs::read(dir.path().join(V1_COPY_NAME)).unwrap(),
+            V1.as_bytes()
+        );
+    }
+
+    /// TASK-061: topic ids are numbered per chat. The same id in the group
+    /// and in a private chat is two topics: each finds its own slot, both
+    /// load, and a topic result of one chat never touches the other's view.
+    #[test]
+    fn one_topic_id_in_two_chats_is_two_topics() {
+        use crate::hub::chat::PrivateChat;
+        let private = Chat::Private(PrivateChat::of_user(7_319_402_518));
+        let dir = TempDir::new("registry-two-chats");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(B, CWD, Some(11), None));
+        registry.slots[1].views.push(View::new(private));
+        registry.topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        registry.topic_created(SlotId(1), private, 100, "b", None);
+        assert_eq!(
+            registry.slot_by_topic(Place::topic(Chat::Group, 100)),
+            Some(SlotId(0))
+        );
+        assert_eq!(
+            registry.slot_by_topic(Place::topic(private, 100)),
+            Some(SlotId(1))
+        );
+        assert_eq!(registry.slot_by_topic(Place::new(private, None)), None);
+        // A gone report of the private topic 100 leaves the group's alone.
+        registry.topic_invalid(SlotId(0), private, 100);
+        assert_eq!(registry.slots[0].views[0].topic_id, Some(100));
+        registry.topic_invalid(SlotId(1), Chat::Group, 100);
+        assert_eq!(registry.slots[1].views[1].topic_id, Some(100));
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.slots[1].views[1].place(),
+            Some(Place::topic(private, 100))
+        );
     }
 }

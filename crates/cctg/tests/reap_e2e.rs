@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress;
 use cctg::hub::registry::{Registry, RegistryStore, SlotId};
 use cctg::wire::{HookEvent, HookPost, Secret};
@@ -105,7 +106,7 @@ async fn a_start_after_a_killed_session_takes_its_topic() {
     registry.apply_hook(&post("box", LIVE, "/work/other", Some(live_pid)));
     registry.apply_hook(&post("far", FAR, &folder, Some(dead_pid)));
     registry.apply_hook(&post("box", NO_PID, "/work/third", None));
-    registry.topic_created(SlotId(0), 100, "project", None);
+    registry.topic_created(SlotId(0), Chat::Group, 100, "project", None);
     // Saved and loaded: the starts are older than any grace.
     let store = RegistryStore::open(&root).unwrap();
     store.save(&RegistryStore::encode(&registry)).unwrap();
@@ -185,6 +186,6 @@ async fn a_start_after_a_killed_session_takes_its_topic() {
     let slot = registry.sessions[NEXT].slot.expect("a slot");
     assert_eq!(slot, SlotId(0), "the killed session's topic");
     assert_eq!(registry.slots[slot.0].ordinal, 1);
-    assert_eq!(registry.slots[slot.0].topic_id, Some(100));
+    assert_eq!(registry.slots[slot.0].views[0].topic_id, Some(100));
     assert!(registry.slots.iter().all(|slot| slot.ordinal == 1), "no #2");
 }

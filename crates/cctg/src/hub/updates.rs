@@ -1,6 +1,7 @@
 //! Inbound side: long polling, allowlist gate, service-message classification.
 //!
 //! `Routed` values carry no Telegram user id, so nothing downstream can log one.
+//! A private chat is a [`Chat::Private`], whose id never prints.
 
 use std::future::Future;
 use std::io;
@@ -10,8 +11,9 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::api::{ApiError, BotApi, FileInfo, Message, Update, User};
+use super::api::{ApiError, BotApi, FileInfo, Message, MessageChat, Update, User};
 use super::buffer::Attachment;
+use super::chat::{Chat, MessageKey, Place, PrivateChat};
 use super::config::Allowlist;
 use super::offset::OffsetStore;
 use super::registry::cut;
@@ -28,7 +30,8 @@ const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::f
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Routed {
-    /// A message from an allowlisted user in the configured chat.
+    /// A message from an allowlisted user in the group (or, once private
+    /// chats are on, in an allowlisted user's private chat).
     Input(Inbound),
     /// A button press from an allowlisted user.
     Callback(CallbackInput),
@@ -39,6 +42,8 @@ pub enum Routed {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inbound {
+    /// The chat of the message: every id here is one of this chat.
+    pub chat: Chat,
     pub message_id: i64,
     /// `None` for the General topic.
     pub thread_id: Option<i64>,
@@ -131,6 +136,8 @@ fn media(message: &mut Message) -> Option<Media> {
 pub struct CallbackInput {
     pub query_id: String,
     pub data: Option<String>,
+    /// The chat of the pressed message; `None` when Telegram did not say.
+    pub chat: Option<Chat>,
     pub message_id: Option<i64>,
     /// The topic of the pressed message, as [`Inbound::thread_id`]: `None`
     /// in General or when Telegram did not say.
@@ -169,6 +176,7 @@ pub fn author_name(from: &User) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceMessage {
+    pub chat: Chat,
     pub kind: ServiceKind,
     pub message_id: i64,
     pub thread_id: Option<i64>,
@@ -192,8 +200,12 @@ pub enum Ignored {
     NotAllowed,
     /// No `from` (channel posts and similar).
     NoSender,
-    /// Another chat than the configured supergroup.
+    /// Another chat than the configured supergroup or an allowlisted user's
+    /// private chat.
     OtherChat,
+    /// An allowlisted user's private chat: recognised, not served yet
+    /// (TASK-061; the private view comes with TASK-063).
+    PrivateChat,
     /// An update type the hub does not handle.
     Unsupported,
     /// The update did not match the expected shape.
@@ -217,15 +229,27 @@ fn service_kind(message: &Message) -> Option<ServiceKind> {
     }
 }
 
+/// The chat of a message: the group `chat_id`, or the private chat of an
+/// allowlisted user (a private chat's id is its user's id). Anything else is
+/// no chat of the hub.
+fn chat_of(chat: &MessageChat, chat_id: i64, allowlist: &Allowlist) -> Option<Chat> {
+    if chat.id == chat_id {
+        return Some(Chat::Group);
+    }
+    (chat.kind == "private" && allowlist.contains(chat.id))
+        .then(|| Chat::Private(PrivateChat::of_user(chat.id)))
+}
+
 /// Classifies one parsed update. Service messages are recognised before the
 /// allowlist check because the bot itself is their sender.
 pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
     if let Some(mut message) = update.message {
-        if message.chat.id != chat_id {
+        let Some(chat) = chat_of(&message.chat, chat_id, allowlist) else {
             return Routed::Ignored(Ignored::OtherChat);
-        }
+        };
         if let Some(kind) = service_kind(&message) {
             return Routed::Service(ServiceMessage {
+                chat,
                 kind,
                 message_id: message.message_id,
                 thread_id: message.message_thread_id,
@@ -255,6 +279,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
                 .map(|text| cut(&text, QUOTE_LIMIT))
         });
         return Routed::Input(Inbound {
+            chat,
             message_id: message.message_id,
             thread_id,
             text: message.text,
@@ -267,13 +292,13 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
     }
 
     if let Some(query) = update.callback_query {
-        if query
-            .message
-            .as_ref()
-            .is_some_and(|message| message.chat.id != chat_id)
-        {
-            return Routed::Ignored(Ignored::OtherChat);
-        }
+        let chat = match &query.message {
+            Some(message) => match chat_of(&message.chat, chat_id, allowlist) {
+                Some(chat) => Some(chat),
+                None => return Routed::Ignored(Ignored::OtherChat),
+            },
+            None => None,
+        };
         let Some(from) = query.from else {
             return Routed::Ignored(Ignored::NoSender);
         };
@@ -288,6 +313,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         return Routed::Callback(CallbackInput {
             query_id: query.id,
             data: query.data,
+            chat,
             message_id: query.message.map(|message| message.message_id),
             thread_id,
             from_name: author_name(&from).filter(|_| allowlist.is_team()),
@@ -295,6 +321,45 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
     }
 
     Routed::Ignored(Ignored::Unsupported)
+}
+
+/// Private chats are recognised but not served yet (TASK-063 serves them):
+/// everything from one is ignored, as before TASK-061.
+fn group_only(routed: Routed) -> Routed {
+    let private = match &routed {
+        Routed::Input(input) => input.chat.is_private(),
+        Routed::Callback(input) => input.chat.is_some_and(Chat::is_private),
+        Routed::Service(service) => service.chat.is_private(),
+        Routed::Ignored(_) => false,
+    };
+    if private {
+        Routed::Ignored(Ignored::PrivateChat)
+    } else {
+        routed
+    }
+}
+
+impl Inbound {
+    /// Where the message was written.
+    pub fn place(&self) -> Place {
+        Place::new(self.chat, self.thread_id)
+    }
+
+    pub fn key(&self) -> MessageKey {
+        MessageKey::new(self.chat, self.message_id)
+    }
+}
+
+impl CallbackInput {
+    /// The pressed message, when Telegram named it.
+    pub fn message(&self) -> Option<MessageKey> {
+        Some(MessageKey::new(self.chat?, self.message_id?))
+    }
+
+    /// The topic of the pressed message, when Telegram named it.
+    pub fn topic(&self) -> Option<Place> {
+        Some(Place::topic(self.chat?, self.thread_id?))
+    }
 }
 
 /// Routes a raw `getUpdates` batch. Returns the next offset and the routed
@@ -318,7 +383,7 @@ pub fn route_batch(
             highest = Some(highest.map_or(id, |current| current.max(id)));
         }
         let item = match serde_json::from_value::<Update>(value) {
-            Ok(update) => classify(update, chat_id, allowlist),
+            Ok(update) => group_only(classify(update, chat_id, allowlist)),
             Err(_) => Routed::Ignored(Ignored::Malformed),
         };
         match &item {
@@ -505,6 +570,7 @@ mod tests {
         assert_eq!(
             ok,
             Routed::Input(Inbound {
+                chat: Chat::Group,
                 message_id: 10,
                 thread_id: Some(7),
                 text: Some("hi".to_owned()),
@@ -535,6 +601,7 @@ mod tests {
         assert_eq!(
             route_one(callback(ALLOWED)),
             Routed::Callback(CallbackInput {
+                chat: Some(Chat::Group),
                 query_id: "q1".to_owned(),
                 data: Some("allow:abcde".to_owned()),
                 message_id: Some(10),
@@ -839,6 +906,59 @@ mod tests {
         );
     }
 
+    /// TASK-061: a private chat of an allowlisted user is recognised (its
+    /// chat id is the user id) but ignored until TASK-063 serves it; another
+    /// user's private chat is no chat of the hub.
+    #[test]
+    fn a_private_chat_is_known_but_not_served_yet() {
+        let private = |from: i64, extra: Value| {
+            let mut message = message(from, extra);
+            message["chat"] = json!({ "id": from, "type": "private", "first_name": "x" });
+            message
+        };
+        let text = private(ALLOWED, json!({ "text": "hi" }));
+        let classified = classify(
+            serde_json::from_value(json!({ "update_id": 1, "message": text.clone() })).unwrap(),
+            CHAT,
+            &allowlist(),
+        );
+        let Routed::Input(input) = &classified else {
+            panic!("{classified:?}");
+        };
+        assert_eq!(input.chat, Chat::Private(PrivateChat::of_user(ALLOWED)));
+        assert_eq!(input.key(), MessageKey::new(input.chat, 10));
+        assert!(!format!("{classified:?}").contains(&ALLOWED.to_string()));
+        assert_eq!(
+            route_one(json!({ "update_id": 1, "message": text })),
+            Routed::Ignored(Ignored::PrivateChat)
+        );
+        let press = json!({ "update_id": 2, "callback_query": {
+            "id": "q1", "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
+            "chat_instance": "c", "data": "allow:abcde",
+            "message": private(ALLOWED, json!({ "text": "prompt" })),
+        }});
+        assert_eq!(route_one(press), Routed::Ignored(Ignored::PrivateChat));
+        // The bot edits a topic of the owner's private chat.
+        let mut service = private(ALLOWED, json!({ "forum_topic_edited": {} }));
+        service["from"]["id"] = json!(BOT);
+        assert_eq!(
+            route_one(json!({ "update_id": 3, "message": service })),
+            Routed::Ignored(Ignored::PrivateChat)
+        );
+        let stranger = private(STRANGER, json!({ "text": "hi" }));
+        assert_eq!(
+            route_one(json!({ "update_id": 4, "message": stranger })),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+        // A group whose id happens to be an allowlisted user's is no private chat.
+        let mut group = message(ALLOWED, json!({ "text": "hi" }));
+        group["chat"]["id"] = json!(ALLOWED);
+        assert_eq!(
+            route_one(json!({ "update_id": 5, "message": group })),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+    }
+
     #[test]
     fn forum_service_messages_are_never_input() {
         let cases = [
@@ -872,6 +992,7 @@ mod tests {
                 assert_eq!(
                     route_one(update),
                     Routed::Service(ServiceMessage {
+                        chat: Chat::Group,
                         kind,
                         message_id: 10,
                         thread_id: Some(7),

@@ -5,8 +5,8 @@
 //! line per tool call once its result is in, plus the assistant's visible
 //! thinking, cut short. The final answer of a turn is not part of it: the hub
 //! sends it from the `Stop` hook. Calls of cctg's own `reply` tool are not
-//! shown. Telegram messages taken into work are reported by their
-//! `message_id`, never by their text. A `!` command typed in the terminal
+//! shown. Telegram messages taken into work are reported by their place
+//! (`group` or `private`) and `message_id`, never by their text. A `!` command typed in the terminal
 //! shows as a prompt `! command`, and its output, like the output of a local
 //! slash command (`/cost`, `/model`), as a short code block (TASK-043).
 
@@ -23,9 +23,12 @@ pub enum StreamEvent {
     /// A prompt typed in the terminal or a slash command, shown as `/brief`
     /// shows it (without the `> `).
     Prompt(String),
-    /// A Telegram message went into the session: the `message_id` attribute of
-    /// its `<channel ...>` tag.
-    Channel { message_id: i64 },
+    /// A Telegram message went into the session: the `place` and
+    /// `message_id` attributes of its `<channel ...>` tag.
+    Channel {
+        place: ChannelPlace,
+        message_id: i64,
+    },
     /// Assistant text written before a tool call (`stop_reason: tool_use`),
     /// or Claude Code's `[Request interrupted by user...]` line.
     Note(String),
@@ -41,6 +44,16 @@ pub enum StreamEvent {
     /// Assistant text that ends a turn (`stop_reason` set and not
     /// `tool_use`). Its text is not carried: the `Stop` hook sends it.
     TurnEnd,
+}
+
+/// The chat a Telegram message came from, as the hub tells the session
+/// (`place` meta, TASK-061); message ids are numbered per chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPlace {
+    /// The forum group; also a tag without `place` (hub v0.1.12 and older).
+    Group,
+    /// The private chat of the session's owner.
+    Private,
 }
 
 /// The `source` of cctg's channel tags: the server name cctg is registered
@@ -88,8 +101,8 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
     if line.is_empty() {
         return Vec::new();
     }
-    if let Some(message_id) = queued_channel(line) {
-        return vec![StreamEvent::Channel { message_id }];
+    if let Some((place, message_id)) = queued_channel(line) {
+        return vec![StreamEvent::Channel { place, message_id }];
     }
     if let Some(event) = local_command(line) {
         return event.into_iter().collect();
@@ -106,8 +119,8 @@ pub fn stream_events(line: &str) -> Vec<StreamEvent> {
     for block in &turn.blocks {
         match (turn.role, block) {
             (Role::User, Block::Text(text)) if turn.is_meta => {
-                if let Some(message_id) = channel_message_id(text) {
-                    events.push(StreamEvent::Channel { message_id });
+                if let Some((place, message_id)) = channel_message(text) {
+                    events.push(StreamEvent::Channel { place, message_id });
                 }
             }
             (Role::User, Block::Text(text)) => {
@@ -323,27 +336,34 @@ fn cut(text: &str, limit: usize) -> String {
 /// A channel message queued while a turn ran reaches Claude as a
 /// `queued_command` attachment (the shape Claude Code uses for other queued
 /// prompts; not yet seen for a channel message).
-fn queued_channel(line: &str) -> Option<i64> {
+fn queued_channel(line: &str) -> Option<(ChannelPlace, i64)> {
     let record: RawAttachmentRecord = serde_json::from_str(line).ok()?;
     if record.kind != "attachment"
         || record.attachment.get("type").and_then(Value::as_str) != Some("queued_command")
     {
         return None;
     }
-    channel_message_id(record.attachment.get("prompt")?.as_str()?)
+    channel_message(record.attachment.get("prompt")?.as_str()?)
 }
 
-/// `message_id` of a `<channel source="cctg" ...>` opening tag, when it is
-/// all digits. Another channel server's tag never counts, whatever its ids.
-fn channel_message_id(text: &str) -> Option<i64> {
+/// `place` and `message_id` of a `<channel source="cctg" ...>` opening tag,
+/// when the id is all digits. No `place` is the group (older hubs sent
+/// `chat_id`); a place this crate does not know matches nothing. Another
+/// channel server's tag never counts, whatever its ids.
+fn channel_message(text: &str) -> Option<(ChannelPlace, i64)> {
     if channel_attribute(text, "source")? != SOURCE {
         return None;
     }
+    let place = match channel_attribute(text, "place") {
+        None | Some("group") => ChannelPlace::Group,
+        Some("private") => ChannelPlace::Private,
+        Some(_) => return None,
+    };
     let id = channel_attribute(text, "message_id")?;
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    id.parse().ok()
+    Some((place, id.parse().ok()?))
 }
 
 /// The value of attribute `name` of the `<channel ...>` tag that starts

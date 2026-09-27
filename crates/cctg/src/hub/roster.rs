@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use super::chat::{Chat, MessageKey};
 use super::config::PublicAddrs;
 use super::devices::{CODE_TTL, Devices, Listed, MAX_CODES, MintError, SharedState, code_key};
 use super::scheduler::{Op, Outbox, Outcome};
@@ -256,7 +257,7 @@ pub async fn serve(
     let mut spent = devices.spent();
     // Code key -> the `/join` message and when its code expires. At most
     // MAX_CODES: minting refuses beyond that.
-    let mut waiting: HashMap<String, (i64, Instant)> = HashMap::new();
+    let mut waiting: HashMap<String, (MessageKey, Instant)> = HashMap::new();
     let mut inputs_open = true;
     let mut spent_open = true;
     while inputs_open || !waiting.is_empty() {
@@ -269,19 +270,15 @@ pub async fn serve(
                         continue;
                     }
                     if command_name(&input) == Some("join") {
-                        if let Some((key, message_id)) = on_join(&outbox, &devices, &join).await {
-                            waiting.insert(key, (message_id, Instant::now() + CODE_TTL));
+                        if let Some((key, message)) = on_join(&outbox, &devices, &join, input.chat).await {
+                            waiting.insert(key, (message, Instant::now() + CODE_TTL));
                         }
                         continue;
                     }
                     let (text, keyboard) = list(&devices, None);
                     submit(
                         &outbox,
-                        Op::Send {
-                            thread_id: None,
-                            text,
-                            html: None,
-                            reply_markup: keyboard,
+                        Op::Send { chat: input.chat, thread_id: None, text, html: None, reply_markup: keyboard,
                             permission: false,
                             reply_to: None,
                             notify: false,
@@ -293,9 +290,9 @@ pub async fn serve(
             },
             used = spent.recv(), if spent_open => match used {
                 Ok(used) => {
-                    if let Some((message_id, _)) = waiting.remove(&used.key) {
+                    if let Some((message, _)) = waiting.remove(&used.key) {
                         info!(device_id = used.id, "join message marked used");
-                        edit(&outbox, message_id, used_text(&used.id, &used.name)).await;
+                        edit(&outbox, message, used_text(&used.id, &used.name)).await;
                     }
                 }
                 // Missed ones get the expiry edit.
@@ -310,8 +307,8 @@ pub async fn serve(
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in due {
-                    if let Some((message_id, _)) = waiting.remove(&key) {
-                        edit(&outbox, message_id, EXPIRED.to_owned()).await;
+                    if let Some((message, _)) = waiting.remove(&key) {
+                        edit(&outbox, message, EXPIRED.to_owned()).await;
                     }
                 }
             }
@@ -319,11 +316,12 @@ pub async fn serve(
     }
 }
 
-async fn edit(outbox: &Outbox, message_id: i64, text: String) {
+async fn edit(outbox: &Outbox, message: MessageKey, text: String) {
     submit(
         outbox,
         Op::Edit {
-            message_id,
+            chat: message.chat,
+            message_id: message.id,
             text,
             reply_markup: None,
             background: false,
@@ -341,10 +339,15 @@ fn addressed_elsewhere(text: Option<&str>, bot: Option<&str>) -> bool {
     matches!((target, bot), (Some(target), Some(bot)) if !target.eq_ignore_ascii_case(bot))
 }
 
-/// `/join`: a new code in a new message; `Some((code key, message id))`
+/// `/join`: a new code in a new message of `chat`; `Some((code key, message))`
 /// when the line went out ([`serve`] edits the message later). A failed
 /// mint is answered with why, never with a line.
-async fn on_join(outbox: &Outbox, devices: &Devices, join: &JoinInfo) -> Option<(String, i64)> {
+async fn on_join(
+    outbox: &Outbox,
+    devices: &Devices,
+    join: &JoinInfo,
+    chat: Chat,
+) -> Option<(String, MessageKey)> {
     let minting = devices.clone();
     let minted = tokio::task::spawn_blocking(move || minting.mint_code())
         .await
@@ -371,6 +374,7 @@ async fn on_join(outbox: &Outbox, devices: &Devices, join: &JoinInfo) -> Option<
         }
     };
     let op = Op::Send {
+        chat,
         thread_id: None,
         text,
         html,
@@ -380,7 +384,7 @@ async fn on_join(outbox: &Outbox, devices: &Devices, join: &JoinInfo) -> Option<
         notify: false,
     };
     let sent = match outbox.submit(op).await.await {
-        Ok(Ok(Outcome::Sent(message))) => Some(message.message_id),
+        Ok(Ok(Outcome::Sent(message))) => Some(MessageKey::new(chat, message.message_id)),
         Ok(Ok(_)) => None,
         Ok(Err(error)) => {
             warn!(%error, "join message not delivered");
@@ -395,6 +399,7 @@ async fn on_join(outbox: &Outbox, devices: &Devices, join: &JoinInfo) -> Option<
 }
 
 async fn on_press(outbox: &Outbox, devices: &Devices, input: CallbackInput) {
+    let pressed = input.message();
     let Some(press) = input.data.as_deref().and_then(parse_callback) else {
         return;
     };
@@ -442,10 +447,11 @@ async fn on_press(outbox: &Outbox, devices: &Devices, input: CallbackInput) {
         },
     )
     .await;
-    if let Some(message_id) = input.message_id {
+    if let Some(message) = pressed {
         let (text, keyboard) = edit;
         let op = Op::Edit {
-            message_id,
+            chat: message.chat,
+            message_id: message.id,
             text,
             reply_markup: Some(keyboard.unwrap_or_else(|| json!({ "inline_keyboard": [] }))),
             background: false,
@@ -578,6 +584,7 @@ mod tests {
 
     fn command(text: &str, thread_id: Option<i64>) -> Inbound {
         Inbound {
+            chat: Chat::Group,
             message_id: 1,
             thread_id,
             text: Some(text.to_owned()),
@@ -591,6 +598,7 @@ mod tests {
 
     fn press(data: &str) -> CallbackInput {
         CallbackInput {
+            chat: Some(Chat::Group),
             query_id: "q".into(),
             data: Some(data.into()),
             message_id: Some(77),

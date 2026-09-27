@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use cctg::hub::api::{BotApi, Document};
+use cctg::hub::chat::{Chat, PrivateChat};
 use cctg::hub::config::Config;
 use cctg::hub::scheduler::{BucketConfig, Op, Outbox, Outcome, Scheduler};
 use serde_json::Value;
@@ -97,6 +98,7 @@ async fn html_refused_by_telegram_is_sent_again_once_as_plain_text() {
     let running = tokio::spawn(scheduler.run());
     let answer = outbox
         .submit(Op::Send {
+            chat: Chat::Group,
             thread_id: Some(5),
             text: "**done** <ok>".to_owned(),
             html: Some("<b>done</b> &lt;ok&gt;".to_owned()),
@@ -127,6 +129,7 @@ async fn only_loud_sends_go_without_disable_notification() {
     let (scheduler, outbox) = scheduler(bodies.clone()).await;
     let running = tokio::spawn(scheduler.run());
     let send = |text: &str, notify| Op::Send {
+        chat: Chat::Group,
         thread_id: Some(5),
         text: text.to_owned(),
         html: None,
@@ -136,6 +139,7 @@ async fn only_loud_sends_go_without_disable_notification() {
         notify,
     };
     let line = |text: &str, notify| Op::Stream {
+        chat: Chat::Group,
         thread_id: 5,
         text: text.to_owned(),
         html: None,
@@ -144,6 +148,7 @@ async fn only_loud_sends_go_without_disable_notification() {
         notify,
     };
     let document = |name: &str, notify| Op::SendDocument {
+        chat: Chat::Group,
         thread_id: Some(5),
         document: Document {
             file_name: name.to_owned(),
@@ -194,4 +199,84 @@ async fn only_loud_sends_go_without_disable_notification() {
     };
     multipart(4, "quiet.txt", true);
     multipart(5, "loud.txt", false);
+}
+
+/// TASK-061: every request names its chat: the configured group for
+/// `Chat::Group`, the user's id for the private chat with that user. The same
+/// message id goes to each chat as asked.
+#[tokio::test]
+async fn every_request_goes_to_the_chat_its_op_names() {
+    const USER: i64 = 7_319_402_518;
+    let private = Chat::Private(PrivateChat::of_user(USER));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let (scheduler, outbox) = scheduler(bodies.clone()).await;
+    let running = tokio::spawn(scheduler.run());
+    let send = |chat| Op::Send {
+        chat,
+        thread_id: Some(5),
+        text: "hi".to_owned(),
+        html: None,
+        reply_markup: None,
+        permission: false,
+        reply_to: None,
+        notify: false,
+    };
+    let edit = |chat| Op::Edit {
+        chat,
+        message_id: 9,
+        text: "edited".to_owned(),
+        reply_markup: None,
+        background: false,
+    };
+    let react = |chat| Op::React {
+        chat,
+        message_id: 9,
+        emoji: "👀".to_owned(),
+    };
+    let topic = |chat| Op::EditTopic {
+        chat,
+        thread_id: 5,
+        name: Some("name".to_owned()),
+        icon_custom_emoji_id: None,
+    };
+    let document = |chat| Op::SendDocument {
+        chat,
+        thread_id: Some(5),
+        document: Document {
+            file_name: "a.txt".to_owned(),
+            bytes: b"body".to_vec(),
+            caption: None,
+        },
+        notify: false,
+    };
+    for chat in [Chat::Group, private] {
+        for op in [
+            send(chat),
+            edit(chat),
+            react(chat),
+            topic(chat),
+            document(chat),
+        ] {
+            assert!(outbox.submit(op).await.await.unwrap().is_ok());
+        }
+    }
+    drop(outbox);
+    running.await.unwrap();
+
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 10, "{bodies:?}");
+    for (index, body) in bodies.iter().enumerate() {
+        let want = if index < 5 { -1001 } else { USER };
+        match body.as_str() {
+            // The multipart document: its chat_id field.
+            Some(form) => {
+                let value = form.split("name=\"chat_id\"").nth(1).unwrap();
+                assert!(
+                    value.trim_start().starts_with(&want.to_string()),
+                    "{index}: {form}"
+                );
+            }
+            None => assert_eq!(body["chat_id"], want, "{index}: {body}"),
+        }
+    }
 }

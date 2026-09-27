@@ -1,4 +1,6 @@
-use transcript::{StreamEvent, THINKING_LIMIT, parse, render_brief, render_full, stream_events};
+use transcript::{
+    ChannelPlace, StreamEvent, THINKING_LIMIT, parse, render_brief, render_full, stream_events,
+};
 
 const FINAL_ANSWER: &str = include_str!("fixtures/final_answer.jsonl");
 const STREAM: &str = include_str!("fixtures/stream.jsonl");
@@ -36,7 +38,10 @@ fn a_turn_streams_its_prompt_notes_and_calls_but_not_its_final_answer() {
             StreamEvent::Thinking("SECRET-THINKING-MARKER final".to_owned()),
             StreamEvent::TurnEnd,
             // A Telegram message: its id, never its text.
-            StreamEvent::Channel { message_id: 7 },
+            StreamEvent::Channel {
+                place: ChannelPlace::Group,
+                message_id: 7,
+            },
             call("toolu_demo32", "↳ Explore: Explore crate"),
             ok("toolu_demo32"),
             StreamEvent::TurnEnd,
@@ -57,7 +62,10 @@ fn queued_channel_messages_errors_and_service_records() {
                 error: Some("String to replace not found in file.".to_owned()),
             },
             // Only the opening tag counts, not an id-looking body.
-            StreamEvent::Channel { message_id: 12 },
+            StreamEvent::Channel {
+                place: ChannelPlace::Group,
+                message_id: 12,
+            },
             // Queue operations, a typed queued prompt, sidechain records, text
             // with no tool call after it (the answer comes from the Stop hook)
             // and a channel tag without a numeric id give nothing.
@@ -83,7 +91,10 @@ fn only_cctg_channel_records_match_and_a_bom_line_still_counts() {
     };
     assert_eq!(
         stream_events(&channel("cctg")),
-        [StreamEvent::Channel { message_id: 42 }]
+        [StreamEvent::Channel {
+            place: ChannelPlace::Group,
+            message_id: 42,
+        }]
     );
     for foreign in ["webhook", "plugin:fakechat:fakechat", "cctg2", ""] {
         assert!(stream_events(&channel(foreign)).is_empty(), "{foreign}");
@@ -233,4 +244,35 @@ fn a_local_command_written_as_a_system_record_streams_as_prompt_and_code() {
             StreamEvent::Note("```\nContext Usage\n142.8k/1m tokens (14%)\n```".to_owned()),
         ]
     );
+}
+
+/// TASK-061: a cctg tag names its place; no place is the group (tags of
+/// hub v0.1.12 and older carry `chat_id`), a place the crate does not know
+/// matches nothing.
+#[test]
+fn a_channel_record_names_its_place_and_an_old_one_is_the_group() {
+    let channel = |attributes: &str| {
+        format!(
+            "{{\"type\":\"user\",\"isMeta\":true,\"message\":{{\"role\":\"user\",\"content\":\"<channel source=\\\"cctg\\\" {attributes} message_id=\\\"42\\\">hi</channel>\"}}}}"
+        )
+    };
+    let event = |place| StreamEvent::Channel {
+        place,
+        message_id: 42,
+    };
+    assert_eq!(
+        stream_events(&channel("place=\\\"group\\\"")),
+        [event(ChannelPlace::Group)]
+    );
+    assert_eq!(
+        stream_events(&channel("place=\\\"private\\\"")),
+        [event(ChannelPlace::Private)]
+    );
+    assert_eq!(
+        stream_events(&channel("chat_id=\\\"-1001\\\"")),
+        [event(ChannelPlace::Group)]
+    );
+    assert!(stream_events(&channel("place=\\\"elsewhere\\\"")).is_empty());
+    let queued = "{\"type\":\"attachment\",\"attachment\":{\"type\":\"queued_command\",\"prompt\":\"<channel source=\\\"cctg\\\" place=\\\"private\\\" message_id=\\\"42\\\">x</channel>\"}}";
+    assert_eq!(stream_events(queued), [event(ChannelPlace::Private)]);
 }

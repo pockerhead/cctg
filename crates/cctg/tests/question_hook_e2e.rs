@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::Chat;
 use cctg::hub::ingress::{self, AgentEvent};
 use cctg::hub::questions::{self, Press};
 use cctg::hub::registry::RegistryStore;
@@ -184,7 +185,6 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
     let store = RegistryStore::open(&state).unwrap();
     let options = Options {
         grace: Duration::ZERO,
-        chat_id: -1000000000001,
         question_wait,
         ..Options::default()
     };
@@ -339,6 +339,7 @@ fn assert_clean(output: &Output) {
 fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
     hub.control
         .send(Control::Callback(CallbackInput {
+            chat: Some(Chat::Group),
             query_id: "q".into(),
             data: Some(questions::callback_data(id, question, press)),
             message_id: Some(message_id),
@@ -351,6 +352,7 @@ fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
 fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
     hub.control
         .send(Control::Message(Inbound {
+            chat: Chat::Group,
             message_id,
             thread_id: Some(100),
             text: Some(text.into()),

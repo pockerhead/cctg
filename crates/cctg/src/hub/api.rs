@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::{Value, json};
 
+use super::chat::{Chat, Place};
 use super::config::{BotToken, ProxyUrl};
 
 pub const TELEGRAM_API: &str = "https://api.telegram.org";
@@ -70,10 +71,14 @@ pub struct User {
     pub first_name: Option<String>,
 }
 
+/// The chat of a message as Telegram describes it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct Chat {
+pub struct MessageChat {
     pub id: i64,
+    /// `private`, `group`, `supergroup` or `channel`.
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -84,7 +89,7 @@ pub struct Message {
     pub is_topic_message: bool,
     /// Boxed: keeps `Message` (a scheduler `Outcome`) small.
     pub from: Option<Box<User>>,
-    pub chat: Chat,
+    pub chat: MessageChat,
     pub text: Option<String>,
     /// In a forum topic every message that is not an explicit reply points
     /// at the topic root (the `forum_topic_created` message).
@@ -235,14 +240,16 @@ pub struct Document {
     pub caption: Option<String>,
 }
 
-/// Bot API client bound to one bot and one forum supergroup.
+/// Bot API client of one bot; every call names its [`Chat`], and the id of
+/// [`Chat::Group`] is the configured forum supergroup's (TASK-061).
 pub struct BotApi {
     http: reqwest::Client,
     /// `<api>/bot<token>`; never logged, see the manual `Debug`.
     base: String,
     /// `<api>/file/bot<token>`, for downloads; never logged either.
     file_base: String,
-    chat_id: i64,
+    /// The forum supergroup, [`Chat::Group`].
+    group_id: i64,
 }
 
 impl fmt::Debug for BotApi {
@@ -278,20 +285,29 @@ impl BotApi {
             http,
             base: format!("{api_url}/bot{}", token.expose()),
             file_base: format!("{api_url}/file/bot{}", token.expose()),
-            chat_id,
+            group_id: chat_id,
         })
     }
 
+    /// The forum supergroup's id.
     pub fn chat_id(&self) -> i64 {
-        self.chat_id
+        self.group_id
+    }
+
+    /// The Bot API `chat_id` of `chat`; only request bodies carry it.
+    fn id_of(&self, chat: Chat) -> i64 {
+        match chat {
+            Chat::Group => self.group_id,
+            Chat::Private(private) => private.expose(),
+        }
     }
 
     pub async fn get_me(&self) -> Result<User, ApiError> {
         self.call("getMe", json!({}), None).await
     }
 
-    pub async fn get_chat_member(&self, user_id: i64) -> Result<ChatMember, ApiError> {
-        let body = json!({ "chat_id": self.chat_id, "user_id": user_id });
+    pub async fn get_chat_member(&self, chat: Chat, user_id: i64) -> Result<ChatMember, ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat), "user_id": user_id });
         self.call("getChatMember", body, None).await
     }
 
@@ -319,18 +335,18 @@ impl BotApi {
     /// `notify: false` sends it with `disable_notification` (no sound).
     pub async fn send_message(
         &self,
-        thread_id: Option<i64>,
+        place: Place,
         text: &str,
         reply_markup: Option<&Value>,
         parse_mode: Option<&str>,
         reply_to: Option<i64>,
         notify: bool,
     ) -> Result<Message, ApiError> {
-        let mut body = json!({ "chat_id": self.chat_id, "text": text });
+        let mut body = json!({ "chat_id": self.id_of(place.chat), "text": text });
         if !notify {
             body["disable_notification"] = json!(true);
         }
-        if let Some(thread_id) = thread_id {
+        if let Some(thread_id) = place.thread {
             body["message_thread_id"] = json!(thread_id);
         }
         if let Some(reply_to) = reply_to {
@@ -347,11 +363,13 @@ impl BotApi {
 
     pub async fn edit_message_text(
         &self,
+        chat: Chat,
         message_id: i64,
         text: &str,
         reply_markup: Option<&Value>,
     ) -> Result<(), ApiError> {
-        let mut body = json!({ "chat_id": self.chat_id, "message_id": message_id, "text": text });
+        let mut body =
+            json!({ "chat_id": self.id_of(chat), "message_id": message_id, "text": text });
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup.clone();
         }
@@ -363,22 +381,22 @@ impl BotApi {
     /// `notify`: as in [`Self::send_message`].
     pub async fn send_document(
         &self,
-        thread_id: Option<i64>,
+        place: Place,
         document: &Document,
         notify: bool,
     ) -> Result<Message, ApiError> {
-        self.send_file("sendDocument", "document", thread_id, document, notify)
+        self.send_file("sendDocument", "document", place, document, notify)
             .await
     }
 
     /// `sendPhoto` of a JPEG, PNG or WebP of at most 10 MB (TASK-032).
     pub async fn send_photo(
         &self,
-        thread_id: Option<i64>,
+        place: Place,
         document: &Document,
         notify: bool,
     ) -> Result<Message, ApiError> {
-        self.send_file("sendPhoto", "photo", thread_id, document, notify)
+        self.send_file("sendPhoto", "photo", place, document, notify)
             .await
     }
 
@@ -388,14 +406,15 @@ impl BotApi {
     /// the first message of the album.
     pub async fn send_media_group(
         &self,
-        thread_id: Option<i64>,
+        place: Place,
         items: &[Document],
         photos: bool,
         notify: bool,
     ) -> Result<Message, ApiError> {
         let kind = if photos { "photo" } else { "document" };
         let mut media = Vec::with_capacity(items.len());
-        let mut form = reqwest::multipart::Form::new().text("chat_id", self.chat_id.to_string());
+        let mut form =
+            reqwest::multipart::Form::new().text("chat_id", self.id_of(place.chat).to_string());
         for (index, item) in items.iter().enumerate() {
             let field = format!("file{index}");
             let mut entry = json!({ "type": kind, "media": format!("attach://{field}") });
@@ -411,7 +430,7 @@ impl BotApi {
         if !notify {
             form = form.text("disable_notification", "true");
         }
-        if let Some(thread_id) = thread_id {
+        if let Some(thread_id) = place.thread {
             form = form.text("message_thread_id", thread_id.to_string());
         }
         let response = self
@@ -431,19 +450,19 @@ impl BotApi {
         &self,
         method: &str,
         field: &str,
-        thread_id: Option<i64>,
+        place: Place,
         document: &Document,
         notify: bool,
     ) -> Result<Message, ApiError> {
         let part = reqwest::multipart::Part::bytes(document.bytes.clone())
             .file_name(document.file_name.clone());
         let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", self.chat_id.to_string())
+            .text("chat_id", self.id_of(place.chat).to_string())
             .part(field.to_owned(), part);
         if !notify {
             form = form.text("disable_notification", "true");
         }
-        if let Some(thread_id) = thread_id {
+        if let Some(thread_id) = place.thread {
             form = form.text("message_thread_id", thread_id.to_string());
         }
         if let Some(caption) = &document.caption {
@@ -509,9 +528,14 @@ impl BotApi {
 
     /// Replaces the bot's reaction on a message with one emoji from the Bot
     /// API list (`👀`, `✍` are in it; bots set at most one reaction).
-    pub async fn set_message_reaction(&self, message_id: i64, emoji: &str) -> Result<(), ApiError> {
+    pub async fn set_message_reaction(
+        &self,
+        chat: Chat,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<(), ApiError> {
         let body = json!({
-            "chat_id": self.chat_id,
+            "chat_id": self.id_of(chat),
             "message_id": message_id,
             "reaction": [{ "type": "emoji", "emoji": emoji }],
         });
@@ -522,9 +546,9 @@ impl BotApi {
 
     /// Pins a message without a notification; a message of a forum topic is
     /// pinned in that topic.
-    pub async fn pin_chat_message(&self, message_id: i64) -> Result<(), ApiError> {
+    pub async fn pin_chat_message(&self, chat: Chat, message_id: i64) -> Result<(), ApiError> {
         let body = json!({
-            "chat_id": self.chat_id,
+            "chat_id": self.id_of(chat),
             "message_id": message_id,
             "disable_notification": true,
         });
@@ -533,8 +557,8 @@ impl BotApi {
             .map(drop)
     }
 
-    pub async fn delete_message(&self, message_id: i64) -> Result<(), ApiError> {
-        let body = json!({ "chat_id": self.chat_id, "message_id": message_id });
+    pub async fn delete_message(&self, chat: Chat, message_id: i64) -> Result<(), ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat), "message_id": message_id });
         self.call::<IgnoredAny>("deleteMessage", body, None)
             .await
             .map(drop)
@@ -556,10 +580,11 @@ impl BotApi {
 
     pub async fn create_forum_topic(
         &self,
+        chat: Chat,
         name: &str,
         icon_custom_emoji_id: Option<&str>,
     ) -> Result<ForumTopic, ApiError> {
-        let mut body = json!({ "chat_id": self.chat_id, "name": name });
+        let mut body = json!({ "chat_id": self.id_of(chat), "name": name });
         if let Some(icon) = icon_custom_emoji_id {
             body["icon_custom_emoji_id"] = json!(icon);
         }
@@ -568,11 +593,12 @@ impl BotApi {
 
     pub async fn edit_forum_topic(
         &self,
+        chat: Chat,
         thread_id: i64,
         name: Option<&str>,
         icon_custom_emoji_id: Option<&str>,
     ) -> Result<(), ApiError> {
-        let mut body = json!({ "chat_id": self.chat_id, "message_thread_id": thread_id });
+        let mut body = json!({ "chat_id": self.id_of(chat), "message_thread_id": thread_id });
         if let Some(name) = name {
             body["name"] = json!(name);
         }
@@ -913,6 +939,7 @@ mod tests {
         .await;
         let api = test_api(&url);
         let op = Op::SendPhoto {
+            chat: Chat::Group,
             thread_id: Some(100),
             document: Document {
                 file_name: "shot.png".into(),
@@ -986,6 +1013,7 @@ mod tests {
             },
         ];
         let photos = Op::SendAlbum {
+            chat: Chat::Group,
             thread_id: Some(100),
             items: items.clone(),
             photos: true,
@@ -1001,6 +1029,7 @@ mod tests {
         }
         assert!(api.execute(&photos).await.is_err(), "not a 400");
         let documents = Op::SendAlbum {
+            chat: Chat::Group,
             thread_id: Some(100),
             items,
             photos: false,
