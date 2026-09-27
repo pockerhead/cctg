@@ -73,8 +73,13 @@
 //! Metered ops (new messages) take a token from the group message bucket.
 //! Edits, reactions and topic mutations have no published limit, but they
 //! count against the same group (429s were seen live with them unbounded):
-//! each takes a token from a second group bucket, `Limits::edits`, so the
-//! requests into the group per minute stay below the sum of both buckets.
+//! each takes a token from a second bucket, `Limits::edits`. On top of both,
+//! every request but a callback answer takes a token of one budget for the
+//! whole group, `Limits::group` (TASK-068: with only the two, the group saw
+//! up to 40 requests a minute and a 429 about every minute). Inside it the
+//! order above holds, except that a status refresh takes only what the new
+//! messages and growing turn messages leave (those go oldest first), and
+//! one after every four other requests while it waits.
 //! Callback answers go to the pressing user, not into the group, and take no
 //! token: they go ahead of edits that wait for theirs. Under a steady load of
 //! background refreshes a lone topic call or foreground edit waits at most
@@ -82,7 +87,10 @@
 //! Everything is serialized (one request in flight).
 //! Any 429 pauses the whole queue for `retry_after` and puts the job back at
 //! the head of its lane; an edit or reaction whose message got a newer one
-//! queued meanwhile is answered `Superseded` instead.
+//! queued meanwhile is answered `Superseded` instead. It also halves the
+//! group's rate (down to a quarter), which comes back by a tenth of the full
+//! rate a minute: a real limit below the guess costs a 429 now and then, not
+//! one a minute.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -100,6 +108,11 @@ use super::chat::{Chat, MessageKey, Place};
 const QUEUE_CAPACITY: usize = 1024;
 const MAX_CONSECUTIVE_UNMETERED: usize = 4;
 const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
+/// The group's rate after 429s is at least this share of `Limits::group`.
+const SLOWEST_RATE: f64 = 0.25;
+/// Share of the full rate the group's rate gains back per minute: from half
+/// to full in five minutes.
+const RECOVERY_PER_MINUTE: f64 = 0.1;
 
 /// Every op but a callback answer names its chat (TASK-061): topics and
 /// messages are numbered per chat.
@@ -595,6 +608,18 @@ pub const EDIT_BUCKET: BucketConfig = BucketConfig {
     min_gap: Duration::ZERO,
 };
 
+/// Every request into the group together (TASK-068): new messages, edits,
+/// reactions, deletes, unpins and topic calls, at most 5 + 15 = 20 in any
+/// 60 s. Telegram documents 20 messages a minute per group and no number for
+/// the rest; v0.1.14 sent up to 40 requests a minute (both buckets above)
+/// and got a 429 about every minute, so the others count too. After a 429
+/// the rate adapts (see the module docs).
+pub const GROUP_BUCKET: BucketConfig = BucketConfig {
+    capacity: 5,
+    refill_every: Duration::from_secs(4),
+    min_gap: Duration::ZERO,
+};
+
 /// Quiet time a tool-call line waits for the next line of its topic: calls
 /// of one step (parallel reads, a quick search) finish well within it, so a
 /// burst becomes one message, and a lone line still shows within 1.5 s.
@@ -612,6 +637,9 @@ pub struct Limits {
     pub messages: BucketConfig,
     /// Edits, reactions and topic mutations; `None` leaves them unmetered.
     pub edits: Option<BucketConfig>,
+    /// Every request into the group but a callback answer, on top of the
+    /// two above (TASK-068); `None`: only those.
+    pub group: Option<BucketConfig>,
     /// Quiet time a `merge` stream line waits for more lines of its topic;
     /// zero turns the debounce off.
     pub debounce: Duration,
@@ -625,6 +653,7 @@ impl Default for Limits {
         Self {
             messages: BucketConfig::default(),
             edits: Some(EDIT_BUCKET),
+            group: Some(GROUP_BUCKET),
             debounce: DEBOUNCE,
             debounce_max: DEBOUNCE_MAX,
         }
@@ -638,6 +667,7 @@ impl From<BucketConfig> for Limits {
         Self {
             messages,
             edits: None,
+            group: None,
             debounce: Duration::ZERO,
             debounce_max: Duration::ZERO,
         }
@@ -650,6 +680,8 @@ struct Bucket {
     tokens: f64,
     refilled_at: Instant,
     last_take: Option<Instant>,
+    /// Share of the configured refill rate, below 1 after a 429 (TASK-068).
+    rate: f64,
 }
 
 impl Bucket {
@@ -659,13 +691,19 @@ impl Bucket {
             tokens: f64::from(config.capacity),
             refilled_at: now,
             last_take: None,
+            rate: 1.0,
         }
     }
 
     fn refill(&mut self, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.refilled_at);
-        let gained = elapsed.as_secs_f64() / self.config.refill_every.as_secs_f64();
+        // A 429 pause still running refills nothing (`slow_down`).
+        if now <= self.refilled_at {
+            return;
+        }
+        let elapsed = now.duration_since(self.refilled_at).as_secs_f64();
+        let gained = elapsed * self.rate / self.config.refill_every.as_secs_f64();
         self.tokens = (self.tokens + gained).min(f64::from(self.config.capacity));
+        self.rate = (self.rate + elapsed / 60.0 * RECOVERY_PER_MINUTE).min(1.0);
         self.refilled_at = now;
     }
 
@@ -675,7 +713,10 @@ impl Bucket {
         let token_at = if self.tokens >= 1.0 {
             now
         } else {
-            now + self.config.refill_every.mul_f64(1.0 - self.tokens)
+            now + self
+                .config
+                .refill_every
+                .mul_f64((1.0 - self.tokens) / self.rate)
         };
         match self.last_take {
             Some(last) => token_at.max(last + self.config.min_gap),
@@ -687,6 +728,16 @@ impl Bucket {
         self.refill(now);
         self.tokens -= 1.0;
         self.last_take = Some(now);
+    }
+
+    /// Telegram answered 429 and the queue waits until `until` (TASK-068):
+    /// the rate halves, down to [`SLOWEST_RATE`]; one token is there when
+    /// the pause ends, for the refused request, and the next ones come at
+    /// the new rate from then.
+    fn slow_down(&mut self, until: Instant) {
+        self.rate = (self.rate / 2.0).max(SLOWEST_RATE);
+        self.tokens = 1.0;
+        self.refilled_at = until;
     }
 }
 
@@ -817,10 +868,14 @@ pub struct Scheduler<T> {
     bucket: Bucket,
     /// Edits, reactions and topic mutations; `None`: unmetered.
     edit_bucket: Option<Bucket>,
+    /// Every request but a callback answer (TASK-068); `None`: unmetered.
+    group: Option<Bucket>,
     debounce: Duration,
     debounce_max: Duration,
     paused_until: Option<Instant>,
     consecutive_unmetered: usize,
+    /// Requests into the group since the last status refresh went.
+    since_refresh: usize,
     /// When topic calls and foreground edits both wait, a topic call goes
     /// next; they take turns.
     topic_turn: bool,
@@ -850,10 +905,12 @@ impl<T: Transport> Scheduler<T> {
             open: true,
             bucket: Bucket::new(limits.messages, now),
             edit_bucket: limits.edits.map(|edits| Bucket::new(edits, now)),
+            group: limits.group.map(|group| Bucket::new(group, now)),
             debounce: limits.debounce,
             debounce_max: limits.debounce_max,
             paused_until: None,
             consecutive_unmetered: 0,
+            since_refresh: 0,
             topic_turn: true,
             broken: HashSet::new(),
             edit: VecDeque::new(),
@@ -1050,8 +1107,14 @@ impl<T: Transport> Scheduler<T> {
             }
             self.paused_until = None;
         }
-        let message_ready = self.bucket.ready_at(now);
-        let edit_ready = self.edit_bucket.as_mut().map_or(now, |b| b.ready_at(now));
+        // Every request waits for the group's token too.
+        let group_ready = self.group.as_mut().map_or(now, |b| b.ready_at(now));
+        let message_ready = self.bucket.ready_at(now).max(group_ready);
+        let edit_ready = self
+            .edit_bucket
+            .as_mut()
+            .map_or(now, |b| b.ready_at(now))
+            .max(group_ready);
         let permission = self.next_permission();
         if let Some(index) = permission
             && self.ready_at(index, message_ready, edit_ready) <= now
@@ -1059,9 +1122,12 @@ impl<T: Transport> Scheduler<T> {
             return Pick::Now(Lane::Message(index));
         }
         let message = self.next_message(now, message_ready, edit_ready);
+        // With one budget for the group (TASK-068) turn content written into
+        // a message is no new message here: it waits its turn below.
         if let Some((at, index)) = message
             && at <= now
             && self.consecutive_unmetered >= MAX_CONSECUTIVE_UNMETERED
+            && (self.group.is_none() || self.message[index].op.metered())
         {
             return Pick::Now(Lane::Message(index));
         }
@@ -1071,11 +1137,28 @@ impl<T: Transport> Scheduler<T> {
         // (the turn message growing) with the background ones.
         let content = [true, false].map(|first| self.due_content(now, edit_ready, first));
         // A message token no new message wants: the turn content takes it,
-        // and the edit token goes to a status refresh.
-        let spare = message_ready <= now
+        // and the edit token goes to a status refresh. Not with one budget
+        // for the group: both would take its token.
+        let spare = self.group.is_none()
+            && message_ready <= now
             && message.is_none_or(|(at, index)| at > now || !self.message[index].op.metered());
-        if let Some(lane) = self.next_edit(edit_ready <= now, content, spare) {
+        // With one budget for the group (TASK-068) a growing turn message
+        // does not share the status refreshes' turn: it goes with the new
+        // messages, below.
+        let shared = [content[0], content[1].filter(|_| self.group.is_none())];
+        if let Some(lane) = self.next_edit(edit_ready <= now, shared, spare) {
+            // The group's token goes to a due new message or growing turn
+            // message before a status refresh, but for one in five.
+            if matches!(lane, Lane::Edit(index) if self.edit[index].op.background())
+                && self.since_refresh < MAX_CONSECUTIVE_UNMETERED
+                && let Some(index) = self.group_content(message, content[1], now)
+            {
+                return Pick::Now(Lane::Message(index));
+            }
             return Pick::Now(lane);
+        }
+        if let Some(index) = self.group_content(message, content[1], now) {
+            return Pick::Now(Lane::Message(index));
         }
         // Edits or topic mutations left wait for the edit bucket.
         let edits_at = (!self.edit.is_empty() || !self.topic.is_empty()).then_some(edit_ready);
@@ -1086,6 +1169,24 @@ impl<T: Transport> Scheduler<T> {
                 None => Pick::Idle,
             },
         }
+    }
+
+    /// With one budget for the group (TASK-068): the older of the due new
+    /// message `message` ([`Self::next_message`]) and the due growing turn
+    /// message `growing`; `None` without a group budget.
+    fn group_content(
+        &self,
+        message: Option<(Instant, usize)>,
+        growing: Option<usize>,
+        now: Instant,
+    ) -> Option<usize> {
+        self.group.as_ref()?;
+        message
+            .filter(|&(at, index)| at <= now && self.message[index].op.metered())
+            .map(|(_, index)| index)
+            .into_iter()
+            .chain(growing)
+            .min_by_key(|&index| self.message[index].queued_at)
     }
 
     /// When the token the `Message` job at `index` takes is there: a new
@@ -1265,6 +1366,16 @@ impl<T: Transport> Scheduler<T> {
         if let Some(status) = &job.status {
             status.fill(&mut job.op);
         }
+        if !matches!(job.op, Op::AnswerCallback { .. })
+            && let Some(group) = &mut self.group
+        {
+            group.take(Instant::now());
+            self.since_refresh = if job.op.background() {
+                0
+            } else {
+                self.since_refresh.saturating_add(1)
+            };
+        }
         if job.op.metered() || self.spills(&job.op, Instant::now()) {
             self.bucket.take(Instant::now());
             self.consecutive_unmetered = 0;
@@ -1297,8 +1408,17 @@ impl<T: Transport> Scheduler<T> {
         match result {
             Err(ApiError::RetryAfter(wait)) => {
                 let wait = wait.max(MIN_RETRY_AFTER);
-                warn!(?wait, "telegram flood control, outbound queue paused");
-                self.paused_until = Some(Instant::now() + wait);
+                let until = Instant::now() + wait;
+                self.paused_until = Some(until);
+                let group_rate = self.group.as_mut().map(|group| {
+                    group.slow_down(until);
+                    format!("{:.0}%", group.rate * 100.0)
+                });
+                warn!(
+                    ?wait,
+                    group_rate = group_rate.as_deref().unwrap_or("-"),
+                    "telegram flood control, outbound queue paused"
+                );
                 // A newer edit of the message came while this one was out:
                 // it carries the newest text and must not be overwritten.
                 if let Some(newer) = self.edit.iter_mut().find(|q| q.op.replaces(&job.op)) {
@@ -2572,7 +2692,25 @@ mod tests {
     /// Submits each op at its offset from the start with the hub's pacing,
     /// runs until everything is answered, and returns the answers in order.
     async fn run_timed(fake: &Arc<Fake>, ops: Vec<(u64, Op)>) -> Vec<Option<Delivery>> {
-        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        run_limited(fake, ops, Limits::default()).await
+    }
+
+    /// [`run_timed`] with the hub's two class budgets but not the group's
+    /// one (TASK-068): for the rules between the classes.
+    async fn run_classes(fake: &Arc<Fake>, ops: Vec<(u64, Op)>) -> Vec<Option<Delivery>> {
+        let limits = Limits {
+            group: None,
+            ..Limits::default()
+        };
+        run_limited(fake, ops, limits).await
+    }
+
+    async fn run_limited(
+        fake: &Arc<Fake>,
+        ops: Vec<(u64, Op)>,
+        limits: Limits,
+    ) -> Vec<Option<Delivery>> {
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), limits);
         let handle = tokio::spawn(scheduler.run());
         let start = Instant::now();
         let mut receivers = Vec::new();
@@ -2611,6 +2749,13 @@ mod tests {
         let refills = Duration::from_secs(60).as_secs_f64() / edits.refill_every.as_secs_f64();
         assert!(f64::from(edits.capacity) + refills <= 20.0);
         assert!(limits.debounce <= limits.debounce_max);
+    }
+
+    #[test]
+    fn default_group_budget_fits_twenty_per_minute() {
+        let group = Limits::default().group.expect("the hub meters the group");
+        let refills = Duration::from_secs(60).as_secs_f64() / group.refill_every.as_secs_f64();
+        assert!(f64::from(group.capacity) + refills <= 20.0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2821,6 +2966,8 @@ mod tests {
         let allowed = |bucket: BucketConfig| {
             f64::from(bucket.capacity) + 60.0 / bucket.refill_every.as_secs_f64()
         };
+        // TASK-068: everything together within the group's budget.
+        let group = allowed(GROUP_BUCKET);
         for (i, call) in calls.iter().enumerate() {
             let window: Vec<&Call> = calls[i..]
                 .iter()
@@ -2839,20 +2986,28 @@ mod tests {
                 call.at
             );
             assert!(
-                window.len() <= 40,
+                window.len() as f64 <= group,
                 "{} requests after {:?}",
                 window.len(),
                 call.at
             );
         }
-        // Messages are not held back by the edits waiting for their bucket.
+        // The group's tokens go to the foreground edits and topic calls
+        // first, and to a waiting message after every
+        // `MAX_CONSECUTIVE_UNMETERED` of them: the fifth token, the burst's
+        // at 0 s, then one every 5 x 4 s.
         let sends: Vec<Duration> = calls
             .iter()
             .filter(|c| c.op.metered())
             .map(|c| c.at)
             .take(5)
             .collect();
-        assert_eq!(sends, (0..5).map(Duration::from_secs).collect::<Vec<_>>());
+        let every = GROUP_BUCKET.refill_every * (MAX_CONSECUTIVE_UNMETERED as u32 + 1);
+        assert_eq!(
+            sends,
+            (0..5u32).map(|k| every * k).collect::<Vec<_>>(),
+            "{sends:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3276,12 +3431,14 @@ mod tests {
 
     /// With the group's message budget spent, content written into an
     /// existing message still goes on the edit budget; a new message waits.
+    /// The two classes alone: the group's budget (TASK-068), which both
+    /// take, is spent as soon as the message one is.
     #[tokio::test(start_paused = true)]
     async fn content_into_a_message_does_not_wait_for_the_message_budget() {
         let fake = Fake::new(&[]);
         let mut ops: Vec<(u64, Op)> = (0..6).map(|i| (0, send(2, &format!("s{i}")))).collect();
         ops.push((5500, into(7, "a ✓")));
-        run_timed(&fake, ops).await;
+        run_classes(&fake, ops).await;
         let times = stream_times(&fake);
         let at = |text: &str| times.iter().find(|(t, _)| t == text).map(|(_, at)| *at);
         // s5 needs a refill: 5 burst sends, the next token 4 s after the first.
@@ -3322,10 +3479,9 @@ mod tests {
         assert!(matches!(seven.as_slice(), [Op::Stream { .. }]), "{seven:?}");
     }
 
-    /// Turn content and status refreshes share the edit budget that
-    /// foreground edits leave, oldest first: with ten status messages
-    /// refreshed for good, a turn's lines still show every few tokens, and
-    /// the refreshes still go.
+    /// Turn content and status refreshes share the budget that foreground
+    /// edits leave: with ten status messages refreshed for good, a turn's
+    /// lines still show every few tokens, and the refreshes still go.
     #[tokio::test(start_paused = true)]
     async fn turn_content_and_status_refreshes_share_the_edit_budget() {
         let fake = Fake::new(&[]);
@@ -3341,10 +3497,12 @@ mod tests {
             waits.push(wait);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        // Eleven messages share ~15 tokens a minute: each waits at most for
-        // the ten others once, plus its debounce.
+        // With the group's budget (TASK-068) the turn message goes before
+        // the refreshes but for one in five: it waits for its debounce, a
+        // refresh's token at most and its own.
         let longest = waits.iter().max().copied().unwrap_or_default();
-        assert!(longest <= Duration::from_secs(50), "{waits:?}");
+        let bound = DEBOUNCE + GROUP_BUCKET.refill_every * 2;
+        assert!(longest <= bound, "{waits:?}");
         let before = refreshes.lock().map(|log| log.len()).unwrap_or(0);
         tokio::time::sleep(Duration::from_secs(60)).await;
         let after = refreshes.lock().map(|log| log.len()).unwrap_or(0);
@@ -3353,7 +3511,8 @@ mod tests {
     }
 
     /// With the edit budget spent, turn content takes spare message tokens
-    /// (TASK-062): lines used to be new messages.
+    /// (TASK-062): lines used to be new messages. The two classes alone, as
+    /// above.
     #[tokio::test(start_paused = true)]
     async fn turn_content_takes_spare_message_tokens_when_the_edit_budget_is_spent() {
         let fake = Fake::new(&[]);
@@ -3365,7 +3524,7 @@ mod tests {
             }
             ops.push((100, line));
         }
-        run_timed(&fake, ops).await;
+        run_classes(&fake, ops).await;
         let at: Vec<Duration> = fake
             .calls()
             .into_iter()
@@ -3377,10 +3536,11 @@ mod tests {
     }
 
     /// Ten topics whose turn messages grow every 2 s and ten status
-    /// messages refreshed for good: with spare message tokens taken for turn
-    /// content, every turn message still shows its new lines within a bound.
+    /// messages refreshed for good share the group's budget (TASK-068):
+    /// every turn message still shows its new lines within a bound, and
+    /// the refreshes still go.
     #[tokio::test(start_paused = true)]
-    async fn ten_growing_turn_messages_share_both_budgets() {
+    async fn ten_growing_turn_messages_share_the_group_budget() {
         let fake = Fake::new(&[]);
         let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
         let handle = tokio::spawn(scheduler.run());
@@ -3390,7 +3550,7 @@ mod tests {
             let outbox = outbox.clone();
             writers.push(tokio::spawn(async move {
                 let mut text = String::new();
-                for step in 0..60 {
+                for step in 0..150 {
                     text.push_str(&format!("{topic}-{step}\n"));
                     let mut op = into(500 + topic, text.trim_end());
                     if let Op::Stream { thread_id, .. } = &mut op {
@@ -3401,7 +3561,7 @@ mod tests {
                 }
             }));
         }
-        tokio::time::sleep(Duration::from_secs(130)).await;
+        tokio::time::sleep(Duration::from_secs(300)).await;
         let calls = fake.calls();
         for topic in 0..10i64 {
             let at: Vec<Duration> = calls
@@ -3416,14 +3576,16 @@ mod tests {
                 .map(|pair| pair[1] - pair[0])
                 .max()
                 .unwrap_or_default();
-            // 35 requests a minute for twenty messages: each turn message
-            // shows its new lines about every half minute.
+            // The ten turn messages take four of every five tokens (a status
+            // refresh the fifth), oldest first: each comes around within
+            // ceil(10 x 5 / 4) = 13 tokens of 4 s, a debounce after its
+            // line at most; 300 s give 5 + 75 tokens, six each.
+            let bound = GROUP_BUCKET.refill_every * 13 + DEBOUNCE;
             assert!(at.len() >= 3, "topic {topic}: {} writes", at.len());
-            assert!(
-                gap <= Duration::from_secs(60),
-                "topic {topic}: {gap:?} between writes"
-            );
+            assert!(gap <= bound, "topic {topic}: {gap:?} between writes");
         }
+        let refreshes = calls.iter().filter(|call| call.op.background()).count();
+        assert!(refreshes >= 10, "{refreshes} refreshes");
         handle.abort();
     }
     /// A delete (an old status message, a service message) keeps its place
@@ -3480,5 +3642,74 @@ mod tests {
             editor.abort();
         }
         handle.abort();
+    }
+
+    // ------------------------------------------------------------ TASK-068
+
+    /// Ten status messages refreshed for good keep the group's budget busy:
+    /// a new message still takes the next token of the group, not the fifth.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_message_takes_the_groups_token_before_status_refreshes() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        let handle = tokio::spawn(scheduler.run());
+        let refreshes = refresh_forever(&outbox, 10);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        for i in 0..6i64 {
+            tokio::time::sleep(Duration::from_millis(5300)).await;
+            let wait = waited(&outbox, send(i, &format!("m{i}"))).await;
+            assert!(wait <= GROUP_BUCKET.refill_every, "m{i} waited {wait:?}");
+        }
+        assert!(
+            refreshes.lock().map(|log| log.len()).unwrap_or(0) > 10,
+            "refreshes went on meanwhile"
+        );
+        handle.abort();
+    }
+
+    /// A 429 halves the group's rate: the refused request goes when the
+    /// pause ends, the next ones one token per 8 s instead of 4 s, and the
+    /// rate comes back by a tenth a minute, full after five minutes.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_halves_the_groups_rate_and_it_comes_back_slowly() {
+        let fake = Fake::new(&[10]);
+        let ops = (0..110).map(|i| (0, edit(i, "x"))).collect();
+        let answers = run_timed(&fake, ops).await;
+        assert!(answers.iter().all(|a| matches!(a, Some(Ok(_)))));
+        let at: Vec<Duration> = fake.calls().iter().map(|call| call.at).collect();
+        assert_eq!(
+            at[..2],
+            [ms(0), ms(10_000)],
+            "the retry when the pause ends"
+        );
+        let gap = at[2] - at[1];
+        assert!(
+            (ms(7_900)..=ms(8_000)).contains(&gap),
+            "half the rate after the 429: {gap:?}"
+        );
+        // Half the rate plus a tenth a minute: full five minutes after the
+        // pause, 4 s a token from then.
+        let full = ms(10_000) + Duration::from_secs(300);
+        let later: Vec<Duration> = at
+            .windows(2)
+            .filter(|pair| pair[0] >= full)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        assert!(!later.is_empty(), "the run lasts past the recovery: {at:?}");
+        assert!(
+            later
+                .iter()
+                .all(|gap| *gap <= GROUP_BUCKET.refill_every + ms(1)),
+            "full rate again: {later:?}"
+        );
+        let slow: Vec<Duration> = at
+            .windows(2)
+            .skip(1)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        assert!(
+            slow.windows(2).all(|pair| pair[1] <= pair[0] + ms(1)),
+            "the gaps only shrink: {slow:?}"
+        );
     }
 }
