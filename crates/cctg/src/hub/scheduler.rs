@@ -690,10 +690,10 @@ impl Bucket {
     }
 }
 
-/// The text and buttons of a new status message (TASK-062), read when it
-/// goes out, not when it was queued: after a wait for the group's budget it
-/// shows the status of that moment. The sender keeps a clone to change it
-/// meanwhile and to learn what went out.
+/// The text and buttons of a status message (TASK-062), new or edited, read
+/// when the call goes out, not when it was queued: after a wait for the
+/// group's budget it shows the status of that moment. The sender keeps a
+/// clone to change it meanwhile and to learn what went out.
 #[derive(Debug, Clone)]
 pub struct LiveText(Arc<Mutex<LiveContent>>);
 
@@ -720,7 +720,8 @@ impl LiveText {
         self.lock().current = (text, keyboard);
     }
 
-    /// What the last try sent, or what it is to show when none went.
+    /// What the last try sent, or what it is to show when none went; what
+    /// Telegram shows only once the call was accepted.
     pub fn shown(&self) -> (String, Value) {
         let content = self.lock();
         content
@@ -729,10 +730,18 @@ impl LiveText {
             .unwrap_or_else(|| content.current.clone())
     }
 
-    /// Puts the newest text and buttons into `op`, a `Send`.
+    /// The same text: `other` is a clone of this one.
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Puts the newest text and buttons into `op`, a `Send` or an `Edit`.
     fn fill(&self, op: &mut Op) {
         let mut content = self.lock();
         if let Op::Send {
+            text, reply_markup, ..
+        }
+        | Op::Edit {
             text, reply_markup, ..
         } = op
         {
@@ -755,7 +764,8 @@ struct Job {
     /// more lines in, so it cannot become HTML and be refused a second time.
     plain_retry: bool,
     /// A status message (TASK-062): its text is read when it goes, and a
-    /// permission prompt of its topic answers it `Superseded` while it waits.
+    /// permission prompt of its topic answers a new one `Superseded` while it
+    /// waits.
     status: Option<LiveText>,
 }
 
@@ -772,11 +782,11 @@ impl Outbox {
         self.submit_job(op, None).await
     }
 
-    /// Enqueues a new status message, a `Send` (TASK-062): it goes with the
-    /// text `status` holds then. A status message never holds a permission
-    /// prompt (or question) of its topic back: when one comes while it
-    /// waits, it is answered `Superseded` and its sender sends it again
-    /// below the prompt.
+    /// Enqueues a new status message, a `Send`, or an `Edit` of one
+    /// (TASK-062): it goes with the text `status` holds then. A new status
+    /// message never holds a permission prompt (or question) of its topic
+    /// back: when one comes while it waits, it is answered `Superseded` and
+    /// its sender sends it again below the prompt.
     pub async fn submit_status(&self, op: Op, status: LiveText) -> oneshot::Receiver<Delivery> {
         self.submit_job(op, Some(status)).await
     }
@@ -977,6 +987,9 @@ impl<T: Transport> Scheduler<T> {
                     // wait behind the refreshes it replaced.
                     *queued_background &= *background;
                 }
+                // The newer one's text is read when it goes; one without
+                // (an old status message emptied) goes as it is.
+                queued.status = job.status;
                 let superseded = std::mem::replace(&mut queued.reply, job.reply);
                 let _ = superseded.send(Ok(Outcome::Superseded));
                 return;
@@ -1966,6 +1979,53 @@ mod tests {
         assert!(matches!(s2.await, Ok(Ok(Outcome::Superseded))));
         assert!(matches!(p2.await, Ok(Ok(Outcome::Sent(_)))));
         assert_eq!(texts(&fake), ["s2", "p2"]);
+    }
+
+    /// TASK-062 code review: a status refresh goes with the text it holds
+    /// when it goes; one that replaces it in the queue brings its own text.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_refresh_goes_with_the_text_of_when_it_goes() {
+        let keyboard = serde_json::json!({"inline_keyboard": []});
+        let live = |text: &str| LiveText::new(text.to_owned(), keyboard.clone());
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        // Message 7: its text changes while it waits.
+        let first = live("❓ Ждёт разрешения");
+        let r7 = outbox
+            .submit_status(refresh(7, "❓ Ждёт разрешения"), first.clone())
+            .await;
+        first.set("💤 Ждёт вас".to_owned(), keyboard.clone());
+        // Message 8: a newer status edit replaces the queued one. Message 9:
+        // an edit without a live text (an old status message emptied) does.
+        let old = live("❓ old");
+        let _r8 = outbox
+            .submit_status(refresh(8, "❓ old"), old.clone())
+            .await;
+        let newer = live("⏹ newer");
+        let _r8b = outbox
+            .submit_status(edit(8, "⏹ newer"), newer.clone())
+            .await;
+        old.set("❓ stale".to_owned(), keyboard.clone());
+        newer.set("⚙️ newest".to_owned(), keyboard.clone());
+        let r9 = outbox
+            .submit_status(refresh(9, "❓ s9"), live("❓ s9"))
+            .await;
+        let _r9b = outbox.submit(edit(9, "emptied")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert!(matches!(r7.await, Ok(Ok(Outcome::Done))));
+        assert!(matches!(r9.await, Ok(Ok(Outcome::Superseded))));
+        let calls = fake.calls();
+        let mut sent: Vec<(i64, &str)> = calls
+            .iter()
+            .filter_map(|call| match &call.op {
+                Op::Edit { message_id, .. } => Some((*message_id, text_of(&call.op))),
+                _ => None,
+            })
+            .collect();
+        sent.sort_unstable();
+        assert_eq!(sent, [(7, "💤 Ждёт вас"), (8, "⚙️ newest"), (9, "emptied")]);
+        assert_eq!(first.shown(), ("💤 Ждёт вас".to_owned(), keyboard));
     }
 
     #[tokio::test(start_paused = true)]

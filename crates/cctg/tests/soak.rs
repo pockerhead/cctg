@@ -33,7 +33,8 @@
 //! remove, user and service messages included), and at the end every topic
 //! must end with its status message, nothing is pinned, every prompt and tool
 //! line shows exactly once and in order, every answer is a loud message
-//! of its own, and no new status message still shows a decided prompt.
+//! of its own, and no status message sent or edited after the decisions
+//! (there must be some in both prompts' topics) still shows a decided prompt.
 //! Several minutes (20 messages and 20 edits a minute). In every fake mode a
 //! permission prompt goes within three message refills (+3 s) of its request.
 //!
@@ -88,6 +89,8 @@ const A2: &str = "a2a2a2a2-0000-4000-8000-000000000002";
 const B1: &str = "b1b1b1b1-0000-4000-8000-000000000003";
 const NESTED: &str = "ee0e0e0e-0000-4000-8000-000000000004";
 const A5: &str = "a5a5a5a5-0000-4000-8000-000000000005";
+/// The status of a session a permission prompt waits for (`status::render`).
+const WAITING: &str = "❓ Ждёт разрешения";
 
 fn short(session: &str) -> &str {
     &session[..8]
@@ -1758,14 +1761,27 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     }
     let latency_a = p_a.at.duration_since(t0);
     let latency_a2 = p_a2.at.duration_since(t0);
-    // A prompt goes first among new messages once no older message of its
-    // topic waits (a status message of its topic gives way, TASK-062). With
-    // the bucket spent by the burst, at most three new messages go from the
-    // request on before the later prompt: A #2's debounced lines (they go
-    // first, as one message), then both prompts; so its token comes within
-    // three refills. 3 s cover the agent link, the hub actor and a loaded
-    // machine. Status mode: 3 x 4 s + 3 s = 15 s (it was 128-172 s behind
-    // the topic's status move).
+    // The bound, derived from the scheduler's rules (TASK-062 code review):
+    // - The burst spent the message bucket at t0; from then a message token
+    //   comes every `refill_every`.
+    // - Until the hub queues a prompt (agent link, hub actor: L), any job
+    //   takes the tokens that come, a new message or turn content written
+    //   into a message above that takes a spare one (`spills`). Those tokens
+    //   are gone, but they came within L.
+    // - Once queued, a prompt takes the next message token before any other
+    //   job (`next_permission`, checked before the spill path), unless an
+    //   older ordinary message of its topic (a send or document that is not
+    //   a status message: those are dropped for it, TASK-062) waits; each of
+    //   those takes one token first. Stream lines of its topic yield, except
+    //   debounced tool lines that came first: they go first, as one message.
+    // - In this scenario A and A #2 have no ordinary message queued then
+    //   (answers and lines ride the stream), so from the later request's
+    //   queueing at most three messages go up to the later prompt: A's
+    //   prompt, A #2's debounced lines, A #2's prompt.
+    // So latency <= L + 3 x refill_every. L is taken as 3 s (a loaded
+    // machine): a heuristic for the manual run, not a guarantee; CI never
+    // runs this (`#[ignore]`). Status mode: 3 x 4 s + 3 s = 15 s (it was
+    // 128-172 s behind the topic's status move).
     if !soak.live {
         let bound = soak.limits.messages.refill_every * 3 + Duration::from_secs(3);
         for (name, latency) in [("A", latency_a), ("A #2", latency_a2)] {
@@ -2228,21 +2244,61 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let mut layout_notes = Vec::new();
     if soak.status {
         assert_eq!(tg.count("unpin"), 0, "nothing was pinned, nothing unpinned");
-        // A new status message shows the status of when it goes, not of
-        // when it was queued (TASK-062): no waiting one after the decisions.
-        // 1 s covers the verdict's acknowledgement reaching the hub.
-        let stale: Vec<&Call> = calls
+        // A new status message, and an edit of one, show the status of when
+        // they go, not of when they were queued (TASK-062): no waiting one
+        // after the decisions. 1 s covers the verdict's acknowledgement
+        // reaching the hub. Status calls are told by the first words of
+        // their text (`status::render`).
+        let status_text = |text: &str| {
+            ["🏁 ", WAITING, "⏹ Esc", "⚙️ ", "💭 ", "💤 ", "🗜 "]
+                .iter()
+                .any(|head| text.starts_with(head))
+        };
+        let thread_of: BTreeMap<i64, i64> = calls
+            .iter()
+            .filter(|call| call.kind == "send")
+            .filter_map(|call| Some((call.message_id?, call.thread?)))
+            .collect();
+        let after: Vec<&Call> = calls
             .iter()
             .filter(|call| {
-                call.kind == "send"
+                matches!(call.kind, "send" | "edit")
                     && call.at > decided + Duration::from_secs(1)
-                    && call.text.starts_with("❓")
+                    && status_text(&call.text)
             })
+            .collect();
+        let stale: Vec<&&Call> = after
+            .iter()
+            .filter(|call| call.text.starts_with(WAITING))
             .collect();
         assert!(
             stale.is_empty(),
             "a status message still waiting after the decisions: {stale:?}"
         );
+        // Not vacuous: the statuses of both prompts' topics went on after
+        // the decisions.
+        let in_topics = |topics: &[i64]| {
+            after
+                .iter()
+                .filter(|call| call.outcome == "ok")
+                .filter(|call| {
+                    let thread = match call.kind {
+                        "send" => call.thread,
+                        _ => call.message_id.and_then(|id| thread_of.get(&id).copied()),
+                    };
+                    thread.is_some_and(|thread| topics.contains(&thread))
+                })
+                .count()
+        };
+        let (of_a, of_a2) = (in_topics(&[t_a]), in_topics(&[t_a2]));
+        assert!(
+            of_a > 0 && of_a2 > 0,
+            "no status call after the decisions (A {of_a}, A #2 {of_a2}): the check above saw nothing"
+        );
+        layout_notes.push(format!(
+            "status sends and edits after the decisions: {} (A {of_a}, A #2 {of_a2}), none waiting",
+            after.len()
+        ));
         let (a1s, a2s, b1s, a5s) = (short(A1), short(A2), short(B1), short(A5));
         let mut want_a2 = vec![format!("> task {a2s}"), format!("• Bash: step {a2s} ✓")];
         want_a2.extend((0..burst_a2).map(|n| format!("> burst {a2s} {n:02}")));

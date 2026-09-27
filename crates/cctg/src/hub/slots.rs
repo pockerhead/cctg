@@ -680,10 +680,10 @@ enum StatusJob {
         pinned: bool,
         content: LiveText,
     },
+    /// `content`: read when the edit goes, like a new message's.
     Edit {
         message: MessageKey,
-        text: String,
-        keyboard: serde_json::Value,
+        content: LiveText,
     },
     /// A dead slot's status message a hub before TASK-062 pinned: unpinned
     /// in place, once (TASK-062).
@@ -708,7 +708,9 @@ struct Bottom {
     posting: usize,
     /// The newest message id seen in the topic: sent by the hub or by a user.
     last: i64,
-    /// The command worker posted here since the status message was sent.
+    /// The status message is to move although no message below it is
+    /// known: the command worker posted here since it was sent, or its move
+    /// failed or gave way to a permission prompt.
     foreign: bool,
     /// The status message is being turned into turn content by stream
     /// message `number` of `session`.
@@ -744,6 +746,9 @@ struct Shown {
     /// A `Create` or `Replace` is in flight, with what it is to show: the
     /// status message is not known to be the last one of its topic.
     sending: Option<LiveText>,
+    /// The newest `Edit` in flight, with what it is to show: a refresh that
+    /// waits for the edit budget goes with the status of when it goes.
+    editing: Option<LiveText>,
     /// The `Replace` in flight moves a status message a hub before TASK-062
     /// pinned: one slot at a time.
     migrating: bool,
@@ -6893,10 +6898,10 @@ impl Slots {
     /// a ⏹ press. A status message with something below it in its topic
     /// (TASK-062), or pinned by a hub before TASK-062, is replaced by a new
     /// one below once nothing more of the hub is on its way into that topic;
-    /// a new one goes after the slot's separator. A new one goes with the
-    /// status of when it goes, and a permission prompt or question of its
-    /// topic that comes while it waits drops it: it is planned again below
-    /// the prompt (TASK-062).
+    /// a new one goes after the slot's separator. A new one and an edit go
+    /// with the status of when they go, and a permission prompt or question
+    /// of its topic that comes while a new one waits drops it: it is planned
+    /// again below the prompt (TASK-062).
     fn pump_status(&mut self) {
         let Some(every) = self.options.status_every else {
             return;
@@ -6922,15 +6927,25 @@ impl Slots {
                 .shown
                 .get(&slot)
                 .map_or((0, false), |shown| (shown.in_flight, shown.urgent));
-            // A new status message still on its way shows the newest status
-            // when it goes (TASK-062).
-            if let Some(content) = self
+            // A status message or edit still on its way shows the newest
+            // status when it goes (TASK-062).
+            let live_texts: Vec<LiveText> = self
                 .shown
                 .get(&slot)
-                .and_then(|shown| shown.sending.clone())
-            {
+                .map(|shown| {
+                    shown
+                        .sending
+                        .iter()
+                        .chain(&shown.editing)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !live_texts.is_empty() {
                 let (text, keyboard) = self.status_view(slot, &session, now);
-                content.set(text, keyboard);
+                for content in live_texts {
+                    content.set(text.clone(), keyboard.clone());
+                }
             }
             // Only a ⏹ edit goes next to a call in flight.
             if in_flight > 1 || (in_flight == 1 && !urgent) {
@@ -6941,12 +6956,15 @@ impl Slots {
             let absorbing = bottom.is_some_and(|bottom| bottom.absorbing.is_some());
             let owed = bottom.is_some_and(|bottom| bottom.owed);
             let live = self.registry.is_live_top_level(&session);
-            // An old pin of a live slot moves once, one slot at a time; a
-            // dead slot's is only unpinned (below) and moves with the slot's
-            // next activity.
+            // An old pin of a live slot moves once, one slot at a time,
+            // whatever came below it; a dead slot's is only unpinned (below)
+            // and moves with the slot's next activity.
             let buried = status.is_some_and(|status| {
-                (status.pinned && live && !migrating)
-                    || bottom.is_some_and(|bottom| bottom.buries(status.message_id))
+                if status.pinned {
+                    live && !migrating
+                } else {
+                    bottom.is_some_and(|bottom| bottom.buries(status.message_id))
+                }
             });
             let (text, keyboard) = self.status_view(slot, &session, now);
             let shown = self.shown.entry(slot).or_default();
@@ -6996,8 +7014,7 @@ impl Slots {
                     }
                     StatusJob::Edit {
                         message,
-                        text,
-                        keyboard,
+                        content: LiveText::new(text, keyboard),
                     }
                 }
                 // Only for a live session, or where the status message just
@@ -7010,8 +7027,9 @@ impl Slots {
             };
             shown.in_flight += 1;
             let background = match job {
-                StatusJob::Edit { .. } => {
+                StatusJob::Edit { ref content, .. } => {
                     shown.next_at = Some(now + every);
+                    shown.editing = Some(content.clone());
                     !std::mem::take(&mut shown.urgent)
                 }
                 StatusJob::Unpin { .. } => false,
@@ -7043,17 +7061,16 @@ impl Slots {
                         notify: false,
                     }
                 }
-                StatusJob::Edit {
-                    message,
-                    text,
-                    keyboard,
-                } => Op::Edit {
-                    chat: message.chat,
-                    message_id: message.id,
-                    text: text.clone(),
-                    reply_markup: Some(keyboard.clone()),
-                    background,
-                },
+                StatusJob::Edit { message, content } => {
+                    let (text, keyboard) = content.shown();
+                    Op::Edit {
+                        chat: message.chat,
+                        message_id: message.id,
+                        text,
+                        reply_markup: Some(keyboard),
+                        background,
+                    }
+                }
                 StatusJob::Unpin { message } => Op::Unpin {
                     chat: message.chat,
                     message_id: message.id,
@@ -7076,6 +7093,14 @@ impl Slots {
             .and_then(|slot| slot.primary()?.status);
         let shown = self.shown.entry(slot).or_default();
         shown.in_flight = shown.in_flight.saturating_sub(1);
+        if let StatusJob::Edit { content, .. } = &job
+            && shown
+                .editing
+                .as_ref()
+                .is_some_and(|editing| editing.is(content))
+        {
+            shown.editing = None;
+        }
         if matches!(delivery, Some(Ok(Outcome::Superseded))) {
             // An edit: a ⏹ edit of the message, or the turn content it
             // became, took its place; that answer counts. A new status
@@ -7087,6 +7112,8 @@ impl Slots {
                 shown.migrating = false;
                 if let Some(bottom) = self.bottoms.get_mut(place) {
                     match job {
+                        // An old pin stays pinned: it moves again as one.
+                        StatusJob::Replace { pinned: true, .. } => {}
                         StatusJob::Replace { .. } => bottom.foreign = true,
                         _ => bottom.owed = true,
                     }
@@ -7102,11 +7129,7 @@ impl Slots {
                 pinned,
                 content,
             } => (place, Some((old, pinned)), content),
-            StatusJob::Edit {
-                message,
-                text,
-                keyboard,
-            } => {
+            StatusJob::Edit { message, content } => {
                 let applied = matches!(&delivery, Some(Ok(_)))
                     || delivery.as_ref().is_some_and(|delivery| {
                         telegram_error(delivery, &["message is not modified"])
@@ -7118,6 +7141,7 @@ impl Slots {
                     )
                 });
                 if applied {
+                    let (text, keyboard) = content.shown();
                     shown.shows(text, keyboard, now);
                 } else if gone {
                     // Deleted in Telegram: a new one is sent.
@@ -7195,6 +7219,8 @@ impl Slots {
                 // due still holds (TASK-062).
                 if let Some(bottom) = self.bottoms.get_mut(&place) {
                     match old {
+                        // An old pin stays pinned: it moves again as one.
+                        Some((_, true)) => {}
                         Some(_) => bottom.foreign = true,
                         None => bottom.owed = true,
                     }
@@ -7218,9 +7244,11 @@ impl Slots {
     }
 
     /// Whether the status message of `slot` can become turn content in
-    /// `place` now (TASK-062): it is the last message of that topic, and no
-    /// new message of the hub and no call that makes a status message is on
-    /// its way there.
+    /// `place` now (TASK-062): it is known to be the last message of that
+    /// topic, and no new message of the hub and no call that makes a status
+    /// message is on its way there. One this run of the hub has not seen go
+    /// in (sent before a restart or an upgrade, perhaps far up the topic)
+    /// never is: the next content goes below it, and it moves.
     fn absorbable(&self, slot: SlotId, place: Place) -> Option<MessageKey> {
         self.options.status_every?;
         let view = self.registry.slot(slot)?.primary()?;
@@ -7233,8 +7261,11 @@ impl Slots {
                 .shown
                 .get(&slot)
                 .is_some_and(|shown| shown.sending.is_some())
-            || bottom.is_some_and(|bottom| {
-                bottom.posting > 0 || bottom.absorbing.is_some() || bottom.buries(status.message_id)
+            || bottom.is_none_or(|bottom| {
+                bottom.last < status.message_id
+                    || bottom.posting > 0
+                    || bottom.absorbing.is_some()
+                    || bottom.buries(status.message_id)
             });
         (!blocked).then(|| MessageKey::new(view.chat, status.message_id))
     }
@@ -8146,7 +8177,10 @@ async fn dispatch_loop(
         let posts = op.posts();
         let answer = match &work {
             Work::Status {
-                job: StatusJob::Create { content, .. } | StatusJob::Replace { content, .. },
+                job:
+                    StatusJob::Create { content, .. }
+                    | StatusJob::Replace { content, .. }
+                    | StatusJob::Edit { content, .. },
                 ..
             } => outbox.submit_status(op, content.clone()).await,
             _ => outbox.submit(op).await,
@@ -20496,5 +20530,471 @@ again"
             .or_default()
             .absorbing = Some((A.to_owned(), 1, key));
         assert_eq!(slots.status_slot(key), Some(SlotId(0)));
+    }
+
+    // ---- TASK-062 review: a status message the hub has not seen go in
+
+    /// The code review's repro (TASK-062): a dead slot's status message a
+    /// hub before TASK-062 pinned is unpinned where it is, perhaps far up
+    /// the topic; `claude --resume` of the same session posts no separator.
+    /// It takes no turn content: the first content goes below it, and it
+    /// moves there.
+    #[tokio::test]
+    async fn an_old_status_message_unpinned_in_place_takes_no_turn_content_after_a_resume() {
+        let dir = TempDir::new("slots-rolling-unpinned-resume");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.registry.slots[0].views[0].pending_separator = None;
+        slots.on_hook(&session_end(A, 10));
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: true,
+        });
+        let mut work = capture_dispatch(&mut slots);
+        slots.pump();
+        let (job, _) = status_work(&mut work).remove(0);
+        assert!(matches!(job, StatusJob::Unpin { .. }), "{job:?}");
+        slots.on_status_done(SlotId(0), job, Some(Ok(Outcome::Done)));
+        slots.on_hook(&start_with(A, 12, "x.jsonl", "resume"));
+        assert!(slots.registry.is_live_top_level(A), "live again");
+        assert_eq!(slots.registry.slots[0].views[0].pending_separator, None);
+        let place = Place::topic(Chat::Group, 100);
+        assert_eq!(
+            slots.absorbable(SlotId(0), place),
+            None,
+            "not known to be the last message of its topic"
+        );
+        // Until something comes below it, it is edited where it is.
+        slots.pump();
+        for (job, op) in status_work(&mut work) {
+            assert!(
+                matches!(
+                    op,
+                    Op::Edit {
+                        message_id: 500,
+                        ..
+                    }
+                ),
+                "{op:?}"
+            );
+            slots.on_status_done(SlotId(0), job, Some(Ok(Outcome::Done)));
+        }
+        // The turn's first content went as a new message.
+        slots.on_done(Done::Posted {
+            place,
+            message_id: Some(501),
+        });
+        slots.pump();
+        let handed = status_work(&mut work);
+        assert!(
+            handed.iter().any(|(job, _)| matches!(
+                job,
+                StatusJob::Replace { old, pinned: false, .. } if old.id == 500
+            )),
+            "it moves below the content: {handed:?}"
+        );
+    }
+
+    /// The registry of the last run, with slot 0 of `A` in topic 100 and
+    /// status message 500 there; `ended`: `A` ended, and the message is an
+    /// old pin.
+    fn save_last_run(dir: &TempDir, path: &str, ended: bool) {
+        let mut slots = stalled_slots(dir, status_options());
+        slots.on_hook(&start_with(A, 10, path, "startup"));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.registry.slots[0].views[0].pending_separator = None;
+        if ended {
+            slots.on_hook(&session_end(A, 10));
+        }
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: ended,
+        });
+        let store = RegistryStore::open(dir.path()).unwrap();
+        store.save(&RegistryStore::encode(&slots.registry)).unwrap();
+    }
+
+    /// After a restart of the hub (TASK-062 code review) the status message
+    /// of the last run may not be the last message of its topic any more:
+    /// the first line of the turn goes as a new message, never into it, and
+    /// the status message moves below that line.
+    #[tokio::test]
+    async fn after_a_restart_the_first_turn_line_goes_below_the_old_status_message() {
+        let dir = TempDir::new("slots-rolling-restart");
+        let path = transcript_file(&dir, A);
+        save_last_run(&dir, &path, false);
+        let fake = Fake {
+            stream_ids: true,
+            ..Fake::default()
+        };
+        let mut rig = stream_rig(fake, status_options(), dir);
+        let _kept = rig.reader(1, A, 10).await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        let ops = settled(&rig, |ops| {
+            ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Delete {
+                        message_id: 500,
+                        ..
+                    }
+                )
+            }) && topic_layout(&rig.fake, 100) == ["• Bash: one ✓", "STATUS"]
+        })
+        .await;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                Op::Stream {
+                    into: Some(500),
+                    ..
+                }
+            )),
+            "{ops:#?}"
+        );
+    }
+
+    /// An old pin of a dead slot is unpinned where it is at the start of
+    /// the new hub; `claude --resume` of the same session brings the slot
+    /// back without a separator, and the status message moves below the
+    /// turn's first line instead of taking it (TASK-062 code review).
+    #[tokio::test]
+    async fn a_resume_after_an_old_pin_was_taken_off_moves_the_status_below_the_turn() {
+        let dir = TempDir::new("slots-rolling-unpinned-restart");
+        let path = transcript_file(&dir, A);
+        save_last_run(&dir, &path, true);
+        let fake = Fake {
+            stream_ids: true,
+            ..Fake::default()
+        };
+        let mut rig = stream_rig(fake, status_options(), dir);
+        settled(&rig, |ops| {
+            ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Unpin {
+                        message_id: 500,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+        rig.hook(start_with(A, 12, &path, "resume")).await;
+        let _kept = rig.reader(1, A, 12).await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        let ops = settled(&rig, |ops| {
+            ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::Delete {
+                        message_id: 500,
+                        ..
+                    }
+                )
+            }) && topic_layout(&rig.fake, 100) == ["• Bash: one ✓", "STATUS"]
+        })
+        .await;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                Op::Stream {
+                    into: Some(500),
+                    ..
+                }
+            )),
+            "{ops:#?}"
+        );
+    }
+
+    /// A status refresh that waits for the edit budget goes with the status
+    /// of when it goes (TASK-062 code review): a prompt decided meanwhile
+    /// leaves no "❓" behind.
+    #[tokio::test]
+    async fn a_waiting_status_refresh_goes_with_the_status_of_when_it_goes() {
+        let dir = TempDir::new("slots-status-edit-live");
+        let (mut slots, _from_hub) = keyed_slots(&dir, status_options());
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: false,
+        });
+        let mut work = capture_dispatch(&mut slots);
+        let set_waiting = |slots: &mut Slots, waiting: bool| {
+            slots.registry.sessions.get_mut(A).unwrap().waiting = waiting;
+        };
+        set_waiting(&mut slots, true);
+        slots.pump();
+        let mut handed = status_work(&mut work);
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        let (refresh, op) = handed.remove(0);
+        assert!(
+            matches!(&op, Op::Edit { message_id: 500, background: true, text, .. }
+                if text.starts_with("❓")),
+            "{op:?}"
+        );
+        let StatusJob::Edit { content, .. } = &refresh else {
+            panic!("{refresh:?}");
+        };
+        let content = content.clone();
+        // The prompt is decided while the refresh waits.
+        set_waiting(&mut slots, false);
+        slots.pump();
+        assert!(status_work(&mut work).is_empty(), "one call at a time");
+        let now = slots.status_view(SlotId(0), A, Instant::now());
+        assert!(!now.0.starts_with("❓"), "{now:?}");
+        assert_eq!(content.shown(), now, "what it goes with");
+        // Telegram took what went.
+        slots.on_status_done(SlotId(0), refresh, Some(Ok(Outcome::Done)));
+        let shown = &slots.shown[&SlotId(0)];
+        assert_eq!(shown.content, Some(now));
+        assert!(shown.editing.is_none());
+    }
+
+    /// A new status message a prompt of its topic superseded (TASK-062 code
+    /// review): it is sent again once the prompt went, below it.
+    #[tokio::test]
+    async fn a_new_status_message_a_prompt_superseded_is_sent_again_below_the_prompt() {
+        let dir = TempDir::new("slots-rolling-superseded-create");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.registry.slots[0].views[0].pending_separator = None;
+        let place = Place::topic(Chat::Group, 100);
+        let mut work = capture_dispatch(&mut slots);
+        slots.pump();
+        let (job, _) = status_work(&mut work).remove(0);
+        assert!(matches!(job, StatusJob::Create { .. }), "{job:?}");
+        slots.hand_off(Work::Message, message_op(place, "prompt".to_owned()));
+        slots.on_done(Done::Posted {
+            place,
+            message_id: None,
+        });
+        slots.on_status_done(SlotId(0), job, Some(Ok(Outcome::Superseded)));
+        let shown = &slots.shown[&SlotId(0)];
+        assert!(shown.sending.is_none() && shown.retry_at.is_none());
+        assert!(slots.bottoms[&place].owed);
+        slots.pump();
+        assert!(
+            status_work(&mut work).is_empty(),
+            "nothing while the prompt is on its way"
+        );
+        slots.on_done(Done::Posted {
+            place,
+            message_id: Some(501),
+        });
+        slots.pump();
+        let (job, _) = status_work(&mut work).remove(0);
+        assert!(matches!(job, StatusJob::Create { .. }), "{job:?}");
+        slots.on_done(Done::Posted {
+            place,
+            message_id: Some(502),
+        });
+        slots.on_status_done(
+            SlotId(0),
+            job,
+            Some(Ok(Outcome::Sent(Message {
+                message_id: 502,
+                ..Message::default()
+            }))),
+        );
+        assert!(slots.shown[&SlotId(0)].sending.is_none());
+        assert_eq!(
+            slots.absorbable(SlotId(0), place),
+            Some(MessageKey::new(Chat::Group, 502)),
+            "the last message of its topic"
+        );
+    }
+
+    /// The move of an old pin a prompt superseded (TASK-062 code review):
+    /// the other slot's old pin moves meanwhile, and the two never move at
+    /// once, also when the prompt went below the first one.
+    #[tokio::test]
+    async fn a_superseded_old_pin_move_waits_for_the_other_slots_move() {
+        let dir = TempDir::new("slots-rolling-superseded-pin");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots.on_hook(&start(B, 11));
+        for (index, topic) in [(0, 100), (1, 101)] {
+            slots
+                .registry
+                .topic_created(SlotId(index), Chat::Group, topic, "a", None);
+            slots.registry.slots[index].views[0].pending_separator = None;
+            slots.registry.slots[index].views[0].status = Some(StatusMessage {
+                message_id: 500 + topic,
+                pinned: true,
+            });
+        }
+        let (place, other) = (
+            Place::topic(Chat::Group, 100),
+            Place::topic(Chat::Group, 101),
+        );
+        let mut work = capture_dispatch(&mut slots);
+        // Answers the edits in place; the moves are returned.
+        let answer_edits = |slots: &mut Slots, handed: Vec<(StatusJob, Op)>| {
+            let mut moves = Vec::new();
+            for (job, _) in handed {
+                match &job {
+                    StatusJob::Edit { message, .. } => {
+                        let slot = SlotId(usize::from(message.id == 601));
+                        slots.on_status_done(slot, job, Some(Ok(Outcome::Done)));
+                    }
+                    _ => moves.push(job),
+                }
+            }
+            moves
+        };
+        slots.pump();
+        let mut moves = answer_edits(&mut slots, status_work(&mut work));
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        let first = moves.remove(0);
+        assert!(
+            matches!(&first, StatusJob::Replace { old, pinned: true, .. } if old.id == 600),
+            "{first:?}"
+        );
+        // A prompt of topic 100 supersedes it.
+        slots.hand_off(Work::Message, message_op(place, "prompt".to_owned()));
+        slots.on_done(Done::Posted {
+            place,
+            message_id: None,
+        });
+        slots.on_status_done(SlotId(0), first, Some(Ok(Outcome::Superseded)));
+        assert!(!slots.shown[&SlotId(0)].migrating);
+        assert!(!slots.bottoms[&place].foreign, "it stays an old pin");
+        // The other slot's old pin moves meanwhile.
+        slots.pump();
+        let mut moves = answer_edits(&mut slots, status_work(&mut work));
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        let second = moves.remove(0);
+        assert!(
+            matches!(&second, StatusJob::Replace { old, pinned: true, .. } if old.id == 601),
+            "{second:?}"
+        );
+        // The prompt went below the first one; its move waits for the other.
+        slots.on_done(Done::Posted {
+            place,
+            message_id: Some(610),
+        });
+        slots.pump();
+        let moves = answer_edits(&mut slots, status_work(&mut work));
+        assert!(moves.is_empty(), "one old pin at a time: {moves:?}");
+        slots.on_done(Done::Posted {
+            place: other,
+            message_id: Some(700),
+        });
+        slots.on_status_done(
+            SlotId(1),
+            second,
+            Some(Ok(Outcome::Sent(Message {
+                message_id: 700,
+                ..Message::default()
+            }))),
+        );
+        slots.pump();
+        let moves = answer_edits(&mut slots, status_work(&mut work));
+        assert!(
+            matches!(
+                moves.as_slice(),
+                [StatusJob::Replace { old, pinned: true, .. }] if old.id == 600
+            ),
+            "then it moves, below the prompt: {moves:?}"
+        );
+    }
+
+    /// Two prompts in a row in one topic (TASK-062 code review): each drops
+    /// the status move queued before it, and the status message ends up
+    /// below the second.
+    #[tokio::test]
+    async fn two_prompts_in_a_row_leave_the_status_message_below_the_second() {
+        let dir = TempDir::new("slots-rolling-two-prompts");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.registry.slots[0].views[0].pending_separator = None;
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: false,
+        });
+        let place = Place::topic(Chat::Group, 100);
+        slots.bottoms.entry(place).or_default().last = 501;
+        let mut work = capture_dispatch(&mut slots);
+        // Answers the edits in place; the moves are returned.
+        let answer_edits = |slots: &mut Slots, handed: Vec<(StatusJob, Op)>| {
+            let mut moves = Vec::new();
+            for (job, _) in handed {
+                match job {
+                    StatusJob::Edit { .. } => {
+                        slots.on_status_done(SlotId(0), job, Some(Ok(Outcome::Done)));
+                    }
+                    job => moves.push(job),
+                }
+            }
+            moves
+        };
+        for (prompt, posted) in [("first", 502), ("second", 503)] {
+            slots.pump();
+            let mut moves = answer_edits(&mut slots, status_work(&mut work));
+            assert_eq!(moves.len(), 1, "{prompt}: {moves:?}");
+            let job = moves.remove(0);
+            assert!(
+                matches!(&job, StatusJob::Replace { old, .. } if old.id == 500),
+                "{prompt}: {job:?}"
+            );
+            slots.hand_off(Work::Message, message_op(place, prompt.to_owned()));
+            slots.on_done(Done::Posted {
+                place,
+                message_id: None,
+            });
+            slots.on_status_done(SlotId(0), job, Some(Ok(Outcome::Superseded)));
+            slots.pump();
+            let moves = answer_edits(&mut slots, status_work(&mut work));
+            assert!(moves.is_empty(), "{prompt} is on its way: {moves:?}");
+            slots.on_done(Done::Posted {
+                place,
+                message_id: Some(posted),
+            });
+        }
+        slots.pump();
+        let mut moves = answer_edits(&mut slots, status_work(&mut work));
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        let job = moves.remove(0);
+        assert!(
+            matches!(&job, StatusJob::Replace { old, .. } if old.id == 500),
+            "{job:?}"
+        );
+        slots.on_done(Done::Posted {
+            place,
+            message_id: Some(504),
+        });
+        slots.on_status_done(
+            SlotId(0),
+            job,
+            Some(Ok(Outcome::Sent(Message {
+                message_id: 504,
+                ..Message::default()
+            }))),
+        );
+        assert_eq!(
+            slots.registry.slots[0].views[0].status,
+            Some(StatusMessage {
+                message_id: 504,
+                pinned: false
+            })
+        );
+        assert_eq!(
+            slots.absorbable(SlotId(0), place),
+            Some(MessageKey::new(Chat::Group, 504)),
+            "below the second prompt (503), the last message of its topic"
+        );
     }
 }
