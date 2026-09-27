@@ -20,6 +20,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.95.0"
+  # Tests publish the debug cctg as a release (update_e2e): with debug info
+  # it outgrew the 64 MiB download cap on Linux (TASK-024).
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   test:
