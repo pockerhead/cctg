@@ -199,11 +199,21 @@ async fn start_hub(
     bucket: BucketConfig,
     fake: Arc<Fake>,
 ) -> Hub {
+    start_hub_with(state, listener, bucket, fake, options()).await
+}
+
+async fn start_hub_with(
+    state: &Path,
+    listener: TcpListener,
+    bucket: BucketConfig,
+    fake: Arc<Fake>,
+    options: Options,
+) -> Hub {
     let (scheduler, outbox) = Scheduler::new(fake.clone(), bucket);
     let sched = tokio::spawn(scheduler.run());
     let store = RegistryStore::open(state).expect("store");
     let registry = store.load().expect("load registry");
-    let slots = Slots::new(registry, store, outbox, options());
+    let slots = Slots::new(registry, store, outbox, options);
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -1238,4 +1248,103 @@ async fn e2e_six_turns_with_refusals_keep_every_answer_in_place() {
     );
     assert_eq!(refused, 6, "every planned refusal happened");
     hub.stop();
+}
+
+/// TASK-024 item 1: A's tool line is refused, and A ends (`exit`) or is
+/// replaced by `/clear` while its stream waits for the retry; B takes the
+/// slot. A cannot read any more, yet its line reaches the topic, once and
+/// before B's session separator.
+async fn rotation_while_a_refused_line_waits(clear: bool) {
+    let s = session(
+        if clear { "rotate-clear" } else { "rotate-exit" },
+        20 + u32::from(clear),
+    );
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let options = Options {
+        // Long enough for the session to end while the line waits.
+        stream_retry: Duration::from_millis(1500),
+        ..options()
+    };
+    let hub = start_hub_with(&s.state, l, fast_bucket(), fake.clone(), options).await;
+    start_session(&hub, &s, "startup").await;
+    let agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("warm"));
+    wait_for("stream up", 20, || fake.topic_lines().len() == 1).await;
+    *fake.refuse_once.lock().unwrap() = vec!["last step".into()];
+    s.append(&call("tl", "last step"));
+    s.append(&result("tl", false));
+    wait_for("the refusal", 20, || {
+        fake.recs().iter().any(|r| {
+            !r.accepted && matches!(&r.op, Op::Stream { text, .. } if text.contains("last step"))
+        })
+    })
+    .await;
+    // A leaves the slot at once; B (same folder) takes it.
+    hub.hooks
+        .send(s.post(HookEvent::SessionEnd {
+            reason: Some(if clear { "clear" } else { "prompt_input_exit" }.into()),
+            claude_pid: Some(4242),
+        }))
+        .await
+        .unwrap();
+    if !clear {
+        drop(agent);
+    }
+    let b_id = format!("0b16e2e0-0000-4000-8000-{:012}", 20 + u32::from(clear));
+    let b_transcript = s.transcript.with_file_name(format!("{b_id}.jsonl"));
+    hub.hooks
+        .send(HookPost::new(
+            HOST.into(),
+            b_id.clone(),
+            s.cwd(),
+            b_transcript.to_string_lossy().into_owned(),
+            HookEvent::SessionStart {
+                source: Some(if clear { "clear" } else { "startup" }.into()),
+                claude_pid: Some(if clear { 4242 } else { 4343 }),
+                parent_claude_pid: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let is_separator = |r: &Rec| {
+        r.accepted
+            && matches!(&r.op, Op::Send { text, thread_id: Some(THREAD), .. } if text.starts_with("── session"))
+    };
+    wait_for("B's separator", 30, || fake.recs().iter().any(is_separator)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let recs = fake.recs();
+    let line = recs.iter().position(|r| {
+        r.accepted && matches!(&r.op, Op::Stream { text, .. } if text.contains("last step"))
+    });
+    let separator = recs.iter().position(is_separator);
+    if line.is_none() || separator < line {
+        dump(&fake);
+    }
+    let line = line.expect("A's refused line reaches the topic");
+    assert!(
+        separator.is_some_and(|separator| line < separator),
+        "A's line before B's separator"
+    );
+    let lines = fake.topic_lines();
+    assert_eq!(lines, ["> warm".to_owned(), ok_line("last step")]);
+    assert_no_dup(&lines);
+    hub.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_session_that_exits_while_its_refused_line_waits_still_sends_it_before_the_next_separator()
+ {
+    rotation_while_a_refused_line_waits(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_clear_while_a_refused_line_waits_still_sends_it_before_the_next_separator() {
+    rotation_while_a_refused_line_waits(true).await;
 }

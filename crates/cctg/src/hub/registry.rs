@@ -1540,10 +1540,22 @@ impl Registry {
         self.dirty = true;
     }
 
+    #[cfg(test)]
+    pub fn topic_work(&mut self, icons: &Icons, edits: bool) -> Vec<TopicJob> {
+        self.topic_work_except(icons, edits, &HashSet::new())
+    }
+
     /// Topic calls needed to make Telegram match the registry. Marks the
     /// slots busy. `edits`: false during the start-up grace, when agents are
-    /// still reconnecting and icons would flicker.
-    pub fn topic_work(&mut self, icons: &Icons, edits: bool) -> Vec<TopicJob> {
+    /// still reconnecting and icons would flicker. `draining`: slots whose
+    /// topic still gets messages of a session that left them; their
+    /// separator (and what comes after it) waits.
+    pub fn topic_work_except(
+        &mut self,
+        icons: &Icons,
+        edits: bool,
+        draining: &HashSet<SlotId>,
+    ) -> Vec<TopicJob> {
         let mut jobs = Vec::new();
         for index in 0..self.slots.len() {
             let id = SlotId(index);
@@ -1569,6 +1581,9 @@ impl Registry {
             // One call per slot at a time; the separator stays pending until
             // Telegram took it.
             if let Some(text) = slot.pending_separator.clone() {
+                if draining.contains(&id) {
+                    continue;
+                }
                 slot.busy = true;
                 jobs.push(TopicJob::Separator {
                     slot: id,
