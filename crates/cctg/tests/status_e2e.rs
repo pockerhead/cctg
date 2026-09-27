@@ -126,16 +126,88 @@ fn prompts(ops: &[Op]) -> Vec<(i64, String)> {
         .collect()
 }
 
-fn pins(ops: &[Op]) -> Vec<i64> {
-    ops.iter()
-        .filter_map(|op| match op {
-            Op::Pin {
-                chat: Chat::Group,
+/// TASK-062: the messages topic `thread` shows now, oldest first: sends
+/// (numbered from 1000 in call order) that were not deleted, with their
+/// text and buttons as their last edit left them.
+fn topic(ops: &[Op], thread: i64) -> Vec<(i64, String, Vec<String>)> {
+    let buttons = |markup: &Option<serde_json::Value>| -> Vec<String> {
+        markup
+            .as_ref()
+            .and_then(|markup| markup["inline_keyboard"].as_array())
+            .into_iter()
+            .flatten()
+            .flat_map(|row| row.as_array().into_iter().flatten())
+            .filter_map(|button| button["callback_data"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let mut shown: Vec<(i64, String, Vec<String>)> = Vec::new();
+    let mut id = 1000;
+    for op in ops {
+        match op {
+            Op::Send {
+                thread_id,
+                text,
+                reply_markup,
+                ..
+            } => {
+                if *thread_id == Some(thread) {
+                    shown.push((id, text.clone(), buttons(reply_markup)));
+                }
+                id += 1;
+            }
+            Op::Edit {
                 message_id,
-            } => Some(*message_id),
+                text,
+                reply_markup,
+                ..
+            } => {
+                if let Some(message) = shown.iter_mut().find(|(at, ..)| at == message_id) {
+                    message.1.clone_from(text);
+                    message.2 = buttons(reply_markup);
+                }
+            }
+            Op::Delete { message_id, .. } => shown.retain(|(at, ..)| at != message_id),
+            _ => {}
+        }
+    }
+    shown
+}
+
+/// The status message of topic `thread` now: the newest status send (the
+/// older ones are deleted when it moves), and what it shows.
+fn current_status(ops: &[Op], thread: i64) -> Option<(i64, (String, Vec<String>))> {
+    let id = ops
+        .iter()
+        .filter(|op| matches!(op, Op::Send { .. }))
+        .zip(1000..)
+        .filter_map(|(op, id)| match op {
+            Op::Send {
+                thread_id: Some(t),
+                reply_markup: Some(_),
+                permission: false,
+                ..
+            } if *t == thread => Some(id),
             _ => None,
         })
-        .collect()
+        .last()?;
+    let (_, text, buttons) = topic(ops, thread).into_iter().find(|(at, ..)| *at == id)?;
+    Some((id, (text, buttons)))
+}
+
+/// TASK-062: the status message is the last message of its topic, and
+/// nothing is pinned.
+fn assert_status_last(ops: &[Op], thread: i64) {
+    let (status, _) = current_status(ops, thread).expect("a status message");
+    assert_eq!(
+        topic(ops, thread).last().map(|(id, ..)| *id),
+        Some(status),
+        "{:#?}",
+        topic(ops, thread)
+    );
+    assert!(
+        !ops.iter().any(|op| matches!(op, Op::Unpin { .. })),
+        "{ops:#?}"
+    );
 }
 
 /// The icon topic `thread` shows: set at creation (topics are numbered from
@@ -378,10 +450,19 @@ impl Hub {
             .unwrap_or_else(|_| panic!("{what}: {:#?}", self.fake.ops()))
     }
 
-    /// Waits until the last edit of `status` is `want`.
-    async fn shows(&self, what: &str, status: i64, want: (String, Vec<String>)) {
-        self.until(what, |ops| edits(ops, status).last() == Some(&want))
-            .await;
+    /// Waits until the status message of topic `thread` shows `want`.
+    async fn shows(&self, what: &str, thread: i64, want: (String, Vec<String>)) {
+        self.until(what, |ops| {
+            current_status(ops, thread).is_some_and(|(_, shown)| shown == want)
+        })
+        .await;
+    }
+
+    /// The status message of topic `thread` now.
+    fn status(&self, thread: i64) -> i64 {
+        current_status(&self.fake.ops(), thread)
+            .map(|(id, _)| id)
+            .expect("a status message")
     }
 
     /// Waits until the slot actor has bound the agent of topic `thread`
@@ -395,11 +476,11 @@ impl Hub {
         .await;
     }
 
-    /// The status message of topic `thread`, once pinned.
+    /// The status message of topic `thread`, once sent.
     async fn status_message(&self, thread: i64) -> i64 {
         let ops = self
-            .until("status message sent and pinned", |ops| {
-                status_sends(ops).iter().any(|(t, _)| *t == thread) && !pins(ops).is_empty()
+            .until("status message sent", |ops| {
+                current_status(ops, thread).is_some()
             })
             .await;
         assert!(
@@ -414,15 +495,7 @@ impl Hub {
             )),
             "status messages go without a sound"
         );
-        // Sends are numbered from 1000 in call order.
-        let index = ops
-            .iter()
-            .filter(|op| matches!(op, Op::Send { .. }))
-            .position(|op| {
-                matches!(op, Op::Send { thread_id: Some(t), reply_markup: Some(_), permission: false, .. } if *t == thread)
-            })
-            .unwrap();
-        1000 + index as i64
+        current_status(&ops, thread).map(|(id, _)| id).unwrap()
     }
 
     /// Stops the hub the way `cctg hub` does (the actor writes the registry)
@@ -551,10 +624,9 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
         status_sends(&hub.fake.ops()),
         [(100, "💤 Ждёт вас".to_owned())]
     );
-    assert_eq!(pins(&hub.fake.ops()), [status]);
 
-    // The bot's pin notice about the status message goes; one about
-    // another message stays.
+    // The bot's pin notice about the status message goes (a hub before
+    // TASK-062 pinned it); one about another message stays.
     hub.control
         .send(Control::Pinned {
             chat: Chat::Group,
@@ -596,7 +668,7 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     hub.hook(A, tool("t1", "• Bash: sleep 30")).await;
     hub.shows(
         "running call shown with ⏹",
-        status,
+        100,
         shown(&format!("⚙️ Bash: sleep 30\n{NUMBERS}"), &["status:stop"]),
     )
     .await;
@@ -604,7 +676,7 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     // ⏹ asks first and only the second press writes Esc.
     hub.press(status, "status:stop");
     hub.until("confirmation shown", |ops| {
-        edits(ops, status).last().is_some_and(|(_, buttons)| {
+        current_status(ops, 100).is_some_and(|(_, (_, buttons))| {
             buttons.first().map(String::as_str) == Some("status:confirm")
         })
     })
@@ -616,7 +688,7 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     // Written is not stopped: the message says Esc was sent, without ⏹.
     hub.shows(
         "a written Esc is shown as sent",
-        status,
+        100,
         shown(&format!("⏹ Esc отправлен в терминал\n{NUMBERS}"), &[]),
     )
     .await;
@@ -635,7 +707,7 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     .await;
     hub.shows(
         "Stop ends the turn",
-        status,
+        100,
         shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
     )
     .await;
@@ -653,14 +725,15 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
         ]
     );
     assert!(agent.quiet().await);
+    assert_status_last(&ops, 100);
+    assert_eq!(status_sends(&ops).len(), 1, "nothing came below it yet");
 
-    // A key that was not written is told once in the topic.
+    // A key that was not written is told once in the topic; the notice
+    // comes below the status message, which moves below it (TASK-062).
     hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
         .await;
     hub.until("thinking", |ops| {
-        edits(ops, status)
-            .last()
-            .is_some_and(|(text, _)| text.starts_with("💭 Думает"))
+        current_status(ops, 100).is_some_and(|(_, (text, _))| text.starts_with("💭 Думает"))
     })
     .await;
     hub.press(status, "status:stop");
@@ -669,28 +742,41 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     agent.written(key_id, false).await;
     hub.until("failure told", |ops| key_failed_notices(ops) == 1)
         .await;
+    let ops = hub
+        .until("the status message moved below the notice", |ops| {
+            status_sends(ops).len() == 2 && topic(ops, 100).len() == 2
+        })
+        .await;
+    assert_status_last(&ops, 100);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op, Op::Delete { message_id, .. } if *message_id == status)),
+        "the old status message is deleted"
+    );
+    let moved = hub.status(100);
+    assert_ne!(moved, status);
 
     // The end of the session: the message says so, without buttons, and a
-    // press does nothing.
+    // press does nothing; a press on the old message is stale.
     hub.end(A, 10).await;
     hub.shows(
         "ended",
-        status,
+        100,
         shown(&format!("🏁 Сессия завершена\n{NUMBERS}"), &[]),
     )
     .await;
-    hub.press(status, "status:confirm");
+    hub.press(moved, "status:confirm");
     hub.until("dead press answered", |ops| {
         answers(ops).last().map(String::as_str) == Some(status::ANSWER_OFFLINE)
     })
     .await;
+    hub.press(status, "status:confirm");
+    hub.until("old press answered", |ops| {
+        answers(ops).last().map(String::as_str) == Some(status::ANSWER_STALE)
+    })
+    .await;
     assert!(agent.quiet().await);
-    assert_eq!(pins(&hub.fake.ops()).len(), 1, "pinned once");
-    assert_eq!(
-        status_sends(&hub.fake.ops()).len(),
-        1,
-        "one message per slot"
-    );
+    assert_status_last(&hub.fake.ops(), 100);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -698,18 +784,18 @@ async fn a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing() {
     let hub = start_hub("waiting", Duration::from_millis(50)).await;
     hub.start(A, 10).await;
     let mut agent = Agent::connect(&hub, A, 10).await;
-    let status = hub.status_message(100).await;
+    hub.status_message(100).await;
     hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
         .await;
     hub.hook(A, tool("t1", "• Bash: rm build")).await;
     hub.shows(
         "a running call offers ⏹",
-        status,
+        100,
         shown("⚙️ Bash: rm build", &["status:stop"]),
     )
     .await;
     // Armed before the prompt opened.
-    hub.press(status, "status:stop");
+    hub.press(hub.status(100), "status:stop");
     hub.until("armed", |ops| answers(ops).len() == 1).await;
     agent
         .send(AgentMsg::PermissionRequest(PermissionRequest {
@@ -719,14 +805,21 @@ async fn a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing() {
             input_preview: "rm -rf build".into(),
         }))
         .await;
-    hub.shows(
-        "a waiting prompt hides ⏹",
-        status,
-        shown("❓ Ждёт разрешения", &[]),
-    )
-    .await;
+    // The prompt comes below the status message, which moves below it.
+    let ops = hub
+        .until("the prompt", |ops| !prompts(ops).is_empty())
+        .await;
+    let (prompt, request_id) = prompts(&ops).pop().expect("prompt shown");
+    let ops = hub
+        .until("a waiting prompt hides ⏹ below the prompt", |ops| {
+            current_status(ops, 100)
+                .is_some_and(|(id, now)| id > prompt && now == shown("❓ Ждёт разрешения", &[]))
+        })
+        .await;
+    assert_status_last(&ops, 100);
     // An old button (first or confirming press) writes nothing: Esc would
     // answer the prompt, not stop the turn.
+    let status = hub.status(100);
     hub.press(status, "status:confirm");
     hub.press(status, "status:stop");
     let ops = hub
@@ -740,7 +833,6 @@ async fn a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing() {
 
     // The prompt is answered in Telegram; the call still runs: ⏹ is back and
     // a fresh confirmation writes Esc.
-    let (prompt, request_id) = prompts(&hub.fake.ops()).pop().expect("prompt shown");
     hub.press(prompt, &format!("allow:{request_id}"));
     let verdict_id = match agent.next().await {
         Some(HubMsg::PermissionVerdict {
@@ -752,7 +844,7 @@ async fn a_waiting_permission_prompt_hides_stop_and_a_press_writes_nothing() {
     agent.send(AgentMsg::PermissionAck { verdict_id }).await;
     hub.shows(
         "⏹ back once the prompt is answered",
-        status,
+        100,
         shown("⚙️ Bash: rm build", &["status:stop"]),
     )
     .await;
@@ -771,24 +863,23 @@ async fn a_late_key_answer_never_reaches_the_next_session_of_the_slot() {
     hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
         .await;
     hub.until("A thinks", |ops| {
-        edits(ops, status)
-            .last()
-            .is_some_and(|(text, _)| text == "💭 Думает")
+        current_status(ops, 100).is_some_and(|(_, (text, _))| text == "💭 Думает")
     })
     .await;
     hub.press(status, "status:stop");
     hub.press(status, "status:confirm");
     let key_id = agent_a.key().await;
 
-    // A ends before its agent answers; B takes the same slot and topic.
+    // A ends before its agent answers; B takes the same slot and topic: its
+    // separator comes below A's status message, which moves below it.
     hub.end(A, 10).await;
     hub.start(B, 11).await;
     let _agent_b = Agent::connect(&hub, B, 11).await;
     hub.hook(B, HookEvent::UserPromptSubmit { prompt_id: None })
         .await;
     hub.shows(
-        "B thinks in the same status message",
-        status,
+        "B thinks in the slot's status message",
+        100,
         shown("💭 Думает", &["status:stop"]),
     )
     .await;
@@ -798,11 +889,16 @@ async fn a_late_key_answer_never_reaches_the_next_session_of_the_slot() {
     let ops = hub.fake.ops();
     assert_eq!(key_failed_notices(&ops), 0, "no notice in B's topic");
     assert_eq!(
-        edits(&ops, status).last(),
-        Some(&shown("💭 Думает", &["status:stop"])),
+        current_status(&ops, 100).map(|(_, shown)| shown),
+        Some(shown("💭 Думает", &["status:stop"])),
         "B's turn is untouched"
     );
-    assert_eq!(status_sends(&ops).len(), 1, "one message per slot");
+    assert_status_last(&ops, 100);
+    assert_eq!(
+        status_sends(&ops).len(),
+        2,
+        "one more message: below the separator"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -814,23 +910,25 @@ async fn a_restarted_hub_keeps_its_status_message_and_the_numbers() {
     hub.numbers(A).await;
     hub.shows(
         "numbers shown",
-        status,
+        100,
         shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
     )
     .await;
     let hub = hub.restart(Duration::from_millis(50)).await;
-    // The same message is edited: no second message, no second pin, and the
-    // numbers are still there without a new status line call.
-    hub.shows(
-        "the same message after the restart",
-        status,
-        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
-    )
+    // The same message is edited: no second message, and the numbers are
+    // still there without a new status line call.
+    hub.until("the same message after the restart", |ops| {
+        edits(ops, status).last() == Some(&shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]))
+    })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let ops = hub.fake.ops();
     assert!(status_sends(&ops).is_empty(), "{ops:#?}");
-    assert!(pins(&ops).is_empty(), "{ops:#?}");
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, Op::Delete { .. } | Op::Unpin { .. })),
+        "{ops:#?}"
+    );
 }
 
 /// TASK-058: an agent that announces `status_lines` is told its session,
@@ -868,7 +966,7 @@ async fn numbers_over_the_agent_link_show_like_the_hooks_numbers() {
     agent.send(numbers(A, 50)).await;
     hub.shows(
         "numbers from the link shown",
-        status,
+        100,
         shown(
             &format!(
                 "💤 Ждёт вас
@@ -949,7 +1047,7 @@ async fn a_press_reaches_only_the_agent_of_its_own_slot() {
     hub.hook(A, tool("t1", "• Bash: sleep 30")).await;
     hub.shows(
         "A runs its call with ⏹ only",
-        status_a,
+        100,
         shown("⚙️ Bash: sleep 30", &["status:stop"]),
     )
     .await;
@@ -1024,7 +1122,7 @@ async fn edits_are_paced_and_a_deleted_status_message_comes_back() {
         edits(&ops, status).len(),
         started.elapsed()
     );
-    // Deleted in Telegram: a new message is sent and pinned.
+    // Deleted in Telegram: a new message is sent.
     hub.fake
         .edit_errors
         .lock()
@@ -1039,7 +1137,7 @@ async fn edits_are_paced_and_a_deleted_status_message_comes_back() {
     .await;
     let ops = hub
         .until("a second status message", |ops| {
-            status_sends(ops).len() == 2 && pins(ops).len() == 2
+            status_sends(ops).len() == 2
         })
         .await;
     assert_eq!(
@@ -1189,11 +1287,11 @@ fn compact_lines(ops: &[Op]) -> Vec<String> {
 async fn a_compaction_from_the_real_hook_shows_in_the_status_and_the_topic() {
     let hub = start_hub("compact", Duration::from_millis(50)).await;
     hub.start(A, 10).await;
-    let status = hub.status_message(100).await;
+    hub.status_message(100).await;
     hub.numbers(A).await;
     hub.shows(
         "numbers shown",
-        status,
+        100,
         shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
     )
     .await;
@@ -1203,7 +1301,7 @@ async fn a_compaction_from_the_real_hook_shows_in_the_status_and_the_topic() {
     pre_compact(&home, "manual").await;
     hub.shows(
         "manual compaction in the status",
-        status,
+        100,
         shown(&format!("🗜 Сжимаю контекст (вручную)…\n{NUMBERS}"), &[]),
     )
     .await;
@@ -1221,7 +1319,7 @@ async fn a_compaction_from_the_real_hook_shows_in_the_status_and_the_topic() {
     .await;
     hub.shows(
         "status back after the compaction",
-        status,
+        100,
         shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
     )
     .await;
@@ -1250,16 +1348,14 @@ async fn a_compaction_from_the_real_hook_shows_in_the_status_and_the_topic() {
     // Auto, cut by the session's end: no line of success.
     pre_compact(&home, "auto").await;
     hub.until("auto compaction in the status", |ops| {
-        edits(ops, status)
-            .last()
-            .is_some_and(|(text, _)| text.starts_with("🗜 Сжимаю контекст (авто)…"))
+        current_status(ops, 100)
+            .is_some_and(|(_, (text, _))| text.starts_with("🗜 Сжимаю контекст (авто)…"))
     })
     .await;
     hub.end(A, 10).await;
     hub.until("ended", |ops| {
-        edits(ops, status)
-            .last()
-            .is_some_and(|(text, _)| text.starts_with("🏁 Сессия завершена"))
+        current_status(ops, 100)
+            .is_some_and(|(_, (text, _))| text.starts_with("🏁 Сессия завершена"))
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;

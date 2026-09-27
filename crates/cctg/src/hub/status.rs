@@ -1,5 +1,7 @@
-//! The pinned status message of a slot (TASK-029): one message per slot,
-//! pinned once, edited as the slot's current session works. Its first line is
+//! The status message of a slot (TASK-029): one message per slot, the last
+//! one of its topic (TASK-062: not pinned; the slots actor moves it below
+//! what comes after it), edited as the slot's current session works. Its
+//! first line is
 //! what the session does now, as an emoji and a few words; the second line
 //! the numbers of Claude Code's status line (model, effort, context and rate
 //! limit percentages). While the session works, no permission prompt of it
@@ -55,6 +57,9 @@ pub const ANSWER_OFFLINE: &str = "Сессия не на связи";
 pub const ANSWER_NO_KEYS: &str = "Эта сессия не принимает клавиши из Telegram";
 pub const ANSWER_STALE: &str = "Кнопка устарела";
 pub const KEY_FAILED_NOTICE: &str = "Не получилось нажать клавишу в терминале сессии.";
+/// An old status message Telegram would not delete (older than 48 hours)
+/// becomes this, without buttons (TASK-062): the status is below it.
+pub const RETIRED_TEXT: &str = "↓";
 
 pub const UPDATE_BUTTON: &str = "⬆️ Обновить";
 pub const OUTDATED_LINE: &str = "⬆️ Клиент cctg устарел";

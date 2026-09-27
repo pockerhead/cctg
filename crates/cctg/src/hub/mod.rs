@@ -337,7 +337,9 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     }
     let can_pin = member.status == "creator" || member.can_pin_messages;
     if !can_pin {
-        warn!("the bot lacks can_pin_messages; status messages will not be pinned");
+        warn!(
+            "the bot lacks can_pin_messages; an old pinned status message that cannot be deleted stays pinned"
+        );
     }
     let icons = checked_icons(api.get_forum_topic_icon_stickers().await)?;
     // Agents running another build are shown as outdated (TASK-040); a
@@ -378,11 +380,12 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     let question_asks = slots.question_asks();
     let transcript_asks = slots.transcript_asks();
     slots.fetch_files(api.clone());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     tokio::spawn(commands::serve(
         commands_rx,
         outbox.clone(),
-        Arc::new(commands::Asks(transcript_asks)),
+        Arc::new(commands::Asks(transcript_asks, Some(control_tx.clone()))),
         me.username.clone(),
     ));
     let (roster_tx, roster_rx) = mpsc::unbounded_channel();
@@ -407,7 +410,6 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         permission_asks,
         question_asks,
     ));
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let actor = tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx));
 
     updates::poll_until(

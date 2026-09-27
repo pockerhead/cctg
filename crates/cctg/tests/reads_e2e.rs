@@ -168,7 +168,7 @@ async fn start_hub(state: &Path, listener: TcpListener, read_wait: Duration) -> 
         tokio::spawn(commands::serve(
             commands_rx,
             outbox,
-            Arc::new(Asks(asks)),
+            Arc::new(Asks(asks, None)),
             None,
         )),
     ];

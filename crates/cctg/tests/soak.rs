@@ -26,6 +26,15 @@
 //! message ids local and deletes the topics at the end, also after a failed
 //! check: see `docs/soak.md`.
 //!
+//! `CCTG_SOAK_STATUS=1` (fake Telegram only) runs the same scenario with the
+//! hub's status settings (`status_every: Some(STATUS_EVERY)`, the default
+//! stream timings) and pacing (`Limits::default()`), TASK-062. The fake then
+//! keeps what each topic shows (sends add, edits and writes change, deletes
+//! remove, user and service messages included), and at the end every topic
+//! must end with its status message, nothing is pinned, every prompt and tool
+//! line shows exactly once and in order, and every answer is a loud message
+//! of its own. Several minutes (20 messages and 20 edits a minute).
+//!
 //! Slow (about a minute), so it runs only when asked:
 //! `cargo test -p cctg --test soak -- --ignored`.
 
@@ -46,8 +55,8 @@ use cctg::hub::offset::OffsetStore;
 use cctg::hub::registry::{
     Icons, RegistryStore, folder_name, nested_header, separator, topic_title,
 };
-use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
-use cctg::hub::slots::{Control, Options, Slots};
+use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outcome, Scheduler, Transport};
+use cctg::hub::slots::{Control, Options, STATUS_EVERY, Slots};
 use cctg::hub::updates::{self, Inbound, Routed, ServiceKind, UpdateSource};
 use cctg::wire::Secret;
 use serde_json::{Value, json};
@@ -100,12 +109,17 @@ fn main() {
         return;
     }
     let live = std::env::var("CCTG_SOAK_LIVE").is_ok_and(|value| value == "1");
+    let status = std::env::var("CCTG_SOAK_STATUS").is_ok_and(|value| value == "1");
+    assert!(
+        !(live && status),
+        "CCTG_SOAK_STATUS runs against the fake Telegram only"
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("runtime");
-    let report = runtime.block_on(soak(live));
+    let report = runtime.block_on(soak(live, status));
     println!("{report}");
     if let Ok(path) = std::env::var("CCTG_SOAK_REPORT") {
         std::fs::write(path, &report).expect("write the report");
@@ -502,8 +516,17 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             chat: Chat::Group,
             thread_id,
             text,
+            into: None,
             ..
         } => ("stream", Some(*thread_id), text.clone(), None),
+        // TASK-062: turn content written into a message of the topic.
+        Op::Stream {
+            chat: Chat::Group,
+            thread_id,
+            text,
+            into: Some(message_id),
+            ..
+        } => ("write", Some(*thread_id), text.clone(), Some(*message_id)),
         Op::Edit {
             chat: Chat::Group,
             message_id,
@@ -520,10 +543,10 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             chat: Chat::Group,
             message_id,
         } => ("delete", None, String::new(), Some(*message_id)),
-        Op::Pin {
+        Op::Unpin {
             chat: Chat::Group,
             message_id,
-        } => ("pin", None, String::new(), Some(*message_id)),
+        } => ("unpin", None, String::new(), Some(*message_id)),
         Op::CreateTopic {
             chat: Chat::Group,
             name,
@@ -563,9 +586,96 @@ struct Tg {
     updates: Updates,
     /// `forum_topic_edited` service messages Telegram showed: (thread, id).
     service: Mutex<Vec<(Option<i64>, i64)>>,
+    /// Fake only: what each topic shows, oldest first.
+    topics: Mutex<BTreeMap<Option<i64>, Vec<Shown>>>,
+}
+
+/// A message a topic of the fake shows (TASK-062).
+#[derive(Debug, Clone)]
+struct Shown {
+    id: i64,
+    text: String,
+    by: By,
+    /// Sent as a status message (buttons, not a prompt, silent) and not
+    /// written into since.
+    status: bool,
+    /// Sent with a sound.
+    loud: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum By {
+    Bot,
+    User,
+    Service,
+}
+
+fn not_found(what: &str) -> Delivery {
+    Err(ApiError::Telegram {
+        code: 400,
+        description: format!("Bad Request: message to {what} not found"),
+    })
 }
 
 impl Tg {
+    /// What the topic shows, oldest first.
+    fn topic(&self, thread: i64) -> Vec<Shown> {
+        self.topics
+            .lock()
+            .unwrap()
+            .get(&Some(thread))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn show(&self, thread: Option<i64>, text: &str, by: By, status: bool, loud: bool) -> i64 {
+        let id = self.next_message.fetch_add(1, Ordering::SeqCst);
+        self.topics
+            .lock()
+            .unwrap()
+            .entry(thread)
+            .or_default()
+            .push(Shown {
+                id,
+                text: text.to_owned(),
+                by,
+                status,
+                loud,
+            });
+        id
+    }
+
+    /// A user's message in a topic: its id, numbered with the bot's.
+    fn user_message(&self, thread: i64, text: &str) -> i64 {
+        self.show(Some(thread), text, By::User, false, false)
+    }
+
+    /// Changes the text of a shown message; `false` when it is not there.
+    fn rewrite(&self, message_id: i64, text: &str, turn_content: bool) -> bool {
+        let mut topics = self.topics.lock().unwrap();
+        let Some(message) = topics
+            .values_mut()
+            .flatten()
+            .find(|message| message.id == message_id)
+        else {
+            return false;
+        };
+        message.text = text.to_owned();
+        if turn_content {
+            message.status = false;
+        }
+        true
+    }
+
+    fn remove(&self, message_id: i64) -> bool {
+        let mut topics = self.topics.lock().unwrap();
+        topics.values_mut().any(|messages| {
+            let before = messages.len();
+            messages.retain(|message| message.id != message_id);
+            messages.len() < before
+        })
+    }
+
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
     }
@@ -584,7 +694,7 @@ impl Tg {
             .filter(|call| {
                 call.thread == Some(thread)
                     && call.outcome == "ok"
-                    && matches!(call.kind, "send" | "permission" | "stream")
+                    && matches!(call.kind, "send" | "permission" | "stream" | "write")
             })
             .flat_map(|call| call.text.lines().map(str::to_owned).collect::<Vec<_>>())
             .collect()
@@ -611,21 +721,75 @@ impl Tg {
                 name: name.clone(),
                 icon_custom_emoji_id: None,
             })),
-            Op::Stream { .. } => {
+            Op::Stream {
+                thread_id,
+                text,
+                notify,
+                into,
+                ..
+            } => {
                 let seen = self.streams_seen.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut flood = self.flood.lock().unwrap();
-                if flood.front() == Some(&seen) {
-                    flood.pop_front();
-                    return Err(ApiError::RetryAfter(self.retry_after));
+                {
+                    let mut flood = self.flood.lock().unwrap();
+                    if flood.front() == Some(&seen) {
+                        flood.pop_front();
+                        return Err(ApiError::RetryAfter(self.retry_after));
+                    }
                 }
-                sent(self.next_message.fetch_add(1, Ordering::SeqCst))
+                match into {
+                    None => sent(self.show(Some(*thread_id), text, By::Bot, false, *notify)),
+                    Some(id) if self.rewrite(*id, text, true) => sent(*id),
+                    Some(_) => not_found("edit"),
+                }
             }
-            Op::Send { .. } | Op::SendDocument { .. } => {
-                sent(self.next_message.fetch_add(1, Ordering::SeqCst))
+            Op::Send {
+                thread_id,
+                text,
+                reply_markup,
+                permission,
+                notify,
+                ..
+            } => {
+                let status = reply_markup.is_some() && !permission && !notify;
+                sent(self.show(*thread_id, text, By::Bot, status, *notify))
+            }
+            Op::SendDocument {
+                thread_id,
+                document,
+                notify,
+                ..
+            } => sent(self.show(
+                *thread_id,
+                &format!("[document {}]", document.file_name),
+                By::Bot,
+                false,
+                *notify,
+            )),
+            Op::Edit {
+                message_id, text, ..
+            } => {
+                if self.rewrite(*message_id, text, false) {
+                    Ok(Outcome::Done)
+                } else {
+                    not_found("edit")
+                }
+            }
+            Op::Delete { message_id, .. } => {
+                if self.remove(*message_id) {
+                    Ok(Outcome::Done)
+                } else {
+                    not_found("delete")
+                }
             }
             Op::EditTopic { thread_id, .. } => {
                 // Telegram posts a service message into the topic.
-                let id = self.next_message.fetch_add(1, Ordering::SeqCst);
+                let id = self.show(
+                    Some(*thread_id),
+                    "[topic edited]",
+                    By::Service,
+                    false,
+                    false,
+                );
                 self.service.lock().unwrap().push((Some(*thread_id), id));
                 self.updates.push(json!({"message": {
                     "message_id": id, "message_thread_id": thread_id, "is_topic_message": true,
@@ -730,6 +894,8 @@ impl UpdateSource for Updates {
 
 struct Soak {
     live: bool,
+    /// `CCTG_SOAK_STATUS`: the hub's status settings and pacing (TASK-062).
+    status: bool,
     /// Live only: for deleting this run's topics at the end.
     /// Live only, with the group's id.
     token: Option<(BotToken, i64)>,
@@ -741,9 +907,10 @@ struct Soak {
     agent_port: u16,
     hook_port: u16,
     tg: Arc<Tg>,
-    bucket: BucketConfig,
+    limits: Limits,
     options: Options,
     allowlist: Allowlist,
+    /// Live only: ids of simulated user messages.
     next_message: AtomicI64,
 }
 
@@ -780,7 +947,7 @@ impl Soak {
         self.tg.run.store(run, Ordering::SeqCst);
         let agents_listener = bind(self.agent_port).await;
         let hooks_listener = bind(self.hook_port).await;
-        let (scheduler, outbox) = Scheduler::new(self.tg.clone(), self.bucket);
+        let (scheduler, outbox) = Scheduler::new(self.tg.clone(), self.limits);
         let store = RegistryStore::open(&self.state).expect("registry store");
         let registry = store.load().expect("registry loads");
         let slots = Slots::new(registry, store, outbox, self.options.clone());
@@ -840,8 +1007,8 @@ impl Soak {
 
     /// A user message in a topic.
     fn say(&self, hub: &Hub, thread: i64, text: &str) {
-        let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
         if self.live {
+            let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
             let _ = hub.control.send(Control::Message(Inbound {
                 chat: Chat::Group,
                 message_id,
@@ -855,6 +1022,8 @@ impl Soak {
             }));
             return;
         }
+        // The fake numbers it with the bot's messages and shows it.
+        let message_id = self.tg.user_message(thread, text);
         let chat = json!({"id": FAKE_CHAT, "type": "supergroup", "is_forum": true});
         self.tg.updates.push(json!({"message": {
             "message_id": message_id, "message_thread_id": thread, "is_topic_message": true,
@@ -983,6 +1152,108 @@ fn topic_of(tg: &Tg, name: &str) -> Option<i64> {
         .and_then(|call| call.message_id)
 }
 
+/// Lines of the turn content, prompts, answers and notices the fake's topic
+/// shows, top to bottom (the status message left out).
+fn shown_lines(tg: &Tg, thread: i64) -> Vec<String> {
+    tg.topic(thread)
+        .into_iter()
+        .filter(|message| message.by == By::Bot && !message.status)
+        .flat_map(|message| message.text.lines().map(str::to_owned).collect::<Vec<_>>())
+        .collect()
+}
+
+/// TASK-062 layout of a topic at a quiet point: the status message is the
+/// last message and the only one; `lines` (prompts and tool lines of its
+/// sessions, in transcript order) show exactly once and in that order, no
+/// prompt or tool line shows twice; each of `answers` is a loud message of
+/// its own; no message is longer than Telegram's limit.
+fn check_layout(tg: &Tg, thread: i64, status: i64, lines: &[String], answers: &[String]) -> String {
+    let shown = tg.topic(thread);
+    let dump = || {
+        shown
+            .iter()
+            .map(|m| {
+                format!(
+                    "{} {:?} {:?}{}",
+                    m.id,
+                    m.by,
+                    m.text,
+                    if m.status { " [status]" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let last = shown.last().expect("the topic shows something");
+    assert_eq!(
+        last.id,
+        status,
+        "topic {thread}: the status message is last:\n{}",
+        dump()
+    );
+    let flagged: Vec<i64> = shown.iter().filter(|m| m.status).map(|m| m.id).collect();
+    assert_eq!(
+        flagged,
+        [status],
+        "topic {thread}: one status message:\n{}",
+        dump()
+    );
+    let content = shown_lines(tg, thread);
+    for line in &content {
+        if line.starts_with("> ") || line.starts_with("• ") {
+            assert_eq!(
+                content.iter().filter(|other| *other == line).count(),
+                1,
+                "topic {thread}: {line:?} shows more than once:\n{}",
+                dump()
+            );
+        }
+    }
+    let got: Vec<&String> = content.iter().filter(|line| lines.contains(line)).collect();
+    assert_eq!(
+        got,
+        lines.iter().collect::<Vec<_>>(),
+        "topic {thread}: every line once, in order:\n{}",
+        dump()
+    );
+    for answer in answers {
+        let own: Vec<&Shown> = shown.iter().filter(|m| m.text == *answer).collect();
+        assert!(
+            own.len() == 1 && own[0].loud,
+            "topic {thread}: {answer:?} is one loud message of its own:\n{}",
+            dump()
+        );
+        assert_eq!(
+            content.iter().filter(|line| *line == answer).count(),
+            1,
+            "topic {thread}: {answer:?} is in no other message:\n{}",
+            dump()
+        );
+    }
+    for message in &shown {
+        assert!(
+            message.text.encode_utf16().count() <= 4096,
+            "topic {thread}: message {} is too long",
+            message.id
+        );
+    }
+    let turn_messages = shown
+        .iter()
+        .filter(|m| m.by == By::Bot && !m.status)
+        .filter(|m| {
+            m.text
+                .lines()
+                .any(|line| lines.iter().any(|want| want == line))
+        })
+        .count();
+    format!(
+        "topic {thread}: {} messages shown, status {status} last; {} prompt and tool lines in {turn_messages} messages; {} answers on their own",
+        shown.len(),
+        lines.len(),
+        answers.len()
+    )
+}
+
 /// The icon last set on `thread` in hub run `run`.
 fn last_icon(tg: &Tg, thread: i64, run: usize) -> Option<String> {
     tg.calls()
@@ -998,7 +1269,7 @@ fn last_icon(tg: &Tg, thread: i64, run: usize) -> Option<String> {
 
 // ------------------------------------------------------------ scenario
 
-async fn soak(live: bool) -> String {
+async fn soak(live: bool, status: bool) -> String {
     let started = Instant::now();
     let root = std::env::temp_dir().join(format!("cctg-soak-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1044,12 +1315,12 @@ async fn soak(live: bool) -> String {
     )
     .unwrap();
 
-    if live {
+    if live || status {
         SLOW.store(10, Ordering::Relaxed);
     }
     let updates = Updates::new();
     let mut foreign_pending = None;
-    let (live_api, token, options, bucket, allowlist) = if live {
+    let (live_api, token, options, limits, allowlist): (_, _, _, Limits, _) = if live {
         let env_file = std::env::var("CCTG_SOAK_ENV")
             .map(PathBuf::from)
             .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env"));
@@ -1093,8 +1364,24 @@ async fn soak(live: bool) -> String {
             Some(api),
             Some((config.token, config.chat_id)),
             options,
-            BucketConfig::default(),
+            BucketConfig::default().into(),
             config.allowlist,
+        )
+    } else if status {
+        // The hub's status settings and pacing (`hub::run`); only the grace
+        // for a lost agent link is cut, as in the live run.
+        let options = Options {
+            grace: Duration::ZERO,
+            status_every: Some(STATUS_EVERY),
+            can_pin: true,
+            ..Options::default()
+        };
+        (
+            None,
+            None,
+            options,
+            Limits::default(),
+            [FAKE_USER].into_iter().collect(),
         )
     } else {
         let options = Options {
@@ -1114,7 +1401,7 @@ async fn soak(live: bool) -> String {
             None,
             None,
             options,
-            bucket,
+            bucket.into(),
             [FAKE_USER].into_iter().collect(),
         )
     };
@@ -1129,9 +1416,11 @@ async fn soak(live: bool) -> String {
         retry_after: Duration::from_secs(1),
         updates,
         service: Mutex::new(Vec::new()),
+        topics: Mutex::new(BTreeMap::new()),
     });
     let soak = Arc::new(Soak {
         live,
+        status,
         token,
         root: root.clone(),
         home,
@@ -1141,12 +1430,13 @@ async fn soak(live: bool) -> String {
         agent_port,
         hook_port,
         tg: tg.clone(),
-        bucket,
+        limits,
         options,
         allowlist,
         // Ids of simulated user messages; against the real chat they must
-        // name no real message (the hub reacts to them with 👀).
-        next_message: AtomicI64::new(if live { SYNTHETIC_MESSAGE } else { 50_000 }),
+        // name no real message (the hub reacts to them with 👀). The fake
+        // numbers them with the bot's messages.
+        next_message: AtomicI64::new(SYNTHETIC_MESSAGE),
     });
     // The scenario runs as its own task, so a failed assertion inside it
     // comes back here as a `JoinError` and the cleanup below always runs:
@@ -1156,6 +1446,29 @@ async fn soak(live: bool) -> String {
         let soak = soak.clone();
         tokio::spawn(async move { scenario(&soak, started).await }).await
     };
+    // `CCTG_SOAK_CALLS=<file>`: every Telegram call of the run, also of a
+    // failed one, one line each (seconds from the start, run, kind, thread,
+    // message, outcome, text cut to 80 characters).
+    if let Ok(path) = std::env::var("CCTG_SOAK_CALLS") {
+        let lines: String = soak
+            .tg
+            .calls()
+            .iter()
+            .map(|call| {
+                format!(
+                    "{:8.3} {} {:<12} {:>5} {:>6} {:<9} {:?}\n",
+                    call.at.duration_since(started).as_secs_f64(),
+                    call.run,
+                    call.kind,
+                    call.thread.map_or_else(String::new, |t| t.to_string()),
+                    call.message_id.map_or_else(String::new, |m| m.to_string()),
+                    call.outcome,
+                    call.text.chars().take(80).collect::<String>()
+                )
+            })
+            .collect();
+        let _ = std::fs::write(path, lines);
+    }
     let undeleted = match &soak.token {
         Some((token, chat_id)) => delete_topics(token, *chat_id, &created_topics(&soak.tg)).await,
         None => Vec::new(),
@@ -1433,7 +1746,12 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let (p_a, p_a2) = (prompt_of(t_a).unwrap(), prompt_of(t_a2).unwrap());
     // The 429s go into the rest of the burst, after the prompts: the
     // latencies above measure the priority of a prompt, not a 429 pause.
-    if !soak.live {
+    // Rolling (TASK-062) sends the rest of a burst in a few writes, so there
+    // they go into the first and third stream call from now (the second is
+    // the retry of the first), of the burst or of phase 5.
+    if soak.status {
+        tg.arm_flood(&[1, 3]);
+    } else if !soak.live {
         tg.arm_flood(&[2, 6]);
     }
     let latency_a = p_a.at.duration_since(t0);
@@ -1456,13 +1774,15 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     })
     .await;
     assert!(
-        tg.flood.lock().unwrap().is_empty(),
+        soak.status || tg.flood.lock().unwrap().is_empty(),
         "both planned 429s fell into the burst"
     );
     let behind_a2 = tg
         .calls()
         .iter()
-        .filter(|call| call.kind == "stream" && call.outcome == "ok" && call.at > p_a2.at)
+        .filter(|call| {
+            matches!(call.kind, "stream" | "write") && call.outcome == "ok" && call.at > p_a2.at
+        })
         .flat_map(|call| call.text.lines().map(str::to_owned).collect::<Vec<_>>())
         .filter(|line| line.starts_with(&format!("> burst {}", short(A2))))
         .count();
@@ -1472,11 +1792,16 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         behind_a2 > 0,
         "the prompt of A2 overtook stream lines of its own topic written before it"
     );
-    let got_a2: Vec<String> = tg
-        .texts(t_a2)
-        .into_iter()
-        .filter(|line| line.contains("burst") || line.contains("merge"))
-        .collect();
+    // Rolling (TASK-062): a write into a turn message above can go after a
+    // newer message, so the order is the one the topic shows.
+    let got_a2: Vec<String> = if soak.status {
+        shown_lines(&tg, t_a2)
+    } else {
+        tg.texts(t_a2)
+    }
+    .into_iter()
+    .filter(|line| line.contains("burst") || line.contains("merge"))
+    .collect();
     let mut firsts = Vec::new();
     for line in got_a2 {
         if !firsts.contains(&line) {
@@ -1578,7 +1903,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     for call in calls.iter().filter(|call| call.outcome == "ok") {
         let Some(thread) = call
             .thread
-            .filter(|_| matches!(call.kind, "send" | "permission" | "stream"))
+            .filter(|_| matches!(call.kind, "send" | "permission" | "stream" | "write"))
         else {
             continue;
         };
@@ -1680,15 +2005,15 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
                 .iter()
                 .take_while(|(r, t)| r == run && t.duration_since(*at) < window)
                 .count() as f64;
-            let allowed = f64::from(soak.bucket.capacity)
-                + window.as_secs_f64() / soak.bucket.refill_every.as_secs_f64()
+            let allowed = f64::from(soak.limits.messages.capacity)
+                + window.as_secs_f64() / soak.limits.messages.refill_every.as_secs_f64()
                 + 1.0;
             worst_window = worst_window.max(inside / allowed);
             assert!(inside <= allowed, "{inside} metered sends in {window:?}");
         }
     }
     assert!(
-        min_gap + Duration::from_millis(5) >= soak.bucket.min_gap,
+        min_gap + Duration::from_millis(5) >= soak.limits.messages.min_gap,
         "sends closer than min_gap: {min_gap:?}"
     );
     // registry.json, field by field.
@@ -1709,6 +2034,8 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     assert_eq!(registry["subagents"], json!({}), "no subagent records");
     let slots = registry["slots"].as_array().expect("slots");
     assert_eq!(slots.len(), 3);
+    // Status mode: the status message of each topic, (thread, id).
+    let mut statuses = Vec::new();
     for (slot, (folder, ordinal, thread, current)) in slots.iter().zip([
         (&a1.cwd, 1, t_a, A5),
         (&a2.cwd, 2, t_a2, A2),
@@ -1743,16 +2070,21 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             topic_title(HOST, &folder_name(folder), ordinal, Some(short(current)))
         );
         assert_eq!(view["applied_icon"], json!(alive), "{current} alive");
-        assert_eq!(
-            keys(view),
-            [
-                "applied_icon",
-                "applied_title",
-                "chat",
-                "pending_separator",
-                "topic_id"
-            ]
-        );
+        let mut want_keys = vec![
+            "applied_icon",
+            "applied_title",
+            "chat",
+            "pending_separator",
+            "topic_id",
+        ];
+        if soak.status {
+            // TASK-062: the status message, never pinned by this hub.
+            want_keys.insert(4, "status");
+            assert_eq!(view["status"]["pinned"], false, "{current}");
+            let id = view["status"]["message_id"].as_i64().expect("status id");
+            statuses.push((thread, id));
+        }
+        assert_eq!(keys(view), want_keys);
     }
     let sessions = registry["sessions"].as_object().expect("sessions");
     let mut ids: Vec<&str> = sessions.keys().map(String::as_str).collect();
@@ -1870,6 +2202,67 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         "only running sessions keep a pid"
     );
 
+    // ---- status mode: the layout of every topic (TASK-062)
+    let mut layout_notes = Vec::new();
+    if soak.status {
+        assert_eq!(tg.count("unpin"), 0, "nothing was pinned, nothing unpinned");
+        let (a1s, a2s, b1s, a5s) = (short(A1), short(A2), short(B1), short(A5));
+        let mut want_a2 = vec![format!("> task {a2s}"), format!("• Bash: step {a2s} ✓")];
+        want_a2.extend((0..burst_a2).map(|n| format!("> burst {a2s} {n:02}")));
+        want_a2.extend((0..burst_a2).map(|n| format!("• Bash: merge {a2s} {n:02} ✓")));
+        let mut want_b = vec![format!("> task {b1s}"), format!("• Bash: step {b1s} ✓")];
+        want_b.extend((0..burst_b1).map(|n| format!("> burst {b1s} {n:02}")));
+        let want = [
+            (
+                t_a,
+                vec![
+                    format!("> task {a1s}"),
+                    format!("• Bash: step {a1s} ✓"),
+                    format!("> while down {a5s}"),
+                ],
+                vec![format!("answer {a1s}"), format!("answer {a5s}")],
+            ),
+            (t_a2, want_a2, vec![format!("answer {a2s}")]),
+            (t_b, want_b, vec![format!("answer {b1s}")]),
+        ];
+        for (thread, lines, answers) in want {
+            let status = statuses
+                .iter()
+                .find(|(t, _)| *t == thread)
+                .map(|(_, id)| *id)
+                .expect("a status message");
+            layout_notes.push(check_layout(&tg, thread, status, &lines, &answers));
+        }
+        // All requests into the group (callback answers go to the user)
+        // stay within both buckets together, per hub run and any 60 s.
+        let edits = soak.limits.edits.expect("an edit budget");
+        let window = Duration::from_secs(60);
+        let allowed = |bucket: BucketConfig| {
+            f64::from(bucket.capacity) + window.as_secs_f64() / bucket.refill_every.as_secs_f64()
+        };
+        let allowed = allowed(soak.limits.messages) + allowed(edits) + 1.0;
+        let requests: Vec<(usize, Instant)> = calls
+            .iter()
+            .filter(|call| call.kind != "callback" && call.outcome != "synthetic")
+            .map(|call| (call.run, call.at))
+            .collect();
+        let mut peak = 0;
+        for (i, (run, at)) in requests.iter().enumerate() {
+            let inside = requests[i..]
+                .iter()
+                .take_while(|(r, t)| r == run && t.duration_since(*at) < window)
+                .count();
+            peak = peak.max(inside);
+        }
+        assert!(
+            peak as f64 <= allowed,
+            "{peak} requests into the group in 60 s (allowed {allowed})"
+        );
+        layout_notes.push(format!(
+            "requests into the group (all but callback answers): peak {peak} in any 60 s (both buckets allow {allowed:.0})"
+        ));
+    }
+
     // ---- report
     let count = |kind: &str| {
         calls
@@ -1895,7 +2288,15 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         2
     ));
     report.push_str("| operation | Bot API method | accepted |\n|---|---|---|\n");
-    for (kind, method) in [
+    let rolling: &[(&str, &str)] = if soak.status {
+        &[
+            ("write", "editMessageText (turn content, TASK-062)"),
+            ("unpin", "unpinChatMessage"),
+        ]
+    } else {
+        &[]
+    };
+    for &(kind, method) in [
         (
             "send",
             "sendMessage (replies, answers, notices, separators, blocks)",
@@ -1909,7 +2310,10 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         ("create_topic", "createForumTopic"),
         ("edit_topic", "editForumTopic"),
         ("delete", "deleteMessage (service messages)"),
-    ] {
+    ]
+    .iter()
+    .chain(rolling)
+    {
         report.push_str(&format!("| {kind} | {method} | {} |\n", count(kind)));
     }
     let errors = calls.iter().filter(|call| call.outcome == "error").count();
@@ -1943,14 +2347,14 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         count("stream"),
         worst_window * 100.0,
         min_gap.as_millis(),
-        soak.bucket.capacity,
-        soak.bucket.refill_every.as_millis(),
-        soak.bucket.min_gap.as_millis()
+        soak.limits.messages.capacity,
+        soak.limits.messages.refill_every.as_millis(),
+        soak.limits.messages.min_gap.as_millis()
     ));
     report.push_str(
         "- edits and topic calls are counted separately and are not compared with the 20 messages/min group limit: Telegram publishes no number for them\n",
     );
-    for note in notes {
+    for note in notes.iter().chain(&layout_notes) {
         report.push_str(&format!("- {note}\n"));
     }
     report.push_str(&format!(

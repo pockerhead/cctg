@@ -368,10 +368,13 @@ impl View {
     }
 }
 
-/// The status message of a slot: sent once per topic, pinned once.
+/// The status message of a slot: the last message of its topic (TASK-062).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusMessage {
     pub message_id: i64,
+    /// A hub before TASK-062 pinned it (TASK-029): it is replaced by a new
+    /// status message at the end of the topic once, and unpinned when it
+    /// cannot be deleted. The hub never pins now.
     #[serde(default)]
     pub pinned: bool,
 }

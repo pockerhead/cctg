@@ -146,6 +146,7 @@ async fn only_loud_sends_go_without_disable_notification() {
         merge: false,
         restart: false,
         notify,
+        into: None,
     };
     let document = |name: &str, notify| Op::SendDocument {
         chat: Chat::Group,

@@ -76,10 +76,23 @@
 //! gets 👀, and ✍ once its own channel record shows up in the transcript.
 //!
 //! The status message (see [`status`], TASK-029): each slot with a topic gets
-//! one message, pinned once, that says what its current session does (from
+//! one message that says what its current session does (from
 //! prompts, `Stop`, the tool hooks, tool results and interrupt notes in the
 //! stream, permission prompts and the session's end) and shows the numbers
-//! of its status line. It is edited at most once per `Options::status_every`,
+//! of its status line. It is the last message of the topic (TASK-062, no
+//! pin): the quiet content of a turn from the stream turns it into a turn
+//! message ([`stream::Open`]: one edit, then the turn's lines, thinking and
+//! text are written into that message until it is full) and a new status
+//! message goes below; any other message below it (a user's message, one
+//! from the terminal that the stream cannot absorb, an answer, a prompt, a
+//! notice, a block, a file, a `/brief` reply) makes it move: once nothing
+//! more of the hub is on its way into the topic, a new one is sent below and
+//! the old one deleted (edited to [`status::RETIRED_TEXT`], and unpinned if a
+//! hub before TASK-062 pinned it, when Telegram refuses the delete). A
+//! status message such a hub pinned moves the same way once while its
+//! session is live, one slot at a time; a dead slot's is only unpinned and
+//! moves with the slot's next activity. The status
+//! message is edited at most once per `Options::status_every`,
 //! except right after a button press. These periodic edits are background
 //! edits for the scheduler (TASK-054): they take only the edit budget other
 //! edits leave, round-robin over the slots. An edit that shows a ⏹ press is
@@ -203,7 +216,7 @@ use super::registry::{
 };
 use super::scheduler::{Delivery, Op, Outbox, Outcome};
 use super::status::{self, Activity, Buttons, Press};
-use super::stream::{self, Format, Held, Live, Step};
+use super::stream::{self, Format, Held, Live, Open, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
 };
@@ -394,10 +407,13 @@ pub struct Options {
     /// A question nobody answered by then goes to the terminal
     /// ([`QUESTION_WAIT`]).
     pub question_wait: Duration,
-    /// Slots get a status message, edited at most this often; `None`: no
-    /// status messages ([`STATUS_EVERY`] in the hub).
+    /// Slots get a status message, edited at most this often, as the last
+    /// message of their topic, and the stream writes a turn's content into
+    /// one message (TASK-062); `None`: no status messages, every stream
+    /// message is a new one ([`STATUS_EVERY`] in the hub).
     pub status_every: Option<Duration>,
-    /// The bot may pin messages (`can_pin_messages`).
+    /// The bot may unpin messages (`can_pin_messages`): an old pinned status
+    /// message it cannot delete is unpinned.
     pub can_pin: bool,
     /// [`PROMPT_SETTLE`].
     pub prompt_settle: Duration,
@@ -548,6 +564,9 @@ pub enum Control {
         message_id: i64,
         pinned: i64,
     },
+    /// The command worker answered a command in `place` (TASK-062): its
+    /// messages are below the status message now.
+    Posted { place: Place },
     /// The hub stops: [`Slots::run`] handles what already came in, writes
     /// the registry and returns.
     Stop,
@@ -555,6 +574,17 @@ pub enum Control {
 
 #[derive(Debug)]
 enum Done {
+    /// A new message for `place` was answered (TASK-062), before its own
+    /// `Done`: its id when Telegram took it as a message of its own.
+    Posted {
+        place: Place,
+        message_id: Option<i64>,
+    },
+    /// A call that clears an old status message away.
+    Retire {
+        retire: Retire,
+        delivery: Option<Delivery>,
+    },
     Topic {
         job: TopicJob,
         /// `None`: the scheduler stopped.
@@ -644,14 +674,59 @@ enum StatusJob {
         text: String,
         keyboard: serde_json::Value,
     },
+    /// A new status message below the messages that came after `old`, which
+    /// is cleared away once the new one is in (TASK-062).
+    Replace {
+        place: Place,
+        old: MessageKey,
+        /// `old` was pinned by a hub before TASK-062.
+        pinned: bool,
+        text: String,
+        keyboard: serde_json::Value,
+    },
     Edit {
         message: MessageKey,
         text: String,
         keyboard: serde_json::Value,
     },
-    Pin {
-        message: MessageKey,
-    },
+    /// A dead slot's status message a hub before TASK-062 pinned: unpinned
+    /// in place, once (TASK-062).
+    Unpin { message: MessageKey },
+}
+
+/// A step of clearing an old status message away (TASK-062): deleted, or,
+/// when Telegram refuses that (older than 48 hours), edited to
+/// [`status::RETIRED_TEXT`] without buttons and unpinned when it was pinned.
+#[derive(Debug, Clone, Copy)]
+enum Retire {
+    Delete { message: MessageKey, pinned: bool },
+    Edit,
+    Unpin,
+}
+
+/// What the hub knows of the bottom of a topic (TASK-062): whether its
+/// status message is still the last message there.
+#[derive(Debug, Default)]
+struct Bottom {
+    /// New messages handed out for the topic that Telegram has not answered.
+    posting: usize,
+    /// The newest message id seen in the topic: sent by the hub or by a user.
+    last: i64,
+    /// The command worker posted here since the status message was sent.
+    foreign: bool,
+    /// The status message is being turned into turn content by stream
+    /// message `number` of `session`.
+    absorbing: Option<(String, u64, MessageKey)>,
+    /// The status message became turn content: a new one is due, also when
+    /// the session ended meanwhile.
+    owed: bool,
+}
+
+impl Bottom {
+    /// Something came below status message `status`.
+    fn buries(&self, status: i64) -> bool {
+        self.foreign || self.last > status
+    }
 }
 
 /// What the actor knows of a slot's status message beyond the registry.
@@ -670,12 +745,35 @@ struct Shown {
     next_at: Option<Instant>,
     /// A first ⏹ press of this session waits for its second until then.
     confirm: Option<(String, Instant)>,
-    /// Pinning failed; not tried again in this run.
-    pin_failed: bool,
+    /// A `Create` or `Replace` is in flight: the status message is not
+    /// known to be the last one of its topic.
+    sending: bool,
+    /// The `Replace` in flight moves a status message a hub before TASK-062
+    /// pinned: one slot at a time.
+    migrating: bool,
     /// A failed send is tried again after this.
     retry_at: Option<Instant>,
     /// A failed send was warned about; the next warn waits for a success.
     send_warned: bool,
+}
+
+impl Shown {
+    /// Telegram shows `text` and `keyboard` now. The ⏹ question gets its
+    /// whole wait from when it shows, however long its call waited for the
+    /// group's budget.
+    fn shows(&mut self, text: String, keyboard: serde_json::Value, now: Instant) {
+        let asked = self
+            .content
+            .as_ref()
+            .is_some_and(|(_, shown)| status::asks_confirm(shown));
+        if !asked
+            && status::asks_confirm(&keyboard)
+            && let Some((_, until)) = self.confirm.as_mut()
+        {
+            *until = now + status::CONFIRM_FOR;
+        }
+        self.content = Some((text, keyboard));
+    }
 }
 
 /// An Esc an agent was asked to write: the slot, session and connection it
@@ -781,6 +879,7 @@ enum Work {
         slot: SlotId,
         job: StatusJob,
     },
+    Retire(Retire),
     File {
         conn: u64,
         transfer_id: u64,
@@ -1065,6 +1164,8 @@ pub struct Slots {
     compactions: HashMap<String, Compaction>,
     /// Status messages by slot.
     shown: HashMap<SlotId, Shown>,
+    /// The bottom of each topic the hub posts into (TASK-062).
+    bottoms: HashMap<Place, Bottom>,
     /// Keys agents were asked to press, by key id.
     key_asks: HashMap<u64, KeyAsk>,
     /// Commands agents were asked to type, by command id.
@@ -1097,7 +1198,9 @@ pub struct Slots {
     file_bytes: u64,
     /// Album offers waiting for Telegram, by `(conn, transfer_id)`.
     albums: HashMap<(u64, u64), Album>,
-    pin_warned: bool,
+    /// A status message could not be cleared away; later failures are
+    /// logged at debug level only.
+    retire_warned: bool,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1171,6 +1274,7 @@ impl Slots {
             activity: HashMap::new(),
             compactions: HashMap::new(),
             shown: HashMap::new(),
+            bottoms: HashMap::new(),
             key_asks: HashMap::new(),
             command_asks: HashMap::new(),
             updates: HashMap::new(),
@@ -1185,7 +1289,7 @@ impl Slots {
             uploads: HashMap::new(),
             file_bytes: 0,
             albums: HashMap::new(),
-            pin_warned: false,
+            retire_warned: false,
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -2821,6 +2925,13 @@ impl Slots {
                 message_id,
                 pinned,
             } => return self.on_pinned(chat, message_id, pinned),
+            Control::Posted { place } => {
+                if self.registry.slot_by_topic(place).is_some() {
+                    self.bottoms.entry(place).or_default().foreign = true;
+                    self.close_turn_message(place);
+                }
+                return;
+            }
             // Handled by `run`.
             Control::Stop => return,
         };
@@ -2854,6 +2965,17 @@ impl Slots {
                     .any(|view| view.status_message() == Some(message))
             })
             .map(SlotId)
+            .or_else(|| {
+                // Still shown while its edit into turn content waits for
+                // Telegram (TASK-062): its buttons still count.
+                let (place, _) = self.bottoms.iter().find(|(_, bottom)| {
+                    bottom
+                        .absorbing
+                        .as_ref()
+                        .is_some_and(|(_, _, absorbed)| *absorbed == message)
+                })?;
+                self.registry.slot_by_topic(*place)
+            })
     }
 
     /// Keeps a topic message in its slot and hands the slot's messages to
@@ -2865,6 +2987,12 @@ impl Slots {
             return;
         };
         let (place, key) = (input.place(), input.key());
+        if self.registry.slot_by_topic(place).is_some() {
+            // It is below the status message now, and below the turn message.
+            let bottom = self.bottoms.entry(place).or_default();
+            bottom.last = bottom.last.max(input.message_id);
+            self.close_turn_message(place);
+        }
 
         let Some(input) = self.hold(Place::topic(input.chat, thread_id), input) else {
             return;
@@ -4233,10 +4361,13 @@ impl Slots {
                 continue;
             };
             let due = live.next_read.is_none_or(|at| now >= at);
+            // A turn message whose send waits for Telegram: the next lines
+            // go into it once its id is known (TASK-062).
             if live.reading.is_some()
                 || !due
                 || live.unanswered() >= stream::MAX_WAITING
                 || self.queued_messages >= STREAM_QUEUE
+                || live.open_pending()
             {
                 continue;
             }
@@ -4325,7 +4456,7 @@ impl Slots {
             "stream messages of a session that left its topic sent again"
         );
         for (number, op) in again {
-            self.queued_messages += 1;
+            self.queued_messages += usize::from(op.posts().is_some());
             self.hand_off(
                 Work::Stream {
                     session: session.to_owned(),
@@ -4492,9 +4623,17 @@ impl Slots {
         let now = Instant::now();
         let every = self.options.stream_every;
         let hold = self.options.hold_answer;
-        let place = self
-            .current_slot(session)
-            .and_then(|slot| self.registry.place(slot));
+        let slot = self.current_slot(session);
+        let place = slot.and_then(|slot| self.registry.place(slot));
+        // TASK-062: the turn's content goes into one message, and the status
+        // message may become the first one.
+        let mut rolling = self.options.status_every.is_some().then(|| Rolling {
+            status: slot
+                .zip(place)
+                .and_then(|(slot, place)| self.absorbable(slot, place)),
+            absorbed: None,
+            posted: 0,
+        });
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
@@ -4601,9 +4740,17 @@ impl Slots {
             match answer_ops(live, held, MAX_QUEUED_MESSAGES.saturating_sub(queued)) {
                 Ok(ops) => {
                     queued += ops.len();
+                    if let Some(rolling) = &mut rolling {
+                        rolling.posted += ops.len();
+                    }
                     actions.push(Action::Answer(ops));
                 }
-                Err(held) => actions.push(Action::Release(held)),
+                Err(held) => {
+                    if let Some(rolling) = &mut rolling {
+                        rolling.posted += 1;
+                    }
+                    actions.push(Action::Release(held));
+                }
             }
         }
         let mut read_to = to;
@@ -4616,7 +4763,13 @@ impl Slots {
         for (index, line) in lines.iter().enumerate() {
             // The first line always goes (the read was asked with room); the
             // rest wait in the file while Telegram is behind.
-            if index > 0 && (live.unanswered() >= stream::MAX_WAITING || queued >= STREAM_QUEUE) {
+            // The turn message's send waits: the next line goes into it once
+            // Telegram gave its id (TASK-062).
+            if index > 0
+                && (live.unanswered() >= stream::MAX_WAITING
+                    || queued >= STREAM_QUEUE
+                    || live.open_pending())
+            {
                 read_to = lines[index - 1].end;
                 stopped = true;
                 break;
@@ -4638,7 +4791,29 @@ impl Slots {
                 .items
                 .iter()
                 .any(|item| matches!(item, StreamItem::Channel { .. }));
+            // The quiet content of this line, not handed out yet (TASK-062):
+            // one tool result line may finish several calls.
+            let mut pieces = Vec::new();
             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
+                let step = match (step, &mut rolling) {
+                    (Step::Send { text, format, .. }, Some(_)) => {
+                        let open = format != Format::Code;
+                        for (text, html) in stream_chunks(&text, format) {
+                            pieces.push((text, html, open));
+                        }
+                        continue;
+                    }
+                    (step, Some(rolling)) => {
+                        for (number, op) in
+                            roll(live, rolling, std::mem::take(&mut pieces), chat, thread_id)
+                        {
+                            queued += usize::from(op.posts().is_some());
+                            actions.push(Action::Stream(number, op));
+                        }
+                        step
+                    }
+                    (step, None) => step,
+                };
                 match step {
                     Step::Send {
                         text,
@@ -4657,6 +4832,7 @@ impl Slots {
                                 merge,
                                 restart: std::mem::take(&mut live.restart),
                                 notify: false,
+                                into: None,
                             };
                             actions.push(Action::Stream(live.sent(&op), op));
                         }
@@ -4681,12 +4857,26 @@ impl Slots {
                             match answer_ops(live, held, room) {
                                 Ok(ops) => {
                                     queued += ops.len();
+                                    if let Some(rolling) = &mut rolling {
+                                        rolling.posted += ops.len();
+                                    }
                                     actions.push(Action::Answer(ops));
                                 }
-                                Err(held) => actions.push(Action::Release(held)),
+                                Err(held) => {
+                                    if let Some(rolling) = &mut rolling {
+                                        rolling.posted += 1;
+                                    }
+                                    actions.push(Action::Release(held));
+                                }
                             }
                         }
                     }
+                }
+            }
+            if let Some(rolling) = &mut rolling {
+                for (number, op) in roll(live, rolling, pieces, chat, thread_id) {
+                    queued += usize::from(op.posts().is_some());
+                    actions.push(Action::Stream(number, op));
                 }
             }
         }
@@ -4697,10 +4887,33 @@ impl Slots {
         if more || stopped {
             live.next_read = Some(now);
         }
+        if let (Some((number, message)), Some(slot)) =
+            (rolling.and_then(|rolling| rolling.absorbed), slot)
+        {
+            // It is turn content now; a new status message follows once
+            // Telegram took the edit.
+            if let Some(view) = self
+                .registry
+                .slot_mut(slot)
+                .and_then(|entry| entry.view_mut(message.chat))
+            {
+                view.status = None;
+                self.registry.dirty = true;
+            }
+            if let Some(shown) = self.shown.get_mut(&slot) {
+                shown.content = None;
+            }
+            self.bottoms
+                .entry(Place::topic(chat, thread_id))
+                .or_default()
+                .absorbing = Some((session.to_owned(), number, message));
+        }
         for action in actions {
             match action {
                 Action::Stream(number, op) => {
-                    self.queued_messages += 1;
+                    // Only new messages count: a write into a message above
+                    // is bounded per session (`stream::MAX_WAITING`).
+                    self.queued_messages += usize::from(op.posts().is_some());
                     self.hand_off(
                         Work::Stream {
                             session: session.to_owned(),
@@ -4732,24 +4945,66 @@ impl Slots {
 
     /// Telegram answered stream message `number` of `session`.
     fn on_stream_done(&mut self, session: &str, number: u64, delivery: Option<Delivery>) {
-        self.queued_messages = self.queued_messages.saturating_sub(1);
-        if self.queued_messages == 0 {
-            self.overflow_warned = false;
+        // TASK-062: the message it was written into, if any. Its text read
+        // again after a rewind is no change; a message that is gone is not
+        // written into again.
+        let (chat, into) = match self
+            .streams
+            .get(session)
+            .and_then(|live| live.op_of(number))
+        {
+            Some(Op::Stream { chat, into, .. }) => (Some(*chat), *into),
+            _ => (None, None),
+        };
+        if into.is_none() {
+            self.queued_messages = self.queued_messages.saturating_sub(1);
+            if self.queued_messages == 0 {
+                self.overflow_warned = false;
+            }
         }
+        let unchanged = into.is_some()
+            && delivery
+                .as_ref()
+                .is_some_and(|delivery| telegram_error(delivery, &["message is not modified"]));
+        let edit_gone = into.is_some()
+            && delivery.as_ref().is_some_and(|delivery| {
+                telegram_error(
+                    delivery,
+                    &["message to edit not found", "message can't be edited"],
+                )
+            });
         // A message Telegram will never take (a bad request, not a lost
         // topic) is skipped rather than sent again for ever.
-        let skipped = matches!(
-            &delivery,
-            Some(result @ Err(ApiError::Telegram { code, .. }))
-                if (400..500).contains(code) && !topic_gone(result)
-        );
-        let accepted = skipped || matches!(delivery, Some(Ok(Outcome::Sent(_) | Outcome::Merged)));
+        let skipped = !unchanged
+            && !edit_gone
+            && matches!(
+                &delivery,
+                Some(result @ Err(ApiError::Telegram { code, .. }))
+                    if (400..500).contains(code) && !topic_gone(result)
+            );
+        let accepted = unchanged
+            || skipped
+            || matches!(delivery, Some(Ok(Outcome::Sent(_) | Outcome::Merged)));
         let gone = delivery.as_ref().is_some_and(topic_gone);
         let left = self.current_slot(session).is_none();
+        self.absorbed(session, number, accepted);
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
         live.answered(number, accepted);
+        if into.is_none() {
+            // A new message: the turn message it may start.
+            let made = match &delivery {
+                Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                    chat.map(|chat| MessageKey::new(chat, message.message_id))
+                }
+                _ => None,
+            };
+            live.opened(number, made);
+        }
+        if edit_gone {
+            live.close_open();
+        }
         if gone && left {
             // Nothing of it can reach that topic any more; the next separator
             // finds out and the slot gets a new topic (TASK-024).
@@ -6636,15 +6891,21 @@ impl Slots {
         status::render(&phase, metrics, buttons)
     }
 
-    /// Sends, pins and edits the status messages that need it: one call per
-    /// slot at a time (plus a ⏹ edit next to a waiting refresh), edits at
-    /// most once per `Options::status_every`, as background edits unless
-    /// they show a ⏹ press.
+    /// Sends and edits the status messages that need it: one call per slot
+    /// at a time (plus a ⏹ edit next to a waiting refresh), edits at most
+    /// once per `Options::status_every`, as background edits unless they show
+    /// a ⏹ press. A status message with something below it in its topic
+    /// (TASK-062), or pinned by a hub before TASK-062, is replaced by a new
+    /// one below once nothing more of the hub is on its way into that topic;
+    /// a new one goes after the slot's separator.
     fn pump_status(&mut self) {
         let Some(every) = self.options.status_every else {
             return;
         };
         let now = Instant::now();
+        let can_pin = self.options.can_pin;
+        // Old pins move one slot at a time (TASK-062).
+        let mut migrating = self.shown.values().any(|shown| shown.migrating);
         for index in 0..self.registry.slots.len() {
             let slot = SlotId(index);
             let entry = &self.registry.slots[index];
@@ -6655,8 +6916,8 @@ impl Slots {
             let Some(place) = view.place() else {
                 continue;
             };
-            let message = view.status;
-            let status = view.status_message();
+            let status = view.status;
+            let message = view.status_message();
             let separated = view.pending_separator.is_none();
             let (in_flight, urgent) = self
                 .shown
@@ -6666,40 +6927,57 @@ impl Slots {
             if in_flight > 1 || (in_flight == 1 && !urgent) {
                 continue;
             }
-            let (text, keyboard) = self.status_view(slot, &session, now);
+            let bottom = self.bottoms.get(&place);
+            let posting = bottom.is_some_and(|bottom| bottom.posting > 0);
+            let absorbing = bottom.is_some_and(|bottom| bottom.absorbing.is_some());
+            let owed = bottom.is_some_and(|bottom| bottom.owed);
             let live = self.registry.is_live_top_level(&session);
-            let can_pin = self.options.can_pin;
+            // An old pin of a live slot moves once, one slot at a time; a
+            // dead slot's is only unpinned (below) and moves with the slot's
+            // next activity.
+            let buried = status.is_some_and(|status| {
+                (status.pinned && live && !migrating)
+                    || bottom.is_some_and(|bottom| bottom.buries(status.message_id))
+            });
+            let (text, keyboard) = self.status_view(slot, &session, now);
             let shown = self.shown.entry(slot).or_default();
-            let job = match message {
-                None => {
-                    // A new message only for a live session, after its
-                    // separator, so it lands below it.
-                    if in_flight > 0
-                        || !live
-                        || !separated
-                        || shown.retry_at.is_some_and(|at| now < at)
-                    {
-                        continue;
-                    }
-                    StatusJob::Create {
-                        place,
-                        text,
-                        keyboard,
-                    }
-                }
-                Some(StatusMessage { pinned: false, .. }) if can_pin && !shown.pin_failed => {
+            // A new message lands below what is on its way into the topic,
+            // and below the separator.
+            let settled = in_flight == 0
+                && separated
+                && !posting
+                && !absorbing
+                && shown.retry_at.is_none_or(|at| now >= at);
+            let job = match (status, message) {
+                (Some(old), Some(message)) if old.pinned && !live => {
                     if in_flight > 0 {
                         continue;
                     }
-                    let Some(message) = status else {
+                    if !can_pin {
+                        // It stays pinned; it is not moved for that.
+                        if let Some(status) = self
+                            .registry
+                            .slot_mut(slot)
+                            .and_then(|entry| entry.view_mut(message.chat))
+                            .and_then(|view| view.status.as_mut())
+                        {
+                            status.pinned = false;
+                            self.registry.dirty = true;
+                        }
                         continue;
-                    };
-                    StatusJob::Pin { message }
+                    }
+                    StatusJob::Unpin { message }
                 }
-                Some(_) => {
-                    let Some(message) = status else {
-                        continue;
-                    };
+                // Until it can move, a buried status message is still
+                // edited where it is (a ⏹ press too).
+                (Some(old), Some(message)) if buried && settled => StatusJob::Replace {
+                    place,
+                    old: message,
+                    pinned: old.pinned,
+                    text,
+                    keyboard,
+                },
+                (Some(_), Some(message)) => {
                     let current = Some((text.clone(), keyboard.clone()));
                     if shown.content == current {
                         shown.urgent = false;
@@ -6714,19 +6992,46 @@ impl Slots {
                         keyboard,
                     }
                 }
+                // Only for a live session, or where the status message just
+                // became turn content.
+                _ if settled && (live || owed) => StatusJob::Create {
+                    place,
+                    text,
+                    keyboard,
+                },
+                _ => continue,
             };
             shown.in_flight += 1;
-            let background = if matches!(job, StatusJob::Edit { .. }) {
-                shown.next_at = Some(now + every);
-                !std::mem::take(&mut shown.urgent)
-            } else {
-                false
+            let background = match job {
+                StatusJob::Edit { .. } => {
+                    shown.next_at = Some(now + every);
+                    !std::mem::take(&mut shown.urgent)
+                }
+                StatusJob::Unpin { .. } => false,
+                StatusJob::Create { .. } | StatusJob::Replace { .. } => {
+                    if matches!(job, StatusJob::Replace { pinned: true, .. }) {
+                        migrating = true;
+                        shown.migrating = true;
+                    }
+                    shown.sending = true;
+                    if let Some(bottom) = self.bottoms.get_mut(&place) {
+                        bottom.foreign = false;
+                        bottom.owed = false;
+                    }
+                    false
+                }
             };
             let op = match &job {
                 StatusJob::Create {
                     place,
                     text,
                     keyboard,
+                }
+                | StatusJob::Replace {
+                    place,
+                    text,
+                    keyboard,
+                    ..
                 } => Op::Send {
                     chat: place.chat,
                     thread_id: place.thread,
@@ -6748,7 +7053,7 @@ impl Slots {
                     reply_markup: Some(keyboard.clone()),
                     background,
                 },
-                StatusJob::Pin { message } => Op::Pin {
+                StatusJob::Unpin { message } => Op::Unpin {
                     chat: message.chat,
                     message_id: message.id,
                 },
@@ -6771,56 +7076,23 @@ impl Slots {
         let shown = self.shown.entry(slot).or_default();
         shown.in_flight = shown.in_flight.saturating_sub(1);
         if matches!(delivery, Some(Ok(Outcome::Superseded))) {
-            // A ⏹ edit of the message took its place; its answer counts.
+            // A ⏹ edit of the message, or the turn content it became, took
+            // its place; that answer counts.
             return;
         }
-        match job {
+        let (place, old, text, keyboard) = match job {
             StatusJob::Create {
                 place,
                 text,
                 keyboard,
-            } => match delivery {
-                Some(Ok(Outcome::Sent(sent))) if sent.message_id != 0 => {
-                    // A message for a topic the slot no longer has stays there.
-                    if topic != Some(place) || message.is_some() {
-                        return;
-                    }
-                    shown.content = Some((text, keyboard));
-                    shown.next_at = Some(now + every);
-                    shown.retry_at = None;
-                    shown.send_warned = false;
-                    if let Some(view) = self
-                        .registry
-                        .slot_mut(slot)
-                        .and_then(|entry| entry.view_mut(place.chat))
-                    {
-                        view.status = Some(StatusMessage {
-                            message_id: sent.message_id,
-                            pinned: false,
-                        });
-                        self.registry.dirty = true;
-                    }
-                    info!(ordinal, "status message sent");
-                }
-                other => {
-                    // Known limitation: a send whose answer was lost may have
-                    // made a message; the retry makes another one.
-                    shown.retry_at = Some(now + retry_every);
-                    let first = !std::mem::replace(&mut shown.send_warned, true);
-                    match other {
-                        Some(Err(error)) if first => {
-                            warn!(%error, ordinal, "status message not sent; retrying later");
-                        }
-                        Some(Err(error)) => {
-                            debug!(%error, ordinal, "status message still not sent");
-                        }
-                        _ if first => {
-                            warn!(ordinal, "status message got no answer; retrying later")
-                        }
-                        _ => debug!(ordinal, "status message still got no answer"),
-                    }
-                }
-            },
+            } => (place, None, text, keyboard),
+            StatusJob::Replace {
+                place,
+                old,
+                pinned,
+                text,
+                keyboard,
+            } => (place, Some((old, pinned)), text, keyboard),
             StatusJob::Edit {
                 message,
                 text,
@@ -6837,21 +7109,9 @@ impl Slots {
                     )
                 });
                 if applied {
-                    // The ⏹ question gets its whole wait from when it shows,
-                    // however long its edit waited for the budget.
-                    let asked = shown
-                        .content
-                        .as_ref()
-                        .is_some_and(|(_, shown)| status::asks_confirm(shown));
-                    if !asked
-                        && status::asks_confirm(&keyboard)
-                        && let Some((_, until)) = shown.confirm.as_mut()
-                    {
-                        *until = now + status::CONFIRM_FOR;
-                    }
-                    shown.content = Some((text, keyboard));
+                    shown.shows(text, keyboard, now);
                 } else if gone {
-                    // Deleted in Telegram: a new one is sent and pinned.
+                    // Deleted in Telegram: a new one is sent.
                     shown.content = None;
                     if let Some(view) = self
                         .registry
@@ -6866,35 +7126,196 @@ impl Slots {
                 } else if let Some(Err(error)) = &delivery {
                     debug!(%error, ordinal, "status edit failed; tried again later");
                 }
+                return;
             }
-            StatusJob::Pin { message } => match delivery {
-                Some(Ok(_)) => {
-                    if let Some(status) = self
-                        .registry
-                        .slot_mut(slot)
-                        .and_then(|entry| entry.view_mut(message.chat))
-                        .and_then(|view| view.status.as_mut())
-                        .filter(|status| status.message_id == message.id)
-                    {
-                        status.pinned = true;
-                        self.registry.dirty = true;
+            StatusJob::Unpin { message } => {
+                // Tried once: a pin that cannot be taken off stays.
+                if let Some(Err(error)) = &delivery {
+                    debug!(%error, ordinal, "old status message not unpinned");
+                }
+                if let Some(status) = self
+                    .registry
+                    .slot_mut(slot)
+                    .and_then(|entry| entry.view_mut(message.chat))
+                    .and_then(|view| view.status.as_mut())
+                    .filter(|status| status.message_id == message.id)
+                {
+                    status.pinned = false;
+                    self.registry.dirty = true;
+                }
+                return;
+            }
+        };
+        shown.sending = false;
+        shown.migrating = false;
+        match delivery {
+            Some(Ok(Outcome::Sent(sent))) if sent.message_id != 0 => {
+                // A message for a topic the slot no longer has stays there,
+                // and so does the one it was to replace.
+                let expected = old.map(|(old, _)| old.id);
+                if topic != Some(place) || expected != message.map(|status| status.message_id) {
+                    return;
+                }
+                shown.shows(text, keyboard, now);
+                shown.next_at = Some(now + every);
+                shown.retry_at = None;
+                shown.send_warned = false;
+                if let Some(view) = self
+                    .registry
+                    .slot_mut(slot)
+                    .and_then(|entry| entry.view_mut(place.chat))
+                {
+                    view.status = Some(StatusMessage {
+                        message_id: sent.message_id,
+                        pinned: false,
+                    });
+                    self.registry.dirty = true;
+                }
+                match old {
+                    Some((old, pinned)) => {
+                        info!(ordinal, "status message moved to the end of its topic");
+                        self.retire(old, pinned);
+                    }
+                    None => info!(ordinal, "status message sent"),
+                }
+            }
+            other => {
+                // Known limitation: a send whose answer was lost may have
+                // made a message; the retry makes another one. What made it
+                // due still holds (TASK-062).
+                if let Some(bottom) = self.bottoms.get_mut(&place) {
+                    match old {
+                        Some(_) => bottom.foreign = true,
+                        None => bottom.owed = true,
                     }
                 }
-                other => {
-                    shown.pin_failed = true;
-                    if !self.pin_warned {
-                        self.pin_warned = true;
-                        match other {
-                            Some(Err(error)) => {
-                                warn!(%error, "cannot pin a status message; not tried again until the hub restarts");
-                            }
-                            _ => warn!(
-                                "status message pin got no answer; not tried again until the hub restarts"
-                            ),
-                        }
+                shown.retry_at = Some(now + retry_every);
+                let first = !std::mem::replace(&mut shown.send_warned, true);
+                match other {
+                    Some(Err(error)) if first => {
+                        warn!(%error, ordinal, "status message not sent; retrying later");
                     }
+                    Some(Err(error)) => {
+                        debug!(%error, ordinal, "status message still not sent");
+                    }
+                    _ if first => {
+                        warn!(ordinal, "status message got no answer; retrying later")
+                    }
+                    _ => debug!(ordinal, "status message still got no answer"),
                 }
+            }
+        }
+    }
+
+    /// Whether the status message of `slot` can become turn content in
+    /// `place` now (TASK-062): it is the last message of that topic, and no
+    /// new message of the hub and no call that makes a status message is on
+    /// its way there.
+    fn absorbable(&self, slot: SlotId, place: Place) -> Option<MessageKey> {
+        self.options.status_every?;
+        let view = self.registry.slot(slot)?.primary()?;
+        let status = view.status?;
+        let bottom = self.bottoms.get(&place);
+        let blocked = view.place() != Some(place)
+            || view.pending_separator.is_some()
+            || status.pinned
+            || self.shown.get(&slot).is_some_and(|shown| shown.sending)
+            || bottom.is_some_and(|bottom| {
+                bottom.posting > 0 || bottom.absorbing.is_some() || bottom.buries(status.message_id)
+            });
+        (!blocked).then(|| MessageKey::new(view.chat, status.message_id))
+    }
+
+    /// Something came below the turn message of `place`'s current session:
+    /// the stream writes nothing more into it (TASK-062).
+    fn close_turn_message(&mut self, place: Place) {
+        let Some(session) = self
+            .registry
+            .slot_by_topic(place)
+            .and_then(|slot| self.registry.slot(slot)?.current_session.clone())
+        else {
+            return;
+        };
+        if let Some(live) = self.streams.get_mut(&session) {
+            live.close_open();
+        }
+    }
+
+    /// Telegram answered stream message `number` of `session`: when that
+    /// turned a status message into turn content, a new status message is
+    /// due. One that may not have become content (refused, no answer) is
+    /// cleared away: it may still show the old status.
+    fn absorbed(&mut self, session: &str, number: u64, accepted: bool) {
+        let Some(bottom) = self.bottoms.values_mut().find(|bottom| {
+            bottom
+                .absorbing
+                .as_ref()
+                .is_some_and(|(owner, at, _)| owner == session && *at == number)
+        }) else {
+            return;
+        };
+        let Some((_, _, message)) = bottom.absorbing.take() else {
+            return;
+        };
+        bottom.owed = true;
+        if !accepted {
+            self.retire(message, false);
+        }
+    }
+
+    /// Clears an old status message away: deleted, or when Telegram refuses
+    /// that, edited to [`status::RETIRED_TEXT`] and unpinned when `pinned`.
+    fn retire(&mut self, message: MessageKey, pinned: bool) {
+        self.hand_off(
+            Work::Retire(Retire::Delete { message, pinned }),
+            Op::Delete {
+                chat: message.chat,
+                message_id: message.id,
             },
+        );
+    }
+
+    fn on_retire_done(&mut self, retire: Retire, delivery: Option<Delivery>) {
+        let Retire::Delete { message, pinned } = retire else {
+            if let Some(Err(error)) = delivery {
+                debug!(%error, "old status message not cleared");
+            }
+            return;
+        };
+        let deleted = matches!(delivery, Some(Ok(_)))
+            || delivery
+                .as_ref()
+                .is_some_and(|delivery| telegram_error(delivery, &["message to delete not found"]));
+        if deleted {
+            return;
+        }
+        match &delivery {
+            Some(Err(error)) if !self.retire_warned => {
+                self.retire_warned = true;
+                warn!(%error, "cannot delete an old status message; it is edited instead, later failures are not logged");
+            }
+            Some(Err(error)) => debug!(%error, "old status message not deleted"),
+            _ => debug!("old status message delete got no answer"),
+        }
+        // Older than 48 hours: it must not look like the status any more.
+        self.hand_off(
+            Work::Retire(Retire::Edit),
+            Op::Edit {
+                chat: message.chat,
+                message_id: message.id,
+                text: status::RETIRED_TEXT.to_owned(),
+                reply_markup: Some(permissions::no_keyboard()),
+                background: false,
+            },
+        );
+        if pinned && self.options.can_pin {
+            self.hand_off(
+                Work::Retire(Retire::Unpin),
+                Op::Unpin {
+                    chat: message.chat,
+                    message_id: message.id,
+                },
+            );
         }
     }
 
@@ -7048,9 +7469,22 @@ impl Slots {
     }
 
     /// Never waits: the dispatch task does.
-    fn hand_off(&self, work: Work, op: Op) {
+    /// A new message counts as on its way into its topic until Telegram
+    /// answered (TASK-062); one that is not the stream's or a status message
+    /// closes the turn message there.
+    fn hand_off(&mut self, work: Work, op: Op) {
+        let posts = op.posts();
+        if let Some(place) = posts {
+            self.bottoms.entry(place).or_default().posting += 1;
+            if !matches!(work, Work::Stream { .. } | Work::Status { .. }) {
+                self.close_turn_message(place);
+            }
+        }
         if self.dispatch.send((work, op)).is_err() {
             debug!("dispatch task stopped; job dropped");
+            if let Some(bottom) = posts.and_then(|place| self.bottoms.get_mut(&place)) {
+                bottom.posting = bottom.posting.saturating_sub(1);
+            }
         }
     }
 
@@ -7096,6 +7530,14 @@ impl Slots {
 
     fn on_done(&mut self, done: Done) {
         match done {
+            Done::Posted { place, message_id } => {
+                let bottom = self.bottoms.entry(place).or_default();
+                bottom.posting = bottom.posting.saturating_sub(1);
+                if let Some(message_id) = message_id {
+                    bottom.last = bottom.last.max(message_id);
+                }
+            }
+            Done::Retire { retire, delivery } => self.on_retire_done(retire, delivery),
             Done::Topic { job, delivery } => self.on_topic_done(job, delivery),
             Done::Delete(delivery) => match delivery {
                 Some(Ok(_)) | None => {}
@@ -7504,6 +7946,9 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         live.answered_outside(&held);
         return Ok(Vec::new());
     };
+    // The answer is below the turn message (TASK-062); a rewind may not read
+    // it again, so it closes the message for rewinds too.
+    live.close_open();
     let op = |live: &mut Live, chunk: HtmlChunk| Op::Stream {
         chat,
         thread_id,
@@ -7512,6 +7957,7 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         merge: false,
         restart: std::mem::take(&mut live.restart),
         notify: true,
+        into: None,
     };
     let mut ops = Vec::with_capacity(chunks.len() + 1);
     for chunk in chunks {
@@ -7521,6 +7967,104 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
     let message = op(live, last);
     ops.push((live.sent_answer(held, &message), message));
     Ok(ops)
+}
+
+/// Where the stream messages of one read go (TASK-062, status messages on).
+struct Rolling {
+    /// The status message of the topic this read may turn into content,
+    /// until a piece does.
+    status: Option<MessageKey>,
+    /// It did: that piece's stream number, and the message.
+    absorbed: Option<(u64, MessageKey)>,
+    /// New messages this read handed out so far: after one of them the
+    /// status message is no longer the last one of the topic.
+    posted: usize,
+}
+
+/// The stream messages of `pieces` (text, HTML, whether it is quiet turn
+/// content; a terminal prompt is not), in order (TASK-062). Quiet pieces go
+/// into the turn message while they fit, else start the next one; the
+/// first new message of a read turns the status message into it when that
+/// is still the last one of the topic, else is a new message.
+fn roll(
+    live: &mut Live,
+    rolling: &mut Rolling,
+    pieces: Vec<(String, Option<String>, bool)>,
+    chat: Chat,
+    thread_id: i64,
+) -> Vec<(u64, Op)> {
+    // Pieces of one line go together where they fit: a result line may end
+    // several calls.
+    let mut joined: Vec<(String, Option<String>, bool)> = Vec::new();
+    for (text, html, quiet) in pieces {
+        if let Some((last_text, last_html, true)) = joined.last_mut()
+            && quiet
+            && let Some((text, html)) =
+                stream::join(last_text, last_html.as_deref(), &text, html.as_deref())
+        {
+            *last_text = text;
+            *last_html = html;
+            continue;
+        }
+        joined.push((text, html, quiet));
+    }
+    let mut ops = Vec::new();
+    for (text, html, quiet) in joined {
+        let restart = std::mem::take(&mut live.restart);
+        if quiet
+            && let Some(open) = live.open.as_mut()
+            && let Some(key) = open.key
+            && open.push(&text, html.as_deref())
+        {
+            let op = Op::Stream {
+                chat,
+                thread_id,
+                text: open.text.clone(),
+                html: open.html.clone(),
+                merge: true,
+                restart,
+                notify: false,
+                into: Some(key.id),
+            };
+            ops.push((live.sent(&op), op));
+            continue;
+        }
+        let status = match rolling.posted {
+            0 => rolling.status.take(),
+            _ => None,
+        };
+        let op = Op::Stream {
+            chat,
+            thread_id,
+            text: text.clone(),
+            html: html.clone(),
+            // The status message becoming content goes at once, as a
+            // foreground edit: the next status message waits for it.
+            merge: quiet && status.is_none(),
+            restart,
+            notify: false,
+            into: status.map(|status| status.id),
+        };
+        let number = match status {
+            Some(status) => {
+                let number = live.sent_absorb(&op);
+                rolling.absorbed = Some((number, status));
+                number
+            }
+            None => {
+                rolling.posted += 1;
+                live.sent(&op)
+            }
+        };
+        live.open = quiet.then_some(Open {
+            key: status,
+            number,
+            text,
+            html,
+        });
+        ops.push((number, op));
+    }
+    ops
 }
 
 /// The messages of a stream line: markdown as HTML with its plain source,
@@ -7586,10 +8130,20 @@ async fn dispatch_loop(
     done: mpsc::UnboundedSender<Done>,
 ) {
     while let Some((work, op)) = work.recv().await {
+        let posts = op.posts();
         let answer = outbox.submit(op).await;
         let done = done.clone();
         tokio::spawn(async move {
             let delivery = answer.await.ok();
+            if let Some(place) = posts {
+                let message_id = match &delivery {
+                    Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                        Some(message.message_id)
+                    }
+                    _ => None,
+                };
+                let _ = done.send(Done::Posted { place, message_id });
+            }
             let _ = done.send(match work {
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
@@ -7625,6 +8179,7 @@ async fn dispatch_loop(
                     job,
                     delivery,
                 },
+                Work::Retire(retire) => Done::Retire { retire, delivery },
                 Work::File {
                     conn,
                     transfer_id,
@@ -7724,6 +8279,11 @@ mod tests {
         react_error: bool,
         /// The next stream messages fail with a 502.
         stream_errors: Mutex<usize>,
+        /// New stream messages get ids from the counter of sends too, like
+        /// Telegram numbers every message of a chat (TASK-062).
+        stream_ids: bool,
+        /// The id each new message got, by the index of its op.
+        ids: Mutex<HashMap<usize, i64>>,
     }
 
     impl Fake {
@@ -7737,7 +8297,23 @@ mod tests {
 
     impl Transport for Fake {
         async fn execute(&self, op: &Op) -> Delivery {
-            self.ops.lock().unwrap().push(op.clone());
+            let index = {
+                let mut ops = self.ops.lock().unwrap();
+                ops.push(op.clone());
+                ops.len() - 1
+            };
+            let delivery = self.answer(op).await;
+            if let Ok(Outcome::Sent(message)) = &delivery
+                && message.message_id != 0
+            {
+                self.ids.lock().unwrap().insert(index, message.message_id);
+            }
+            delivery
+        }
+    }
+
+    impl Fake {
+        async fn answer(&self, op: &Op) -> Delivery {
             let send = matches!(
                 op,
                 Op::Send { .. } | Op::SendDocument { .. } | Op::SendPhoto { .. }
@@ -7779,6 +8355,10 @@ mod tests {
                     code: 502,
                     description: "Bad Gateway".to_owned(),
                 }),
+                Op::Stream { into: None, .. } if self.stream_ids => Ok(Outcome::Sent(Message {
+                    message_id: self.next_id(),
+                    ..Message::default()
+                })),
                 Op::Delete { .. } => match self.delete_error {
                     Some(description) => error(description),
                     None => Ok(Outcome::Done),
@@ -7805,6 +8385,15 @@ mod tests {
     }
 
     impl Fake {
+        /// The id of the next message of the chat, for a user's message too.
+        fn next_id(&self) -> i64 {
+            let mut next = self.next_message.lock().unwrap();
+            *next = (*next).max(1000);
+            let id = *next;
+            *next += 1;
+            id
+        }
+
         fn take_unclear_send(&self) -> bool {
             let mut unclear = self.unclear_sends.lock().unwrap();
             let take = *unclear > 0;
@@ -14036,6 +14625,17 @@ again"
             self.gated_reader(conn, session, pid, gate).await
         }
 
+        /// Like [`Self::reader`], and it presses console keys (TASK-062).
+        async fn keyed_reader(
+            &mut self,
+            conn: u64,
+            session: &str,
+            pid: u32,
+        ) -> mpsc::UnboundedReceiver<HubMsg> {
+            let gate = Arc::new(ReadGate::default());
+            self.reader_with(conn, session, pid, gate, true).await
+        }
+
         /// Like [`Self::reader`] until `gate.stopped` is set; then it
         /// leaves the next read unanswered and sets `gate.parked`.
         async fn gated_reader(
@@ -14044,6 +14644,17 @@ again"
             session: &str,
             pid: u32,
             gate: Arc<ReadGate>,
+        ) -> mpsc::UnboundedReceiver<HubMsg> {
+            self.reader_with(conn, session, pid, gate, false).await
+        }
+
+        async fn reader_with(
+            &mut self,
+            conn: u64,
+            session: &str,
+            pid: u32,
+            gate: Arc<ReadGate>,
+            keys: bool,
         ) -> mpsc::UnboundedReceiver<HubMsg> {
             let (to_agent, mut from_hub) = mpsc::channel(16);
             let (kept, kept_rx) = mpsc::unbounded_channel();
@@ -14080,7 +14691,7 @@ again"
                 claude_pid: Some(pid),
                 verdict_ack: true,
                 transcript_reads: true,
-                console_keys: false,
+                console_keys: keys,
                 console_commands: false,
                 client: None,
                 files: false,
@@ -15894,30 +16505,38 @@ again"
         }
     }
 
-    /// The status message: the first send of the topic that carries a
-    /// keyboard.
+    /// The status message now: the newest send that carries a keyboard
+    /// and is no prompt (TASK-062: it moves, the older ones are deleted).
+    /// The fake numbers sends from 1000.
     fn status_id(ops: &[Op]) -> Option<i64> {
-        let sends: Vec<&Op> = ops
-            .iter()
-            .filter(|op| matches!(op, Op::Send { .. }))
-            .collect();
-        sends
-            .iter()
-            .position(|op| {
-                matches!(
-                    op,
-                    Op::Send {
-                        reply_markup: Some(_),
-                        ..
-                    }
-                )
-            })
-            .map(|index| 1000 + index as i64)
+        status_sends(ops).last().map(|(id, _)| *id)
     }
 
+    /// Status message sends: (message id, text).
+    fn status_sends(ops: &[Op]) -> Vec<(i64, String)> {
+        ops.iter()
+            .filter(|op| matches!(op, Op::Send { .. }))
+            .zip(1000..)
+            .filter_map(|(op, id)| match op {
+                Op::Send {
+                    reply_markup: Some(_),
+                    permission: false,
+                    text,
+                    ..
+                } => Some((id, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What the status message shows now: its last edit, else its send.
     fn last_status_text(ops: &[Op]) -> Option<String> {
-        let id = status_id(ops)?;
-        edits_of(ops, id).last().map(|(text, _)| text.clone())
+        let (id, sent) = status_sends(ops).pop()?;
+        Some(
+            edits_of(ops, id)
+                .last()
+                .map_or(sent, |(text, _)| text.clone()),
+        )
     }
 
     #[tokio::test]
@@ -15931,7 +16550,6 @@ again"
         let ops = settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_ALIVE)).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         let ops = [ops, rig.fake.ops()].concat();
-        assert!(!ops.iter().any(|op| matches!(op, Op::Pin { .. })));
         assert_eq!(status_id(&ops), None);
     }
 
@@ -15942,10 +16560,7 @@ again"
         let mut rig = stream_rig(Fake::default(), status_options(), dir);
         rig.hook(start_with(A, 10, &path, "startup")).await;
         let _kept = rig.reader(1, A, 10).await;
-        settled(&rig, |ops| {
-            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
-        })
-        .await;
+        settled(&rig, |ops| status_id(ops).is_some()).await;
         rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
             .await;
         settled(&rig, |ops| {
@@ -15967,10 +16582,7 @@ again"
         let mut rig = stream_rig(Fake::default(), status_options(), dir);
         rig.hook(start_with(A, 10, &path, "startup")).await;
         let _kept = rig.reader(1, A, 10).await;
-        settled(&rig, |ops| {
-            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
-        })
-        .await;
+        settled(&rig, |ops| status_id(ops).is_some()).await;
         rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
             .await;
         rig.hook(hook(
@@ -16110,7 +16722,7 @@ again"
         let (mut slots, mut from_hub) = keyed_slots(&dir, status_options());
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
-            pinned: true,
+            pinned: false,
         });
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
         assert_eq!(
@@ -16154,7 +16766,7 @@ again"
         let (mut slots, mut from_hub) = keyed_slots(&dir, status_options());
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
-            pinned: true,
+            pinned: false,
         });
         let mut work = capture_dispatch(&mut slots);
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
@@ -16216,10 +16828,7 @@ again"
         let mut rig = stream_rig(Fake::default(), status_options(), dir);
         rig.hook(start_with(A, 10, &path, "startup")).await;
         let _kept = rig.reader(1, A, 10).await;
-        settled(&rig, |ops| {
-            ops.iter().any(|op| matches!(op, Op::Pin { .. }))
-        })
-        .await;
+        settled(&rig, |ops| status_id(ops).is_some()).await;
         rig.hook(hook(A, HookEvent::UserPromptSubmit { prompt_id: None }))
             .await;
         // The prompt comes after the turn started (hooks and agent frames
@@ -16394,8 +17003,8 @@ again"
         within(
             &rig,
             Duration::from_secs(300),
-            "eleven pinned status messages",
-            |ops| count(ops, |op| matches!(op, Op::Pin { .. })) == 11,
+            "eleven status messages",
+            |ops| status_messages(ops).len() == 11,
         )
         .await;
         let hooks = rig.hooks.clone();
@@ -16512,6 +17121,718 @@ again"
                 );
             }
         }
+    }
+
+    // ------------------------------------------------------------ TASK-062
+
+    /// A message topic `thread` shows (TASK-062), as a fake with
+    /// `stream_ids` numbers them.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Posted {
+        id: i64,
+        text: String,
+        /// Sent as the status message and still that.
+        status: bool,
+        /// Sent with a sound.
+        loud: bool,
+    }
+
+    /// The messages of `thread` Telegram shows now, oldest first: sends and
+    /// new stream messages with the ids the fake gave them, edited by edits
+    /// and stream messages written into them, without the deleted ones.
+    fn shown_topic(fake: &Fake, thread: i64) -> Vec<Posted> {
+        // Ids first: each belongs to an op of the snapshot after it.
+        let ids = fake.ids.lock().unwrap().clone();
+        let ops = fake.ops();
+        let mut shown: Vec<Posted> = Vec::new();
+        for (index, op) in ops.iter().enumerate() {
+            let id = ids.get(&index).copied();
+            match op {
+                Op::Send {
+                    thread_id: Some(t),
+                    text,
+                    reply_markup,
+                    permission,
+                    notify,
+                    ..
+                } if *t == thread => shown.extend(id.map(|id| Posted {
+                    id,
+                    text: text.clone(),
+                    status: reply_markup.is_some() && !permission,
+                    loud: *notify,
+                })),
+                Op::Stream {
+                    thread_id,
+                    text,
+                    notify,
+                    into: None,
+                    ..
+                } if *thread_id == thread => shown.extend(id.map(|id| Posted {
+                    id,
+                    text: text.clone(),
+                    status: false,
+                    loud: *notify,
+                })),
+                Op::Stream {
+                    text,
+                    into: Some(id),
+                    ..
+                } => {
+                    if let Some(message) = shown.iter_mut().find(|message| message.id == *id) {
+                        message.text.clone_from(text);
+                        message.status = false;
+                    }
+                }
+                Op::Edit {
+                    message_id, text, ..
+                } => {
+                    if let Some(message) =
+                        shown.iter_mut().find(|message| message.id == *message_id)
+                    {
+                        message.text.clone_from(text);
+                    }
+                }
+                Op::Delete { message_id, .. } => shown.retain(|message| message.id != *message_id),
+                _ => {}
+            }
+        }
+        shown
+    }
+
+    /// Texts of the topic's messages, `STATUS` for the status message.
+    fn topic_layout(fake: &Fake, thread: i64) -> Vec<String> {
+        shown_topic(fake, thread)
+            .into_iter()
+            .map(|message| {
+                if message.status {
+                    "STATUS".to_owned()
+                } else {
+                    message.text
+                }
+            })
+            .collect()
+    }
+
+    fn rolling_rig(name: &str) -> (Rig, String) {
+        let dir = TempDir::new(name);
+        let path = transcript_file(&dir, A);
+        let fake = Fake {
+            stream_ids: true,
+            ..Fake::default()
+        };
+        (stream_rig(fake, status_options(), dir), path)
+    }
+
+    /// The layout the user asked for (2026-09-27): a terminal prompt and
+    /// the lines of its turn go into the status message, which moves below
+    /// them; the lines of one turn share one message; the answer is a loud
+    /// message of its own and the status goes below it; nothing is pinned.
+    #[tokio::test]
+    async fn a_turn_goes_into_the_status_message_and_the_status_follows_it() {
+        let (mut rig, path) = rolling_rig("slots-rolling-turn");
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100).last().map(String::as_str) == Some("STATUS")
+        })
+        .await;
+        append(&path, &typed("go"));
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        append(&path, &tool_call("t2", "two"));
+        append(&path, &tool_result("t2", Some("boom")));
+        // The first session of a slot has no separator.
+        let turn = "• Bash: one ✓\n• Bash: two ✗ boom";
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100) == ["> go", turn, "STATUS"]
+        })
+        .await;
+        rig.hook(hook(
+            A,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: Some("Готово".into()),
+            },
+        ))
+        .await;
+        let ops = settled(&rig, |_| {
+            topic_layout(&rig.fake, 100) == ["> go", turn, "Готово", "STATUS"]
+        })
+        .await;
+        let shown = shown_topic(&rig.fake, 100);
+        assert!(shown[2].loud, "the answer rings");
+        assert!(!shown[0].loud && !shown[1].loud && !shown[3].loud);
+        // Lines went into their message by edits, not as new messages.
+        let new_lines = ops
+            .iter()
+            .filter(|op| {
+                matches!(op, Op::Stream { into: None, text, .. } if text.starts_with("• Bash"))
+            })
+            .count();
+        assert!(new_lines <= 1, "{ops:#?}");
+        assert!(!ops.iter().any(|op| matches!(op, Op::Unpin { .. })));
+    }
+
+    /// A message of the user moves the status message below it and closes
+    /// the turn message: the next lines go into a message below the user's.
+    #[tokio::test]
+    async fn a_users_message_moves_the_status_below_it_and_closes_the_turn_message() {
+        let (mut rig, path) = rolling_rig("slots-rolling-user");
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100) == ["• Bash: one ✓", "STATUS"]
+        })
+        .await;
+        let old = shown_topic(&rig.fake, 100)[1].id;
+        let user = rig.fake.next_id();
+        rig.control
+            .send(say(Some(100), user, Some("again")))
+            .unwrap();
+        let ops = settled(&rig, |_| {
+            shown_topic(&rig.fake, 100)
+                .last()
+                .is_some_and(|last| last.status && last.id > user)
+        })
+        .await;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Delete { message_id, .. } if *message_id == old)),
+            "the old status message is deleted"
+        );
+        append(&path, &tool_call("t2", "two"));
+        append(&path, &tool_result("t2", None));
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100) == ["• Bash: one ✓", "• Bash: two ✓", "STATUS"]
+        })
+        .await;
+        let shown = shown_topic(&rig.fake, 100);
+        assert!(shown[1].id > user, "below the user's message: {shown:?}");
+    }
+
+    /// A turn message that would pass Telegram's limit goes on in the next
+    /// one; assistant text shares the message with the lines.
+    #[tokio::test]
+    async fn a_full_turn_message_goes_on_in_the_next_one() {
+        let (mut rig, path) = rolling_rig("slots-rolling-full");
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        let long = |mark: char| format!("{mark} {}", "слово ".repeat(250).trim_end());
+        append(&path, &note_record(&long('a')));
+        append(&path, &note_record(&long('b')));
+        append(&path, &note_record(&long('c')));
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        settled(&rig, |_| {
+            let layout = topic_layout(&rig.fake, 100);
+            layout.len() == 3
+                && layout[0].starts_with("a ")
+                && layout[0].contains("\nb ")
+                && layout[1].starts_with("c ")
+                && layout[1].ends_with("\n• Bash: one ✓")
+                && layout[2] == "STATUS"
+        })
+        .await;
+        for message in shown_topic(&rig.fake, 100) {
+            assert!(
+                transcript::telegram_len(&message.text) <= transcript::TELEGRAM_TEXT_LIMIT,
+                "{}",
+                message.text.len()
+            );
+        }
+    }
+
+    /// A hub before TASK-062 pinned its status message: the new hub moves it
+    /// to the end of the topic once, and when Telegram refuses to delete the
+    /// old one (older than 48 hours) it is emptied and unpinned instead.
+    #[tokio::test]
+    async fn an_old_pinned_status_message_moves_to_the_end_once() {
+        let dir = TempDir::new("slots-rolling-pinned");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.registry.slots[0].views[0].pending_separator = None;
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: true,
+        });
+        let mut work = capture_dispatch(&mut slots);
+        slots.pump();
+        let mut handed = status_work(&mut work);
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        let (job, op) = handed.remove(0);
+        assert!(
+            matches!(job, StatusJob::Replace { pinned: true, .. }),
+            "{job:?}"
+        );
+        assert!(
+            matches!(
+                op,
+                Op::Send {
+                    thread_id: Some(100),
+                    reply_markup: Some(_),
+                    ..
+                }
+            ),
+            "{op:?}"
+        );
+        // Nothing else while it is out; the old message is still the status.
+        slots.pump();
+        assert!(status_work(&mut work).is_empty());
+        slots.on_status_done(
+            SlotId(0),
+            job,
+            Some(Ok(Outcome::Sent(Message {
+                message_id: 600,
+                ..Message::default()
+            }))),
+        );
+        assert_eq!(
+            slots.registry.slots[0].views[0].status,
+            Some(StatusMessage {
+                message_id: 600,
+                pinned: false
+            })
+        );
+        let retire = |work: &mut mpsc::UnboundedReceiver<(Work, Op)>| {
+            let mut found = Vec::new();
+            while let Ok((job, op)) = work.try_recv() {
+                if let Work::Retire(retire) = job {
+                    found.push((retire, op));
+                }
+            }
+            found
+        };
+        let mut handed = retire(&mut work);
+        assert_eq!(handed.len(), 1);
+        let (step, op) = handed.remove(0);
+        assert!(
+            matches!(
+                op,
+                Op::Delete {
+                    message_id: 500,
+                    ..
+                }
+            ),
+            "{op:?}"
+        );
+        slots.on_retire_done(
+            step,
+            Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message can't be deleted".into(),
+            })),
+        );
+        let ops: Vec<Op> = retire(&mut work).into_iter().map(|(_, op)| op).collect();
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [
+                    Op::Edit { message_id: 500, text, reply_markup: Some(_), .. },
+                    Op::Unpin { message_id: 500, .. },
+                ] if text == status::RETIRED_TEXT
+            ),
+            "{ops:?}"
+        );
+        // Moved once: the new status message is not pinned and stays put.
+        slots.pump();
+        assert!(
+            status_work(&mut work)
+                .iter()
+                .all(|(job, _)| matches!(job, StatusJob::Edit { .. }))
+        );
+    }
+
+    /// TASK-062 with the hub's real pacing (`Limits::default()`): ten
+    /// sessions write a turn line every 2 s each and their status changes as
+    /// often; a person writes into one of them every 30 s and gets its
+    /// answer a minute later. All of it goes into rolling status and turn
+    /// messages. A new session still gets its topic, a
+    /// permission prompt and its decision show, ⏹ asks and interrupts,
+    /// every line reaches its topic, every status message keeps showing
+    /// what its session does, and once the sessions are quiet each topic
+    /// ends with its status message.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_hubs_pacing_ten_rolling_sessions_starve_nothing() {
+        let dir = TempDir::new("slots-rolling-paced");
+        let fake = Fake {
+            stream_ids: true,
+            ..Fake::default()
+        };
+        let options = Options {
+            status_every: Some(STATUS_EVERY),
+            ..message_options()
+        };
+        let mut rig = rig_with(fake, options, dir, Limits::default());
+        let sampled = op_times(rig.fake.clone());
+        // Session 0 asks for a permission; sessions 1..=10 work.
+        let mut paths = Vec::new();
+        let mut kept = Vec::new();
+        for n in 0..=10u32 {
+            let session = paced_session(n);
+            let path = transcript_file(&rig.dir, &session);
+            rig.hook(start_with(&session, 10 + n, &path, "startup"))
+                .await;
+            if n == 0 {
+                // Its prompt's decision shows at once (no verdict ack).
+                keys_agent(&mut rig, 1, &session, 10).await;
+            } else {
+                kept.push(rig.keyed_reader(u64::from(n) + 1, &session, 10 + n).await);
+            }
+            paths.push(path);
+        }
+        within(
+            &rig,
+            Duration::from_secs(300),
+            "eleven status messages",
+            |ops| {
+                (0..=10).all(|n| {
+                    topic_of(ops, n) == Some(100 + i64::from(n))
+                        && topic_of(ops, n).is_some_and(|topic| {
+                            shown_topic(&rig.fake, topic)
+                                .last()
+                                .is_some_and(|last| last.status)
+                        })
+                })
+            },
+        )
+        .await;
+        // The start is over: every topic shows its session alive.
+        within(&rig, Duration::from_secs(300), "alive icons", |ops| {
+            (0..=10).all(|n| icon_now(ops, 100 + n) == Some(ICON_ALIVE))
+        })
+        .await;
+        let hooks = rig.hooks.clone();
+        let control = rig.control.clone();
+        let fake = rig.fake.clone();
+        let written: Arc<Mutex<Vec<(u32, String, Instant)>>> = Arc::default();
+        let log = written.clone();
+        let work_paths = paths.clone();
+        let churn_from = Instant::now();
+        let churn = tokio::spawn(async move {
+            for step in 0u64.. {
+                // The sessions set to work one after another, 6 s apart.
+                for n in (1..=10u32).filter(|n| step >= u64::from(*n) * 3) {
+                    let session = paced_session(n);
+                    let id = format!("s{n}-{step}");
+                    let description = format!("step {step} of {n}");
+                    append(&work_paths[n as usize], &tool_call(&id, &description));
+                    append(&work_paths[n as usize], &tool_result(&id, None));
+                    if let Ok(mut log) = log.lock() {
+                        log.push((n, format!("• Bash: {description} ✓"), Instant::now()));
+                    }
+                    let _ = hooks.send(tool_start(&session, step)).await;
+                }
+                // A person at the keyboard: a message every 30 s, to
+                // sessions 2..=10 in turn, answered a minute later.
+                // Session 1 only works: its ⏹ is tried below.
+                if step % 15 == 0 {
+                    let n = 2 + (step / 15 % 9) as u32;
+                    let topic = 100 + i64::from(n);
+                    let _ = control.send(say(Some(topic), fake.next_id(), Some("ещё")));
+                    let _ = hooks
+                        .send(hook(
+                            &paced_session(n),
+                            HookEvent::UserPromptSubmit { prompt_id: None },
+                        ))
+                        .await;
+                }
+                if step % 15 == 0 && step >= 30 {
+                    let n = 2 + ((step - 30) / 15 % 9) as u32;
+                    let _ = hooks
+                        .send(hook(
+                            &paced_session(n),
+                            HookEvent::Stop {
+                                prompt_id: None,
+                                last_assistant_message: Some(format!("ответ {n}-{step}")),
+                            },
+                        ))
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(40)).await;
+
+        // A new session: its topic comes at once, not after the edits.
+        let path = transcript_file(&rig.dir, &paced_session(11));
+        rig.hook(start_with(&paced_session(11), 21, &path, "startup"))
+            .await;
+        within(&rig, Duration::from_secs(10), "the new topic", |ops| {
+            topic_of(ops, 11).is_some()
+        })
+        .await;
+
+        // A permission prompt and the decision on it.
+        rig.agents.send(permission(1, "abcde", "p")).await.unwrap();
+        within(&rig, Duration::from_secs(5), "the prompt", |_| {
+            prompts_rolling(&rig.fake).len() == 1
+        })
+        .await;
+        let (_, prompt_id) = prompts_rolling(&rig.fake).remove(0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        rig.control
+            .send(press("q1", Some(prompt_id), "allow:abcde"))
+            .unwrap();
+        // Four edit tokens at most: the ❓ icon and its way back (topic
+        // calls) and a 👀 on a user's message may take their turns first.
+        within(&rig, Duration::from_secs(16), "the decision edit", |ops| {
+            edits_of(ops, prompt_id)
+                .iter()
+                .any(|(text, _)| text.contains(permissions::ALLOWED_MARK))
+        })
+        .await;
+
+        // ⏹ on session 1: the question shows on its status message, wherever
+        // that is by then, and the second press interrupts.
+        let topic = topic_of(&rig.fake.ops(), 1).expect("topic of session 1");
+        within(&rig, Duration::from_secs(60), "⏹ on session 1", |_| {
+            offering(&rig.fake, topic, "status:stop").is_some()
+        })
+        .await;
+        let status = offering(&rig.fake, topic, "status:stop").expect("⏹");
+        rig.control
+            .send(press("q2", Some(status), "status:stop"))
+            .unwrap();
+        within(&rig, Duration::from_secs(8), "the ⏹ question", |_| {
+            offering(&rig.fake, topic, "status:confirm").is_some()
+        })
+        .await;
+        let asked = offering(&rig.fake, topic, "status:confirm").expect("the question");
+        rig.control
+            .send(press("q3", Some(asked), "status:confirm"))
+            .unwrap();
+        let ops = within(&rig, Duration::from_secs(5), "both answers", |ops| {
+            answers(ops).len() == 3
+        })
+        .await;
+        assert_eq!(
+            answers(&ops)[1..],
+            [
+                Some(status::ANSWER_CONFIRM),
+                Some(status::ANSWER_INTERRUPTING)
+            ]
+        );
+
+        // The work goes on for a while, then stops.
+        tokio::time::sleep(Duration::from_secs(150)).await;
+        churn.abort();
+        let stopped = Instant::now();
+        let written = written.lock().map(|log| log.clone()).unwrap_or_default();
+        // Every line reaches its topic, the last ones within two minutes.
+        let ops = within(
+            &rig,
+            Duration::from_secs(120),
+            "every line in its topic",
+            |_| {
+                let shown: HashSet<(u32, String)> = (1..=10u32)
+                    .flat_map(|n| {
+                        shown_topic(&rig.fake, 100 + i64::from(n))
+                            .into_iter()
+                            .flat_map(move |message| {
+                                message
+                                    .text
+                                    .lines()
+                                    .map(|line| (n, line.to_owned()))
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .collect();
+                written
+                    .iter()
+                    .all(|(n, line, _)| shown.contains(&(*n, line.clone())))
+            },
+        )
+        .await;
+        let times = op_times_now(
+            &rig,
+            &sampled
+                .lock()
+                .map(|times| times.clone())
+                .unwrap_or_default(),
+        );
+        // How long each line took to show: the first op that carried it.
+        let mut first: HashMap<&str, Instant> = HashMap::new();
+        for (op, at) in ops.iter().zip(&times) {
+            if let Op::Stream { text, .. } = op {
+                for line in text.lines() {
+                    first.entry(line).or_insert(*at);
+                }
+            }
+        }
+        let lag = written
+            .iter()
+            .filter_map(|(_, line, at)| Some(*first.get(line.as_str())? - *at))
+            .max()
+            .unwrap_or_default();
+        eprintln!("longest line lag: {lag:?}");
+        // Measured 2026-09-27: 95-110 s at worst. Ten topics share about 35
+        // requests a minute: each turn message grows about every minute and
+        // a half under this load.
+        assert!(lag <= Duration::from_secs(150), "a line waited {lag:?}");
+        // Each status message keeps showing what its session does: a status
+        // call (sent, moved or edited) for each slot at least every 150 s
+        // (measured: 84-116 s at worst).
+        for n in 1..=10u32 {
+            let topic = 100 + i64::from(n);
+            let given = rig.fake.ids.lock().unwrap().clone();
+            let mut ids: HashSet<i64> = HashSet::new();
+            let mut calls = Vec::new();
+            for (index, (op, at)) in ops.iter().zip(&times).enumerate() {
+                match op {
+                    Op::Send {
+                        thread_id: Some(t),
+                        reply_markup: Some(_),
+                        permission: false,
+                        ..
+                    } if *t == topic => {
+                        ids.extend(given.get(&index));
+                        calls.push(*at);
+                    }
+                    Op::Edit { message_id, .. } if ids.contains(message_id) => calls.push(*at),
+                    _ => {}
+                }
+            }
+            let during: Vec<Instant> = calls
+                .into_iter()
+                .filter(|at| *at >= churn_from && *at <= stopped)
+                .collect();
+            let gap = during
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .max()
+                .unwrap_or_default();
+            eprintln!(
+                "session {n}: {} status calls, longest gap {gap:?}",
+                during.len()
+            );
+            assert!(
+                during.len() >= 2,
+                "session {n}: {} status calls",
+                during.len()
+            );
+            assert!(
+                gap <= Duration::from_secs(150),
+                "session {n}: {gap:?} between status calls"
+            );
+        }
+        // Quiet now: each topic ends with its status message.
+        within(
+            &rig,
+            Duration::from_secs(180),
+            "status messages last",
+            |_| {
+                (1..=10).all(|n| {
+                    shown_topic(&rig.fake, 100 + i64::from(n))
+                        .last()
+                        .is_some_and(|last| last.status)
+                })
+            },
+        )
+        .await;
+        // The group budgets held throughout.
+        let ops = rig.fake.ops();
+        let times = op_times_now(
+            &rig,
+            &sampled
+                .lock()
+                .map(|times| times.clone())
+                .unwrap_or_default(),
+        );
+        for (index, at) in times.iter().enumerate() {
+            let window = || {
+                ops.iter()
+                    .zip(&times)
+                    .skip(index)
+                    .take_while(|(_, later)| **later < *at + Duration::from_secs(60))
+            };
+            let sends = window().filter(|(op, _)| op.posts().is_some()).count();
+            let edits = window()
+                .filter(|(op, _)| !matches!(op, Op::AnswerCallback { .. }) && op.posts().is_none())
+                .count();
+            // Turn content takes a spare message token when no edit token
+            // is there: new messages and all requests are what is bounded.
+            assert!(
+                sends <= 21 && sends + edits <= 41,
+                "{sends} sends, {edits} other requests"
+            );
+        }
+        drop(kept);
+    }
+
+    /// The status message of `thread` when it shows the button with
+    /// callback `data`.
+    fn offering(fake: &Fake, thread: i64, data: &str) -> Option<i64> {
+        let status = shown_topic(fake, thread)
+            .into_iter()
+            .rev()
+            .find(|message| message.status)?
+            .id;
+        let ids = fake.ids.lock().unwrap().clone();
+        let markup = fake
+            .ops()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, op)| match op {
+                Op::Send { reply_markup, .. } if ids.get(&index) == Some(&status) => {
+                    Some(reply_markup.clone())
+                }
+                Op::Edit {
+                    message_id,
+                    reply_markup,
+                    ..
+                } if *message_id == status => Some(reply_markup.clone()),
+                _ => None,
+            })?;
+        has_button(markup.as_ref(), data).then_some(status)
+    }
+
+    /// The icon topic `thread` shows: from its creation (topics are
+    /// numbered from 100), then from its last icon edit.
+    fn icon_now(ops: &[Op], thread: i64) -> Option<&str> {
+        let created = ops
+            .iter()
+            .filter(|op| is_create(op))
+            .zip(100..)
+            .find_map(|(op, topic)| match op {
+                Op::CreateTopic {
+                    icon_custom_emoji_id,
+                    ..
+                } if topic == thread => icon_custom_emoji_id.as_deref(),
+                _ => None,
+            });
+        last_icon(ops, thread).or(created)
+    }
+
+    /// Permission prompts sent so far: (topic, message id).
+    fn prompts_rolling(fake: &Fake) -> Vec<(i64, i64)> {
+        let ids = fake.ids.lock().unwrap().clone();
+        fake.ops()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| match op {
+                Op::Send {
+                    thread_id: Some(thread),
+                    permission: true,
+                    ..
+                } => Some((*thread, *ids.get(&index)?)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `times` for every op recorded by now (the sampler lags up to 100 ms).
+    fn op_times_now(rig: &Rig, times: &[Instant]) -> Vec<Instant> {
+        let mut times = times.to_vec();
+        let count = rig.fake.ops().len();
+        let last = times.last().copied().unwrap_or_else(Instant::now);
+        times.resize(count, last);
+        times
     }
 
     // ------------------------------------------------------------ TASK-040
@@ -18888,5 +20209,181 @@ again"
                 assert!(!value.contains("1000000000001"), "{meta:?}");
             }
         }
+    }
+    // ---------------------------------------------- TASK-062 plan review
+
+    /// A status message turning into turn content is refused (502) and the
+    /// session ends before its stream reads again (TASK-024 drain): every
+    /// line still reaches the topic once, below it the status message.
+    #[tokio::test]
+    async fn a_refused_absorb_of_a_session_that_left_keeps_every_line() {
+        let dir = TempDir::new("slots-rolling-absorb-left");
+        let path = transcript_file(&dir, A);
+        let fake = Fake {
+            stream_ids: true,
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_millis(300),
+            ..status_options()
+        };
+        let mut rig = stream_rig(fake, options, dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100).last().map(String::as_str) == Some("STATUS")
+        })
+        .await;
+        *rig.fake.stream_errors.lock().unwrap() = 1;
+        // One read: the first line turns the status message into content,
+        // the second is written into it.
+        let lines = [
+            tool_call("t1", "one"),
+            tool_result("t1", None),
+            tool_call("t2", "two"),
+            tool_result("t2", None),
+        ]
+        .concat();
+        append(&path, &lines);
+        settled(&rig, |ops| {
+            ops.iter()
+                .any(|op| matches!(op, Op::Stream { into: Some(_), .. }))
+        })
+        .await;
+        rig.hook(session_end(A, 10)).await;
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100) == ["• Bash: one ✓\n• Bash: two ✓", "STATUS"]
+        })
+        .await;
+    }
+
+    /// Q3 of the plan: a dead slot's status message pinned by a hub before
+    /// TASK-062 is only unpinned, in place, once; nothing is sent for it.
+    #[tokio::test]
+    async fn an_old_pinned_status_message_of_a_dead_slot_is_only_unpinned() {
+        let dir = TempDir::new("slots-rolling-pinned-dead");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.registry.slots[0].views[0].pending_separator = None;
+        slots.on_hook(&session_end(A, 10));
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 500,
+            pinned: true,
+        });
+        let mut work = capture_dispatch(&mut slots);
+        slots.pump();
+        let mut handed = status_work(&mut work);
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        let (job, op) = handed.remove(0);
+        assert!(
+            matches!(
+                op,
+                Op::Unpin {
+                    message_id: 500,
+                    ..
+                }
+            ),
+            "{op:?}"
+        );
+        slots.on_status_done(
+            SlotId(0),
+            job,
+            Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: not enough rights".into(),
+            })),
+        );
+        assert_eq!(
+            slots.registry.slots[0].views[0].status,
+            Some(StatusMessage {
+                message_id: 500,
+                pinned: false
+            })
+        );
+        slots.pump();
+        assert!(
+            status_work(&mut work)
+                .iter()
+                .all(|(_, op)| !matches!(op, Op::Send { .. } | Op::Unpin { .. })),
+            "stays where it is until the slot gets activity"
+        );
+    }
+
+    /// Q3 of the plan: old pinned status messages of live slots move to the
+    /// end of their topics one slot at a time.
+    #[tokio::test]
+    async fn old_pinned_status_messages_of_live_slots_move_one_at_a_time() {
+        let dir = TempDir::new("slots-rolling-pinned-live");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots.on_hook(&start(B, 11));
+        for (index, topic) in [(0, 100), (1, 101)] {
+            slots
+                .registry
+                .topic_created(SlotId(index), Chat::Group, topic, "a", None);
+            slots.registry.slots[index].views[0].pending_separator = None;
+            slots.registry.slots[index].views[0].status = Some(StatusMessage {
+                message_id: 500 + topic,
+                pinned: true,
+            });
+        }
+        let mut work = capture_dispatch(&mut slots);
+        slots.pump();
+        let handed = status_work(&mut work);
+        let moves = handed
+            .iter()
+            .filter(|(job, _)| matches!(job, StatusJob::Replace { pinned: true, .. }))
+            .count();
+        assert_eq!(moves, 1, "{handed:?}");
+        // Telegram answers: the move of slot 0, an edit in place of slot 1.
+        for (job, _) in handed {
+            let (slot, delivery) = match &job {
+                StatusJob::Replace { old, .. } if old.id == 600 => (
+                    SlotId(0),
+                    Outcome::Sent(Message {
+                        message_id: 700,
+                        ..Message::default()
+                    }),
+                ),
+                StatusJob::Edit { message, .. } if message.id == 601 => (SlotId(1), Outcome::Done),
+                other => panic!("{other:?}"),
+            };
+            slots.on_status_done(slot, job, Some(Ok(delivery)));
+        }
+        slots.pump();
+        let next = status_work(&mut work);
+        assert!(
+            next.iter().any(|(job, _)| matches!(
+                job,
+                StatusJob::Replace {
+                    pinned: true,
+                    old,
+                    ..
+                } if old.id == 601
+            )),
+            "the other slot moves next: {next:?}"
+        );
+    }
+    /// A ⏹ press on the status message while its edit into turn content
+    /// waits for Telegram still reaches its slot (TASK-062 plan review).
+    #[tokio::test]
+    async fn a_status_message_turning_into_turn_content_keeps_its_buttons() {
+        let dir = TempDir::new("slots-rolling-absorbing-press");
+        let (_fake, mut slots) = live_slots(&dir, status_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        let key = MessageKey::new(Chat::Group, 500);
+        assert_eq!(slots.status_slot(key), None);
+        slots
+            .bottoms
+            .entry(Place::topic(Chat::Group, 100))
+            .or_default()
+            .absorbing = Some((A.to_owned(), 1, key));
+        assert_eq!(slots.status_slot(key), Some(SlotId(0)));
     }
 }

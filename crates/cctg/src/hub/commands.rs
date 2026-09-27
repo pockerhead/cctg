@@ -187,6 +187,10 @@ pub trait TranscriptSource: Send + Sync + 'static {
         place: Place,
         command: TranscriptCommand,
     ) -> impl Future<Output = Prepared> + Send;
+
+    /// A command in `place` and its answer are in the topic now: below the
+    /// status message (TASK-062).
+    fn posted(&self, _place: Place) {}
 }
 
 /// One command for the slot actor ([`super::slots::Slots::transcript_asks`]),
@@ -199,11 +203,21 @@ pub struct TranscriptAsk {
     pub answer: oneshot::Sender<Prepared>,
 }
 
-/// [`TranscriptSource`] over the slot actor's channel.
+/// [`TranscriptSource`] over the slot actor's channels: the asks, and
+/// [`super::slots::Control::Posted`] after each command.
 #[derive(Debug, Clone)]
-pub struct Asks(pub mpsc::Sender<TranscriptAsk>);
+pub struct Asks(
+    pub mpsc::Sender<TranscriptAsk>,
+    pub Option<mpsc::UnboundedSender<super::slots::Control>>,
+);
 
 impl TranscriptSource for Asks {
+    fn posted(&self, place: Place) {
+        if let Some(control) = &self.1 {
+            let _ = control.send(super::slots::Control::Posted { place });
+        }
+    }
+
     async fn prepare(&self, place: Place, command: TranscriptCommand) -> Prepared {
         let (answer, answered) = oneshot::channel();
         let ask = TranscriptAsk {
@@ -515,6 +529,7 @@ pub async fn serve<S: TranscriptSource>(
 ) {
     while let Some(input) = inbox.recv().await {
         handle(&input, &outbox, &source, bot_username.as_deref()).await;
+        source.posted(input.place());
     }
 }
 
@@ -815,7 +830,7 @@ mod tests {
             session_prefix: None,
         };
         assert_eq!(
-            Asks(tx).prepare(GENERAL, command).await,
+            Asks(tx, None).prepare(GENERAL, command).await,
             Prepared::Notice(NO_ACTOR.to_owned())
         );
     }

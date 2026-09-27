@@ -119,7 +119,7 @@ async fn command_logs_carry_no_paths() {
         ..Options::default()
     };
     let mut slots = Slots::new(store.load().expect("load"), store, outbox.clone(), options);
-    let source = Arc::new(Asks(slots.transcript_asks()));
+    let source = Arc::new(Asks(slots.transcript_asks(), None));
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (_control, control_rx) = mpsc::unbounded_channel();
