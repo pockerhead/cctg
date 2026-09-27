@@ -35,8 +35,11 @@
 //! line shows exactly once and in order, every answer is a loud message
 //! of its own, and no status message sent or edited after the decisions
 //! (there must be some in both prompts' topics) still shows a decided prompt.
-//! Several minutes (20 messages and 20 edits a minute). In every fake mode a
-//! permission prompt goes within three message refills (+3 s) of its request.
+//! Instead of planned 429s its fake answers 429 to any request into the group
+//! beyond 20 in 60 s (TASK-068), and the run may see at most one.
+//! Several minutes (20 requests a minute). In every fake mode a permission
+//! prompt goes within three refills of the group's budget (+3 s) of its
+//! request.
 //!
 //! Slow (about a minute), so it runs only when asked:
 //! `cargo test -p cctg --test soak -- --ignored`.
@@ -474,6 +477,8 @@ struct Call {
     /// The message id Telegram gave (sends), or the one acted on.
     message_id: Option<i64>,
     outcome: &'static str,
+    /// A 429's `retry_after`.
+    wait: Duration,
 }
 
 fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
@@ -588,6 +593,12 @@ struct Tg {
     flood: Mutex<VecDeque<usize>>,
     streams_seen: AtomicUsize,
     retry_after: Duration,
+    /// Status mode (TASK-068): at most this many requests into the group
+    /// (every method but callback answers, which go to the user) in any
+    /// 60 s; the next one gets a 429 until the oldest leaves the window.
+    group_limit: Option<usize>,
+    /// When the group's requests Telegram took went, oldest first.
+    group_requests: Mutex<VecDeque<Instant>>,
     updates: Updates,
     /// `forum_topic_edited` service messages Telegram showed: (thread, id).
     service: Mutex<Vec<(Option<i64>, i64)>>,
@@ -703,6 +714,30 @@ impl Tg {
             })
             .flat_map(|call| call.text.lines().map(str::to_owned).collect::<Vec<_>>())
             .collect()
+    }
+
+    /// Status mode: a 429 when `group_limit` requests went in the 60 s
+    /// before `at`, with a `retry_after` (whole seconds, as Telegram's) that
+    /// ends when the oldest of them leaves the window; else `at` counts.
+    fn group_flood(&self, op: &Op, at: Instant) -> Option<Duration> {
+        let limit = self.group_limit?;
+        if matches!(op, Op::AnswerCallback { .. }) {
+            return None;
+        }
+        let window = Duration::from_secs(60);
+        let mut requests = self.group_requests.lock().unwrap();
+        while requests
+            .front()
+            .is_some_and(|first| at.duration_since(*first) >= window)
+        {
+            requests.pop_front();
+        }
+        if requests.len() >= limit {
+            let free = window.saturating_sub(at.duration_since(requests[0]));
+            return Some(Duration::from_secs(free.as_secs() + 1));
+        }
+        requests.push_back(at);
+        None
     }
 
     fn arm_flood(&self, after_streams: &[usize]) {
@@ -826,13 +861,20 @@ impl Transport for Tg {
         let result = match &self.live {
             Some(_) if local => Ok(Outcome::Done),
             Some(api) => api.execute(op).await,
-            None => self.fake_execute(op),
+            None => match self.group_flood(op, at) {
+                Some(wait) => Err(ApiError::RetryAfter(wait)),
+                None => self.fake_execute(op),
+            },
         };
         let (kind, thread, text, acted_on) = describe(op);
         let message_id = match &result {
             Ok(Outcome::Sent(message)) => Some(message.message_id),
             Ok(Outcome::Topic(topic)) => Some(topic.message_thread_id),
             _ => acted_on,
+        };
+        let wait = match &result {
+            Err(ApiError::RetryAfter(wait)) => *wait,
+            _ => Duration::ZERO,
         };
         let outcome = match &result {
             Ok(_) if local => "synthetic",
@@ -848,6 +890,7 @@ impl Transport for Tg {
             text,
             message_id,
             outcome,
+            wait,
         });
         result
     }
@@ -1419,6 +1462,8 @@ async fn soak(live: bool, status: bool) -> String {
         flood: Mutex::new(VecDeque::new()),
         streams_seen: AtomicUsize::new(0),
         retry_after: Duration::from_secs(1),
+        group_limit: status.then_some(20),
+        group_requests: Mutex::new(VecDeque::new()),
         updates,
         service: Mutex::new(Vec::new()),
         topics: Mutex::new(BTreeMap::new()),
@@ -1751,12 +1796,9 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let (p_a, p_a2) = (prompt_of(t_a).unwrap(), prompt_of(t_a2).unwrap());
     // The 429s go into the rest of the burst, after the prompts: the
     // latencies above measure the priority of a prompt, not a 429 pause.
-    // Rolling (TASK-062) sends the rest of a burst in a few writes, so there
-    // they go into the first and third stream call from now (the second is
-    // the retry of the first), of the burst or of phase 5.
-    if soak.status {
-        tg.arm_flood(&[1, 3]);
-    } else if !soak.live {
+    // Status mode plans none: its fake answers 429 above the group's rate
+    // (TASK-068), and the hub's pacing is to keep below it.
+    if !soak.live && !soak.status {
         tg.arm_flood(&[2, 6]);
     }
     let latency_a = p_a.at.duration_since(t0);
@@ -1781,9 +1823,18 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     // So latency <= L + 3 x refill_every. L is taken as 3 s (a loaded
     // machine): a heuristic for the manual run, not a guarantee; CI never
     // runs this (`#[ignore]`). Status mode: 3 x 4 s + 3 s = 15 s (it was
-    // 128-172 s behind the topic's status move).
+    // 128-172 s behind the topic's status move). There every request takes
+    // a token of the group's budget too (TASK-068), which a prompt takes
+    // first the same way: the slower of the two refills counts. The fake
+    // answers no 429 below its limit, so the group's rate stays full.
     if !soak.live {
-        let bound = soak.limits.messages.refill_every * 3 + Duration::from_secs(3);
+        let refill = soak
+            .limits
+            .group
+            .map_or(soak.limits.messages.refill_every, |group| {
+                group.refill_every.max(soak.limits.messages.refill_every)
+            });
+        let bound = refill * 3 + Duration::from_secs(3);
         for (name, latency) in [("A", latency_a), ("A #2", latency_a2)] {
             assert!(
                 latency <= bound,
@@ -2007,10 +2058,14 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             .find(|call| call.at > flood.at)
             .expect("a call after the 429");
         assert!(
-            next.at.duration_since(flood.at) >= tg.retry_after - Duration::from_millis(20),
+            next.at.duration_since(flood.at) >= flood.wait - Duration::from_millis(20),
             "a call {:?} after a 429",
             next.at.duration_since(flood.at)
         );
+        // Status mode: a refused status call may go again with newer text.
+        if soak.status {
+            continue;
+        }
         let tries: Vec<&Call> = calls
             .iter()
             .filter(|call| {
@@ -2020,7 +2075,19 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         assert_eq!(tries.len(), 2, "one retry, no storm: {tries:?}");
         assert_eq!(tries[1].outcome, "ok", "the retry went through");
     }
-    if !soak.live {
+    if soak.status {
+        // TASK-068: the hub keeps below the group's rate; a guess above
+        // Telegram's real one costs one 429 and a slower pace, not more.
+        assert!(
+            floods.len() <= 1,
+            "{} 429s above 20 requests a minute: {:?}",
+            floods.len(),
+            floods
+                .iter()
+                .map(|flood| (flood.at.duration_since(started), flood.kind))
+                .collect::<Vec<_>>()
+        );
+    } else if !soak.live {
         assert_eq!(floods.len(), 2, "both planned 429s happened");
     }
     // Metered sends within the bucket (per hub run, any window).
@@ -2327,16 +2394,15 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             layout_notes.push(check_layout(&tg, thread, status, &lines, &answers));
         }
         // All requests into the group (callback answers go to the user)
-        // stay within both buckets together, per hub run and any 60 s.
-        let edits = soak.limits.edits.expect("an edit budget");
+        // stay within the group's budget (TASK-068), per hub run and any
+        // 60 s: 5 + 15 = 20, the fake's limit.
+        let group = soak.limits.group.expect("a group budget");
         let window = Duration::from_secs(60);
-        let allowed = |bucket: BucketConfig| {
-            f64::from(bucket.capacity) + window.as_secs_f64() / bucket.refill_every.as_secs_f64()
-        };
-        let allowed = allowed(soak.limits.messages) + allowed(edits) + 1.0;
+        let allowed =
+            f64::from(group.capacity) + window.as_secs_f64() / group.refill_every.as_secs_f64();
         let requests: Vec<(usize, Instant)> = calls
             .iter()
-            .filter(|call| call.kind != "callback" && call.outcome != "synthetic")
+            .filter(|call| call.kind != "callback" && !matches!(call.outcome, "synthetic" | "429"))
             .map(|call| (call.run, call.at))
             .collect();
         let mut peak = 0;
@@ -2352,7 +2418,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             "{peak} requests into the group in 60 s (allowed {allowed})"
         );
         layout_notes.push(format!(
-            "requests into the group (all but callback answers): peak {peak} in any 60 s (both buckets allow {allowed:.0})"
+            "requests into the group (all but callback answers): peak {peak} in any 60 s (the group's budget allows {allowed:.0}, the fake answers 429 above 20)"
         ));
     }
 
@@ -2424,11 +2490,14 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     report.push_str(&format!(
         "- 429: {} (retry_after {:?}), each followed by a pause of the whole queue and one retry; other errors: {errors}; answered locally (live: reactions and callback answers on simulated ids): {local}\n",
         floods.len(),
-        tg.retry_after
+        floods
+            .iter()
+            .map(|flood| flood.wait)
+            .collect::<Vec<_>>()
     ));
     let paused = floods
         .iter()
-        .any(|flood| flood.at < p_a2.at && flood.at + tg.retry_after > t0);
+        .any(|flood| flood.at < p_a2.at && flood.at + flood.wait > t0);
     report.push_str(&format!(
         "- permission latency (request written to the agent -> sendMessage): A {} ms (other topic), A #2 {} ms (own topic behind its stream){}; A #2 burst lines written before the request and sent after the prompt: {behind_a2}\n",
         latency_a.as_millis(),
@@ -2444,9 +2513,11 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         soak.limits.messages.refill_every.as_millis(),
         soak.limits.messages.min_gap.as_millis()
     ));
-    report.push_str(
-        "- edits and topic calls are counted separately and are not compared with the 20 messages/min group limit: Telegram publishes no number for them\n",
-    );
+    if !soak.status {
+        report.push_str(
+            "- edits and topic calls are counted separately and are not compared with the 20 messages/min group limit: Telegram publishes no number for them\n",
+        );
+    }
     for note in notes.iter().chain(&layout_notes) {
         report.push_str(&format!("- {note}\n"));
     }

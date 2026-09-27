@@ -741,6 +741,9 @@ struct Shown {
     urgent: bool,
     /// No edit before this (`Options::status_every` after the last one).
     next_at: Option<Instant>,
+    /// No move before this (`Options::status_every` after the last new
+    /// status message went in, TASK-068).
+    move_at: Option<Instant>,
     /// A first ⏹ press of this session waits for its second until then.
     confirm: Option<(String, Instant)>,
     /// A `Create` or `Replace` is in flight, with what it is to show: the
@@ -1467,6 +1470,7 @@ impl Slots {
             .flat_map(|shown| {
                 [
                     shown.next_at,
+                    shown.move_at,
                     shown.confirm.as_ref().map(|(_, until)| *until),
                     shown.retry_at,
                 ]
@@ -6874,11 +6878,20 @@ impl Slots {
             && self
                 .live_agent(slot)
                 .is_some_and(|(_, conn)| self.conns.get(&conn).is_some_and(|bound| bound.keys));
+        // The wait for the second press counts from when the question
+        // shows: while its edit waits for the group's budget (TASK-068: up
+        // to three tokens), the question stays in what that edit shows.
         let confirm = self.shown.get(&slot).is_some_and(|shown| {
+            // A move (a send) waits in line like an edit does.
+            let unseen = (shown.editing.is_some() || shown.sending.is_some())
+                && !shown
+                    .content
+                    .as_ref()
+                    .is_some_and(|(_, keyboard)| status::asks_confirm(keyboard));
             shown
                 .confirm
                 .as_ref()
-                .is_some_and(|(armed, until)| armed == session && now < *until)
+                .is_some_and(|(armed, until)| armed == session && (now < *until || unseen))
         });
         let update = !ended
             && self
@@ -6898,7 +6911,11 @@ impl Slots {
     /// a ⏹ press. A status message with something below it in its topic
     /// (TASK-062), or pinned by a hub before TASK-062, is replaced by a new
     /// one below once nothing more of the hub is on its way into that topic;
-    /// a new one goes after the slot's separator. A new one and an edit go
+    /// a new one goes after the slot's separator. A move waits for
+    /// `status_every` after the last new status message went in, so what
+    /// comes in the meantime moves it once, and a status message whose move
+    /// waits only for that is not refreshed where it is but for a ⏹ press
+    /// (TASK-068). A new one and an edit go
     /// with the status of when they go, and a permission prompt or question
     /// of its topic that comes while a new one waits drops it: it is planned
     /// again below the prompt (TASK-062).
@@ -6968,6 +6985,8 @@ impl Slots {
             });
             let (text, keyboard) = self.status_view(slot, &session, now);
             let shown = self.shown.entry(slot).or_default();
+            let paced = shown.next_at.is_some_and(|at| now < at);
+            let moved = shown.move_at.is_some_and(|at| now < at);
             // A new message lands below what is on its way into the topic,
             // and below the separator.
             let settled = in_flight == 0
@@ -6997,7 +7016,7 @@ impl Slots {
                 }
                 // Until it can move, a buried status message is still
                 // edited where it is (a ⏹ press too).
-                (Some(old), Some(message)) if buried && settled => StatusJob::Replace {
+                (Some(old), Some(message)) if buried && settled && !moved => StatusJob::Replace {
                     place,
                     old: message,
                     pinned: old.pinned,
@@ -7009,7 +7028,9 @@ impl Slots {
                         shown.urgent = false;
                         continue;
                     }
-                    if shown.next_at.is_some_and(|at| now < at) {
+                    // One that moves within `status_every` waits for its
+                    // move, but for a ⏹ press (TASK-068).
+                    if paced || (buried && settled && !urgent) {
                         continue;
                     }
                     StatusJob::Edit {
@@ -7192,6 +7213,7 @@ impl Slots {
                 let (text, keyboard) = content.shown();
                 shown.shows(text, keyboard, now);
                 shown.next_at = Some(now + every);
+                shown.move_at = Some(now + every);
                 shown.retry_at = None;
                 shown.send_warned = false;
                 if let Some(view) = self
@@ -8296,7 +8318,7 @@ mod tests {
     use super::*;
     use crate::hub::api::{ForumTopic, Message};
     use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL};
-    use crate::hub::scheduler::{BucketConfig, Limits, Scheduler, Transport};
+    use crate::hub::scheduler::{BucketConfig, GROUP_BUCKET, Limits, Scheduler, Transport};
     use crate::hub::testdir::TempDir;
     use crate::wire::{
         AskedOption, AskedQuestion, Behavior, HookEvent, PermissionRequest, QuestionPost, Register,
@@ -17095,18 +17117,25 @@ again"
         rig.control
             .send(press("q1", Some(prompt_id), "allow:abcde"))
             .unwrap();
-        // Two edit tokens at most: a topic call (the ❓ icon, the new
-        // session's pin) may take its turn first.
-        within(&rig, Duration::from_secs(8), "the decision edit", |ops| {
-            edits_of(ops, prompt_id)
-                .iter()
-                .any(|(text, _)| text.contains(permissions::ALLOWED_MARK))
-        })
+        // Three tokens of the group's budget at most (TASK-068): a topic
+        // call (the ❓ icon, the new session's pin) may take its turn first,
+        // and a new message after four other requests.
+        within(
+            &rig,
+            GROUP_BUCKET.refill_every * 3,
+            "the decision edit",
+            |ops| {
+                edits_of(ops, prompt_id)
+                    .iter()
+                    .any(|(text, _)| text.contains(permissions::ALLOWED_MARK))
+            },
+        )
         .await;
 
-        // ⏹ on session 1 right after that: the question shows within two
-        // edit tokens (the icon edit after the decision may take its turn first), inside its 10 s
-        // even counted from the press, and the second press interrupts.
+        // ⏹ on session 1 right after that: the question shows within three
+        // tokens of the group's budget (the icon edit after the decision and
+        // a new message after four other requests may go first), its 10 s
+        // counted from then, and the second press interrupts.
         let ops = rig.fake.ops();
         let topic = topic_of(&ops, 1).expect("topic of session 1");
         let (_, status_id) = status_messages(&ops)
@@ -17116,11 +17145,16 @@ again"
         rig.control
             .send(press("q2", Some(status_id), "status:stop"))
             .unwrap();
-        within(&rig, Duration::from_secs(8), "the ⏹ question", |ops| {
-            edits_of(ops, status_id)
-                .iter()
-                .any(|(_, markup)| has_button(markup.as_ref(), "status:confirm"))
-        })
+        within(
+            &rig,
+            GROUP_BUCKET.refill_every * 3,
+            "the ⏹ question",
+            |ops| {
+                edits_of(ops, status_id)
+                    .iter()
+                    .any(|(_, markup)| has_button(markup.as_ref(), "status:confirm"))
+            },
+        )
         .await;
         rig.control
             .send(press("q3", Some(status_id), "status:confirm"))
@@ -17500,17 +17534,20 @@ again"
         );
     }
 
-    /// TASK-062 with the hub's real pacing (`Limits::default()`): ten
+    /// TASK-062 with the hub's real pacing (`Limits::default()`): five
     /// sessions write a turn line every 2 s each and their status changes as
     /// often; a person writes into one of them every 30 s and gets its
-    /// answer a minute later. All of it goes into rolling status and turn
+    /// answer a minute later. (Ten under TASK-062, which allowed about 35
+    /// requests a minute; the group's budget, TASK-068, allows 15 and a
+    /// burst of 5: half the sessions for the same bounds.) All of it goes into rolling status and turn
     /// messages. A new session still gets its topic, a
     /// permission prompt and its decision show, ⏹ asks and interrupts,
     /// every line reaches its topic, every status message keeps showing
     /// what its session does, and once the sessions are quiet each topic
     /// ends with its status message.
     #[tokio::test(start_paused = true)]
-    async fn with_the_hubs_pacing_ten_rolling_sessions_starve_nothing() {
+    async fn with_the_hubs_pacing_rolling_sessions_starve_nothing() {
+        const WORKERS: u32 = 5;
         let dir = TempDir::new("slots-rolling-paced");
         let fake = Fake {
             stream_ids: true,
@@ -17522,10 +17559,10 @@ again"
         };
         let mut rig = rig_with(fake, options, dir, Limits::default());
         let sampled = op_times(rig.fake.clone());
-        // Session 0 asks for a permission; sessions 1..=10 work.
+        // Session 0 asks for a permission; sessions 1..=WORKERS work.
         let mut paths = Vec::new();
         let mut kept = Vec::new();
-        for n in 0..=10u32 {
+        for n in 0..=WORKERS {
             let session = paced_session(n);
             let path = transcript_file(&rig.dir, &session);
             rig.hook(start_with(&session, 10 + n, &path, "startup"))
@@ -17541,9 +17578,9 @@ again"
         within(
             &rig,
             Duration::from_secs(300),
-            "eleven status messages",
+            "a status message in each topic",
             |ops| {
-                (0..=10).all(|n| {
+                (0..=WORKERS).all(|n| {
                     topic_of(ops, n) == Some(100 + i64::from(n))
                         && topic_of(ops, n).is_some_and(|topic| {
                             shown_topic(&rig.fake, topic)
@@ -17556,7 +17593,7 @@ again"
         .await;
         // The start is over: every topic shows its session alive.
         within(&rig, Duration::from_secs(300), "alive icons", |ops| {
-            (0..=10).all(|n| icon_now(ops, 100 + n) == Some(ICON_ALIVE))
+            (0..=i64::from(WORKERS)).all(|n| icon_now(ops, 100 + n) == Some(ICON_ALIVE))
         })
         .await;
         let hooks = rig.hooks.clone();
@@ -17569,7 +17606,7 @@ again"
         let churn = tokio::spawn(async move {
             for step in 0u64.. {
                 // The sessions set to work one after another, 6 s apart.
-                for n in (1..=10u32).filter(|n| step >= u64::from(*n) * 3) {
+                for n in (1..=WORKERS).filter(|n| step >= u64::from(*n) * 3) {
                     let session = paced_session(n);
                     let id = format!("s{n}-{step}");
                     let description = format!("step {step} of {n}");
@@ -17581,10 +17618,10 @@ again"
                     let _ = hooks.send(tool_start(&session, step)).await;
                 }
                 // A person at the keyboard: a message every 30 s, to
-                // sessions 2..=10 in turn, answered a minute later.
+                // sessions 2..=WORKERS in turn, answered a minute later.
                 // Session 1 only works: its ⏹ is tried below.
                 if step % 15 == 0 {
-                    let n = 2 + (step / 15 % 9) as u32;
+                    let n = 2 + (step / 15 % u64::from(WORKERS - 1)) as u32;
                     let topic = 100 + i64::from(n);
                     let _ = control.send(say(Some(topic), fake.next_id(), Some("ещё")));
                     let _ = hooks
@@ -17595,7 +17632,7 @@ again"
                         .await;
                 }
                 if step % 15 == 0 && step >= 30 {
-                    let n = 2 + ((step - 30) / 15 % 9) as u32;
+                    let n = 2 + ((step - 30) / 15 % u64::from(WORKERS - 1)) as u32;
                     let _ = hooks
                         .send(hook(
                             &paced_session(n),
@@ -17612,11 +17649,16 @@ again"
         tokio::time::sleep(Duration::from_secs(40)).await;
 
         // A new session: its topic comes at once, not after the edits.
-        let path = transcript_file(&rig.dir, &paced_session(11));
-        rig.hook(start_with(&paced_session(11), 21, &path, "startup"))
-            .await;
+        let path = transcript_file(&rig.dir, &paced_session(WORKERS + 1));
+        rig.hook(start_with(
+            &paced_session(WORKERS + 1),
+            10 + WORKERS + 1,
+            &path,
+            "startup",
+        ))
+        .await;
         within(&rig, Duration::from_secs(10), "the new topic", |ops| {
-            topic_of(ops, 11).is_some()
+            topic_of(ops, WORKERS + 1).is_some()
         })
         .await;
 
@@ -17631,17 +17673,24 @@ again"
         rig.control
             .send(press("q1", Some(prompt_id), "allow:abcde"))
             .unwrap();
-        // Four edit tokens at most: the ❓ icon and its way back (topic
-        // calls) and a 👀 on a user's message may take their turns first.
-        within(&rig, Duration::from_secs(16), "the decision edit", |ops| {
-            edits_of(ops, prompt_id)
-                .iter()
-                .any(|(text, _)| text.contains(permissions::ALLOWED_MARK))
-        })
+        // Five tokens of the group's budget at most (TASK-068): the ❓ icon
+        // and its way back (topic calls), a 👀 on a user's message and a new
+        // message after four other requests may take their turns first.
+        within(
+            &rig,
+            GROUP_BUCKET.refill_every * 5,
+            "the decision edit",
+            |ops| {
+                edits_of(ops, prompt_id)
+                    .iter()
+                    .any(|(text, _)| text.contains(permissions::ALLOWED_MARK))
+            },
+        )
         .await;
 
         // ⏹ on session 1: the question shows on its status message, wherever
-        // that is by then, and the second press interrupts.
+        // that is by then, within three tokens of the group's budget as
+        // above, and the second press interrupts.
         let topic = topic_of(&rig.fake.ops(), 1).expect("topic of session 1");
         within(&rig, Duration::from_secs(60), "⏹ on session 1", |_| {
             offering(&rig.fake, topic, "status:stop").is_some()
@@ -17651,9 +17700,12 @@ again"
         rig.control
             .send(press("q2", Some(status), "status:stop"))
             .unwrap();
-        within(&rig, Duration::from_secs(8), "the ⏹ question", |_| {
-            offering(&rig.fake, topic, "status:confirm").is_some()
-        })
+        within(
+            &rig,
+            GROUP_BUCKET.refill_every * 3,
+            "the ⏹ question",
+            |_| offering(&rig.fake, topic, "status:confirm").is_some(),
+        )
         .await;
         let asked = offering(&rig.fake, topic, "status:confirm").expect("the question");
         rig.control
@@ -17682,7 +17734,7 @@ again"
             Duration::from_secs(120),
             "every line in its topic",
             |_| {
-                let shown: HashSet<(u32, String)> = (1..=10u32)
+                let shown: HashSet<(u32, String)> = (1..=WORKERS)
                     .flat_map(|n| {
                         shown_topic(&rig.fake, 100 + i64::from(n))
                             .into_iter()
@@ -17723,14 +17775,18 @@ again"
             .max()
             .unwrap_or_default();
         eprintln!("longest line lag: {lag:?}");
-        // Measured 2026-09-27: 95-110 s at worst. Ten topics share about 35
-        // requests a minute: each turn message grows about every minute and
-        // a half under this load.
-        assert!(lag <= Duration::from_secs(150), "a line waited {lag:?}");
+        // Measured 2026-09-27: 95-110 s at worst with ten topics and about
+        // 35 requests a minute. With the group's budget (TASK-068), 15 a
+        // minute, five topics: 240-252 s at worst (71 s with the two class
+        // budgets alone), as the stream of a topic sends one message at a
+        // time; the bound keeps the old margin (150 s for 110 s).
+        assert!(lag <= Duration::from_secs(340), "a line waited {lag:?}");
         // Each status message keeps showing what its session does: a status
-        // call (sent, moved or edited) for each slot at least every 150 s
-        // (measured: 84-116 s at worst).
-        for n in 1..=10u32 {
+        // call (sent, moved or edited) for each slot at least every 150 s,
+        // counted from the start of the work to its end (measured
+        // 2026-09-28: 80-132 s at worst; the last session sets to work 30 s
+        // after the first and its first status call comes latest).
+        for n in 1..=WORKERS {
             let topic = 100 + i64::from(n);
             let given = rig.fake.ids.lock().unwrap().clone();
             let mut ids: HashSet<i64> = HashSet::new();
@@ -17754,18 +17810,17 @@ again"
                 .into_iter()
                 .filter(|at| *at >= churn_from && *at <= stopped)
                 .collect();
-            let gap = during
+            let gap = [churn_from]
+                .iter()
+                .chain(&during)
+                .chain([&stopped])
+                .collect::<Vec<_>>()
                 .windows(2)
-                .map(|pair| pair[1] - pair[0])
+                .map(|pair| *pair[1] - *pair[0])
                 .max()
                 .unwrap_or_default();
             eprintln!(
                 "session {n}: {} status calls, longest gap {gap:?}",
-                during.len()
-            );
-            assert!(
-                during.len() >= 2,
-                "session {n}: {} status calls",
                 during.len()
             );
             assert!(
@@ -17779,7 +17834,7 @@ again"
             Duration::from_secs(180),
             "status messages last",
             |_| {
-                (1..=10).all(|n| {
+                (1..=WORKERS).all(|n| {
                     shown_topic(&rig.fake, 100 + i64::from(n))
                         .last()
                         .is_some_and(|last| last.status)
@@ -17787,7 +17842,7 @@ again"
             },
         )
         .await;
-        // The group budgets held throughout.
+        // The group's budget held throughout (TASK-068).
         let ops = rig.fake.ops();
         let times = op_times_now(
             &rig,
@@ -17807,12 +17862,8 @@ again"
             let edits = window()
                 .filter(|(op, _)| !matches!(op, Op::AnswerCallback { .. }) && op.posts().is_none())
                 .count();
-            // Turn content takes a spare message token when no edit token
-            // is there: new messages and all requests are what is bounded.
-            assert!(
-                sends <= 21 && sends + edits <= 41,
-                "{sends} sends, {edits} other requests"
-            );
+            // 5 + 15, one more for the 100 ms sampling of the times.
+            assert!(sends + edits <= 21, "{sends} sends, {edits} other requests");
         }
         drop(kept);
     }
