@@ -244,6 +244,9 @@ pub struct Held {
     pub until: Instant,
     /// The transcript byte of its turn end, once paired with one.
     pub end: Option<u64>,
+    /// When it went unpaired and left a debt ([`Live::answered_early`]):
+    /// held again by a rewind, it takes that debt back.
+    pub gone: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -309,9 +312,14 @@ pub struct Live {
     pub rewind_at: Option<Instant>,
     /// How often a session that left its slot sent its refused messages again.
     pub resends: u32,
+    /// Since when a message of the next session of its slot waits behind
+    /// this drain: it holds that session's separator one stream retry at
+    /// most after this.
+    pub waited: Option<Instant>,
     /// Answers that went without a turn end (by their timeout), oldest
     /// first, by when they went: the next turn ends read that no held
-    /// answer owns are theirs.
+    /// answer owns are theirs. A rewind that holds such an answer again
+    /// takes its debt back ([`Held::gone`]).
     unpaired: VecDeque<Instant>,
     waiting: VecDeque<Entry>,
     next: u64,
@@ -396,14 +404,17 @@ impl Live {
 
     /// `held` goes at `now` by its timeout ahead of a read of its turn end:
     /// that turn end, read later, must not let another answer go. Not paired
-    /// yet, it takes the next turn end read that no held answer owns (a
-    /// blank one has none: a turn end is assistant text).
-    pub fn answered_early(&mut self, held: &Held, now: Instant) {
+    /// yet, it takes the next turn end read that no held answer owns; a blank
+    /// one too (its turn end may be an empty text), and a debt without a
+    /// turn end lapses ([`Live::lapse_unpaired`]).
+    pub fn answered_early(&mut self, held: &mut Held, now: Instant) {
         match held.end {
             Some(end) if self.read_at.is_some_and(|at| at < end) => self.answered_ends.push(end),
             Some(_) => {}
-            None if !held.answer.trim().is_empty() => self.unpaired.push_back(now),
-            None => {}
+            None => {
+                self.unpaired.push_back(now);
+                held.gone = Some(now);
+            }
         }
     }
 
@@ -425,6 +436,7 @@ impl Live {
         self.ends_until = None;
         for held in &mut self.held {
             held.end = None;
+            held.gone = None;
         }
         for entry in &mut self.waiting {
             if let Entry::Message {
@@ -432,6 +444,7 @@ impl Live {
             } = entry
             {
                 held.end = None;
+                held.gone = None;
             }
         }
     }
@@ -640,13 +653,21 @@ impl Live {
         for entry in std::mem::take(&mut self.waiting) {
             if let Entry::Message {
                 state,
-                answer: Some(answer),
+                answer: Some(mut answer),
                 ..
             } = entry
             {
                 if state == Answer::Accepted {
                     answered_ends.extend(answer.end.filter(read_again));
                 } else {
+                    // Not in the topic: the debt it left when it went is not
+                    // owed; its own turn end lets it go again. Debts of the
+                    // same instant are alike, so one of them goes.
+                    if let Some(gone) = answer.gone.take()
+                        && let Some(at) = self.unpaired.iter().position(|&debt| debt == gone)
+                    {
+                        self.unpaired.remove(at);
+                    }
                     held.push_back(answer);
                 }
             }
@@ -946,6 +967,7 @@ mod tests {
             answer: answer.into(),
             until: now,
             end: None,
+            gone: None,
         };
         let mut live = Live::new(Some(0), Vec::new());
         let line = live.sent(&any_op());
@@ -996,10 +1018,11 @@ mod tests {
             answer: answer.into(),
             until: now,
             end: Some(40),
+            gone: None,
         };
         let mut live = Live::new(Some(0), Vec::new());
-        let early = held("early");
-        live.answered_early(&early, now);
+        let mut early = held("early");
+        live.answered_early(&mut early, now);
         let number = live.sent_answer(early, &any_op());
         live.answered(number, true);
         live.held.push_back(Held {
@@ -1011,8 +1034,8 @@ mod tests {
         assert_eq!(live.held.len(), 1, "the next answer waits for its own end");
 
         let mut live = Live::new(Some(0), Vec::new());
-        let early = held("early");
-        live.answered_early(&early, now);
+        let mut early = held("early");
+        live.answered_early(&mut early, now);
         let number = live.sent_answer(early, &any_op());
         live.answered(number, false);
         assert!(live.stuck());
@@ -1037,6 +1060,7 @@ mod tests {
             answer: "a file".into(),
             until: now,
             end: None,
+            gone: None,
         });
         let doc = live.turn_end(40).expect("its answer");
         live.answered_outside(&doc);
@@ -1051,6 +1075,7 @@ mod tests {
             answer: "next".into(),
             until: now,
             end: None,
+            gone: None,
         });
         assert!(live.turn_end(40).is_none(), "answered already");
         assert!(live.ends_unclaimed.is_empty(), "nothing to claim");
@@ -1073,6 +1098,7 @@ mod tests {
             answer: "first".into(),
             until: now,
             end: None,
+            gone: None,
         });
         let first = live.turn_end(40).expect("its answer");
         let number = live.sent_answer(first, &any_op());
@@ -1157,6 +1183,7 @@ mod tests {
             answer: answer.into(),
             until: now,
             end: None,
+            gone: None,
         }
     }
 
@@ -1167,8 +1194,8 @@ mod tests {
     fn an_answer_gone_unpaired_takes_the_next_turn_end_and_shifts_nothing() {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
-        let first = unpaired("first", now);
-        live.answered_early(&first, now);
+        let mut first = unpaired("first", now);
+        live.answered_early(&mut first, now);
         live.held.push_back(unpaired("second", now));
         assert!(live.turn_end(40).is_none(), "the turn end of \"first\"");
         assert!(live.ends_unclaimed.is_empty(), "not left for a Stop");
@@ -1180,12 +1207,73 @@ mod tests {
         live.held.push_back(unpaired("third", now));
         assert!(live.turn_end(40).is_none());
         assert_eq!(live.held.len(), 1);
-        // A blank Stop has no turn end: it leaves nothing to take.
-        live.answered_early(&unpaired(" ", now), now);
+        // A blank Stop that went unpaired takes its (empty text) turn end too.
+        live.answered_early(&mut unpaired(" ", now), now);
+        assert!(live.turn_end(120).is_none(), "the end of the blank Stop");
         assert_eq!(
-            live.turn_end(120).map(|held| held.answer),
+            live.turn_end(160).map(|held| held.answer),
             Some("third".into())
         );
+    }
+
+    /// TASK-024 review 2: the turn end of a blank Stop that went by its
+    /// timeout is its own; the next answer waits for its own end. Without a
+    /// turn end its debt lapses like any other.
+    #[test]
+    fn a_blank_answer_gone_unpaired_keeps_its_turn_end_or_lapses() {
+        let now = Instant::now();
+        let mut live = Live::new(Some(0), Vec::new());
+        live.answered_early(&mut unpaired(" ", now), now);
+        live.held.push_back(unpaired("y", now));
+        assert!(live.turn_end(40).is_none(), "40 is the blank Stop's end");
+        assert_eq!(live.turn_end(80).map(|held| held.answer), Some("y".into()));
+
+        let mut live = Live::new(Some(0), Vec::new());
+        live.answered_early(&mut unpaired("", now), now);
+        live.lapse_unpaired(now + Duration::from_millis(1));
+        live.held.push_back(unpaired("y", now));
+        assert_eq!(live.turn_end(40).map(|held| held.answer), Some("y".into()));
+    }
+
+    /// TASK-024 review 1: an answer that went unpaired and was refused is
+    /// held again by the rewind, and its debt goes with it: the answer takes
+    /// its own turn end, and the next answer is not shifted onto a later one.
+    #[test]
+    fn a_rewind_that_holds_an_unpaired_answer_again_takes_its_debt_back() {
+        let now = Instant::now();
+        let mut live = Live::new(Some(0), Vec::new());
+        let mut x = unpaired("x", now);
+        live.answered_early(&mut x, now);
+        let n = live.sent_answer(x, &any_op());
+        live.answered(n, false);
+        assert!(live.stuck());
+        live.rewind(Some(0), Vec::new(), now, Duration::ZERO);
+        assert_eq!(live.held.len(), 1, "x held again");
+        assert!(live.unpaired.is_empty(), "its debt went with it");
+        assert_eq!(live.turn_end(40).map(|held| held.answer), Some("x".into()));
+        live.held.push_back(unpaired("y", now));
+        assert_eq!(live.turn_end(80).map(|held| held.answer), Some("y".into()));
+    }
+
+    /// Two answers went unpaired at the same instant (one pump); only the
+    /// refused one is held again, so exactly one debt goes: the accepted
+    /// one's turn end still lets nothing go.
+    #[test]
+    fn a_rewind_takes_back_one_debt_of_the_same_instant() {
+        let now = Instant::now();
+        let mut live = Live::new(Some(0), Vec::new());
+        let mut w = unpaired("w", now);
+        live.answered_early(&mut w, now);
+        let mut x = unpaired("x", now);
+        live.answered_early(&mut x, now);
+        let w = live.sent_answer(w, &any_op());
+        let x = live.sent_answer(x, &any_op());
+        live.answered(w, true);
+        live.answered(x, false);
+        live.rewind(Some(0), Vec::new(), now, Duration::ZERO);
+        assert_eq!(live.unpaired.len(), 1, "w's debt stays");
+        assert!(live.turn_end(40).is_none(), "the end of w");
+        assert_eq!(live.turn_end(80).map(|held| held.answer), Some("x".into()));
     }
 
     /// TASK-024 item 2 with a blocking Stop hook of the user: one turn
@@ -1196,7 +1284,7 @@ mod tests {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
         for answer in ["first", "second"] {
-            live.answered_early(&unpaired(answer, now), now);
+            live.answered_early(&mut unpaired(answer, now), now);
         }
         live.held.push_back(unpaired("next turn", now));
         assert!(live.turn_end(40).is_none());
@@ -1214,7 +1302,7 @@ mod tests {
     fn an_unpaired_answer_without_a_turn_end_lapses_at_a_read_to_the_end() {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
-        live.answered_early(&unpaired("no end", now), now);
+        live.answered_early(&mut unpaired("no end", now), now);
         // A read asked before it went keeps it.
         live.lapse_unpaired(now - Duration::from_millis(1));
         live.held.push_back(unpaired("later", now));
@@ -1225,7 +1313,7 @@ mod tests {
         );
         // It survives a rewind until then.
         let mut live = Live::new(Some(0), Vec::new());
-        live.answered_early(&unpaired("gone", now), now);
+        live.answered_early(&mut unpaired("gone", now), now);
         live.rewind(Some(0), Vec::new(), now, Duration::ZERO);
         live.held.push_back(unpaired("later", now));
         assert!(live.turn_end(40).is_none(), "the end of \"gone\"");
@@ -1242,7 +1330,7 @@ mod tests {
             end: Some(40),
             ..unpaired("a file", now)
         });
-        live.answered_early(&unpaired("gone", now), now);
+        live.answered_early(&mut unpaired("gone", now), now);
         live.ends_unclaimed.push_back(90);
         live.held.push_back(Held {
             end: Some(60),

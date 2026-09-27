@@ -789,6 +789,16 @@ enum Work {
     },
 }
 
+/// A turn answer or reply of a slot's new session held back until the
+/// slot's separator is out (TASK-024, [`Slots::behind_drain`]).
+struct AfterSeparator {
+    slot: SlotId,
+    session: String,
+    text: String,
+    kind: &'static str,
+    notify: bool,
+}
+
 fn short(session_id: &str) -> &str {
     session_id
         .char_indices()
@@ -1001,6 +1011,9 @@ pub struct Slots {
     block_jobs: usize,
     /// Live transcript streams by session.
     streams: HashMap<String, Live>,
+    /// Texts of a slot's new session waiting behind its separator, oldest
+    /// first ([`Slots::behind_drain`]).
+    after_separator: Vec<AfterSeparator>,
     reaction_warned: bool,
     /// Reactions handed out and not answered, at most [`MAX_REACTIONS`].
     reactions: usize,
@@ -1111,6 +1124,7 @@ impl Slots {
             title_failures: HashMap::new(),
             block_jobs: 0,
             streams: HashMap::new(),
+            after_separator: Vec::new(),
             reaction_warned: false,
             reactions: 0,
             activity: HashMap::new(),
@@ -1351,6 +1365,11 @@ impl Slots {
             .map(|gather| gather.due)
             .filter(|at| *at > now)
             .fold(deadline, Instant::min);
+        // A refused stream reads (or, once its session left the slot, sends)
+        // again at its retry, and a drain holds the next separator for a
+        // bounded time; a past read time the pump did not act on waits for
+        // an event, not for a loop.
+        let wait = self.options.stream_retry;
         self.streams
             .values()
             .flat_map(|live| {
@@ -1359,8 +1378,11 @@ impl Slots {
                     None => live.next_read,
                 };
                 read.into_iter()
+                    .chain(live.rewind_at)
+                    .chain(live.waited.map(|since| since + wait))
                     .chain(live.held.front().map(|held| held.until))
             })
+            .filter(|at| *at > now)
             .fold(deadline, Instant::min)
     }
 
@@ -3958,6 +3980,7 @@ impl Slots {
                 answer: answer.to_owned(),
                 until: now + self.options.hold_answer,
                 end: None,
+                gone: None,
             };
             if let Some(end) = live.claim_end(now) {
                 // A turn end read already: the lines before it are handed
@@ -3968,10 +3991,10 @@ impl Slots {
             }
             // The lines of this turn up to its end in the transcript go
             // first, for at most `hold_answer`.
-            let oldest = (live.held.len() >= stream::MAX_HELD)
+            let mut oldest = (live.held.len() >= stream::MAX_HELD)
                 .then(|| live.held.pop_front())
                 .flatten();
-            if let Some(oldest) = &oldest {
+            if let Some(oldest) = &mut oldest {
                 live.answered_early(oldest, now);
             }
             live.held.push_back(held);
@@ -3982,6 +4005,10 @@ impl Slots {
             return;
         }
         if answer.trim().is_empty() {
+            return;
+        }
+        if self.behind_drain(slot, Instant::now()) {
+            self.hold_after_separator(slot, session, answer, "answer", true);
             return;
         }
         if let Some(parts) = self.send_text(thread_id, session, answer, "answer", true) {
@@ -4075,10 +4102,10 @@ impl Slots {
         (bound.reads && bound.session == session).then(|| (conn, entry.transcript_path.clone()))
     }
 
-    /// Asks the agents of streamed sessions for new lines, releases held
-    /// answers that waited long enough or can no longer be matched, and
-    /// forgets the streams of sessions that are over once everything of
-    /// theirs is in the topic (see [`Self::drain_stream`]).
+    /// Asks the agents of streamed sessions for new lines and releases held
+    /// answers that waited long enough or can no longer be matched. The
+    /// streams of sessions that left their slot drain in
+    /// [`Self::pump_drains`].
     fn pump_streams(&mut self) {
         let now = Instant::now();
         let mut sessions: HashSet<String> = self
@@ -4088,8 +4115,8 @@ impl Slots {
             .collect();
         sessions.extend(self.streams.keys().cloned());
         for session in sessions {
+            // Drained by `pump_drains`.
             if self.current_slot(&session).is_none() {
-                self.drain_stream(&session, now);
                 continue;
             }
             let target = self.stream_target(&session);
@@ -4107,6 +4134,10 @@ impl Slots {
                 .streams
                 .entry(session.clone())
                 .or_insert_with(|| Live::new(offset, calls));
+            // Back in its slot (a resume during its drain): a later drain
+            // starts over.
+            live.resends = 0;
+            live.waited = None;
             // A read that is late, or went to a connection that is no longer
             // the session's, is asked again.
             let conn = target.as_ref().map(|(conn, _)| *conn);
@@ -4125,8 +4156,8 @@ impl Slots {
                 .front()
                 .is_some_and(|held| target.is_none() || now >= held.until)
             {
-                if let Some(held) = live.held.pop_front() {
-                    live.answered_early(&held, now);
+                if let Some(mut held) = live.held.pop_front() {
+                    live.answered_early(&mut held, now);
                     released.push(held);
                 }
             }
@@ -4169,6 +4200,22 @@ impl Slots {
             } else {
                 live.next_read = Some(now + self.options.stream_every);
             }
+        }
+    }
+
+    /// Drains the streams of sessions that left their slot, before the
+    /// separators are handed out: a resend due now goes ahead of the next
+    /// session's separator.
+    fn pump_drains(&mut self) {
+        let now = Instant::now();
+        let left: Vec<String> = self
+            .streams
+            .keys()
+            .filter(|session| self.current_slot(session).is_none())
+            .cloned()
+            .collect();
+        for session in left {
+            self.drain_stream(&session, now);
         }
     }
 
@@ -4228,13 +4275,110 @@ impl Slots {
     }
 
     /// Slots whose topic still gets stream messages of a session that left
-    /// them: their next session separator waits for those.
-    fn draining_slots(&self) -> HashSet<SlotId> {
+    /// them: their next session separator waits for those, but at most one
+    /// stream retry after a message of that next session began to wait
+    /// behind it ([`Self::behind_drain`]); the rest of the drain then comes
+    /// after the separator.
+    fn draining_slots(&self, now: Instant) -> HashSet<SlotId> {
+        let wait = self.options.stream_retry;
         self.streams
             .iter()
-            .filter(|(session, live)| self.current_slot(session).is_none() && !live.settled())
+            .filter(|(session, live)| {
+                self.current_slot(session).is_none()
+                    && !live.settled()
+                    && live.waited.is_none_or(|since| now < since + wait)
+            })
             .filter_map(|(session, _)| self.registry.sessions.get(session)?.slot)
             .collect()
+    }
+
+    /// Whether a new message of the current session of `slot` (its turn
+    /// answer, a reply, a permission prompt or a question) waits now: the
+    /// slot's separator is not in the topic yet and a session that left the
+    /// slot still sends there (TASK-024). It goes once the separator is:
+    /// after the drain, or [`Options::stream_retry`] after the first such
+    /// message began to wait.
+    fn behind_drain(&mut self, slot: SlotId, now: Instant) -> bool {
+        let Some(entry) = self.registry.slot(slot) else {
+            return false;
+        };
+        if entry.topic_id.is_none() || entry.pending_separator.is_none() || entry.failed.is_some() {
+            return false;
+        }
+        let draining: Vec<String> = self
+            .streams
+            .iter()
+            .filter(|(session, live)| {
+                !live.settled()
+                    && self.current_slot(session).is_none()
+                    && self
+                        .registry
+                        .sessions
+                        .get(session.as_str())
+                        .and_then(|entry| entry.slot)
+                        == Some(slot)
+            })
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in &draining {
+            if let Some(live) = self.streams.get_mut(session) {
+                live.waited.get_or_insert(now);
+            }
+        }
+        !draining.is_empty()
+    }
+
+    fn hold_after_separator(
+        &mut self,
+        slot: SlotId,
+        session: &str,
+        text: &str,
+        kind: &'static str,
+        notify: bool,
+    ) {
+        debug!(
+            session = short(session),
+            kind, "waits behind the separator of its slot"
+        );
+        self.after_separator.push(AfterSeparator {
+            slot,
+            session: session.to_owned(),
+            text: text.to_owned(),
+            kind,
+            notify,
+        });
+    }
+
+    /// Sends the held texts whose slot's separator is in the topic now.
+    fn send_after_separator(&mut self) {
+        if self.after_separator.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for held in std::mem::take(&mut self.after_separator) {
+            if self.behind_drain(held.slot, now) {
+                self.after_separator.push(held);
+                continue;
+            }
+            let Some(thread_id) = self.registry.slot(held.slot).and_then(|slot| slot.topic_id)
+            else {
+                debug!(
+                    session = short(&held.session),
+                    "held text for a slot without a topic now; not sent"
+                );
+                continue;
+            };
+            if let Some(parts) =
+                self.send_text(thread_id, &held.session, &held.text, held.kind, held.notify)
+            {
+                info!(
+                    session = short(&held.session),
+                    parts,
+                    kind = held.kind,
+                    "held text queued after the separator"
+                );
+            }
+        }
     }
 
     /// One answered transcript read: its messages go to the topic in order,
@@ -4505,10 +4649,22 @@ impl Slots {
                 if (400..500).contains(code) && !topic_gone(result)
         );
         let accepted = skipped || matches!(delivery, Some(Ok(Outcome::Sent(_) | Outcome::Merged)));
+        let gone = delivery.as_ref().is_some_and(topic_gone);
+        let left = self.current_slot(session).is_none();
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
         live.answered(number, accepted);
+        if gone && left {
+            // Nothing of it can reach that topic any more; the next separator
+            // finds out and the slot gets a new topic (TASK-024).
+            warn!(
+                session = short(session),
+                "the topic of a session that left it is gone; its stream messages are given up"
+            );
+            self.streams.remove(session);
+            return;
+        }
         if !live.refused_warned && (skipped || !accepted) {
             live.refused_warned = true;
             if skipped {
@@ -4583,6 +4739,10 @@ impl Slots {
             warn!(ordinal, "reply for a slot without a topic yet; dropped");
             return;
         };
+        if self.behind_drain(slot, Instant::now()) {
+            self.hold_after_separator(slot, &session, text, "reply", false);
+            return;
+        }
         if let Some(parts) = self.send_text(thread_id, &session, text, "reply", false) {
             info!(
                 ordinal,
@@ -5097,6 +5257,17 @@ impl Slots {
                 self.end_question(key, questions::State::Expired);
                 continue;
             };
+            let slot = self
+                .registry
+                .sessions
+                .get(&ask.session)
+                .and_then(|entry| entry.slot);
+            if slot.is_some_and(|slot| self.behind_drain(slot, Instant::now())) {
+                continue;
+            }
+            let Some(ask) = self.questions.get(key) else {
+                continue;
+            };
             let op = Op::Send {
                 thread_id: Some(thread_id),
                 text: ask.text(),
@@ -5351,13 +5522,16 @@ impl Slots {
                 self.finish(key, State::Closed);
                 continue;
             }
-            let thread_id = entry
-                .slot
+            let slot = entry.slot;
+            let thread_id = slot
                 .and_then(|slot| self.registry.slot(slot))
                 .and_then(|slot| slot.topic_id);
             let Some(thread_id) = thread_id else {
                 continue;
             };
+            if slot.is_some_and(|slot| self.behind_drain(slot, Instant::now())) {
+                continue;
+            }
             let Some(prompt) = self.prompts.get(key) else {
                 continue;
             };
@@ -7114,7 +7288,8 @@ impl Slots {
         self.flush_all();
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
-        let draining = self.draining_slots();
+        self.pump_drains();
+        let draining = self.draining_slots(Instant::now());
         for job in self
             .registry
             .topic_work_except(&self.options.icons, edits, &draining)
@@ -7148,6 +7323,7 @@ impl Slots {
             };
             self.hand_off(Work::Topic(job), op);
         }
+        self.send_after_separator();
         let room = MAX_BLOCK_JOBS.saturating_sub(self.block_jobs);
         for job in self.registry.block_work(room) {
             self.block_jobs += 1;
@@ -14598,6 +14774,345 @@ again"
         assert_eq!(slots.queued_messages, 0);
         slots.pump();
         assert!(slots.registry.slots[0].busy, "the separator goes");
+    }
+
+    fn stream_chunk(session: &str, from: u64, lines: Vec<StreamLine>) -> AgentEvent {
+        AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::TranscriptChunk {
+                session_id: session.into(),
+                from,
+                to: lines.last().map_or(from, |line| line.end),
+                lines,
+                missing: false,
+                more: false,
+                reset: false,
+            },
+        }
+    }
+
+    /// A prompt line ending at `prompt`, then a turn end at `end`.
+    fn turn_lines(text: &str, prompt: u64, end: u64) -> Vec<StreamLine> {
+        use crate::wire::StreamItem;
+        vec![
+            StreamLine {
+                end: prompt,
+                items: vec![StreamItem::Prompt { text: text.into() }],
+            },
+            StreamLine {
+                end,
+                items: vec![StreamItem::TurnEnd],
+            },
+        ]
+    }
+
+    fn topic_gone_error() -> Option<Delivery> {
+        Some(Err(ApiError::Telegram {
+            code: 400,
+            description: "Bad Request: message thread not found".into(),
+        }))
+    }
+
+    fn session_end(session: &str, pid: u32) -> HookPost {
+        hook(
+            session,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(pid),
+            },
+        )
+    }
+
+    /// TASK-024 review 1 through the actor: an answer that went by its
+    /// timeout before its turn end was read is refused; the re-read holds it
+    /// again, and it goes at its own turn end, right after its lines. The
+    /// next turn's answer goes at its own turn end, not shifted.
+    #[tokio::test]
+    async fn a_refused_unpaired_answer_goes_at_its_own_turn_end_after_the_reread() {
+        let dir = TempDir::new("slots-stream-debt-rewind");
+        let mut slots = asked_slots(&dir);
+        slots.on_hook(&stop(A, Some("x")));
+        slots.streams.get_mut(A).unwrap().held[0].until = Instant::now();
+        slots.pump();
+        assert_eq!(
+            slots.streams[A].answer_numbers(),
+            [(1, "x")],
+            "gone unpaired"
+        );
+        slots.on_stream_done(A, 1, bad_gateway());
+        assert!(slots.streams[A].stuck());
+        // The re-read after the retry.
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(A, 0, turn_lines("one", 10, 20)));
+        let live = &slots.streams[A];
+        assert!(live.held.is_empty(), "x goes at its own turn end");
+        assert_eq!(
+            live.answer_numbers().last().map(|(_, text)| *text),
+            Some("x")
+        );
+        // The next turn.
+        slots.on_hook(&stop(A, Some("y")));
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(A, 20, turn_lines("two", 30, 40)));
+        let live = &slots.streams[A];
+        assert!(live.held.is_empty(), "y goes at its own turn end");
+        assert_eq!(
+            live.answer_numbers().last().map(|(_, text)| *text),
+            Some("y")
+        );
+    }
+
+    /// TASK-024 fix: a refused stream sleeps until its retry instead of
+    /// waking the actor in a loop, and so does the drain of its session
+    /// once it left the slot.
+    #[tokio::test]
+    async fn a_refused_stream_wakes_the_actor_at_its_retry_not_before() {
+        let dir = TempDir::new("slots-stream-retry-sleep");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        slots.on_stream_done(A, 1, bad_gateway());
+        // The next read time of the chunk passes.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        slots.pump();
+        let retry = slots.streams[A].rewind_at.expect("a retry");
+        let deadline = slots.next_deadline();
+        assert!(deadline > Instant::now(), "no busy loop");
+        assert!(deadline <= retry, "awake for the retry");
+        slots.on_hook(&session_end(A, 10));
+        slots.pump();
+        assert!(slots.streams.contains_key(A), "draining");
+        let deadline = slots.next_deadline();
+        assert!(deadline > Instant::now() && deadline <= retry);
+    }
+
+    /// TASK-024 review 3: a drain whose topic is gone ends at once, so the
+    /// next separator (which finds the topic gone) goes now, not after all
+    /// resends.
+    #[tokio::test]
+    async fn a_drain_into_a_gone_topic_ends_at_once() {
+        let dir = TempDir::new("slots-stream-drain-gone");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        slots.on_stream_done(A, 1, bad_gateway());
+        slots.on_hook(&session_end(A, 10));
+        let path = transcript_file(&dir, B);
+        slots.on_hook(&start_with(B, 11, &path, "startup"));
+        // The stalled scheduler never answers the title edit of A's start.
+        slots.registry.slots[0].busy = false;
+        slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
+        slots.pump();
+        assert_eq!(slots.streams[A].resends, 1);
+        assert!(!slots.registry.slots[0].busy, "the separator waits");
+        slots.on_stream_done(A, 1, topic_gone_error());
+        assert!(!slots.streams.contains_key(A), "given up at once");
+        slots.pump();
+        assert!(slots.registry.slots[0].busy, "the separator goes");
+    }
+
+    /// TASK-024 review, missing coverage: a session that ends with nothing
+    /// refused only waits for its messages in flight. Its stream is never
+    /// sent again, and the separator goes on the pump right after the last
+    /// of them is accepted (no retry delay).
+    #[tokio::test]
+    async fn a_plain_session_end_only_waits_for_its_messages_in_flight() {
+        let dir = TempDir::new("slots-stream-drain-plain");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        assert_eq!(slots.queued_messages, 1);
+        slots.on_hook(&session_end(A, 10));
+        let path = transcript_file(&dir, B);
+        slots.on_hook(&start_with(B, 11, &path, "startup"));
+        slots.registry.slots[0].busy = false;
+        slots.pump();
+        assert!(!slots.registry.slots[0].busy, "behind the line in flight");
+        slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
+        assert_eq!(slots.queued_messages, 0, "nothing sent again");
+        slots.pump();
+        assert!(slots.registry.slots[0].busy, "the separator goes now");
+        assert!(!slots.streams.contains_key(A));
+    }
+
+    /// The same through the real scheduler: a `/clear` right after a turn
+    /// shows A's lines, then B's separator, without a retry pause.
+    #[tokio::test]
+    async fn a_plain_clear_shows_the_separator_right_after_the_old_lines() {
+        let (rig, path) = live_stream(
+            stream_options(),
+            Fake::default(),
+            "slots-stream-plain-clear",
+        )
+        .await;
+        append(&path, &typed("go"));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        rig.hook(session_end(A, 10)).await;
+        let second = transcript_file(&rig.dir, B);
+        let ended = std::time::Instant::now();
+        rig.hook(start_with(B, 11, &second, "startup")).await;
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 2).await;
+        let texts = topic_texts(&rig.fake.ops(), 100);
+        assert!(
+            ended.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            ended.elapsed()
+        );
+        assert_eq!(texts, ["> go", "── session bbbbbbbb · new ──"]);
+    }
+
+    /// TASK-024 review, missing coverage: A ends with a refused line and a
+    /// held answer; the topic shows the line, the answer, then B's
+    /// separator.
+    #[tokio::test]
+    async fn a_drain_sends_the_refused_line_then_the_held_answer_then_the_separator() {
+        let fake = Fake {
+            stream_errors: Mutex::new(1),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_millis(300),
+            hold_answer: Duration::from_secs(30),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, fake, "slots-stream-drain-held").await;
+        append(&path, &typed("go"));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        // Its turn end is not in the file: the answer is held.
+        rig.hook(stop(A, Some("done"))).await;
+        rig.hook(session_end(A, 10)).await;
+        let second = transcript_file(&rig.dir, B);
+        rig.hook(start_with(B, 11, &second, "startup")).await;
+        assert_eq!(
+            stream_texts(&rig, 100, 4).await,
+            ["> go", "> go", "done", "── session bbbbbbbb · new ──"]
+        );
+    }
+
+    /// TASK-024 review 4: while A's refused line drains, B's permission
+    /// prompt and Stop answer wait behind B's separator, which waits for the
+    /// line.
+    #[tokio::test]
+    async fn messages_of_the_next_session_wait_behind_its_separator_during_a_drain() {
+        let fake = Fake {
+            stream_errors: Mutex::new(1),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_millis(500),
+            ..stream_options()
+        };
+        let (mut rig, path) = live_stream(options, fake, "slots-stream-drain-behind").await;
+        append(&path, &typed("go"));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        rig.hook(session_end(A, 10)).await;
+        let second = transcript_file(&rig.dir, B);
+        rig.hook(start_with(B, 11, &second, "startup")).await;
+        rig.agent(2, B).await;
+        rig.agents
+            .send(permission(2, "abcde", "cargo test"))
+            .await
+            .unwrap();
+        rig.hook(stop(B, Some("b answer"))).await;
+        let texts = stream_texts(&rig, 100, 5).await;
+        assert_eq!(
+            texts[..3],
+            ["> go", "> go", "── session bbbbbbbb · new ──"],
+            "{texts:?}"
+        );
+        assert_eq!(texts.len(), 5, "{texts:?}");
+        assert!(
+            texts[3..].iter().any(|text| text.contains("cargo test")),
+            "{texts:?}"
+        );
+        assert!(
+            texts[3..].iter().any(|text| text == "b answer"),
+            "{texts:?}"
+        );
+    }
+
+    /// TASK-024 review 4, the worst case: A's line keeps failing. B's
+    /// permission prompt waits behind B's separator for at most one stream
+    /// retry (`Options::stream_retry`, 5 s by default), then the separator
+    /// and the prompt go; A's line comes after them.
+    #[tokio::test]
+    async fn a_prompt_of_the_next_session_waits_for_a_failing_drain_at_most_one_retry() {
+        let fake = Fake {
+            stream_errors: Mutex::new(usize::MAX),
+            ..Fake::default()
+        };
+        let retry = Duration::from_secs(1);
+        let options = Options {
+            stream_retry: retry,
+            ..stream_options()
+        };
+        let (mut rig, path) = live_stream(options, fake, "slots-stream-drain-bound").await;
+        append(&path, &typed("go"));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        rig.hook(session_end(A, 10)).await;
+        let second = transcript_file(&rig.dir, B);
+        rig.hook(start_with(B, 11, &second, "startup")).await;
+        rig.agent(2, B).await;
+        let asked = std::time::Instant::now();
+        rig.agents
+            .send(permission(2, "abcde", "cargo test"))
+            .await
+            .unwrap();
+        let ops = settled(&rig, |ops| {
+            topic_texts(ops, 100)
+                .iter()
+                .any(|text| text.contains("cargo test"))
+        })
+        .await;
+        let delay = asked.elapsed();
+        let texts = topic_texts(&ops, 100);
+        let separator = texts.iter().position(|text| text.starts_with("── session"));
+        let prompt = texts.iter().position(|text| text.contains("cargo test"));
+        assert!(separator.is_some() && separator < prompt, "{texts:?}");
+        assert!(delay >= retry - Duration::from_millis(100), "{delay:?}");
+        assert!(delay < retry + Duration::from_secs(1), "{delay:?}");
+        println!("worst-case prompt delay with stream_retry {retry:?}: {delay:?}");
+    }
+
+    /// TASK-024 review, missing coverage: A resumes into its slot while its
+    /// refused line waits. Its stream is live again (the same session: no
+    /// separator), and the line comes once more, not twice.
+    #[tokio::test]
+    async fn a_resume_during_a_drain_reads_the_refused_line_again_once() {
+        let fake = Fake {
+            stream_errors: Mutex::new(1),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_millis(300),
+            ..stream_options()
+        };
+        let (mut rig, path) = live_stream(options, fake, "slots-stream-drain-resume").await;
+        append(&path, &typed("go"));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        rig.hook(session_end(A, 10)).await;
+        rig.agents
+            .send(AgentEvent::Disconnected { conn: 1 })
+            .await
+            .unwrap();
+        rig.hook(start_with(A, 12, &path, "resume")).await;
+        settled(&rig, |ops| last_icon(ops, 100) == Some(ICON_NO_CHANNEL)).await;
+        let _kept = rig.reader(2, A, 12).await;
+        assert_eq!(stream_texts(&rig, 100, 2).await, ["> go", "> go"]);
+        append(&path, &typed("next"));
+        assert_eq!(stream_texts(&rig, 100, 3).await[2], "> next");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(topic_texts(&rig.fake.ops(), 100).len(), 3, "no duplicate");
     }
 
     /// TASK-024 item 3 through the actor: a reset chunk forgets the marks of
