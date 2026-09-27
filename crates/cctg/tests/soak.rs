@@ -32,8 +32,10 @@
 //! keeps what each topic shows (sends add, edits and writes change, deletes
 //! remove, user and service messages included), and at the end every topic
 //! must end with its status message, nothing is pinned, every prompt and tool
-//! line shows exactly once and in order, and every answer is a loud message
-//! of its own. Several minutes (20 messages and 20 edits a minute).
+//! line shows exactly once and in order, every answer is a loud message
+//! of its own, and no new status message still shows a decided prompt.
+//! Several minutes (20 messages and 20 edits a minute). In every fake mode a
+//! permission prompt goes within three message refills (+3 s) of its request.
 //!
 //! Slow (about a minute), so it runs only when asked:
 //! `cargo test -p cctg --test soak -- --ignored`.
@@ -1756,6 +1758,25 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     }
     let latency_a = p_a.at.duration_since(t0);
     let latency_a2 = p_a2.at.duration_since(t0);
+    // A prompt goes first among new messages once no older message of its
+    // topic waits (a status message of its topic gives way, TASK-062). With
+    // the bucket spent by the burst, at most three new messages go from the
+    // request on before the later prompt: A #2's debounced lines (they go
+    // first, as one message), then both prompts; so its token comes within
+    // three refills. 3 s cover the agent link, the hub actor and a loaded
+    // machine. Status mode: 3 x 4 s + 3 s = 15 s (it was 128-172 s behind
+    // the topic's status move).
+    if !soak.live {
+        let bound = soak.limits.messages.refill_every * 3 + Duration::from_secs(3);
+        for (name, latency) in [("A", latency_a), ("A #2", latency_a2)] {
+            assert!(
+                latency <= bound,
+                "the prompt of {name} went {} ms after its request (bound {} ms)",
+                latency.as_millis(),
+                bound.as_millis()
+            );
+        }
+    }
     soak.press(&hub, p_a.message_id.unwrap(), "allow:qwert");
     soak.press(&hub, p_a2.message_id.unwrap(), "deny:asdfg");
     wait_for("verdicts reach their agents", 30, || {
@@ -1763,6 +1784,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             && a2.verdicts() == [("asdfg".to_owned(), "deny".to_owned())]
     })
     .await;
+    let decided = Instant::now();
     assert!(b1.verdicts().is_empty());
     let want_a2: Vec<String> = (0..burst_a2)
         .map(|n| format!("> burst {} {n:02}", short(A2)))
@@ -2206,6 +2228,21 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let mut layout_notes = Vec::new();
     if soak.status {
         assert_eq!(tg.count("unpin"), 0, "nothing was pinned, nothing unpinned");
+        // A new status message shows the status of when it goes, not of
+        // when it was queued (TASK-062): no waiting one after the decisions.
+        // 1 s covers the verdict's acknowledgement reaching the hub.
+        let stale: Vec<&Call> = calls
+            .iter()
+            .filter(|call| {
+                call.kind == "send"
+                    && call.at > decided + Duration::from_secs(1)
+                    && call.text.starts_with("❓")
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "a status message still waiting after the decisions: {stale:?}"
+        );
         let (a1s, a2s, b1s, a5s) = (short(A1), short(A2), short(B1), short(A5));
         let mut want_a2 = vec![format!("> task {a2s}"), format!("• Bash: step {a2s} ✓")];
         want_a2.extend((0..burst_a2).map(|n| format!("> burst {a2s} {n:02}")));

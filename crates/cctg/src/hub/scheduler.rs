@@ -26,7 +26,9 @@
 //! 5. `Message` - `sendMessage`, `sendDocument`, `sendPhoto`, `sendMediaGroup`
 //!    (one token per album) and transcript stream lines; metered, one FIFO. Permission prompts live here too, so they never
 //!    overtake their own topic's ordinary messages; they do overtake its
-//!    stream lines, except its debounced ones (1.).
+//!    stream lines, except its debounced ones (1.). A new status message of
+//!    their topic still queued ([`Outbox::submit_status`]) never holds them
+//!    back: it is answered `Superseded` when the prompt comes (TASK-062).
 //!
 //! Stream lines marked `merge` (one tool call each) are debounced (TASK-054):
 //! the first line of a topic waits until no further mergeable line of that
@@ -84,7 +86,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -112,7 +114,8 @@ pub enum Op {
         html: Option<String>,
         reply_markup: Option<Value>,
         /// Permission prompts jump ahead of ordinary messages of other topics,
-        /// never ahead of older messages of their own topic.
+        /// never ahead of older messages of their own topic but a status
+        /// message, which they supersede (TASK-062).
         permission: bool,
         /// The message this one answers (`reply_parameters`).
         reply_to: Option<i64>,
@@ -687,6 +690,60 @@ impl Bucket {
     }
 }
 
+/// The text and buttons of a new status message (TASK-062), read when it
+/// goes out, not when it was queued: after a wait for the group's budget it
+/// shows the status of that moment. The sender keeps a clone to change it
+/// meanwhile and to learn what went out.
+#[derive(Debug, Clone)]
+pub struct LiveText(Arc<Mutex<LiveContent>>);
+
+#[derive(Debug)]
+struct LiveContent {
+    current: (String, Value),
+    sent: Option<(String, Value)>,
+}
+
+impl LiveText {
+    pub fn new(text: String, keyboard: Value) -> Self {
+        Self(Arc::new(Mutex::new(LiveContent {
+            current: (text, keyboard),
+            sent: None,
+        })))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LiveContent> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the message is to show when it goes.
+    pub fn set(&self, text: String, keyboard: Value) {
+        self.lock().current = (text, keyboard);
+    }
+
+    /// What the last try sent, or what it is to show when none went.
+    pub fn shown(&self) -> (String, Value) {
+        let content = self.lock();
+        content
+            .sent
+            .clone()
+            .unwrap_or_else(|| content.current.clone())
+    }
+
+    /// Puts the newest text and buttons into `op`, a `Send`.
+    fn fill(&self, op: &mut Op) {
+        let mut content = self.lock();
+        if let Op::Send {
+            text, reply_markup, ..
+        } = op
+        {
+            let (current, keyboard) = content.current.clone();
+            text.clone_from(&current);
+            *reply_markup = Some(keyboard.clone());
+            content.sent = Some((current, keyboard));
+        }
+    }
+}
+
 struct Job {
     op: Op,
     /// When it was handed over; the debounce counts from here.
@@ -697,6 +754,9 @@ struct Job {
     /// Goes again as plain text after Telegram refused its HTML: never takes
     /// more lines in, so it cannot become HTML and be refused a second time.
     plain_retry: bool,
+    /// A status message (TASK-062): its text is read when it goes, and a
+    /// permission prompt of its topic answers it `Superseded` while it waits.
+    status: Option<LiveText>,
 }
 
 /// Cloneable handle that enqueues outbound operations.
@@ -709,6 +769,19 @@ impl Outbox {
     /// Enqueues `op`. The receiver resolves when Telegram answered; it errors
     /// only if the scheduler has stopped. Dropping it makes the op fire-and-forget.
     pub async fn submit(&self, op: Op) -> oneshot::Receiver<Delivery> {
+        self.submit_job(op, None).await
+    }
+
+    /// Enqueues a new status message, a `Send` (TASK-062): it goes with the
+    /// text `status` holds then. A status message never holds a permission
+    /// prompt (or question) of its topic back: when one comes while it
+    /// waits, it is answered `Superseded` and its sender sends it again
+    /// below the prompt.
+    pub async fn submit_status(&self, op: Op, status: LiveText) -> oneshot::Receiver<Delivery> {
+        self.submit_job(op, Some(status)).await
+    }
+
+    async fn submit_job(&self, op: Op, status: Option<LiveText>) -> oneshot::Receiver<Delivery> {
         let (reply, receiver) = oneshot::channel();
         // A send error drops the job and its reply sender, so the receiver
         // reports the stopped scheduler by itself.
@@ -720,6 +793,7 @@ impl Outbox {
                 reply,
                 merged: Vec::new(),
                 plain_retry: false,
+                status,
             })
             .await;
         receiver
@@ -922,6 +996,29 @@ impl<T: Transport> Scheduler<T> {
                 if matches!(self.edit[index].op, Op::Edit { .. })
                     && self.edit[index].op.message() == target
                     && let Some(old) = self.edit.remove(index)
+                {
+                    let _ = old.reply.send(Ok(Outcome::Superseded));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if let (
+            Op::Send {
+                permission: true, ..
+            },
+            Some(place),
+        ) = (&job.op, job.op.place())
+        {
+            // A status message of the prompt's topic still queued would hold
+            // it back (TASK-062): it goes again below the prompt. One put
+            // back after a 429 is queued again before the prompt, which came
+            // while it was out, is taken in.
+            let mut index = 0;
+            while index < self.message.len() {
+                if self.message[index].status.is_some()
+                    && self.message[index].op.place() == Some(place)
+                    && let Some(old) = self.message.remove(index)
                 {
                     let _ = old.reply.send(Ok(Outcome::Superseded));
                 } else {
@@ -1151,6 +1248,9 @@ impl<T: Transport> Scheduler<T> {
         };
         if matches!(lane, Lane::Message(_)) {
             self.merge_lines(&mut job, Instant::now());
+        }
+        if let Some(status) = &job.status {
+            status.fill(&mut job.op);
         }
         if job.op.metered() || self.spills(&job.op, Instant::now()) {
             self.bucket.take(Instant::now());
@@ -1789,6 +1889,83 @@ mod tests {
         let expected = [("p", 0), ("p", 3), ("m0", 4), ("after", 5)]
             .map(|(text, at)| (text.to_owned(), Duration::from_secs(at)));
         assert_eq!(order, expected);
+    }
+
+    /// A new status message of `thread` (TASK-062), as the slots actor
+    /// hands it over.
+    fn status(thread: i64, text: &str) -> (Op, LiveText) {
+        let keyboard = serde_json::json!({"inline_keyboard": []});
+        let mut op = send(thread, text);
+        if let Op::Send { reply_markup, .. } = &mut op {
+            *reply_markup = Some(keyboard.clone());
+        }
+        (op, LiveText::new(text.to_owned(), keyboard))
+    }
+
+    /// TASK-062: a status message never holds a permission prompt of its
+    /// topic back; the one of another topic keeps its place.
+    #[tokio::test(start_paused = true)]
+    async fn a_permission_prompt_supersedes_the_queued_status_message_of_its_topic() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let m0 = outbox.submit(send(1, "m0")).await;
+        let (op, text) = status(2, "s2");
+        let s2 = outbox.submit_status(op, text).await;
+        let (op, text) = status(3, "s3");
+        let s3 = outbox.submit_status(op, text).await;
+        let m1 = outbox.submit(send(1, "m1")).await;
+        let p2 = outbox.submit(permission(2, "p2")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert!(matches!(s2.await, Ok(Ok(Outcome::Superseded))));
+        for sent in [m0, s3, m1, p2] {
+            assert!(matches!(sent.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        assert_eq!(texts(&fake), ["p2", "m0", "s3", "m1"]);
+    }
+
+    /// TASK-062: a status message goes with the text it holds when it goes,
+    /// not the one it was queued with, and tells what went.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_message_goes_with_the_text_of_when_it_goes() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let (op, text) = status(2, "❓ Ждёт разрешения");
+        let sent = outbox.submit_status(op, text.clone()).await;
+        let keyboard = serde_json::json!({"inline_keyboard": [[{"text": "⏹"}]]});
+        text.set("💤 Ждёт вас".to_owned(), keyboard.clone());
+        drop(outbox);
+        scheduler.run().await;
+        assert!(matches!(sent.await, Ok(Ok(Outcome::Sent(_)))));
+        let calls = fake.calls();
+        assert!(
+            matches!(
+                &calls[0].op,
+                Op::Send { text, reply_markup: Some(markup), .. }
+                    if text == "💤 Ждёт вас" && *markup == keyboard
+            ),
+            "{calls:?}"
+        );
+        text.set("later".to_owned(), serde_json::json!({}));
+        assert_eq!(text.shown(), ("💤 Ждёт вас".to_owned(), keyboard));
+    }
+
+    /// TASK-062: a status message that got a 429 does not go again ahead of
+    /// a prompt of its topic that came while it was out.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_message_refused_by_flood_control_yields_to_a_prompt_that_came_meanwhile() {
+        let fake = Fake::with_delay(&[1], Duration::from_secs(1));
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let running = tokio::spawn(scheduler.run());
+        let (op, text) = status(2, "s2");
+        let s2 = outbox.submit_status(op, text).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let p2 = outbox.submit(permission(2, "p2")).await;
+        drop(outbox);
+        running.await.unwrap();
+        assert!(matches!(s2.await, Ok(Ok(Outcome::Superseded))));
+        assert!(matches!(p2.await, Ok(Ok(Outcome::Sent(_)))));
+        assert_eq!(texts(&fake), ["s2", "p2"]);
     }
 
     #[tokio::test(start_paused = true)]
