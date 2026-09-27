@@ -797,6 +797,39 @@ struct AfterSeparator {
     text: String,
     kind: &'static str,
     notify: bool,
+    /// Messages it takes; they count in `queued_messages` while it waits.
+    parts: usize,
+}
+
+/// The messages of [`Slots::send_text`]: the chunks of
+/// `split_markdown_for_telegram`, or one document when it prefers a file.
+fn text_ops(thread_id: i64, session: &str, text: &str, kind: &str, notify: bool) -> Vec<Op> {
+    let split = split_markdown_for_telegram(text, SplitOptions::default());
+    if split.prefer_file {
+        vec![Op::SendDocument {
+            thread_id: Some(thread_id),
+            document: Document {
+                file_name: format!("{kind}-{}.txt", short(session)),
+                bytes: text.as_bytes().to_vec(),
+                caption: None,
+            },
+            notify,
+        }]
+    } else {
+        split
+            .chunks
+            .into_iter()
+            .map(|chunk| Op::Send {
+                thread_id: Some(thread_id),
+                text: chunk.text,
+                html: Some(chunk.html),
+                reply_markup: None,
+                permission: false,
+                reply_to: None,
+                notify,
+            })
+            .collect()
+    }
 }
 
 fn short(session_id: &str) -> &str {
@@ -1275,6 +1308,9 @@ impl Slots {
         }
         // Messages held for a question's id go on (into the slot buffer).
         self.release_held();
+        // Texts held behind a separator go to the dispatch task like the
+        // messages queued before them.
+        self.send_after_separator(true);
         self.pump();
         let save_task = self.save_task.take();
         // Closes the save channel: the task writes the last snapshot and ends.
@@ -4008,7 +4044,7 @@ impl Slots {
             return;
         }
         if self.behind_drain(slot, Instant::now()) {
-            self.hold_after_separator(slot, session, answer, "answer", true);
+            self.hold_after_separator(slot, thread_id, session, answer, "answer", true);
             return;
         }
         if let Some(parts) = self.send_text(thread_id, session, answer, "answer", true) {
@@ -4328,36 +4364,66 @@ impl Slots {
         !draining.is_empty()
     }
 
+    /// Holds a text of `session` until its slot's separator is out. It
+    /// counts against [`MAX_QUEUED_MESSAGES`] like a queued one, and is
+    /// dropped like one when the cap is reached.
     fn hold_after_separator(
         &mut self,
         slot: SlotId,
+        thread_id: i64,
         session: &str,
         text: &str,
         kind: &'static str,
         notify: bool,
     ) {
+        let parts = text_ops(thread_id, session, text, kind, notify).len();
+        if self.queued_messages + parts > MAX_QUEUED_MESSAGES {
+            if !self.overflow_warned {
+                self.overflow_warned = true;
+                warn!(
+                    "too many messages wait for Telegram; new replies, turn answers and notices are dropped"
+                );
+            }
+            return;
+        }
         debug!(
             session = short(session),
             kind, "waits behind the separator of its slot"
         );
+        self.queued_messages += parts;
         self.after_separator.push(AfterSeparator {
             slot,
             session: session.to_owned(),
             text: text.to_owned(),
             kind,
             notify,
+            parts,
         });
     }
 
-    /// Sends the held texts whose slot's separator is in the topic now.
-    fn send_after_separator(&mut self) {
+    /// Sends the held texts whose slot's separator is in the topic now, or
+    /// every held text when `stopping`. A text whose session is no longer
+    /// the current one of its slot goes the way a late text of a gone
+    /// session goes: it is not sent, never under a newer session's
+    /// separator.
+    fn send_after_separator(&mut self, stopping: bool) {
         if self.after_separator.is_empty() {
             return;
         }
         let now = Instant::now();
         for held in std::mem::take(&mut self.after_separator) {
-            if self.behind_drain(held.slot, now) {
+            let current = self.current_slot(&held.session) == Some(held.slot);
+            if current && !stopping && self.behind_drain(held.slot, now) {
                 self.after_separator.push(held);
+                continue;
+            }
+            self.queued_messages = self.queued_messages.saturating_sub(held.parts);
+            if !current {
+                debug!(
+                    session = short(&held.session),
+                    kind = held.kind,
+                    "held text of a session that is not the live one of its slot; not sent"
+                );
                 continue;
             }
             let Some(thread_id) = self.registry.slot(held.slot).and_then(|slot| slot.topic_id)
@@ -4740,7 +4806,7 @@ impl Slots {
             return;
         };
         if self.behind_drain(slot, Instant::now()) {
-            self.hold_after_separator(slot, &session, text, "reply", false);
+            self.hold_after_separator(slot, thread_id, &session, text, "reply", false);
             return;
         }
         if let Some(parts) = self.send_text(thread_id, &session, text, "reply", false) {
@@ -4765,32 +4831,7 @@ impl Slots {
         kind: &str,
         notify: bool,
     ) -> Option<usize> {
-        let split = split_markdown_for_telegram(text, SplitOptions::default());
-        let ops: Vec<Op> = if split.prefer_file {
-            vec![Op::SendDocument {
-                thread_id: Some(thread_id),
-                document: Document {
-                    file_name: format!("{kind}-{}.txt", short(session)),
-                    bytes: text.as_bytes().to_vec(),
-                    caption: None,
-                },
-                notify,
-            }]
-        } else {
-            split
-                .chunks
-                .into_iter()
-                .map(|chunk| Op::Send {
-                    thread_id: Some(thread_id),
-                    text: chunk.text,
-                    html: Some(chunk.html),
-                    reply_markup: None,
-                    permission: false,
-                    reply_to: None,
-                    notify,
-                })
-                .collect()
-        };
+        let ops = text_ops(thread_id, session, text, kind, notify);
         let parts = ops.len();
         self.send_messages(ops).then_some(parts)
     }
@@ -7323,7 +7364,7 @@ impl Slots {
             };
             self.hand_off(Work::Topic(job), op);
         }
-        self.send_after_separator();
+        self.send_after_separator(false);
         let room = MAX_BLOCK_JOBS.saturating_sub(self.block_jobs);
         for job in self.registry.block_work(room) {
             self.block_jobs += 1;
@@ -15039,6 +15080,117 @@ again"
             texts[3..].iter().any(|text| text == "b answer"),
             "{texts:?}"
         );
+    }
+
+    /// A with a refused line ended and B took the slot: B's separator
+    /// waits for A's drain.
+    fn draining_into_b(dir: &TempDir) -> Slots {
+        let mut slots = asked_slots(dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        slots.on_stream_done(A, 1, bad_gateway());
+        slots.on_hook(&session_end(A, 10));
+        let path = transcript_file(dir, B);
+        slots.on_hook(&start_with(B, 11, &path, "startup"));
+        // The stalled scheduler never answers the title edit of A's start.
+        slots.registry.slots[0].busy = false;
+        slots
+    }
+
+    /// TASK-024 review 2 item 1: B's answer held behind its separator is
+    /// not sent once C took the slot (it would show under C's separator);
+    /// it goes the way a late answer of a gone session goes.
+    #[tokio::test]
+    async fn a_held_answer_of_a_session_that_left_its_slot_is_not_sent_under_the_next_separator() {
+        const C: &str = "cccccccc-0000-4000-8000-000000000003";
+        let dir = TempDir::new("slots-stream-drain-held-gone");
+        let mut slots = draining_into_b(&dir);
+        slots.on_hook(&stop(B, Some("b answer")));
+        assert_eq!(slots.after_separator.len(), 1, "B's answer waits");
+        assert_eq!(slots.queued_messages, 1, "and counts as queued");
+        slots.on_hook(&session_end(B, 11));
+        let path = transcript_file(&dir, C);
+        slots.on_hook(&start_with(C, 12, &path, "startup"));
+        assert_eq!(slots.registry.slots[0].current_session.as_deref(), Some(C));
+        slots.pump();
+        assert!(slots.after_separator.is_empty(), "B's answer is dropped");
+        assert_eq!(slots.queued_messages, 0, "nothing of it is queued");
+        // A's drain ends; C's separator goes and nothing of B follows it.
+        slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
+        slots.pump();
+        assert_eq!(slots.queued_messages, 1, "only A's line");
+        slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
+        slots.pump();
+        assert!(slots.registry.slots[0].busy, "C's separator goes");
+        assert_eq!(slots.queued_messages, 0, "no answer of B");
+    }
+
+    /// The same while B is still the slot's session: its answer goes once
+    /// the separator is out.
+    #[tokio::test]
+    async fn a_held_answer_of_the_current_session_goes_after_the_drain() {
+        let dir = TempDir::new("slots-stream-drain-held-current");
+        let mut slots = draining_into_b(&dir);
+        slots.on_hook(&stop(B, Some("b answer")));
+        slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
+        slots.pump();
+        assert_eq!(slots.queued_messages, 2, "A's line and B's held answer");
+        slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
+        assert_eq!(slots.after_separator.len(), 1, "still waits");
+        slots.pump();
+        assert!(slots.registry.slots[0].busy, "B's separator goes");
+        assert!(slots.after_separator.is_empty(), "right behind it");
+        assert_eq!(slots.queued_messages, 1, "B's answer handed out");
+    }
+
+    /// TASK-024 review 2 item 2: a held text counts against
+    /// [`MAX_QUEUED_MESSAGES`]; one past it is dropped with the usual warn.
+    #[tokio::test]
+    async fn a_text_held_behind_a_separator_counts_against_the_message_cap() {
+        let dir = TempDir::new("slots-stream-drain-held-cap");
+        let mut slots = draining_into_b(&dir);
+        slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
+        slots.on_hook(&stop(B, Some("fits")));
+        assert_eq!(slots.after_separator.len(), 1);
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+        slots.on_hook(&stop(B, Some("over")));
+        assert_eq!(slots.after_separator.len(), 1, "the second is dropped");
+        assert_eq!(slots.queued_messages, MAX_QUEUED_MESSAGES);
+        assert!(slots.overflow_warned);
+    }
+
+    /// TASK-024 review 2 item 2: on stop, a text still behind a separator
+    /// is handed to the scheduler like the messages queued before it.
+    #[tokio::test]
+    async fn a_text_held_behind_a_separator_is_sent_on_stop() {
+        let fake = Fake {
+            stream_errors: Mutex::new(usize::MAX),
+            ..Fake::default()
+        };
+        let options = Options {
+            stream_retry: Duration::from_secs(60),
+            ..stream_options()
+        };
+        let (rig, path) = live_stream(options, fake, "slots-stream-drain-stop").await;
+        append(&path, &typed("go"));
+        settled(&rig, |ops| topic_texts(ops, 100).len() == 1).await;
+        rig.hook(session_end(A, 10)).await;
+        let second = transcript_file(&rig.dir, B);
+        rig.hook(start_with(B, 11, &second, "startup")).await;
+        rig.hook(stop(B, Some("b answer"))).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !topic_texts(&rig.fake.ops(), 100).contains(&"b answer".to_owned()),
+            "held behind the drain"
+        );
+        rig.control.send(Control::Stop).unwrap();
+        settled(&rig, |ops| {
+            topic_texts(ops, 100).contains(&"b answer".to_owned())
+        })
+        .await;
     }
 
     /// TASK-024 review 4, the worst case: A's line keeps failing. B's
