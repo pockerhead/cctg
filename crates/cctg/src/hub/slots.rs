@@ -3971,6 +3971,9 @@ impl Slots {
             let oldest = (live.held.len() >= stream::MAX_HELD)
                 .then(|| live.held.pop_front())
                 .flatten();
+            if let Some(oldest) = &oldest {
+                live.answered_early(oldest, now);
+            }
             live.held.push_back(held);
             live.next_read = Some(now);
             if let Some(oldest) = oldest {
@@ -3993,9 +3996,11 @@ impl Slots {
 
     /// Sends a turn answer. A streamed session's answer rides its stream
     /// (see [`answer_ops`]), so it never shows before a stream line queued
-    /// earlier, refused or not.
+    /// earlier, refused or not; so does the answer of a session that left
+    /// its slot while its stream still sends (TASK-024).
     fn release(&mut self, session: &str, held: Held) {
-        let streamed = self.stream_target(session).is_some();
+        let streamed =
+            self.stream_target(session).is_some() || self.current_slot(session).is_none();
         let room = MAX_QUEUED_MESSAGES.saturating_sub(self.queued_messages);
         let held = match self.streams.get_mut(session).filter(|_| streamed) {
             Some(live) => match answer_ops(live, held, room) {
@@ -4072,8 +4077,8 @@ impl Slots {
 
     /// Asks the agents of streamed sessions for new lines, releases held
     /// answers that waited long enough or can no longer be matched, and
-    /// forgets the streams of sessions that are over once nothing of theirs
-    /// waits for Telegram.
+    /// forgets the streams of sessions that are over once everything of
+    /// theirs is in the topic (see [`Self::drain_stream`]).
     fn pump_streams(&mut self) {
         let now = Instant::now();
         let mut sessions: HashSet<String> = self
@@ -4084,16 +4089,7 @@ impl Slots {
         sessions.extend(self.streams.keys().cloned());
         for session in sessions {
             if self.current_slot(&session).is_none() {
-                let Some(live) = self.streams.get_mut(&session) else {
-                    continue;
-                };
-                let held: Vec<Held> = live.held.drain(..).collect();
-                if live.unanswered() == 0 {
-                    self.streams.remove(&session);
-                }
-                for held in held {
-                    self.release(&session, held);
-                }
+                self.drain_stream(&session, now);
                 continue;
             }
             let target = self.stream_target(&session);
@@ -4130,7 +4126,7 @@ impl Slots {
                 .is_some_and(|held| target.is_none() || now >= held.until)
             {
                 if let Some(held) = live.held.pop_front() {
-                    live.answered_early(&held);
+                    live.answered_early(&held, now);
                     released.push(held);
                 }
             }
@@ -4151,10 +4147,18 @@ impl Slots {
             {
                 continue;
             }
+            // After a refusal the stream reads again from the last barrier
+            // Telegram fully accepted, once its retry is due and nothing of
+            // it is in flight; the answer to that read rewinds it.
+            let from = match live.rewind_at {
+                Some(at) if now < at || !live.stuck() => continue,
+                Some(_) => offset,
+                None => live.read_at,
+            };
             let read = HubMsg::TranscriptRead {
                 session_id: session.clone(),
                 path,
-                from: live.read_at,
+                from,
             };
             let asked = self
                 .conns
@@ -4166,6 +4170,71 @@ impl Slots {
                 live.next_read = Some(now + self.options.stream_every);
             }
         }
+    }
+
+    /// The stream of a session that left its slot (it ended, or another
+    /// session took the slot) cannot read any more (TASK-024). Its held
+    /// answers go behind what it already sent, its refused messages go again
+    /// as they were once their retry is due (at most
+    /// [`stream::MAX_RESENDS`] times), and it is forgotten once all of it is
+    /// in the topic. Until then the next separator of its slot waits
+    /// ([`Self::draining_slots`]).
+    fn drain_stream(&mut self, session: &str, now: Instant) {
+        let Some(live) = self.streams.get_mut(session) else {
+            return;
+        };
+        // Its chunks are not taken any more (see `on_chunk`).
+        live.reading = None;
+        let held: Vec<Held> = live.held.drain(..).collect();
+        for held in held {
+            self.release(session, held);
+        }
+        let Some(live) = self.streams.get_mut(session) else {
+            return;
+        };
+        if live.settled() {
+            self.streams.remove(session);
+            return;
+        }
+        if !live.stuck() || live.rewind_at.is_some_and(|at| now < at) {
+            return;
+        }
+        if live.resends >= stream::MAX_RESENDS {
+            warn!(
+                session = short(session),
+                "stream messages of a session that left its topic keep failing; given up"
+            );
+            self.streams.remove(session);
+            return;
+        }
+        live.resends += 1;
+        live.rewind_at = None;
+        let again = live.resend();
+        debug!(
+            session = short(session),
+            messages = again.len(),
+            "stream messages of a session that left its topic sent again"
+        );
+        for (number, op) in again {
+            self.queued_messages += 1;
+            self.hand_off(
+                Work::Stream {
+                    session: session.to_owned(),
+                    number,
+                },
+                op,
+            );
+        }
+    }
+
+    /// Slots whose topic still gets stream messages of a session that left
+    /// them: their next session separator waits for those.
+    fn draining_slots(&self) -> HashSet<SlotId> {
+        self.streams
+            .iter()
+            .filter(|(session, live)| self.current_slot(session).is_none() && !live.settled())
+            .filter_map(|(session, _)| self.registry.sessions.get(session)?.slot)
+            .collect()
     }
 
     /// One answered transcript read: its messages go to the topic in order,
@@ -4195,18 +4264,37 @@ impl Slots {
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
-        if live.reading.is_none_or(|(asked, _)| asked != conn) {
+        let Some((_, asked_at)) = live.reading.filter(|(asked, _)| *asked == conn) else {
             debug!(
                 session = short(session),
                 "transcript chunk nobody asked for; dropped"
             );
             return;
-        }
+        };
         live.reading = None;
         live.next_read = Some(now + every);
         let Some(thread_id) = thread_id else {
             return;
         };
+        if live.rewind_at.is_some() {
+            if !live.stuck() {
+                // A message went out after the read was asked: the read is
+                // asked again once nothing is in flight.
+                return;
+            }
+            // The read again after a refusal: what went since the last
+            // accepted barrier is dropped now, answers not in the topic are
+            // held again.
+            let (offset, calls) = self
+                .registry
+                .sessions
+                .get(session)
+                .and_then(|entry| entry.stream.as_ref())
+                .map(|stream| (stream.offset, stream.calls.clone()))
+                .unwrap_or_default();
+            live.rewind(offset, calls, now, hold);
+            live.next_read = Some(now + every);
+        }
         if live.read_at.is_some_and(|at| at != from) || to < from {
             debug!(
                 session = short(session),
@@ -4250,8 +4338,7 @@ impl Slots {
                     "session transcript was cut or replaced; the stream reads it again from its start"
                 );
             }
-            live.read_at = Some(0);
-            live.calls.clear();
+            live.reset();
             live.next_read = Some(now);
             return;
         }
@@ -4332,7 +4419,7 @@ impl Slots {
                                 restart: std::mem::take(&mut live.restart),
                                 notify: false,
                             };
-                            actions.push(Action::Stream(live.sent(), op));
+                            actions.push(Action::Stream(live.sent(&op), op));
                         }
                     }
                     Step::Working(message_id) => {
@@ -4363,6 +4450,9 @@ impl Slots {
                     }
                 }
             }
+        }
+        if !more && !stopped {
+            live.lapse_unpaired(asked_at);
         }
         live.barrier(read_to);
         if more || stopped {
@@ -4437,20 +4527,13 @@ impl Slots {
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
-        if live.stuck() {
-            let (offset, calls) = self
-                .registry
-                .sessions
-                .get(session)
-                .and_then(|entry| entry.stream.as_ref())
-                .map(|stream| (stream.offset, stream.calls.clone()))
-                .unwrap_or_default();
-            live.rewind(
-                offset,
-                calls,
-                Instant::now() + self.options.stream_retry,
-                self.options.hold_answer,
-            );
+        // The stream reads again (or, when its session left the slot, sends
+        // again) after the retry; until the answer to that read it keeps
+        // what it sent (TASK-024).
+        if live.stuck() && live.rewind_at.is_none() {
+            live.rewind_at = Some(Instant::now() + self.options.stream_retry);
+            // A read in flight now would bring lines after the refused ones.
+            live.reading = None;
         }
     }
 
@@ -7031,7 +7114,11 @@ impl Slots {
         self.flush_all();
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
-        for job in self.registry.topic_work(&self.options.icons, edits) {
+        let draining = self.draining_slots();
+        for job in self
+            .registry
+            .topic_work_except(&self.options.icons, edits, &draining)
+        {
             let op = match &job {
                 TopicJob::Create { name, icon, .. } => Op::CreateTopic {
                     name: name.clone(),
@@ -7130,10 +7217,10 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
     let mut ops = Vec::with_capacity(chunks.len() + 1);
     for chunk in chunks {
         let message = op(live, chunk);
-        ops.push((live.sent(), message));
+        ops.push((live.sent(&message), message));
     }
     let message = op(live, last);
-    ops.push((live.sent_answer(held), message));
+    ops.push((live.sent_answer(held, &message), message));
     Ok(ops)
 }
 
@@ -14215,15 +14302,14 @@ again"
         );
         slots.on_stream_done(A, 2, None);
         let live = &slots.streams[A];
-        assert_eq!(live.read_at, Some(0), "rewound");
-        let held: Vec<&str> = live.held.iter().map(|h| h.answer.as_str()).collect();
-        assert_eq!(held, ["done"], "held again, not lost");
+        // TASK-024: kept as sent until the re-read after the retry.
+        assert!(live.stuck() && live.rewind_at.is_some() && live.reading.is_none());
+        assert_eq!(live.answer_numbers(), [(2, "done")], "not lost");
         assert_eq!(stream_offset(&slots), Some(0));
 
-        // The re-read: the line, then the answer at its turn end.
-        let live = slots.streams.get_mut(A).unwrap();
-        live.reading = Some((1, Instant::now()));
-        assert!(live.restart);
+        // The re-read rewinds (the answer is held again): the line, then the
+        // answer at its turn end.
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
         slots.on_agent(message(chunk()));
         let live = &slots.streams[A];
         assert!(live.held.is_empty());
@@ -14297,9 +14383,9 @@ again"
         );
         slots.on_stream_done(A, 4, None);
         let live = &slots.streams[A];
-        assert_eq!(live.read_at, Some(0), "rewound to the start of the read");
-        let held: Vec<&str> = live.held.iter().map(|h| h.answer.as_str()).collect();
-        assert_eq!(held, ["second"]);
+        // TASK-024: the re-read from the start of the read rewinds it.
+        assert!(live.stuck() && live.rewind_at.is_some());
+        assert_eq!(stream_offset(&slots), Some(0));
 
         slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
         slots.on_agent(message(chunk()));
@@ -14386,8 +14472,9 @@ again"
         );
         slots.on_stream_done(A, 3, None);
         let live = &slots.streams[A];
-        assert_eq!(live.read_at, Some(20));
-        assert_eq!(live.held.len(), 1);
+        // TASK-024: the re-read from the committed offset rewinds it.
+        assert!(live.stuck() && live.rewind_at.is_some());
+        assert_eq!(stream_offset(&slots), Some(20));
 
         slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
         slots.on_agent(message(two()));
@@ -14419,6 +14506,147 @@ again"
         slots.on_hook(&stop(A, Some("late")));
         assert_eq!(slots.queued_messages, 1);
         assert_eq!(slots.streams[A].answer_numbers(), [(1, "answer 1")]);
+    }
+
+    fn bad_gateway() -> Option<Delivery> {
+        Some(Err(ApiError::Telegram {
+            code: 502,
+            description: "Bad Gateway".into(),
+        }))
+    }
+
+    /// TASK-024 item 1: A ends while its refused line waits for the retry,
+    /// and B takes the slot. The line goes again as it was (A cannot read any
+    /// more), and B's separator waits until it is in the topic.
+    #[tokio::test]
+    async fn a_session_ending_while_its_stream_waits_sends_the_refused_lines_before_the_next_separator()
+     {
+        let dir = TempDir::new("slots-stream-drain");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        slots.on_stream_done(A, 1, bad_gateway());
+        assert!(slots.streams[A].stuck());
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        let path = transcript_file(&dir, B);
+        slots.on_hook(&start_with(B, 11, &path, "startup"));
+        // The stalled scheduler never answers the title edit of A's start.
+        slots.registry.slots[0].busy = false;
+        let slot = &slots.registry.slots[0];
+        assert_eq!(slot.current_session.as_deref(), Some(B));
+        assert!(slot.pending_separator.is_some());
+        slots.pump();
+        assert!(slots.streams.contains_key(A), "kept: its line is not out");
+        assert_eq!(slots.queued_messages, 0, "not before its retry");
+        assert!(!slots.registry.slots[0].busy, "the separator waits");
+        // The retry is due: the line goes again, the separator still waits.
+        slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
+        slots.pump();
+        assert_eq!(slots.queued_messages, 1);
+        assert_eq!(slots.streams[A].unanswered(), 1);
+        assert_eq!(slots.streams[A].resends, 1);
+        assert!(!slots.registry.slots[0].busy);
+        slots.on_stream_done(A, 1, Some(Ok(Outcome::Sent(Message::default()))));
+        assert_eq!(stream_offset(&slots), Some(10), "the line is in the topic");
+        slots.pump();
+        assert!(!slots.streams.contains_key(A), "forgotten once all is out");
+        assert!(slots.registry.slots[0].busy, "the separator goes now");
+    }
+
+    /// TASK-024 item 1: a refused line of an ended session that keeps
+    /// failing is given up after [`stream::MAX_RESENDS`] tries, and the next
+    /// separator goes.
+    #[tokio::test]
+    async fn refused_lines_of_an_ended_session_are_given_up_after_a_bounded_number_of_tries() {
+        let dir = TempDir::new("slots-stream-drain-give-up");
+        let mut slots = asked_slots(&dir);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: one_prompt_chunk(A),
+        });
+        slots.on_stream_done(A, 1, bad_gateway());
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        let path = transcript_file(&dir, B);
+        slots.on_hook(&start_with(B, 11, &path, "startup"));
+        // The stalled scheduler never answers the title edit of A's start.
+        slots.registry.slots[0].busy = false;
+        for _ in 0..stream::MAX_RESENDS {
+            slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
+            slots.pump();
+            assert!(!slots.registry.slots[0].busy);
+            slots.on_stream_done(A, 1, bad_gateway());
+        }
+        slots.streams.get_mut(A).unwrap().rewind_at = Some(Instant::now());
+        slots.pump();
+        assert!(!slots.streams.contains_key(A), "given up");
+        assert_eq!(slots.queued_messages, 0);
+        slots.pump();
+        assert!(slots.registry.slots[0].busy, "the separator goes");
+    }
+
+    /// TASK-024 item 3 through the actor: a reset chunk forgets the marks of
+    /// the old file.
+    #[tokio::test]
+    async fn a_reset_chunk_forgets_the_answered_turn_ends_of_the_old_file() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-stream-reset-marks");
+        let mut slots = asked_slots(&dir);
+        let message = |msg| AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg,
+        };
+        // A reset answers the read asked (from 20) with nothing.
+        let chunk = |reset: bool| AgentMsg::TranscriptChunk {
+            session_id: A.into(),
+            from: if reset { 20 } else { 0 },
+            to: 20,
+            lines: if reset {
+                Vec::new()
+            } else {
+                vec![
+                    StreamLine {
+                        end: 10,
+                        items: vec![StreamItem::Prompt { text: "one".into() }],
+                    },
+                    StreamLine {
+                        end: 20,
+                        items: vec![StreamItem::TurnEnd],
+                    },
+                ]
+            },
+            missing: false,
+            more: false,
+            reset,
+        };
+        // "first" is a blank answer: its turn end at 20 counts as answered.
+        slots.on_hook(&stop(A, Some(" ")));
+        slots.on_agent(message(chunk(false)));
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(message(chunk(true)));
+        // The replaced file has a turn end at 20 too; its answer goes there.
+        slots.on_hook(&stop(A, Some("second")));
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(message(chunk(false)));
+        let numbers = slots.streams[A].answer_numbers();
+        assert_eq!(numbers.last().map(|(_, text)| *text), Some("second"));
+        assert!(slots.streams[A].held.is_empty());
     }
 
     #[tokio::test]
