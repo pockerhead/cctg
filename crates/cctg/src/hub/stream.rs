@@ -31,6 +31,17 @@
 //! A session that leaves its slot while its stream waits for Telegram can no
 //! longer read (TASK-024): its refused messages go again as they were
 //! ([`Live::resend`]), and the next session's separator waits for them.
+//!
+//! The turn message (TASK-062, with status messages on): the quiet content
+//! of a turn - assistant text, thinking and tool lines - is written into one
+//! message ([`Live::open`], [`Open`]) by edits of its whole text until the
+//! next piece no longer fits; the slots actor starts it by turning the
+//! status message into it, or with a new message. Every barrier keeps the
+//! open message as it was then, and a rewind goes on from the one of the
+//! last barrier Telegram accepted: the lines read again are written into
+//! that message again, so an edit that already showed them changes nothing.
+//! A message the topic got in between (a user's, a prompt, an answer)
+//! closes it for good ([`Live::close_open`]).
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -90,6 +101,53 @@ pub enum Format {
     Markdown,
     /// A prompt typed in the terminal: the whole message monospace.
     Code,
+}
+
+/// The message a turn's quiet content is written into (TASK-062).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Open {
+    /// The message; `None` while the send that makes it waits for Telegram.
+    pub key: Option<MessageKey>,
+    /// The stream message that made it.
+    pub number: u64,
+    /// Its whole text.
+    pub text: String,
+    /// Its text as Telegram HTML, once a formatted piece is in it.
+    pub html: Option<String>,
+}
+
+impl Open {
+    /// `text` (as `html`, when formatted) below the message's text; false,
+    /// and nothing changes, when that would not fit one message.
+    pub fn push(&mut self, text: &str, html: Option<&str>) -> bool {
+        match join(&self.text, self.html.as_deref(), text, html) {
+            Some((joined, joined_html)) => {
+                self.text = joined;
+                self.html = joined_html;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// `text` and `next` one below the other, as HTML when either is formatted;
+/// `None` when that is longer than one Telegram message.
+pub fn join(
+    text: &str,
+    html: Option<&str>,
+    next: &str,
+    next_html: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let joined = format!("{text}\n{next}");
+    let joined_html = (html.is_some() || next_html.is_some()).then(|| {
+        let escaped = |text: &str, html: Option<&str>| {
+            html.map_or_else(|| transcript::escape_html(text), str::to_owned)
+        };
+        format!("{}\n{}", escaped(text, html), escaped(next, next_html))
+    });
+    let fits = |text: &str| transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT;
+    (fits(&joined) && joined_html.as_deref().is_none_or(fits)).then_some((joined, joined_html))
 }
 
 /// Applies the items of one line to the calls still open and the receipts.
@@ -268,9 +326,17 @@ enum Entry {
         /// What went to the scheduler, to send again when the stream cannot
         /// read any more.
         op: Box<Op>,
+        /// It turned the status message into turn content (TASK-062): sent
+        /// again, it is a new message.
+        absorb: bool,
     },
-    /// Everything before it read: the offset and the calls open there.
-    Barrier { to: u64, calls: Vec<PendingCall> },
+    /// Everything before it read: the offset, the calls open there and the
+    /// turn message then (TASK-062).
+    Barrier {
+        to: u64,
+        calls: Vec<PendingCall>,
+        open: Option<Open>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +395,11 @@ pub struct Live {
     /// answer owns are theirs. A rewind that holds such an answer again
     /// takes its debt back ([`Held::gone`]).
     unpaired: VecDeque<Instant>,
+    /// The turn message the next quiet content goes into (TASK-062).
+    pub open: Option<Open>,
+    /// `open` as of the last barrier Telegram fully accepted: a rewind goes
+    /// on from it.
+    committed_open: Option<Open>,
     waiting: VecDeque<Entry>,
     next: u64,
 }
@@ -442,6 +513,7 @@ impl Live {
         self.unpaired.clear();
         self.ends_unclaimed.clear();
         self.ends_until = None;
+        self.close_open();
         for held in &mut self.held {
             held.end = None;
             held.gone = None;
@@ -471,30 +543,93 @@ impl Live {
 
     /// Message `op` goes to Telegram; its number.
     pub fn sent(&mut self, op: &Op) -> u64 {
-        self.push_message(None, op)
+        self.push_message(None, op, false)
+    }
+
+    /// `op` turns the status message into turn content (TASK-062); its
+    /// number.
+    pub fn sent_absorb(&mut self, op: &Op) -> u64 {
+        self.push_message(None, op, true)
     }
 
     /// `op`, the last message of turn answer `held`, goes to Telegram; its
     /// number.
     pub fn sent_answer(&mut self, held: Held, op: &Op) -> u64 {
-        self.push_message(Some(held), op)
+        self.push_message(Some(held), op, false)
     }
 
-    fn push_message(&mut self, answer: Option<Held>, op: &Op) -> u64 {
+    fn push_message(&mut self, answer: Option<Held>, op: &Op, absorb: bool) -> u64 {
         self.next += 1;
         self.waiting.push_back(Entry::Message {
             number: self.next,
             state: Answer::Waiting,
             answer,
             op: Box::new(op.clone()),
+            absorb,
         });
         self.next
+    }
+
+    /// What went to the scheduler as stream message `number`, until the
+    /// barrier after it passed.
+    pub fn op_of(&self, number: u64) -> Option<&Op> {
+        self.waiting.iter().find_map(|entry| match entry {
+            Entry::Message { number: n, op, .. } if *n == number => Some(op.as_ref()),
+            _ => None,
+        })
+    }
+
+    /// The turn message's send waits for Telegram: the next quiet content
+    /// has no message to go into yet.
+    pub fn open_pending(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| open.key.is_none())
+    }
+
+    /// The send of stream message `number` answered: the turn message it
+    /// made is `key` (`None`: no message to write into, it closes).
+    pub fn opened(&mut self, number: u64, key: Option<MessageKey>) {
+        let barriers = self.waiting.iter_mut().filter_map(|entry| match entry {
+            Entry::Barrier { open, .. } => Some(open),
+            Entry::Message { .. } => None,
+        });
+        for open in [&mut self.open, &mut self.committed_open]
+            .into_iter()
+            .chain(barriers)
+        {
+            if open
+                .as_ref()
+                .is_some_and(|open| open.key.is_none() && open.number == number)
+            {
+                match key {
+                    Some(key) => {
+                        if let Some(open) = open.as_mut() {
+                            open.key = Some(key);
+                        }
+                    }
+                    None => *open = None,
+                }
+            }
+        }
+    }
+
+    /// Something else came into the topic below the turn message (or it is
+    /// gone): nothing is written into it any more, not after a rewind
+    /// either.
+    pub fn close_open(&mut self) {
+        self.open = None;
+        self.committed_open = None;
+        for entry in &mut self.waiting {
+            if let Entry::Barrier { open, .. } = entry {
+                *open = None;
+            }
+        }
     }
 
     /// The refused messages again, in order, for a stream that cannot read
     /// any more: each waits for Telegram again under its number, and the
     /// first one ends the break of its topic's stream.
     pub fn resend(&mut self) -> Vec<(u64, Op)> {
+        self.fold_refused_absorbs();
         let mut again = Vec::new();
         for entry in &mut self.waiting {
             if let Entry::Message {
@@ -515,6 +650,57 @@ impl Live {
             }
         }
         again
+    }
+
+    /// A refused message that was to turn the status message into turn
+    /// content goes again as a new message (TASK-062): that status message
+    /// is cleared away and not the session's to write any more. The refused
+    /// writes after it into the same message carry its whole text, so the
+    /// newest of them becomes the new message's text and they are not sent
+    /// again. The ops are changed where they wait, so an answer counts as
+    /// the one of what went, also when it is refused once more.
+    fn fold_refused_absorbs(&mut self) {
+        let mut moved: Vec<(i64, usize)> = Vec::new();
+        for index in 0..self.waiting.len() {
+            let Entry::Message {
+                state: state @ Answer::Refused,
+                op,
+                absorb,
+                ..
+            } = &mut self.waiting[index]
+            else {
+                continue;
+            };
+            let Op::Stream {
+                into, text, html, ..
+            } = op.as_mut()
+            else {
+                continue;
+            };
+            let Some(target) = *into else {
+                continue;
+            };
+            if std::mem::take(absorb) {
+                *into = None;
+                moved.push((target, index));
+                continue;
+            }
+            let Some(&(_, first)) = moved.iter().find(|(moved, _)| *moved == target) else {
+                continue;
+            };
+            let (text, html) = (std::mem::take(text), html.take());
+            *state = Answer::Accepted;
+            if let Entry::Message { op, .. } = &mut self.waiting[first]
+                && let Op::Stream {
+                    text: first_text,
+                    html: first_html,
+                    ..
+                } = op.as_mut()
+            {
+                *first_text = text;
+                *first_html = html;
+            }
+        }
     }
 
     /// Every message is in the topic (or skipped): nothing waits for
@@ -540,6 +726,7 @@ impl Live {
         let barrier = Entry::Barrier {
             to,
             calls: self.calls.clone(),
+            open: self.open.clone(),
         };
         match self.waiting.back_mut() {
             Some(last @ Entry::Barrier { .. }) => *last = barrier,
@@ -579,9 +766,10 @@ impl Live {
                 _ => return passed,
             }
             match self.waiting.pop_front() {
-                Some(Entry::Barrier { to, calls }) => {
+                Some(Entry::Barrier { to, calls, open }) => {
                     // A rewind never goes back past `to` now.
                     self.answered_ends.retain(|&end| end > to);
+                    self.committed_open = open;
                     passed = Some((to, calls));
                 }
                 // Until a barrier passes it, a rewind may read its turn end
@@ -694,7 +882,12 @@ impl Live {
         let refused_warned = self.refused_warned;
         let file_seen = self.file_seen;
         let unpaired = std::mem::take(&mut self.unpaired);
+        // The turn message as it was at that barrier: the lines read again
+        // go into it again.
+        let open = self.committed_open.take();
         *self = Self::new(offset, calls);
+        self.open.clone_from(&open);
+        self.committed_open = open;
         self.held = held;
         self.answered_ends = answered_ends;
         self.unpaired = unpaired;
@@ -725,6 +918,7 @@ mod tests {
             merge: false,
             restart: false,
             notify: false,
+            into: None,
         }
     }
 
@@ -1449,5 +1643,201 @@ mod tests {
         live.answered(c, true);
         assert_eq!(live.advance().map(|(offset, _)| offset), Some(20));
         assert!(live.settled());
+    }
+
+    // ------------------------------------------------------------ TASK-062
+
+    fn open(key: Option<i64>, number: u64, text: &str) -> Open {
+        Open {
+            key: key.map(|id| MessageKey::new(Chat::Group, id)),
+            number,
+            text: text.into(),
+            html: None,
+        }
+    }
+
+    fn into_op(message: i64, text: &str) -> Op {
+        let mut op = stream_op(text);
+        if let Op::Stream { into, merge, .. } = &mut op {
+            *into = Some(message);
+            *merge = true;
+        }
+        op
+    }
+
+    #[test]
+    fn the_turn_message_takes_pieces_while_they_fit_and_turns_html_once_one_is() {
+        let mut turn = open(Some(7), 1, "• Bash: a ✓");
+        assert!(turn.push("• Read: b ✓", None));
+        assert_eq!(turn.text, "• Bash: a ✓\n• Read: b ✓");
+        assert_eq!(turn.html, None);
+        assert!(turn.push("Done <now>.", Some("<b>Done</b> &lt;now&gt;.")));
+        assert_eq!(
+            turn.html.as_deref(),
+            Some("• Bash: a ✓\n• Read: b ✓\n<b>Done</b> &lt;now&gt;.")
+        );
+        // One more that would pass Telegram's limit changes nothing.
+        let long = "я".repeat(transcript::TELEGRAM_TEXT_LIMIT);
+        let before = turn.clone();
+        assert!(!turn.push(&long, None));
+        assert_eq!(turn, before);
+        assert_eq!(
+            join("a", Some("<i>a</i>"), "<b>", None).unwrap().1.unwrap(),
+            "<i>a</i>\n&lt;b&gt;"
+        );
+    }
+
+    /// A rewind goes on writing into the turn message as the last barrier
+    /// Telegram fully accepted left it: the lines read again go into it
+    /// again, not into a new message.
+    #[test]
+    fn a_rewind_goes_on_in_the_turn_message_of_the_last_accepted_barrier() {
+        let mut live = Live::new(Some(0), Vec::new());
+        live.open = Some(open(Some(7), 1, "one"));
+        let first = live.sent(&into_op(7, "one"));
+        live.barrier(10);
+        live.open = Some(open(Some(7), 1, "one\ntwo"));
+        let second = live.sent(&into_op(7, "one\ntwo"));
+        live.barrier(20);
+        live.answered(first, true);
+        live.answered(second, false);
+        assert_eq!(live.advance().map(|(offset, _)| offset), Some(10));
+        assert!(live.stuck());
+        live.rewind(Some(10), Vec::new(), Instant::now(), Duration::ZERO);
+        assert_eq!(live.open, Some(open(Some(7), 1, "one")));
+        // The barrier of the read again keeps it for the next rewind too.
+        live.barrier(20);
+        live.open = None;
+        live.rewind(Some(10), Vec::new(), Instant::now(), Duration::ZERO);
+        assert_eq!(live.open, Some(open(Some(7), 1, "one")));
+    }
+
+    /// Something else in the topic below the turn message closes it, also
+    /// for a rewind to a barrier from before.
+    #[test]
+    fn a_closed_turn_message_is_not_written_into_after_a_rewind() {
+        let mut live = Live::new(Some(0), Vec::new());
+        live.open = Some(open(Some(7), 1, "one"));
+        let first = live.sent(&into_op(7, "one"));
+        live.barrier(10);
+        live.answered(first, true);
+        live.advance();
+        live.barrier(15);
+        let second = live.sent(&into_op(7, "one\ntwo"));
+        live.barrier(20);
+        live.close_open();
+        assert_eq!(live.open, None);
+        live.answered(second, false);
+        live.rewind(Some(10), Vec::new(), Instant::now(), Duration::ZERO);
+        assert_eq!(live.open, None);
+    }
+
+    /// The send that starts a turn message: its id reaches every copy of
+    /// the message; without one (refused, merged) the message closes.
+    #[test]
+    fn the_id_of_a_new_turn_message_reaches_its_barriers() {
+        let mut live = Live::new(Some(0), Vec::new());
+        let number = live.sent(&stream_op("one"));
+        live.open = Some(open(None, number, "one"));
+        assert!(live.open_pending());
+        live.barrier(10);
+        live.opened(number + 1, Some(MessageKey::new(Chat::Group, 9)));
+        assert!(live.open_pending(), "another message's answer");
+        live.opened(number, Some(MessageKey::new(Chat::Group, 9)));
+        assert_eq!(live.open, Some(open(Some(9), number, "one")));
+        live.answered(number, true);
+        live.advance();
+        live.open = None;
+        live.rewind(Some(10), Vec::new(), Instant::now(), Duration::ZERO);
+        assert_eq!(
+            live.open,
+            Some(open(Some(9), number, "one")),
+            "from the barrier"
+        );
+
+        let mut live = Live::new(Some(0), Vec::new());
+        let number = live.sent(&stream_op("one"));
+        live.open = Some(open(None, number, "one"));
+        live.opened(number, None);
+        assert_eq!(live.open, None);
+    }
+
+    /// The status message a refused message was to become is not the
+    /// stream's to write any more: sent again, it is a new message.
+    #[test]
+    fn a_refused_absorb_goes_again_as_a_new_message() {
+        let mut live = Live::new(Some(0), Vec::new());
+        let absorb = live.sent_absorb(&into_op(500, "> go"));
+        let append = live.sent(&into_op(600, "one\ntwo"));
+        live.barrier(10);
+        live.answered(absorb, false);
+        live.answered(append, false);
+        let again: Vec<Option<i64>> = live
+            .resend()
+            .into_iter()
+            .map(|(_, op)| match op {
+                Op::Stream { into, .. } => into,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(again, [None, Some(600)]);
+        assert!(matches!(
+            live.op_of(append),
+            Some(Op::Stream {
+                into: Some(600),
+                ..
+            })
+        ));
+    }
+    /// A refused absorb goes again as a new message with the text of the
+    /// newest refused write into that status message, which is not sent:
+    /// the status message is cleared away, a write into it would be lost
+    /// (TASK-062 plan review).
+    #[test]
+    fn a_refused_absorb_goes_again_with_the_writes_into_its_message() {
+        let mut live = Live::new(Some(0), Vec::new());
+        let absorb = live.sent_absorb(&into_op(500, "one"));
+        live.barrier(10);
+        let grown = live.sent(&into_op(500, "one\ntwo"));
+        let other = live.sent(&into_op(600, "x\ny"));
+        live.barrier(20);
+        live.answered(absorb, false);
+        live.answered(grown, false);
+        live.answered(other, false);
+        let again: Vec<(u64, Option<i64>, String)> = live
+            .resend()
+            .into_iter()
+            .map(|(number, op)| match op {
+                Op::Stream { into, text, .. } => (number, into, text),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            again,
+            [
+                (absorb, None, "one\ntwo".to_owned()),
+                (other, Some(600), "x\ny".to_owned())
+            ]
+        );
+        // What waits is what went: its answer is a new message's.
+        assert!(matches!(
+            live.op_of(absorb),
+            Some(Op::Stream { into: None, .. })
+        ));
+        live.answered(absorb, true);
+        live.answered(other, true);
+        assert_eq!(live.advance().map(|(offset, _)| offset), Some(20));
+
+        // Refused once more, it goes again as the same new message.
+        let mut live = Live::new(Some(0), Vec::new());
+        let absorb = live.sent_absorb(&into_op(500, "one"));
+        live.answered(absorb, false);
+        assert_eq!(live.resend().len(), 1);
+        live.answered(absorb, false);
+        let again = live.resend();
+        assert!(matches!(
+            again.as_slice(),
+            [(_, Op::Stream { into: None, text, .. })] if text == "one"
+        ));
     }
 }

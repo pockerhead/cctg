@@ -7,13 +7,18 @@
 //!    message where they fit (they happened before the prompt).
 //! 2. `answerCallbackQuery` from `Edit`; no token.
 //! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`,
-//!    `pinChatMessage` - and foreground `Edit` - `editMessageText` and
+//!    `unpinChatMessage` - and foreground `Edit` - `editMessageText` and
 //!    `setMessageReaction` that show what a user did or asked for
 //!    (decisions, questions, subagent blocks, reactions, ⏹). When both
 //!    wait they take turns, so neither waits behind more than one of the
 //!    other, and neither ever waits behind a background edit.
+//!    A due stream message that turns a status message into turn content
+//!    (`Op::Stream::into`, not `merge`, TASK-062) counts as a foreground
+//!    edit.
 //! 4. background `Edit` - the periodic refresh of a status message
-//!    (`Op::Edit::background`): only the edit budget foreground edits left.
+//!    (`Op::Edit::background`) - and due stream messages that grow a turn
+//!    message (`Op::Stream::into`, `merge`, TASK-062), the one queued
+//!    longest first: only the edit budget foreground edits left.
 //!    Edits and reactions are coalesced per message (the newest text wins,
 //!    in the oldest one's place, foreground when either was), so the
 //!    background queue holds one edit per message and is served oldest
@@ -21,7 +26,9 @@
 //! 5. `Message` - `sendMessage`, `sendDocument`, `sendPhoto`, `sendMediaGroup`
 //!    (one token per album) and transcript stream lines; metered, one FIFO. Permission prompts live here too, so they never
 //!    overtake their own topic's ordinary messages; they do overtake its
-//!    stream lines, except its debounced ones (1.).
+//!    stream lines, except its debounced ones (1.). A new status message of
+//!    their topic still queued ([`Outbox::submit_status`]) never holds them
+//!    back: it is answered `Superseded` when the prompt comes (TASK-062).
 //!
 //! Stream lines marked `merge` (one tool call each) are debounced (TASK-054):
 //! the first line of a topic waits until no further mergeable line of that
@@ -34,6 +41,21 @@
 //! prompts never wait. Without a debounce, lines go one per message while the
 //! group budget has room and merge only when more messages wait than there
 //! are tokens.
+//!
+//! In the `Topic` queue a `createForumTopic` goes first; the other topic
+//! calls, deletes included, keep their order (TASK-062).
+//!
+//! A stream message written into an existing message (`into`, TASK-062)
+//! waits in the `Message` lane and is debounced like a line, in order with
+//! the other writes into that message only: it changes what is above, so it
+//! neither waits for the new messages of its topic nor holds them back (a
+//! new status message does not wait behind the turn message growing). It
+//! takes an edit token, or a message token while no edit token is there
+//! (turn lines were new messages before TASK-062: the message budget keeps
+//! room for them). The `merge` ones queued after it for the same
+//! message carry its text and more, so they replace its text and are
+//! answered `Merged`. It also supersedes an `Edit` of that message still
+//! queued (a status refresh must not overwrite the content).
 //!
 //! A stream line Telegram does not take (any error but a 4xx, which the
 //! stream skips) breaks its topic's stream: the lines of that topic queued
@@ -64,7 +86,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -92,7 +114,8 @@ pub enum Op {
         html: Option<String>,
         reply_markup: Option<Value>,
         /// Permission prompts jump ahead of ordinary messages of other topics,
-        /// never ahead of older messages of their own topic.
+        /// never ahead of older messages of their own topic but a status
+        /// message, which they supersede (TASK-062).
         permission: bool,
         /// The message this one answers (`reply_parameters`).
         reply_to: Option<i64>,
@@ -145,8 +168,9 @@ pub enum Op {
         chat: Chat,
         message_id: i64,
     },
-    /// `pinChatMessage` without a notification.
-    Pin {
+    /// `unpinChatMessage`: a status message a hub pinned before TASK-062
+    /// that could not be deleted.
+    Unpin {
         chat: Chat,
         message_id: i64,
     },
@@ -175,6 +199,14 @@ pub enum Op {
         restart: bool,
         /// As in `Send`; only lines of equal `notify` share a message.
         notify: bool,
+        /// TASK-062: the message of the topic this is written into
+        /// (`editMessageText` without buttons) instead of a new message: the
+        /// status message turning into turn content, or the turn message
+        /// growing. `text` is then that message's whole new text, and a
+        /// later `merge` line into the same message replaces it. It takes a
+        /// token of the edit budget, not of the message one, and answers
+        /// `Sent` with that message's id.
+        into: Option<i64>,
     },
     /// `setMessageReaction` with one emoji; a newer one for the same message
     /// replaces a queued one.
@@ -203,9 +235,10 @@ impl Op {
             | Op::SendAlbum { .. }
             | Op::Stream { .. } => Lane::Message(0),
             Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit(0),
-            Op::Delete { .. } | Op::Pin { .. } | Op::CreateTopic { .. } | Op::EditTopic { .. } => {
-                Lane::Topic
-            }
+            Op::Delete { .. }
+            | Op::Unpin { .. }
+            | Op::CreateTopic { .. }
+            | Op::EditTopic { .. } => Lane::Topic,
         }
     }
 
@@ -217,8 +250,26 @@ impl Op {
                 | Op::SendDocument { .. }
                 | Op::SendPhoto { .. }
                 | Op::SendAlbum { .. }
-                | Op::Stream { .. }
+                | Op::Stream { into: None, .. }
         )
+    }
+
+    /// The topic this op puts a new message into (TASK-062): every send, a
+    /// stream message not written into an existing one.
+    pub fn posts(&self) -> Option<Place> {
+        self.metered().then(|| self.place()).flatten()
+    }
+
+    /// The order a `Message` job keeps: new messages of a topic go in the
+    /// order they came, and so do the writes into one existing message
+    /// (TASK-062). A write into a message above waits for no new message
+    /// and holds none back: it changes what is above either way.
+    fn queue(&self) -> (Option<Place>, Option<i64>) {
+        let into = match self {
+            Op::Stream { into, .. } => *into,
+            _ => None,
+        };
+        (self.place(), into)
     }
 
     /// Requests into the group other than new messages: they take a token
@@ -383,7 +434,7 @@ impl Transport for BotApi {
                 reply_markup,
                 ..
             } => self
-                .edit_message_text(*chat, *message_id, text, reply_markup.as_ref())
+                .edit_message_text(*chat, *message_id, text, None, reply_markup.as_ref())
                 .await
                 .map(|()| Outcome::Done),
             Op::AnswerCallback { query_id, text } => self
@@ -394,8 +445,8 @@ impl Transport for BotApi {
                 .delete_message(*chat, *message_id)
                 .await
                 .map(|()| Outcome::Done),
-            Op::Pin { chat, message_id } => self
-                .pin_chat_message(*chat, *message_id)
+            Op::Unpin { chat, message_id } => self
+                .unpin_chat_message(*chat, *message_id)
                 .await
                 .map(|()| Outcome::Done),
             Op::CreateTopic {
@@ -422,10 +473,36 @@ impl Transport for BotApi {
                 .map(|()| Outcome::Done),
             Op::Stream {
                 chat,
+                text,
+                html,
+                into: Some(message_id),
+                ..
+            } => {
+                let (text, parse_mode) = formatted(text, html.as_deref());
+                // An explicit empty keyboard: the ⏹ of a status message
+                // turning into turn content must go.
+                self.edit_message_text(
+                    *chat,
+                    *message_id,
+                    text,
+                    parse_mode,
+                    Some(&super::permissions::no_keyboard()),
+                )
+                .await
+                .map(|()| {
+                    Outcome::Sent(Message {
+                        message_id: *message_id,
+                        ..Message::default()
+                    })
+                })
+            }
+            Op::Stream {
+                chat,
                 thread_id,
                 text,
                 html,
                 notify,
+                into: None,
                 ..
             } => {
                 let (text, parse_mode) = formatted(text, html.as_deref());
@@ -613,6 +690,69 @@ impl Bucket {
     }
 }
 
+/// The text and buttons of a status message (TASK-062), new or edited, read
+/// when the call goes out, not when it was queued: after a wait for the
+/// group's budget it shows the status of that moment. The sender keeps a
+/// clone to change it meanwhile and to learn what went out.
+#[derive(Debug, Clone)]
+pub struct LiveText(Arc<Mutex<LiveContent>>);
+
+#[derive(Debug)]
+struct LiveContent {
+    current: (String, Value),
+    sent: Option<(String, Value)>,
+}
+
+impl LiveText {
+    pub fn new(text: String, keyboard: Value) -> Self {
+        Self(Arc::new(Mutex::new(LiveContent {
+            current: (text, keyboard),
+            sent: None,
+        })))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LiveContent> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the message is to show when it goes.
+    pub fn set(&self, text: String, keyboard: Value) {
+        self.lock().current = (text, keyboard);
+    }
+
+    /// What the last try sent, or what it is to show when none went; what
+    /// Telegram shows only once the call was accepted.
+    pub fn shown(&self) -> (String, Value) {
+        let content = self.lock();
+        content
+            .sent
+            .clone()
+            .unwrap_or_else(|| content.current.clone())
+    }
+
+    /// The same text: `other` is a clone of this one.
+    pub fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Puts the newest text and buttons into `op`, a `Send` or an `Edit`.
+    fn fill(&self, op: &mut Op) {
+        let mut content = self.lock();
+        if let Op::Send {
+            text, reply_markup, ..
+        }
+        | Op::Edit {
+            text, reply_markup, ..
+        } = op
+        {
+            let (current, keyboard) = content.current.clone();
+            text.clone_from(&current);
+            *reply_markup = Some(keyboard.clone());
+            content.sent = Some((current, keyboard));
+        }
+    }
+}
+
 struct Job {
     op: Op,
     /// When it was handed over; the debounce counts from here.
@@ -623,6 +763,10 @@ struct Job {
     /// Goes again as plain text after Telegram refused its HTML: never takes
     /// more lines in, so it cannot become HTML and be refused a second time.
     plain_retry: bool,
+    /// A status message (TASK-062): its text is read when it goes, and a
+    /// permission prompt of its topic answers a new one `Superseded` while it
+    /// waits.
+    status: Option<LiveText>,
 }
 
 /// Cloneable handle that enqueues outbound operations.
@@ -635,6 +779,19 @@ impl Outbox {
     /// Enqueues `op`. The receiver resolves when Telegram answered; it errors
     /// only if the scheduler has stopped. Dropping it makes the op fire-and-forget.
     pub async fn submit(&self, op: Op) -> oneshot::Receiver<Delivery> {
+        self.submit_job(op, None).await
+    }
+
+    /// Enqueues a new status message, a `Send`, or an `Edit` of one
+    /// (TASK-062): it goes with the text `status` holds then. A new status
+    /// message never holds a permission prompt (or question) of its topic
+    /// back: when one comes while it waits, it is answered `Superseded` and
+    /// its sender sends it again below the prompt.
+    pub async fn submit_status(&self, op: Op, status: LiveText) -> oneshot::Receiver<Delivery> {
+        self.submit_job(op, Some(status)).await
+    }
+
+    async fn submit_job(&self, op: Op, status: Option<LiveText>) -> oneshot::Receiver<Delivery> {
         let (reply, receiver) = oneshot::channel();
         // A send error drops the job and its reply sender, so the receiver
         // reports the stopped scheduler by itself.
@@ -646,6 +803,7 @@ impl Outbox {
                 reply,
                 merged: Vec::new(),
                 plain_retry: false,
+                status,
             })
             .await;
         receiver
@@ -758,6 +916,9 @@ impl<T: Transport> Scheduler<T> {
             let permission = match &job.op {
                 Op::Send { permission, .. } => *permission,
                 Op::SendDocument { .. } | Op::SendPhoto { .. } | Op::SendAlbum { .. } => false,
+                // A write into a message above neither waits for a prompt
+                // nor holds it back.
+                Op::Stream { into: Some(_), .. } => continue,
                 // Stream lines yield to a prompt of their own topic, except
                 // tool-call lines the debounce holds: those came first.
                 Op::Stream { merge, .. } => {
@@ -826,9 +987,56 @@ impl<T: Transport> Scheduler<T> {
                     // wait behind the refreshes it replaced.
                     *queued_background &= *background;
                 }
+                // The newer one's text is read when it goes; one without
+                // (an old status message emptied) goes as it is.
+                queued.status = job.status;
                 let superseded = std::mem::replace(&mut queued.reply, job.reply);
                 let _ = superseded.send(Ok(Outcome::Superseded));
                 return;
+            }
+        }
+        if let Op::Stream {
+            chat,
+            into: Some(message_id),
+            ..
+        } = &job.op
+        {
+            // A status refresh or a ⏹ edit still queued for the message this
+            // content goes into would overwrite it.
+            let target = Some(MessageKey::new(*chat, *message_id));
+            let mut index = 0;
+            while index < self.edit.len() {
+                if matches!(self.edit[index].op, Op::Edit { .. })
+                    && self.edit[index].op.message() == target
+                    && let Some(old) = self.edit.remove(index)
+                {
+                    let _ = old.reply.send(Ok(Outcome::Superseded));
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if let (
+            Op::Send {
+                permission: true, ..
+            },
+            Some(place),
+        ) = (&job.op, job.op.place())
+        {
+            // A status message of the prompt's topic still queued would hold
+            // it back (TASK-062): it goes again below the prompt. One put
+            // back after a 429 is queued again before the prompt, which came
+            // while it was out, is taken in.
+            let mut index = 0;
+            while index < self.message.len() {
+                if self.message[index].status.is_some()
+                    && self.message[index].op.place() == Some(place)
+                    && let Some(old) = self.message.remove(index)
+                {
+                    let _ = old.reply.send(Ok(Outcome::Superseded));
+                } else {
+                    index += 1;
+                }
             }
         }
         let lane = job.op.lane();
@@ -842,25 +1050,31 @@ impl<T: Transport> Scheduler<T> {
             }
             self.paused_until = None;
         }
-        let message_ready = (!self.message.is_empty()).then(|| self.bucket.ready_at(now));
+        let message_ready = self.bucket.ready_at(now);
+        let edit_ready = self.edit_bucket.as_mut().map_or(now, |b| b.ready_at(now));
         let permission = self.next_permission();
-        if let (Some(index), Some(ready)) = (permission, message_ready)
-            && ready <= now
+        if let Some(index) = permission
+            && self.ready_at(index, message_ready, edit_ready) <= now
         {
             return Pick::Now(Lane::Message(index));
         }
-        let message = self
-            .next_message(now)
-            .zip(message_ready)
-            .map(|((due, index), ready)| (due.max(ready), index));
+        let message = self.next_message(now, message_ready, edit_ready);
         if let Some((at, index)) = message
             && at <= now
             && self.consecutive_unmetered >= MAX_CONSECUTIVE_UNMETERED
         {
             return Pick::Now(Lane::Message(index));
         }
-        let edit_ready = self.edit_bucket.as_mut().map_or(now, |b| b.ready_at(now));
-        if let Some(lane) = self.next_edit(edit_ready <= now) {
+        // Due stream messages written into an existing one compete for the
+        // edit token: one that is not `merge` (the status message turning
+        // into turn content, TASK-062) with the foreground edits, the others
+        // (the turn message growing) with the background ones.
+        let content = [true, false].map(|first| self.due_content(now, edit_ready, first));
+        // A message token no new message wants: the turn content takes it,
+        // and the edit token goes to a status refresh.
+        let spare = message_ready <= now
+            && message.is_none_or(|(at, index)| at > now || !self.message[index].op.metered());
+        if let Some(lane) = self.next_edit(edit_ready <= now, content, spare) {
             return Pick::Now(lane);
         }
         // Edits or topic mutations left wait for the edit bucket.
@@ -874,76 +1088,153 @@ impl<T: Transport> Scheduler<T> {
         }
     }
 
+    /// When the token the `Message` job at `index` takes is there: a new
+    /// message's or, for one written into an existing message, an edit's or
+    /// a spare message token (see [`Self::spills`]).
+    fn ready_at(&self, index: usize, message_ready: Instant, edit_ready: Instant) -> Instant {
+        if self.message[index].op.metered() {
+            message_ready
+        } else {
+            edit_ready.min(message_ready)
+        }
+    }
+
+    /// Turn content (a stream message written into an existing message)
+    /// takes a message token when no edit token is there (TASK-062): turn
+    /// lines used to be new messages, and with them in edits the message
+    /// budget has room while the edit budget has none. The group still sees
+    /// at most the two budgets together.
+    fn spills(&mut self, op: &Op, now: Instant) -> bool {
+        matches!(op, Op::Stream { into: Some(_), .. })
+            && self
+                .edit_bucket
+                .as_mut()
+                .is_some_and(|bucket| bucket.ready_at(now) > now)
+    }
+
+    /// The first due `Message` job, first of its queue ([`Op::queue`]), that
+    /// is written into an existing message: a `first` one (not `merge`) or a
+    /// growing one.
+    fn due_content(&self, now: Instant, edit_ready: Instant, first: bool) -> Option<usize> {
+        let mut queues = HashSet::new();
+        (0..self.message.len()).find(|&index| {
+            let job = &self.message[index];
+            queues.insert(job.op.queue())
+                && matches!(&job.op, Op::Stream { into: Some(_), merge, .. } if *merge != first)
+                && self.due(index).max(edit_ready) <= now
+        })
+    }
+
     /// The unmetered job to send: the oldest callback answer (no token), and
-    /// with a token a topic call or the oldest foreground edit (in turns when
-    /// both wait), else the oldest background one.
-    fn next_edit(&self, bucket_ready: bool) -> Option<Lane> {
+    /// with a token a topic call or the oldest foreground edit - or else
+    /// `content[0]`, a status message turning into turn content (TASK-062) -
+    /// (in turns when both wait), else the oldest of the background edits
+    /// and `content[1]`, a turn message growing; the background edit when a
+    /// `spare` message token can take the growing turn message instead.
+    fn next_edit(
+        &self,
+        bucket_ready: bool,
+        content: [Option<usize>; 2],
+        spare: bool,
+    ) -> Option<Lane> {
         if let Some(index) = self.edit.iter().position(|job| !job.op.edit_metered()) {
             return Some(Lane::Edit(index));
         }
         if !bucket_ready {
             return None;
         }
-        let foreground = self.edit.iter().position(|job| !job.op.background());
+        let foreground = self
+            .edit
+            .iter()
+            .position(|job| !job.op.background())
+            .map(Lane::Edit)
+            .or(content[0].map(Lane::Message));
         match (self.topic.is_empty(), foreground) {
-            (false, Some(index)) if !self.topic_turn => Some(Lane::Edit(index)),
+            (false, Some(lane)) if !self.topic_turn => Some(lane),
             (false, _) => Some(Lane::Topic),
-            (true, Some(index)) => Some(Lane::Edit(index)),
-            (true, None) => (!self.edit.is_empty()).then_some(Lane::Edit(0)),
+            (true, Some(lane)) => Some(lane),
+            // Turn content and status refreshes share what is left, oldest
+            // first: neither starves the other.
+            (true, None) if spare && !self.edit.is_empty() => Some(Lane::Edit(0)),
+            (true, None) => self
+                .edit
+                .front()
+                .map(|job| (job.queued_at, Lane::Edit(0)))
+                .into_iter()
+                .chain(
+                    content[1].map(|index| (self.message[index].queued_at, Lane::Message(index))),
+                )
+                .min_by_key(|(queued_at, _)| *queued_at)
+                .map(|(_, lane)| lane),
         }
     }
 
-    /// The message to send next and when its debounce allows it: the first
-    /// one that has no older message of its topic queued and is due, else
-    /// the one due soonest.
-    fn next_message(&self, now: Instant) -> Option<(Instant, usize)> {
-        let mut topics = HashSet::new();
+    /// The message to send next and when its debounce and its bucket allow
+    /// it: the first one that has no older job of its queue ([`Op::queue`])
+    /// queued and is due, else the one due soonest.
+    fn next_message(
+        &self,
+        now: Instant,
+        message_ready: Instant,
+        edit_ready: Instant,
+    ) -> Option<(Instant, usize)> {
+        let mut queues = HashSet::new();
         let mut soonest: Option<(Instant, usize)> = None;
+        // Turn content that is due goes only when no new message is: it
+        // takes what the new messages leave of the message budget.
+        let mut content = None;
         for (index, job) in self.message.iter().enumerate() {
-            if !topics.insert(job.op.place()) {
+            if !queues.insert(job.op.queue()) {
                 continue;
             }
-            let due = self.due(index);
-            if due <= now {
+            let due = self
+                .due(index)
+                .max(self.ready_at(index, message_ready, edit_ready));
+            if due <= now && job.op.metered() {
                 return Some((due, index));
+            }
+            if due <= now {
+                content = content.or(Some((due, index)));
             }
             if soonest.is_none_or(|(at, _)| due < at) {
                 soonest = Some((due, index));
             }
         }
-        soonest
+        content.or(soonest)
     }
 
-    /// When the message at `index`, the first of its topic in the queue, may
-    /// go: a `merge` line waits for a quiet `debounce` after the last line
-    /// that would join it, at most `debounce_max` after it came, and not at
-    /// all once a message of its topic that cannot join (a prompt included)
-    /// is queued; anything else at once.
+    /// When the message at `index`, the first of its queue ([`Op::queue`]),
+    /// may go: a `merge` line waits for a quiet `debounce` after the last
+    /// line that would join it, at most `debounce_max` after it came, and not
+    /// at all once a message of its queue that cannot join (a prompt
+    /// included) is queued; anything else at once.
     fn due(&self, index: usize) -> Instant {
         let job = &self.message[index];
         let Op::Stream {
             merge: true,
             notify,
+            into,
             ..
         } = &job.op
         else {
             return job.queued_at;
         };
-        let place = job.op.place();
+        let queue = job.op.queue();
         if self.debounce.is_zero() || job.plain_retry {
             return job.queued_at;
         }
         let mut last = job.queued_at;
         for later in self.message.iter().skip(index + 1) {
-            if later.op.place() != place {
+            if later.op.queue() != queue {
                 continue;
             }
             match &later.op {
                 Op::Stream {
                     merge: true,
                     notify: later_notify,
+                    into: later_into,
                     ..
-                } if later_notify == notify => last = later.queued_at,
+                } if later_notify == notify && later_into == into => last = later.queued_at,
                 // A prompt of the topic (it lets the lines before it go
                 // first, at once), or anything else that cannot join: no
                 // reason to wait, and nothing after it joins the message.
@@ -956,7 +1247,14 @@ impl<T: Transport> Scheduler<T> {
     async fn dispatch(&mut self, lane: Lane) {
         let index = match lane {
             Lane::Message(index) | Lane::Edit(index) => index,
-            Lane::Topic => 0,
+            // A new topic does not wait behind the deletes of old status
+            // messages (TASK-062); the other topic calls keep their order, so
+            // a delete never waits behind a stream of topic edits.
+            Lane::Topic => self
+                .topic
+                .iter()
+                .position(|job| matches!(job.op, Op::CreateTopic { .. }))
+                .unwrap_or(0),
         };
         let Some(mut job) = self.lane_mut(lane).remove(index) else {
             return;
@@ -964,7 +1262,10 @@ impl<T: Transport> Scheduler<T> {
         if matches!(lane, Lane::Message(_)) {
             self.merge_lines(&mut job, Instant::now());
         }
-        if job.op.metered() {
+        if let Some(status) = &job.status {
+            status.fill(&mut job.op);
+        }
+        if job.op.metered() || self.spills(&job.op, Instant::now()) {
             self.bucket.take(Instant::now());
             self.consecutive_unmetered = 0;
         } else {
@@ -977,6 +1278,9 @@ impl<T: Transport> Scheduler<T> {
             match lane {
                 Lane::Topic => self.topic_turn = false,
                 Lane::Edit(_) if job.op.edit_metered() && !job.op.background() => {
+                    self.topic_turn = true;
+                }
+                Lane::Message(_) if matches!(job.op, Op::Stream { merge: false, .. }) => {
                     self.topic_turn = true;
                 }
                 _ => {}
@@ -1059,17 +1363,52 @@ impl<T: Transport> Scheduler<T> {
         if job.plain_retry {
             return;
         }
-        let place = job.op.place();
+        let queue = job.op.queue();
         let Op::Stream {
             text,
             html,
             merge: true,
             notify,
+            into,
             ..
         } = &mut job.op
         else {
             return;
         };
+        if into.is_some() {
+            // Written into a message: a later line into the same message
+            // carries this text and more.
+            let mut index = 0;
+            while index < self.message.len() {
+                let queued = &self.message[index].op;
+                if queued.queue() != queue {
+                    index += 1;
+                    continue;
+                }
+                let Op::Stream {
+                    text: next,
+                    html: next_html,
+                    merge: true,
+                    notify: next_notify,
+                    into: next_into,
+                    ..
+                } = queued
+                else {
+                    break;
+                };
+                if next_notify != notify || next_into != into {
+                    break;
+                }
+                text.clone_from(next);
+                html.clone_from(next_html);
+                let Some(next) = self.message.remove(index) else {
+                    break;
+                };
+                job.merged.push(next.reply);
+                job.merged.extend(next.merged);
+            }
+            return;
+        }
         self.bucket.refill(now);
         if self.debounce.is_zero() && (self.message.len() + 1) as f64 <= self.bucket.tokens {
             return;
@@ -1077,7 +1416,7 @@ impl<T: Transport> Scheduler<T> {
         let mut index = 0;
         while index < self.message.len() {
             let queued = &self.message[index].op;
-            if queued.place() != place {
+            if queued.queue() != queue {
                 index += 1;
                 continue;
             }
@@ -1086,6 +1425,7 @@ impl<T: Transport> Scheduler<T> {
                 html: next_html,
                 merge: true,
                 notify: next_notify,
+                into: None,
                 ..
             } = queued
             else {
@@ -1564,6 +1904,130 @@ mod tests {
         assert_eq!(order, expected);
     }
 
+    /// A new status message of `thread` (TASK-062), as the slots actor
+    /// hands it over.
+    fn status(thread: i64, text: &str) -> (Op, LiveText) {
+        let keyboard = serde_json::json!({"inline_keyboard": []});
+        let mut op = send(thread, text);
+        if let Op::Send { reply_markup, .. } = &mut op {
+            *reply_markup = Some(keyboard.clone());
+        }
+        (op, LiveText::new(text.to_owned(), keyboard))
+    }
+
+    /// TASK-062: a status message never holds a permission prompt of its
+    /// topic back; the one of another topic keeps its place.
+    #[tokio::test(start_paused = true)]
+    async fn a_permission_prompt_supersedes_the_queued_status_message_of_its_topic() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let m0 = outbox.submit(send(1, "m0")).await;
+        let (op, text) = status(2, "s2");
+        let s2 = outbox.submit_status(op, text).await;
+        let (op, text) = status(3, "s3");
+        let s3 = outbox.submit_status(op, text).await;
+        let m1 = outbox.submit(send(1, "m1")).await;
+        let p2 = outbox.submit(permission(2, "p2")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert!(matches!(s2.await, Ok(Ok(Outcome::Superseded))));
+        for sent in [m0, s3, m1, p2] {
+            assert!(matches!(sent.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        assert_eq!(texts(&fake), ["p2", "m0", "s3", "m1"]);
+    }
+
+    /// TASK-062: a status message goes with the text it holds when it goes,
+    /// not the one it was queued with, and tells what went.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_message_goes_with_the_text_of_when_it_goes() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let (op, text) = status(2, "❓ Ждёт разрешения");
+        let sent = outbox.submit_status(op, text.clone()).await;
+        let keyboard = serde_json::json!({"inline_keyboard": [[{"text": "⏹"}]]});
+        text.set("💤 Ждёт вас".to_owned(), keyboard.clone());
+        drop(outbox);
+        scheduler.run().await;
+        assert!(matches!(sent.await, Ok(Ok(Outcome::Sent(_)))));
+        let calls = fake.calls();
+        assert!(
+            matches!(
+                &calls[0].op,
+                Op::Send { text, reply_markup: Some(markup), .. }
+                    if text == "💤 Ждёт вас" && *markup == keyboard
+            ),
+            "{calls:?}"
+        );
+        text.set("later".to_owned(), serde_json::json!({}));
+        assert_eq!(text.shown(), ("💤 Ждёт вас".to_owned(), keyboard));
+    }
+
+    /// TASK-062: a status message that got a 429 does not go again ahead of
+    /// a prompt of its topic that came while it was out.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_message_refused_by_flood_control_yields_to_a_prompt_that_came_meanwhile() {
+        let fake = Fake::with_delay(&[1], Duration::from_secs(1));
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let running = tokio::spawn(scheduler.run());
+        let (op, text) = status(2, "s2");
+        let s2 = outbox.submit_status(op, text).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let p2 = outbox.submit(permission(2, "p2")).await;
+        drop(outbox);
+        running.await.unwrap();
+        assert!(matches!(s2.await, Ok(Ok(Outcome::Superseded))));
+        assert!(matches!(p2.await, Ok(Ok(Outcome::Sent(_)))));
+        assert_eq!(texts(&fake), ["s2", "p2"]);
+    }
+
+    /// TASK-062 code review: a status refresh goes with the text it holds
+    /// when it goes; one that replaces it in the queue brings its own text.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_refresh_goes_with_the_text_of_when_it_goes() {
+        let keyboard = serde_json::json!({"inline_keyboard": []});
+        let live = |text: &str| LiveText::new(text.to_owned(), keyboard.clone());
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        // Message 7: its text changes while it waits.
+        let first = live("❓ Ждёт разрешения");
+        let r7 = outbox
+            .submit_status(refresh(7, "❓ Ждёт разрешения"), first.clone())
+            .await;
+        first.set("💤 Ждёт вас".to_owned(), keyboard.clone());
+        // Message 8: a newer status edit replaces the queued one. Message 9:
+        // an edit without a live text (an old status message emptied) does.
+        let old = live("❓ old");
+        let _r8 = outbox
+            .submit_status(refresh(8, "❓ old"), old.clone())
+            .await;
+        let newer = live("⏹ newer");
+        let _r8b = outbox
+            .submit_status(edit(8, "⏹ newer"), newer.clone())
+            .await;
+        old.set("❓ stale".to_owned(), keyboard.clone());
+        newer.set("⚙️ newest".to_owned(), keyboard.clone());
+        let r9 = outbox
+            .submit_status(refresh(9, "❓ s9"), live("❓ s9"))
+            .await;
+        let _r9b = outbox.submit(edit(9, "emptied")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert!(matches!(r7.await, Ok(Ok(Outcome::Done))));
+        assert!(matches!(r9.await, Ok(Ok(Outcome::Superseded))));
+        let calls = fake.calls();
+        let mut sent: Vec<(i64, &str)> = calls
+            .iter()
+            .filter_map(|call| match &call.op {
+                Op::Edit { message_id, .. } => Some((*message_id, text_of(&call.op))),
+                _ => None,
+            })
+            .collect();
+        sent.sort_unstable();
+        assert_eq!(sent, [(7, "💤 Ждёт вас"), (8, "⚙️ newest"), (9, "emptied")]);
+        assert_eq!(first.shown(), ("💤 Ждёт вас".to_owned(), keyboard));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn failed_attempts_spend_tokens() {
         // Five 429s of 1 s, then 25 more sends: every attempt, failed or not,
@@ -1607,6 +2071,7 @@ mod tests {
             merge: true,
             restart: false,
             notify: false,
+            into: None,
         }
     }
 
@@ -1768,6 +2233,7 @@ mod tests {
             merge: false,
             restart,
             notify: false,
+            into: None,
         }
     }
 
@@ -1870,6 +2336,7 @@ mod tests {
                 merge: false,
                 restart: false,
                 notify: false,
+                into: None,
             })
             .collect();
         ops.push(permission(1, "prompt"));
@@ -1977,6 +2444,7 @@ mod tests {
                 merge: false,
                 restart: true,
                 notify: false,
+                into: None,
             })
             .await;
         let next = outbox.submit(send(1, "after")).await;
@@ -2030,6 +2498,7 @@ mod tests {
             merge: true,
             restart: false,
             notify: false,
+            into: None,
         };
         let mut ops: Vec<Op> = (0..8).map(|i| line(1, &format!("• a<{i}> ✓"))).collect();
         ops.insert(6, formatted);
@@ -2069,6 +2538,7 @@ mod tests {
                 merge: true,
                 restart: false,
                 notify: false,
+                into: None,
             };
             receivers.push(outbox.submit(op).await);
         }
@@ -2472,7 +2942,7 @@ mod tests {
                 message_id: 901,
                 emoji: "👀".to_owned(),
             },
-            Op::Pin {
+            Op::Unpin {
                 chat: Chat::Group,
                 message_id: 902,
             },
@@ -2524,7 +2994,7 @@ mod tests {
         for i in 0..3 {
             receivers.push(
                 outbox
-                    .submit(Op::Pin {
+                    .submit(Op::Unpin {
                         chat: Chat::Group,
                         message_id: 900 + i,
                     })
@@ -2540,7 +3010,7 @@ mod tests {
             .calls()
             .iter()
             .filter_map(|call| match &call.op {
-                Op::Pin {
+                Op::Unpin {
                     chat: Chat::Group,
                     message_id,
                 } if *message_id >= 900 => Some('T'),
@@ -2739,5 +3209,276 @@ mod tests {
             matches!(delivered[3], Some(Ok(Outcome::Sent(_)))),
             "the private topic 1 goes on"
         );
+    }
+
+    // ------------------------------------------------------------ TASK-062
+
+    /// A turn line written into message `message` of topic 1: `text` is
+    /// the message's whole new text.
+    fn into(message: i64, text: &str) -> Op {
+        match line(1, text) {
+            Op::Stream {
+                chat,
+                thread_id,
+                text,
+                html,
+                merge,
+                restart,
+                notify,
+                ..
+            } => Op::Stream {
+                chat,
+                thread_id,
+                text,
+                html,
+                merge,
+                restart,
+                notify,
+                into: Some(message),
+            },
+            other => other,
+        }
+    }
+
+    #[test]
+    fn a_stream_message_into_a_message_posts_nothing_and_takes_an_edit_token() {
+        let op = into(7, "a");
+        assert_eq!(op.posts(), None);
+        assert!(!op.metered() && op.edit_metered());
+        assert_eq!(line(1, "a").posts(), Some(Place::topic(Chat::Group, 1)));
+        assert_eq!(send(2, "x").posts(), Some(Place::topic(Chat::Group, 2)));
+        assert_eq!(edit(7, "x").posts(), None);
+    }
+
+    /// Lines written into one message in a burst go as one edit with the
+    /// newest text; the others are answered `Merged` once it is in.
+    #[tokio::test(start_paused = true)]
+    async fn lines_into_one_message_go_as_one_edit_with_the_newest_text() {
+        let fake = Fake::new(&[]);
+        let answers = run_timed(
+            &fake,
+            vec![
+                (0, into(7, "a ✓")),
+                (500, into(7, "a ✓\nb ✓")),
+                (1000, into(7, "a ✓\nb ✓\nc ✓")),
+            ],
+        )
+        .await;
+        assert_eq!(
+            stream_times(&fake),
+            [("a ✓\nb ✓\nc ✓".to_owned(), ms(2500))],
+            "one edit, 1.5 s after the last line"
+        );
+        assert!(matches!(answers[0], Some(Ok(Outcome::Sent(_)))));
+        assert!(matches!(answers[1], Some(Ok(Outcome::Merged))));
+        assert!(matches!(answers[2], Some(Ok(Outcome::Merged))));
+    }
+
+    /// With the group's message budget spent, content written into an
+    /// existing message still goes on the edit budget; a new message waits.
+    #[tokio::test(start_paused = true)]
+    async fn content_into_a_message_does_not_wait_for_the_message_budget() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<(u64, Op)> = (0..6).map(|i| (0, send(2, &format!("s{i}")))).collect();
+        ops.push((5500, into(7, "a ✓")));
+        run_timed(&fake, ops).await;
+        let times = stream_times(&fake);
+        let at = |text: &str| times.iter().find(|(t, _)| t == text).map(|(_, at)| *at);
+        // s5 needs a refill: 5 burst sends, the next token 4 s after the first.
+        assert!(at("s5").unwrap() >= ms(4000), "{times:?}");
+        assert_eq!(at("a ✓"), Some(ms(7000)), "only its debounce: {times:?}");
+    }
+
+    /// A status refresh still queued for the message that becomes turn
+    /// content would overwrite it: it is answered `Superseded` and never goes.
+    #[tokio::test(start_paused = true)]
+    async fn content_into_a_message_drops_a_refresh_of_it_that_waits() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        let handle = tokio::spawn(scheduler.run());
+        // Spend the edit budget so the refresh waits.
+        for i in 0..5 {
+            drop(outbox.submit(edit(900 + i, "x")).await);
+        }
+        let waiting = outbox.submit(refresh(7, "💭 Думает")).await;
+        let other = outbox.submit(refresh(8, "💭 Думает")).await;
+        let content = outbox.submit(into(7, "> go")).await;
+        assert!(matches!(waiting.await, Ok(Ok(Outcome::Superseded))));
+        assert!(matches!(content.await, Ok(Ok(Outcome::Sent(_)))));
+        assert!(matches!(other.await, Ok(Ok(Outcome::Done))));
+        drop(outbox);
+        assert!(handle.await.is_ok());
+        let seven: Vec<Op> = fake
+            .calls()
+            .into_iter()
+            .map(|call| call.op)
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Edit { message_id: 7, .. } | Op::Stream { into: Some(7), .. }
+                )
+            })
+            .collect();
+        assert!(matches!(seven.as_slice(), [Op::Stream { .. }]), "{seven:?}");
+    }
+
+    /// Turn content and status refreshes share the edit budget that
+    /// foreground edits leave, oldest first: with ten status messages
+    /// refreshed for good, a turn's lines still show every few tokens, and
+    /// the refreshes still go.
+    #[tokio::test(start_paused = true)]
+    async fn turn_content_and_status_refreshes_share_the_edit_budget() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        let handle = tokio::spawn(scheduler.run());
+        let refreshes = refresh_forever(&outbox, 10);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let mut text = String::new();
+        let mut waits = Vec::new();
+        for step in 0..30 {
+            text.push_str(&format!("step {step} ✓\n"));
+            let wait = waited(&outbox, into(7, text.trim_end())).await;
+            waits.push(wait);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        // Eleven messages share ~15 tokens a minute: each waits at most for
+        // the ten others once, plus its debounce.
+        let longest = waits.iter().max().copied().unwrap_or_default();
+        assert!(longest <= Duration::from_secs(50), "{waits:?}");
+        let before = refreshes.lock().map(|log| log.len()).unwrap_or(0);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let after = refreshes.lock().map(|log| log.len()).unwrap_or(0);
+        assert!(after > before, "refreshes go on");
+        handle.abort();
+    }
+
+    /// With the edit budget spent, turn content takes spare message tokens
+    /// (TASK-062): lines used to be new messages.
+    #[tokio::test(start_paused = true)]
+    async fn turn_content_takes_spare_message_tokens_when_the_edit_budget_is_spent() {
+        let fake = Fake::new(&[]);
+        let mut ops: Vec<(u64, Op)> = (0..5).map(|i| (0, edit(900 + i, "x"))).collect();
+        for i in 0..5 {
+            let mut line = into(10 + i, "a ✓");
+            if let Op::Stream { merge, .. } = &mut line {
+                *merge = false;
+            }
+            ops.push((100, line));
+        }
+        run_timed(&fake, ops).await;
+        let at: Vec<Duration> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call.op, Op::Stream { .. }))
+            .map(|call| call.at)
+            .collect();
+        assert_eq!(at.len(), 5);
+        assert!(at[4] <= ms(5000), "one per message token: {at:?}");
+    }
+
+    /// Ten topics whose turn messages grow every 2 s and ten status
+    /// messages refreshed for good: with spare message tokens taken for turn
+    /// content, every turn message still shows its new lines within a bound.
+    #[tokio::test(start_paused = true)]
+    async fn ten_growing_turn_messages_share_both_budgets() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        let handle = tokio::spawn(scheduler.run());
+        let _refreshes = refresh_forever(&outbox, 10);
+        let mut writers = Vec::new();
+        for topic in 0..10i64 {
+            let outbox = outbox.clone();
+            writers.push(tokio::spawn(async move {
+                let mut text = String::new();
+                for step in 0..60 {
+                    text.push_str(&format!("{topic}-{step}\n"));
+                    let mut op = into(500 + topic, text.trim_end());
+                    if let Op::Stream { thread_id, .. } = &mut op {
+                        *thread_id = topic;
+                    }
+                    drop(outbox.submit(op).await);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }));
+        }
+        tokio::time::sleep(Duration::from_secs(130)).await;
+        let calls = fake.calls();
+        for topic in 0..10i64 {
+            let at: Vec<Duration> = calls
+                .iter()
+                .filter(
+                    |call| matches!(call.op, Op::Stream { into: Some(m), .. } if m == 500 + topic),
+                )
+                .map(|call| call.at)
+                .collect();
+            let gap = at
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .max()
+                .unwrap_or_default();
+            // 35 requests a minute for twenty messages: each turn message
+            // shows its new lines about every half minute.
+            assert!(at.len() >= 3, "topic {topic}: {} writes", at.len());
+            assert!(
+                gap <= Duration::from_secs(60),
+                "topic {topic}: {gap:?} between writes"
+            );
+        }
+        handle.abort();
+    }
+    /// A delete (an old status message, a service message) keeps its place
+    /// among the topic calls: eleven slots editing their topics without a
+    /// pause do not hold it back for good (TASK-062 plan review); only a new
+    /// topic goes ahead of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_delete_is_not_held_back_by_topic_edits_queued_after_it() {
+        let fake = Fake::new(&[]);
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+        let handle = tokio::spawn(scheduler.run());
+        let mut editors = Vec::new();
+        for slot in 0..11i64 {
+            let outbox = outbox.clone();
+            editors.push(tokio::spawn(async move {
+                for i in 0u64.. {
+                    let answer = outbox
+                        .submit(Op::EditTopic {
+                            chat: Chat::Group,
+                            thread_id: 10 + slot,
+                            name: None,
+                            icon_custom_emoji_id: Some(format!("{i}")),
+                        })
+                        .await;
+                    if answer.await.is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        tokio::time::sleep(ms(100)).await;
+        let delete = waited(
+            &outbox,
+            Op::Delete {
+                chat: Chat::Group,
+                message_id: 77,
+            },
+        )
+        .await;
+        // Behind the eleven edits queued before it, one token each (48 s
+        // measured), where the planner's order never sent it.
+        assert!(delete <= Duration::from_secs(60), "{delete:?}");
+        let create = waited(
+            &outbox,
+            Op::CreateTopic {
+                chat: Chat::Group,
+                name: "new".to_owned(),
+                icon_custom_emoji_id: None,
+            },
+        )
+        .await;
+        assert!(create <= EDIT_BUCKET.refill_every, "{create:?}");
+        for editor in editors {
+            editor.abort();
+        }
+        handle.abort();
     }
 }

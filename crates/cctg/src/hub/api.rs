@@ -361,15 +361,20 @@ impl BotApi {
         self.call("sendMessage", body, None).await
     }
 
+    /// `parse_mode`: as in [`Self::send_message`].
     pub async fn edit_message_text(
         &self,
         chat: Chat,
         message_id: i64,
         text: &str,
+        parse_mode: Option<&str>,
         reply_markup: Option<&Value>,
     ) -> Result<(), ApiError> {
         let mut body =
             json!({ "chat_id": self.id_of(chat), "message_id": message_id, "text": text });
+        if let Some(parse_mode) = parse_mode {
+            body["parse_mode"] = json!(parse_mode);
+        }
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup.clone();
         }
@@ -544,15 +549,11 @@ impl BotApi {
             .map(drop)
     }
 
-    /// Pins a message without a notification; a message of a forum topic is
-    /// pinned in that topic.
-    pub async fn pin_chat_message(&self, chat: Chat, message_id: i64) -> Result<(), ApiError> {
-        let body = json!({
-            "chat_id": self.id_of(chat),
-            "message_id": message_id,
-            "disable_notification": true,
-        });
-        self.call::<IgnoredAny>("pinChatMessage", body, None)
+    /// Unpins one message (the pinned status message of a hub before
+    /// TASK-062).
+    pub async fn unpin_chat_message(&self, chat: Chat, message_id: i64) -> Result<(), ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat), "message_id": message_id });
+        self.call::<IgnoredAny>("unpinChatMessage", body, None)
             .await
             .map(drop)
     }
