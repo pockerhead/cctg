@@ -508,7 +508,9 @@ async fn the_permission_hook_of_a_question_never_waits() {
         let (output, elapsed) = run_hook(home("permission", &hub.addr), "PermissionRequest").await;
         assert_clean(&output);
         assert!(output.stdout.is_empty());
-        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        // Not waiting for the question (60 s here); not a start-up budget,
+        // so the bound leaves room for a loaded host (TASK-071).
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(hub.fake.permission_prompts(), 0, "no Allow/Deny");

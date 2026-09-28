@@ -701,4 +701,13 @@ async fn a_crash_looping_hub_stops_on_the_stop_file() {
     assert!(status.success(), "{status:?}\n{log}");
     assert!(log.contains("supervisor stopped"), "{log}");
     assert!(!stop_file.exists(), "cctg.stop is removed");
+    // Each start is marked before the hub can write (install.sh reads a
+    // hub's lines after its mark; TASK-071): no hub line before the first
+    // mark, and a mark for every hub that failed.
+    let first = log.find("hub starting").expect("a start mark");
+    assert!(!log[..first].contains("Error: "), "{log}");
+    assert!(
+        log.matches("hub starting").count() >= log.matches("Error: ").count(),
+        "{log}"
+    );
 }

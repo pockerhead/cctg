@@ -18096,7 +18096,10 @@ again"
                 rig.hook(post).await;
             }
         };
-        tokio::time::timeout(WAIT, sent)
+        // A stalled actor never takes the next hook, so the bound only has to
+        // outlast the work: 1100 registrations take ~13 s on an idle host
+        // and passed 60 s under the TASK-066 load (TASK-071).
+        tokio::time::timeout(5 * WAIT, sent)
             .await
             .expect("ingress kept draining while Telegram stalled");
         let saved = async {
@@ -18111,7 +18114,7 @@ again"
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         };
-        tokio::time::timeout(WAIT, saved)
+        tokio::time::timeout(5 * WAIT, saved)
             .await
             .expect("every session registered");
     }
@@ -19775,8 +19778,18 @@ again"
         let separator = texts.iter().position(|text| text.starts_with("── session"));
         let prompt = texts.iter().position(|text| text.contains("cargo test"));
         assert!(separator.is_some() && separator < prompt, "{texts:?}");
+        // The prompt waited for the retry (a lower bound: load only adds)...
         assert!(delay >= retry - Duration::from_millis(100), "{delay:?}");
-        assert!(delay < retry + Duration::from_secs(1), "{delay:?}");
+        // ...and for one retry only: before the separator A's line was sent
+        // at most twice (the first send and the one retry; the retry may
+        // come after the separator when a late pump finds both due), never
+        // a third time. Counted, not timed: a loaded runner stretches the
+        // wall clock (TASK-071: 2.003 s against a 2 s bound on CI).
+        let tries = texts[..separator.unwrap()]
+            .iter()
+            .filter(|text| *text == "> go")
+            .count();
+        assert!((1..=2).contains(&tries), "{texts:?}");
         println!("worst-case prompt delay with stream_retry {retry:?}: {delay:?}");
     }
 

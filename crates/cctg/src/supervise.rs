@@ -223,6 +223,10 @@ fn start_hub(settings: &Settings) -> io::Result<Running> {
     }
     #[cfg(unix)]
     command.process_group(0);
+    // Before the start: the hub writes to the same log and can pass its
+    // start checks before "hub started pid=" below is written (macOS CI,
+    // TASK-071); install.sh reads the hub's lines after this one.
+    info!("hub starting");
     let mut child = command.spawn()?;
     let pid = child.id().unwrap_or_default();
     let nanos = SystemTime::now()

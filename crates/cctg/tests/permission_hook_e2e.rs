@@ -404,7 +404,10 @@ async fn a_request_the_channel_relays_gets_no_second_prompt() {
     let (output, elapsed) = run_hook(home("twin", &hub.addr)).await;
     assert_clean(&output);
     assert!(output.stdout.is_empty());
-    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    // Not waiting for a decision: that wait would last until a press that
+    // never comes. Not a start-up budget, so the bound leaves room for a
+    // loaded host (TASK-071).
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(hub.fake.prompts().len(), 1, "no second set of buttons");
 }

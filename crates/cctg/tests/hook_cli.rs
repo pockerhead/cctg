@@ -58,6 +58,21 @@ fn run_hook(home: &Path, event: &str, stdin: &[u8]) -> (Output, Duration) {
     (output, started.elapsed())
 }
 
+/// How long a hook that sends nothing takes here and now (input it cannot
+/// parse): process start and exit, which a loaded host stretches by
+/// seconds (TASK-071). The larger of a run before and one after `run`, whose
+/// time is returned with it. A budget of the hook's own work is asserted on
+/// top of it.
+fn against_start_up<T>(
+    home: &Path,
+    run: impl FnOnce() -> (T, Duration),
+) -> (T, Duration, Duration) {
+    let idle = || run_hook(home, "Stop", b"{").1;
+    let before = idle();
+    let (value, elapsed) = run();
+    (value, elapsed, before.max(idle()))
+}
+
 fn assert_quiet(output: &Output, secret_free_of: &[&str]) {
     assert!(output.status.success(), "{:?}", output.status);
     assert!(
@@ -142,15 +157,19 @@ async fn a_hub_without_compactions_leaves_the_hook_quiet() {
         }
     });
     let home = home("old-hub-compact", Some(&addr));
-    let (output, elapsed) =
-        tokio::task::spawn_blocking(move || run_hook(&home, "PreCompact", &pre_compact()))
-            .await
-            .unwrap();
+    let (output, elapsed, start_up) = tokio::task::spawn_blocking(move || {
+        against_start_up(&home, || run_hook(&home, "PreCompact", &pre_compact()))
+    })
+    .await
+    .unwrap();
     assert_quiet(&output, &["private compact focus"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("HTTP 400"), "{stderr}");
     assert!(!stderr.contains("kept"), "{stderr}");
-    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    assert!(
+        elapsed < start_up + 2 * cctg::hook::POST_TIMEOUT,
+        "{elapsed:?} against {start_up:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -226,13 +245,21 @@ async fn a_silent_hub_keeps_session_end_well_inside_its_budget() {
         }
     });
     let home = home("silent", Some(&addr));
-    let (output, elapsed) =
-        tokio::task::spawn_blocking(move || run_hook(&home, "SessionEnd", &fixture("session_end")))
-            .await
-            .unwrap();
+    let (output, elapsed, start_up) = tokio::task::spawn_blocking(move || {
+        against_start_up(&home, || {
+            run_hook(&home, "SessionEnd", &fixture("session_end"))
+        })
+    })
+    .await
+    .unwrap();
     assert_quiet(&output, &["745465f7", "\"reason\""]);
-    // Claude Code allows 1.5 s for all SessionEnd hooks together.
-    assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+    // Claude Code allows 1.5 s for all SessionEnd hooks together, start-up
+    // included. The hook's own part is one POST_TIMEOUT; as much again of
+    // margin keeps load noise out and still fails a POST that is not cut.
+    assert!(
+        elapsed < start_up + 2 * cctg::hook::POST_TIMEOUT,
+        "{elapsed:?} against {start_up:?}"
+    );
     assert!(!output.stderr.is_empty(), "a failed delivery is reported");
 }
 
@@ -246,11 +273,14 @@ fn no_hub_listening_is_quiet_and_fast() {
         ("SessionStart", "session_start"),
         ("SessionEnd", "session_end"),
     ] {
-        let (output, elapsed) = run_hook(&home, event, &fixture(name));
+        let (output, elapsed, start_up) =
+            against_start_up(&home, || run_hook(&home, event, &fixture(name)));
         assert_quiet(&output, &["1e087ca8", "745465f7", "~\\"]);
+        // On Windows the connect lasts until the POST timeout (see the
+        // silent hub above for the margin).
         assert!(
-            elapsed < Duration::from_millis(1200),
-            "{event}: {elapsed:?}"
+            elapsed < start_up + 2 * cctg::hook::POST_TIMEOUT,
+            "{event}: {elapsed:?} against {start_up:?}"
         );
     }
 }
@@ -329,27 +359,34 @@ fn bad_hook_arguments_still_exit_zero() {
 #[test]
 fn an_open_silent_stdin_does_not_hold_the_hook() {
     let home = home("hung-stdin", Some("127.0.0.1:9"));
-    let started = Instant::now();
-    let mut child = common::spawn(
-        common::cctg(&home)
-            .args(["hook", "SessionEnd"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
-    )
-    .expect("cctg starts");
-    // Held open, never written, until the hook has exited.
-    let stdin = child.stdin.take().unwrap();
-    let output = child.wait_with_output().unwrap();
-    let elapsed = started.elapsed();
-    drop(stdin);
+    let (output, elapsed, start_up) = against_start_up(&home, || {
+        let started = Instant::now();
+        let mut child = common::spawn(
+            common::cctg(&home)
+                .args(["hook", "SessionEnd"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("cctg starts");
+        // Held open, never written, until the hook has exited.
+        let stdin = child.stdin.take().unwrap();
+        let output = child.wait_with_output().unwrap();
+        let elapsed = started.elapsed();
+        drop(stdin);
+        (output, elapsed)
+    });
     assert_quiet(&output, &[]);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("hook input unreadable"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(elapsed < Duration::from_millis(1200), "{elapsed:?}");
+    // The hook's own part is the stdin wait; a POST_TIMEOUT of margin.
+    assert!(
+        elapsed < start_up + cctg::hook::STDIN_TIMEOUT + cctg::hook::POST_TIMEOUT,
+        "{elapsed:?} against {start_up:?}"
+    );
 }
 
 #[test]
