@@ -445,6 +445,7 @@ async fn e2e_the_status_message_rolls_below_the_turn() {
     hub.control
         .send(Control::Message(Inbound {
             chat: Chat::Group,
+            sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id: user,
             thread_id: Some(THREAD),
             text: Some("ещё".into()),
@@ -453,6 +454,7 @@ async fn e2e_the_status_message_rolls_below_the_turn() {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         }))
         .unwrap();
     layout(

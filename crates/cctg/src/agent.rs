@@ -701,6 +701,8 @@ pub async fn run_stdio() -> i32 {
                 files: true,
                 session_reads: true,
                 status_lines: status.is_some(),
+                private_place: true,
+                enrolled: None,
                 heartbeat: true,
             };
             let (outbox, events) = spawn(LinkConfig {
@@ -2077,6 +2079,8 @@ mod tests {
             files: true,
             session_reads: false,
             status_lines: false,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
         }
     }

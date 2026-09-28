@@ -546,6 +546,7 @@ mod tests {
     fn only_our_commands_are_commands() {
         let input = |text: &str| crate::hub::updates::Inbound {
             chat: Chat::Group,
+            sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
             thread_id: Some(2),
             text: Some(text.to_owned()),
@@ -554,6 +555,7 @@ mod tests {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         };
         for text in ["/brief", "/full 2", " /brief@cctg_bot 3", "/full@other_bot"] {
             assert!(super::is_command(&input(text)), "{text}");
@@ -676,6 +678,7 @@ mod tests {
         for text in texts {
             tx.send(Inbound {
                 chat: Chat::Group,
+                sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 1,
                 thread_id: THREAD,
                 text: Some((*text).to_owned()),
@@ -684,6 +687,7 @@ mod tests {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             })
             .unwrap();
         }

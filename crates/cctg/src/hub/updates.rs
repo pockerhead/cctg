@@ -44,6 +44,9 @@ pub enum Routed {
 pub struct Inbound {
     /// The chat of the message: every id here is one of this chat.
     pub chat: Chat,
+    /// Who wrote it, as the private chat with them (TASK-063: `/join`
+    /// makes its sender the owner of the device it enrolls). Never logged.
+    pub sender: PrivateChat,
     pub message_id: i64,
     /// `None` for the General topic.
     pub thread_id: Option<i64>,
@@ -63,6 +66,9 @@ pub struct Inbound {
     /// The sender's [`author_name`], only when the allowlist is a team
     /// (TASK-036). Never logged.
     pub from_name: Option<String>,
+    /// The sender's [`author_name`] always: it signs the echo of the message
+    /// in the slot's other views (TASK-063). Never logged.
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,8 +209,8 @@ pub enum Ignored {
     /// Another chat than the configured supergroup or an allowlisted user's
     /// private chat.
     OtherChat,
-    /// An allowlisted user's private chat: recognised, not served yet
-    /// (TASK-061; the private view comes with TASK-063).
+    /// An allowlisted user's private chat while the hub serves none (the
+    /// bot has no topics in private chats, TASK-063).
     PrivateChat,
     /// An update type the hub does not handle.
     Unsupported,
@@ -262,7 +268,8 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         if !allowlist.contains(from.id) {
             return Routed::Ignored(Ignored::NotAllowed);
         }
-        let from_name = author_name(&from).filter(|_| allowlist.is_team());
+        let author = author_name(&from);
+        let from_name = author.clone().filter(|_| allowlist.is_team());
         let media = media(&mut message);
         let thread_id = message
             .message_thread_id
@@ -280,6 +287,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         });
         return Routed::Input(Inbound {
             chat,
+            sender: PrivateChat::of_user(from.id),
             message_id: message.message_id,
             thread_id,
             text: message.text,
@@ -288,6 +296,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             forwarded: message.forward_origin.is_some(),
             media,
             from_name,
+            author,
         });
     }
 
@@ -323,8 +332,8 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
     Routed::Ignored(Ignored::Unsupported)
 }
 
-/// Private chats are recognised but not served yet (TASK-063 serves them):
-/// everything from one is ignored, as before TASK-061.
+/// Without topics in private chats the hub serves only the group:
+/// everything from a private chat is ignored, as before TASK-061.
 fn group_only(routed: Routed) -> Routed {
     let private = match &routed {
         Routed::Input(input) => input.chat.is_private(),
@@ -376,6 +385,18 @@ pub fn route_batch(
     chat_id: i64,
     allowlist: &Allowlist,
 ) -> (Option<i64>, Vec<Routed>) {
+    route_batch_with(raw, offset, chat_id, allowlist, false)
+}
+
+/// [`route_batch`]; `private`: the private chats of allowlisted users are
+/// served too (TASK-063, the bot has topics there).
+pub fn route_batch_with(
+    raw: Vec<Value>,
+    offset: Option<i64>,
+    chat_id: i64,
+    allowlist: &Allowlist,
+    private: bool,
+) -> (Option<i64>, Vec<Routed>) {
     let mut highest: Option<i64> = None;
     let mut routed = Vec::with_capacity(raw.len());
     for value in raw {
@@ -383,6 +404,7 @@ pub fn route_batch(
             highest = Some(highest.map_or(id, |current| current.max(id)));
         }
         let item = match serde_json::from_value::<Update>(value) {
+            Ok(update) if private => classify(update, chat_id, allowlist),
             Ok(update) => group_only(classify(update, chat_id, allowlist)),
             Err(_) => Routed::Ignored(Ignored::Malformed),
         };
@@ -465,15 +487,25 @@ pub async fn poll<S: UpdateSource>(
     store: &OffsetStore,
     handle: impl FnMut(Routed),
 ) {
-    poll_until(source, allowlist, store, handle, std::future::pending()).await;
+    poll_until(
+        source,
+        allowlist,
+        false,
+        store,
+        handle,
+        std::future::pending(),
+    )
+    .await;
 }
 
 /// [`poll`] until `stop` completes. It is only noticed while no batch is
 /// being handled: a batch whose offset was saved is always handed out whole,
 /// and an interrupted `getUpdates` confirms nothing, so its updates come again.
+/// `private`: as in [`route_batch_with`].
 pub async fn poll_until<S: UpdateSource>(
     source: &S,
     allowlist: &Allowlist,
+    private: bool,
     store: &OffsetStore,
     mut handle: impl FnMut(Routed),
     stop: impl Future<Output = ()>,
@@ -492,7 +524,8 @@ pub async fn poll_until<S: UpdateSource>(
                 backoff = Duration::from_secs(1);
                 let batch_len = raw.len();
                 let previous = offset;
-                let (next, routed) = route_batch(raw, offset, source.chat_id(), allowlist);
+                let (next, routed) =
+                    route_batch_with(raw, offset, source.chat_id(), allowlist, private);
                 offset = next;
                 if next != previous
                     && let Some(next) = next
@@ -571,6 +604,7 @@ mod tests {
             ok,
             Routed::Input(Inbound {
                 chat: Chat::Group,
+                sender: PrivateChat::of_user(ALLOWED),
                 message_id: 10,
                 thread_id: Some(7),
                 text: Some("hi".to_owned()),
@@ -579,6 +613,7 @@ mod tests {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: Some("x".to_owned()),
             })
         );
 
@@ -661,6 +696,7 @@ mod tests {
             is_bot: false,
             username: username.map(str::to_owned),
             first_name: first_name.map(str::to_owned),
+            ..User::default()
         };
         assert_eq!(
             author_name(&user(Some("anna_k"), Some("Анна"))).as_deref(),
@@ -955,6 +991,51 @@ mod tests {
         group["chat"]["id"] = json!(ALLOWED);
         assert_eq!(
             route_one(json!({ "update_id": 5, "message": group })),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+    }
+
+    /// TASK-063: with topics in private chats the hub serves the private
+    /// chat of an allowlisted user: its messages, presses and service
+    /// messages go on with the chat, and nobody else's private chat does.
+    #[test]
+    fn a_private_chat_is_served_when_the_bot_has_topics_there() {
+        let route = |update: Value| {
+            let (_, mut routed) = route_batch_with(vec![update], None, CHAT, &allowlist(), true);
+            routed.remove(0)
+        };
+        let private = |from: i64, extra: Value| {
+            let mut message = message(from, extra);
+            message["chat"] = json!({ "id": from, "type": "private", "first_name": "x" });
+            message
+        };
+        let owner = Chat::Private(PrivateChat::of_user(ALLOWED));
+        let text =
+            route(json!({ "update_id": 1, "message": private(ALLOWED, json!({ "text": "hi" })) }));
+        assert!(
+            matches!(&text, Routed::Input(Inbound { chat, thread_id: Some(7), .. }) if *chat == owner),
+            "{text:?}"
+        );
+        let press = route(json!({ "update_id": 2, "callback_query": {
+            "id": "q1", "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
+            "chat_instance": "c", "data": "allow:abcde",
+            "message": private(ALLOWED, json!({ "text": "prompt" })),
+        }}));
+        assert!(
+            matches!(&press, Routed::Callback(CallbackInput { chat: Some(chat), .. }) if *chat == owner),
+            "{press:?}"
+        );
+        let mut service = private(ALLOWED, json!({ "forum_topic_edited": {} }));
+        service["from"]["id"] = json!(BOT);
+        assert!(matches!(
+            route(json!({ "update_id": 3, "message": service })),
+            Routed::Service(ServiceMessage {
+                kind: ServiceKind::TopicEdited,
+                ..
+            })
+        ));
+        assert_eq!(
+            route(json!({ "update_id": 4, "message": private(STRANGER, json!({ "text": "hi" })) })),
             Routed::Ignored(Ignored::OtherChat)
         );
     }

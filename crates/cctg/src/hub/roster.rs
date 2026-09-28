@@ -14,7 +14,9 @@
 //! devices reach the hub ([`JoinInfo`]), no secret is in it. The message
 //! stays in the group's history, so it is edited to say the code was used
 //! (device name and id) or, after [`CODE_TTL`], expired. A hub restart
-//! loses those edits (its codes expire all the same).
+//! loses those edits (its codes expire all the same). The user who asked
+//! for the code owns the device it enrolls (TASK-063): its sessions show
+//! in that user's private chat too.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -26,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::chat::{Chat, MessageKey};
+use super::chat::{Chat, MessageKey, PrivateChat};
 use super::config::PublicAddrs;
 use super::devices::{CODE_TTL, Devices, Listed, MAX_CODES, MintError, SharedState, code_key};
 use super::scheduler::{Op, Outbox, Outcome};
@@ -255,13 +257,13 @@ pub async fn serve(
     bot_username: Option<String>,
 ) {
     let mut spent = devices.spent();
-    // Code key -> the `/join` message and when its code expires. At most
-    // MAX_CODES: minting refuses beyond that.
-    let mut waiting: HashMap<String, (MessageKey, Instant)> = HashMap::new();
+    // Code key -> the `/join` message, when its code expires and who asked
+    // for it. At most MAX_CODES: minting refuses beyond that.
+    let mut waiting: HashMap<String, (MessageKey, Instant, PrivateChat)> = HashMap::new();
     let mut inputs_open = true;
     let mut spent_open = true;
     while inputs_open || !waiting.is_empty() {
-        let next = waiting.values().map(|&(_, at)| at).min();
+        let next = waiting.values().map(|&(_, at, _)| at).min();
         tokio::select! {
             input = inputs.recv(), if inputs_open => match input {
                 None => inputs_open = false,
@@ -271,7 +273,7 @@ pub async fn serve(
                     }
                     if command_name(&input) == Some("join") {
                         if let Some((key, message)) = on_join(&outbox, &devices, &join, input.chat).await {
-                            waiting.insert(key, (message, Instant::now() + CODE_TTL));
+                            waiting.insert(key, (message, Instant::now() + CODE_TTL, input.sender));
                         }
                         continue;
                     }
@@ -290,8 +292,9 @@ pub async fn serve(
             },
             used = spent.recv(), if spent_open => match used {
                 Ok(used) => {
-                    if let Some((message, _)) = waiting.remove(&used.key) {
+                    if let Some((message, _, owner)) = waiting.remove(&used.key) {
                         info!(device_id = used.id, "join message marked used");
+                        own(&devices, &used.id, owner).await;
                         edit(&outbox, message, used_text(&used.id, &used.name)).await;
                     }
                 }
@@ -303,16 +306,29 @@ pub async fn serve(
                 let now = Instant::now();
                 let due: Vec<String> = waiting
                     .iter()
-                    .filter(|(_, (_, at))| *at <= now)
+                    .filter(|(_, (_, at, _))| *at <= now)
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in due {
-                    if let Some((message, _)) = waiting.remove(&key) {
+                    if let Some((message, _, _)) = waiting.remove(&key) {
                         edit(&outbox, message, EXPIRED.to_owned()).await;
                     }
                 }
             }
         }
+    }
+}
+
+/// Device `id` belongs to `owner` now, the user whose `/join` enrolled it.
+async fn own(devices: &Devices, id: &str, owner: PrivateChat) {
+    let (owning, target) = (devices.clone(), id.to_owned());
+    match tokio::task::spawn_blocking(move || owning.set_owner(&target, owner)).await {
+        Ok(Ok(true)) => info!(device_id = id, "device owner recorded"),
+        Ok(Ok(false)) => {}
+        Ok(Err(error)) => {
+            warn!(device_id = id, kind = ?error.kind(), "device owner not saved");
+        }
+        Err(_) => warn!(device_id = id, "device owner not saved"),
     }
 }
 
@@ -585,6 +601,7 @@ mod tests {
     fn command(text: &str, thread_id: Option<i64>) -> Inbound {
         Inbound {
             chat: Chat::Group,
+            sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
             thread_id,
             text: Some(text.to_owned()),
@@ -593,6 +610,7 @@ mod tests {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         }
     }
 
@@ -1006,6 +1024,16 @@ mod tests {
             started.elapsed() < CODE_TTL,
             "no expiry edit after the used one"
         );
+        // TASK-063: who asked for the code owns the device; the side one
+        // has no owner.
+        let asker = crate::hub::chat::PrivateChat::of_user(1001);
+        assert_eq!(devices.owner(&enrolled.id), Some(asker));
+        let (listed, _) = devices.list();
+        let side_box = listed
+            .iter()
+            .find(|entry| entry.name == "side box")
+            .unwrap();
+        assert_eq!(devices.owner(&side_box.id), None);
     }
 
     #[tokio::test(start_paused = true)]

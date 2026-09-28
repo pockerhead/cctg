@@ -401,6 +401,18 @@ impl Prompts {
         found.next().is_none().then_some(*key)
     }
 
+    /// The one active prompt with `request_id` in topic `place` (TASK-063:
+    /// its twin was pressed before Telegram's answer linked it).
+    pub fn active_in(&self, request_id: &str, place: Place) -> Option<u64> {
+        let mut found = self.prompts.iter().filter(|(_, prompt)| {
+            prompt.state.is_active()
+                && prompt.request_id == request_id
+                && prompt.place == Some(place)
+        });
+        let (key, _) = found.next()?;
+        found.next().is_none().then_some(*key)
+    }
+
     /// The selected prompt waiting for the ack of `verdict_id`.
     pub fn by_verdict(&self, verdict_id: u64) -> Option<u64> {
         self.prompts.iter().find_map(|(key, prompt)| {

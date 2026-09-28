@@ -493,6 +493,17 @@ impl Asks {
         found.next().is_none().then_some(*key)
     }
 
+    /// The one open ask with id `id` in topic `place` (TASK-063: its twin
+    /// was pressed before Telegram's answer linked it).
+    pub fn open_in(&self, id: &str, place: Place) -> Option<u64> {
+        let mut found = self
+            .asks
+            .iter()
+            .filter(|(_, ask)| ask.is_open() && ask.id == id && ask.place == Some(place));
+        let (key, _) = found.next()?;
+        found.next().is_none().then_some(*key)
+    }
+
     /// Topic `place` has an open ask whose message id is not known yet:
     /// a reply there may answer it before the hub can tell.
     pub fn sending_in(&self, place: Place) -> bool {

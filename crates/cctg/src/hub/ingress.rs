@@ -434,7 +434,7 @@ async fn agent_session(
         result
     })
     .await;
-    let (who, register) = match handshake {
+    let (who, mut register) = match handshake {
         Ok(Ok(Some(registered))) => registered,
         Ok(Ok(None)) => {
             debug!(conn, %peer, "connection closed before its first byte");
@@ -458,6 +458,12 @@ async fn agent_session(
     drop(pre_auth.unauthenticated);
     drop(pre_auth.peer_place);
 
+    // Whose device it is decides whose private chat shows its session
+    // (TASK-063); never taken from the wire.
+    register.enrolled = match &who {
+        Who::Device(id) => Some(id.clone()),
+        Who::Shared => None,
+    };
     let session = short(&register.session_id).to_owned();
     let mut liveness = Liveness::new(register.heartbeat.then_some(heartbeat));
     let (to_agent, mut outbound) = mpsc::channel(TO_AGENT_QUEUE);
@@ -867,7 +873,7 @@ async fn hook_request(
             debug!(%peer, "hook request of a revoked device");
             Status::Unauthorized
         }
-        Ok(Ok((Route::Hook, body, _))) => accept_hook(&body, dedup, events),
+        Ok(Ok((Route::Hook, body, who))) => accept_hook(&body, who, dedup, events),
         // `cctg doctor`: the secret matched; nothing else happens.
         Ok(Ok((Route::Ping, _, _))) => {
             debug!(%peer, "ping answered");
@@ -1127,8 +1133,13 @@ async fn join_request(
     }
 }
 
-fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost>) -> Status {
-    let post = match wire::decode_hook(body) {
+fn accept_hook(
+    body: &[u8],
+    who: Option<Who>,
+    dedup: &Mutex<Dedup>,
+    events: &mpsc::Sender<HookPost>,
+) -> Status {
+    let mut post = match wire::decode_hook(body) {
         Ok(post) => post,
         Err(error) => {
             debug!(%error, "hook body rejected");
@@ -1144,6 +1155,12 @@ fn accept_hook(body: &[u8], dedup: &Mutex<Dedup>, events: &mpsc::Sender<HookPost
         return Status::NoContent;
     }
     note_hook_version(post.client_version.as_deref());
+    // Whose device it is decides whose private chat a new slot shows in
+    // (TASK-063); never taken from the wire.
+    post.enrolled = match who {
+        Some(Who::Device(id)) => Some(id),
+        Some(Who::Shared) | None => None,
+    };
     let (id, kind, session, frequent) = (
         post.event_id.clone(),
         post.event.kind(),
@@ -1405,6 +1422,8 @@ mod tests {
             files: false,
             session_reads: false,
             status_lines: false,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
         }
     }

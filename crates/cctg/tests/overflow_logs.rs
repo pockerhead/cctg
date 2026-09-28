@@ -140,6 +140,7 @@ async fn one_overflow_warning_per_episode() {
         control
             .send(Control::Message(Inbound {
                 chat: Chat::Group,
+                sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
                 thread_id: Some(100),
                 text: None,
@@ -148,6 +149,7 @@ async fn one_overflow_warning_per_episode() {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             }))
             .expect("control");
     };

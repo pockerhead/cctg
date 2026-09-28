@@ -157,6 +157,8 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,

@@ -190,6 +190,7 @@ impl Hub {
         self.commands
             .send(Inbound {
                 chat: Chat::Group,
+                sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id: 1,
                 thread_id: thread,
                 text: Some(text.to_owned()),
@@ -198,6 +199,7 @@ impl Hub {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             })
             .unwrap();
     }

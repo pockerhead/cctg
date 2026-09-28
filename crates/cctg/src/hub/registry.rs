@@ -7,8 +7,14 @@
 //! never get a slot, they only point at their parent's.
 //!
 //! A slot shows in one or more chats, each its own [`View`] with its own
-//! topic, name, icon, separator and status message (TASK-061). Today every
-//! slot has exactly one view, the group's.
+//! topic, name, icon, separator and status message (TASK-061): the group's,
+//! and with topics in private chats (TASK-063) its owner's private chat. A
+//! slot made while its owner's private chat is usable shows there alone
+//! ([`Registry::make_private`]); one made in the group keeps its group view.
+//! The session is answered in the primary view ([`Registry::primary_view`]:
+//! the private one once it has a topic); the other views mirror it. `Chat`
+//! names the one group of TASK-061; views and places carry their chat, so
+//! more groups would be more `Chat` values, not a new model.
 //!
 //! Paths, folder names and titles are private: nothing here logs them.
 
@@ -21,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use transcript::telegram_len;
 
 use super::buffer::Buffer;
-use super::chat::{Chat, MessageKey, Place};
+use super::chat::{Chat, MessageKey, Place, PrivateChat};
 use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
 
@@ -298,18 +304,15 @@ pub struct Slot {
     /// Topic messages no session of the slot could take yet (TASK-017).
     #[serde(default, skip_serializing_if = "Buffer::is_idle")]
     pub buffer: Buffer,
-    /// The chats the slot shows in, at most one view per chat, the primary
-    /// one first: its topic gets the session's answers and messages. Never
-    /// empty (the loader refuses a slot without one).
+    /// The chats the slot shows in, at most one view per chat, in the
+    /// order they came: a slot made in the group has the group's first; one
+    /// made while its owner's private chat was usable has only that
+    /// (TASK-063; a hub before that answers in the first). Never empty (the
+    /// loader refuses a slot without one).
     pub views: Vec<View>,
 }
 
 impl Slot {
-    /// The view the slot's session is answered in (TASK-061: the group's).
-    pub fn primary(&self) -> Option<&View> {
-        self.views.first()
-    }
-
     /// The caller sets [`Registry::dirty`] when it changes a saved field.
     pub fn view_mut(&mut self, chat: Chat) -> Option<&mut View> {
         self.views.iter_mut().find(|view| view.chat == chat)
@@ -656,6 +659,25 @@ pub struct Registry {
     /// Set by every change that must reach `registry.json`.
     #[serde(skip)]
     pub dirty: bool,
+    /// Views in private chats count: the bot has topics there (TASK-063).
+    #[serde(skip)]
+    pub private: bool,
+    /// Private chats the bot cannot write to now (403: the user never
+    /// pressed Start, or blocked the bot); their views wait (TASK-063).
+    #[serde(skip)]
+    pub closed: HashSet<PrivateChat>,
+    /// Twins of the lasting messages of primary topics, newest last
+    /// (TASK-063): a subagent block or a Resume offer is edited long after
+    /// it went, also after a restart of the hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub twins: Vec<TwinLink>,
+}
+
+/// A message of a primary topic and its twin in a mirror topic (TASK-063).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TwinLink {
+    pub primary: MessageKey,
+    pub twin: MessageKey,
 }
 
 impl Default for Registry {
@@ -670,6 +692,9 @@ impl Default for Registry {
             recent_clears: BTreeMap::new(),
             recent_starts: BTreeMap::new(),
             dirty: false,
+            private: false,
+            closed: HashSet::new(),
+            twins: Vec::new(),
         }
     }
 }
@@ -703,9 +728,78 @@ impl Registry {
             .map(SlotId)
     }
 
+    /// The bot writes to `chat` now: the group, or a private chat while
+    /// private chats are on and it is not closed (TASK-063).
+    pub fn usable(&self, chat: Chat) -> bool {
+        match chat {
+            Chat::Group => true,
+            Chat::Private(private) => self.private && !self.closed.contains(&private),
+        }
+    }
+
+    /// The view the slot's session is answered in: a usable view with a
+    /// topic, a private one first (TASK-063: the owner's view; the group
+    /// mirrors it). `None` while no usable view has its topic yet.
+    pub fn primary_view(&self, id: SlotId) -> Option<&View> {
+        let views = &self.slot(id)?.views;
+        let ready = |view: &&View| view.topic_id.is_some() && self.usable(view.chat);
+        views
+            .iter()
+            .filter(ready)
+            .find(|view| view.chat.is_private())
+            .or_else(|| views.iter().find(ready))
+    }
+
     /// The topic of the slot's primary view, where its session's messages go.
     pub fn place(&self, id: SlotId) -> Option<Place> {
-        self.slot(id)?.primary()?.place()
+        self.primary_view(id)?.place()
+    }
+
+    /// The topics that mirror the primary one (TASK-063): the slot's other
+    /// usable views with a topic.
+    pub fn mirrors(&self, id: SlotId) -> Vec<Place> {
+        let Some(primary) = self.place(id) else {
+            return Vec::new();
+        };
+        self.slot(id)
+            .into_iter()
+            .flat_map(|slot| &slot.views)
+            .filter(|view| self.usable(view.chat))
+            .filter_map(View::place)
+            .filter(|place| *place != primary)
+            .collect()
+    }
+
+    /// A slot just made shows in `chat` alone (TASK-063: its owner's private
+    /// chat; the group only by a share, TASK-064): its one view, the group's
+    /// placeholder, is replaced while it has no topic and no call in flight.
+    /// `false`: the slot is not such a one.
+    pub fn make_private(&mut self, id: SlotId, chat: Chat) -> bool {
+        let Some(slot) = self.slots.get_mut(id.0) else {
+            return false;
+        };
+        match slot.views.as_slice() {
+            [view] if view.chat != chat && view.topic_id.is_none() && !view.busy => {
+                slot.views = vec![View::new(chat)];
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The slot shows in `chat` too (TASK-063: its owner's private chat, or
+    /// the group when no view of it is usable); `false` when it did already.
+    pub fn add_view(&mut self, id: SlotId, chat: Chat) -> bool {
+        let Some(slot) = self.slots.get_mut(id.0) else {
+            return false;
+        };
+        if slot.views.iter().any(|view| view.chat == chat) {
+            return false;
+        }
+        slot.views.push(View::new(chat));
+        self.dirty = true;
+        true
     }
 
     /// A slot is free when no session that is still running holds it.
@@ -1638,8 +1732,14 @@ impl Registry {
             let name = self.desired_title(id);
             let icon = icons.for_state(self.state(id)).map(str::to_owned);
             let wanted = (name.clone(), icon.clone());
-            for view in &mut self.slots[index].views {
-                if view.busy || view.failed.as_ref() == Some(&wanted) {
+            // A closed private chat waits (TASK-063).
+            let usable: Vec<bool> = self.slots[index]
+                .views
+                .iter()
+                .map(|view| self.usable(view.chat))
+                .collect();
+            for (view, usable) in self.slots[index].views.iter_mut().zip(usable) {
+                if !usable || view.busy || view.failed.as_ref() == Some(&wanted) {
                     continue;
                 }
                 let chat = view.chat;
@@ -2144,6 +2244,90 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// TASK-063 (decision 2026-09-28): a slot just made shows in its owner's
+    /// private chat alone; one with a topic or a call in flight keeps its
+    /// view.
+    #[test]
+    fn a_new_slot_can_show_in_the_private_chat_alone() {
+        let owner = Chat::Private(PrivateChat::of_user(7));
+        let mut registry = Registry {
+            private: true,
+            ..Registry::default()
+        };
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        let slot = slot_of(&registry, A).unwrap();
+        assert!(registry.make_private(slot, owner));
+        assert!(!registry.make_private(slot, owner), "once");
+        assert_eq!(registry.slots[slot.0].views, [View::new(owner)]);
+        let jobs = registry.topic_work(&Icons::default(), true);
+        assert!(
+            matches!(jobs.as_slice(), [TopicJob::Create { chat, .. }] if *chat == owner),
+            "{jobs:?}"
+        );
+        // One made in the group before keeps its topic.
+        registry.apply_hook(&start(B, "/work/other", Some(2), None));
+        let other = slot_of(&registry, B).unwrap();
+        let mut next = 100;
+        settle(&mut registry, &mut next);
+        assert!(!registry.make_private(other, owner));
+        assert_eq!(registry.slots[other.0].views[0].chat, Chat::Group);
+    }
+
+    /// TASK-063: a slot answers in its owner's private view once that has a
+    /// topic, and the group mirrors it; a closed private chat, or private
+    /// chats off, leave the group primary and make no private topic.
+    #[test]
+    fn the_private_view_is_primary_once_it_has_a_topic() {
+        let owner = Chat::Private(PrivateChat::of_user(7));
+        let mut registry = Registry {
+            private: true,
+            ..Registry::default()
+        };
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        let slot = slot_of(&registry, A).unwrap();
+        let mut next = 100;
+        settle(&mut registry, &mut next);
+        let group = registry.place(slot).unwrap();
+        assert_eq!(group.chat, Chat::Group);
+        assert!(registry.add_view(slot, owner));
+        assert!(!registry.add_view(slot, owner), "one view per chat");
+        assert_eq!(registry.slots[slot.0].views[0].chat, Chat::Group);
+        // Its topic is not made yet: the group answers, nothing mirrors.
+        assert_eq!(registry.place(slot), Some(group));
+        assert!(registry.mirrors(slot).is_empty());
+        let jobs = registry.topic_work(&Icons::default(), true);
+        assert!(
+            matches!(jobs.as_slice(), [TopicJob::Create { chat, .. }] if *chat == owner),
+            "{jobs:?}"
+        );
+        registry.topic_created(slot, owner, 700, "t", None);
+        assert_eq!(registry.place(slot), Some(Place::topic(owner, 700)));
+        assert_eq!(registry.mirrors(slot), [group]);
+        assert_eq!(registry.slot_by_topic(Place::topic(owner, 700)), Some(slot));
+        // Closed (403): the group answers again, the private view waits.
+        let Chat::Private(private) = owner else {
+            unreachable!()
+        };
+        registry.closed.insert(private);
+        assert_eq!(registry.place(slot), Some(group));
+        assert!(registry.mirrors(slot).is_empty());
+        registry.slots[slot.0].views[1].applied_title = None;
+        assert!(
+            registry
+                .topic_work(&Icons::default(), true)
+                .iter()
+                .all(|job| job.view().1 == Chat::Group),
+            "no call into a closed chat"
+        );
+        registry.closed.clear();
+        registry.private = false;
+        assert_eq!(registry.place(slot), Some(group), "private chats off");
+        // Saved and loaded: the private view stays, after the group's.
+        let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
+        assert_eq!(saved.slots[slot.0].views[1].chat, owner);
+        assert_eq!(saved.slots[slot.0].views[1].topic_id, Some(700));
     }
 
     #[test]

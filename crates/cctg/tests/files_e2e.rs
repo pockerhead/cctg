@@ -242,6 +242,8 @@ impl Claude {
             files: true,
             session_reads: false,
             status_lines: false,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
         };
         let (outbox, events) = agent::spawn(LinkConfig {

@@ -250,6 +250,8 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -354,6 +356,7 @@ fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
     hub.control
         .send(Control::Message(Inbound {
             chat: Chat::Group,
+            sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id: Some(100),
             text: Some(text.into()),
@@ -362,6 +365,7 @@ fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         }))
         .unwrap();
 }

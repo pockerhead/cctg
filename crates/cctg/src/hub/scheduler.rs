@@ -91,6 +91,12 @@
 //! group's rate (down to a quarter), which comes back by a tenth of the full
 //! rate a minute: a real limit below the guess costs a 429 now and then, not
 //! one a minute.
+//!
+//! One scheduler paces one chat. With private chats on (TASK-063) the hub
+//! uses [`Outbox::per_chat`]: every chat gets a scheduler of its own, the
+//! group with [`Limits::default`], each private chat with
+//! [`Limits::private`], and callback answers one more; so a 429 pauses only
+//! the chat that got it, and each chat has its own budgets.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -313,7 +319,7 @@ impl Op {
     }
 
     /// The message an edit or a reaction is for.
-    fn message(&self) -> Option<MessageKey> {
+    pub fn message(&self) -> Option<MessageKey> {
         match self {
             Op::Edit {
                 chat, message_id, ..
@@ -325,8 +331,26 @@ impl Op {
         }
     }
 
+    /// The chat the op writes to; `None` for a callback answer.
+    pub fn chat(&self) -> Option<Chat> {
+        match self {
+            Op::Send { chat, .. }
+            | Op::SendDocument { chat, .. }
+            | Op::SendPhoto { chat, .. }
+            | Op::SendAlbum { chat, .. }
+            | Op::Edit { chat, .. }
+            | Op::Delete { chat, .. }
+            | Op::Unpin { chat, .. }
+            | Op::CreateTopic { chat, .. }
+            | Op::EditTopic { chat, .. }
+            | Op::Stream { chat, .. }
+            | Op::React { chat, .. } => Some(*chat),
+            Op::AnswerCallback { .. } => None,
+        }
+    }
+
     /// The chat and topic of a new message.
-    fn place(&self) -> Option<Place> {
+    pub fn place(&self) -> Option<Place> {
         match self {
             Op::Send {
                 chat, thread_id, ..
@@ -647,6 +671,50 @@ pub struct Limits {
     pub debounce_max: Duration,
 }
 
+/// New messages into one private chat (TASK-063): one a second on average
+/// (the Bot API FAQ's limit per chat) with bursts of ten at most 2.5 a
+/// second. The live probe of TASK-055 sent 60 messages in 23 s (2.6/s) and
+/// 120 edits in 45 s (2.7/s) into a topic of a private chat without a 429.
+pub const PRIVATE_MESSAGES: BucketConfig = BucketConfig {
+    capacity: 10,
+    refill_every: Duration::from_secs(1),
+    min_gap: Duration::from_millis(400),
+};
+
+/// Edits, reactions and topic calls in one private chat (TASK-063): one a
+/// second on average, bursts of ten; [`PRIVATE_BUCKET`] holds both kinds
+/// together below the rate the probe measured for either alone.
+pub const PRIVATE_EDITS: BucketConfig = BucketConfig {
+    capacity: 10,
+    refill_every: Duration::from_secs(1),
+    min_gap: Duration::ZERO,
+};
+
+/// Every request into one private chat together (TASK-063 on TASK-068):
+/// at most 10 + 120 in any 60 s, two a second, below the rate of either
+/// kind the probe measured alone. It is the chat's budget the way
+/// [`GROUP_BUCKET`] is the group's: its class order holds inside it, and a
+/// 429 in the chat halves its rate, which comes back as the group's does.
+pub const PRIVATE_BUCKET: BucketConfig = BucketConfig {
+    capacity: 10,
+    refill_every: Duration::from_millis(500),
+    min_gap: Duration::ZERO,
+};
+
+impl Limits {
+    /// The pacing of one private chat (TASK-063); the debounce as in the
+    /// group.
+    pub fn private() -> Self {
+        Self {
+            messages: PRIVATE_MESSAGES,
+            edits: Some(PRIVATE_EDITS),
+            group: Some(PRIVATE_BUCKET),
+            debounce: DEBOUNCE,
+            debounce_max: DEBOUNCE_MAX,
+        }
+    }
+}
+
 impl Default for Limits {
     /// The hub's pacing.
     fn default() -> Self {
@@ -752,6 +820,8 @@ pub struct LiveText(Arc<Mutex<LiveContent>>);
 struct LiveContent {
     current: (String, Value),
     sent: Option<(String, Value)>,
+    /// It is not to go any more ([`LiveText::cancel`]).
+    cancelled: bool,
 }
 
 impl LiveText {
@@ -759,6 +829,7 @@ impl LiveText {
         Self(Arc::new(Mutex::new(LiveContent {
             current: (text, keyboard),
             sent: None,
+            cancelled: false,
         })))
     }
 
@@ -779,6 +850,24 @@ impl LiveText {
             .sent
             .clone()
             .unwrap_or_else(|| content.current.clone())
+    }
+
+    /// It went to Telegram at least once (TASK-063: nothing left to keep
+    /// current).
+    pub fn went(&self) -> bool {
+        self.lock().sent.is_some()
+    }
+
+    /// It is not to go any more (TASK-063: the twin of a status message
+    /// that was taken away before its twin went): while still queued it is
+    /// answered `Superseded` without a request or a token.
+    pub fn cancel(&self) {
+        self.lock().cancelled = true;
+    }
+
+    /// [`Self::cancel`] was called.
+    pub fn cancelled(&self) -> bool {
+        self.lock().cancelled
     }
 
     /// The same text: `other` is a clone of this one.
@@ -823,10 +912,82 @@ struct Job {
 /// Cloneable handle that enqueues outbound operations.
 #[derive(Clone, Debug)]
 pub struct Outbox {
-    tx: mpsc::Sender<Job>,
+    route: Route,
+}
+
+#[derive(Clone)]
+enum Route {
+    /// One scheduler for every op ([`Scheduler::new`]).
+    One(mpsc::Sender<Job>),
+    /// A scheduler per chat ([`Outbox::per_chat`]).
+    Chats(Arc<Chats>),
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::One(_) => f.write_str("One"),
+            Self::Chats(_) => f.write_str("Chats"),
+        }
+    }
+}
+
+/// Makes a scheduler with the given limits, runs it and returns its queue.
+type Start = Box<dyn Fn(Limits) -> mpsc::Sender<Job> + Send + Sync>;
+
+/// The schedulers of [`Outbox::per_chat`], started when a chat is first
+/// written to; `None` is the one for callback answers, which go to a user,
+/// not into a chat.
+struct Chats {
+    start: Start,
+    group: Limits,
+    private: Limits,
+    queues: Mutex<HashMap<Option<Chat>, mpsc::Sender<Job>>>,
+}
+
+impl Chats {
+    fn queue(&self, chat: Option<Chat>) -> mpsc::Sender<Job> {
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        queues
+            .entry(chat)
+            .or_insert_with(|| {
+                (self.start)(match chat {
+                    Some(Chat::Private(_)) => self.private,
+                    Some(Chat::Group) => self.group,
+                    // Callback answers take no token of any budget.
+                    None => Limits::from(BucketConfig::default()),
+                })
+            })
+            .clone()
+    }
 }
 
 impl Outbox {
+    /// A scheduler per chat (TASK-063), each started on the runtime the
+    /// first op for its chat is submitted on: `group` paces the group,
+    /// `private` each private chat, each with its own budgets and its own
+    /// rate after a 429 (TASK-068); callback answers go unmetered on a
+    /// scheduler of their own. A 429 pauses and slows only the chat that
+    /// got it.
+    pub fn per_chat<T: Transport>(transport: Arc<T>, group: Limits, private: Limits) -> Self {
+        let start: Start = Box::new(move |limits| {
+            let (scheduler, outbox) = Scheduler::new(transport.clone(), limits);
+            tokio::spawn(scheduler.run());
+            match outbox.route {
+                Route::One(tx) => tx,
+                Route::Chats(_) => unreachable!("Scheduler::new makes one queue"),
+            }
+        });
+        Self {
+            route: Route::Chats(Arc::new(Chats {
+                start,
+                group,
+                private,
+                queues: Mutex::new(HashMap::new()),
+            })),
+        }
+    }
+
     /// Enqueues `op`. The receiver resolves when Telegram answered; it errors
     /// only if the scheduler has stopped. Dropping it makes the op fire-and-forget.
     pub async fn submit(&self, op: Op) -> oneshot::Receiver<Delivery> {
@@ -844,10 +1005,13 @@ impl Outbox {
 
     async fn submit_job(&self, op: Op, status: Option<LiveText>) -> oneshot::Receiver<Delivery> {
         let (reply, receiver) = oneshot::channel();
+        let tx = match &self.route {
+            Route::One(tx) => tx.clone(),
+            Route::Chats(chats) => chats.queue(op.chat()),
+        };
         // A send error drops the job and its reply sender, so the receiver
         // reports the stopped scheduler by itself.
-        let _ = self
-            .tx
+        let _ = tx
             .send(Job {
                 op,
                 queued_at: Instant::now(),
@@ -917,7 +1081,10 @@ impl<T: Transport> Scheduler<T> {
             topic: VecDeque::new(),
             message: VecDeque::new(),
         };
-        (scheduler, Outbox { tx })
+        let outbox = Outbox {
+            route: Route::One(tx),
+        };
+        (scheduler, outbox)
     }
 
     /// Runs until every `Outbox` is dropped and the queue is empty.
@@ -1360,6 +1527,10 @@ impl<T: Transport> Scheduler<T> {
         let Some(mut job) = self.lane_mut(lane).remove(index) else {
             return;
         };
+        if job.status.as_ref().is_some_and(LiveText::cancelled) {
+            let _ = job.reply.send(Ok(Outcome::Superseded));
+            return;
+        }
         if matches!(lane, Lane::Message(_)) {
             self.merge_lines(&mut job, Instant::now());
         }
@@ -1670,6 +1841,204 @@ mod tests {
                 _ => Outcome::Done,
             })
         }
+    }
+
+    /// Answers 429 (`retry_after` 30 s) to the first request into `flooded`
+    /// and records when each request of each chat went (TASK-063).
+    struct ChatFlood {
+        start: Instant,
+        flooded: Mutex<Option<Chat>>,
+        calls: Mutex<Vec<(Option<Chat>, Duration)>>,
+    }
+
+    impl ChatFlood {
+        fn new(flooded: Chat) -> Arc<Self> {
+            Arc::new(Self {
+                start: Instant::now(),
+                flooded: Mutex::new(Some(flooded)),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn at(&self, chat: Option<Chat>) -> Vec<Duration> {
+            let calls = self.calls.lock().unwrap();
+            calls
+                .iter()
+                .filter(|(of, _)| *of == chat)
+                .map(|(_, at)| *at)
+                .collect()
+        }
+    }
+
+    impl Transport for ChatFlood {
+        async fn execute(&self, op: &Op) -> Delivery {
+            let chat = op.chat();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((chat, Instant::now() - self.start));
+            let mut flooded = self.flooded.lock().unwrap();
+            if chat.is_some() && *flooded == chat {
+                *flooded = None;
+                return Err(ApiError::RetryAfter(Duration::from_secs(30)));
+            }
+            Ok(match op {
+                Op::AnswerCallback { .. } => Outcome::Done,
+                _ => Outcome::Sent(Message::default()),
+            })
+        }
+    }
+
+    fn send_in(chat: Chat, text: &str) -> Op {
+        Op::Send {
+            chat,
+            thread_id: Some(7),
+            text: text.to_owned(),
+            html: None,
+            reply_markup: None,
+            permission: false,
+            reply_to: None,
+            notify: false,
+        }
+    }
+
+    /// TASK-063: with a scheduler per chat, a 429 pauses only the chat that
+    /// got it: the private chat's pause holds back neither the group nor a
+    /// callback answer, and the group's pause not the private chat.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_in_one_chat_holds_back_no_other_chat() {
+        let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(77));
+        for (flooded, other) in [(private, Chat::Group), (Chat::Group, private)] {
+            let fake = ChatFlood::new(flooded);
+            let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
+            let first = outbox.submit(send_in(flooded, "a")).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let second = outbox.submit(send_in(other, "b")).await;
+            let pressed = outbox
+                .submit(Op::AnswerCallback {
+                    query_id: "q".to_owned(),
+                    text: None,
+                })
+                .await;
+            assert!(matches!(second.await, Ok(Ok(Outcome::Sent(_)))));
+            assert!(matches!(pressed.await, Ok(Ok(Outcome::Done))));
+            assert!(matches!(first.await, Ok(Ok(Outcome::Sent(_)))));
+            let (flooded_at, other_at) = (fake.at(Some(flooded)), fake.at(Some(other)));
+            assert!(other_at[0] < Duration::from_secs(1), "{other_at:?}");
+            assert!(fake.at(None)[0] < Duration::from_secs(1));
+            assert_eq!(flooded_at.len(), 2, "sent again after the pause");
+            assert!(flooded_at[1] >= Duration::from_secs(30), "{flooded_at:?}");
+        }
+    }
+
+    /// TASK-063 on TASK-068: a 429 pauses and slows only its own chat. The
+    /// other chat's requests go exactly when they go without any 429, and
+    /// the chat that got it ends later than its pause alone explains (its
+    /// rate halved).
+    #[tokio::test(start_paused = true)]
+    async fn a_429_slows_no_other_chat() {
+        let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(77));
+        let nobody = Chat::Private(crate::hub::chat::PrivateChat::of_user(1));
+        let run = |flooded: Chat| async move {
+            let fake = ChatFlood::new(flooded);
+            let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
+            let mut answers = Vec::new();
+            for n in 0..12i64 {
+                for chat in [private, Chat::Group] {
+                    answers.push(outbox.submit(send_in(chat, &format!("s{n}"))).await);
+                    let edit = Op::Edit {
+                        chat,
+                        message_id: n,
+                        text: "e".to_owned(),
+                        reply_markup: None,
+                        background: false,
+                    };
+                    answers.push(outbox.submit(edit).await);
+                }
+            }
+            for answer in answers {
+                assert!(matches!(answer.await, Ok(Ok(_))));
+            }
+            fake
+        };
+        let calm = run(nobody).await;
+        for (flooded, other) in [(private, Chat::Group), (Chat::Group, private)] {
+            let fake = run(flooded).await;
+            assert_eq!(
+                fake.at(Some(other)),
+                calm.at(Some(other)),
+                "{other:?} goes as if nothing happened"
+            );
+            let (got, alone) = (fake.at(Some(flooded)), calm.at(Some(flooded)));
+            assert_eq!(got.len(), alone.len() + 1, "the refused request again");
+            let (last, calm_last) = (got[got.len() - 1], alone[alone.len() - 1]);
+            assert!(
+                last > calm_last + Duration::from_secs(30),
+                "{flooded:?} slower after its pause: {last:?} vs {calm_last:?}"
+            );
+        }
+    }
+
+    /// TASK-063: a status message cancelled while it waits never goes and
+    /// takes no token: the next message goes when it would have gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_status_message_never_goes() {
+        async fn run(cancel: bool) -> Vec<(String, Duration)> {
+            let fake = Fake::new(&[]);
+            let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+            let handle = tokio::spawn(scheduler.run());
+            let mut answers = Vec::new();
+            for i in 0..5 {
+                answers.push(outbox.submit(send(1, &format!("b{i}"))).await);
+            }
+            let status = LiveText::new("status".to_owned(), serde_json::json!({}));
+            let old = outbox.submit_status(send(2, "old"), status.clone()).await;
+            let next = outbox.submit(send(3, "next")).await;
+            if cancel {
+                status.cancel();
+            }
+            let old = old.await;
+            assert!(matches!(next.await, Ok(Ok(Outcome::Sent(_)))));
+            for answer in answers {
+                assert!(matches!(answer.await, Ok(Ok(Outcome::Sent(_)))));
+            }
+            if cancel {
+                assert!(matches!(old, Ok(Ok(Outcome::Superseded))));
+                assert!(!status.went());
+            }
+            handle.abort();
+            fake.calls()
+                .into_iter()
+                .map(|call| (text_of(&call.op).to_owned(), call.at))
+                .collect()
+        }
+        let calm = run(false).await;
+        let cancelled = run(true).await;
+        let at = |calls: &[(String, Duration)], text: &str| {
+            calls.iter().find(|(t, _)| t == text).map(|(_, at)| *at)
+        };
+        assert_eq!(at(&cancelled, "status"), None, "{cancelled:?}");
+        assert_eq!(at(&cancelled, "next"), at(&calm, "status"), "{calm:?}");
+    }
+
+    /// TASK-063: each chat has its own budget: ten messages into a private
+    /// chat go within 4 s, while the group keeps its 5 + one per 4 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_private_chat_has_its_own_message_budget() {
+        let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(77));
+        let fake = ChatFlood::new(Chat::Private(crate::hub::chat::PrivateChat::of_user(1)));
+        let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
+        let mut answers = Vec::new();
+        for n in 0..10 {
+            answers.push(outbox.submit(send_in(private, &format!("p{n}"))).await);
+            answers.push(outbox.submit(send_in(Chat::Group, &format!("g{n}"))).await);
+        }
+        for answer in answers {
+            assert!(matches!(answer.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        let (private_at, group_at) = (fake.at(Some(private)), fake.at(Some(Chat::Group)));
+        assert!(private_at[9] <= Duration::from_secs(4), "{private_at:?}");
+        assert!(group_at[9] >= Duration::from_secs(19), "{group_at:?}");
     }
 
     fn send(thread: i64, text: &str) -> Op {

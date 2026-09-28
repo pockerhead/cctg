@@ -83,6 +83,7 @@ fn post(event: HookEvent) -> HookPost {
 fn say(message_id: i64, text: &str) -> Control {
     Control::Message(Inbound {
         chat: Chat::Group,
+        sender: cctg::hub::chat::PrivateChat::of_user(1001),
         message_id,
         thread_id: Some(100),
         text: Some(text.into()),
@@ -91,6 +92,7 @@ fn say(message_id: i64, text: &str) -> Control {
         forwarded: false,
         media: None,
         from_name: None,
+        author: None,
     })
 }
 
@@ -188,6 +190,8 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         files: false,
         session_reads: false,
         status_lines: false,
+        private_place: false,
+        enrolled: None,
         heartbeat: false,
     };
     write
@@ -334,6 +338,8 @@ async fn a_burst_reaches_a_live_session_over_tcp_as_one_inbound() {
         files: false,
         session_reads: false,
         status_lines: false,
+        private_place: false,
+        enrolled: None,
         heartbeat: false,
     };
     write
