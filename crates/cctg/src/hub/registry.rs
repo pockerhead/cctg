@@ -336,6 +336,11 @@ pub struct View {
     /// The status message in the topic (TASK-029); its id is one of `chat`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusMessage>,
+    /// The group view of a slot that shows in the group only because its
+    /// owner's private chat was not usable (TASK-063): it goes once that
+    /// chat takes the session again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
     /// A topic call for this view is in flight.
     #[serde(skip)]
     pub busy: bool,
@@ -354,6 +359,7 @@ impl View {
             applied_icon: None,
             pending_separator: None,
             status: None,
+            fallback: false,
             busy: false,
             failed: None,
         }
@@ -800,6 +806,19 @@ impl Registry {
         slot.views.push(View::new(chat));
         self.dirty = true;
         true
+    }
+
+    /// The slot no longer shows in `chat` (TASK-063: a fallback group view
+    /// once the private chat took the session again): the view removed.
+    /// `None` when it is not there or the slot's only view.
+    pub fn remove_view(&mut self, id: SlotId, chat: Chat) -> Option<View> {
+        let slot = self.slots.get_mut(id.0)?;
+        if slot.views.len() < 2 {
+            return None;
+        }
+        let at = slot.views.iter().position(|view| view.chat == chat)?;
+        self.dirty = true;
+        Some(slot.views.remove(at))
     }
 
     /// A slot is free when no session that is still running holds it.
@@ -1879,7 +1898,10 @@ impl Registry {
             .filter(|view| view.topic_id == Some(thread_id))
         {
             // Its status message went with the topic.
-            *view = View::new(chat);
+            *view = View {
+                fallback: view.fallback,
+                ..View::new(chat)
+            };
             self.dirty = true;
         }
     }

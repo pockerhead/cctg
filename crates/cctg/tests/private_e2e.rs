@@ -19,7 +19,8 @@ use cctg::hub::ingress::{bind, serve_agents};
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Transport};
 use cctg::hub::slots::{
-    Control, ECHO_MARK, Options, Owners, PRIVATE_CLOSED_NOTICE, PRIVATE_START_TEXT, Slots,
+    Control, ECHO_MARK, FALLBACK_END_NOTICE, Options, Owners, PRIVATE_CLOSED_NOTICE,
+    PRIVATE_GENERAL_NOTICE, PRIVATE_START_TEXT, Slots,
 };
 use cctg::hub::updates::{CallbackInput, Inbound};
 use cctg::hub::{permissions, updates};
@@ -338,18 +339,28 @@ enum Mode {
 
 /// A hub on a fresh state.
 async fn start_hub(name: &str, mode: Mode, fake: Fake) -> Hub {
+    let state = fresh_state(name);
+    start_hub_on(&state, mode, Arc::new(fake), true).await
+}
+
+fn fresh_state(name: &str) -> PathBuf {
     let state =
         std::env::temp_dir().join(format!("cctg-private-e2e-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
     std::fs::create_dir_all(&state).unwrap();
-    let fake = Arc::new(fake);
+    state
+}
+
+/// A hub on `state` as a hub before left it (`registry.json`), talking to
+/// `fake`; `own`: it removes `state` when dropped.
+async fn start_hub_on(state: &std::path::Path, mode: Mode, fake: Arc<Fake>, own: bool) -> Hub {
     let fast = Limits::from(BucketConfig {
         capacity: 1000,
         refill_every: Duration::from_millis(1),
         min_gap: Duration::ZERO,
     });
     let outbox = Outbox::per_chat(fake.clone(), fast, fast);
-    let store = RegistryStore::open(&state).unwrap();
+    let store = RegistryStore::open(state).unwrap();
     let registry = store.load().unwrap();
     let options = Options {
         grace: Duration::ZERO,
@@ -380,13 +391,19 @@ async fn start_hub(name: &str, mode: Mode, fake: Fake) -> Hub {
         )),
         tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx)),
     ];
+    // A hub that hands its state on removes nothing.
+    let keep = if own {
+        state.to_path_buf()
+    } else {
+        state.join("never-there")
+    };
     Hub {
         fake,
         agent_addr,
         hooks,
         control,
         tasks,
-        _state: TempRoot(state),
+        _state: TempRoot(keep),
     }
 }
 
@@ -454,6 +471,25 @@ impl Hub {
             }))
             .unwrap();
         message_id
+    }
+
+    /// A user's message in the General of `chat`.
+    fn say_general(&self, chat: Chat, text: &str) {
+        self.control
+            .send(Control::Message(Inbound {
+                chat,
+                sender: PrivateChat::of_user(OWNER),
+                message_id: 1,
+                thread_id: None,
+                text: Some(text.into()),
+                reply_to: None,
+                quote: None,
+                forwarded: false,
+                media: None,
+                from_name: None,
+                author: None,
+            }))
+            .unwrap();
     }
 
     /// A press of the button `data` of message `message_id` in `chat`.
@@ -559,6 +595,46 @@ fn prompt_in(fake: &Fake, chat: Chat, request_id: &str) -> Option<Shown> {
     fake.shown(chat)
         .into_iter()
         .find(|shown| shown.text.starts_with("Запрос разрешения"))
+}
+
+/// The prompts the topic of `chat` shows.
+fn prompts_in(fake: &Fake, chat: Chat) -> usize {
+    fake.shown(chat)
+        .iter()
+        .filter(|shown| shown.text.starts_with("Запрос разрешения"))
+        .count()
+}
+
+/// The prompt shows in `chat` with its buttons.
+fn asks_in(fake: &Fake, chat: Chat, request_id: &str) -> bool {
+    prompt_in(fake, chat, request_id)
+        .is_some_and(|prompt| prompt.buttons == ["Разрешить", "Запретить"])
+}
+
+/// Presses Allow on the prompt of `request_id` in `chat`: the agent gets
+/// the one verdict and acks it.
+async fn allow_in(hub: &Hub, agent: &mut Agent, chat: Chat, request_id: &str) {
+    let message = prompt_in(&hub.fake, chat, request_id).unwrap().id;
+    hub.press(chat, message, &format!("allow:{request_id}"));
+    let verdict_id = loop {
+        match agent.next().await {
+            Some(HubMsg::PermissionVerdict {
+                request_id: got,
+                behavior: Behavior::Allow,
+                verdict_id: Some(verdict_id),
+            }) if got == request_id => break verdict_id,
+            Some(HubMsg::Inbound { .. }) | None => panic!("no verdict"),
+            Some(_) => {}
+        }
+    };
+    agent.send(AgentMsg::PermissionAck { verdict_id }).await;
+}
+
+/// The prompt of `request_id` in `chat` shows the decision, no buttons.
+fn allowed_in(fake: &Fake, chat: Chat, request_id: &str) -> bool {
+    prompt_in(fake, chat, request_id).is_some_and(|prompt| {
+        prompt.text.ends_with(permissions::ALLOWED_MARK) && prompt.buttons.is_empty()
+    })
 }
 
 /// Every text Telegram got, for the leak check.
@@ -804,7 +880,9 @@ async fn e2e_an_old_agent_gets_the_private_chats_messages_too() {
 
 /// A private chat whose user never pressed Start (403): the group is told
 /// once and the session goes on in the group alone; once the user presses
-/// Start, the private view comes and takes the session.
+/// Start, the private view comes and takes the session, and the slot
+/// leaves the group (it was there only for the 403): its group topic is
+/// told, loses its status message and gets nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_a_private_chat_without_start_leaves_the_session_in_the_group() {
     let fake = Fake::default();
@@ -829,35 +907,30 @@ async fn e2e_a_private_chat_without_start_leaves_the_session_in_the_group() {
 
     // Start: Telegram sends `/start` into the private chat's General.
     hub.fake.forbid_private.store(false, Ordering::SeqCst);
-    hub.control
-        .send(Control::Message(Inbound {
-            chat: owner(),
-            sender: PrivateChat::of_user(OWNER),
-            message_id: 1,
-            thread_id: None,
-            text: Some("/start".into()),
-            reply_to: None,
-            quote: None,
-            forwarded: false,
-            media: None,
-            from_name: None,
-            author: None,
-        }))
-        .unwrap();
+    hub.say_general(owner(), "/start");
     hub.until("the private chat is answered and gets the topic", |fake| {
         fake.general(owner()) == [PRIVATE_START_TEXT] && fake.layout(owner()) == ["STATUS"]
     })
     .await;
-    agent
-        .send(AgentMsg::Reply {
-            text: "в обоих".into(),
-        })
-        .await;
-    hub.until("the next reply in both views", |fake| {
-        fake.layout(owner()) == ["в обоих", "STATUS"]
-            && fake.layout(Chat::Group) == ["только в группе", "в обоих", "STATUS"]
+    hub.until("the group topic is told and has no status", |fake| {
+        fake.layout(Chat::Group) == ["только в группе", FALLBACK_END_NOTICE]
     })
     .await;
+    agent
+        .send(AgentMsg::Reply {
+            text: "в личке".into(),
+        })
+        .await;
+    hub.until("the next reply in the private chat alone", |fake| {
+        fake.layout(owner()) == ["в личке", "STATUS"]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        hub.fake.layout(Chat::Group),
+        ["только в группе", FALLBACK_END_NOTICE],
+        "nothing more in the group"
+    );
     assert_eq!(
         hub.fake.general(Chat::Group),
         [PRIVATE_CLOSED_NOTICE],
@@ -865,8 +938,256 @@ async fn e2e_a_private_chat_without_start_leaves_the_session_in_the_group() {
     );
 }
 
+/// A private-only slot whose owner blocks the bot for a while (TASK-063):
+/// the reply that hit the 403 goes to the group, which takes the session
+/// meanwhile; the private status message stays where it was. Once the
+/// owner writes again, the slot is private-only again, and its private
+/// status message is the one live status there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_blocked_bot_moves_a_private_slot_to_the_group_and_back() {
+    let hub = start_hub("blocked", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.fake.forbid_private.store(true, Ordering::SeqCst);
+    agent
+        .send(AgentMsg::Reply {
+            text: "в заблокированную".into(),
+        })
+        .await;
+    hub.until("the reply lost to the 403 is in the group", |fake| {
+        fake.layout(Chat::Group) == ["в заблокированную", "STATUS"]
+            && fake.general(Chat::Group) == [PRIVATE_CLOSED_NOTICE]
+    })
+    .await;
+    assert_eq!(hub.fake.layout(owner()), ["STATUS"], "the old status stays");
+
+    // The owner writes in the private topic: it opens again.
+    hub.fake.forbid_private.store(false, Ordering::SeqCst);
+    hub.say(owner(), "снова тут");
+    let (content, _) = agent.inbound().await;
+    assert_eq!(content, "снова тут");
+    hub.until("the slot leaves the group", |fake| {
+        fake.layout(Chat::Group) == ["в заблокированную", FALLBACK_END_NOTICE]
+    })
+    .await;
+    agent
+        .send(AgentMsg::Reply {
+            text: "в личке".into(),
+        })
+        .await;
+    hub.until("one live status, below the new messages", |fake| {
+        fake.layout(owner()) == ["снова тут", "в личке", "STATUS"]
+    })
+    .await;
+}
+
+/// A message in the private chat's General other than `/start` reaches no
+/// session and is answered once a minute with where to write; `/start` in
+/// a chat that is open already gets the start text again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_the_private_general_answers_where_to_write() {
+    let hub = start_hub("general", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.say_general(owner(), "привет");
+    hub.say_general(owner(), "ещё");
+    hub.say_general(owner(), "/start");
+    hub.until("both answers in General", |fake| {
+        fake.general(owner()) == [PRIVATE_GENERAL_NOTICE, PRIVATE_START_TEXT]
+    })
+    .await;
+    assert!(
+        !matches!(
+            agent.next_within(Duration::from_millis(300)).await,
+            Some(HubMsg::Inbound { .. })
+        ),
+        "General reaches no session"
+    );
+}
+
+/// The user deletes the private topic of a shared slot and the next
+/// message of the session is a permission prompt (code review TASK-063):
+/// the prompt is not lost. Its twin in the group stays, it goes again into
+/// the private topic made again, and a press there decides it in both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_prompt_into_a_deleted_private_topic_of_a_shared_slot_goes_again() {
+    let hub = start_hub("prompt-deleted-shared", SHARED, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.both("a status message in both views", &["STATUS"])
+        .await;
+    let first = hub.fake.topic(owner()).unwrap();
+    hub.fake.delete_topic(owner());
+    agent.send(permission("abcde")).await;
+    hub.until(
+        "the prompt in the new private topic and in the group",
+        |fake| {
+            fake.topic(owner()).is_some_and(|topic| topic != first)
+                && asks_in(fake, owner(), "abcde")
+                && asks_in(fake, Chat::Group, "abcde")
+        },
+    )
+    .await;
+    assert_eq!(prompts_in(&hub.fake, Chat::Group), 1, "the twin is kept");
+    allow_in(&hub, &mut agent, owner(), "abcde").await;
+    hub.until("both show the decision", |fake| {
+        allowed_in(fake, owner(), "abcde") && allowed_in(fake, Chat::Group, "abcde")
+    })
+    .await;
+    assert_eq!(prompts_in(&hub.fake, Chat::Group), 1);
+    assert_eq!(prompts_in(&hub.fake, owner()), 1);
+}
+
+/// The same for a slot in the private chat alone: the prompt goes into the
+/// topic made again, and nothing goes to the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_prompt_into_a_deleted_private_topic_goes_again() {
+    let hub = start_hub("prompt-deleted-private", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    let first = hub.fake.topic(owner()).unwrap();
+    hub.fake.delete_topic(owner());
+    agent.send(permission("abcde")).await;
+    hub.until("the prompt in the new private topic", |fake| {
+        fake.topic(owner()).is_some_and(|topic| topic != first) && asks_in(fake, owner(), "abcde")
+    })
+    .await;
+    allow_in(&hub, &mut agent, owner(), "abcde").await;
+    hub.until("it shows the decision", |fake| {
+        allowed_in(fake, owner(), "abcde")
+    })
+    .await;
+    assert!(
+        hub.fake
+            .ops()
+            .iter()
+            .all(|op| op.chat().is_none_or(|chat| chat != Chat::Group)),
+        "{:#?}",
+        hub.fake.ops()
+    );
+}
+
+/// A shared slot whose owner blocked the bot (403) gets a permission
+/// prompt: the group shows it once, with its buttons (its twin is the
+/// prompt now), and a press there decides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_prompt_that_meets_a_403_is_the_groups() {
+    let hub = start_hub("prompt-403", SHARED, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.both("a status message in both views", &["STATUS"])
+        .await;
+    hub.fake.forbid_private.store(true, Ordering::SeqCst);
+    agent.send(permission("abcde")).await;
+    hub.until("the prompt in the group, the notice in General", |fake| {
+        asks_in(fake, Chat::Group, "abcde") && fake.general(Chat::Group) == [PRIVATE_CLOSED_NOTICE]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(prompts_in(&hub.fake, Chat::Group), 1, "not sent twice");
+    allow_in(&hub, &mut agent, Chat::Group, "abcde").await;
+    hub.until("the group shows the decision", |fake| {
+        allowed_in(fake, Chat::Group, "abcde")
+    })
+    .await;
+    assert_eq!(prompts_in(&hub.fake, Chat::Group), 1);
+}
+
+/// The first minutes after the hub update (code review TASK-063): a slot a
+/// hub before made in the group (topic, live session, status message) gets
+/// a private topic; each view ends with one status message, a reply shows
+/// in both, and a message from either view reaches the session once, with
+/// its echo in the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_after_the_hub_update_a_group_slot_gets_its_private_view() {
+    let state = fresh_state("update");
+    let fake = Arc::new(Fake::default());
+    let old = start_hub_on(&state, Mode::Group, fake.clone(), false).await;
+    old.start().await;
+    let mut agent = Agent::connect(&old, true).await;
+    old.until("status in the group", |f| {
+        f.layout(Chat::Group) == ["STATUS"]
+    })
+    .await;
+    agent
+        .send(AgentMsg::Reply {
+            text: "до".into()
+        })
+        .await;
+    old.until("reply in the group", |f| {
+        f.layout(Chat::Group) == ["до", "STATUS"]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(agent);
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let new = start_hub_on(&state, PRIVATE, fake.clone(), true).await;
+    let mut agent = Agent::connect(&new, true).await;
+    new.until("a private topic with the status", |f| {
+        f.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    agent
+        .send(AgentMsg::Reply {
+            text: "после".into(),
+        })
+        .await;
+    new.until("the reply in both", |f| {
+        f.layout(owner()).contains(&"после".to_owned())
+            && f.layout(Chat::Group).contains(&"после".to_owned())
+    })
+    .await;
+    new.say(owner(), "из лички");
+    let (content, meta) = agent.inbound().await;
+    assert_eq!(
+        (content.as_str(), meta["place"].as_str()),
+        ("из лички", "private")
+    );
+    new.until("the echo in the group", |f| {
+        f.layout(Chat::Group).contains(&echo("из лички"))
+    })
+    .await;
+    let second = agent.next_within(Duration::from_millis(800)).await;
+    assert!(
+        !matches!(second, Some(HubMsg::Inbound { .. })),
+        "a second inbound: {second:?}"
+    );
+    new.say(Chat::Group, "из группы");
+    let (content, meta) = agent.inbound().await;
+    assert_eq!(
+        (content.as_str(), meta["place"].as_str()),
+        ("из группы", "group")
+    );
+    new.until("the echo in the private chat, one status in each", |f| {
+        f.layout(owner()) == ["после", "из лички", echo("из группы").as_str(), "STATUS"]
+            && f.layout(Chat::Group)
+                == [
+                    "до",
+                    "после",
+                    echo("из лички").as_str(),
+                    "из группы",
+                    "STATUS",
+                ]
+    })
+    .await;
+}
+
 /// The user deletes the private topic: the next message finds it gone and
-/// the slot gets a new private topic, which takes the session again.
+/// the slot gets a new private topic, which takes the session again; that
+/// message goes again into it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_a_deleted_private_topic_is_made_again() {
     let hub = start_hub("deleted", PRIVATE, Fake::default()).await;
@@ -893,8 +1214,8 @@ async fn e2e_a_deleted_private_topic_is_made_again() {
             text: "два".into()
         })
         .await;
-    hub.until("the next reply in the new topic", |fake| {
-        fake.layout(owner()).contains(&"два".to_owned())
+    hub.until("both replies in the new topic, in order", |fake| {
+        fake.layout(owner()) == ["раз", "два", "STATUS"]
     })
     .await;
 }

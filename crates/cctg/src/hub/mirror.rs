@@ -17,7 +17,10 @@
 //!   no message and is made again (a stream line, a status message) or ends
 //!   (a prompt, a question) takes its twin away; any other keeps it unlinked
 //!   (the mirror still shows it), and so does one merged into an earlier
-//!   message.
+//!   message. A prompt or question lost in a private chat (its topic
+//!   deleted, the bot blocked) goes again: its twins are kept for that send
+//!   ([`Landed::Again`], [`Mirror::carry`]), or one of them becomes the
+//!   prompt itself.
 //! - A call about a primary message whose twin is still on its way waits
 //!   in the book, the newest one only (every call carries the whole text; a
 //!   delete wins over an edit), and goes once the twin's id is known.
@@ -53,6 +56,10 @@ pub enum Landed {
     Merged,
     /// No message: refused, superseded or no answer.
     Nothing,
+    /// No message now, and the actor sends it again (a prompt or question
+    /// lost in a private chat): its twins are kept, never taken away as
+    /// ghosts ([`Mirror::kept`]).
+    Again,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +69,8 @@ enum Primary {
     Key(MessageKey),
     Merged,
     Nothing,
+    /// It goes again; the twin waits for that send ([`Mirror::carry`]).
+    Again,
 }
 
 #[derive(Debug)]
@@ -127,6 +136,9 @@ pub struct Mirror {
     lasting: VecDeque<(MessageKey, MessageKey)>,
     /// `lasting` changed since [`Self::take_changed`].
     changed: bool,
+    /// Twin sends kept for a primary send that goes again, by the dispatch
+    /// number of the send that was lost.
+    kept: HashMap<u64, Vec<u64>>,
 }
 
 impl Mirror {
@@ -180,6 +192,15 @@ impl Mirror {
             Landed::Message(id) => Primary::Key(MessageKey::new(chat, id)),
             Landed::Merged => Primary::Merged,
             Landed::Nothing => Primary::Nothing,
+            Landed::Again => {
+                for id in &ids {
+                    if let Some(send) = self.sends.get_mut(id) {
+                        send.primary = Primary::Again;
+                    }
+                }
+                self.kept.entry(seq).or_default().extend(ids);
+                return Vec::new();
+            }
         };
         let mut follows = Vec::new();
         for id in ids {
@@ -210,7 +231,7 @@ impl Mirror {
     fn settle(&mut self, id: u64) -> Option<Follow> {
         let send = self.sends.get(&id)?;
         let answer = send.answer?;
-        if matches!(send.primary, Primary::Waiting(_)) {
+        if matches!(send.primary, Primary::Waiting(_) | Primary::Again) {
             return None;
         }
         let send = self.sends.remove(&id)?;
@@ -296,6 +317,92 @@ impl Mirror {
             }
         }
         writes
+    }
+
+    /// The primary send `seq` has twin sends (it is not answered yet).
+    pub fn twinned(&self, seq: u64) -> bool {
+        self.by_seq.contains_key(&seq)
+    }
+
+    /// The twins kept for lost primary send `seq` ([`Landed::Again`]): each
+    /// one's chat and, once Telegram answered it, the message it made.
+    pub fn kept(&self, seq: u64) -> Vec<(Chat, Option<Option<i64>>)> {
+        self.kept
+            .get(&seq)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.sends.get(id))
+            .map(|send| (send.chat, send.answer))
+            .collect()
+    }
+
+    /// The lost primary send whose kept twin `twin` is.
+    pub fn kept_of(&self, twin: MessageKey) -> Option<u64> {
+        self.kept.iter().find_map(|(seq, ids)| {
+            ids.iter()
+                .filter_map(|id| self.sends.get(id))
+                .any(|send| send.chat == twin.chat && send.answer == Some(Some(twin.id)))
+                .then_some(*seq)
+        })
+    }
+
+    /// Lost primary sends with kept twins.
+    pub fn lost(&self) -> Vec<u64> {
+        self.kept.keys().copied().collect()
+    }
+
+    /// Lost primary send `old` went again as dispatch number `new`: its kept
+    /// twins wait for that send's answer, and a twin that made no message is
+    /// forgotten. The chats that keep a twin: no new twin goes there.
+    pub fn carry(&mut self, old: u64, new: u64) -> Vec<Chat> {
+        let mut chats = Vec::new();
+        for id in self.kept.remove(&old).unwrap_or_default() {
+            let Some(send) = self.sends.get_mut(&id) else {
+                continue;
+            };
+            if send.answer == Some(None) {
+                self.sends.remove(&id);
+                continue;
+            }
+            send.primary = Primary::Waiting(new);
+            chats.push(send.chat);
+            self.by_seq.entry(new).or_default().push(id);
+        }
+        chats
+    }
+
+    /// The chats [`Self::carry`] would keep a twin in.
+    pub fn kept_chats(&self, old: u64) -> Vec<Chat> {
+        self.kept(old)
+            .into_iter()
+            .filter(|(_, answer)| *answer != Some(None))
+            .map(|(chat, _)| chat)
+            .collect()
+    }
+
+    /// Lost primary send `old` does not go again (one of its twins became
+    /// the prompt itself, or the prompt ended): its kept twins are let go.
+    /// The ones Telegram shows are returned for the actor to clear or keep;
+    /// one still on its way is deleted once it comes, like a ghost.
+    pub fn release(&mut self, old: u64) -> Vec<MessageKey> {
+        let mut shown = Vec::new();
+        for id in self.kept.remove(&old).unwrap_or_default() {
+            let Some(send) = self.sends.get_mut(&id) else {
+                continue;
+            };
+            match send.answer {
+                Some(answer) => {
+                    let chat = send.chat;
+                    self.sends.remove(&id);
+                    shown.extend(answer.map(|twin| MessageKey::new(chat, twin)));
+                }
+                None => {
+                    send.primary = Primary::Nothing;
+                    send.ghost = true;
+                }
+            }
+        }
+        shown
     }
 
     /// The twin of `primary` shown in `chat`.
@@ -476,6 +583,53 @@ mod tests {
         assert!(mirror.twin_answered(merged, Some(51)).is_empty());
         assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 51)), None);
         assert_eq!(mirror.waiting(), 0);
+    }
+
+    #[test]
+    fn a_prompt_that_goes_again_keeps_its_twin_for_the_next_send() {
+        let mut mirror = Mirror::default();
+        // The twin comes before the primary is lost, and one after.
+        let early = mirror.send(1, Chat::Group, true, false).unwrap();
+        mirror.twin_answered(early, Some(50));
+        assert!(
+            mirror
+                .primary_answered(1, owner(), Landed::Again)
+                .is_empty()
+        );
+        let late = mirror.send(2, Chat::Group, true, false).unwrap();
+        mirror.primary_answered(2, owner(), Landed::Again);
+        assert_eq!(mirror.kept(2), [(Chat::Group, None)]);
+        assert!(mirror.twin_answered(late, Some(51)).is_empty(), "no delete");
+        assert_eq!(mirror.kept(1), [(Chat::Group, Some(Some(50)))]);
+        assert_eq!(mirror.kept_of(MessageKey::new(Chat::Group, 51)), Some(2));
+        let mut lost = mirror.lost();
+        lost.sort_unstable();
+        assert_eq!(lost, [1, 2]);
+        // Sent again as number 7: the kept twin is linked to that message.
+        assert_eq!(mirror.kept_chats(1), [Chat::Group]);
+        assert_eq!(mirror.carry(1, 7), [Chat::Group]);
+        assert!(mirror.twinned(7));
+        mirror.primary_answered(7, owner(), Landed::Message(9));
+        assert_eq!(
+            mirror.twin(MessageKey::new(owner(), 9), Chat::Group),
+            Some(MessageKey::new(Chat::Group, 50))
+        );
+        assert_eq!(
+            mirror.primary_of(MessageKey::new(Chat::Group, 50)),
+            Some(MessageKey::new(owner(), 9))
+        );
+        // Not sent again: the twin is handed back, not deleted.
+        assert_eq!(mirror.release(2), [MessageKey::new(Chat::Group, 51)]);
+        assert!(mirror.lost().is_empty());
+        assert_eq!(mirror.waiting(), 0);
+        // One still on its way when let go is deleted once it comes.
+        let unanswered = mirror.send(3, Chat::Group, true, false).unwrap();
+        mirror.primary_answered(3, owner(), Landed::Again);
+        assert!(mirror.release(3).is_empty());
+        assert!(matches!(
+            mirror.twin_answered(unanswered, Some(52)).as_slice(),
+            [Follow::Delete(key)] if *key == MessageKey::new(Chat::Group, 52)
+        ));
     }
 
     #[test]
