@@ -169,11 +169,12 @@ fn write_newer(path: &Path, original: &[u8]) -> String {
     // The changed bytes void the linker's ad-hoc signature (Apple Silicon).
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(path)
-            .status()
-            .expect("codesign runs");
+        let status = common::status(
+            Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(path),
+        )
+        .expect("codesign runs");
         assert!(status.success(), "codesign");
     }
     other
@@ -204,20 +205,21 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
 
     let mut command = Command::new(&exe);
     common::isolate(&mut command, &home);
-    let mut child = command
-        .arg("agent")
-        .current_dir(&work)
-        .env("CCTG_HUB_SECRET", SECRET)
-        .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
-        .env("CCTG_HOST", "box")
-        .env("CCTG_STATE_DIR", root.0.join("state"))
-        .env("CLAUDE_CODE_SESSION_ID", SESSION)
-        .env("CLAUDE_CONFIG_DIR", home.join("claude"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("cctg agent starts");
+    let mut child = common::spawn(
+        command
+            .arg("agent")
+            .current_dir(&work)
+            .env("CCTG_HUB_SECRET", SECRET)
+            .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
+            .env("CCTG_HOST", "box")
+            .env("CCTG_STATE_DIR", root.0.join("state"))
+            .env("CLAUDE_CODE_SESSION_ID", SESSION)
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("cctg agent starts");
     let mut claude = child.stdin.take().unwrap();
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     {
@@ -566,21 +568,22 @@ fn start_session(root: &Path, exe: &Path, port: u16, base: &str) -> Session {
     }
     let mut command = Command::new(exe);
     common::isolate(&mut command, &home);
-    let mut child = command
-        .arg("agent")
-        .current_dir(&work)
-        .env("CCTG_HUB_SECRET", SECRET)
-        .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
-        .env("CCTG_HOST", "box")
-        .env("CCTG_STATE_DIR", root.join("state"))
-        .env("CCTG_RELEASE_BASE_URL", base)
-        .env("CLAUDE_CODE_SESSION_ID", SESSION)
-        .env("CLAUDE_CONFIG_DIR", home.join("claude"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("cctg agent starts");
+    let mut child = common::spawn(
+        command
+            .arg("agent")
+            .current_dir(&work)
+            .env("CCTG_HUB_SECRET", SECRET)
+            .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
+            .env("CCTG_HOST", "box")
+            .env("CCTG_STATE_DIR", root.join("state"))
+            .env("CCTG_RELEASE_BASE_URL", base)
+            .env("CLAUDE_CODE_SESSION_ID", SESSION)
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("cctg agent starts");
     let mut claude = child.stdin.take().unwrap();
     let out = Arc::new(Mutex::new(Vec::<String>::new()));
     {

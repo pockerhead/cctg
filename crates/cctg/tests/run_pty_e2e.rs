@@ -405,7 +405,7 @@ mod unix {
                 Ok(())
             });
         }
-        let child = command.spawn().expect("cctg run starts");
+        let child = common::spawn(&mut command).expect("cctg run starts");
         let scene = Scene {
             log: log.clone(),
             terminal,

@@ -144,13 +144,14 @@ fn main() {
     reason = "the launcher exits at once; the harness talks to the stand-in"
 )]
 fn launch() {
-    Command::new(std::env::current_exe().expect("own path"))
-        .env(ROLE, "claude")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start the stand-in");
+    common::spawn(
+        Command::new(std::env::current_exe().expect("own path"))
+            .env(ROLE, "claude")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null()),
+    )
+    .expect("start the stand-in");
 }
 
 fn out(session: &str, mut line: Value) {
@@ -184,12 +185,13 @@ fn stand_in() {
         let started = Instant::now();
         let mut command = Command::new(&cctg);
         prepare(&mut command);
-        let child = command
-            .args(["hook", event])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        let child = common::spawn(
+            command
+                .args(["hook", event])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
         let Ok(mut child) = child else {
             return json!({"hook": event, "error": "spawn"});
         };
@@ -235,13 +237,14 @@ fn stand_in() {
         } else if command.get("agent").is_some() {
             let mut spawn = Command::new(&cctg);
             prepare(&mut spawn);
-            let mut child = spawn
-                .arg("agent")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("start cctg agent");
+            let mut child = common::spawn(
+                spawn
+                    .arg("agent")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+            )
+            .expect("start cctg agent");
             let stdin = child.stdin.take().expect("agent stdin");
             let stdout = child.stdout.take().expect("agent stdout");
             let session = session.clone();
@@ -261,16 +264,17 @@ fn stand_in() {
             }
         } else if let Some(nest) = command.get("nest") {
             let nested = nest["session"].as_str().unwrap_or_default().to_owned();
-            let mut child = Command::new(std::env::current_exe().expect("own path"))
-                .env(ROLE, "claude")
-                .env("SOAK_SESSION", &nested)
-                .env("SOAK_ENTRYPOINT", "sdk-cli")
-                .env("SOAK_SCRIPT", nest["script"].to_string())
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("start the nested stand-in");
+            let mut child = common::spawn(
+                Command::new(std::env::current_exe().expect("own path"))
+                    .env(ROLE, "claude")
+                    .env("SOAK_SESSION", &nested)
+                    .env("SOAK_ENTRYPOINT", "sdk-cli")
+                    .env("SOAK_SCRIPT", nest["script"].to_string())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null()),
+            )
+            .expect("start the nested stand-in");
             let stdout = child.stdout.take().expect("nested stdout");
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
@@ -1115,20 +1119,21 @@ impl Soak {
         std::fs::write(&transcript, "").unwrap();
         let mut command = Command::new(&self.bin);
         common::isolate(&mut command, &self.home);
-        let mut launcher = command
-            .env(ROLE, "launch")
-            .env("SOAK_SESSION", id)
-            .env("SOAK_ENTRYPOINT", "cli")
-            .env("SOAK_CCTG", env!("CARGO_BIN_EXE_cctg"))
-            .env("SOAK_CWD", folder)
-            .env("CLAUDE_CONFIG_DIR", &self.config_dir)
-            .env_remove("SOAK_SCRIPT")
-            .current_dir(folder)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start the launcher");
+        let mut launcher = common::spawn(
+            command
+                .env(ROLE, "launch")
+                .env("SOAK_SESSION", id)
+                .env("SOAK_ENTRYPOINT", "cli")
+                .env("SOAK_CCTG", env!("CARGO_BIN_EXE_cctg"))
+                .env("SOAK_CWD", folder)
+                .env("CLAUDE_CONFIG_DIR", &self.config_dir)
+                .env_remove("SOAK_SCRIPT")
+                .current_dir(folder)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )
+        .expect("start the launcher");
         let stdin = launcher.stdin.take().expect("launcher stdin");
         let stdout = launcher.stdout.take().expect("launcher stdout");
         let lines = Arc::new(Mutex::new(Vec::new()));

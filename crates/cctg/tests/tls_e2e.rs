@@ -226,11 +226,6 @@ impl Drop for Proc {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn collect(mut stream: impl Read + Send + 'static) -> Arc<Mutex<String>> {
     let log = Arc::new(Mutex::new(String::new()));
     let sink = log.clone();
@@ -290,7 +285,7 @@ async fn session_start(home: &Path, work: &Path) -> String {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = tokio::task::spawn_blocking(move || {
-        let mut child = command.spawn().expect("cctg hook");
+        let mut child = common::spawn(&mut command).expect("cctg hook");
         child
             .stdin
             .take()
@@ -315,7 +310,7 @@ async fn health(home: &Path, ports: (u16, u16)) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    tokio::task::spawn_blocking(move || command.status().expect("cctg health"))
+    tokio::task::spawn_blocking(move || common::status(&mut command).expect("cctg health"))
         .await
         .unwrap()
         .success()
@@ -339,7 +334,7 @@ async fn devices_reach_the_hub_only_over_pinned_tls() {
 
     let fake = Arc::new(Fake::default());
     let api_port = serve_fake(fake.clone()).await;
-    let ports = (free_port(), free_port());
+    let ports = (common::free_port(), common::free_port());
     let mut hub_command = common::cctg(&hub_home);
     hub_command
         .arg("hub")
@@ -357,7 +352,7 @@ async fn devices_reach_the_hub_only_over_pinned_tls() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut hub = Proc(hub_command.spawn().expect("cctg hub"));
+    let mut hub = Proc(common::spawn(&mut hub_command).expect("cctg hub"));
     let hub_log = collect(hub.0.stderr.take().unwrap());
     wait_for("a polling hub", || fake.calls_of("getUpdates") > 0).await;
     assert!(health(&hub_home, ports).await, "cctg health sees the hub");
@@ -398,7 +393,7 @@ async fn devices_reach_the_hub_only_over_pinned_tls() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut agent = Proc(agent_command.spawn().expect("cctg agent"));
+    let mut agent = Proc(common::spawn(&mut agent_command).expect("cctg agent"));
     let mut agent_in = agent.0.stdin.take().unwrap();
     for line in [
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,

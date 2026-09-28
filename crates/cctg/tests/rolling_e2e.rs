@@ -307,19 +307,20 @@ impl Drop for Agent {
 }
 
 fn start_agent(s: &Session, port: u16) -> Agent {
-    let mut child = common::cctg(&s.home)
-        .arg("agent")
-        .current_dir(&s.workdir)
-        .env("CCTG_HUB_SECRET", SECRET)
-        .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
-        .env("CCTG_HOST", HOST)
-        .env("CLAUDE_CODE_SESSION_ID", &s.id)
-        .env("CLAUDE_CONFIG_DIR", &s.config)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn cctg agent");
+    let mut child = common::spawn(
+        common::cctg(&s.home)
+            .arg("agent")
+            .current_dir(&s.workdir)
+            .env("CCTG_HUB_SECRET", SECRET)
+            .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
+            .env("CCTG_HOST", HOST)
+            .env("CLAUDE_CODE_SESSION_ID", &s.id)
+            .env("CLAUDE_CONFIG_DIR", &s.config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("spawn cctg agent");
     // Keep stdin open (the agent stops at EOF) and drain stdout.
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(

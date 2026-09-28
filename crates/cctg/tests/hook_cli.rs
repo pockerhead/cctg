@@ -43,13 +43,14 @@ fn home(test: &str, addr: Option<&str>) -> PathBuf {
 
 fn run_hook(home: &Path, event: &str, stdin: &[u8]) -> (Output, Duration) {
     let started = Instant::now();
-    let mut child = common::cctg(home)
-        .args(["hook", event])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cctg starts");
+    let mut child = common::spawn(
+        common::cctg(home)
+            .args(["hook", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("cctg starts");
     let mut input = child.stdin.take().unwrap();
     let _ = input.write_all(stdin);
     drop(input);
@@ -237,10 +238,9 @@ async fn a_silent_hub_keeps_session_end_well_inside_its_budget() {
 
 #[test]
 fn no_hub_listening_is_quiet_and_fast() {
-    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // Held: nothing listens there (TASK-066).
+    let (_held, port) = common::held_port();
+    let port = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let home = home("refused", Some(&port.to_string()));
     for (event, name) in [
         ("SessionStart", "session_start"),
@@ -257,23 +257,23 @@ fn no_hub_listening_is_quiet_and_fast() {
 
 #[test]
 fn an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure() {
-    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // Held: nothing listens there (TASK-066).
+    let (_held, port) = common::held_port();
+    let port = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     // No home and no CCTG_STATE_DIR: the device has no spool.
-    let mut child = common::cctg(Path::new(env!("CARGO_TARGET_TMPDIR")))
-        .args(["hook", "Stop"])
-        .env_remove("USERPROFILE")
-        .env_remove("HOME")
-        .env("CCTG_HUB_SECRET", SECRET)
-        .env("CCTG_HUB_HOOK_ADDR", port.to_string())
-        .env("CCTG_HOST", "box")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cctg starts");
+    let mut child = common::spawn(
+        common::cctg(Path::new(env!("CARGO_TARGET_TMPDIR")))
+            .args(["hook", "Stop"])
+            .env_remove("USERPROFILE")
+            .env_remove("HOME")
+            .env("CCTG_HUB_SECRET", SECRET)
+            .env("CCTG_HUB_HOOK_ADDR", port.to_string())
+            .env("CCTG_HOST", "box")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("cctg starts");
     let mut input = child.stdin.take().unwrap();
     let _ = input.write_all(&fixture("stop"));
     drop(input);
@@ -315,11 +315,12 @@ fn broken_input_and_missing_config_exit_zero_quietly() {
 #[test]
 fn bad_hook_arguments_still_exit_zero() {
     for args in [&["hook"][..], &["hook", "Stop", "extra"][..]] {
-        let output = common::cctg(&home("bad-args", None))
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
+        let output = common::output(
+            common::cctg(&home("bad-args", None))
+                .args(args)
+                .stdin(Stdio::null()),
+        )
+        .unwrap();
         assert_eq!(output.status.code(), Some(0), "{args:?}");
         assert!(output.stdout.is_empty(), "{args:?}");
     }
@@ -329,13 +330,14 @@ fn bad_hook_arguments_still_exit_zero() {
 fn an_open_silent_stdin_does_not_hold_the_hook() {
     let home = home("hung-stdin", Some("127.0.0.1:9"));
     let started = Instant::now();
-    let mut child = common::cctg(&home)
-        .args(["hook", "SessionEnd"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cctg starts");
+    let mut child = common::spawn(
+        common::cctg(&home)
+            .args(["hook", "SessionEnd"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("cctg starts");
     // Held open, never written, until the hook has exited.
     let stdin = child.stdin.take().unwrap();
     let output = child.wait_with_output().unwrap();

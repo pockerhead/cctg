@@ -68,7 +68,7 @@ fn run_input(home: &Path, extra_env: &[(&str, &str)], input: &str) -> (Output, D
     for (name, value) in extra_env {
         command.env(name, value);
     }
-    let mut child = command.spawn().expect("cctg starts");
+    let mut child = common::spawn(&mut command).expect("cctg starts");
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input.as_bytes()).unwrap();
     drop(stdin);
@@ -186,14 +186,15 @@ async fn without_a_command_or_inside_one_cctg_prints_its_own_line() {
 
 /// `git` in `dir`, for setting up a repository.
 fn git(dir: &Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    common::status(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|status| status.success())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -256,12 +257,10 @@ async fn the_own_line_shows_the_branch_and_the_account_and_the_hub_never_gets_th
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_hub_adds_well_under_150_ms() {
     let (addr, _events) = hub().await;
-    // A port nobody listens on: on Windows a connect there lasts until the
-    // client gives up.
-    let closed = {
-        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        listener.local_addr().unwrap().to_string()
-    };
+    // A port nobody listens on, held so none can come (TASK-066): on
+    // Windows a connect there lasts until the client gives up.
+    let (_held, closed) = common::held_port();
+    let closed = format!("127.0.0.1:{closed}");
     let up = home("up", &addr, None);
     let down = home("down", &closed, None);
     let best = |home: PathBuf| (0..5).map(|_| run(&home, &[]).1).min().unwrap();

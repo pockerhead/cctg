@@ -160,11 +160,6 @@ impl Drop for Proc {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn collect(mut stream: impl Read + Send + 'static) -> Arc<Mutex<String>> {
     let log = Arc::new(Mutex::new(String::new()));
     let sink = log.clone();
@@ -225,13 +220,19 @@ fn hub(
         .env("CCTG_ALLOWED_USER_IDS", "1001")
         .env("CCTG_HUB_SECRET", SECRET)
         .env("CCTG_STATE_DIR", &state)
-        .env("CCTG_AGENT_LISTEN", format!("127.0.0.1:{}", free_port()))
-        .env("CCTG_HOOK_LISTEN", format!("127.0.0.1:{}", free_port()))
+        .env(
+            "CCTG_AGENT_LISTEN",
+            format!("127.0.0.1:{}", common::free_port()),
+        )
+        .env(
+            "CCTG_HOOK_LISTEN",
+            format!("127.0.0.1:{}", common::free_port()),
+        )
         .env("CCTG_BOT_API_URL", api)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = Proc(command.spawn().expect("cctg hub"));
+    let mut child = Proc(common::spawn(&mut command).expect("cctg hub"));
     let log = collect(child.0.stderr.take().unwrap());
     (child, log)
 }
@@ -281,7 +282,9 @@ async fn the_hub_reaches_the_bot_api_only_through_its_proxy() {
     );
 
     // 2. http: absolute-form requests; the stand-in is the Bot API.
-    let dead = free_port();
+    // Never connected to (the proxy answers for it); held, so nothing
+    // listens there.
+    let (_dead, dead) = common::held_port();
     let (_polling, log) = hub(
         &root,
         "forward",

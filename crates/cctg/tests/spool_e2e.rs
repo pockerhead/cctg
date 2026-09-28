@@ -71,31 +71,16 @@ fn command(home: &Path) -> Command {
     common::cctg(home)
 }
 
-/// One spawn at a time in this binary. On macOS std makes a child's pipes
-/// with `pipe` and sets close-on-exec only afterwards, and `posix_spawn`
-/// passes on every descriptor without it: a child that another test spawns
-/// in between inherits the write end of this child's stdin, and the hook
-/// sees no end of input until that child exits (TASK-066: "hook input
-/// unreadable, too large or late" on the macOS runner). Linux makes pipes
-/// with `pipe2(O_CLOEXEC)`.
-static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn spawn(command: &mut Command) -> Child {
-    let _alone = SPAWN
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    command.spawn().expect("cctg starts")
-}
-
 /// Runs `cctg hook <event>` with `input` as stdin; returns its stderr.
 fn hook(home: &Home, event: &str, input: serde_json::Value) -> String {
-    let mut child = spawn(
+    let mut child = common::spawn(
         command(&home.0)
             .args(["hook", event])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
-    );
+    )
+    .expect("cctg starts");
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input.to_string().as_bytes()).unwrap();
     drop(stdin);
@@ -121,25 +106,12 @@ fn input(event: &str, extra: serde_json::Value) -> serde_json::Value {
     value
 }
 
-/// A loopback port bound and held, not listened on: a hub that is down.
-/// Connects to it are refused, and no other socket (another test, a
-/// parallel run) can listen on it while it is held, as it could on a port
-/// bound and closed again (TASK-066). `listen` on it brings the hub up.
-fn held_port() -> (TcpSocket, u16) {
-    let socket = TcpSocket::new_v4().unwrap();
-    socket
-        .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let port = socket.local_addr().unwrap().port();
-    (socket, port)
-}
-
 /// A held port is a hub that is down, and it stays so: no other socket can
 /// listen on it (tokio's bind sets `SO_REUSEADDR` on Unix; it still fails),
 /// and a connect to it fails (on Windows only after its SYN retries).
 #[tokio::test]
 async fn a_held_port_refuses_and_nobody_else_can_listen_on_it() {
-    let (_held, port) = held_port();
+    let (_held, port) = common::held_port();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     assert!(std::net::TcpListener::bind(addr).is_err());
     assert!(TcpListener::bind(addr).await.is_err());
@@ -202,8 +174,8 @@ fn blocking<T: Send + 'static>(
 /// delivered twice, also when a delivered file comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missed_session_start_reaches_the_hub_before_the_next_hook() {
-    let (hook_port, port) = held_port();
-    let (_agent_port, agent_port) = held_port();
+    let (hook_port, port) = common::held_port();
+    let (_agent_port, agent_port) = common::held_port();
     let home = Home::new("next-hook", port, agent_port);
     // No listener on the port: the hub is down.
     let home = std::sync::Arc::new(home);
@@ -277,7 +249,7 @@ async fn a_missed_session_start_reaches_the_hub_before_the_next_hook() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_spool_holds_no_text_and_is_bounded() {
     let port = refusing_hub().await;
-    let (_agent_port, agent_port) = held_port();
+    let (_agent_port, agent_port) = common::held_port();
     let home = std::sync::Arc::new(Home::new("bounded", port, agent_port));
     let h = home.clone();
     blocking(move || {
@@ -363,8 +335,8 @@ impl Drop for Agent {
 /// start itself: the hub learns the session without another hook.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_agent_delivers_its_sessions_kept_start_when_it_registers() {
-    let (hooks_held, hook_port) = held_port();
-    let (agents_held, agent_port) = held_port();
+    let (hooks_held, hook_port) = common::held_port();
+    let (agents_held, agent_port) = common::held_port();
     let home = std::sync::Arc::new(Home::new("agent", hook_port, agent_port));
     let h = home.clone();
     blocking(move || {
@@ -386,7 +358,7 @@ async fn the_agent_delivers_its_sessions_kept_start_when_it_registers() {
         Secret::parse(SECRET).unwrap(),
         agents_tx,
     ));
-    let mut child = spawn(
+    let mut child = common::spawn(
         command(&home.0)
             .arg("agent")
             .env_remove("CLAUDE_CODE_ENTRYPOINT")
@@ -394,7 +366,8 @@ async fn the_agent_delivers_its_sessions_kept_start_when_it_registers() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),
-    );
+    )
+    .expect("cctg starts");
     // Keep stdin open (the agent stops at EOF); drain stdout.
     std::mem::forget(child.stdin.take());
     let mut stdout = child.stdout.take().unwrap();
@@ -439,7 +412,7 @@ async fn a_silent_hub_costs_a_hook_one_budget_however_much_is_kept() {
         }
     });
     let run = |name: &'static str, kept: usize| {
-        let (agent_held, agent_port) = held_port();
+        let (agent_held, agent_port) = common::held_port();
         let home = std::sync::Arc::new(Home::new(name, port, agent_port));
         for n in 0..kept {
             let post = HookPost::new(

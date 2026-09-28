@@ -62,7 +62,7 @@ fn run(home: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (Output,
     for (key, value) in env {
         command.env(key, value);
     }
-    let output = command.output().expect("cctg runs");
+    let output = common::output(&mut command).expect("cctg runs");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
