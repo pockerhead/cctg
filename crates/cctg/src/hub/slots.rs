@@ -245,6 +245,13 @@
 //! menu does not refresh itself (↻ does). Its logs carry ordinals and fixed
 //! text: no titles, chat ids, times or time zones.
 //!
+//! Compact turn (TASK-076): the turn view of the menu acts where the detail
+//! level does. In the compact view the tool lines and 💭 of the turn
+//! message go into Telegram's collapsed quote ([`stream::Open`]); nothing
+//! else changes, no edit is added and nothing is kept. A turn message goes
+//! on only in the view it was made in: a change of the view (the menu, a
+//! share) starts the next one.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
 
@@ -5117,6 +5124,7 @@ impl Slots {
                 .and_then(|(slot, place)| self.absorbable(slot, place)),
             absorbed: None,
             posted: 0,
+            compact: display.turn == menu::TurnView::Compact,
         });
         let Some(live) = self.streams.get_mut(session) else {
             return;
@@ -5287,10 +5295,22 @@ impl Slots {
                     continue;
                 }
                 let step = match (step, &mut rolling) {
-                    (Step::Send { text, format, .. }, Some(_)) => {
+                    (
+                        Step::Send {
+                            text,
+                            format,
+                            piece,
+                            ..
+                        },
+                        Some(rolling),
+                    ) => {
                         let open = format != Format::Code;
+                        // TASK-076: tool lines and 💭 in the quote.
+                        let quoted = rolling.compact
+                            && matches!(piece, menu::Piece::Tool | menu::Piece::Thinking);
                         for (text, html) in stream_chunks(&text, format) {
-                            pieces.push((text, html, open));
+                            let quoted = quoted && stream::quotable(html.as_deref());
+                            pieces.push((text, html, open, quoted));
                         }
                         continue;
                     }
@@ -10856,43 +10876,54 @@ struct Rolling {
     /// New messages this read handed out so far: after one of them the
     /// status message is no longer the last one of the topic.
     posted: usize,
+    /// The owner's compact turn view (TASK-076).
+    compact: bool,
 }
 
+/// Quiet pieces of one line that go together: as one turn message of their
+/// own, and each piece (text, HTML, quoted) for the turn message above.
+type Group = (Open, Vec<(String, Option<String>, bool)>);
+
 /// The stream messages of `pieces` (text, HTML, whether it is quiet turn
-/// content; a terminal prompt is not), in order (TASK-062). Quiet pieces go
+/// content (a terminal prompt is not), whether it goes into the quote of a
+/// compact turn message), in order (TASK-062, TASK-076). Quiet pieces go
 /// into the turn message while they fit, else start the next one; the
 /// first new message of a read turns the status message into it when that
 /// is still the last one of the topic, else is a new message.
 fn roll(
     live: &mut Live,
     rolling: &mut Rolling,
-    pieces: Vec<(String, Option<String>, bool)>,
+    pieces: Vec<(String, Option<String>, bool, bool)>,
     chat: Chat,
     thread_id: i64,
 ) -> Vec<(u64, Op)> {
     // Pieces of one line go together where they fit: a result line may end
-    // several calls.
-    let mut joined: Vec<(String, Option<String>, bool)> = Vec::new();
-    for (text, html, quiet) in pieces {
-        if let Some((last_text, last_html, true)) = joined.last_mut()
-            && quiet
-            && let Some((text, html)) =
-                stream::join(last_text, last_html.as_deref(), &text, html.as_deref())
-        {
-            *last_text = text;
-            *last_html = html;
+    // several calls. `Err`: a terminal prompt, on its own.
+    let mut joined: Vec<Result<Group, (String, Option<String>)>> = Vec::new();
+    for (text, html, quiet, quoted) in pieces {
+        if !quiet {
+            joined.push(Err((text, html)));
             continue;
         }
-        joined.push((text, html, quiet));
+        if let Some(Ok((together, parts))) = joined.last_mut()
+            && together.push(&text, html.as_deref(), quoted)
+        {
+            parts.push((text, html, quoted));
+            continue;
+        }
+        let together = Open::new(None, 0, text.clone(), html.clone(), rolling.compact, quoted);
+        joined.push(Ok((together, vec![(text, html, quoted)])));
     }
     let mut ops = Vec::new();
-    for (text, html, quiet) in joined {
+    for piece in joined {
         let restart = std::mem::take(&mut live.restart);
-        if quiet
+        if let Ok((_, parts)) = &piece
             && let Some(open) = live.open.as_mut()
             && let Some(key) = open.key
-            && open.push(&text, html.as_deref())
+            && open.compact == rolling.compact
+            && let Some(grown) = grown(open, parts)
         {
+            *open = grown;
             let op = Op::Stream {
                 chat,
                 thread_id,
@@ -10910,14 +10941,18 @@ fn roll(
             0 => rolling.status.take(),
             _ => None,
         };
+        let (text, html, open) = match piece {
+            Ok((open, _)) => (open.text.clone(), open.html.clone(), Some(open)),
+            Err((text, html)) => (text, html, None),
+        };
         let op = Op::Stream {
             chat,
             thread_id,
-            text: text.clone(),
-            html: html.clone(),
+            text,
+            html,
             // The status message becoming content goes at once, as a
             // foreground edit: the next status message waits for it.
-            merge: quiet && status.is_none(),
+            merge: open.is_some() && status.is_none(),
             restart,
             notify: false,
             into: status.map(|status| status.id),
@@ -10933,15 +10968,24 @@ fn roll(
                 live.sent(&op)
             }
         };
-        live.open = quiet.then_some(Open {
+        live.open = open.map(|open| Open {
             key: status,
             number,
-            text,
-            html,
+            ..open
         });
         ops.push((number, op));
     }
     ops
+}
+
+/// `open` with every one of `parts` below it; `None` when they do not all
+/// fit.
+fn grown(open: &Open, parts: &[(String, Option<String>, bool)]) -> Option<Open> {
+    let mut grown = open.clone();
+    parts
+        .iter()
+        .all(|(text, html, quoted)| grown.push(text, html.as_deref(), *quoted))
+        .then_some(grown)
 }
 
 /// The messages of a stream line: markdown as HTML with its plain source,
@@ -27144,5 +27188,251 @@ again"
         );
         assert!(slots.registry.people.is_empty());
         assert!(deletes(&handed).is_empty());
+    }
+
+    // ------------------------------------------------------------ TASK-076
+
+    /// A stream op as the topic gets it.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Streamed {
+        text: String,
+        html: Option<String>,
+        into: Option<i64>,
+        /// The message it made or was written into.
+        id: i64,
+    }
+
+    /// The stream ops of `handed`, each taken by Telegram: a new message
+    /// gets id 7000 + its index.
+    fn accept_streams(slots: &mut Slots, handed: &[(Work, Op)]) -> Vec<Streamed> {
+        let mut streamed = Vec::new();
+        for (index, (work, op)) in handed.iter().enumerate() {
+            if let (
+                Work::Stream { session, number },
+                Op::Stream {
+                    text, html, into, ..
+                },
+            ) = (work, op)
+            {
+                let id = into.unwrap_or(7000 + index as i64);
+                slots.on_stream_done(
+                    session,
+                    *number,
+                    Some(Ok(Outcome::Sent(Message {
+                        message_id: id,
+                        ..Message::default()
+                    }))),
+                );
+                streamed.push(Streamed {
+                    text: text.clone(),
+                    html: html.clone(),
+                    into: *into,
+                    id,
+                });
+            }
+        }
+        streamed
+    }
+
+    /// Session A's next transcript line `from..to` with `items`, as the
+    /// answer to a read the actor asked.
+    fn next_line(slots: &mut Slots, from: u64, to: u64, items: Vec<crate::wire::StreamItem>) {
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(A, from, vec![StreamLine { end: to, items }]));
+    }
+
+    /// A call `id` with `line` and its result.
+    fn finished_call(id: &str, line: &str) -> Vec<crate::wire::StreamItem> {
+        use crate::wire::StreamItem;
+        vec![
+            StreamItem::Call {
+                id: id.into(),
+                line: line.into(),
+            },
+            StreamItem::Result {
+                id: id.into(),
+                error: None,
+            },
+        ]
+    }
+
+    /// Text, 💭 and three finished calls, in one line.
+    fn tool_turn() -> Vec<crate::wire::StreamItem> {
+        use crate::wire::StreamItem;
+        let mut items = vec![
+            StreamItem::Note {
+                text: "Looking.".into(),
+            },
+            StreamItem::Thinking {
+                text: "Hmm.".into(),
+            },
+        ];
+        for n in ["one", "two", "three"] {
+            items.push(StreamItem::Call {
+                id: n.into(),
+                line: format!("• Bash: {n}"),
+            });
+        }
+        for n in ["one", "two", "three"] {
+            items.push(StreamItem::Result {
+                id: n.into(),
+                error: None,
+            });
+        }
+        items
+    }
+
+    fn with_turn(turn: menu::TurnView, thinking: bool) -> menu::Settings {
+        menu::Settings {
+            turn,
+            thinking,
+            ..menu::Settings::default()
+        }
+    }
+
+    const LINES: &str = "• Bash: one ✓\n• Bash: two ✓\n• Bash: three ✓";
+
+    /// The compact view quotes the tool lines and 💭 of the turn message,
+    /// the text stays outside; the full view on the same line gives the
+    /// message as before, and the plain text is the same in both.
+    #[tokio::test]
+    async fn a_compact_turn_quotes_its_tool_lines() {
+        let mut got = Vec::new();
+        for turn in [menu::TurnView::Compact, menu::TurnView::Full] {
+            let dir = TempDir::new("slots-compact-turn");
+            let settings = with_turn(turn, true);
+            let (mut slots, mut work) =
+                private_streaming(&dir, settings, Some(Duration::from_secs(3600)));
+            next_line(&mut slots, 0, 10, tool_turn());
+            let streamed = accept_streams(&mut slots, &all_work(&mut work));
+            assert_eq!(streamed.len(), 1, "one turn message: {streamed:#?}");
+            got.push(streamed[0].clone());
+            assert_eq!(stream_offset(&slots), Some(10));
+        }
+        let text = format!("Looking.\n💭 Hmm.\n{LINES}");
+        assert_eq!(got[0].text, text);
+        assert_eq!(
+            got[0].html.as_deref(),
+            Some(
+                format!("Looking.\n<blockquote expandable>💭 Hmm.\n{LINES}</blockquote>").as_str()
+            )
+        );
+        assert_eq!(got[1].text, text);
+        assert_eq!(got[1].html.as_deref(), Some(text.as_str()));
+    }
+
+    /// Without 💭 only the tool lines are in the quote.
+    #[tokio::test]
+    async fn a_compact_turn_without_thinking_quotes_only_tool_lines() {
+        let dir = TempDir::new("slots-compact-nothink");
+        let settings = with_turn(menu::TurnView::Compact, false);
+        let (mut slots, mut work) =
+            private_streaming(&dir, settings, Some(Duration::from_secs(3600)));
+        next_line(&mut slots, 0, 10, tool_turn());
+        let streamed = accept_streams(&mut slots, &all_work(&mut work));
+        assert_eq!(streamed.len(), 1, "{streamed:#?}");
+        assert_eq!(streamed[0].text, format!("Looking.\n{LINES}"));
+        assert_eq!(
+            streamed[0].html.as_deref(),
+            Some(format!("Looking.\n<blockquote expandable>{LINES}</blockquote>").as_str())
+        );
+    }
+
+    /// A turn message goes on only in the view it was made in: a switch in
+    /// the menu starts the next one, and the old one is not written again.
+    #[tokio::test]
+    async fn switching_the_view_starts_a_new_turn_message() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-compact-switch");
+        let settings = with_turn(menu::TurnView::Compact, true);
+        let (mut slots, mut work) =
+            private_streaming(&dir, settings, Some(Duration::from_secs(3600)));
+        let mut items = vec![StreamItem::Note {
+            text: "Looking.".into(),
+        }];
+        items.extend(finished_call("one", "• Bash: one"));
+        next_line(&mut slots, 0, 10, items);
+        let first = accept_streams(&mut slots, &all_work(&mut work));
+        assert_eq!(first.len(), 1, "{first:#?}");
+        let message = first[0].id;
+        // The next line goes into it, into the same quote.
+        next_line(&mut slots, 10, 20, finished_call("two", "• Bash: two"));
+        let second = accept_streams(&mut slots, &all_work(&mut work));
+        assert_eq!(
+            second,
+            [Streamed {
+                text: "Looking.\n• Bash: one ✓\n• Bash: two ✓".into(),
+                html: Some(
+                    "Looking.\n<blockquote expandable>• Bash: one ✓\n• Bash: two ✓</blockquote>"
+                        .into()
+                ),
+                into: Some(message),
+                id: message,
+            }]
+        );
+        // Full now: a new message, as the full view makes it.
+        slots.registry.person_mut(owner_chat()).settings.turn = menu::TurnView::Full;
+        next_line(&mut slots, 20, 30, finished_call("three", "• Bash: three"));
+        let third = accept_streams(&mut slots, &all_work(&mut work));
+        assert_eq!(third.len(), 1, "{third:#?}");
+        assert_ne!(third[0].into, Some(message), "the compact one is left");
+        assert_eq!(
+            (third[0].text.as_str(), third[0].html.as_deref()),
+            ("• Bash: three ✓", None)
+        );
+        let full = third[0].id;
+        // Compact again: another new one.
+        slots.registry.person_mut(owner_chat()).settings.turn = menu::TurnView::Compact;
+        next_line(&mut slots, 30, 40, finished_call("four", "• Bash: four"));
+        let fourth = accept_streams(&mut slots, &all_work(&mut work));
+        assert_eq!(fourth.len(), 1, "{fourth:#?}");
+        assert!(
+            fourth[0].into != Some(message) && fourth[0].into != Some(full),
+            "{fourth:#?}"
+        );
+        assert_eq!(
+            fourth[0].html.as_deref(),
+            Some("<blockquote expandable>• Bash: four ✓</blockquote>")
+        );
+        assert_eq!(stream_offset(&slots), Some(40));
+    }
+
+    /// A slot that shows in the group too keeps the full turn message in
+    /// both views, whatever its owner chose (the rule of TASK-073).
+    #[tokio::test]
+    async fn a_shared_slot_keeps_the_full_turn_message() {
+        let dir = TempDir::new("slots-compact-shared");
+        let settings = with_turn(menu::TurnView::Compact, true);
+        let (mut slots, mut work) =
+            private_streaming(&dir, settings.clone(), Some(Duration::from_secs(3600)));
+        slots.registry.slots[0]
+            .views
+            .push(crate::hub::registry::View::new(Chat::Group));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        assert_eq!(slots.display_of(SlotId(0)), menu::Settings::default());
+        next_line(&mut slots, 0, 10, tool_turn());
+        let handed = all_work(&mut work);
+        let streams: Vec<&Op> = handed
+            .iter()
+            .map(|(_, op)| op)
+            .filter(|op| matches!(op, Op::Stream { .. }))
+            .collect();
+        assert!(!streams.is_empty(), "{handed:#?}");
+        for op in streams {
+            let Op::Stream { html, .. } = op else {
+                continue;
+            };
+            assert!(
+                !html
+                    .as_deref()
+                    .is_some_and(|html| html.contains("<blockquote")),
+                "{op:?}"
+            );
+        }
+        // Back in the private chat alone, the owner's view applies again.
+        slots.registry.slots[0].views.pop();
+        assert_eq!(slots.display_of(SlotId(0)), settings);
     }
 }

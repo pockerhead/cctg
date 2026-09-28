@@ -8,9 +8,11 @@
 //! changes them: a private chat is its user's, and a press counts only in
 //! the private chat it came from. The detail level filters the stream of a
 //! slot that shows in the owner's private chat alone; while the slot shows
-//! anywhere else too, every view gets the full layout. The sound setting
-//! changes new messages into the private chat only; the group sounds as
-//! before. The menu does not refresh itself: ↻ does.
+//! anywhere else too, every view gets the full layout. The turn view
+//! (TASK-076) acts on the same slots: compact puts the tool lines and 💭 of
+//! the turn message into a collapsed quote that Telegram opens on a tap.
+//! The sound setting changes new messages into the private chat only; the
+//! group sounds as before. The menu does not refresh itself: ↻ does.
 //!
 //! This module is pure: data, rendering and the press codes. The slot actor
 //! sends, pins and edits.
@@ -88,6 +90,7 @@ pub struct Settings {
     pub detail: Detail,
     /// 💭 thinking in the topics, at any detail level.
     pub thinking: bool,
+    pub turn: TurnView,
     pub sound: Sound,
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -104,6 +107,7 @@ impl Default for Settings {
         Self {
             detail: Detail::Full,
             thinking: true,
+            turn: TurnView::Full,
             sound: Sound::Replies,
             quiet: None,
             tz: None,
@@ -122,6 +126,20 @@ pub enum Detail {
     /// «Только ответы»: terminal prompts, then the turn's answer.
     Answers,
     /// «Всё».
+    #[default]
+    #[serde(other)]
+    Full,
+}
+
+/// How the turn message shows its tool lines and 💭 (TASK-076). Default
+/// last, as [`Detail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnView {
+    /// «Сжатый»: each run of them in a collapsed quote
+    /// (`<blockquote expandable>`) that the reader opens with a tap.
+    Compact,
+    /// «Полный»: as lines of the message.
     #[default]
     #[serde(other)]
     Full,
@@ -236,6 +254,10 @@ pub fn change(
             new.thinking = on;
             Page::Display
         }
+        MenuPress::TurnView(turn) => {
+            new.turn = turn;
+            Page::Display
+        }
         MenuPress::SoundMode(sound) => {
             new.sound = sound;
             Page::Sound
@@ -336,6 +358,7 @@ pub enum MenuPress {
     /// 💭 on or off: the value the button sets, so a double tap sets it
     /// twice instead of undoing itself.
     Thinking(bool),
+    TurnView(TurnView),
     SoundMode(Sound),
     /// Quiet hours on or off, as [`MenuPress::Thinking`].
     Quiet(bool),
@@ -362,6 +385,13 @@ fn detail_code(detail: Detail) -> &'static str {
     }
 }
 
+fn turn_code(turn: TurnView) -> &'static str {
+    match turn {
+        TurnView::Full => "f",
+        TurnView::Compact => "c",
+    }
+}
+
 fn sound_code(sound: Sound) -> &'static str {
     match sound {
         Sound::Replies => "r",
@@ -381,6 +411,7 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::UpdateAll { page } => format!("up:{page}"),
         MenuPress::Detail(detail) => format!("dl:{}", detail_code(detail)),
         MenuPress::Thinking(on) => format!("th:{}", u8::from(on)),
+        MenuPress::TurnView(turn) => format!("tv:{}", turn_code(turn)),
         MenuPress::SoundMode(sound) => format!("sn:{}", sound_code(sound)),
         MenuPress::Quiet(on) => format!("q:{}", u8::from(on)),
         MenuPress::QuietFrom(hour) => format!("qf:{hour}"),
@@ -420,6 +451,11 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ),
         ["th", "0"] => MenuPress::Thinking(false),
         ["th", "1"] => MenuPress::Thinking(true),
+        ["tv", code] => MenuPress::TurnView(
+            [TurnView::Full, TurnView::Compact]
+                .into_iter()
+                .find(|turn| turn_code(*turn) == *code)?,
+        ),
         ["sn", code] => MenuPress::SoundMode(
             [Sound::Replies, Sound::All, Sound::Off]
                 .into_iter()
@@ -676,11 +712,22 @@ fn render_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
         format!("💭 Размышления: {thinking}"),
         MenuPress::Thinking(!settings.thinking),
     )]);
+    let turn = |label: &str, turn: TurnView| {
+        button(
+            radio(label, settings.turn == turn),
+            MenuPress::TurnView(turn),
+        )
+    };
+    rows.push(vec![
+        turn("Ход: полный", TurnView::Full),
+        turn("Ход: сжатый", TurnView::Compact),
+    ]);
     "Что показывать в темах лички\n\n\
 Всё: промпты из терминала, текст Claude и строка на каждый вызов инструмента.\n\
 Кратко: без строк инструментов.\n\
 Только ответы: промпты из терминала и ответ хода.\n\
 💭 размышления включаются отдельно, при любой подробности.\n\
+Ход сжатый: строки инструментов и 💭 свёрнуты в цитату, нажмите на неё, чтобы раскрыть.\n\
 Ответы хода, запросы разрешений, вопросы и субагенты видны всегда.\n\n\
 Пока сессия показана и в группе, показ полный и в личке, и в группе."
         .to_owned()
@@ -861,6 +908,9 @@ mod tests {
             "menu:q",
             "menu:th:2",
             "menu:q:x",
+            "menu:tv",
+            "menu:tv:x",
+            "menu:tv:c:1",
         ] {
             assert_eq!(parse_callback(junk), None, "{junk}");
         }
@@ -965,6 +1015,7 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.detail, Detail::Full);
         assert!(settings.thinking);
+        assert_eq!(settings.turn, TurnView::Full);
         assert_eq!(settings.sound, Sound::Replies);
         assert_eq!(settings.quiet, None);
         assert_eq!(settings.tz, None);
@@ -989,9 +1040,10 @@ mod tests {
     #[test]
     fn an_unknown_level_reads_as_the_default() {
         let settings: Settings =
-            serde_json::from_str(r#"{"detail":"later","sound":"later"}"#).unwrap();
+            serde_json::from_str(r#"{"detail":"later","sound":"later","turn":"later"}"#).unwrap();
         assert_eq!(settings.detail, Detail::Full);
         assert_eq!(settings.sound, Sound::Replies);
+        assert_eq!(settings.turn, TurnView::Full);
         assert!(settings.thinking);
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings, Settings::default());
@@ -1002,18 +1054,20 @@ mod tests {
             quiet: Some(Quiet { from: 22, to: 7 }),
             tz: Some(180),
             thinking: false,
+            turn: TurnView::Compact,
         })
         .unwrap();
         assert_eq!(
             written,
-            json!({"detail": "answers", "thinking": false, "sound": "off",
+            json!({"detail": "answers", "thinking": false, "turn": "compact", "sound": "off",
                    "quiet": {"from": 22, "to": 7}, "tz": 180})
         );
         let back: Settings = serde_json::from_value(written).unwrap();
         assert_eq!(back.detail, Detail::Answers);
+        assert_eq!(back.turn, TurnView::Compact);
         assert_eq!(
             serde_json::to_value(Settings::default()).unwrap(),
-            json!({"detail": "full", "thinking": true, "sound": "replies"})
+            json!({"detail": "full", "thinking": true, "turn": "full", "sound": "replies"})
         );
     }
 
@@ -1165,6 +1219,39 @@ mod tests {
         assert_eq!(change(&off, MenuPress::Quiet(false)).unwrap().0, off);
         let (_, keyboard) = render(&Page::Sound, &on, None, 0);
         assert!(datas(&keyboard).contains(&"menu:q:0".to_owned()));
+    }
+
+    /// TASK-076: the turn view is a radio row of the display tab; a press
+    /// sets it and stays on that tab, a repeat changes nothing.
+    #[test]
+    fn the_turn_view_is_chosen_on_the_display_tab() {
+        let full = Settings::default();
+        let (text, keyboard) = render(&Page::Display, &full, None, 0);
+        assert!(text.contains("Ход сжатый: "), "{text}");
+        let labels = labels(&keyboard);
+        assert!(labels.contains(&"✅ Ход: полный".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"Ход: сжатый".to_owned()), "{labels:?}");
+        let datas = datas(&keyboard);
+        assert!(datas.contains(&"menu:tv:c".to_owned()), "{datas:?}");
+        assert!(datas.contains(&"menu:tv:f".to_owned()), "{datas:?}");
+        let press = parse_callback("menu:tv:c").unwrap();
+        assert_eq!(press, MenuPress::TurnView(TurnView::Compact));
+        assert!(!press.navigates());
+        let (compact, page) = change(&full, press).unwrap();
+        assert_eq!(page, Page::Display);
+        assert_eq!(
+            compact,
+            Settings {
+                turn: TurnView::Compact,
+                ..full.clone()
+            },
+            "nothing else changes"
+        );
+        assert_eq!(change(&compact, press).unwrap().0, compact);
+        let (_, keyboard) = render(&Page::Display, &compact, None, 0);
+        assert!(super::tests::labels(&keyboard).contains(&"✅ Ход: сжатый".to_owned()));
+        let (back, _) = change(&compact, MenuPress::TurnView(TurnView::Full)).unwrap();
+        assert_eq!(back, full);
     }
 
     /// An hour past 23 in `registry.json` reads as no quiet hours, and the

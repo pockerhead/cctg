@@ -2783,7 +2783,7 @@ mod tests {
     /// file of v0.1.17 (no `people`) loads, and no people write nothing.
     #[test]
     fn people_round_trip_and_an_older_hub_reads_the_file() {
-        use crate::hub::menu::{Detail, Quiet, Settings, Sound};
+        use crate::hub::menu::{Detail, Quiet, Settings, Sound, TurnView};
         let dir = TempDir::new("registry-people");
         let store = RegistryStore::open(dir.path()).unwrap();
         let (mut registry, _, _) = private_slot();
@@ -2803,6 +2803,7 @@ mod tests {
         registry.person_mut(anna).settings = Settings {
             detail: Detail::Answers,
             thinking: false,
+            turn: TurnView::Compact,
             sound: Sound::Off,
             quiet: Some(Quiet { from: 22, to: 7 }),
             tz: Some(-570),

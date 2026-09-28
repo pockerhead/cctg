@@ -42,6 +42,17 @@
 //! that message again, so an edit that already showed them changes nothing.
 //! A message the topic got in between (a user's, a prompt, an answer)
 //! closes it for good ([`Live::close_open`]).
+//!
+//! Compact turn view (TASK-076): the owner may choose that the tool lines
+//! and 💭 of the turn message sit in Telegram's collapsed quote
+//! (`<blockquote expandable>`), which the reader opens with a tap; no edit
+//! and no state of ours. [`Open`] builds that HTML: each run of quoted
+//! pieces is one quote, assistant text and the interrupt note stay outside
+//! between the runs, and a piece whose HTML has a quote of its own
+//! (a markdown quote in 💭) stays outside too, since quotes do not nest.
+//! The plain text is the same as in the full view, so a message Telegram
+//! refuses as HTML falls back to all its lines. The quote tags count
+//! against the message limit like any HTML.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -71,6 +82,9 @@ pub const MAX_HELD: usize = 8;
 pub const MAX_RESENDS: u32 = 5;
 /// Mark of a thinking message in the topic.
 pub const THINKING: &str = "\u{1F4AD}";
+/// The collapsed quote of a compact turn message (TASK-076).
+pub const QUOTE_OPEN: &str = "<blockquote expandable>";
+pub const QUOTE_CLOSE: &str = "</blockquote>";
 /// Reaction for a message handed to the session's agent.
 pub const ACCEPTED: &str = "👀";
 /// Reaction for a message Claude took into work (its channel record is in the
@@ -118,21 +132,92 @@ pub struct Open {
     pub text: String,
     /// Its text as Telegram HTML, once a formatted piece is in it.
     pub html: Option<String>,
+    /// The compact turn view (TASK-076): it goes on only in that view.
+    pub compact: bool,
+    /// Its HTML ends with an open run of quoted pieces: the next quoted one
+    /// goes into that quote.
+    pub quote: bool,
 }
 
 impl Open {
-    /// `text` (as `html`, when formatted) below the message's text; false,
-    /// and nothing changes, when that would not fit one message.
-    pub fn push(&mut self, text: &str, html: Option<&str>) -> bool {
-        match join(&self.text, self.html.as_deref(), text, html) {
+    /// The turn message of one piece; `quoted`: in the quote of a compact
+    /// message, when that fits one message with its tags.
+    pub fn new(
+        key: Option<MessageKey>,
+        number: u64,
+        text: String,
+        html: Option<String>,
+        compact: bool,
+        quoted: bool,
+    ) -> Self {
+        let wrapped = quoted
+            .then(|| {
+                format!(
+                    "{QUOTE_OPEN}{}{QUOTE_CLOSE}",
+                    html_of(&text, html.as_deref())
+                )
+            })
+            .filter(|wrapped| fits(wrapped));
+        let quote = wrapped.is_some();
+        Self {
+            key,
+            number,
+            text,
+            html: wrapped.or(html),
+            compact,
+            quote,
+        }
+    }
+
+    /// `text` (as `html`, when formatted) below the message's text,
+    /// `quoted` in the quote of its run; false, and nothing changes, when
+    /// that would not fit one message.
+    pub fn push(&mut self, text: &str, html: Option<&str>, quoted: bool) -> bool {
+        let joined = if quoted {
+            self.quoted(text, html)
+        } else {
+            join(&self.text, self.html.as_deref(), text, html)
+        };
+        match joined {
             Some((joined, joined_html)) => {
                 self.text = joined;
                 self.html = joined_html;
+                self.quote = quoted;
                 true
             }
             None => false,
         }
     }
+
+    /// The message with `text` below it in the quote of the open run, or
+    /// in a new one.
+    fn quoted(&self, text: &str, html: Option<&str>) -> Option<(String, Option<String>)> {
+        let own = html_of(&self.text, self.html.as_deref());
+        let next = html_of(text, html);
+        let joined_html = match own.strip_suffix(QUOTE_CLOSE).filter(|_| self.quote) {
+            Some(run) => format!("{run}\n{next}{QUOTE_CLOSE}"),
+            None => format!("{own}\n{QUOTE_OPEN}{next}{QUOTE_CLOSE}"),
+        };
+        let joined = format!("{}\n{text}", self.text);
+        (fits(&joined) && fits(&joined_html)).then_some((joined, Some(joined_html)))
+    }
+}
+
+/// A piece with this HTML may go into the quote of a compact turn message
+/// (TASK-076): it has no quote of its own (quotes do not nest; Telegram
+/// takes `<pre>` in one, tried 2026-09-28).
+pub fn quotable(html: Option<&str>) -> bool {
+    html.is_none_or(|html| !html.contains("<blockquote"))
+}
+
+/// `html`, or `text` escaped as HTML.
+fn html_of(text: &str, html: Option<&str>) -> String {
+    html.map_or_else(|| transcript::escape_html(text), str::to_owned)
+}
+
+/// `text` fits one Telegram message.
+fn fits(text: &str) -> bool {
+    transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT
 }
 
 /// `text` and `next` one below the other, as HTML when either is formatted;
@@ -144,13 +229,8 @@ pub fn join(
     next_html: Option<&str>,
 ) -> Option<(String, Option<String>)> {
     let joined = format!("{text}\n{next}");
-    let joined_html = (html.is_some() || next_html.is_some()).then(|| {
-        let escaped = |text: &str, html: Option<&str>| {
-            html.map_or_else(|| transcript::escape_html(text), str::to_owned)
-        };
-        format!("{}\n{}", escaped(text, html), escaped(next, next_html))
-    });
-    let fits = |text: &str| transcript::telegram_len(text) <= transcript::TELEGRAM_TEXT_LIMIT;
+    let joined_html = (html.is_some() || next_html.is_some())
+        .then(|| format!("{}\n{}", html_of(text, html), html_of(next, next_html)));
     (fits(&joined) && joined_html.as_deref().is_none_or(fits)).then_some((joined, joined_html))
 }
 
@@ -1716,6 +1796,8 @@ mod tests {
             number,
             text: text.into(),
             html: None,
+            compact: false,
+            quote: false,
         }
     }
 
@@ -1731,10 +1813,10 @@ mod tests {
     #[test]
     fn the_turn_message_takes_pieces_while_they_fit_and_turns_html_once_one_is() {
         let mut turn = open(Some(7), 1, "• Bash: a ✓");
-        assert!(turn.push("• Read: b ✓", None));
+        assert!(turn.push("• Read: b ✓", None, false));
         assert_eq!(turn.text, "• Bash: a ✓\n• Read: b ✓");
         assert_eq!(turn.html, None);
-        assert!(turn.push("Done <now>.", Some("<b>Done</b> &lt;now&gt;.")));
+        assert!(turn.push("Done <now>.", Some("<b>Done</b> &lt;now&gt;."), false));
         assert_eq!(
             turn.html.as_deref(),
             Some("• Bash: a ✓\n• Read: b ✓\n<b>Done</b> &lt;now&gt;.")
@@ -1742,12 +1824,133 @@ mod tests {
         // One more that would pass Telegram's limit changes nothing.
         let long = "я".repeat(transcript::TELEGRAM_TEXT_LIMIT);
         let before = turn.clone();
-        assert!(!turn.push(&long, None));
+        assert!(!turn.push(&long, None, false));
         assert_eq!(turn, before);
         assert_eq!(
             join("a", Some("<i>a</i>"), "<b>", None).unwrap().1.unwrap(),
             "<i>a</i>\n&lt;b&gt;"
         );
+    }
+
+    // ------------------------------------------------------------ TASK-076
+
+    /// The pieces of a turn: (text, HTML, a tool line or 💭).
+    const TURN: [(&str, Option<&str>, bool); 6] = [
+        ("Смотрю.", Some("Смотрю."), false),
+        ("• Bash: a ✓", None, true),
+        ("• Bash: b ✓", None, true),
+        ("💭 …", Some("💭 …"), true),
+        ("Дальше.", Some("Дальше."), false),
+        ("• Edit: x ✓", None, true),
+    ];
+
+    /// The turn message of `pieces` in view `compact`, as the slots actor
+    /// builds it: the first piece makes it, the rest are pushed.
+    fn built(compact: bool, pieces: &[(&str, Option<&str>, bool)]) -> Open {
+        let (text, html, tool) = pieces[0];
+        let mut turn = Open::new(
+            Some(MessageKey::new(Chat::Group, 7)),
+            1,
+            text.into(),
+            html.map(str::to_owned),
+            compact,
+            compact && tool,
+        );
+        for (text, html, tool) in &pieces[1..] {
+            assert!(turn.push(text, *html, compact && *tool), "{text}");
+        }
+        turn
+    }
+
+    #[test]
+    fn a_compact_turn_message_quotes_runs_of_tool_lines_and_thinking() {
+        let turn = built(true, &TURN);
+        assert_eq!(
+            turn.html.as_deref(),
+            Some(
+                "Смотрю.\n<blockquote expandable>• Bash: a ✓\n• Bash: b ✓\n💭 …</blockquote>\nДальше.\n<blockquote expandable>• Edit: x ✓</blockquote>"
+            )
+        );
+        assert!(turn.quote, "it ends in a run");
+        assert!(turn.compact);
+        // The plain text, for a message Telegram refuses as HTML, is the
+        // full view's.
+        assert_eq!(turn.text, built(false, &TURN).text);
+        assert_eq!(
+            turn.text,
+            "Смотрю.\n• Bash: a ✓\n• Bash: b ✓\n💭 …\nДальше.\n• Edit: x ✓"
+        );
+        // A message that starts with a tool line starts with its quote.
+        let turn = built(true, &TURN[1..4]);
+        assert_eq!(
+            turn.html.as_deref(),
+            Some("<blockquote expandable>• Bash: a ✓\n• Bash: b ✓\n💭 …</blockquote>")
+        );
+    }
+
+    #[test]
+    fn a_piece_with_a_block_stays_outside_the_quote() {
+        assert!(quotable(None));
+        assert!(quotable(Some("💭 <b>x</b> <code>y</code>")));
+        assert!(
+            quotable(Some("💭 <pre>fn main() {}</pre>")),
+            "Telegram takes it"
+        );
+        let quoting = "💭 <blockquote>said</blockquote>";
+        assert!(!quotable(Some(quoting)));
+        let mut turn = built(true, &TURN[1..2]);
+        // The actor pushes it unquoted: it closes the run.
+        assert!(turn.push("💭 said", Some(quoting), false));
+        assert!(!turn.quote);
+        assert!(turn.push("• Read: c ✓", None, true));
+        assert_eq!(
+            turn.html.as_deref(),
+            Some(
+                "<blockquote expandable>• Bash: a ✓</blockquote>\n💭 <blockquote>said</blockquote>\n<blockquote expandable>• Read: c ✓</blockquote>"
+            )
+        );
+        // Tool lines are escaped inside the quote.
+        let mut turn = built(true, &TURN[..1]);
+        assert!(turn.push("• Bash: a<b ✓", None, true));
+        assert_eq!(
+            turn.html.as_deref(),
+            Some("Смотрю.\n<blockquote expandable>• Bash: a&lt;b ✓</blockquote>")
+        );
+    }
+
+    #[test]
+    fn the_quote_tags_count_against_the_limit() {
+        let limit = transcript::TELEGRAM_TEXT_LIMIT;
+        let tags = QUOTE_OPEN.len() + QUOTE_CLOSE.len();
+        // Without tags it fits, with them it does not.
+        let long = "я".repeat(limit - "a\n".len() - tags + 1);
+        let mut turn = built(true, &[("a", Some("a"), false)]);
+        let before = turn.clone();
+        assert!(!turn.push(&long, None, true));
+        assert_eq!(turn, before);
+        assert!(turn.push(&long, None, false), "unquoted it fits");
+        // A first piece whose quote does not fit starts unquoted.
+        let long = "я".repeat(limit - tags + 1);
+        let turn = Open::new(None, 1, long.clone(), None, true, true);
+        assert_eq!((turn.html, turn.quote), (None, false));
+        let short = "я".repeat(limit - tags);
+        let turn = Open::new(None, 1, short.clone(), None, true, true);
+        assert_eq!(turn.html, Some(format!("{QUOTE_OPEN}{short}{QUOTE_CLOSE}")));
+        assert!(turn.quote);
+    }
+
+    #[test]
+    fn a_full_turn_message_is_as_before() {
+        let turn = built(false, &TURN);
+        let (mut text, mut html) = (TURN[0].0.to_owned(), TURN[0].1.map(str::to_owned));
+        for (next, next_html, _) in &TURN[1..] {
+            (text, html) = join(&text, html.as_deref(), next, *next_html).unwrap();
+        }
+        assert_eq!((turn.text, turn.html), (text, html));
+        assert!(!turn.quote && !turn.compact);
+        // Plain pieces stay plain.
+        let turn = built(false, &TURN[1..3]);
+        assert_eq!(turn.html, None);
     }
 
     /// A rewind goes on writing into the turn message as the last barrier
