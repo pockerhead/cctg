@@ -551,6 +551,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             | Op::Unpin { chat, .. }
             | Op::CreateTopic { chat, .. }
             | Op::EditTopic { chat, .. }
+            | Op::DeleteTopic { chat, .. }
             | Op::Stream { chat, .. }
             | Op::React { chat, .. } => *chat = Chat::Group,
             Op::AnswerCallback { .. } => {}
@@ -653,6 +654,10 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             ),
             None,
         ),
+        Op::DeleteTopic {
+            chat: Chat::Group,
+            thread_id,
+        } => ("delete_topic", Some(*thread_id), String::new(), None),
         // TASK-061: a hub without private chats writes only to the group.
         other => panic!("an op outside the group: {other:?}"),
     }
@@ -1184,6 +1189,7 @@ impl Soak {
         if self.live {
             let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
             let _ = hub.control.send(Control::Message(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
@@ -1220,6 +1226,7 @@ impl Soak {
                 message_id: Some(message_id),
                 thread_id: None,
                 from_name: None,
+                display_name: None,
             }));
             return;
         }

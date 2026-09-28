@@ -189,6 +189,7 @@ impl Hub {
     fn command(&self, thread: Option<i64>, text: &str) {
         self.commands
             .send(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id: 1,

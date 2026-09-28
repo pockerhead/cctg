@@ -6,8 +6,8 @@
 //!    `merge` lines of its topic queued before it go first, at once, as one
 //!    message where they fit (they happened before the prompt).
 //! 2. `answerCallbackQuery` from `Edit`; no token.
-//! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteMessage`,
-//!    `unpinChatMessage` - and foreground `Edit` - `editMessageText` and
+//! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteForumTopic`,
+//!    `deleteMessage`, `unpinChatMessage` - and foreground `Edit` - `editMessageText` and
 //!    `setMessageReaction` that show what a user did or asked for
 //!    (decisions, questions, subagent blocks, reactions, ⏹). When both
 //!    wait they take turns, so neither waits behind more than one of the
@@ -204,6 +204,12 @@ pub enum Op {
         name: Option<String>,
         icon_custom_emoji_id: Option<String>,
     },
+    /// TASK-064: unshare; `deleteForumTopic` deletes the topic with all its
+    /// messages (in the group the bot needs `can_delete_messages`).
+    DeleteTopic {
+        chat: Chat,
+        thread_id: i64,
+    },
     /// A message of the live transcript stream (TASK-016). `merge`: a one-line
     /// tool call that may share a message with the lines queued after it.
     /// `restart`: the first line of a stream (again); it ends a break of its
@@ -257,7 +263,8 @@ impl Op {
             Op::Delete { .. }
             | Op::Unpin { .. }
             | Op::CreateTopic { .. }
-            | Op::EditTopic { .. } => Lane::Topic,
+            | Op::EditTopic { .. }
+            | Op::DeleteTopic { .. } => Lane::Topic,
         }
     }
 
@@ -343,6 +350,7 @@ impl Op {
             | Op::Unpin { chat, .. }
             | Op::CreateTopic { chat, .. }
             | Op::EditTopic { chat, .. }
+            | Op::DeleteTopic { chat, .. }
             | Op::Stream { chat, .. }
             | Op::React { chat, .. } => Some(*chat),
             Op::AnswerCallback { .. } => None,
@@ -506,6 +514,10 @@ impl Transport for BotApi {
                     name.as_deref(),
                     icon_custom_emoji_id.as_deref(),
                 )
+                .await
+                .map(|()| Outcome::Done),
+            Op::DeleteTopic { chat, thread_id } => self
+                .delete_forum_topic(*chat, *thread_id)
                 .await
                 .map(|()| Outcome::Done),
             Op::Stream {
@@ -3125,6 +3137,21 @@ mod tests {
         let group = Limits::default().group.expect("the hub meters the group");
         let refills = Duration::from_secs(60).as_secs_f64() / group.refill_every.as_secs_f64();
         assert!(f64::from(group.capacity) + refills <= 20.0);
+    }
+
+    /// TASK-064: an unshare's topic delete is a topic call that takes a
+    /// token of the group's edit budget, not of its message one.
+    #[test]
+    fn a_topic_delete_rides_the_topic_lane_and_takes_an_edit_token() {
+        let op = Op::DeleteTopic {
+            chat: Chat::Group,
+            thread_id: 100,
+        };
+        assert_eq!(op.lane(), Lane::Topic);
+        assert!(op.edit_metered());
+        assert!(!op.metered());
+        assert_eq!(op.posts(), None);
+        assert_eq!(op.chat(), Some(Chat::Group));
     }
 
     #[tokio::test(start_paused = true)]

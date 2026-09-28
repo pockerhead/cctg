@@ -82,6 +82,7 @@ fn post(event: HookEvent) -> HookPost {
 
 fn say(message_id: i64, text: &str) -> Control {
     Control::Message(Inbound {
+        display_name: None,
         chat: Chat::Group,
         sender: cctg::hub::chat::PrivateChat::of_user(1001),
         message_id,

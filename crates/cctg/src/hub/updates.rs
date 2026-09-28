@@ -69,6 +69,9 @@ pub struct Inbound {
     /// The sender's [`author_name`] always: it signs the echo of the message
     /// in the slot's other views (TASK-063). Never logged.
     pub author: Option<String>,
+    /// The sender's [`display_name`]: it signs the share line of `/share`
+    /// (TASK-064). Never logged.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +153,9 @@ pub struct CallbackInput {
     pub thread_id: Option<i64>,
     /// Who pressed, as [`Inbound::from_name`].
     pub from_name: Option<String>,
+    /// Who pressed, as [`Inbound::display_name`]: it signs the share line
+    /// (TASK-064). Never logged.
+    pub display_name: Option<String>,
 }
 
 /// UTF-16 units kept of an author's name.
@@ -161,23 +167,35 @@ pub const NAME_LIMIT: usize = 32;
 /// overrides, zero-width) and `<>"` are dropped; at most [`NAME_LIMIT`].
 /// `None` when nothing is left. Never the user id.
 pub fn author_name(from: &User) -> Option<String> {
+    from.username
+        .as_deref()
+        .and_then(clean_name)
+        .or_else(|| from.first_name.as_deref().and_then(clean_name))
+}
+
+/// How a person is named in a share line (TASK-064): the first and last
+/// name, else the username; cleaned and bounded as [`author_name`].
+pub fn display_name(from: &User) -> Option<String> {
+    let name: Vec<&str> = [from.first_name.as_deref(), from.last_name.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    clean_name(&name.join(" ")).or_else(|| from.username.as_deref().and_then(clean_name))
+}
+
+/// [`author_name`]'s cleaning of one name.
+fn clean_name(raw: &str) -> Option<String> {
     let invisible = |c: char| {
         matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}'
             | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}')
     };
-    let clean = |raw: &str| {
-        let kept: String = raw
-            .chars()
-            .map(|c| if c.is_whitespace() { ' ' } else { c })
-            .filter(|&c| !c.is_control() && !invisible(c) && !matches!(c, '<' | '>' | '"'))
-            .collect();
-        let name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!name.is_empty()).then(|| cut(&name, NAME_LIMIT))
-    };
-    from.username
-        .as_deref()
-        .and_then(clean)
-        .or_else(|| from.first_name.as_deref().and_then(clean))
+    let kept: String = raw
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|&c| !c.is_control() && !invisible(c) && !matches!(c, '<' | '>' | '"'))
+        .collect();
+    let name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!name.is_empty()).then(|| cut(&name, NAME_LIMIT))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +288,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         }
         let author = author_name(&from);
         let from_name = author.clone().filter(|_| allowlist.is_team());
+        let display_name = display_name(&from);
         let media = media(&mut message);
         let thread_id = message
             .message_thread_id
@@ -297,6 +316,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             media,
             from_name,
             author,
+            display_name,
         });
     }
 
@@ -326,6 +346,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             message_id: query.message.map(|message| message.message_id),
             thread_id,
             from_name: author_name(&from).filter(|_| allowlist.is_team()),
+            display_name: display_name(&from),
         });
     }
 
@@ -614,6 +635,7 @@ mod tests {
                 media: None,
                 from_name: None,
                 author: Some("x".to_owned()),
+                display_name: Some("x".to_owned()),
             })
         );
 
@@ -642,6 +664,7 @@ mod tests {
                 message_id: Some(10),
                 thread_id: Some(7),
                 from_name: None,
+                display_name: Some("x".to_owned()),
             })
         );
     }
@@ -674,19 +697,60 @@ mod tests {
         // One person: no names, as before the team mode.
         let alone: Allowlist = [MATE].into_iter().collect();
         assert!(matches!(
-            route(text, &alone),
+            route(text.clone(), &alone),
             Routed::Input(Inbound {
                 from_name: None,
+
                 ..
             })
         ));
+        // The name, not the username, signs a share line either way
+        // (TASK-064).
         assert!(matches!(
             route(press, &alone),
             Routed::Callback(CallbackInput {
                 from_name: None,
+                display_name: Some(ref name),
                 ..
-            })
+            }) if name == "Анна"
         ));
+        assert!(matches!(
+            route(text, &alone),
+            Routed::Input(Inbound {
+                author: Some(ref author),
+                display_name: Some(ref name),
+                ..
+            }) if author == "anna_k" && name == "Анна"
+        ));
+    }
+
+    #[test]
+    fn a_display_name_is_the_name_else_the_username() {
+        let user = |username: Option<&str>, first: Option<&str>, last: Option<&str>| User {
+            id: 987654321,
+            is_bot: false,
+            username: username.map(str::to_owned),
+            first_name: first.map(str::to_owned),
+            last_name: last.map(str::to_owned),
+            ..User::default()
+        };
+        assert_eq!(
+            display_name(&user(Some("anna_k"), Some("Анна"), Some("Кузнецова"))).as_deref(),
+            Some("Анна Кузнецова")
+        );
+        assert_eq!(
+            display_name(&user(Some("anna_k"), None, Some("Кузнецова"))).as_deref(),
+            Some("Кузнецова")
+        );
+        assert_eq!(
+            display_name(&user(Some("anna_k"), Some("\u{200B}"), None)).as_deref(),
+            Some("anna_k")
+        );
+        assert_eq!(
+            display_name(&user(None, Some(" Иван\n"), Some("<Петров>"))).as_deref(),
+            Some("Иван Петров")
+        );
+        assert_eq!(display_name(&user(None, None, None)), None);
     }
 
     #[test]

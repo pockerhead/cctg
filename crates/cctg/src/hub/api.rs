@@ -69,6 +69,8 @@ pub struct User {
     pub is_bot: bool,
     pub username: Option<String>,
     pub first_name: Option<String>,
+    /// With the first name, signs a share line (TASK-064).
+    pub last_name: Option<String>,
     /// The bot has topics in private chats (Threaded Mode in @BotFather);
     /// only `getMe` says it (Bot API 9.3, TASK-063).
     pub has_topics_enabled: bool,
@@ -613,6 +615,15 @@ impl BotApi {
             body["icon_custom_emoji_id"] = json!(icon);
         }
         self.call::<IgnoredAny>("editForumTopic", body, None)
+            .await
+            .map(drop)
+    }
+
+    /// Deletes the topic with all its messages (TASK-064); in the group the
+    /// bot needs `can_delete_messages`.
+    pub async fn delete_forum_topic(&self, chat: Chat, thread_id: i64) -> Result<(), ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat), "message_thread_id": thread_id });
+        self.call::<IgnoredAny>("deleteForumTopic", body, None)
             .await
             .map(drop)
     }

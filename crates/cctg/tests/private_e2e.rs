@@ -4,7 +4,8 @@
 //! real per-chat `Outbox`, and a fake Bot API that keeps every chat on its
 //! own: topics and messages are numbered per chat, as Telegram does, so a
 //! message of the group and its twin in the private chat have different
-//! ids. Private chats are on (`Options::owners`) with one owner.
+//! ids. Private chats are on (`Options::owners`) with one owner. Sharing a
+//! slot to the group and taking it out (TASK-064) at the end.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -16,12 +17,14 @@ use std::time::Duration;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
 use cctg::hub::chat::{Chat, Place, PrivateChat};
 use cctg::hub::ingress::{bind, serve_agents};
-use cctg::hub::registry::RegistryStore;
+use cctg::hub::registry::{ICON_DEAD, RegistryStore, share_line};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Transport};
 use cctg::hub::slots::{
-    Control, ECHO_MARK, FALLBACK_END_NOTICE, Options, Owners, PRIVATE_CLOSED_NOTICE,
-    PRIVATE_GENERAL_NOTICE, PRIVATE_START_TEXT, Slots,
+    Control, ECHO_MARK, FALLBACK_END_NOTICE, FOREIGN_TOPIC_NOTICE, Options, Owners,
+    PRIVATE_CLOSED_NOTICE, PRIVATE_GENERAL_NOTICE, PRIVATE_START_TEXT, SHARE_OWNER_ONLY_NOTICE,
+    SHARED_NOTICE, Slots, UNSHARED_KEPT_NOTICE, UNSHARED_NOTICE,
 };
+use cctg::hub::status;
 use cctg::hub::updates::{CallbackInput, Inbound};
 use cctg::hub::{permissions, updates};
 use cctg::wire::{
@@ -84,6 +87,8 @@ struct Fake {
     ops: Mutex<Vec<Op>>,
     /// Every call into a private chat is refused with 403 (no Start yet).
     forbid_private: AtomicBool,
+    /// `deleteForumTopic` is refused: the bot may not delete messages.
+    refuse_topic_delete: AtomicBool,
 }
 
 fn buttons(markup: Option<&Value>) -> Vec<String> {
@@ -228,6 +233,16 @@ impl Transport for Fake {
                 }
                 Ok(Outcome::Done)
             }
+            Op::DeleteTopic { thread_id, .. } => {
+                if self.refuse_topic_delete.load(Ordering::SeqCst) {
+                    return Err(ApiError::Telegram {
+                        code: 400,
+                        description: "Bad Request: not enough rights to delete a topic".into(),
+                    });
+                }
+                model.topics.remove(thread_id);
+                Ok(Outcome::Done)
+            }
             _ => Ok(Outcome::Done),
         }
     }
@@ -283,6 +298,29 @@ impl Fake {
             status: false,
         };
         model.post(base, thread, shown).expect("the topic is there")
+    }
+
+    /// How many topics `chat` has.
+    fn topics(&self, chat: Chat) -> usize {
+        let chats = self.chats.lock().unwrap();
+        chats.get(&chat).map_or(0, |model| model.topics.len())
+    }
+
+    /// The id the next message of `chat` gets.
+    fn next_id(&self, chat: Chat) -> i64 {
+        let base = if chat.is_private() { 5000 } else { 1000 };
+        let mut chats = self.chats.lock().unwrap();
+        let model = chats.entry(chat).or_default();
+        model.next_message = model.next_message.max(base) + 1;
+        model.next_message
+    }
+
+    /// The status message `chat` shows.
+    fn status(&self, chat: Chat) -> Option<Shown> {
+        self.shown(chat)
+            .into_iter()
+            .rev()
+            .find(|shown| shown.status)
     }
 
     /// The user deletes the topic of `chat` (a private chat lets them).
@@ -409,9 +447,13 @@ async fn start_hub_on(state: &std::path::Path, mode: Mode, fake: Arc<Fake>, own:
 
 impl Hub {
     async fn hook(&self, event: HookEvent) {
+        self.hook_of(SESSION, event).await;
+    }
+
+    async fn hook_of(&self, session: &str, event: HookEvent) {
         let post = HookPost::new(
             HOST.into(),
-            SESSION.into(),
+            session.into(),
             CWD.into(),
             String::new(),
             event,
@@ -468,15 +510,43 @@ impl Hub {
                 media: None,
                 from_name: None,
                 author: Some(NAME.into()),
+                display_name: Some(NAME.into()),
             }))
             .unwrap();
         message_id
+    }
+
+    /// The owner's message in topic `thread` of `chat`, which the fake need
+    /// not have (a deleted topic): handed over as the poll does.
+    fn say_in(&self, chat: Chat, thread: i64, text: &str) {
+        self.say_as(OWNER, chat, thread, text);
+    }
+
+    /// A message of allowlisted user `user` in topic `thread` of `chat`.
+    fn say_as(&self, user: i64, chat: Chat, thread: i64, text: &str) {
+        self.control
+            .send(Control::Message(Inbound {
+                chat,
+                sender: PrivateChat::of_user(user),
+                message_id: self.fake.next_id(chat),
+                thread_id: Some(thread),
+                text: Some(text.into()),
+                reply_to: None,
+                quote: None,
+                forwarded: false,
+                media: None,
+                from_name: None,
+                author: Some(NAME.into()),
+                display_name: Some(NAME.into()),
+            }))
+            .unwrap();
     }
 
     /// A user's message in the General of `chat`.
     fn say_general(&self, chat: Chat, text: &str) {
         self.control
             .send(Control::Message(Inbound {
+                display_name: None,
                 chat,
                 sender: PrivateChat::of_user(OWNER),
                 message_id: 1,
@@ -502,6 +572,7 @@ impl Hub {
                 message_id: Some(message_id),
                 thread_id: self.fake.topic(chat),
                 from_name: None,
+                display_name: Some(NAME.into()),
             }))
             .unwrap();
     }
@@ -1269,4 +1340,530 @@ async fn e2e_without_topics_in_private_chats_the_group_is_all() {
         [updates::Routed::Ignored(updates::Ignored::PrivateChat)]
     );
     let _ = Place::new(Chat::Group, None);
+}
+
+// ---------------------------------------------------------------- TASK-064
+
+/// A call that puts something new into the group: a message or a topic.
+fn posts_to_group(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Send {
+            chat: Chat::Group,
+            ..
+        } | Op::Stream {
+            chat: Chat::Group,
+            ..
+        } | Op::CreateTopic {
+            chat: Chat::Group,
+            ..
+        }
+    )
+}
+
+/// The session's status message in `chat` has a button labelled `label`.
+fn status_has(fake: &Fake, chat: Chat, label: &str) -> bool {
+    fake.status(chat)
+        .is_some_and(|status| status.buttons.iter().any(|button| button == label))
+}
+
+/// A session in the private chat alone, shared with `/share`: the group
+/// topic shows the share line, then the status.
+async fn shared_hub(name: &str, fake: Fake) -> (Hub, Agent) {
+    let hub = start_hub(name, PRIVATE, fake).await;
+    hub.start().await;
+    let agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.say(owner(), "/share");
+    let line = share_line(NAME);
+    hub.until("the group topic: its line, then the status", |fake| {
+        fake.layout(Chat::Group) == [line.as_str(), "STATUS"]
+    })
+    .await;
+    (hub, agent)
+}
+
+/// `/share` in the private topic: a group topic that starts with the share
+/// line, without what came before; from then on the session shows in both,
+/// and the group writes to it as in a shared slot. The answer stays in the
+/// private chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_share_opens_a_group_topic_with_its_line_and_mirrors_only_what_comes_after() {
+    let hub = start_hub("share", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.say(owner(), "раз");
+    let (content, _) = agent.inbound().await;
+    assert_eq!(content, "раз");
+    assert!(
+        hub.fake
+            .ops()
+            .iter()
+            .all(|op| op.chat().is_none_or(|chat| chat != Chat::Group)),
+        "nothing in the group before the share"
+    );
+    hub.say(owner(), "/share");
+    let line = share_line(NAME);
+    assert_eq!(line, "── общий доступ: Анна ──");
+    hub.until("the group topic, the answer in the private chat", |fake| {
+        fake.layout(Chat::Group) == [line.as_str(), "STATUS"]
+            && fake.layout(owner()).contains(&SHARED_NOTICE.to_owned())
+    })
+    .await;
+    agent
+        .send(AgentMsg::Reply {
+            text: "ответ".into(),
+        })
+        .await;
+    hub.until("the reply in both", |fake| {
+        fake.layout(owner()).contains(&"ответ".to_owned())
+            && fake.layout(Chat::Group) == [line.as_str(), "ответ", "STATUS"]
+    })
+    .await;
+    // The group writes to the session; the command before never reached it.
+    hub.say(Chat::Group, "два");
+    let (content, meta) = agent.inbound().await;
+    assert_eq!((content.as_str(), meta["place"].as_str()), ("два", "group"));
+    hub.until("the echo in the private chat", |fake| {
+        fake.layout(owner()).contains(&echo("два"))
+    })
+    .await;
+    let group = hub.fake.layout(Chat::Group);
+    assert!(
+        !group.contains(&"раз".to_owned()) && !group.contains(&SHARED_NOTICE.to_owned()),
+        "{group:?}"
+    );
+    assert!(
+        hub.fake
+            .status(Chat::Group)
+            .is_some_and(|status| status.buttons.is_empty()),
+        "the twin has no share button"
+    );
+}
+
+/// `/unshare` deletes the group topic; the session goes on in the private
+/// chat alone, with one status message there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_unshare_deletes_the_group_topic_and_the_session_goes_on_in_private() {
+    let (hub, mut agent) = shared_hub("unshare", Fake::default()).await;
+    let thread = hub.fake.topic(Chat::Group).unwrap();
+    hub.say(owner(), "/unshare");
+    hub.until("the group topic gone, the private chat told", |fake| {
+        let private = fake.layout(owner());
+        fake.topics(Chat::Group) == 0
+            && private.contains(&UNSHARED_NOTICE.to_owned())
+            && private.iter().filter(|text| *text == "STATUS").count() == 1
+            && private.last().is_some_and(|text| text == "STATUS")
+    })
+    .await;
+    assert!(hub.fake.ops().iter().any(|op| matches!(
+        op,
+        Op::DeleteTopic { chat: Chat::Group, thread_id } if *thread_id == thread
+    )));
+    let after = hub.fake.ops().len();
+    agent
+        .send(AgentMsg::Reply {
+            text: "после".into(),
+        })
+        .await;
+    hub.hook(HookEvent::Stop {
+        prompt_id: None,
+        last_assistant_message: Some("Готово".into()),
+    })
+    .await;
+    hub.until("the reply and the answer in the private chat", |fake| {
+        let private = fake.layout(owner());
+        private.contains(&"после".to_owned()) && private.contains(&"Готово".to_owned())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ops = hub.fake.ops();
+    assert!(
+        !ops[after..].iter().any(posts_to_group),
+        "{:#?}",
+        &ops[after..]
+    );
+}
+
+/// The status button: «👥 В группу» shares, «🙈 Убрать из группы» asks
+/// again, and the confirming press takes the slot out of the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_the_status_button_shares_and_unshares_after_a_confirm() {
+    let hub = start_hub("share-button", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let _agent = Agent::connect(&hub, true).await;
+    hub.until("the share button on the private status", |fake| {
+        status_has(fake, owner(), status::SHARE_BUTTON)
+    })
+    .await;
+    assert_eq!(
+        press_status(&hub, "status:share").await,
+        status::ANSWER_SHARED
+    );
+    let line = share_line(NAME);
+    hub.until("the group topic, the unshare button", |fake| {
+        fake.layout(Chat::Group) == [line.as_str(), "STATUS"]
+            && status_has(fake, owner(), status::UNSHARE_BUTTON)
+    })
+    .await;
+    assert_eq!(
+        press_status(&hub, "status:unshare").await,
+        status::ANSWER_UNSHARE_CONFIRM
+    );
+    hub.until("the confirming button", |fake| {
+        status_has(fake, owner(), status::UNSHARE_CONFIRM_BUTTON)
+    })
+    .await;
+    assert_eq!(hub.fake.topics(Chat::Group), 1, "not before the confirm");
+    assert_eq!(
+        press_status(&hub, "status:unshare_confirm").await,
+        status::ANSWER_UNSHARED
+    );
+    hub.until("the group topic gone, the share button back", |fake| {
+        fake.topics(Chat::Group) == 0 && status_has(fake, owner(), status::SHARE_BUTTON)
+    })
+    .await;
+}
+
+/// Presses `data` on the private status message and returns the answer.
+/// The fake shows a moved status message a moment before the hub has
+/// Telegram's answer about it; a press then is answered as stale (as it
+/// would be in Telegram) and is made again.
+async fn press_status(hub: &Hub, data: &str) -> String {
+    let answers = |fake: &Fake| -> Vec<String> {
+        fake.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::AnswerCallback { text, .. } => text,
+                _ => None,
+            })
+            .collect()
+    };
+    for _ in 0..100 {
+        let before = answers(&hub.fake).len();
+        let status = hub.fake.status(owner()).unwrap().id;
+        hub.press(owner(), status, data);
+        hub.until("the press is answered", |fake| answers(fake).len() > before)
+            .await;
+        let answer = answers(&hub.fake).remove(before);
+        if answer != status::ANSWER_STALE {
+            return answer;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{data}: the status message stays unknown to the hub");
+}
+
+/// Only the owner shares and unshares, from their private topic: another
+/// user's private chat with the same topic number gets the foreign-topic
+/// answer, `/unshare` in the group is refused there, and a press on the
+/// twin of the status message in the group does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_only_the_owner_shares_and_unshares() {
+    const OTHER: i64 = 7_319_402_519;
+    let hub = start_hub("owner-only", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    let other = Chat::Private(PrivateChat::of_user(OTHER));
+    let thread = hub.fake.topic(owner()).unwrap();
+    hub.say_as(OTHER, other, thread, "/share");
+    hub.until("the other user is told where to write", |fake| {
+        fake.ops().iter().any(|op| {
+            matches!(op, Op::Send { chat, text, .. } if *chat == other && text == FOREIGN_TOPIC_NOTICE)
+        })
+    })
+    .await;
+    assert_eq!(hub.fake.topics(Chat::Group), 0);
+    assert!(!hub.fake.ops().iter().any(posts_to_group));
+
+    hub.say(owner(), "/share");
+    let line = share_line(NAME);
+    hub.until("the group topic", |fake| {
+        fake.layout(Chat::Group) == [line.as_str(), "STATUS"]
+    })
+    .await;
+    hub.say(Chat::Group, "/unshare");
+    hub.until("the group is told who may", |fake| {
+        fake.layout(Chat::Group)
+            .contains(&SHARE_OWNER_ONLY_NOTICE.to_owned())
+    })
+    .await;
+    assert!(
+        !matches!(
+            agent.next_within(Duration::from_millis(300)).await,
+            Some(HubMsg::Inbound { .. })
+        ),
+        "the command reaches no session"
+    );
+    let twin = hub.fake.status(Chat::Group).unwrap().id;
+    hub.press(Chat::Group, twin, "status:unshare_confirm");
+    hub.until("the press is refused", |fake| {
+        fake.ops().iter().any(|op| {
+            matches!(op, Op::AnswerCallback { text: Some(text), .. } if text == status::ANSWER_OWNER_ONLY)
+        })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(hub.fake.topics(Chat::Group), 1);
+    assert!(
+        !hub.fake
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::DeleteTopic { .. }))
+    );
+}
+
+/// A prompt open in both views as the slot is unshared stays decidable in
+/// the private chat; the group gets no topic again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_an_unshare_with_an_open_prompt_leaves_it_decidable_in_private() {
+    let (hub, mut agent) = shared_hub("unshare-prompt", Fake::default()).await;
+    agent.send(permission("abcde")).await;
+    hub.until("the prompt in both views", |fake| {
+        asks_in(fake, owner(), "abcde") && asks_in(fake, Chat::Group, "abcde")
+    })
+    .await;
+    hub.say(owner(), "/unshare");
+    hub.until("the group topic gone", |fake| fake.topics(Chat::Group) == 0)
+        .await;
+    let after = hub.fake.ops().len();
+    allow_in(&hub, &mut agent, owner(), "abcde").await;
+    hub.until("the private prompt shows the decision", |fake| {
+        allowed_in(fake, owner(), "abcde")
+    })
+    .await;
+    let ops = hub.fake.ops();
+    assert!(
+        !ops[after..].iter().any(|op| matches!(
+            op,
+            Op::CreateTopic {
+                chat: Chat::Group,
+                ..
+            }
+        )),
+        "{:#?}",
+        &ops[after..]
+    );
+}
+
+/// A message written into the group topic as it is being deleted reaches
+/// no session and gets no answer; the session goes on in the private chat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_messages_written_into_the_group_as_it_is_unshared_go_nowhere_quietly() {
+    let (hub, mut agent) = shared_hub("unshare-late", Fake::default()).await;
+    let thread = hub.fake.topic(Chat::Group).unwrap();
+    hub.say(owner(), "/unshare");
+    hub.until("the group topic gone", |fake| fake.topics(Chat::Group) == 0)
+        .await;
+    let after = hub.fake.ops().len();
+    hub.say_in(Chat::Group, thread, "поздно");
+    assert!(
+        !matches!(
+            agent.next_within(Duration::from_millis(300)).await,
+            Some(HubMsg::Inbound { .. })
+        ),
+        "no inbound from a topic that is no view"
+    );
+    agent
+        .send(AgentMsg::Reply {
+            text: "дальше".into(),
+        })
+        .await;
+    hub.until("the reply in the private chat", |fake| {
+        fake.layout(owner()).contains(&"дальше".to_owned())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ops = hub.fake.ops();
+    assert!(
+        !ops[after..].iter().any(posts_to_group),
+        "{:#?}",
+        &ops[after..]
+    );
+}
+
+/// A dead slot can be shared: its group topic shows the line and the
+/// ended status; the next session of the slot shows in both, after its
+/// separator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_dead_slot_can_be_shared_and_its_next_session_is_shared_too() {
+    const NEXT: &str = "1b27f3f1-0000-4000-8000-000000000632";
+    let hub = start_hub("share-dead", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.hook(HookEvent::SessionEnd {
+        reason: None,
+        claude_pid: Some(4242),
+    })
+    .await;
+    drop(agent);
+    let ended = |fake: &Fake, chat: Chat| {
+        fake.status(chat)
+            .is_some_and(|status| status.text.starts_with("🏁"))
+    };
+    hub.until("the session ended", |fake| ended(fake, owner()))
+        .await;
+    hub.say(owner(), "/share");
+    let line = share_line(NAME);
+    hub.until(
+        "the group topic with the line and the ended status",
+        |fake| fake.layout(Chat::Group) == [line.as_str(), "STATUS"] && ended(fake, Chat::Group),
+    )
+    .await;
+    hub.hook_of(
+        NEXT,
+        HookEvent::SessionStart {
+            source: Some("startup".into()),
+            claude_pid: Some(4243),
+            parent_claude_pid: None,
+        },
+    )
+    .await;
+    let separator = "── session 1b27f3f1 · new ──".to_owned();
+    hub.until("the separator in both views", |fake| {
+        fake.layout(owner()).contains(&separator) && fake.layout(Chat::Group).contains(&separator)
+    })
+    .await;
+}
+
+/// A slot in the group only because the owner blocked the bot: once the
+/// owner is back, `/share` in the private topic keeps that group topic as
+/// the shared one instead of leaving it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_share_keeps_the_fallback_group_topic() {
+    let hub = start_hub("share-fallback", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.fake.forbid_private.store(true, Ordering::SeqCst);
+    agent
+        .send(AgentMsg::Reply {
+            text: "в заблокированную".into(),
+        })
+        .await;
+    hub.until("the slot is in the group", |fake| {
+        fake.layout(Chat::Group) == ["в заблокированную", "STATUS"]
+    })
+    .await;
+    hub.fake.forbid_private.store(false, Ordering::SeqCst);
+    hub.say(owner(), "/share");
+    let line = share_line(NAME);
+    hub.until("the share line in the old group topic", |fake| {
+        fake.layout(Chat::Group).contains(&line)
+            && fake.layout(owner()).contains(&SHARED_NOTICE.to_owned())
+    })
+    .await;
+    let group = hub.fake.layout(Chat::Group);
+    assert_eq!(hub.fake.topics(Chat::Group), 1, "the same topic");
+    assert_eq!(group[0], "в заблокированную");
+    assert!(
+        !group.contains(&FALLBACK_END_NOTICE.to_owned()),
+        "{group:?}"
+    );
+    agent
+        .send(AgentMsg::Reply {
+            text: "снова вместе".into(),
+        })
+        .await;
+    hub.until("the reply in both", |fake| {
+        fake.layout(owner()).contains(&"снова вместе".to_owned())
+            && fake
+                .layout(Chat::Group)
+                .contains(&"снова вместе".to_owned())
+    })
+    .await;
+}
+
+/// Sharing is kept over a hub restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_shared_slot_stays_shared_over_a_hub_restart() {
+    let state = fresh_state("share-restart");
+    let fake = Arc::new(Fake::default());
+    let old = start_hub_on(&state, PRIVATE, fake.clone(), false).await;
+    old.start().await;
+    let agent = Agent::connect(&old, true).await;
+    old.until("the status in the private chat", |f| {
+        f.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    old.say(owner(), "/share");
+    let line = share_line(NAME);
+    old.until("the group topic", |f| {
+        f.layout(Chat::Group) == [line.as_str(), "STATUS"]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(agent);
+    drop(old);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let new = start_hub_on(&state, PRIVATE, fake.clone(), true).await;
+    let mut agent = Agent::connect(&new, true).await;
+    agent
+        .send(AgentMsg::Reply {
+            text: "после".into(),
+        })
+        .await;
+    new.until("the reply in both", |f| {
+        f.layout(owner()).contains(&"после".to_owned())
+            && f.layout(Chat::Group).contains(&"после".to_owned())
+    })
+    .await;
+    assert_eq!(fake.topics(Chat::Group), 1);
+}
+
+/// Without the right to delete messages the group topic stays: it is told,
+/// gets the dead icon, loses its status twin and gets nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_without_the_delete_right_an_unshared_topic_is_told_and_left() {
+    let fake = Fake::default();
+    fake.refuse_topic_delete.store(true, Ordering::SeqCst);
+    let (hub, mut agent) = shared_hub("unshare-kept", fake).await;
+    let thread = hub.fake.topic(Chat::Group).unwrap();
+    hub.say(owner(), "/unshare");
+    hub.until("the group topic told, dead, without status", |fake| {
+        let group = fake.layout(Chat::Group);
+        group.contains(&UNSHARED_KEPT_NOTICE.to_owned())
+            && !group.contains(&"STATUS".to_owned())
+            && fake.ops().iter().any(|op| {
+                matches!(op, Op::EditTopic { chat: Chat::Group, thread_id, icon_custom_emoji_id: Some(icon), .. }
+                    if *thread_id == thread && icon == ICON_DEAD)
+            })
+    })
+    .await;
+    assert_eq!(hub.fake.topics(Chat::Group), 1);
+    let after = hub.fake.ops().len();
+    agent
+        .send(AgentMsg::Reply {
+            text: "дальше".into(),
+        })
+        .await;
+    hub.until("the reply in the private chat", |fake| {
+        fake.layout(owner()).contains(&"дальше".to_owned())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let ops = hub.fake.ops();
+    assert!(
+        !ops[after..].iter().any(posts_to_group),
+        "{:#?}",
+        &ops[after..]
+    );
 }
