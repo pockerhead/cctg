@@ -549,6 +549,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             | Op::Edit { chat, .. }
             | Op::Delete { chat, .. }
             | Op::Unpin { chat, .. }
+            | Op::Pin { chat, .. }
             | Op::CreateTopic { chat, .. }
             | Op::EditTopic { chat, .. }
             | Op::DeleteTopic { chat, .. }
@@ -634,6 +635,10 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             chat: Chat::Group,
             message_id,
         } => ("unpin", None, String::new(), Some(*message_id)),
+        Op::Pin {
+            chat: Chat::Group,
+            message_id,
+        } => ("pin", None, String::new(), Some(*message_id)),
         Op::CreateTopic {
             chat: Chat::Group,
             name,

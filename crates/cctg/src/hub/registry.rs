@@ -22,6 +22,9 @@
 //! ([`View::opening`], [`share_line`]); an unshare removes the view and keeps
 //! its topic in [`Registry::unshared`] until Telegram deleted it.
 //!
+//! Each person's menu in their private chat and their settings for it
+//! (TASK-073) are kept in [`Registry::people`], by private chat.
+//!
 //! Paths, folder names and titles are private: nothing here logs them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -34,6 +37,7 @@ use transcript::telegram_len;
 
 use super::buffer::Buffer;
 use super::chat::{Chat, MessageKey, Place, PrivateChat};
+use super::menu::Person;
 use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
 
@@ -732,6 +736,10 @@ pub struct Registry {
     /// Telegram has not deleted yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unshared: Vec<UnsharedTopic>,
+    /// The menu and the settings of each person, by their private chat
+    /// (TASK-073).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub people: Vec<Person>,
 }
 
 /// The group topic of a slot taken out of the group (TASK-064), to delete.
@@ -793,6 +801,7 @@ impl Default for Registry {
             closed: HashSet::new(),
             twins: Vec::new(),
             unshared: Vec::new(),
+            people: Vec::new(),
         }
     }
 }
@@ -810,6 +819,25 @@ impl Registry {
 
     pub fn slot(&self, id: SlotId) -> Option<&Slot> {
         self.slots.get(id.0)
+    }
+
+    /// The person of private chat `chat` (TASK-073), once they have a menu.
+    pub fn person(&self, chat: PrivateChat) -> Option<&Person> {
+        self.people.iter().find(|person| person.chat == chat)
+    }
+
+    /// The person of private chat `chat`, made when missing; marks the
+    /// registry dirty.
+    pub fn person_mut(&mut self, chat: PrivateChat) -> &mut Person {
+        self.dirty = true;
+        let at = match self.people.iter().position(|person| person.chat == chat) {
+            Some(at) => at,
+            None => {
+                self.people.push(Person::new(chat));
+                self.people.len() - 1
+            }
+        };
+        &mut self.people[at]
     }
 
     /// The caller sets [`Registry::dirty`] when it changes a saved field.
@@ -2749,6 +2777,44 @@ mod tests {
             Some(share_line("Анна"))
         );
         assert_eq!(loaded.unshared, registry.unshared);
+    }
+
+    /// TASK-073: each person's menu and settings survive `registry.json`; a
+    /// file of v0.1.17 (no `people`) loads, and no people write nothing.
+    #[test]
+    fn people_round_trip_and_an_older_hub_reads_the_file() {
+        use crate::hub::menu::{Detail, Quiet, Settings, Sound};
+        let dir = TempDir::new("registry-people");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let (mut registry, _, _) = private_slot();
+        let plain = String::from_utf8(RegistryStore::encode(&registry)).unwrap();
+        assert!(!plain.contains("people"), "{plain}");
+        // As v0.1.17 wrote it: loads with nobody.
+        store.save(plain.as_bytes()).unwrap();
+        assert!(store.load().unwrap().people.is_empty());
+
+        let anna = PrivateChat::of_user(7);
+        let boris = PrivateChat::of_user(8);
+        assert!(registry.person(anna).is_none());
+        registry.dirty = false;
+        registry.person_mut(anna).menu = Some(41);
+        assert!(registry.dirty, "a new person is saved");
+        registry.dirty = false;
+        registry.person_mut(anna).settings = Settings {
+            detail: Detail::Answers,
+            thinking: false,
+            sound: Sound::Off,
+            quiet: Some(Quiet { from: 22, to: 7 }),
+            tz: Some(-570),
+        };
+        assert!(registry.dirty, "a change of a known person too");
+        registry.person_mut(boris);
+        assert_eq!(registry.people.len(), 2);
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.people, registry.people);
+        assert_eq!(loaded.person(anna).unwrap().menu, Some(41));
+        assert_eq!(loaded.person(boris).unwrap().settings, Settings::default());
     }
 
     #[test]

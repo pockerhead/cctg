@@ -49,8 +49,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::chat::{MessageKey, Place};
+use super::menu::Piece;
 use super::registry::{PendingCall, Stream};
 use super::scheduler::Op;
+use super::status::INTERRUPT_NOTE;
 use crate::wire::StreamItem;
 
 /// Tool calls of a turn waiting for their result, per session. A call past it
@@ -79,11 +81,13 @@ pub const WORKING: &str = "✍";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// A topic message; `merge`: a one-line tool call that may share a
-    /// message with the next ones.
+    /// message with the next ones; `piece`: what it shows, for the detail
+    /// level of the menu (TASK-073).
     Send {
         text: String,
         merge: bool,
         format: Format,
+        piece: Piece,
     },
     /// Mark this Telegram message ✍.
     Working(MessageKey),
@@ -166,14 +170,23 @@ pub fn apply_line(
                     text: format!("> {text}"),
                     merge: false,
                     format: Format::Code,
+                    piece: Piece::Prompt,
                 });
             }
             StreamItem::Note { text } => {
                 flush(calls, &mut steps);
+                // The interrupt note shows at every detail level: after ⏹
+                // no answer comes (TASK-073).
+                let piece = if text.starts_with(INTERRUPT_NOTE) {
+                    Piece::Interrupt
+                } else {
+                    Piece::Text
+                };
                 steps.push(Step::Send {
                     text: text.clone(),
                     merge: false,
                     format: Format::Markdown,
+                    piece,
                 });
             }
             // Its own message; under the rate limit it joins its neighbours like a tool line.
@@ -183,6 +196,7 @@ pub fn apply_line(
                     text: format!("{THINKING} {text}"),
                     merge: true,
                     format: Format::Markdown,
+                    piece: Piece::Thinking,
                 });
             }
             StreamItem::TurnEnd => {
@@ -262,6 +276,7 @@ fn finished(call: &PendingCall) -> Step {
         text,
         merge: true,
         format: Format::Plain,
+        piece: Piece::Tool,
     }
 }
 
@@ -1008,21 +1023,68 @@ mod tests {
                     text: "> go".into(),
                     merge: false,
                     format: Format::Code,
+                    piece: Piece::Prompt,
                 },
                 Step::Send {
                     text: "• Bash: A ✓".into(),
                     merge: true,
                     format: Format::Plain,
+                    piece: Piece::Tool,
                 },
                 Step::Send {
                     text: "\u{1F4AD} Checking cargo.".into(),
                     merge: true,
                     format: Format::Markdown,
+                    piece: Piece::Thinking,
                 },
                 Step::TurnEnd,
             ]
         );
         assert!(calls.is_empty());
+    }
+
+    /// TASK-073: each message says what it shows, set where it is made.
+    #[test]
+    fn every_step_names_its_piece() {
+        let mut calls = Vec::new();
+        let steps = run(
+            &mut calls,
+            &[
+                vec![StreamItem::Prompt { text: "go".into() }],
+                vec![StreamItem::Note {
+                    text: "Looking.".into(),
+                }],
+                vec![StreamItem::Thinking {
+                    text: "Hmm.".into(),
+                }],
+                vec![call("a", "• Bash: A")],
+                vec![result("a", None)],
+                vec![call("b", "• Bash: B")],
+                vec![result("b", Some("no"))],
+                vec![StreamItem::Note {
+                    text: "[Request interrupted by user]".into(),
+                }],
+                vec![StreamItem::TurnEnd],
+            ],
+        );
+        let pieces: Vec<(&str, Piece)> = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Send { text, piece, .. } => Some((text.as_str(), *piece)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pieces,
+            [
+                ("> go", Piece::Prompt),
+                ("Looking.", Piece::Text),
+                ("\u{1F4AD} Hmm.", Piece::Thinking),
+                ("• Bash: A ✓", Piece::Tool),
+                ("• Bash: B ✗ no", Piece::Tool),
+                ("[Request interrupted by user]", Piece::Interrupt),
+            ]
+        );
     }
 
     #[test]
@@ -1043,6 +1105,7 @@ mod tests {
                     text: "• Bash: B ✓".into(),
                     merge: true,
                     format: Format::Plain,
+                    piece: Piece::Tool,
                 },
                 Step::TurnEnd
             ]

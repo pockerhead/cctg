@@ -5,7 +5,8 @@
 //! own: topics and messages are numbered per chat, as Telegram does, so a
 //! message of the group and its twin in the private chat have different
 //! ids. Private chats are on (`Options::owners`) with one owner. Sharing a
-//! slot to the group and taking it out (TASK-064) at the end.
+//! slot to the group and taking it out (TASK-064), then the menu in the
+//! private chat's General (TASK-073), at the end.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -17,7 +18,8 @@ use std::time::Duration;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
 use cctg::hub::chat::{Chat, Place, PrivateChat};
 use cctg::hub::ingress::{bind, serve_agents};
-use cctg::hub::registry::{ICON_DEAD, RegistryStore, share_line};
+use cctg::hub::menu;
+use cctg::hub::registry::{ICON_ALIVE, ICON_DEAD, RegistryStore, share_line};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Transport};
 use cctg::hub::slots::{
     Control, ECHO_MARK, FALLBACK_END_NOTICE, FOREIGN_TOPIC_NOTICE, Options, Owners,
@@ -78,7 +80,9 @@ struct ChatModel {
     next_message: i64,
     topics: BTreeMap<i64, Vec<Shown>>,
     /// Messages outside a topic (General).
-    general: Vec<String>,
+    general: Vec<Shown>,
+    /// The pinned message (TASK-073: the menu).
+    pinned: Option<i64>,
 }
 
 #[derive(Default)]
@@ -107,6 +111,7 @@ impl ChatModel {
         self.topics
             .values_mut()
             .flat_map(|topic| topic.iter_mut())
+            .chain(self.general.iter_mut())
             .find(|shown| shown.id == id)
     }
 
@@ -114,7 +119,7 @@ impl ChatModel {
         self.next_message = self.next_message.max(base) + 1;
         let id = self.next_message;
         let Some(thread) = thread else {
-            self.general.push(shown.text);
+            self.general.push(Shown { id, ..shown });
             return Ok(id);
         };
         let Some(topic) = self.topics.get_mut(&thread) else {
@@ -231,6 +236,17 @@ impl Transport for Fake {
                 for topic in model.topics.values_mut() {
                     topic.retain(|shown| shown.id != *message_id);
                 }
+                model.general.retain(|shown| shown.id != *message_id);
+                Ok(Outcome::Done)
+            }
+            Op::Pin { message_id, .. } => {
+                model.pinned = Some(*message_id);
+                Ok(Outcome::Done)
+            }
+            Op::Unpin { message_id, .. } => {
+                if model.pinned == Some(*message_id) {
+                    model.pinned = None;
+                }
                 Ok(Outcome::Done)
             }
             Op::DeleteTopic { thread_id, .. } => {
@@ -280,8 +296,37 @@ impl Fake {
         let chats = self.chats.lock().unwrap();
         chats
             .get(&chat)
-            .map(|model| model.general.clone())
+            .map(|model| model.general.iter().map(|m| m.text.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// The pinned message of `chat`'s General (TASK-073: the menu).
+    fn menu(&self, chat: Chat) -> Option<Shown> {
+        let chats = self.chats.lock().unwrap();
+        let model = chats.get(&chat)?;
+        let pinned = model.pinned?;
+        model.general.iter().find(|m| m.id == pinned).cloned()
+    }
+
+    /// The edits of message `message_id` of `chat` so far.
+    fn edits_of(&self, chat: Chat, message_id: i64) -> usize {
+        self.ops()
+            .iter()
+            .filter(|op| {
+                matches!(op, Op::Edit { chat: to, message_id: id, .. } if *to == chat && *id == message_id)
+            })
+            .count()
+    }
+
+    /// The texts of the answers to button presses so far.
+    fn answers(&self) -> Vec<Option<String>> {
+        self.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::AnswerCallback { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A message of the user in the topic of `chat`: its id.
@@ -361,10 +406,21 @@ impl Drop for Hub {
 
 /// Private chats on, and new slots shared to the group too: a slot as one
 /// made in the group before TASK-063, mirrored there.
-const SHARED: Mode = Mode::Private { share_new: true };
+const SHARED: Mode = Mode::Private {
+    share_new: true,
+    menu: false,
+};
 /// Private chats on as the hub runs: a new slot shows in the private chat
 /// alone (decision 2026-09-28).
-const PRIVATE: Mode = Mode::Private { share_new: false };
+const PRIVATE: Mode = Mode::Private {
+    share_new: false,
+    menu: false,
+};
+/// [`PRIVATE`] with the menu (TASK-073), as the hub runs.
+const MENU: Mode = Mode::Private {
+    share_new: false,
+    menu: true,
+};
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -372,6 +428,7 @@ enum Mode {
     Group,
     Private {
         share_new: bool,
+        menu: bool,
     },
 }
 
@@ -405,12 +462,13 @@ async fn start_hub_on(state: &std::path::Path, mode: Mode, fake: Arc<Fake>, own:
         status_every: Some(Duration::from_millis(50)),
         owners: match mode {
             Mode::Group => None,
-            Mode::Private { share_new } => Some(Owners {
+            Mode::Private { share_new, .. } => Some(Owners {
                 first: PrivateChat::of_user(OWNER),
                 devices: None,
                 share_new,
             }),
         },
+        menu: matches!(mode, Mode::Private { menu: true, .. }),
         ..Options::default()
     };
     let slots = Slots::new(registry, store, outbox, options);
@@ -562,6 +620,53 @@ impl Hub {
             .unwrap();
     }
 
+    /// A press of the button `data` of message `message_id` in the General
+    /// of `chat` (TASK-073: the menu).
+    fn press_general(&self, chat: Chat, message_id: i64, data: &str) {
+        self.control
+            .send(Control::Callback(CallbackInput {
+                chat: Some(chat),
+                query_id: format!("q-{data}-{message_id}"),
+                data: Some(data.into()),
+                message_id: Some(message_id),
+                thread_id: None,
+                from_name: None,
+                display_name: Some(NAME.into()),
+            }))
+            .unwrap();
+    }
+
+    /// Presses `data` on the owner's menu and waits for its one edit, and a
+    /// little more for a second one that must not come.
+    async fn menu_press(&self, data: &str) {
+        let menu = self.fake.menu(owner()).expect("a menu").id;
+        let before = self.fake.edits_of(owner(), menu);
+        self.press_general(owner(), menu, data);
+        self.until(data, |fake| fake.edits_of(owner(), menu) > before)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(self.fake.edits_of(owner(), menu), before + 1, "{data}");
+    }
+
+    /// Stops the hub as an update or a restart does (`Control::Stop`): it
+    /// returns once the slot actor has its last registry snapshot on disk.
+    /// Dropping it instead cuts the actor off: a snapshot still being
+    /// written (a slow disk) leaves an older `registry.json` behind.
+    async fn stop(mut self) {
+        self.control.send(Control::Stop).unwrap();
+        let slots = self.tasks.pop().expect("the slot actor");
+        tokio::time::timeout(WAIT, slots)
+            .await
+            .expect("the hub stops")
+            .unwrap();
+    }
+
+    /// The state directory's `registry.json`, as JSON.
+    fn saved(&self) -> Value {
+        let bytes = std::fs::read(self._state.0.join("registry.json")).unwrap_or_default();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
     /// A press of the button `data` of message `message_id` in `chat`.
     fn press(&self, chat: Chat, message_id: i64, data: &str) {
         self.control
@@ -588,6 +693,16 @@ struct Agent {
 impl Agent {
     /// `private_place`: it tells a private chat's message from the group's.
     async fn connect(hub: &Hub, private_place: bool) -> Self {
+        Self::connect_as(hub, private_place, false).await
+    }
+
+    /// `console_keys`: it writes ⏹ into the console (TASK-073 menu tests).
+    /// It returns once the hub bound it to its session: `registered` only
+    /// says the link took the frame, and a message written before the slot
+    /// actor bound the agent waits in the buffer with a notice, as it would
+    /// for a real session whose agent is not up yet.
+    async fn connect_as(hub: &Hub, private_place: bool, console_keys: bool) -> Self {
+        let from = hub.fake.ops().len();
         let stream = TcpStream::connect(hub.agent_addr).await.unwrap();
         let (read, mut write) = stream.into_split();
         let hello = AgentMsg::Hello {
@@ -601,7 +716,7 @@ impl Agent {
             claude_pid: Some(4242),
             verdict_ack: true,
             transcript_reads: false,
-            console_keys: false,
+            console_keys,
             console_commands: false,
             client: None,
             files: false,
@@ -620,6 +735,10 @@ impl Agent {
             agent.next().await,
             Some(HubMsg::Registered { .. })
         ));
+        hub.until("the agent bound: the alive icon", |fake| {
+            alive_since(fake, from)
+        })
+        .await;
         agent
     }
 
@@ -649,6 +768,16 @@ impl Agent {
     async fn send(&mut self, msg: AgentMsg) {
         wire::write_msg(&mut self.write, &msg).await.unwrap();
     }
+}
+
+/// A topic call after call `from` gives a topic the alive icon: the slot's
+/// session has its agent bound (the icon shows "no channel" until then).
+fn alive_since(fake: &Fake, from: usize) -> bool {
+    fake.ops()[from..].iter().any(|op| {
+        matches!(op,
+            Op::CreateTopic { icon_custom_emoji_id: Some(icon), .. }
+            | Op::EditTopic { icon_custom_emoji_id: Some(icon), .. } if icon == ICON_ALIVE)
+    })
 }
 
 fn permission(request_id: &str) -> AgentMsg {
@@ -1210,8 +1339,7 @@ async fn e2e_after_the_hub_update_a_group_slot_gets_its_private_view() {
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(agent);
-    drop(old);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    old.stop().await;
     let new = start_hub_on(&state, PRIVATE, fake.clone(), true).await;
     let mut agent = Agent::connect(&new, true).await;
     new.until("a private topic with the status", |f| {
@@ -1383,7 +1511,24 @@ async fn shared_hub(name: &str, fake: Fake) -> (Hub, Agent) {
         fake.layout(Chat::Group) == [line.as_str(), "STATUS"]
     })
     .await;
+    // The fake shows the group's status message a moment before the hub has
+    // Telegram's answer about it; an unshare that keeps the topic takes away
+    // only a status message the hub knows.
+    hub.until("the hub knows the group's status message", |fake| {
+        let status = fake.status(Chat::Group).map(|shown| shown.id);
+        status.is_some() && group_status(&hub.saved()) == status
+    })
+    .await;
     (hub, agent)
+}
+
+/// The status message of the group view in a saved `registry.json`.
+fn group_status(saved: &Value) -> Option<i64> {
+    saved["slots"][0]["views"]
+        .as_array()?
+        .iter()
+        .find(|view| view["chat"] == "group")?["status"]["message_id"]
+        .as_i64()
 }
 
 /// `/share` in the private topic: a group topic that starts with the share
@@ -1812,8 +1957,7 @@ async fn e2e_a_shared_slot_stays_shared_over_a_hub_restart() {
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(agent);
-    drop(old);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    old.stop().await;
     let new = start_hub_on(&state, PRIVATE, fake.clone(), true).await;
     let mut agent = Agent::connect(&new, true).await;
     agent
@@ -1866,4 +2010,280 @@ async fn e2e_without_the_delete_right_an_unshared_topic_is_told_and_left() {
         "{:#?}",
         &ops[after..]
     );
+}
+
+// ---------------------------------------------------------------- TASK-073
+
+/// A hub with the menu, session started, its agent bound, the private
+/// topic's status and the owner's pinned menu there.
+async fn menu_hub(name: &str, mode: Mode, console_keys: bool) -> (Hub, Agent) {
+    let hub = start_hub(name, mode, Fake::default()).await;
+    hub.start().await;
+    let agent = Agent::connect_as(&hub, true, console_keys).await;
+    hub.until("the status and the pinned menu", |fake| {
+        fake.layout(owner()).contains(&"STATUS".to_owned())
+            && fake
+                .menu(owner())
+                .is_some_and(|menu| menu.text.starts_with("Сессии (стр. 1/1)"))
+    })
+    .await;
+    (hub, agent)
+}
+
+/// The first private topic brings the pinned menu; `/menu` and `/start`
+/// put up a new one, pinned, and the old one and the command go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_start_shows_the_pinned_menu_and_menu_shows_it_again() {
+    let (hub, _agent) = menu_hub("menu-start", MENU, false).await;
+    let first = hub.fake.menu(owner()).unwrap();
+    assert!(
+        first.buttons.contains(&"· 🗂 Сессии".to_owned()),
+        "{first:?}"
+    );
+    assert!(
+        first.text.contains("1. ") && first.text.contains("[e2ebox] private · 0a16e2e0 — "),
+        "{}",
+        first.text
+    );
+    assert_eq!(hub.fake.general(owner()).len(), 1);
+    hub.say_general(owner(), "/menu");
+    hub.until("a new pinned menu, the old one gone", |fake| {
+        fake.menu(owner()).is_some_and(|menu| menu.id != first.id)
+            && fake.general(owner()).len() == 1
+    })
+    .await;
+    // The command went too (its id: 1).
+    assert!(hub.fake.ops().iter().any(|op| matches!(
+        op,
+        Op::Delete { chat, message_id: 1 } if *chat == owner()
+    )));
+    let second = hub.fake.menu(owner()).unwrap().id;
+    hub.say_general(owner(), "/start");
+    hub.until("a third menu", |fake| {
+        fake.menu(owner()).is_some_and(|menu| menu.id != second) && fake.general(owner()).len() == 1
+    })
+    .await;
+    assert!(
+        !hub.fake
+            .general(owner())
+            .contains(&PRIVATE_START_TEXT.to_owned()),
+        "the menu answers /start"
+    );
+    assert!(!texts(&hub.fake.ops()).contains(&OWNER.to_string()));
+}
+
+/// Each section press edits the one menu once; the settings are in
+/// `registry.json` and hold after a restart: the menu still answers, and
+/// the turn's answer in the private topic is quiet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_menu_sections_change_settings_and_they_survive_a_restart() {
+    let state = fresh_state("menu-restart");
+    let fake = Arc::new(Fake::default());
+    let hub = start_hub_on(&state, MENU, fake.clone(), false).await;
+    hub.start().await;
+    let agent = Agent::connect(&hub, true).await;
+    hub.until("the pinned menu", |fake| fake.menu(owner()).is_some())
+        .await;
+    hub.menu_press("menu:d").await;
+    assert!(
+        fake.menu(owner())
+            .unwrap()
+            .text
+            .starts_with("Что показывать")
+    );
+    hub.menu_press("menu:dl:b").await;
+    hub.menu_press("menu:th:0").await;
+    let shown = fake.menu(owner()).unwrap();
+    assert!(shown.buttons.contains(&"✅ Кратко".to_owned()), "{shown:?}");
+    assert!(shown.buttons.contains(&"💭 Размышления: выкл".to_owned()));
+    hub.menu_press("menu:n").await;
+    hub.menu_press("menu:sn:o").await;
+    // Quiet hours want the zone first.
+    hub.menu_press("menu:q:1").await;
+    assert!(
+        fake.menu(owner())
+            .unwrap()
+            .text
+            .starts_with("Сколько у вас")
+    );
+    hub.menu_press("menu:tz:180").await;
+    hub.menu_press("menu:q:1").await;
+    let shown = fake.menu(owner()).unwrap();
+    assert!(shown.buttons.contains(&"✅ Ничего".to_owned()), "{shown:?}");
+    assert!(
+        shown
+            .buttons
+            .contains(&"🌙 Тихие часы: с 23 до 08".to_owned())
+    );
+    assert!(shown.buttons.contains(&"🕒 Пояс: UTC+3".to_owned()));
+    let want = serde_json::json!({
+        "detail": "brief", "thinking": false, "sound": "off",
+        "quiet": {"from": 23, "to": 8}, "tz": 180,
+    });
+    let file = state.join("registry.json");
+    let saved = || -> Value {
+        let bytes = std::fs::read(&file).unwrap_or_default();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    let reached = async {
+        while saved()["people"][0]["settings"] != want {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, reached)
+        .await
+        .expect("the settings are saved");
+    let menu = fake.menu(owner()).unwrap().id;
+    assert_eq!(saved()["people"][0]["menu"], serde_json::json!(menu));
+    drop(agent);
+    drop(hub);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let hub = start_hub_on(&state, MENU, fake.clone(), true).await;
+    let _agent = Agent::connect(&hub, true).await;
+    hub.until("the private topic's status again", |fake| {
+        fake.layout(owner()).last().is_some_and(|m| m == "STATUS")
+    })
+    .await;
+    assert_eq!(fake.menu(owner()).unwrap().id, menu, "no second menu");
+    hub.menu_press("menu:d").await;
+    let shown = fake.menu(owner()).unwrap();
+    assert!(shown.buttons.contains(&"✅ Кратко".to_owned()), "{shown:?}");
+    hub.hook(HookEvent::Stop {
+        prompt_id: None,
+        last_assistant_message: Some("готово".into()),
+    })
+    .await;
+    hub.until("the quiet answer", |fake| {
+        fake.shown(owner())
+            .iter()
+            .any(|m| m.text == "готово" && !m.loud)
+    })
+    .await;
+    assert_eq!(saved()["people"][0]["settings"], want);
+}
+
+/// A shared slot: «Ничего» quiets the owner's private topic only; the
+/// group's copy of the answer rings as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_the_owners_sound_setting_quiets_the_private_topic_only() {
+    let mode = Mode::Private {
+        share_new: true,
+        menu: true,
+    };
+    let (hub, _agent) = menu_hub("menu-sound", mode, false).await;
+    hub.menu_press("menu:n").await;
+    hub.menu_press("menu:sn:o").await;
+    hub.hook(HookEvent::Stop {
+        prompt_id: None,
+        last_assistant_message: Some("готово".into()),
+    })
+    .await;
+    let answer = |fake: &Fake, chat: Chat| {
+        fake.shown(chat)
+            .into_iter()
+            .find(|m| m.text == "готово")
+            .map(|m| m.loud)
+    };
+    hub.until("the answer in both", |fake| {
+        answer(fake, owner()).is_some() && answer(fake, Chat::Group).is_some()
+    })
+    .await;
+    assert_eq!(answer(&hub.fake, owner()), Some(false));
+    assert_eq!(answer(&hub.fake, Chat::Group), Some(true));
+}
+
+/// The session buttons of the menu: 👥 shares the slot to the group, 🙈
+/// takes it out after a second press, ⏹ interrupts after a second press.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_menu_session_buttons_share_unshare_and_stop() {
+    let (hub, mut agent) = menu_hub("menu-buttons", MENU, true).await;
+    hub.menu_press("menu:sh:0:0").await;
+    let line = share_line(NAME);
+    hub.until("the group topic with the share line", |fake| {
+        fake.layout(Chat::Group).first() == Some(&line)
+    })
+    .await;
+    // The share's own edit shows 🙈 already.
+    assert!(
+        hub.fake
+            .menu(owner())
+            .unwrap()
+            .buttons
+            .contains(&"🙈 1".to_owned())
+    );
+    hub.menu_press("menu:us:0:0").await;
+    assert_eq!(
+        hub.fake.topics(Chat::Group),
+        1,
+        "one press does not unshare"
+    );
+    hub.menu_press("menu:uc:0:0").await;
+    hub.until("the group topic deleted", |fake| {
+        fake.topics(Chat::Group) == 0
+    })
+    .await;
+    // ⏹: a turn runs.
+    hub.hook(HookEvent::UserPromptSubmit { prompt_id: None })
+        .await;
+    hub.until("the status offers ⏹", |fake| {
+        fake.status(owner())
+            .is_some_and(|status| status.buttons.iter().any(|b| b.contains('⏹')))
+    })
+    .await;
+    hub.menu_press("menu:st:0:0").await;
+    hub.until("asked for a second press", |fake| {
+        fake.answers()
+            .contains(&Some(status::ANSWER_CONFIRM.to_owned()))
+    })
+    .await;
+    assert!(
+        hub.fake
+            .menu(owner())
+            .unwrap()
+            .buttons
+            .contains(&"⏹ 1 точно?".to_owned())
+    );
+    let menu = hub.fake.menu(owner()).unwrap().id;
+    hub.press_general(owner(), menu, "menu:sc:0:0");
+    loop {
+        match agent.next().await {
+            Some(HubMsg::ConsoleKey { .. }) => break,
+            Some(_) => {}
+            None => panic!("no console key"),
+        }
+    }
+}
+
+/// Only the person changes their settings: a menu press in the group, and
+/// one from another allowlisted user's private chat about the owner's
+/// slot, change nothing and edit nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_only_the_person_changes_their_settings() {
+    let (hub, _agent) = menu_hub("menu-person", MENU, true).await;
+    let menu = hub.fake.menu(owner()).unwrap().id;
+    let reached = async {
+        while hub.saved()["people"][0]["menu"] != serde_json::json!(menu) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, reached)
+        .await
+        .expect("the menu is saved");
+    let before = hub.saved()["people"].clone();
+    hub.press_general(Chat::Group, 5, "menu:dl:a");
+    let other = Chat::Private(PrivateChat::of_user(OWNER + 1));
+    hub.press_general(other, 5, "menu:st:0:0");
+    hub.until("two answers", |fake| fake.answers().len() >= 2)
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        hub.fake.answers(),
+        [
+            Some(menu::ANSWER_PRIVATE_ONLY.to_owned()),
+            Some(menu::ANSWER_NOT_YOURS.to_owned()),
+        ]
+    );
+    assert_eq!(hub.fake.edits_of(owner(), menu), 0);
+    assert_eq!(hub.saved()["people"], before);
 }

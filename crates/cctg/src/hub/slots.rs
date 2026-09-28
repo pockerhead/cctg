@@ -231,6 +231,20 @@
 //! and nothing more. A press on a twin in a topic that is no slot's view any
 //! more counts for nothing.
 //!
+//! Menu (TASK-073, see [`menu`]): each person with a topic in their private
+//! chat gets one menu message in its General once, pinned; `/start` and
+//! `/menu` there send it again (the old one is deleted, or edited to `↓` and
+//! unpinned when Telegram refuses) and delete the command. A menu press
+//! counts only in the private chat it came from, acts only on slots that
+//! show there, and edits only the person's current menu, once per press at
+//! most (nothing when it shows the same). The detail level filters the
+//! stream steps of a slot that shows in its owner's private chat alone; a
+//! slot that shows anywhere else too keeps the full layout in every view.
+//! The sound setting changes the sound of new messages into the private
+//! chat only, where they are handed out; the group's twins keep theirs. The
+//! menu does not refresh itself (↻ does). Its logs carry ordinals and fixed
+//! text: no titles, chat ids, times or time zones.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
 
@@ -254,6 +268,7 @@ use super::console;
 use super::devices::Devices;
 use super::fetch::{self, Fetch, Fetched};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
+use super::menu::{self, MenuPress, Page, RowState, SlotAction};
 use super::mirror::{Follow, Landed, Mirror, Write};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
@@ -437,6 +452,9 @@ pub const FOREIGN_TOPIC_NOTICE: &str = "Эта тема не связана с �
 /// `/start` (TASK-063): it reaches no session.
 pub const PRIVATE_GENERAL_NOTICE: &str =
     "Отсюда сообщения в сессии не идут: пишите в тему нужной сессии.";
+/// [`PRIVATE_GENERAL_NOTICE`] with the menu on (TASK-073).
+pub const PRIVATE_GENERAL_MENU_NOTICE: &str =
+    "Отсюда сообщения в сессии не идут: пишите в тему нужной сессии. Меню: /menu.";
 /// Told in a group topic a slot showed in only while its owner's private
 /// chat was closed, once that chat takes the session again (TASK-063).
 pub const FALLBACK_END_NOTICE: &str =
@@ -552,6 +570,9 @@ pub struct Options {
     /// The bot has topics in private chats (TASK-063): slots show in their
     /// owner's private chat too; `None`: the group only.
     pub owners: Option<Owners>,
+    /// The menu in the General of each private chat (TASK-073); `false`:
+    /// `/start` there answers [`PRIVATE_START_TEXT`], as before.
+    pub menu: bool,
 }
 
 /// A burst of topic messages of a slot being gathered into one inbound
@@ -653,6 +674,7 @@ impl Default for Options {
             inbound_settle: Duration::ZERO,
             channel_wait: Duration::ZERO,
             owners: None,
+            menu: false,
         }
     }
 }
@@ -803,6 +825,28 @@ enum Done {
         place: Place,
         delivery: Option<Delivery>,
     },
+    /// A call about a menu (TASK-073).
+    Menu {
+        job: MenuJob,
+        delivery: Option<Delivery>,
+    },
+}
+
+/// A call about the menu in the General of a private chat (TASK-073).
+#[derive(Debug, Clone, Copy)]
+enum MenuJob {
+    /// A new menu.
+    Show {
+        chat: PrivateChat,
+    },
+    Pin,
+    /// An edit of menu `message`.
+    Edit {
+        chat: PrivateChat,
+        message: i64,
+    },
+    /// The delete of a `/start` or `/menu` message.
+    Clean,
 }
 
 /// A call about a slot's status message; at most one per slot in flight,
@@ -1015,6 +1059,9 @@ enum Work {
     /// A notice about a user's own message: like `Message`, but it stays in
     /// the view the user wrote in (TASK-063).
     Answer,
+    /// What the session says: a turn answer or a reply. Like `Message`, but
+    /// «Всё» rings it; notices stay quiet (TASK-073).
+    Content,
     Permission(u64),
     PromptEdit(u64),
     Question {
@@ -1056,6 +1103,8 @@ enum Work {
     },
     /// The delete of the group topic of an unshared slot (TASK-064).
     DeleteTopic(Place),
+    /// A call about a menu (TASK-073).
+    Menu(MenuJob),
     /// A call in a mirror topic (TASK-063): `id` its twin send in the
     /// [`Mirror`] when the answer links it, `place` the topic of a new
     /// message, `status` the text of a status message or of its edit (it
@@ -1487,6 +1536,14 @@ pub struct Slots {
     deleting: HashSet<Place>,
     /// Those whose delete failed for now: tried again on the retry tick.
     delete_later: HashSet<Place>,
+    /// What each person's current menu shows (TASK-073), as far as known;
+    /// missing: unknown, the next press edits it.
+    menus: HashMap<PrivateChat, (String, serde_json::Value)>,
+    /// What the menu sent last and not answered yet shows.
+    pending_menus: HashMap<PrivateChat, (String, serde_json::Value)>,
+    /// Private chats whose menu Telegram did not take for now: offered
+    /// again on the retry tick.
+    menu_later: HashSet<PrivateChat>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1627,6 +1684,9 @@ impl Slots {
             proven: HashSet::new(),
             deleting: HashSet::new(),
             delete_later: HashSet::new(),
+            menus: HashMap::new(),
+            pending_menus: HashMap::new(),
+            menu_later: HashSet::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -3293,9 +3353,20 @@ impl Slots {
     }
 
     /// The service message about pinning a slot's status message goes, like
-    /// `forum_topic_edited`; other pins are the users' business.
+    /// `forum_topic_edited`, and so does the one about pinning a menu
+    /// (TASK-073; a private chat needs no right for it); other pins are the
+    /// users' business.
     fn on_pinned(&mut self, chat: Chat, message_id: i64, pinned: i64) {
-        if self.options.can_delete && self.status_slot(MessageKey::new(chat, pinned)).is_some() {
+        let menu = match chat {
+            Chat::Private(private) => {
+                self.registry.person(private).and_then(|person| person.menu) == Some(pinned)
+            }
+            Chat::Group => false,
+        };
+        if menu
+            || (self.options.can_delete
+                && self.status_slot(MessageKey::new(chat, pinned)).is_some())
+        {
             self.hand_off(Work::Delete, Op::Delete { chat, message_id });
         }
     }
@@ -3339,7 +3410,11 @@ impl Slots {
         }
         self.reopen(input.chat);
         let Some(thread_id) = input.thread_id else {
-            if input.chat.is_private() && is_start(input.text.as_deref()) {
+            if let Chat::Private(private) = input.chat
+                && self.options.menu
+            {
+                self.on_private_general(private, &input);
+            } else if input.chat.is_private() && is_start(input.text.as_deref()) {
                 self.send_messages(vec![message_op(
                     input.place(),
                     PRIVATE_START_TEXT.to_owned(),
@@ -5031,6 +5106,9 @@ impl Slots {
         let hold = self.options.hold_answer;
         let slot = self.current_slot(session);
         let place = slot.and_then(|slot| self.registry.place(slot));
+        // TASK-073: what the owner chose to see, while the slot shows in
+        // their private chat alone.
+        let display = slot.map(|slot| self.display_of(slot)).unwrap_or_default();
         // TASK-062: the turn's content goes into one message, and the status
         // message may become the first one.
         let mut rolling = self.options.status_every.is_some().then(|| Rolling {
@@ -5201,6 +5279,13 @@ impl Slots {
             // one tool result line may finish several calls.
             let mut pieces = Vec::new();
             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
+                // Not shown (TASK-073): no message, in the turn message or
+                // on its own; receipts and turn ends go on as before.
+                if let Step::Send { piece, .. } = &step
+                    && !menu::shows(&display, *piece)
+                {
+                    continue;
+                }
                 let step = match (step, &mut rolling) {
                     (Step::Send { text, format, .. }, Some(_)) => {
                         let open = format != Format::Code;
@@ -5225,6 +5310,7 @@ impl Slots {
                         text,
                         merge,
                         format,
+                        ..
                     } => {
                         let chunks = stream_chunks(&text, format);
                         let merge = merge && chunks.len() == 1;
@@ -5525,7 +5611,8 @@ impl Slots {
     ) -> Option<usize> {
         let ops = text_ops(place, session, text, kind, notify);
         let parts = ops.len();
-        self.send_messages(ops).then_some(parts)
+        self.queue_messages(|| Work::Content, false, ops)
+            .then_some(parts)
     }
 
     /// Remembers a relayed permission request; [`Self::send_prompts`] puts it
@@ -6625,6 +6712,20 @@ impl Slots {
     /// Answers every button press at once; the final edit follows when the
     /// prompt ends.
     fn on_callback(&mut self, input: CallbackInput) {
+        // A menu press counts only in its private chat (TASK-073).
+        if self.options.menu
+            && let Some(press) = input.data.as_deref().and_then(menu::parse_callback)
+        {
+            let answer = self.press_menu(&input, press);
+            self.hand_off(
+                Work::Callback,
+                Op::AnswerCallback {
+                    query_id: input.query_id,
+                    text: (!answer.is_empty()).then_some(answer),
+                },
+            );
+            return;
+        }
         // The share button counts only where it was pressed (TASK-064):
         // before a press on a twin becomes one on its primary.
         if let Some(press @ (Press::Share | Press::Unshare | Press::UnshareConfirm)) =
@@ -6842,6 +6943,12 @@ impl Slots {
             debug!("status button of a message that is no status message");
             return status::ANSWER_STALE;
         };
+        self.press_status_of(slot, press)
+    }
+
+    /// A status button of `slot`, pressed on its status message or in the
+    /// menu (TASK-073): both share the ⏹ question.
+    fn press_status_of(&mut self, slot: SlotId, press: Press) -> &'static str {
         let Some((session, conn)) = self.live_agent(slot) else {
             return status::ANSWER_OFFLINE;
         };
@@ -8264,7 +8371,7 @@ impl Slots {
         match &delivery {
             Some(Err(error)) if !self.retire_warned => {
                 self.retire_warned = true;
-                warn!(%error, "cannot delete an old status message; it is edited instead, later failures are not logged");
+                warn!(%error, "cannot delete an old status or menu message; it is edited instead, later failures are not logged");
             }
             Some(Err(error)) => debug!(%error, "old status message not deleted"),
             _ => debug!("old status message delete got no answer"),
@@ -8280,7 +8387,8 @@ impl Slots {
                 background: false,
             },
         );
-        if pinned && self.options.can_pin {
+        // A private chat needs no right to unpin (an old menu, TASK-073).
+        if pinned && (self.options.can_pin || message.chat.is_private()) {
             self.hand_off(
                 Work::Retire(Retire::Unpin),
                 Op::Unpin {
@@ -8466,6 +8574,16 @@ impl Slots {
     /// [`Self::send_messages`]; `answer`: they answer a user's own message
     /// ([`Work::Answer`]).
     fn send_as(&mut self, answer: bool, ops: Vec<Op>) -> bool {
+        let work: fn() -> Work = if answer {
+            || Work::Answer
+        } else {
+            || Work::Message
+        };
+        self.queue_messages(work, answer, ops)
+    }
+
+    /// [`Self::send_as`] with each op's job made by `work`.
+    fn queue_messages(&mut self, work: fn() -> Work, answer: bool, ops: Vec<Op>) -> bool {
         if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
@@ -8477,7 +8595,7 @@ impl Slots {
         }
         self.queued_messages += ops.len();
         for op in ops {
-            let work = if answer { Work::Answer } else { Work::Message };
+            let work = work();
             // A text for a private topic is sent again if it is lost there
             // (TASK-063).
             let text = (matches!(op, Op::Send { .. }) && op.chat().is_some_and(|c| c.is_private()))
@@ -8516,6 +8634,8 @@ impl Slots {
             let kept = self.mirror.kept_chats(old);
             twins.retain(|twin| twin.op.chat().is_none_or(|chat| !kept.contains(&chat)));
         }
+        // After the twins: the group sounds as before (TASK-073).
+        let op = self.voiced(&work, op);
         if self.dispatch.send((work, op)).is_err() {
             debug!("dispatch task stopped; job dropped");
             if let Some(bottom) = posts.and_then(|place| self.bottoms.get_mut(&place)) {
@@ -8562,7 +8682,12 @@ impl Slots {
         if !self.registry.private
             || matches!(
                 work,
-                Work::Topic(_) | Work::Delete | Work::Reaction | Work::Answer | Work::Twin { .. }
+                Work::Topic(_)
+                    | Work::Delete
+                    | Work::Reaction
+                    | Work::Answer
+                    | Work::Twin { .. }
+                    | Work::Menu(_)
             )
         {
             return Vec::new();
@@ -9284,12 +9409,25 @@ impl Slots {
             debug!("share button of a message that is no private status message");
             return status::ANSWER_STALE;
         };
+        self.press_share_of(slot, chat, press, input.display_name.as_deref())
+    }
+
+    /// A share button of `slot` pressed by its owner in private chat `chat`:
+    /// on its status message or in the menu (TASK-073), which share the
+    /// unshare question.
+    fn press_share_of(
+        &mut self,
+        slot: SlotId,
+        chat: Chat,
+        press: Press,
+        author: Option<&str>,
+    ) -> &'static str {
         if press == Press::Share {
             // Before `reopen`, which would drop a fallback group view.
-            let adopted = self.adopt_fallback(slot, input.display_name.as_deref());
+            let adopted = self.adopt_fallback(slot, author);
             self.reopen(chat);
             return adopted
-                .unwrap_or_else(|| self.share_slot(slot, input.display_name.as_deref()))
+                .unwrap_or_else(|| self.share_slot(slot, author))
                 .answer();
         }
         self.reopen(chat);
@@ -9435,6 +9573,504 @@ impl Slots {
     fn forget_unshared(&mut self, place: Place) {
         self.registry.unshared.retain(|entry| entry.place != place);
         self.registry.dirty = true;
+    }
+
+    /// A message in the General of private chat `chat` with the menu on
+    /// (TASK-073): `/start` and `/menu` send the menu again and go; anything
+    /// else is told where to write.
+    fn on_private_general(&mut self, chat: PrivateChat, input: &Inbound) {
+        let text = input.text.as_deref();
+        if !is_start(text) && !is_menu(text) {
+            self.tell_foreign(input.place(), PRIVATE_GENERAL_MENU_NOTICE);
+            return;
+        }
+        self.show_menu(chat, Page::Sessions(0));
+        self.hand_off(
+            Work::Menu(MenuJob::Clean),
+            Op::Delete {
+                chat: input.chat,
+                message_id: input.message_id,
+            },
+        );
+    }
+
+    /// Sends the menu into the General of private chat `chat` (TASK-073);
+    /// once Telegram took it, it is pinned and the old one goes.
+    fn show_menu(&mut self, chat: PrivateChat, page: Page) {
+        if !self.options.menu
+            || !self.registry.private
+            || !self.registry.usable(Chat::Private(chat))
+        {
+            return;
+        }
+        // Before the send: the person is known from now on, so no second
+        // menu goes for their first topic.
+        self.registry.person_mut(chat);
+        let content = self.menu_content(chat, page);
+        self.hand_off(
+            Work::Menu(MenuJob::Show { chat }),
+            Op::Send {
+                chat: Chat::Private(chat),
+                thread_id: None,
+                text: content.0.clone(),
+                html: None,
+                reply_markup: Some(content.1.clone()),
+                permission: false,
+                reply_to: None,
+                notify: false,
+            },
+        );
+        self.pending_menus.insert(chat, content);
+    }
+
+    /// Every person with a topic in their usable private chat and no menu
+    /// gets one (TASK-073): also when the first was lost to a failure or a
+    /// hub crash before Telegram's answer. A menu the person deleted, or one
+    /// Telegram refused, is not sent again by itself: `/menu` does.
+    fn offer_menus(&mut self) {
+        if !self.options.menu || !self.registry.private {
+            return;
+        }
+        let mut chats = Vec::new();
+        for view in self.registry.slots.iter().flat_map(|slot| &slot.views) {
+            if let Chat::Private(chat) = view.chat
+                && view.topic_id.is_some()
+                && !chats.contains(&chat)
+            {
+                chats.push(chat);
+            }
+        }
+        for chat in chats {
+            let wanted = self
+                .registry
+                .person(chat)
+                .is_none_or(|person| person.menu.is_none() && !person.on_request);
+            if wanted && !self.pending_menus.contains_key(&chat) && !self.menu_later.contains(&chat)
+            {
+                self.show_menu(chat, Page::Sessions(0));
+            }
+        }
+    }
+
+    /// The text and keyboard of `page` of the menu of `chat` now.
+    fn menu_content(&self, chat: PrivateChat, page: Page) -> (String, serde_json::Value) {
+        let settings = self
+            .registry
+            .person(chat)
+            .map(|person| person.settings.clone())
+            .unwrap_or_default();
+        let sessions = match page {
+            Page::Sessions(page) => Some(self.sessions_view(chat, page)),
+            _ => None,
+        };
+        menu::render(&page, &settings, sessions.as_ref(), unix_now())
+    }
+
+    /// Page `page` of the sessions of `chat`: the slots that show there,
+    /// live ones by host, folder and ordinal, then at most
+    /// [`menu::MAX_ENDED_ROWS`] ended ones, newest first. A page past the
+    /// last shows the last.
+    fn sessions_view(&self, chat: PrivateChat, page: usize) -> menu::SessionsView {
+        let mut live = Vec::new();
+        let mut ended = Vec::new();
+        for (index, entry) in self.registry.slots.iter().enumerate() {
+            let slot = SlotId(index);
+            let Some(session) = entry.current_session.as_deref() else {
+                continue;
+            };
+            if !entry
+                .views
+                .iter()
+                .any(|view| view.chat == Chat::Private(chat))
+            {
+                continue;
+            }
+            if self.registry.state(slot) == SlotState::Dead {
+                let seen = self.registry.sessions.get(session).map_or(0, |e| e.seen);
+                ended.push((seen, slot));
+            } else {
+                live.push(slot);
+            }
+        }
+        let key = |slot: &SlotId| {
+            let entry = &self.registry.slots[slot.0];
+            (entry.host.clone(), entry.folder_name.clone(), entry.ordinal)
+        };
+        live.sort_by_key(key);
+        ended.sort_by_key(|(seen, _)| std::cmp::Reverse(*seen));
+        let outdated = live
+            .iter()
+            .filter(|slot| {
+                self.live_agent(**slot)
+                    .is_some_and(|(_, conn)| self.outdated(conn))
+            })
+            .count();
+        let slots: Vec<SlotId> = live
+            .into_iter()
+            .chain(
+                ended
+                    .into_iter()
+                    .take(menu::MAX_ENDED_ROWS)
+                    .map(|(_, slot)| slot),
+            )
+            .collect();
+        let pages = slots.len().div_ceil(menu::PAGE_SIZE).max(1);
+        let page = page.min(pages - 1);
+        let now = Instant::now();
+        let rows = slots
+            .iter()
+            .skip(page * menu::PAGE_SIZE)
+            .take(menu::PAGE_SIZE)
+            .map(|slot| self.session_row(*slot, chat, now))
+            .collect();
+        menu::SessionsView {
+            rows,
+            page,
+            pages,
+            outdated,
+        }
+    }
+
+    /// The row of `slot` in the menu of `chat`.
+    fn session_row(&self, slot: SlotId, chat: PrivateChat, now: Instant) -> menu::SessionRow {
+        let session = self.registry.slots[slot.0]
+            .current_session
+            .clone()
+            .unwrap_or_default();
+        let state = match self.registry.state(slot) {
+            SlotState::Dead => RowState::Ended,
+            SlotState::NoChannel => RowState::NoChannel,
+            SlotState::Waiting => RowState::Asking,
+            SlotState::Alive if self.busy(&session) => RowState::Working,
+            SlotState::Alive => RowState::Idle,
+        };
+        let shown = self.shown.get(&slot);
+        // The share buttons act from the private view only.
+        let shared = self
+            .registry
+            .place(slot)
+            .is_some_and(|place| place.chat == Chat::Private(chat))
+            .then(|| self.registry.shared(slot, Chat::Group));
+        let share_confirm = shown
+            .and_then(|shown| shown.unshare_confirm)
+            .is_some_and(|until| now < until);
+        let stop = self
+            .live_agent(slot)
+            .filter(|(session, conn)| {
+                self.conns.get(conn).is_some_and(|bound| bound.keys) && self.busy(session)
+            })
+            .map(|(session, _)| {
+                shown
+                    .and_then(|shown| shown.confirm.as_ref())
+                    .is_some_and(|(armed, until)| *armed == session && now < *until)
+            });
+        menu::SessionRow {
+            slot: u32::try_from(slot.0).unwrap_or(u32::MAX),
+            title: self.registry.desired_title(slot),
+            state,
+            shared,
+            share_confirm,
+            stop,
+        }
+    }
+
+    /// A menu press (TASK-073): it acts, then edits the person's current
+    /// menu to the page it leads to, when the press was on that menu and
+    /// the page changed. The answer to show; empty: none.
+    fn press_menu(&mut self, input: &CallbackInput, press: MenuPress) -> String {
+        // A private chat is its user's: the press is theirs.
+        let Some(Chat::Private(chat)) = input.chat else {
+            return menu::ANSWER_PRIVATE_ONLY.to_owned();
+        };
+        // Its user is there (TASK-063); a share opens the chat itself, once
+        // it kept a fallback group view.
+        if !matches!(
+            press,
+            MenuPress::Slot {
+                action: SlotAction::Share,
+                ..
+            }
+        ) {
+            self.reopen(Chat::Private(chat));
+        }
+        let (page, answer) = match press {
+            MenuPress::Sessions { page } => (Page::Sessions(page as usize), String::new()),
+            MenuPress::Display => (Page::Display, String::new()),
+            MenuPress::Sound => (Page::Sound, String::new()),
+            MenuPress::Zone { fractions } => (Page::Zone { fractions }, String::new()),
+            MenuPress::Slot { action, page, slot } => (
+                Page::Sessions(page as usize),
+                self.press_menu_slot(chat, action, slot, input.display_name.as_deref()),
+            ),
+            MenuPress::UpdateAll { page } => (Page::Sessions(page as usize), self.update_all(chat)),
+            setting => {
+                let old = self
+                    .registry
+                    .person(chat)
+                    .map(|person| person.settings.clone())
+                    .unwrap_or_default();
+                match menu::change(&old, setting) {
+                    Ok((new, page)) if new == old => (page, menu::ANSWER_UNCHANGED.to_owned()),
+                    Ok((new, page)) => {
+                        self.registry.person_mut(chat).settings = new;
+                        (page, menu::ANSWER_SAVED.to_owned())
+                    }
+                    Err((page, answer)) => (page, answer.to_owned()),
+                }
+            }
+        };
+        // Only the current menu is edited: a press forged on a status
+        // message or a prompt rewrites nothing.
+        let menu = self.registry.person(chat).and_then(|person| person.menu);
+        match input.message_id {
+            Some(message) if input.thread_id.is_none() && Some(message) == menu => {
+                self.edit_menu(chat, message, page);
+                answer
+            }
+            _ if press.navigates() => menu::ANSWER_STALE_MENU.to_owned(),
+            _ => answer,
+        }
+    }
+
+    /// Menu `message` of `chat` shows `page`; one edit when it shows
+    /// something else.
+    fn edit_menu(&mut self, chat: PrivateChat, message: i64, page: Page) {
+        let content = self.menu_content(chat, page);
+        if self.menus.get(&chat) == Some(&content) {
+            return;
+        }
+        self.hand_off(
+            Work::Menu(MenuJob::Edit { chat, message }),
+            Op::Edit {
+                chat: Chat::Private(chat),
+                message_id: message,
+                text: content.0.clone(),
+                reply_markup: Some(content.1.clone()),
+                background: false,
+            },
+        );
+        // At once: quick presses edit once each, and the scheduler keeps
+        // only the newest of those still waiting.
+        self.menus.insert(chat, content);
+    }
+
+    /// A session button of the menu of `chat` for registry slot `slot`; it
+    /// acts only on a slot that shows in that chat.
+    fn press_menu_slot(
+        &mut self,
+        chat: PrivateChat,
+        action: SlotAction,
+        slot: u32,
+        author: Option<&str>,
+    ) -> String {
+        let slot = SlotId(slot as usize);
+        let private = Chat::Private(chat);
+        let own = self
+            .registry
+            .slot(slot)
+            .is_some_and(|entry| entry.views.iter().any(|view| view.chat == private));
+        if !own {
+            return menu::ANSWER_NOT_YOURS.to_owned();
+        }
+        match action {
+            SlotAction::Open => {
+                // Its status message moves below: the topic goes up the list.
+                if let Some(place) = self
+                    .registry
+                    .place(slot)
+                    .filter(|place| place.chat == private)
+                {
+                    self.bottoms.entry(place).or_default().foreign = true;
+                }
+                info!(ordinal = self.ordinal(slot), "topic lifted from the menu");
+                menu::lifted(&self.registry.desired_title(slot))
+            }
+            SlotAction::Share => self
+                .press_share_of(slot, private, Press::Share, author)
+                .to_owned(),
+            SlotAction::Unshare => self
+                .press_share_of(slot, private, Press::Unshare, author)
+                .to_owned(),
+            SlotAction::UnshareConfirm => self
+                .press_share_of(slot, private, Press::UnshareConfirm, author)
+                .to_owned(),
+            SlotAction::Stop | SlotAction::StopConfirm => {
+                let press = match action {
+                    SlotAction::Stop => Press::Stop,
+                    _ => Press::Confirm,
+                };
+                self.press_status_of(slot, press).to_owned()
+            }
+        }
+    }
+
+    /// «Обновить все клиенты» of `chat` (TASK-073): every live session of
+    /// the person whose client is outdated is asked, like ⬆️ Обновить.
+    fn update_all(&mut self, chat: PrivateChat) -> String {
+        let mut sessions = Vec::new();
+        for (index, entry) in self.registry.slots.iter().enumerate() {
+            if !entry
+                .views
+                .iter()
+                .any(|view| view.chat == Chat::Private(chat))
+            {
+                continue;
+            }
+            if let Some((session, conn)) = self.live_agent(SlotId(index))
+                && self.outdated(conn)
+            {
+                sessions.push(session);
+            }
+        }
+        let mut asked = 0;
+        for session in sessions {
+            if matches!(
+                self.press_update(&session),
+                status::ANSWER_UPDATING | status::ANSWER_AFTER_TURN
+            ) {
+                asked += 1;
+            }
+        }
+        if asked == 0 {
+            menu::ANSWER_ALL_CURRENT.to_owned()
+        } else {
+            menu::updates_asked(asked)
+        }
+    }
+
+    /// Telegram answered a call about a menu (TASK-073).
+    fn on_menu_done(&mut self, job: MenuJob, delivery: Option<Delivery>) {
+        match job {
+            MenuJob::Show { chat } => {
+                let content = self.pending_menus.remove(&chat);
+                let message = match &delivery {
+                    Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                        message.message_id
+                    }
+                    // A 403 closed the chat already (`Done::Landed`).
+                    Some(delivery) if forbidden(delivery) => return,
+                    // Refused: a new one would be too.
+                    Some(Err(ApiError::Telegram { code, .. })) if *code < 500 => {
+                        debug!("menu refused; it comes on /menu");
+                        if self.registry.person(chat).is_some_and(|p| p.menu.is_none()) {
+                            self.registry.person_mut(chat).on_request = true;
+                        }
+                        return;
+                    }
+                    _ => {
+                        debug!("menu not sent; offered again later");
+                        self.menu_later.insert(chat);
+                        return;
+                    }
+                };
+                // The menu of then: two quick `/menu` leave the second.
+                let old = self.registry.person(chat).and_then(|person| person.menu);
+                let person = self.registry.person_mut(chat);
+                person.menu = Some(message);
+                person.on_request = false;
+                match content {
+                    Some(content) => self.menus.insert(chat, content),
+                    None => self.menus.remove(&chat),
+                };
+                self.hand_off(
+                    Work::Menu(MenuJob::Pin),
+                    Op::Pin {
+                        chat: Chat::Private(chat),
+                        message_id: message,
+                    },
+                );
+                if let Some(old) = old.filter(|old| *old != message) {
+                    self.retire(MessageKey::new(Chat::Private(chat), old), true);
+                }
+            }
+            MenuJob::Edit { chat, message } => match &delivery {
+                Some(Ok(_)) => {}
+                Some(delivery) if telegram_error(delivery, &["message is not modified"]) => {}
+                Some(delivery) if telegram_error(delivery, &["message to edit not found"]) => {
+                    // The person deleted it: `/menu` brings a new one.
+                    if self.registry.person(chat).and_then(|person| person.menu) == Some(message) {
+                        let person = self.registry.person_mut(chat);
+                        person.menu = None;
+                        person.on_request = true;
+                        self.menus.remove(&chat);
+                    }
+                }
+                _ => {
+                    debug!("menu edit failed");
+                    self.menus.remove(&chat);
+                }
+            },
+            MenuJob::Pin | MenuJob::Clean => {
+                if let Some(Err(error)) = delivery {
+                    debug!(%error, "menu call failed");
+                }
+            }
+        }
+    }
+
+    /// What the stream of `slot` shows (TASK-073): its owner's choice while
+    /// the slot shows in their private chat alone; with any other view (the
+    /// group's, shared or a fallback still mirrored) the full layout, so
+    /// every view gets the same.
+    fn display_of(&self, slot: SlotId) -> menu::Settings {
+        let Some(Chat::Private(chat)) = self.registry.place(slot).map(|place| place.chat) else {
+            return menu::Settings::default();
+        };
+        let alone = self.registry.slot(slot).is_some_and(|entry| {
+            entry
+                .views
+                .iter()
+                .all(|view| view.chat == Chat::Private(chat))
+        });
+        if !alone {
+            return menu::Settings::default();
+        }
+        self.registry
+            .person(chat)
+            .map(|person| person.settings.clone())
+            .unwrap_or_default()
+    }
+
+    /// `op` with the sound its person chose (TASK-073), when it is a new
+    /// message into a private chat; anything else as it is.
+    fn voiced(&self, work: &Work, mut op: Op) -> Op {
+        let (Some(_), Some(Chat::Private(chat))) = (op.posts(), op.chat()) else {
+            return op;
+        };
+        let Some(person) = self.registry.person(chat) else {
+            return op;
+        };
+        // What the session says; notices, echoes and answers to the
+        // person's own actions stay as they are.
+        let counts = matches!(
+            work,
+            Work::Content
+                | Work::Stream { .. }
+                | Work::Permission(_)
+                | Work::Question { .. }
+                | Work::Block(_)
+                | Work::File { .. }
+                | Work::Album { .. }
+        );
+        let asks = matches!(
+            op,
+            Op::Send {
+                permission: true,
+                ..
+            }
+        );
+        let now = unix_now();
+        if let Op::Send { notify, .. }
+        | Op::SendDocument { notify, .. }
+        | Op::SendPhoto { notify, .. }
+        | Op::SendAlbum { notify, .. }
+        | Op::Stream {
+            notify, into: None, ..
+        } = &mut op
+        {
+            *notify = menu::loud(&person.settings, *notify, asks, counts, now);
+        }
+        op
     }
 
     /// An unshared slot's group topic that stays: told, dead icon, its
@@ -9674,6 +10310,7 @@ impl Slots {
             self.questions.retry_edits();
             self.push_selected(None);
             self.delete_later.clear();
+            self.menu_later.clear();
             self.next_retry = now + self.options.retry_every;
         }
         self.check_candidates();
@@ -9884,6 +10521,7 @@ impl Slots {
                 delivery,
             } => self.on_album_done(conn, transfer_id, size, &parts, delivery),
             Done::TopicDeleted { place, delivery } => self.on_topic_deleted(place, delivery),
+            Done::Menu { job, delivery } => self.on_menu_done(job, delivery),
         }
     }
 
@@ -10104,6 +10742,7 @@ impl Slots {
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
         self.ensure_private_views();
+        self.offer_menus();
         self.delete_unshared();
         self.pump_drains();
         let draining = self.draining_slots(Instant::now());
@@ -10499,6 +11138,22 @@ fn is_start(text: Option<&str>) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
 }
 
+/// `/menu` (optionally `@bot`, any case): the menu again (TASK-073).
+fn is_menu(text: Option<&str>) -> bool {
+    text.and_then(|text| text.split_whitespace().next())
+        .map(|word| word.split_once('@').map_or(word, |(name, _)| name))
+        .is_some_and(|name| name.eq_ignore_ascii_case("/menu"))
+}
+
+/// Seconds since 1970 by the hub's clock: the quiet hours (TASK-073).
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
 /// The echo of a user's message (TASK-063): `✉ <author>: <text>`, a file as
 /// `📎 <name>` before its caption, a forward marked `↪`; cut to Telegram's
 /// limit.
@@ -10598,7 +11253,7 @@ async fn dispatch_loop(
                 },
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
-                Work::Message | Work::Answer => Done::Message(delivery),
+                Work::Message | Work::Answer | Work::Content => Done::Message(delivery),
                 Work::Permission(key) => Done::Permission { key, seq, delivery },
                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
                 Work::Question { key, version } => Done::Question {
@@ -10655,6 +11310,7 @@ async fn dispatch_loop(
                     delivery,
                 },
                 Work::DeleteTopic(place) => Done::TopicDeleted { place, delivery },
+                Work::Menu(job) => Done::Menu { job, delivery },
             });
         });
     }
@@ -25084,5 +25740,1409 @@ again"
         );
         let handed = all_work(&mut work);
         assert!(into_group(&handed).is_empty(), "{handed:#?}");
+    }
+    // ------------------------------------------------------------ TASK-073
+
+    /// The menu of the owner (private chat 7) in these tests.
+    const MENU: i64 = 5500;
+
+    fn owner_chat() -> PrivateChat {
+        PrivateChat::of_user(7)
+    }
+
+    fn menu_options() -> Options {
+        Options {
+            menu: true,
+            ..private_only_options()
+        }
+    }
+
+    /// Telegram took the menu sent to `chat` as `message_id`.
+    fn menu_sent_to(slots: &mut Slots, chat: PrivateChat, message_id: i64) {
+        slots.on_done(Done::Menu {
+            job: MenuJob::Show { chat },
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id,
+                ..Message::default()
+            }))),
+        });
+    }
+
+    fn menu_sent(slots: &mut Slots, message_id: i64) {
+        menu_sent_to(slots, owner_chat(), message_id);
+    }
+
+    /// Slot 0 of session A in the owner's private chat alone (topic 700),
+    /// its menu [`MENU`] in General sent and taken; the dispatch captured.
+    fn menu_slot(dir: &TempDir, options: Options) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = private_slot(dir, options);
+        assert!(slots.registry.person(owner_chat()).is_some(), "offered");
+        menu_sent(&mut slots, MENU);
+        let _ = all_work(&mut work);
+        (slots, work)
+    }
+
+    /// A press of `data` on message `message_id` in the owner's General.
+    fn menu_press(message_id: i64, data: &str) -> Control {
+        Control::Callback(CallbackInput {
+            query_id: format!("q-{data}-{message_id}"),
+            data: Some(data.into()),
+            chat: Some(private_owner()),
+            message_id: Some(message_id),
+            thread_id: None,
+            from_name: None,
+            display_name: Some(SHARER.into()),
+        })
+    }
+
+    /// The texts of the new menus among `handed`.
+    fn menu_sends(handed: &[(Work, Op)]) -> Vec<(PrivateChat, String)> {
+        handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (
+                    Work::Menu(MenuJob::Show { chat }),
+                    Op::Send {
+                        chat: Chat::Private(to),
+                        thread_id: None,
+                        text,
+                        reply_markup: Some(_),
+                        notify: false,
+                        ..
+                    },
+                ) if to == chat => Some((*chat, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The edits of menu messages among `handed`: (message, text, keyboard).
+    fn menu_edits(handed: &[(Work, Op)]) -> Vec<(i64, String, serde_json::Value)> {
+        handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (
+                    Work::Menu(MenuJob::Edit { message, .. }),
+                    Op::Edit {
+                        message_id,
+                        text,
+                        reply_markup: Some(keyboard),
+                        background: false,
+                        ..
+                    },
+                ) if message == message_id => Some((*message_id, text.clone(), keyboard.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pins(handed: &[(Work, Op)]) -> Vec<(Chat, i64)> {
+        handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::Pin { chat, message_id } => Some((*chat, *message_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn deletes(handed: &[(Work, Op)]) -> Vec<(Chat, i64)> {
+        handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::Delete { chat, message_id } => Some((*chat, *message_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn button_texts(keyboard: &serde_json::Value) -> Vec<String> {
+        keyboard["inline_keyboard"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(|button| button["text"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Session A streaming in the owner's private chat alone (topic 700)
+    /// through agent conn 1 (reads, private place), the owner's settings
+    /// `settings`, its first read asked; the dispatch captured.
+    fn private_streaming(
+        dir: &TempDir,
+        settings: menu::Settings,
+        status_every: Option<Duration>,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let path = transcript_file(dir, A);
+        let options = Options {
+            owners: private_only_options().owners,
+            menu: true,
+            status_every,
+            ..stream_options()
+        };
+        let mut slots = stalled_slots(dir, options);
+        slots.on_hook(&start_with(A, 10, &path, "startup"));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "a", None);
+        slots.registry.person_mut(owner_chat()).settings = settings;
+        let (to_agent, mut from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: true,
+                transcript_reads: true,
+                console_keys: false,
+                console_commands: false,
+                client: None,
+                files: false,
+                session_reads: false,
+                status_lines: false,
+                private_place: true,
+                enrolled: None,
+                heartbeat: false,
+            },
+            to_agent,
+        });
+        slots.pump();
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::TranscriptRead { from: Some(0), .. })
+        ));
+        let work = capture_dispatch(&mut slots);
+        (slots, work)
+    }
+
+    /// One transcript line of a whole turn: a prompt, text, thinking, a
+    /// finished call and the turn's end.
+    fn whole_turn(slots: &mut Slots) {
+        use crate::wire::StreamItem;
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::TranscriptChunk {
+                session_id: A.into(),
+                from: 0,
+                to: 10,
+                lines: vec![StreamLine {
+                    end: 10,
+                    items: vec![
+                        StreamItem::Prompt { text: "go".into() },
+                        StreamItem::Note {
+                            text: "Looking.".into(),
+                        },
+                        StreamItem::Thinking {
+                            text: "Hmm.".into(),
+                        },
+                        StreamItem::Call {
+                            id: "t1".into(),
+                            line: "• Bash: ls".into(),
+                        },
+                        StreamItem::Result {
+                            id: "t1".into(),
+                            error: None,
+                        },
+                        StreamItem::TurnEnd,
+                    ],
+                }],
+                missing: false,
+                more: false,
+                reset: false,
+            },
+        });
+    }
+
+    /// The stream messages of `handed` (new ones and writes into one) as
+    /// one text, and Telegram takes each of them.
+    fn streamed(slots: &mut Slots, handed: &[(Work, Op)]) -> String {
+        let mut texts = Vec::new();
+        for (index, (work, op)) in handed.iter().enumerate() {
+            if let (Work::Stream { session, number }, Op::Stream { text, .. }) = (work, op) {
+                texts.push(text.clone());
+                slots.on_stream_done(
+                    session,
+                    *number,
+                    Some(Ok(Outcome::Sent(Message {
+                        message_id: 6000 + index as i64,
+                        ..Message::default()
+                    }))),
+                );
+            }
+        }
+        texts.join("\n")
+    }
+
+    /// TASK-073: the owner's detail level and thinking switch shape what
+    /// their private topic gets; the turn's answer always comes, and the
+    /// stream's offset reaches the end of the read either way, with and
+    /// without the turn message (TASK-062).
+    #[tokio::test]
+    async fn detail_and_thinking_shape_what_the_private_topic_gets() {
+        use crate::hub::menu::{Detail, Settings};
+        let cases = [
+            (
+                Detail::Full,
+                true,
+                &["> go", "Looking.", "💭 Hmm.", "• Bash: ls ✓"][..],
+                &[][..],
+            ),
+            (
+                Detail::Brief,
+                true,
+                &["> go", "Looking.", "💭 Hmm."][..],
+                &["• Bash"][..],
+            ),
+            (
+                Detail::Answers,
+                true,
+                &["> go", "💭 Hmm."][..],
+                &["Looking.", "• Bash"][..],
+            ),
+            (
+                Detail::Answers,
+                false,
+                &["> go"][..],
+                &["Looking.", "💭", "• Bash"][..],
+            ),
+            (
+                Detail::Full,
+                false,
+                &["> go", "Looking.", "• Bash: ls ✓"][..],
+                &["💭"][..],
+            ),
+        ];
+        for status_every in [None, Some(Duration::from_secs(3600))] {
+            for (detail, thinking, shown, hidden) in cases {
+                let dir = TempDir::new("slots-menu-detail");
+                let settings = Settings {
+                    detail,
+                    thinking,
+                    ..Settings::default()
+                };
+                let (mut slots, mut work) = private_streaming(&dir, settings, status_every);
+                slots.on_hook(&stop(A, Some("done")));
+                whole_turn(&mut slots);
+                let handed = all_work(&mut work);
+                let text = streamed(&mut slots, &handed);
+                let case = format!("{detail:?} thinking={thinking} status={status_every:?}");
+                for want in shown.iter().chain(&["done"]) {
+                    assert!(text.contains(want), "{case}: {want} in {text:?}");
+                }
+                for not in hidden {
+                    assert!(!text.contains(not), "{case}: {not} in {text:?}");
+                }
+                assert_eq!(stream_offset(&slots), Some(10), "{case}");
+                assert!(slots.streams[A].held.is_empty(), "{case}");
+            }
+        }
+    }
+
+    /// TASK-073: a line the owner does not see still carries the ✍ of the
+    /// message Claude took.
+    #[tokio::test]
+    async fn a_filtered_turn_still_marks_its_message_working() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-menu-receipt");
+        let settings = menu::Settings {
+            detail: menu::Detail::Answers,
+            ..menu::Settings::default()
+        };
+        let (mut slots, mut work) = private_streaming(&dir, settings, None);
+        let message = MessageKey::new(private_owner(), 5005);
+        stream::receipt(
+            slots
+                .registry
+                .sessions
+                .get_mut(A)
+                .and_then(|entry| entry.stream.as_mut())
+                .unwrap(),
+            message,
+        );
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::TranscriptChunk {
+                session_id: A.into(),
+                from: 0,
+                to: 10,
+                lines: vec![StreamLine {
+                    end: 10,
+                    items: vec![
+                        StreamItem::Channel {
+                            message_id: 5005,
+                            private: true,
+                        },
+                        StreamItem::Note {
+                            text: "On it.".into(),
+                        },
+                    ],
+                }],
+                missing: false,
+                more: false,
+                reset: false,
+            },
+        });
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(|(_, op)| matches!(op,
+                Op::React { chat, message_id: 5005, emoji } if *chat == private_owner() && emoji == stream::WORKING)),
+            "{handed:#?}"
+        );
+        assert!(
+            !handed.iter().any(|(_, op)| matches!(op, Op::Stream { .. })),
+            "the text is not shown: {handed:#?}"
+        );
+    }
+
+    /// TASK-073: «Только ответы» still shows that the turn was interrupted:
+    /// after ⏹ no answer comes, and the topic must say why.
+    #[tokio::test]
+    async fn only_answers_still_shows_the_interrupt_note() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-menu-interrupt");
+        let settings = menu::Settings {
+            detail: menu::Detail::Answers,
+            thinking: false,
+            ..menu::Settings::default()
+        };
+        let (mut slots, mut work) = private_streaming(&dir, settings, None);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::TranscriptChunk {
+                session_id: A.into(),
+                from: 0,
+                to: 10,
+                lines: vec![StreamLine {
+                    end: 10,
+                    items: vec![
+                        StreamItem::Prompt { text: "go".into() },
+                        StreamItem::Note {
+                            text: "Looking.".into(),
+                        },
+                        StreamItem::Note {
+                            text: "[Request interrupted by user]".into(),
+                        },
+                    ],
+                }],
+                missing: false,
+                more: false,
+                reset: false,
+            },
+        });
+        let handed = all_work(&mut work);
+        let text = streamed(&mut slots, &handed);
+        assert!(text.contains("> go"), "{text:?}");
+        assert!(text.contains("[Request interrupted by user]"), "{text:?}");
+        assert!(!text.contains("Looking."), "{text:?}");
+    }
+
+    /// TASK-073 (decision 3): while a slot shows in the group too, the
+    /// owner's detail level does not apply: both views get every line. The
+    /// owner's sound quiets their private chat only; the group's twin of the
+    /// answer rings as before.
+    #[tokio::test]
+    async fn a_shared_slot_keeps_the_full_layout_and_the_groups_sound() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-menu-shared");
+        let path = transcript_file(&dir, A);
+        let options = Options {
+            owners: private_options().owners,
+            menu: true,
+            ..stream_options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        slots.on_hook(&start_with(A, 10, &path, "startup"));
+        let owner = private_owner();
+        slots.registry.slots[0].views = vec![
+            crate::hub::registry::View::new(Chat::Group),
+            crate::hub::registry::View::new(owner),
+        ];
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "a", None);
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        slots.registry.person_mut(owner_chat()).settings = menu::Settings {
+            detail: menu::Detail::Answers,
+            sound: menu::Sound::Off,
+            ..menu::Settings::default()
+        };
+        let (to_agent, _from_hub) = mpsc::channel(4);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                transcript_reads: true,
+                session_reads: false,
+                private_place: true,
+                ..reads_register(A, Some(10))
+            },
+            to_agent,
+        });
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        assert_eq!(slots.display_of(SlotId(0)), menu::Settings::default());
+        slots.on_hook(&stop(A, Some("done")));
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::TranscriptChunk {
+                session_id: A.into(),
+                from: 0,
+                to: 10,
+                lines: vec![StreamLine {
+                    end: 10,
+                    items: vec![
+                        StreamItem::Call {
+                            id: "t1".into(),
+                            line: "• Bash: ls".into(),
+                        },
+                        StreamItem::Result {
+                            id: "t1".into(),
+                            error: None,
+                        },
+                        StreamItem::TurnEnd,
+                    ],
+                }],
+                missing: false,
+                more: false,
+                reset: false,
+            },
+        });
+        let handed = all_work(&mut work);
+        let lines = |chat: Chat| -> Vec<(String, bool)> {
+            handed
+                .iter()
+                .filter_map(|(_, op)| match op {
+                    Op::Stream {
+                        chat: to,
+                        text,
+                        notify,
+                        into: None,
+                        ..
+                    } if *to == chat => Some((text.clone(), *notify)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            lines(owner),
+            [
+                ("• Bash: ls ✓".to_owned(), false),
+                ("done".to_owned(), false)
+            ],
+            "{handed:#?}"
+        );
+        assert_eq!(
+            lines(Chat::Group),
+            [
+                ("• Bash: ls ✓".to_owned(), false),
+                ("done".to_owned(), true)
+            ],
+            "{handed:#?}"
+        );
+    }
+
+    /// The sounds of the sends into `chat` among `handed`, by work.
+    fn sounds(handed: &[(Work, Op)], chat: Chat) -> Vec<(&'static str, bool)> {
+        handed
+            .iter()
+            .filter_map(|(work, op)| {
+                let kind = match work {
+                    Work::Permission(_) => "permission",
+                    Work::Question { .. } => "question",
+                    Work::Message | Work::Answer => "notice",
+                    Work::Content => "content",
+                    Work::Status { .. } => "status",
+                    Work::Menu(_) => "menu",
+                    Work::Stream { .. } => "stream",
+                    _ => "other",
+                };
+                match op {
+                    Op::Send {
+                        chat: to, notify, ..
+                    }
+                    | Op::Stream {
+                        chat: to,
+                        notify,
+                        into: None,
+                        ..
+                    } if *to == chat => Some((kind, *notify)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Slot 0 of session A in the owner's private chat with a bound agent
+    /// (conn 1) and the owner's `settings`: a permission prompt, a question
+    /// and a turn answer are handed out; their sounds.
+    fn asked_sounds(settings: menu::Settings) -> Vec<(&'static str, bool)> {
+        let dir = TempDir::new("slots-menu-sound");
+        let (mut slots, mut work) = private_slot(&dir, menu_options());
+        slots.registry.person_mut(owner_chat()).settings = settings;
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_agent(permission(1, "abcde", "p"));
+        let (answer, _answered) = oneshot::channel();
+        slots.on_question_ask(QuestionAsk {
+            post: question_post(A),
+            answer,
+        });
+        slots.on_hook(&stop(A, Some("done")));
+        slots.pump();
+        sounds(&all_work(&mut work), private_owner())
+    }
+
+    /// The UTC hour now, for quiet hours around it.
+    fn utc_hour() -> u8 {
+        u8::try_from(unix_now().div_euclid(3600).rem_euclid(24)).unwrap()
+    }
+
+    /// TASK-073: in the quiet hours only permission prompts and questions
+    /// ring (both hold the session until answered); out of them, what rings
+    /// today.
+    #[tokio::test]
+    async fn quiet_hours_keep_only_asks_loud() {
+        let hour = utc_hour();
+        let quiet = menu::Settings {
+            quiet: Some(menu::Quiet {
+                from: hour,
+                to: (hour + 2) % 24,
+            }),
+            tz: Some(0),
+            ..menu::Settings::default()
+        };
+        let got = asked_sounds(quiet);
+        assert!(got.contains(&("permission", true)), "{got:?}");
+        assert!(got.contains(&("question", true)), "{got:?}");
+        assert!(
+            got.contains(&("content", false)),
+            "the answer is quiet: {got:?}"
+        );
+        assert!(!got.contains(&("content", true)), "{got:?}");
+        // Outside the window: the answer rings again.
+        let later = menu::Settings {
+            quiet: Some(menu::Quiet {
+                from: (hour + 2) % 24,
+                to: (hour + 4) % 24,
+            }),
+            tz: Some(0),
+            ..menu::Settings::default()
+        };
+        let got = asked_sounds(later);
+        assert!(got.contains(&("content", true)), "{got:?}");
+        assert!(got.contains(&("permission", true)), "{got:?}");
+    }
+
+    /// TASK-073: «Ничего» quiets the asks too.
+    #[tokio::test]
+    async fn nothing_silences_asks_too() {
+        let got = asked_sounds(menu::Settings {
+            sound: menu::Sound::Off,
+            ..menu::Settings::default()
+        });
+        assert!(!got.is_empty());
+        assert!(got.iter().all(|(_, loud)| !loud), "{got:?}");
+        assert!(got.contains(&("permission", false)), "{got:?}");
+        // Today's behaviour without a choice.
+        let got = asked_sounds(menu::Settings::default());
+        assert!(got.contains(&("permission", true)), "{got:?}");
+        assert!(got.contains(&("content", true)), "{got:?}");
+    }
+
+    /// TASK-073: «Всё» rings every new message of the session, a reply too,
+    /// but not the status message, the menu, or a notice: the one in
+    /// General, the one of a message that waits for the session, the
+    /// answers to the person's own actions.
+    #[tokio::test]
+    async fn everything_loud_rings_new_messages_but_not_the_status_or_the_menu() {
+        let dir = TempDir::new("slots-menu-all");
+        let (mut slots, mut work) = private_slot(&dir, menu_options());
+        slots.registry.person_mut(owner_chat()).settings = menu::Settings {
+            sound: menu::Sound::All,
+            ..menu::Settings::default()
+        };
+        // No agent yet: the message waits and its notice goes.
+        slots.on_control(owner_says(Some(700), 5002, "early"));
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_reply(1, "a reply");
+        slots.on_control(owner_says(None, 5001, "/menu"));
+        slots.on_control(owner_says(None, 5003, "hello"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        let got = sounds(&handed, private_owner());
+        assert!(got.contains(&("content", true)), "{got:?}");
+        assert!(got.contains(&("menu", false)), "{got:?}");
+        let notices: Vec<&str> = handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (Work::Message | Work::Answer, Op::Send { text, .. }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(notices.contains(&buffer::QUEUED_NOTICE), "{notices:?}");
+        assert!(
+            notices.contains(&PRIVATE_GENERAL_MENU_NOTICE),
+            "{notices:?}"
+        );
+        assert!(
+            got.iter().all(|(kind, loud)| *loud == (*kind == "content")),
+            "{got:?}"
+        );
+        // A status message stays quiet; the same send as a message rings.
+        let place = Place::topic(private_owner(), 700);
+        let send = message_op(place, "status".into());
+        let job = StatusJob::Create {
+            place,
+            content: LiveText::new("status".into(), permissions::no_keyboard()),
+        };
+        let status = Work::Status {
+            slot: SlotId(0),
+            job,
+        };
+        assert!(matches!(
+            slots.voiced(&status, send.clone()),
+            Op::Send { notify: false, .. }
+        ));
+        assert!(matches!(
+            slots.voiced(&Work::Content, send.clone()),
+            Op::Send { notify: true, .. }
+        ));
+        // Notices, echoes, answers to the person's own actions: as today.
+        for work in [Work::Message, Work::Answer] {
+            assert!(matches!(
+                slots.voiced(&work, send.clone()),
+                Op::Send { notify: false, .. }
+            ));
+        }
+    }
+
+    /// TASK-073: in a team each person's choice applies to the slots of
+    /// their own private chat only.
+    #[tokio::test]
+    async fn in_a_team_each_person_has_own_settings() {
+        let dir = TempDir::new("slots-menu-team");
+        let (mut slots, _work) = private_slot(&dir, menu_options());
+        let boris = PrivateChat::of_user(8);
+        slots.on_hook(&start(B, 11));
+        slots.registry.slots[1].views = vec![crate::hub::registry::View::new(Chat::Private(boris))];
+        slots
+            .registry
+            .topic_created(SlotId(1), Chat::Private(boris), 800, "b", None);
+        let quiet = menu::Settings {
+            detail: menu::Detail::Answers,
+            sound: menu::Sound::Off,
+            ..menu::Settings::default()
+        };
+        slots.registry.person_mut(boris).settings = quiet.clone();
+        assert_eq!(slots.display_of(SlotId(0)), menu::Settings::default());
+        assert_eq!(slots.display_of(SlotId(1)), quiet);
+        let answer = |chat: Chat, thread: i64| Op::Send {
+            chat,
+            thread_id: Some(thread),
+            text: "done".into(),
+            html: None,
+            reply_markup: None,
+            permission: false,
+            reply_to: None,
+            notify: true,
+        };
+        let loud = |op: Op| matches!(op, Op::Send { notify: true, .. });
+        assert!(loud(
+            slots.voiced(&Work::Message, answer(private_owner(), 700))
+        ));
+        assert!(!loud(
+            slots.voiced(&Work::Message, answer(Chat::Private(boris), 800))
+        ));
+        assert!(loud(slots.voiced(&Work::Message, answer(Chat::Group, 100))));
+    }
+
+    /// TASK-073: a menu press counts only in a private chat, and only for
+    /// the slots that show there.
+    #[tokio::test]
+    async fn a_menu_press_elsewhere_changes_nothing() {
+        let dir = TempDir::new("slots-menu-elsewhere");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        let mut from_hub = connect_typing(&mut slots, 1);
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        // In the group.
+        slots.on_control(press_in(Chat::Group, 100, 900, "menu:dl:a"));
+        // From the private chat of another allowlisted user, about A's slot.
+        slots.on_control(Control::Callback(CallbackInput {
+            query_id: "q".into(),
+            data: Some("menu:st:0:0".into()),
+            chat: Some(Chat::Private(PrivateChat::of_user(8))),
+            message_id: Some(77),
+            thread_id: None,
+            from_name: None,
+            display_name: None,
+        }));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(menu::ANSWER_PRIVATE_ONLY.to_owned()),
+                Some(menu::ANSWER_NOT_YOURS.to_owned())
+            ]
+        );
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().settings,
+            menu::Settings::default()
+        );
+        assert!(slots.registry.person(PrivateChat::of_user(8)).is_none());
+        assert!(
+            slots
+                .shown
+                .get(&SlotId(0))
+                .is_none_or(|shown| shown.confirm.is_none())
+        );
+        assert!(menu_edits(&handed).is_empty());
+        assert!(from_hub.try_recv().is_err(), "no key");
+    }
+
+    /// TASK-073: a `menu:` press forged on another message of the private
+    /// chat (a status message, an old menu) never rewrites it.
+    #[tokio::test]
+    async fn a_forged_menu_press_on_another_message_edits_nothing() {
+        let dir = TempDir::new("slots-menu-forged");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 5900,
+            pinned: false,
+        });
+        slots.on_control(press_in(private_owner(), 700, 5900, "menu:s:0"));
+        slots.on_control(menu_press(MENU - 1, "menu:d"));
+        // A setting still counts, but the old message stays as it is.
+        slots.on_control(menu_press(MENU - 1, "menu:th:0"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(
+            !handed.iter().any(|(_, op)| matches!(op, Op::Edit { .. })),
+            "{handed:#?}"
+        );
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(menu::ANSWER_STALE_MENU.to_owned()),
+                Some(menu::ANSWER_STALE_MENU.to_owned()),
+                Some(menu::ANSWER_SAVED.to_owned())
+            ]
+        );
+        assert!(
+            !slots
+                .registry
+                .person(owner_chat())
+                .unwrap()
+                .settings
+                .thinking
+        );
+    }
+
+    /// TASK-073: a press edits the menu once, and not at all when it would
+    /// show the same.
+    #[tokio::test]
+    async fn a_menu_press_that_changes_nothing_edits_nothing() {
+        let dir = TempDir::new("slots-menu-same");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        slots.on_control(menu_press(MENU, "menu:d"));
+        let handed = all_work(&mut work);
+        let edits = menu_edits(&handed);
+        assert_eq!(edits.len(), 1, "{handed:#?}");
+        assert!(edits[0].1.starts_with("Что показывать"), "{}", edits[0].1);
+        assert!(button_texts(&edits[0].2).contains(&"✅ Всё".to_owned()));
+        assert_eq!(callback_answers(&handed), [None]);
+        slots.on_control(menu_press(MENU, "menu:d"));
+        slots.on_control(menu_press(MENU, "menu:dl:f"));
+        let handed = all_work(&mut work);
+        assert!(menu_edits(&handed).is_empty(), "{handed:#?}");
+        assert_eq!(
+            callback_answers(&handed),
+            [None, Some(menu::ANSWER_UNCHANGED.to_owned())]
+        );
+        // A change: saved, one edit showing it.
+        slots.on_control(menu_press(MENU, "menu:dl:b"));
+        let handed = all_work(&mut work);
+        let edits = menu_edits(&handed);
+        assert_eq!(edits.len(), 1);
+        assert!(button_texts(&edits[0].2).contains(&"✅ Кратко".to_owned()));
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(menu::ANSWER_SAVED.to_owned())]
+        );
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().settings.detail,
+            menu::Detail::Brief
+        );
+        // A failed edit is tried again by the next press.
+        slots.on_done(Done::Menu {
+            job: MenuJob::Edit {
+                chat: owner_chat(),
+                message: MENU,
+            },
+            delivery: Some(Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            })),
+        });
+        slots.on_control(menu_press(MENU, "menu:d"));
+        assert_eq!(menu_edits(&all_work(&mut work)).len(), 1);
+        // The person deleted it: the menu is forgotten, nothing comes back
+        // by itself.
+        slots.on_done(Done::Menu {
+            job: MenuJob::Edit {
+                chat: owner_chat(),
+                message: MENU,
+            },
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message to edit not found".into(),
+            })),
+        });
+        assert_eq!(slots.registry.person(owner_chat()).unwrap().menu, None);
+        assert!(slots.registry.person(owner_chat()).unwrap().on_request);
+        slots.pump();
+        slots.next_retry = Instant::now();
+        slots.on_tick();
+        slots.pump();
+        assert!(menu_sends(&all_work(&mut work)).is_empty());
+        // `/menu` brings one; from then on it is an ordinary menu.
+        slots.on_control(owner_says(None, 5001, "/menu"));
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 1);
+        menu_sent(&mut slots, MENU + 1);
+        assert!(!slots.registry.person(owner_chat()).unwrap().on_request);
+    }
+
+    /// TASK-073: a first menu lost on its way (a 5xx, no connection) is
+    /// offered again on the retry tick, never while one is in flight; so is
+    /// one lost to a hub crash (a person in `registry.json` with no menu).
+    /// One Telegram refused comes on `/menu` only.
+    #[tokio::test]
+    async fn a_menu_lost_on_its_way_is_offered_again() {
+        let tick = |slots: &mut Slots| {
+            slots.next_retry = Instant::now();
+            slots.on_tick();
+            slots.pump();
+        };
+        let dir = TempDir::new("slots-menu-lost");
+        let mut slots = stalled_slots(&dir, menu_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.pump();
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 1);
+        slots.pump();
+        assert!(menu_sends(&all_work(&mut work)).is_empty(), "in flight");
+        for lost in [refused(502, "Bad Gateway"), None] {
+            slots.on_done(Done::Menu {
+                job: MenuJob::Show { chat: owner_chat() },
+                delivery: lost,
+            });
+            slots.pump();
+            assert!(menu_sends(&all_work(&mut work)).is_empty(), "not at once");
+            tick(&mut slots);
+            assert_eq!(menu_sends(&all_work(&mut work)).len(), 1, "again");
+        }
+        menu_sent(&mut slots, MENU);
+        tick(&mut slots);
+        assert!(menu_sends(&all_work(&mut work)).is_empty());
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().menu,
+            Some(MENU)
+        );
+
+        // After a crash: the person is known, the menu is not.
+        let dir = TempDir::new("slots-menu-crash");
+        let mut slots = stalled_slots(&dir, menu_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.registry.person_mut(owner_chat());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.pump();
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 1, "after a crash");
+        // Refused: not by itself any more.
+        slots.on_done(Done::Menu {
+            job: MenuJob::Show { chat: owner_chat() },
+            delivery: refused(400, "Bad Request: something"),
+        });
+        tick(&mut slots);
+        assert!(menu_sends(&all_work(&mut work)).is_empty(), "refused");
+        assert!(slots.registry.person(owner_chat()).unwrap().on_request);
+    }
+
+    /// TASK-073: a toggle's button carries the value it sets: a double tap
+    /// sets it once, the second press changes nothing.
+    #[tokio::test]
+    async fn a_double_tap_on_a_toggle_sets_it_once() {
+        let dir = TempDir::new("slots-menu-tap");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        let twice = [
+            Some(menu::ANSWER_SAVED.to_owned()),
+            Some(menu::ANSWER_UNCHANGED.to_owned()),
+        ];
+        slots.on_control(menu_press(MENU, "menu:th:0"));
+        slots.on_control(menu_press(MENU, "menu:th:0"));
+        assert_eq!(callback_answers(&all_work(&mut work)), twice);
+        let settings = |slots: &Slots| {
+            slots
+                .registry
+                .person(owner_chat())
+                .unwrap()
+                .settings
+                .clone()
+        };
+        assert!(!settings(&slots).thinking);
+        slots.registry.person_mut(owner_chat()).settings.tz = Some(0);
+        slots.on_control(menu_press(MENU, "menu:q:1"));
+        slots.on_control(menu_press(MENU, "menu:q:1"));
+        assert_eq!(callback_answers(&all_work(&mut work)), twice);
+        assert!(settings(&slots).quiet.is_some());
+        slots.on_control(menu_press(MENU, "menu:q:0"));
+        slots.on_control(menu_press(MENU, "menu:q:0"));
+        assert_eq!(callback_answers(&all_work(&mut work)), twice);
+        assert!(settings(&slots).quiet.is_none());
+    }
+
+    /// TASK-073: quiet hours come on only with a time zone; the zone page
+    /// comes first and a zone takes the menu back to the sound page.
+    #[tokio::test]
+    async fn quiet_hours_ask_for_the_zone_first() {
+        let dir = TempDir::new("slots-menu-zone");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        slots.on_control(menu_press(MENU, "menu:n"));
+        slots.on_control(menu_press(MENU, "menu:q:1"));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [None, Some(menu::ANSWER_ZONE_FIRST.to_owned())]
+        );
+        let edits = menu_edits(&handed);
+        assert!(edits.last().unwrap().1.starts_with("Сколько у вас"));
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().settings.quiet,
+            None
+        );
+        slots.on_control(menu_press(MENU, "menu:tz:180"));
+        slots.on_control(menu_press(MENU, "menu:tz:9999"));
+        slots.on_control(menu_press(MENU, "menu:q:1"));
+        slots.on_control(menu_press(MENU, "menu:qf:22"));
+        slots.on_control(menu_press(MENU, "menu:qt:99"));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(menu::ANSWER_SAVED.to_owned()),
+                Some(menu::ANSWER_UNCHANGED.to_owned()),
+                Some(menu::ANSWER_SAVED.to_owned()),
+                Some(menu::ANSWER_SAVED.to_owned()),
+                Some(menu::ANSWER_UNCHANGED.to_owned())
+            ]
+        );
+        let settings = &slots.registry.person(owner_chat()).unwrap().settings;
+        assert_eq!(settings.tz, Some(180));
+        assert_eq!(settings.quiet, Some(menu::Quiet { from: 22, to: 8 }));
+        let edits = menu_edits(&handed);
+        assert!(
+            button_texts(&edits.last().unwrap().2)
+                .contains(&"🌙 Тихие часы: с 22 до 08".to_owned()),
+            "{edits:#?}"
+        );
+    }
+
+    /// TASK-073: ⏹ in the menu asks for a second press like the one of the
+    /// status message, and the two share the question.
+    #[tokio::test]
+    async fn menu_stop_needs_a_second_press_and_shares_the_status_confirm() {
+        let dir = TempDir::new("slots-menu-stop");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        let mut from_hub = connect_typing(&mut slots, 1);
+        // No turn: nothing to stop.
+        slots.on_control(menu_press(MENU, "menu:st:0:0"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(status::ANSWER_IDLE.to_owned())]
+        );
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let edits = menu_edits(&all_work(&mut work));
+        assert!(button_texts(&edits.last().unwrap().2).contains(&"⏹ 1".to_owned()));
+        slots.on_control(menu_press(MENU, "menu:st:0:0"));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_CONFIRM.to_owned())]
+        );
+        assert!(
+            button_texts(&menu_edits(&handed).last().unwrap().2).contains(&"⏹ 1 точно?".to_owned())
+        );
+        // The status message asks too.
+        let (_, keyboard) = slots.status_view(SlotId(0), A, Instant::now());
+        assert!(status::asks_confirm(&keyboard), "{keyboard}");
+        assert!(from_hub.try_recv().is_err());
+        slots.on_control(menu_press(MENU, "menu:sc:0:0"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(status::ANSWER_INTERRUPTING.to_owned())]
+        );
+        assert!(matches!(
+            from_hub.try_recv(),
+            Ok(HubMsg::ConsoleKey {
+                key: ConsoleKey::Interrupt,
+                ..
+            })
+        ));
+    }
+
+    /// TASK-073: 👥 and 🙈 in the menu share and unshare like the button of
+    /// the status message, the unshare with a second press.
+    #[tokio::test]
+    async fn menu_share_and_unshare_reuse_the_status_path() {
+        let dir = TempDir::new("slots-menu-share");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        slots.on_control(menu_press(MENU, "menu:sh:0:0"));
+        slots.pump();
+        let handed = group_topic_made(&mut slots, &mut work, 100);
+        let _ = handed;
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        slots.on_control(menu_press(MENU, "menu:us:0:0"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_UNSHARE_CONFIRM.to_owned())]
+        );
+        assert!(topic_deletes(&handed).is_empty());
+        assert!(
+            button_texts(&menu_edits(&handed).last().unwrap().2)
+                .contains(&"🙈 1 точно?".to_owned())
+        );
+        slots.on_control(menu_press(MENU, "menu:uc:0:0"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_UNSHARED.to_owned())]
+        );
+        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::Group, 100)]);
+        assert!(!slots.registry.shared(SlotId(0), Chat::Group));
+    }
+
+    /// Registers agent `conn` of `session` (claude `pid`) with `client`.
+    fn register_session(
+        slots: &mut Slots,
+        conn: u64,
+        session: &str,
+        pid: u32,
+        client: Option<Client>,
+    ) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(8);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                client,
+                console_keys: true,
+                session_reads: false,
+                ..reads_register(session, Some(pid))
+            },
+            to_agent,
+        });
+        from_hub
+    }
+
+    /// TASK-073: «Обновить все клиенты» asks every outdated session of the
+    /// person that can update itself, and no one else's.
+    #[tokio::test]
+    async fn update_all_asks_every_outdated_session_of_the_person() {
+        let dir = TempDir::new("slots-menu-update");
+        let options = Options {
+            build: Some(HUB_BUILD.into()),
+            ..menu_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        const C: &str = "cccccccc-0000-4000-8000-000000000003";
+        const D: &str = "dddddddd-0000-4000-8000-000000000004";
+        const E: &str = "eeeeeeee-0000-4000-8000-000000000005";
+        for (index, session) in [B, C, D, E].into_iter().enumerate() {
+            let pid = 11 + u32::try_from(index).unwrap();
+            slots.on_hook(&start(session, pid));
+            let slot = SlotId(index + 1);
+            slots
+                .registry
+                .topic_created(slot, private_owner(), 701 + index as i64, "t", None);
+        }
+        // D is another person's.
+        let boris = Chat::Private(PrivateChat::of_user(8));
+        slots.registry.slots[3].views = vec![crate::hub::registry::View::new(boris)];
+        slots
+            .registry
+            .topic_created(SlotId(3), boris, 801, "t", None);
+        let _a = register_session(&mut slots, 1, A, 10, client(OLD_BUILD, true));
+        let _b = register_session(&mut slots, 2, B, 11, client(OLD_BUILD, true));
+        let _c = register_session(&mut slots, 3, C, 12, client(OLD_BUILD, false));
+        let _d = register_session(&mut slots, 4, D, 13, client(OLD_BUILD, true));
+        let _e = register_session(&mut slots, 5, E, 14, client(HUB_BUILD, true));
+        // No pump: in a one-user hub it would show D in the owner's chat
+        // too (a team's owners come from enrolled devices).
+        let _ = all_work(&mut work);
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let edits = menu_edits(&all_work(&mut work));
+        assert!(
+            button_texts(&edits.last().unwrap().2)
+                .contains(&"⬆️ Обновить все клиенты (3)".to_owned()),
+            "{edits:#?}"
+        );
+        slots.on_control(menu_press(MENU, "menu:up:0"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(menu::updates_asked(2))]
+        );
+        let mut asked: Vec<&str> = slots.updates.keys().map(String::as_str).collect();
+        asked.sort_unstable();
+        assert_eq!(asked, [A, B]);
+        // Asked already: nothing new.
+        slots.on_control(menu_press(MENU, "menu:up:0"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(menu::ANSWER_ALL_CURRENT.to_owned())]
+        );
+    }
+
+    /// TASK-073 (decision 5): a person gets the menu once their private
+    /// chat has its first topic; it is pinned once Telegram took it.
+    #[tokio::test]
+    async fn the_menu_goes_once_when_a_private_chat_gets_its_first_topic_and_is_pinned() {
+        let dir = TempDir::new("slots-menu-first");
+        let mut slots = stalled_slots(&dir, menu_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_hook(&start(A, 10));
+        slots.pump();
+        assert!(menu_sends(&all_work(&mut work)).is_empty(), "no topic yet");
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.pump();
+        let handed = all_work(&mut work);
+        let sent = menu_sends(&handed);
+        assert_eq!(sent.len(), 1, "{handed:#?}");
+        assert!(sent[0].1.starts_with("Сессии (стр. 1/1)"), "{}", sent[0].1);
+        assert!(slots.registry.people[0].menu.is_none());
+        slots.pump();
+        assert!(menu_sends(&all_work(&mut work)).is_empty(), "once");
+        menu_sent(&mut slots, MENU);
+        let handed = all_work(&mut work);
+        assert_eq!(pins(&handed), [(private_owner(), MENU)]);
+        assert!(deletes(&handed).is_empty());
+        assert_eq!(slots.registry.people[0].menu, Some(MENU));
+        slots.pump();
+        assert!(menu_sends(&all_work(&mut work)).is_empty());
+    }
+
+    /// TASK-073: `/start` in the same cycle as the first topic sends one
+    /// menu, not two.
+    #[tokio::test]
+    async fn start_right_after_the_first_topic_sends_one_menu() {
+        let dir = TempDir::new("slots-menu-start-first");
+        let mut slots = stalled_slots(&dir, menu_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.on_control(owner_says(None, 5001, "/start"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(menu_sends(&handed).len(), 1, "{handed:#?}");
+        assert_eq!(deletes(&handed), [(private_owner(), 5001)]);
+        assert!(sends_into(&handed, Place::new(private_owner(), None)).len() == 1);
+    }
+
+    /// TASK-073: `/menu` and `/start` send the menu again and delete the
+    /// command; once Telegram took the new one, the old one goes (or, when
+    /// Telegram refuses the delete, is edited to `↓` and unpinned).
+    #[tokio::test]
+    async fn start_and_menu_show_it_again_and_retire_the_old_one() {
+        let dir = TempDir::new("slots-menu-again");
+        let options = Options {
+            can_pin: false,
+            ..menu_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        slots.on_control(owner_says(None, 5601, "/Menu@cctg_bot"));
+        let handed = all_work(&mut work);
+        assert_eq!(menu_sends(&handed).len(), 1);
+        assert_eq!(deletes(&handed), [(private_owner(), 5601)]);
+        menu_sent(&mut slots, 5602);
+        let handed = all_work(&mut work);
+        assert_eq!(pins(&handed), [(private_owner(), 5602)]);
+        assert_eq!(deletes(&handed), [(private_owner(), MENU)]);
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().menu,
+            Some(5602)
+        );
+        // Older than 48 hours: Telegram keeps it.
+        slots.on_done(Done::Retire {
+            retire: Retire::Delete {
+                message: MessageKey::new(private_owner(), MENU),
+                pinned: true,
+            },
+            delivery: refused(400, "Bad Request: message can't be deleted"),
+        });
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(|(_, op)| matches!(op,
+                Op::Edit { message_id: MENU, text, reply_markup: Some(keyboard), .. }
+                    if text == status::RETIRED_TEXT && *keyboard == permissions::no_keyboard())),
+            "{handed:#?}"
+        );
+        assert!(
+            handed.iter().any(|(_, op)| matches!(op,
+                Op::Unpin { chat, message_id: MENU } if *chat == private_owner())),
+            "a private chat needs no right: {handed:#?}"
+        );
+        // `/start` too; other text is told where to write.
+        slots.on_control(owner_says(None, 5603, "/start"));
+        slots.on_control(owner_says(None, 5604, "hello"));
+        let handed = all_work(&mut work);
+        assert_eq!(menu_sends(&handed).len(), 1);
+        assert_eq!(
+            sends_into(&handed, Place::new(private_owner(), None))
+                .into_iter()
+                .filter(|text| text == PRIVATE_GENERAL_MENU_NOTICE)
+                .count(),
+            1
+        );
+    }
+
+    /// TASK-073 (review 1): two quick `/menu` leave one menu: the second
+    /// clears the first away once Telegram took it.
+    #[tokio::test]
+    async fn two_quick_menus_leave_one() {
+        let dir = TempDir::new("slots-menu-twice");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        slots.on_control(owner_says(None, 5601, "/menu"));
+        slots.on_control(owner_says(None, 5602, "/menu"));
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 2);
+        menu_sent(&mut slots, 5603);
+        menu_sent(&mut slots, 5604);
+        let handed = all_work(&mut work);
+        assert_eq!(
+            pins(&handed),
+            [(private_owner(), 5603), (private_owner(), 5604)]
+        );
+        assert_eq!(
+            deletes(&handed),
+            [(private_owner(), MENU), (private_owner(), 5603)]
+        );
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().menu,
+            Some(5604)
+        );
+        // A menu that did not go changes nothing.
+        slots.on_done(Done::Menu {
+            job: MenuJob::Show { chat: owner_chat() },
+            delivery: refused(400, "Bad Request: chat not found"),
+        });
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().menu,
+            Some(5604)
+        );
+        assert!(all_work(&mut work).is_empty());
+    }
+
+    /// TASK-073: the service message of the menu's pin goes, without the
+    /// group's right to delete; a pin of something else stays.
+    #[tokio::test]
+    async fn the_pin_notice_of_the_menu_is_deleted() {
+        let dir = TempDir::new("slots-menu-pin-notice");
+        let options = Options {
+            can_delete: false,
+            ..menu_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        slots.on_control(Control::Pinned {
+            chat: private_owner(),
+            message_id: 5501,
+            pinned: MENU,
+        });
+        slots.on_control(Control::Pinned {
+            chat: private_owner(),
+            message_id: 5502,
+            pinned: 42,
+        });
+        assert_eq!(deletes(&all_work(&mut work)), [(private_owner(), 5501)]);
+    }
+
+    /// TASK-073: ↗ lifts the slot's private topic (its status message moves
+    /// below) and names it; an ended slot is listed and lifted too.
+    #[tokio::test]
+    async fn menu_open_lifts_the_topic() {
+        let dir = TempDir::new("slots-menu-open");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        let place = Place::topic(private_owner(), 700);
+        let title = slots.registry.desired_title(SlotId(0));
+        slots.on_control(menu_press(MENU, "menu:o:0:0"));
+        let handed = all_work(&mut work);
+        assert_eq!(callback_answers(&handed), [Some(menu::lifted(&title))]);
+        assert!(slots.bottoms[&place].foreign);
+        slots.bottoms.get_mut(&place).unwrap().foreign = false;
+        slots.on_hook(&hook(
+            A,
+            HookEvent::SessionEnd {
+                reason: None,
+                claude_pid: Some(10),
+            },
+        ));
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let edits = menu_edits(&all_work(&mut work));
+        assert!(
+            edits.last().unwrap().1.contains("🏁"),
+            "{:?}",
+            edits.last().unwrap().1
+        );
+        slots.on_control(menu_press(MENU, "menu:o:0:0"));
+        let handed = all_work(&mut work);
+        assert_eq!(callback_answers(&handed), [Some(menu::lifted(&title))]);
+        assert!(slots.bottoms[&place].foreign);
+        // A slot of no view of this chat.
+        slots.on_control(menu_press(MENU, "menu:o:0:9"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(menu::ANSWER_NOT_YOURS.to_owned())]
+        );
+    }
+
+    /// TASK-073: without the menu option `/start` answers as TASK-063 did,
+    /// and no menu goes.
+    #[tokio::test]
+    async fn without_the_menu_option_start_answers_as_before() {
+        let dir = TempDir::new("slots-menu-off");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        slots.on_control(owner_says(None, 5001, "/start"));
+        slots.on_control(owner_says(None, 5002, "/menu"));
+        slots.on_control(menu_press(MENU, "menu:dl:a"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            sends_into(&handed, Place::new(private_owner(), None)),
+            [PRIVATE_START_TEXT, PRIVATE_GENERAL_NOTICE]
+        );
+        assert!(
+            !handed.iter().any(|(work, _)| matches!(work, Work::Menu(_))),
+            "{handed:#?}"
+        );
+        assert!(slots.registry.people.is_empty());
+        assert!(deletes(&handed).is_empty());
     }
 }
