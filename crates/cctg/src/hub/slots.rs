@@ -335,11 +335,12 @@ pub const CONTINUE_AGENTS_HOW: &str = "Возобнови каждого чер�
 /// long: a lost `SubagentStop` must not hold them forever (TASK-047).
 pub const AGENT_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 /// A burst of topic messages for a live session goes once no new one came
-/// for this long (TASK-048).
-pub const GATHER_QUIET: Duration = Duration::from_secs(1);
+/// for this long (TASK-048; 2.5 s since TASK-070: forwarded batches and
+/// several people writing at once come as one).
+pub const GATHER_QUIET: Duration = Duration::from_millis(2500);
 /// A burst goes at most this long after its first message, however steady
 /// the stream.
-pub const GATHER_MAX: Duration = Duration::from_secs(3);
+pub const GATHER_MAX: Duration = Duration::from_secs(6);
 /// Content of one burst inbound at most (the first message always goes);
 /// the rest of the burst follows in the next one. A link line holds
 /// [`crate::wire::MAX_LINE`], and a JSON escape takes up to 6 bytes per byte.
@@ -19917,9 +19918,9 @@ again"
                 ]),
             )]
         );
-        // A message every half second: its burst goes 3 s after the first.
+        // A message every half second: its burst goes GATHER_MAX (6 s) after the first.
         let mut went = Vec::new();
-        for id in 10..20 {
+        for id in 10..26 {
             slots.on_topic_message(topic_text(id, "x", false));
             slots.pump();
             pass(&mut slots, ms(500)).await;
@@ -19927,14 +19928,17 @@ again"
                 went.push((id, meta["message_ids"].clone()));
             }
         }
-        assert_eq!(went, [(15, "10,11,12,13,14,15".to_owned())]);
+        assert_eq!(
+            went,
+            [(21, "10,11,12,13,14,15,16,17,18,19,20,21".to_owned())]
+        );
         // The rest goes a quiet window after the last one.
-        pass(&mut slots, ms(499)).await;
+        pass(&mut slots, GATHER_QUIET - ms(501)).await;
         assert!(inbounds(&mut agent).is_empty());
         pass(&mut slots, ms(1)).await;
         let rest = inbounds(&mut agent);
         assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].1["message_ids"], "16,17,18,19");
+        assert_eq!(rest[0].1["message_ids"], "22,23,24,25");
     }
 
     #[tokio::test(start_paused = true)]
