@@ -100,8 +100,9 @@ pub struct Message {
     pub chat: MessageChat,
     pub text: Option<String>,
     /// In a forum topic every message that is not an explicit reply points
-    /// at the topic root (the `forum_topic_created` message).
-    pub reply_to_message: Option<MessageRef>,
+    /// at the topic root (the `forum_topic_created` message). Boxed: it
+    /// keeps `Message` (a scheduler `Outcome`) small.
+    pub reply_to_message: Option<Box<MessageRef>>,
     /// The part of the replied message the user selected (`TextQuote`).
     pub quote: Option<TextQuote>,
     /// Present on a forwarded message (`MessageOrigin`); only its presence
@@ -193,6 +194,16 @@ pub struct MessageRef {
     /// A rich message has no `text` (TASK-075 probe R2c); read for the reply
     /// quote. Boxed: `MessageRef` is twice in `Message`, a scheduler `Outcome`.
     pub rich_message: Option<Box<Value>>,
+    /// Who wrote it: a reply to the bot's own message addresses the agent
+    /// (TASK-077).
+    pub from: Option<RefSender>,
+}
+
+/// The sender of a referred message: only its id.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub struct RefSender {
+    pub id: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -781,6 +792,21 @@ mod tests {
         let member: ChatMember = parse_envelope(200, ADMIN_MEMBER.as_bytes()).unwrap();
         assert_eq!(member.status, "administrator");
         assert!(member.can_manage_topics && member.can_delete_messages && member.can_pin_messages);
+    }
+
+    /// TASK-077: the sender of a replied message is read by its id only.
+    #[test]
+    fn a_replied_message_carries_its_senders_id() {
+        let body = r#"{"ok":true,"result":{"message_id":5,"chat":{"id":-1001},"text":"t",
+            "reply_to_message":{"message_id":4,"text":"q",
+                "from":{"id":7,"is_bot":true,"first_name":"b","username":"b_bot"}}}}"#;
+        let message: Message = parse_envelope(200, body.as_bytes()).unwrap();
+        let replied = message.reply_to_message.unwrap();
+        assert_eq!(replied.from.map(|from| from.id), Some(7));
+        let body = r#"{"ok":true,"result":{"message_id":5,"chat":{"id":-1001},
+            "reply_to_message":{"message_id":4}}}"#;
+        let message: Message = parse_envelope(200, body.as_bytes()).unwrap();
+        assert!(message.reply_to_message.unwrap().from.is_none());
     }
 
     #[test]

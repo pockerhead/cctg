@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod channel;
 pub mod client;
+pub mod compress;
 pub mod deploy;
 pub mod device;
 pub mod doctor;

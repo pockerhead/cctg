@@ -263,6 +263,7 @@ impl Claude {
         let dirs = Dirs {
             project: None,
             work: Some(work.to_owned()),
+            claude: None,
         };
         tokio::spawn(agent::serve_channel(
             frames_rx,

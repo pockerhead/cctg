@@ -91,6 +91,73 @@ pub struct Parked {
     /// See [`crate::hub::updates::Inbound::from_name`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_name: Option<String>,
+    /// The group topic's messages since the last mention of the agent,
+    /// read before this one (TASK-077).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<History>,
+}
+
+/// The kept group messages a mention takes along ([`crate::hub::mention`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    pub text: String,
+    /// Messages in it.
+    pub count: u32,
+    /// Older messages dropped before the mention came.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped: u32,
+    /// At most this many characters of `text` reach the session.
+    pub limit: u32,
+    pub state: HistoryState,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// Where a [`History`] is on its way to the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryState {
+    /// Longer than its limit: the agent is to compress it first.
+    Pending,
+    /// Whole.
+    Full,
+    /// The agent's summary.
+    Compressed,
+    /// Its newest part only. A state of a later hub reads as this: the
+    /// message goes, never waits.
+    #[serde(other)]
+    Cut,
+}
+
+/// Russian plural of «сообщение» after `n`.
+fn messages(n: u32) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, 11) | (_, 12..=14) | (5..=9 | 0, _) => "сообщений",
+        (1, _) => "сообщение",
+        _ => "сообщения",
+    }
+}
+
+impl History {
+    /// The block the session reads before the mention.
+    fn block(&self) -> String {
+        let mut head = format!(
+            "(история темы группы с прошлого обращения к вам: {} {}",
+            self.count,
+            messages(self.count)
+        );
+        match self.state {
+            HistoryState::Compressed => head.push_str(", сжато"),
+            HistoryState::Cut => head.push_str(", начало обрезано"),
+            HistoryState::Pending | HistoryState::Full => {}
+        }
+        if self.dropped > 0 {
+            head.push_str(&format!(", ранние {} не сохранились", self.dropped));
+        }
+        format!("{head})\n{}\n(конец истории)", self.text)
+    }
 }
 
 /// Heads a forwarded message in the content the session reads.
@@ -106,11 +173,23 @@ impl Parked {
         MessageKey::new(self.chat, self.message_id)
     }
 
-    /// What the session reads: the quoted words as `> ` lines and a blank
-    /// line, then `Name: ` of a team member (TASK-036), then [`FORWARDED`]
-    /// on its own line for a forward, then the text.
+    /// Its history waits to be compressed (TASK-077): it does not go yet.
+    pub fn pending(&self) -> bool {
+        self.history
+            .as_ref()
+            .is_some_and(|history| history.state == HistoryState::Pending)
+    }
+
+    /// What the session reads: the group history block and a blank line
+    /// (TASK-077), the quoted words as `> ` lines and a blank line, then
+    /// `Name: ` of a team member (TASK-036), then [`FORWARDED`] on its own
+    /// line for a forward, then the text.
     pub fn content(&self) -> String {
         let mut content = String::new();
+        if let Some(history) = &self.history {
+            content.push_str(&history.block());
+            content.push_str("\n\n");
+        }
         if let Some(quote) = &self.quote {
             for line in quote.lines() {
                 content.push_str(format!("> {line}").trim_end());
@@ -272,6 +351,7 @@ mod tests {
             forwarded: false,
             file: None,
             from_name: None,
+            history: None,
         }
     }
 
@@ -375,6 +455,105 @@ mod tests {
             burst_content(&[forward, reply, parked(3)]),
             "(переслано)\nm1\n\n---\n\n> q\n\nm2\n\n---\n\nm3"
         );
+    }
+
+    fn history(state: HistoryState, dropped: u32) -> History {
+        History {
+            text: "Анна: a\n\n---\n\nИван: b".into(),
+            count: 2,
+            dropped,
+            limit: 4000,
+            state,
+        }
+    }
+
+    /// TASK-077: a mention reads the group history first, then itself.
+    #[test]
+    fn a_mention_reads_the_history_block_before_its_own_words() {
+        let mention = Parked {
+            from_name: Some("Анна".into()),
+            quote: Some("q".into()),
+            history: Some(history(HistoryState::Full, 0)),
+            ..parked(3)
+        };
+        assert_eq!(
+            mention.content(),
+            "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
+             Анна: a\n\n---\n\nИван: b\n(конец истории)\n\n> q\n\nАнна: m3"
+        );
+        assert!(!mention.pending());
+        for (state, dropped, head) in [
+            (HistoryState::Compressed, 0, "2 сообщения, сжато)"),
+            (HistoryState::Cut, 0, "2 сообщения, начало обрезано)"),
+            (
+                HistoryState::Cut,
+                7,
+                "2 сообщения, начало обрезано, ранние 7 не сохранились)",
+            ),
+            (
+                HistoryState::Full,
+                1,
+                "2 сообщения, ранние 1 не сохранились)",
+            ),
+        ] {
+            let content = Parked {
+                history: Some(history(state, dropped)),
+                ..parked(1)
+            }
+            .content();
+            assert!(
+                content.starts_with(&format!(
+                    "(история темы группы с прошлого обращения к вам: {head}\n"
+                )),
+                "{content}"
+            );
+            assert!(content.ends_with("(конец истории)\n\nm1"), "{content}");
+        }
+        let waiting = Parked {
+            history: Some(history(HistoryState::Pending, 0)),
+            ..parked(1)
+        };
+        assert!(waiting.pending());
+        for (n, word) in [
+            (1, "сообщение"),
+            (2, "сообщения"),
+            (5, "сообщений"),
+            (11, "сообщений"),
+            (12, "сообщений"),
+            (21, "сообщение"),
+            (22, "сообщения"),
+            (111, "сообщений"),
+            (200, "сообщений"),
+        ] {
+            assert_eq!(messages(n), word, "{n}");
+        }
+    }
+
+    /// TASK-077: a message without history is written as before; one with
+    /// it round-trips; a state of a later hub reads as cut (it never waits).
+    #[test]
+    fn the_history_is_written_only_with_one_and_an_unknown_state_is_cut() {
+        let plain = serde_json::to_string(&parked(1)).unwrap();
+        assert_eq!(
+            plain,
+            r#"{"chat":"group","message_id":1,"thread_id":100,"text":"m1"}"#
+        );
+        let with = Parked {
+            history: Some(history(HistoryState::Pending, 3)),
+            ..parked(1)
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains(r#""state":"pending""#), "{text}");
+        assert!(text.contains(r#""dropped":3"#), "{text}");
+        assert_eq!(serde_json::from_str::<Parked>(&text).unwrap(), with);
+        assert!(
+            !serde_json::to_string(&history(HistoryState::Full, 0))
+                .unwrap()
+                .contains("dropped")
+        );
+        let later: History =
+            serde_json::from_str(r#"{"text":"t","count":1,"limit":5,"state":"future"}"#).unwrap();
+        assert_eq!(later.state, HistoryState::Cut);
     }
 
     #[test]

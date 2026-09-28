@@ -9,6 +9,7 @@ pub mod console;
 pub mod devices;
 pub mod fetch;
 pub mod ingress;
+pub mod mention;
 pub mod menu;
 pub mod mirror;
 pub mod offset;
@@ -397,6 +398,17 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
             devices: config.allowlist.is_team().then(|| devices.clone()),
             share_new: false,
         });
+    // A shared slot's group topic answers mentions of the bot (TASK-077).
+    let mentions = match me.username.clone() {
+        Some(username) => Some(slots::MentionBot {
+            id: me.id,
+            username,
+        }),
+        None => {
+            warn!("the bot has no username; group topics of shared sessions take every message");
+            None
+        }
+    };
     let options = slots::Options {
         icons,
         can_delete,
@@ -410,6 +422,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         channel_wait: slots::CHANNEL_WAIT,
         owners,
         menu: true,
+        mentions,
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
@@ -631,6 +644,7 @@ mod tests {
             media: None,
             from_name: None,
             author: None,
+            reply_from: None,
         };
         let mut route = route_inbound(&commands_tx, &roster_tx, &control_tx, BOT);
         route(Routed::Input(input("hello")));

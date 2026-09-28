@@ -94,6 +94,7 @@ fn say(message_id: i64, text: &str) -> Control {
         media: None,
         from_name: None,
         author: None,
+        reply_from: None,
     })
 }
 

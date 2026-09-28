@@ -201,6 +201,7 @@ impl Hub {
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             })
             .unwrap();
     }

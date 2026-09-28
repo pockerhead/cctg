@@ -558,6 +558,7 @@ mod tests {
             media: None,
             from_name: None,
             author: None,
+            reply_from: None,
         };
         for text in ["/brief", "/full 2", " /brief@cctg_bot 3", "/full@other_bot"] {
             assert!(super::is_command(&input(text)), "{text}");
@@ -691,6 +692,7 @@ mod tests {
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             })
             .unwrap();
         }

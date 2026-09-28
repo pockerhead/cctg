@@ -56,6 +56,10 @@ pub struct Inbound {
     /// The message this one explicitly answers. `None` for the implicit
     /// reply to the topic root that Telegram sets on every topic message.
     pub reply_to: Option<i64>,
+    /// The sender id of the message [`Inbound::reply_to`] answers, when
+    /// Telegram gave it: a reply to the bot's own message addresses the
+    /// agent (TASK-077). Never logged.
+    pub reply_from: Option<i64>,
     /// The words an explicit reply answers: the fragment the user selected,
     /// else the start of the replied text or caption, at most
     /// [`QUOTE_LIMIT`]. Never logged.
@@ -299,7 +303,12 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             .reply_to_message
             .filter(|replied| replied.message_id != 0 && Some(replied.message_id) != thread_id);
         let reply_to = replied.as_ref().map(|replied| replied.message_id);
+        let reply_from = replied
+            .as_ref()
+            .and_then(|replied| replied.from)
+            .map(|from| from.id);
         let quote = replied.and_then(|replied| {
+            let replied = *replied;
             let words = |text: Option<String>| text.filter(|text| !text.trim().is_empty());
             words(message.quote.map(|quote| quote.text))
                 .or_else(|| words(replied.text))
@@ -315,6 +324,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             thread_id,
             text: message.text,
             reply_to,
+            reply_from,
             quote,
             forwarded: message.forward_origin.is_some(),
             media,
@@ -709,6 +719,7 @@ mod tests {
                 from_name: None,
                 author: Some("x".to_owned()),
                 display_name: Some("x".to_owned()),
+                reply_from: None,
             })
         );
 
@@ -892,6 +903,33 @@ mod tests {
                 "reply_to_message": { "message_id": 42 } })
             ),
             Some(42)
+        );
+    }
+
+    /// TASK-077: the sender of an explicitly replied message is kept by id;
+    /// the implicit reply to the topic root (the bot made it) has none.
+    #[test]
+    fn an_explicit_reply_keeps_the_replied_senders_id() {
+        let reply_from = |extra: Value| input(extra).reply_from;
+        assert_eq!(
+            reply_from(json!({ "text": "hi", "reply_to_message": {
+                "message_id": 42, "text": "t", "from": { "id": 7, "is_bot": false, "first_name": "a" } } })),
+            Some(7)
+        );
+        assert_eq!(
+            reply_from(json!({ "text": "hi", "reply_to_message": {
+                "message_id": 7, "from": { "id": BOT, "is_bot": true, "first_name": "bot" } } })),
+            None,
+            "the topic root"
+        );
+        assert_eq!(
+            reply_from(json!({ "text": "hi", "reply_to_message": { "message_id": 42 } })),
+            None
+        );
+        assert_eq!(reply_from(json!({ "text": "hi" })), None);
+        assert_eq!(
+            reply_from(json!({ "text": "hi", "reply_to_message": replied(42, json!({})) })),
+            Some(BOT)
         );
     }
 

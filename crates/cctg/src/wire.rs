@@ -355,6 +355,12 @@ pub enum SessionAsk {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last: Option<String>,
     },
+    /// Not a read: the group topic history `text` of a shared slot, to be
+    /// compressed to about `limit` characters by an isolated helper claude
+    /// on the device (TASK-077). Answered with `text` pieces, or
+    /// `unreadable` when that failed; an agent before it answers
+    /// `unsupported`, and the hub cuts the history itself.
+    Compress { text: String, limit: u32 },
     /// An ask of a newer hub.
     #[serde(other)]
     Other,
@@ -2269,6 +2275,22 @@ mod tests {
                 answer: SessionAnswer::Other
             })
         );
+        // TASK-077: a compression ask round-trips; an agent that does not
+        // know it reads it as another ask (and answers `unsupported`).
+        let compress = HubMsg::SessionRead {
+            read_id: 3,
+            session_id: "s".into(),
+            ask: SessionAsk::Compress {
+                text: "Анна: да".into(),
+                limit: 4000,
+            },
+        };
+        let line = encode(&compress);
+        assert!(
+            String::from_utf8_lossy(&line)
+                .contains(r#""ask":{"kind":"compress","text":"Анна: да","limit":4000}"#)
+        );
+        assert_eq!(decode::<HubMsg>(&line), Ok(compress));
         // The last piece of a text leaves `more` out.
         let last =
             br#"{"v":1,"type":"session_answer","read_id":2,"answer":{"kind":"text","text":"x"}}"#;

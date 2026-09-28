@@ -1171,6 +1171,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             }))
             .unwrap();
     };
