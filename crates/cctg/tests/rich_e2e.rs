@@ -302,3 +302,56 @@ async fn a_rich_write_into_a_message_and_its_html_fallback() {
         }
     }
 }
+
+/// A new stream message with its rich form (a streamed turn answer, a new
+/// turn message): `sendRichMessage` into its topic, no buttons, no reply,
+/// quiet unless it is an answer.
+#[tokio::test]
+async fn a_new_rich_stream_message_goes_as_send_rich_message() {
+    let line = |notify: bool| Op::Stream {
+        chat: Chat::Group,
+        thread_id: 5,
+        text: "Смотрю.".to_owned(),
+        html: Some("Смотрю.".to_owned()),
+        rich: Some(Box::new(Rich {
+            markdown: Some("Смотрю.\n\n<p>• Bash: a&lt;b ✓</p>".to_owned()),
+            before: Vec::new(),
+            file: None,
+        })),
+        merge: false,
+        restart: false,
+        notify,
+        into: None,
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (scheduler, outbox) = scheduler(requests.clone(), false).await;
+    let running = tokio::spawn(scheduler.run());
+    for notify in [false, true] {
+        let delivery = outbox.submit(line(notify)).await;
+        assert!(
+            matches!(delivery.await, Ok(Ok(Outcome::Sent(_)))),
+            "notify {notify}"
+        );
+    }
+    drop(outbox);
+    running.await.unwrap();
+
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    for ((method, body), notify) in requests.iter().zip([false, true]) {
+        assert_eq!(method, "sendRichMessage");
+        assert_eq!(
+            body["rich_message"]["markdown"],
+            "Смотрю.\n\n<p>• Bash: a&lt;b ✓</p>"
+        );
+        assert_eq!(body["message_thread_id"], 5);
+        for absent in ["text", "parse_mode", "reply_markup", "reply_parameters"] {
+            assert!(body.get(absent).is_none(), "{absent}: {body}");
+        }
+        assert_eq!(
+            body.get("disable_notification").is_some(),
+            !notify,
+            "{body}"
+        );
+    }
+}

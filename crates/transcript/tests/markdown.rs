@@ -335,7 +335,7 @@ fn rich_markdown_keeps_complete_allowed_tags() {
         r#"<code class="language-rust">x</code>"#,
         r#"<ol start=3 reversed><li>a</li></ol>"#,
         r#"<td align="right" colspan=2>c</td>"#,
-        "<tg-spoiler>s</tg-spoiler> <H1>t</H1>",
+        "<tg-spoiler>s</tg-spoiler> <h1>t</h1>",
     ] {
         assert_eq!(rich_markdown(text), text);
     }
@@ -397,4 +397,87 @@ fn rich_markdown_without_lt_or_fence_is_the_input() {
         assert_eq!(rich_markdown(text), text);
     }
     assert_eq!(rich_markdown(ANSWER).replace("&lt;", "<"), ANSWER);
+}
+
+#[test]
+fn rich_markdown_tag_names_are_lowercase_so_generics_stay_text() {
+    assert_eq!(
+        rich_markdown("hyper Request<B>, tower Service<S>, Foo<U>, Cow<A>, Wrap<P>, Vec<I> end"),
+        "hyper Request&lt;B>, tower Service&lt;S>, Foo&lt;U>, Cow&lt;A>, Wrap&lt;P>, Vec&lt;I> end"
+    );
+    assert_eq!(rich_markdown("<H1>t</H1>"), "&lt;H1>t&lt;/H1>");
+    assert_eq!(rich_markdown("<b>x</b> <i>y</i>"), "<b>x</b> <i>y</i>");
+}
+
+#[test]
+fn rich_markdown_reads_fences_inside_list_items_and_quotes() {
+    for (text, expected) in [
+        // A fence opened on the marker line: code up to its closing line, prose after it.
+        (
+            "- ```rust\n  let a: Vec<u8>;\n  ```\n\nThen Vec<String> is returned.",
+            "- ```rust\n  let a: Vec<u8>;\n  ```\n\nThen Vec&lt;String> is returned.",
+        ),
+        (
+            "1. ```sh\n   echo <x>\n   ```\n2. Returns Option<T>.",
+            "1. ```sh\n   echo <x>\n   ```\n2. Returns Option&lt;T>.",
+        ),
+        (
+            "> ```\n> Vec<T>\n> ```\nafter Vec<U>",
+            "> ```\n> Vec<T>\n> ```\nafter Vec&lt;U>",
+        ),
+        // The usual step with its code below it.
+        (
+            "1. Step\n   ```sh\n   cmd <x>\n   ```\n2. Next <y>",
+            "1. Step\n   ```sh\n   cmd <x>\n   ```\n2. Next &lt;y>",
+        ),
+        // A fence ends with its container.
+        (
+            "> ```\n> Vec<T>\nafter Vec<U>",
+            "> ```\n> Vec<T>\nafter Vec&lt;U>",
+        ),
+        (
+            "- ```\n  a<b>\n\n  c<d>\nafter <e>",
+            "- ```\n  a<b>\n\n  c<d>\nafter &lt;e>",
+        ),
+        // Left open at the end: closed inside its containers.
+        ("- ```\n  Vec<T>", "- ```\n  Vec<T>\n  ```"),
+        ("> ```\n> a<b\n", "> ```\n> a<b\n> ```"),
+    ] {
+        assert_eq!(rich_markdown(text), expected, "{text:?}");
+    }
+}
+
+#[test]
+fn rich_markdown_code_in_nested_containers_stays_code() {
+    for text in [
+        "- a\n   - b\n     ```\n     Vec<T>\n     ```\n",
+        "- a\n  - b\n    ```\n    Vec<T>\n    ```",
+        "- > ```\n  > Vec<T>\n  > ```",
+        "> - x\n>   ```\n>   Vec<T>\n>   ```",
+    ] {
+        assert_eq!(rich_markdown(text), text, "{text:?}");
+    }
+    assert_eq!(
+        rich_markdown("10. x\n    ```\n    Vec<T>\n    ```\nafter <z>"),
+        "10. x\n    ```\n    Vec<T>\n    ```\nafter &lt;z>"
+    );
+}
+
+#[test]
+fn rich_markdown_code_spans_go_on_within_a_paragraph() {
+    assert_eq!(
+        rich_markdown("Run `cargo\ntest` then read Vec<String> and `x` here."),
+        "Run `cargo\ntest` then read Vec&lt;String> and `x` here."
+    );
+    assert_eq!(
+        rich_markdown("- run `a\n  b<c>` and d<e>"),
+        "- run `a\n  b<c>` and d&lt;e>"
+    );
+    // Not across a blank line, a new item or a table row.
+    assert_eq!(rich_markdown("a `b\n\nc<d> `e`"), "a `b\n\nc&lt;d> `e`");
+    assert_eq!(rich_markdown("- a `b\n- c<d> `e`"), "- a `b\n- c&lt;d> `e`");
+    assert_eq!(
+        rich_markdown("| a ` | b |\n| c<d> ` | e |"),
+        "| a ` | b |\n| c&lt;d> ` | e |"
+    );
 }

@@ -282,10 +282,12 @@
 //! message carries a rich form of itself ([`stream::Open`]); everything
 //! else stays HTML. Each op carries today's messages too: the scheduler
 //! falls back to them when Telegram refuses the rich one. A view without
-//! rich gets today's form: the primary view's ops are built so, and a twin
-//! into another view or a lost message sent later drops its markdown there
-//! ([`Slots::in_view`]), or goes as today's document when the text is more
-//! than four messages.
+//! rich gets today's form: an answer or reply is built rich when any view
+//! of its slot shows rich messages, and each view, the primary one at the
+//! hand-off, a twin or a lost message sent later where it goes, drops its
+//! markdown when it shows none ([`Slots::in_view`]), or takes today's
+//! document when the text is more than four messages (a streamed answer
+//! then goes outside the stream, as today).
 //!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
@@ -4782,7 +4784,7 @@ impl Slots {
             }
             return;
         };
-        let rich = self.rich_in(place);
+        let (rich, rich_here) = (self.rich_anywhere(place), self.rich_in(place));
         if let Some(live) = self.streams.get_mut(session).filter(|_| streamed) {
             let now = Instant::now();
             let mut held = Held {
@@ -4792,6 +4794,7 @@ impl Slots {
                 end: None,
                 gone: None,
                 rich,
+                rich_here,
             };
             if let Some(end) = live.claim_end(now) {
                 // A turn end read already: the lines before it are handed
@@ -5155,7 +5158,15 @@ impl Slots {
         kind: &'static str,
         notify: bool,
     ) {
-        let parts = text_ops(place, session, text, kind, notify, self.rich_in(place)).len();
+        let parts = text_ops(
+            place,
+            session,
+            text,
+            kind,
+            notify,
+            self.rich_anywhere(place),
+        )
+        .len();
         if self.queued_messages + parts > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
@@ -5935,7 +5946,14 @@ impl Slots {
         kind: &str,
         notify: bool,
     ) -> Option<usize> {
-        let ops = text_ops(place, session, text, kind, notify, self.rich_in(place));
+        let ops = text_ops(
+            place,
+            session,
+            text,
+            kind,
+            notify,
+            self.rich_anywhere(place),
+        );
         let parts = ops.len();
         self.queue_messages(|| Work::Content, false, ops)
             .then_some(parts)
@@ -6962,7 +6980,7 @@ impl Slots {
             "message for a slot whose topic is being made; it waits for it"
         );
         // Pointed at the slot's primary topic once there is one; rich, which
-        // its target's view may drop then ([`Self::in_view`]).
+        // its target's view may drop then ([`Self::in_own_view`]).
         let nowhere = Place::new(Chat::Group, None);
         for op in text_ops(nowhere, session, text, kind, notify, true) {
             self.keep_lost(LostMessage {
@@ -7009,8 +7027,8 @@ impl Slots {
                 *chat = target.chat;
                 *thread_id = target.thread;
             }
-            let op = self.in_view(op, target);
-            // Into the private topic made again: that view alone.
+            // Into the private topic made again: that view alone. Each view
+            // takes its own form at the hand-off.
             self.send_as(lost.gone, vec![op]);
         }
     }
@@ -9011,6 +9029,8 @@ impl Slots {
             let kept = self.mirror.kept_chats(old);
             twins.retain(|twin| twin.op.chat().is_none_or(|chat| !kept.contains(&chat)));
         }
+        // After the twins, which take the rich form for their own views.
+        let op = self.in_own_view(op);
         // After the twins: the group sounds as before (TASK-073).
         let op = self.voiced(&work, op);
         if self.dispatch.send((work, op)).is_err() {
@@ -9244,6 +9264,39 @@ impl Slots {
             },
             None => op,
         }
+    }
+
+    /// `op` for the view of its own topic ([`Self::in_view`]): a new
+    /// message is built rich when any view of its slot shows rich messages
+    /// ([`Self::rich_anywhere`]), so that its twins can take that form.
+    fn in_own_view(&self, op: Op) -> Op {
+        let own = match &op {
+            Op::Send {
+                chat,
+                thread_id,
+                rich: Some(_),
+                ..
+            } => Place::new(*chat, *thread_id),
+            Op::Stream {
+                chat,
+                thread_id,
+                rich: Some(_),
+                ..
+            } => Place::topic(*chat, *thread_id),
+            _ => return op,
+        };
+        self.in_view(op, own)
+    }
+
+    /// Topic `place` or one of its mirror topics shows rich messages
+    /// (TASK-075): a text for it carries its rich form, and each view takes
+    /// its own form of it ([`Self::in_view`]).
+    fn rich_anywhere(&self, place: Place) -> bool {
+        self.rich_in(place)
+            || self
+                .primary_mirrors(place)
+                .into_iter()
+                .any(|to| self.rich_in(to))
     }
 
     /// The view of topic `place` shows rich messages (TASK-075): by the
@@ -11390,7 +11443,10 @@ impl Slots {
 /// With `held.rich` (TASK-075) an answer that fits one rich message is one
 /// such message, carrying today's messages for the fallback (and today's
 /// document, `answer-<short id of session>.txt`, for a view without rich
-/// messages); it is not sent as a file for its length.
+/// messages); it is not sent as a file for its length, unless its own view
+/// shows no rich messages (`held.rich_here`). It stays an `Op::Stream` for
+/// its pairing in `Live`; [`Slots::in_own_view`] drops its markdown for an
+/// own view without rich messages at the hand-off.
 fn answer_ops(
     live: &mut Live,
     held: Held,
@@ -11404,7 +11460,9 @@ fn answer_ops(
     if let Some((markdown, before, last, long)) =
         held.rich.then(|| rich_parts(&held.answer)).flatten()
     {
-        if before.len() + 1 > room {
+        // Today's document in its own view goes outside the stream, as
+        // today; its twins still get the rich form ([`Slots::send_text`]).
+        if before.len() + 1 > room || (long && !held.rich_here) {
             live.answered_outside(&held);
             return Err(held);
         }
@@ -28942,6 +29000,7 @@ again"
             end: None,
             gone: None,
             rich: false,
+            rich_here: false,
         };
         let Ok(ops) = answer_ops(&mut live, held, 10, A) else {
             panic!("the answer rides the stream");
@@ -29563,6 +29622,100 @@ again"
         }
     }
 
+    /// Each view by its own rich setting (review finding 4): private off and
+    /// group on gives the group rich answers and replies, the private chat
+    /// today's form of the same ops (the markdown dropped, or today's
+    /// document for more than four messages).
+    #[tokio::test]
+    async fn a_rich_group_gets_rich_answers_when_the_private_view_has_none() {
+        let short = table_answer(2);
+        let dir = TempDir::new("slots-rich-group-only");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        let settings = &mut slots.registry.person_mut(owner_chat()).settings;
+        (settings.rich, settings.group.rich) = (false, true);
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_hook(&stop(A, Some(&short)));
+        slots.on_agent(reply(1, &short));
+        slots.pump();
+        let (primary, twins) = rich_contents(&all_work(&mut work));
+        assert_eq!((primary.len(), twins.len()), (2, 2), "{primary:#?}");
+        for op in &primary {
+            assert_rich_of(op, private_owner(), &short, false);
+        }
+        for op in &twins {
+            assert_rich_of(op, Chat::Group, &short, true);
+        }
+
+        let long = table_answer(6);
+        let dir = TempDir::new("slots-rich-group-only-long");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        let settings = &mut slots.registry.person_mut(owner_chat()).settings;
+        (settings.rich, settings.group.rich) = (false, true);
+        slots.on_hook(&stop(A, Some(&long)));
+        slots.pump();
+        let (primary, twins) = rich_contents(&all_work(&mut work));
+        assert!(
+            matches!(primary.as_slice(), [Op::SendDocument { chat, document, .. }]
+                if *chat == private_owner() && document.bytes == long.as_bytes()),
+            "{primary:#?}"
+        );
+        assert_eq!(twins.len(), 1, "{twins:#?}");
+        assert_rich_of(&twins[0], Chat::Group, &long, true);
+    }
+
+    /// A streamed answer whose own view has no rich messages but a mirror's
+    /// has: one stream message carrying the rich form (the answer's pairing
+    /// in `Live` needs the `Op::Stream`), its markdown dropped for its own
+    /// view at the hand-off and kept for the twin; one that is a document
+    /// there today goes outside the stream.
+    #[tokio::test]
+    async fn a_streamed_answer_keeps_its_rich_form_for_a_rich_mirror() {
+        let owner = private_owner();
+        let held = |answer: &str| Held {
+            place: Place::topic(owner, 700),
+            answer: answer.to_owned(),
+            until: Instant::now(),
+            end: None,
+            gone: None,
+            rich: true,
+            rich_here: false,
+        };
+        let long = table_answer(6);
+        let mut live = Live::new(Some(0), Vec::new());
+        assert!(answer_ops(&mut live, held(&long), 10, A).is_err());
+
+        let short = table_answer(2);
+        let mut live = Live::new(Some(0), Vec::new());
+        let Ok(ops) = answer_ops(&mut live, held(&short), 10, A) else {
+            panic!("the answer rides the stream");
+        };
+        let [(_, op)] = ops.as_slice() else {
+            panic!("{ops:#?}");
+        };
+        assert!(is_answer(op));
+        assert_eq!(
+            rich_form(op),
+            Some(transcript::rich_markdown(&short).as_str())
+        );
+        let dir = TempDir::new("slots-rich-stream-twin");
+        let (mut slots, _work) = shared_slot(&dir, private_only_options());
+        let settings = &mut slots.registry.person_mut(owner_chat()).settings;
+        (settings.rich, settings.group.rich) = (false, true);
+        let own = slots.in_own_view(op.clone());
+        assert!(
+            matches!(&own, Op::Stream { rich: Some(form), into: None, .. }
+                if form.markdown.is_none() && !form.before.is_empty()),
+            "{own:?}"
+        );
+        let twin = slots
+            .as_new_twin(op, Place::topic(Chat::Group, 100))
+            .expect("a twin into the group");
+        assert_eq!(
+            rich_form(&twin),
+            Some(transcript::rich_markdown(&short).as_str())
+        );
+    }
+
     /// A streamed answer in a rich view is one stream message with its
     /// fallback, remembered as the answer; without rich, today's messages.
     #[test]
@@ -29578,6 +29731,7 @@ again"
                 end: None,
                 gone: None,
                 rich,
+                rich_here: rich,
             };
             let Ok(ops) = answer_ops(&mut live, held, 10, A) else {
                 panic!("the answer rides the stream");

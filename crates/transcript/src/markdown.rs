@@ -623,39 +623,203 @@ const RICH_TAGS: &[(&str, &[&str])] = &[
 /// as it is, but for `<`. Telegram rich markdown reads HTML tags, drops a tag it does not know
 /// with no error (`Vec<String>` shows as `Vec`), and a backslash does not help there, while
 /// `&lt;` does (probe TASK-075 R4, R9). So every `<` outside code that does not start a complete
-/// tag of [`RICH_TAGS`] on its line (attributes from that list only) becomes `&lt;`, and `\<`
-/// becomes `&lt;` too. Code is left alone: fenced blocks by GFM rules (an unclosed one is code to
-/// the end of the text, as Telegram reads it, and is closed at the end so that text added below
-/// is not swallowed) and code spans within a line. Indented code (four spaces) is not known here:
-/// a `<` in it shows as `&lt;`.
+/// tag of [`RICH_TAGS`] on its line (lowercase name, attributes from that list only; `Request<B>`
+/// is text) becomes `&lt;`, and `\<` becomes `&lt;` too. Code is left alone, found by GFM rules:
+/// fenced blocks, also inside block quotes and list items (a fence ends with its container; an
+/// unclosed one is code to the end of the text, as Telegram reads it, and is closed at the end so
+/// that text added below is not swallowed), and code spans within a paragraph. Indented code (four
+/// spaces) is not known here: a `<` in it shows as `&lt;`; neither are lazy continuation lines,
+/// which end their container here.
 pub fn rich_markdown(text: &str) -> String {
     if !text.contains(['<', '`', '~']) {
         return text.to_owned();
     }
     let mut out = String::with_capacity(text.len() + 16);
-    let mut fence: Option<(u8, usize)> = None;
+    let mut containers: Vec<Container> = Vec::new();
+    // The open fence: its marker, its length, and how many containers hold it.
+    let mut fence: Option<(u8, usize, usize)> = None;
+    // The lines of the paragraph being read, each with where its text starts.
+    let mut paragraph: Vec<(&str, usize)> = Vec::new();
     for line in text.split_inclusive('\n') {
-        if let Some((marker, len)) = fence {
-            out.push_str(line);
-            if closes_rich_fence(line, marker, len) {
-                fence = None;
+        let (held, mut at) = open_containers(line, &containers);
+        if let Some((marker, len, depth)) = fence {
+            if held >= depth {
+                out.push_str(line);
+                if closes_rich_fence(&line[at..], marker, len) {
+                    fence = None;
+                }
+                continue;
             }
-            continue;
+            // Its container ended, and the fence with it.
+            fence = None;
         }
-        if let Some(open) = rich_fence(line) {
-            fence = Some(open);
+        let ended = held < containers.len();
+        containers.truncate(held);
+        let mut started = false;
+        while let Some((container, next)) = new_container(line, at) {
+            containers.push(container);
+            at = next;
+            started = true;
+        }
+        let rest = &line[at..];
+        let blank = is_blank(rest.as_bytes());
+        // A heading or a table row is a paragraph of its own.
+        let single = is_heading(rest) || rest.trim_start_matches(' ').starts_with('|');
+        if ended || started || blank || single {
+            rich_paragraph(&mut paragraph, &mut out);
+        }
+        if let Some((marker, len)) = rich_fence(rest) {
+            rich_paragraph(&mut paragraph, &mut out);
+            fence = Some((marker, len, containers.len()));
             out.push_str(line);
             continue;
         }
-        rich_line(line, &mut out);
+        if blank {
+            out.push_str(line);
+            continue;
+        }
+        paragraph.push((line, at));
+        if single {
+            rich_paragraph(&mut paragraph, &mut out);
+        }
     }
-    if let Some((marker, len)) = fence {
+    rich_paragraph(&mut paragraph, &mut out);
+    if let Some((marker, len, _)) = fence {
         if !out.ends_with('\n') {
             out.push('\n');
+        }
+        // The closing line stays in the fence's containers.
+        for container in &containers {
+            match *container {
+                Container::Quote => out.push_str("> "),
+                Container::Item(width) => out.extend(std::iter::repeat_n(' ', width)),
+            }
         }
         out.extend(std::iter::repeat_n(char::from(marker), len));
     }
     out
+}
+
+/// A container block (GFM) a line may be in: a block quote, or a list item whose content starts
+/// this many columns in.
+#[derive(Debug, Clone, Copy)]
+enum Container {
+    Quote,
+    Item(usize),
+}
+
+/// How many of `containers` (outermost first) `line` stays in, and where its text starts after
+/// their markers and indentation. A blank line stays in a list item, not in a quote.
+fn open_containers(line: &str, containers: &[Container]) -> (usize, usize) {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    for (held, container) in containers.iter().enumerate() {
+        let indent = spaces(bytes, at);
+        match *container {
+            Container::Quote if indent <= 3 && bytes.get(at + indent) == Some(&b'>') => {
+                at += indent + 1;
+                if bytes.get(at) == Some(&b' ') {
+                    at += 1;
+                }
+            }
+            Container::Item(width) if indent >= width || is_blank(&bytes[at + indent..]) => {
+                at += indent.min(width);
+            }
+            _ => return (held, at),
+        }
+    }
+    (containers.len(), at)
+}
+
+/// The container block whose marker `line` has at `at` (after at most three spaces): `>`, or a
+/// list marker (`-`, `*`, `+`, `1.`, `1)`) followed by a space or the end of the line; and where
+/// its content starts.
+fn new_container(line: &str, at: usize) -> Option<(Container, usize)> {
+    let bytes = line.as_bytes();
+    let indent = spaces(bytes, at);
+    if indent > 3 {
+        return None;
+    }
+    let start = at + indent;
+    let end = match *bytes.get(start)? {
+        b'>' => {
+            let next = start + 1;
+            let space = usize::from(bytes.get(next) == Some(&b' '));
+            return Some((Container::Quote, next + space));
+        }
+        b'-' | b'*' | b'+' => start + 1,
+        b'0'..=b'9' => {
+            let digits = bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if digits > 9 || !matches!(bytes.get(start + digits), Some(b'.' | b')')) {
+                return None;
+            }
+            start + digits + 1
+        }
+        _ => return None,
+    };
+    let gap = spaces(bytes, end);
+    let empty = is_blank(&bytes[end + gap..]);
+    if gap == 0 && !empty {
+        return None;
+    }
+    // Content five or more spaces in is indented code: the item starts one space after its
+    // marker.
+    let gap = if empty || gap > 4 { 1 } else { gap };
+    Some((
+        Container::Item(end - at + gap),
+        (end + gap).min(bytes.len()),
+    ))
+}
+
+/// Spaces from `at` on.
+fn spaces(bytes: &[u8], at: usize) -> usize {
+    bytes[at..].iter().take_while(|&&b| b == b' ').count()
+}
+
+/// Nothing but blanks and the line end.
+fn is_blank(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// An ATX heading line: at most three spaces, one to six `#`, then a blank or the end.
+fn is_heading(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let start = spaces(bytes, 0);
+    let hashes = run(bytes, start);
+    start <= 3
+        && bytes.get(start) == Some(&b'#')
+        && hashes <= 6
+        && bytes
+            .get(start + hashes)
+            .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// The paragraph `lines` (each with where its text starts) into `out`, emptied: the container
+/// markers as they are, the text read as one, so that a code span may go on to the next line.
+fn rich_paragraph(lines: &mut Vec<(&str, usize)>, out: &mut String) {
+    match lines.as_slice() {
+        [] => return,
+        [(line, at)] => {
+            out.push_str(&line[..*at]);
+            rich_inline(&line[*at..], out);
+        }
+        _ => {
+            let text: String = lines.iter().map(|(line, at)| &line[*at..]).collect();
+            let mut escaped = String::with_capacity(text.len() + 16);
+            rich_inline(&text, &mut escaped);
+            // Escaping never adds or takes a line end: one piece per line.
+            for ((line, at), piece) in lines.iter().zip(escaped.split_inclusive('\n')) {
+                out.push_str(&line[..*at]);
+                out.push_str(piece);
+            }
+        }
+    }
+    lines.clear();
 }
 
 /// A fence line without its indentation (at most three spaces).
@@ -691,8 +855,8 @@ fn closes_rich_fence(line: &str, marker: u8, len: usize) -> bool {
         && body[n..].trim_matches([' ', '\t', '\r', '\n']).is_empty()
 }
 
-/// One line outside a fenced block, into `out`.
-fn rich_line(line: &str, out: &mut String) {
+/// Text outside fenced blocks (a paragraph, maybe of several lines), into `out`.
+fn rich_inline(line: &str, out: &mut String) {
     let bytes = line.as_bytes();
     let (mut i, mut plain) = (0, 0);
     while i < bytes.len() {
@@ -762,7 +926,8 @@ fn rich_tag(line: &str, at: usize) -> Option<usize> {
         .iter()
         .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
         .count();
-    let name = line[i..name_end].to_ascii_lowercase();
+    // Case matters: models write tags in lowercase, and `Request<B>` is a type.
+    let name = &line[i..name_end];
     let attributes = RICH_TAGS.iter().find(|(tag, _)| *tag == name)?.1;
     i = name_end;
     if closing {

@@ -909,9 +909,13 @@ pub struct Held {
     /// When it went unpaired and left a debt ([`Live::answered_early`]):
     /// held again by a rewind, it takes that debt back.
     pub gone: Option<Instant>,
-    /// The answer goes as a rich message (TASK-075): its topic's view shows
-    /// them.
+    /// The answer carries its rich form (TASK-075): a view of its topic,
+    /// its own or a mirror's, shows rich messages.
     pub rich: bool,
+    /// Its own topic's view shows rich messages; when not, the answer goes
+    /// there as today's messages, and as today's document outside the
+    /// stream when it is one ([`crate::hub::slots`]).
+    pub rich_here: bool,
 }
 
 #[derive(Debug)]
@@ -1867,6 +1871,7 @@ mod tests {
             end: None,
             gone: None,
             rich: false,
+            rich_here: false,
         };
         let mut live = Live::new(Some(0), Vec::new());
         let line = live.sent(&any_op());
@@ -1919,6 +1924,7 @@ mod tests {
             end: Some(40),
             gone: None,
             rich: false,
+            rich_here: false,
         };
         let mut live = Live::new(Some(0), Vec::new());
         let mut early = held("early");
@@ -1962,6 +1968,7 @@ mod tests {
             end: None,
             gone: None,
             rich: false,
+            rich_here: false,
         });
         let doc = live.turn_end(40).expect("its answer");
         live.answered_outside(&doc);
@@ -1978,6 +1985,7 @@ mod tests {
             end: None,
             gone: None,
             rich: false,
+            rich_here: false,
         });
         assert!(live.turn_end(40).is_none(), "answered already");
         assert!(live.ends_unclaimed.is_empty(), "nothing to claim");
@@ -2002,6 +2010,7 @@ mod tests {
             end: None,
             gone: None,
             rich: false,
+            rich_here: false,
         });
         let first = live.turn_end(40).expect("its answer");
         let number = live.sent_answer(first, &any_op());
@@ -2088,6 +2097,7 @@ mod tests {
             end: None,
             gone: None,
             rich: false,
+            rich_here: false,
         }
     }
 
