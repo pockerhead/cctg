@@ -481,3 +481,68 @@ fn rich_markdown_code_spans_go_on_within_a_paragraph() {
         "| a ` | b |\n| c&lt;d> ` | e |"
     );
 }
+
+#[test]
+fn rich_markdown_counts_tabs_as_columns() {
+    for (text, expected) in [
+        // Code lines of gofmt or a Makefile start with a tab: still in the item and its fence.
+        (
+            "- In the loop add:\n  ```go\n\tif x < y {\n\t\treturn <-ch\n\t}\n  ```\n\nThen Vec<T> is used.",
+            "- In the loop add:\n  ```go\n\tif x < y {\n\t\treturn <-ch\n\t}\n  ```\n\nThen Vec&lt;T> is used.",
+        ),
+        (
+            "1. Body:\n   ```go\n\tfmt.Println(\"<hi>\")\n   ```\n2. Returns Option<T>.",
+            "1. Body:\n   ```go\n\tfmt.Println(\"<hi>\")\n   ```\n2. Returns Option&lt;T>.",
+        ),
+        (
+            "```go\n\tx := <-ch\n```\nThen Vec<T>.",
+            "```go\n\tx := <-ch\n```\nThen Vec&lt;T>.",
+        ),
+        // A tab after the marker, and a whole item indented by a tab.
+        (
+            "-\t```sh\n\techo <x>\n\t```\nThen Vec<T>.",
+            "-\t```sh\n\techo <x>\n\t```\nThen Vec&lt;T>.",
+        ),
+        (
+            "- a\n\t- b Vec<T>\n\t  ```\n\t  x<y>\n\t  ```\nafter Option<U>",
+            "- a\n\t- b Vec&lt;T>\n\t  ```\n\t  x<y>\n\t  ```\nafter Option&lt;U>",
+        ),
+        // A tab after `>` counts as its space.
+        (
+            ">\t```\n>\tVec<T>\n>\t```\nafter <z>",
+            ">\t```\n>\tVec<T>\n>\t```\nafter &lt;z>",
+        ),
+    ] {
+        assert_eq!(rich_markdown(text), expected, "{text:?}");
+    }
+}
+
+#[test]
+fn rich_markdown_markers_deeper_than_the_cap_are_text() {
+    let deep = "> ".repeat(40);
+    assert_eq!(
+        rich_markdown(&format!("{deep}```\n{deep}<x>\n")),
+        format!("{deep}```\n{deep}&lt;x>\n")
+    );
+    let shallow = "> ".repeat(10);
+    let text = format!("{shallow}```\n{shallow}<x>\n{shallow}```");
+    assert_eq!(rich_markdown(&text), text);
+    // Nested empty items and many blank lines: each line reads at most the cap.
+    let items = "- ".repeat(8000) + "x\n" + &"\n".repeat(16000) + "y<z>";
+    assert!(rich_markdown(&items).ends_with("\ny&lt;z>"));
+}
+
+#[test]
+fn rich_markdown_rules_and_underlines_end_a_paragraph() {
+    for (text, expected) in [
+        (
+            "Use `foo Vec<T>\n---\nbar` baz",
+            "Use `foo Vec&lt;T>\n---\nbar` baz",
+        ),
+        ("a `b<c>\n===\nd` e", "a `b&lt;c>\n===\nd` e"),
+        ("a `b<c>\n***\nd` e", "a `b&lt;c>\n***\nd` e"),
+        ("a `b<c>\n_ _ _\nd` e", "a `b&lt;c>\n_ _ _\nd` e"),
+    ] {
+        assert_eq!(rich_markdown(text), expected, "{text:?}");
+    }
+}

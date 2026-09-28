@@ -9268,24 +9268,35 @@ impl Slots {
 
     /// `op` for the view of its own topic ([`Self::in_view`]): a new
     /// message is built rich when any view of its slot shows rich messages
-    /// ([`Self::rich_anywhere`]), so that its twins can take that form.
-    fn in_own_view(&self, op: Op) -> Op {
-        let own = match &op {
+    /// ([`Self::rich_anywhere`]), so that its twins can take that form. A
+    /// stream message stays one (its `restart` and its answer's pairing in
+    /// `Live` depend on it): without rich it goes as today's messages, never
+    /// as a document, even when the view changed while the answer was held.
+    fn in_own_view(&self, mut op: Op) -> Op {
+        match &mut op {
             Op::Send {
                 chat,
                 thread_id,
                 rich: Some(_),
                 ..
-            } => Place::new(*chat, *thread_id),
+            } => {
+                let own = Place::new(*chat, *thread_id);
+                self.in_view(op, own)
+            }
             Op::Stream {
                 chat,
                 thread_id,
-                rich: Some(_),
+                rich: Some(form),
                 ..
-            } => Place::topic(*chat, *thread_id),
-            _ => return op,
-        };
-        self.in_view(op, own)
+            } => {
+                if !self.rich_in(Place::topic(*chat, *thread_id)) {
+                    form.markdown = None;
+                    form.file = None;
+                }
+                op
+            }
+            _ => op,
+        }
     }
 
     /// Topic `place` or one of its mirror topics shows rich messages
@@ -29661,6 +29672,41 @@ again"
         );
         assert_eq!(twins.len(), 1, "{twins:#?}");
         assert_rich_of(&twins[0], Chat::Group, &long, true);
+    }
+
+    /// A long streamed answer held while its view showed rich messages, and
+    /// the owner turned rich off before it went (review 2 finding 3): it
+    /// stays a stream message with its `restart` (a document would leave a
+    /// broken topic broken), without its markdown and document.
+    #[tokio::test]
+    async fn a_stream_answer_held_across_a_rich_switch_stays_a_stream_message() {
+        let long = table_answer(6);
+        let mut live = Live::new(Some(0), Vec::new());
+        live.restart = true;
+        let held = Held {
+            place: Place::topic(private_owner(), 700),
+            answer: long.clone(),
+            until: Instant::now(),
+            end: None,
+            gone: None,
+            rich: true,
+            rich_here: true,
+        };
+        let Ok(ops) = answer_ops(&mut live, held, 10, A) else {
+            panic!("the answer rides the stream");
+        };
+        let [(_, op)] = ops.as_slice() else {
+            panic!("{ops:#?}");
+        };
+        let dir = TempDir::new("slots-rich-stale");
+        let (mut slots, _work) = private_slot(&dir, private_only_options());
+        slots.registry.person_mut(owner_chat()).settings.rich = false;
+        let own = slots.in_own_view(op.clone());
+        assert!(
+            matches!(&own, Op::Stream { rich: Some(form), restart: true, into: None, .. }
+                if form.markdown.is_none() && form.file.is_none() && form.before.len() > 4),
+            "{own:?}"
+        );
     }
 
     /// A streamed answer whose own view has no rich messages but a mirror's

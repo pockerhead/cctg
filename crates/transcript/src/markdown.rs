@@ -627,9 +627,10 @@ const RICH_TAGS: &[(&str, &[&str])] = &[
 /// is text) becomes `&lt;`, and `\<` becomes `&lt;` too. Code is left alone, found by GFM rules:
 /// fenced blocks, also inside block quotes and list items (a fence ends with its container; an
 /// unclosed one is code to the end of the text, as Telegram reads it, and is closed at the end so
-/// that text added below is not swallowed), and code spans within a paragraph. Indented code (four
-/// spaces) is not known here: a `<` in it shows as `&lt;`; neither are lazy continuation lines,
-/// which end their container here.
+/// that text added below is not swallowed), and code spans within a paragraph. Indentation is
+/// counted in columns, a tab to the next multiple of four. Indented code (four spaces) is not
+/// known here: a `<` in it shows as `&lt;`; neither are lazy continuation lines, which end their
+/// container here (a `<` in code there may show as `&lt;` too).
 pub fn rich_markdown(text: &str) -> String {
     if !text.contains(['<', '`', '~']) {
         return text.to_owned();
@@ -645,7 +646,7 @@ pub fn rich_markdown(text: &str) -> String {
         if let Some((marker, len, depth)) = fence {
             if held >= depth {
                 out.push_str(line);
-                if closes_rich_fence(&line[at..], marker, len) {
+                if closes_rich_fence(line, at, marker, len) {
                     fence = None;
                 }
                 continue;
@@ -656,19 +657,27 @@ pub fn rich_markdown(text: &str) -> String {
         let ended = held < containers.len();
         containers.truncate(held);
         let mut started = false;
-        while let Some((container, next)) = new_container(line, at) {
+        // Deeper markers are text (Telegram takes no more than 16 levels anyway); this keeps
+        // the work per line bounded.
+        while containers.len() < MAX_CONTAINERS
+            && let Some((container, next)) = new_container(line, at)
+        {
             containers.push(container);
             at = next;
             started = true;
         }
-        let rest = &line[at..];
+        let rest = &line[at.at..];
         let blank = is_blank(rest.as_bytes());
-        // A heading or a table row is a paragraph of its own.
-        let single = is_heading(rest) || rest.trim_start_matches(' ').starts_with('|');
+        // A heading, a table row, a thematic break or a setext underline is a paragraph of its
+        // own.
+        let single = is_heading(rest)
+            || rest.trim_start_matches(' ').starts_with('|')
+            || is_rule(rest)
+            || is_underline(rest);
         if ended || started || blank || single {
             rich_paragraph(&mut paragraph, &mut out);
         }
-        if let Some((marker, len)) = rich_fence(rest) {
+        if let Some((marker, len)) = rich_fence(line, at) {
             rich_paragraph(&mut paragraph, &mut out);
             fence = Some((marker, len, containers.len()));
             out.push_str(line);
@@ -678,7 +687,7 @@ pub fn rich_markdown(text: &str) -> String {
             out.push_str(line);
             continue;
         }
-        paragraph.push((line, at));
+        paragraph.push((line, at.at));
         if single {
             rich_paragraph(&mut paragraph, &mut out);
         }
@@ -700,6 +709,9 @@ pub fn rich_markdown(text: &str) -> String {
     out
 }
 
+/// Containers a line is read in, at most: a marker deeper than this is text.
+const MAX_CONTAINERS: usize = 32;
+
 /// A container block (GFM) a line may be in: a block quote, or a list item whose content starts
 /// this many columns in.
 #[derive(Debug, Clone, Copy)]
@@ -708,46 +720,114 @@ enum Container {
     Item(usize),
 }
 
-/// How many of `containers` (outermost first) `line` stays in, and where its text starts after
-/// their markers and indentation. A blank line stays in a list item, not in a quote.
-fn open_containers(line: &str, containers: &[Container]) -> (usize, usize) {
-    let bytes = line.as_bytes();
-    let mut at = 0;
-    for (held, container) in containers.iter().enumerate() {
-        let indent = spaces(bytes, at);
-        match *container {
-            Container::Quote if indent <= 3 && bytes.get(at + indent) == Some(&b'>') => {
-                at += indent + 1;
-                if bytes.get(at) == Some(&b' ') {
-                    at += 1;
-                }
-            }
-            Container::Item(width) if indent >= width || is_blank(&bytes[at + indent..]) => {
-                at += indent.min(width);
-            }
-            _ => return (held, at),
-        }
-    }
-    (containers.len(), at)
+/// A place in a line, in columns as CommonMark counts them (a tab goes on to the next multiple of
+/// four): byte `at`, which starts at column `real`, read up to column `col`. `col` is past
+/// `real` only inside a tab a container took part of.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cursor {
+    at: usize,
+    real: usize,
+    col: usize,
 }
 
-/// The container block whose marker `line` has at `at` (after at most three spaces): `>`, or a
-/// list marker (`-`, `*`, `+`, `1.`, `1)`) followed by a space or the end of the line; and where
-/// its content starts.
-fn new_container(line: &str, at: usize) -> Option<(Container, usize)> {
+impl Cursor {
+    /// The first byte after the blanks from here, and its column.
+    fn first(self, bytes: &[u8]) -> (usize, usize) {
+        let (mut at, mut col) = (self.at, self.real);
+        while let Some(&b) = bytes.get(at) {
+            col = match b {
+                b' ' => col + 1,
+                b'\t' => col / 4 * 4 + 4,
+                _ => break,
+            };
+            at += 1;
+        }
+        (at, col)
+    }
+
+    /// `n` more columns of blanks read, or as many as there are.
+    fn advance(self, bytes: &[u8], n: usize) -> Self {
+        let target = self.col + n;
+        let (mut at, mut real) = (self.at, self.real);
+        while real < target {
+            let next = match bytes.get(at) {
+                Some(b' ') => real + 1,
+                Some(b'\t') => real / 4 * 4 + 4,
+                _ => break,
+            };
+            if next > target {
+                // Into a tab: the rest of it is still to read.
+                return Self {
+                    at,
+                    real,
+                    col: target,
+                };
+            }
+            at += 1;
+            real = next;
+        }
+        Self {
+            at,
+            real,
+            col: real.max(self.col),
+        }
+    }
+
+    /// The cursor on the non-blank byte `at` of column `col`, `n` bytes further.
+    fn past(at: usize, col: usize, n: usize) -> Self {
+        Self {
+            at: at + n,
+            real: col + n,
+            col: col + n,
+        }
+    }
+}
+
+/// How many of `containers` (outermost first) `line` stays in, and where its text starts after
+/// their markers and indentation. A blank line stays in a list item, not in a quote.
+fn open_containers(line: &str, containers: &[Container]) -> (usize, Cursor) {
     let bytes = line.as_bytes();
-    let indent = spaces(bytes, at);
-    if indent > 3 {
+    let mut cursor = Cursor::default();
+    for (held, container) in containers.iter().enumerate() {
+        let (first, first_col) = cursor.first(bytes);
+        let indent = first_col - cursor.col;
+        match *container {
+            Container::Quote if indent <= 3 && bytes.get(first) == Some(&b'>') => {
+                cursor = quote_space(bytes, Cursor::past(first, first_col, 1));
+            }
+            Container::Item(width) if indent >= width || is_blank(&bytes[first..]) => {
+                cursor = cursor.advance(bytes, indent.min(width));
+            }
+            _ => return (held, cursor),
+        }
+    }
+    (containers.len(), cursor)
+}
+
+/// After a `>`: its optional space (one column, also of a tab).
+fn quote_space(bytes: &[u8], cursor: Cursor) -> Cursor {
+    if matches!(bytes.get(cursor.at), Some(b' ' | b'\t')) {
+        cursor.advance(bytes, 1)
+    } else {
+        cursor
+    }
+}
+
+/// The container block whose marker `line` has at `cursor` (after at most three columns of
+/// blanks): `>`, or a list marker (`-`, `*`, `+`, `1.`, `1)`) followed by a blank or the end of
+/// the line; and where its content starts.
+fn new_container(line: &str, cursor: Cursor) -> Option<(Container, Cursor)> {
+    let bytes = line.as_bytes();
+    let (start, start_col) = cursor.first(bytes);
+    if start_col - cursor.col > 3 {
         return None;
     }
-    let start = at + indent;
-    let end = match *bytes.get(start)? {
+    let marker = match *bytes.get(start)? {
         b'>' => {
-            let next = start + 1;
-            let space = usize::from(bytes.get(next) == Some(&b' '));
-            return Some((Container::Quote, next + space));
+            let next = quote_space(bytes, Cursor::past(start, start_col, 1));
+            return Some((Container::Quote, next));
         }
-        b'-' | b'*' | b'+' => start + 1,
+        b'-' | b'*' | b'+' => 1,
         b'0'..=b'9' => {
             let digits = bytes[start..]
                 .iter()
@@ -756,21 +836,23 @@ fn new_container(line: &str, at: usize) -> Option<(Container, usize)> {
             if digits > 9 || !matches!(bytes.get(start + digits), Some(b'.' | b')')) {
                 return None;
             }
-            start + digits + 1
+            digits + 1
         }
         _ => return None,
     };
-    let gap = spaces(bytes, end);
-    let empty = is_blank(&bytes[end + gap..]);
+    let end = Cursor::past(start, start_col, marker);
+    let (content, content_col) = end.first(bytes);
+    let gap = content_col - end.col;
+    let empty = is_blank(&bytes[content..]);
     if gap == 0 && !empty {
         return None;
     }
-    // Content five or more spaces in is indented code: the item starts one space after its
+    // Content five or more columns in is indented code: the item starts one column after its
     // marker.
     let gap = if empty || gap > 4 { 1 } else { gap };
     Some((
-        Container::Item(end - at + gap),
-        (end + gap).min(bytes.len()),
+        Container::Item(end.col + gap - cursor.col),
+        end.advance(bytes, gap),
     ))
 }
 
@@ -799,6 +881,12 @@ fn is_heading(line: &str) -> bool {
             .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
+/// A setext heading underline: a run of `=` or of `-`, blanks around it.
+fn is_underline(line: &str) -> bool {
+    let run = line.trim_matches([' ', '\t', '\r', '\n']);
+    !run.is_empty() && (run.bytes().all(|b| b == b'=') || run.bytes().all(|b| b == b'-'))
+}
+
 /// The paragraph `lines` (each with where its text starts) into `out`, emptied: the container
 /// markers as they are, the text read as one, so that a code span may go on to the next line.
 fn rich_paragraph(lines: &mut Vec<(&str, usize)>, out: &mut String) {
@@ -822,16 +910,16 @@ fn rich_paragraph(lines: &mut Vec<(&str, usize)>, out: &mut String) {
     lines.clear();
 }
 
-/// A fence line without its indentation (at most three spaces).
-fn fence_body(line: &str) -> Option<&str> {
-    let body = line.trim_start_matches(' ');
-    (line.len() - body.len() <= 3).then_some(body)
+/// The fence line `line` from `cursor` on without its indentation (at most three columns).
+fn fence_body(line: &str, cursor: Cursor) -> Option<&str> {
+    let (first, col) = cursor.first(line.as_bytes());
+    (col - cursor.col <= 3).then(|| &line[first..])
 }
 
-/// The marker and length of the fence `line` opens (GFM): three or more backticks (with no
-/// backtick after them on the line) or tildes.
-fn rich_fence(line: &str) -> Option<(u8, usize)> {
-    let body = fence_body(line)?;
+/// The marker and length of the fence `line` opens at `cursor` (GFM): three or more backticks
+/// (with no backtick after them on the line) or tildes.
+fn rich_fence(line: &str, cursor: Cursor) -> Option<(u8, usize)> {
+    let body = fence_body(line, cursor)?;
     let marker = *body.as_bytes().first()?;
     if marker != b'`' && marker != b'~' {
         return None;
@@ -843,10 +931,10 @@ fn rich_fence(line: &str) -> Option<(u8, usize)> {
     Some((marker, len))
 }
 
-/// `line` closes a fence of `len` `marker`s: the same marker, at least as many, only blanks
-/// after them.
-fn closes_rich_fence(line: &str, marker: u8, len: usize) -> bool {
-    let Some(body) = fence_body(line) else {
+/// `line` closes, at `cursor`, a fence of `len` `marker`s: the same marker, at least as many,
+/// only blanks after them.
+fn closes_rich_fence(line: &str, cursor: Cursor, marker: u8, len: usize) -> bool {
+    let Some(body) = fence_body(line, cursor) else {
         return false;
     };
     let n = run(body.as_bytes(), 0);
