@@ -190,6 +190,9 @@ pub struct MessageRef {
     pub message_id: i64,
     pub text: Option<String>,
     pub caption: Option<String>,
+    /// A rich message has no `text` (TASK-075 probe R2c); read for the reply
+    /// quote. Boxed: `MessageRef` is twice in `Message`, a scheduler `Outcome`.
+    pub rich_message: Option<Box<Value>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -369,6 +372,35 @@ impl BotApi {
         self.call("sendMessage", body, None).await
     }
 
+    /// `sendRichMessage` (TASK-075): `markdown` as `rich_message.markdown`;
+    /// the other arguments as in [`Self::send_message`].
+    pub async fn send_rich_message(
+        &self,
+        place: Place,
+        markdown: &str,
+        reply_markup: Option<&Value>,
+        reply_to: Option<i64>,
+        notify: bool,
+    ) -> Result<Message, ApiError> {
+        let mut body = json!({
+            "chat_id": self.id_of(place.chat),
+            "rich_message": { "markdown": markdown },
+        });
+        if !notify {
+            body["disable_notification"] = json!(true);
+        }
+        if let Some(thread_id) = place.thread {
+            body["message_thread_id"] = json!(thread_id);
+        }
+        if let Some(reply_to) = reply_to {
+            body["reply_parameters"] = json!({ "message_id": reply_to });
+        }
+        if let Some(markup) = reply_markup {
+            body["reply_markup"] = markup.clone();
+        }
+        self.call("sendRichMessage", body, None).await
+    }
+
     /// `parse_mode`: as in [`Self::send_message`].
     pub async fn edit_message_text(
         &self,
@@ -383,6 +415,28 @@ impl BotApi {
         if let Some(parse_mode) = parse_mode {
             body["parse_mode"] = json!(parse_mode);
         }
+        if let Some(markup) = reply_markup {
+            body["reply_markup"] = markup.clone();
+        }
+        self.call::<IgnoredAny>("editMessageText", body, None)
+            .await
+            .map(drop)
+    }
+
+    /// `editMessageText` with `rich_message` (TASK-075): the message's whole
+    /// new text as rich markdown.
+    pub async fn edit_message_rich(
+        &self,
+        chat: Chat,
+        message_id: i64,
+        markdown: &str,
+        reply_markup: Option<&Value>,
+    ) -> Result<(), ApiError> {
+        let mut body = json!({
+            "chat_id": self.id_of(chat),
+            "message_id": message_id,
+            "rich_message": { "markdown": markdown },
+        });
         if let Some(markup) = reply_markup {
             body["reply_markup"] = markup.clone();
         }

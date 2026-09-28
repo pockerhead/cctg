@@ -15,13 +15,16 @@ mod stream;
 mod subagent;
 
 pub use markdown::{
-    HtmlChunk, HtmlSplit, escape_html, markdown_to_html, split_markdown_for_telegram,
+    HtmlChunk, HtmlSplit, escape_html, markdown_to_html, rich_markdown, split_markdown_for_telegram,
 };
 pub use render::{
     call_line, last_prompts, render_brief, render_brief_with_subagents, render_full,
     render_full_with_subagents,
 };
-pub use split::{SplitOptions, SplitResult, TELEGRAM_TEXT_LIMIT, split_for_telegram, telegram_len};
+pub use split::{
+    SplitOptions, SplitResult, TELEGRAM_RICH_LIMIT, TELEGRAM_TEXT_LIMIT, split_for_telegram,
+    telegram_len,
+};
 pub use stream::{ChannelPlace, StreamEvent, THINKING_LIMIT, stream_events};
 pub use subagent::{Subagent, SubagentBody, SubagentInput, SubagentMeta, parse_subagent_meta};
 

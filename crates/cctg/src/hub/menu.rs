@@ -11,9 +11,11 @@
 //! collapsed quote that Telegram opens on a tap) apply per view (TASK-078):
 //! the owner's private settings in their private chat, the owner's
 //! [`Settings::group`] in the group topic of their sessions (default:
-//! everything, 💭 on, full turn). The sound setting changes the private chat
-//! only; the group sounds as before. The menu does not refresh itself: ↻
-//! does.
+//! everything, 💭 on, full turn, rich messages off). Rich messages
+//! (TASK-075: answers and turn text as Telegram rich markdown) are a setting
+//! of each view too: on by default in the private chat, off in the group.
+//! The sound setting changes the private chat only; the group sounds as
+//! before. The menu does not refresh itself: ↻ does.
 //!
 //! This module is pure: data, rendering and the press codes. The slot actor
 //! sends, pins and edits.
@@ -105,6 +107,9 @@ pub struct Settings {
     /// written only when it is not the default.
     #[serde(skip_serializing_if = "Display::is_default")]
     pub group: Display,
+    /// Rich messages in the person's private topics (TASK-075); on by
+    /// default.
+    pub rich: bool,
 }
 
 impl Settings {
@@ -114,6 +119,7 @@ impl Settings {
             detail: self.detail,
             thinking: self.thinking,
             turn: self.turn,
+            rich: self.rich,
         }
     }
 }
@@ -126,6 +132,9 @@ pub struct Display {
     pub detail: Detail,
     pub thinking: bool,
     pub turn: TurnView,
+    /// Agent text as rich messages (TASK-075); off by default: the group
+    /// view.
+    pub rich: bool,
 }
 
 impl Default for Display {
@@ -134,6 +143,7 @@ impl Default for Display {
             detail: Detail::Full,
             thinking: true,
             turn: TurnView::Full,
+            rich: false,
         }
     }
 }
@@ -154,6 +164,7 @@ impl Default for Settings {
             quiet: None,
             tz: None,
             group: Display::default(),
+            rich: true,
         }
     }
 }
@@ -301,6 +312,10 @@ pub fn change(
             new.turn = turn;
             Page::Display
         }
+        MenuPress::Rich(on) => {
+            new.rich = on;
+            Page::Display
+        }
         MenuPress::GroupDetail(detail) => {
             new.group.detail = detail;
             Page::GroupDisplay
@@ -311,6 +326,10 @@ pub fn change(
         }
         MenuPress::GroupTurn(turn) => {
             new.group.turn = turn;
+            Page::GroupDisplay
+        }
+        MenuPress::GroupRich(on) => {
+            new.group.rich = on;
             Page::GroupDisplay
         }
         MenuPress::SoundMode(sound) => {
@@ -417,11 +436,14 @@ pub enum MenuPress {
     /// twice instead of undoing itself.
     Thinking(bool),
     TurnView(TurnView),
+    /// Rich messages on or off (TASK-075), as [`MenuPress::Thinking`].
+    Rich(bool),
     /// The group's detail level, 💭 and turn view (TASK-078), as the
     /// private ones.
     GroupDetail(Detail),
     GroupThinking(bool),
     GroupTurn(TurnView),
+    GroupRich(bool),
     SoundMode(Sound),
     /// Quiet hours on or off, as [`MenuPress::Thinking`].
     Quiet(bool),
@@ -480,9 +502,11 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::Detail(detail) => format!("dl:{}", detail_code(detail)),
         MenuPress::Thinking(on) => format!("th:{}", u8::from(on)),
         MenuPress::TurnView(turn) => format!("tv:{}", turn_code(turn)),
+        MenuPress::Rich(on) => format!("rc:{}", u8::from(on)),
         MenuPress::GroupDetail(detail) => format!("gdl:{}", detail_code(detail)),
         MenuPress::GroupThinking(on) => format!("gth:{}", u8::from(on)),
         MenuPress::GroupTurn(turn) => format!("gtv:{}", turn_code(turn)),
+        MenuPress::GroupRich(on) => format!("grc:{}", u8::from(on)),
         MenuPress::SoundMode(sound) => format!("sn:{}", sound_code(sound)),
         MenuPress::Quiet(on) => format!("q:{}", u8::from(on)),
         MenuPress::QuietFrom(hour) => format!("qf:{hour}"),
@@ -523,6 +547,8 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ),
         ["th", "0"] => MenuPress::Thinking(false),
         ["th", "1"] => MenuPress::Thinking(true),
+        ["rc", "0"] => MenuPress::Rich(false),
+        ["rc", "1"] => MenuPress::Rich(true),
         ["tv", code] => MenuPress::TurnView(
             [TurnView::Full, TurnView::Compact]
                 .into_iter()
@@ -535,6 +561,8 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ),
         ["gth", "0"] => MenuPress::GroupThinking(false),
         ["gth", "1"] => MenuPress::GroupThinking(true),
+        ["grc", "0"] => MenuPress::GroupRich(false),
+        ["grc", "1"] => MenuPress::GroupRich(true),
         ["gtv", code] => MenuPress::GroupTurn(
             [TurnView::Full, TurnView::Compact]
                 .into_iter()
@@ -784,19 +812,22 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
     text
 }
 
-/// The presses of one view's display rows: detail, 💭, turn view.
+/// The presses of one view's display rows: detail, 💭, turn view, rich
+/// messages.
 type DisplayPresses = (
     fn(Detail) -> MenuPress,
     fn(bool) -> MenuPress,
     fn(TurnView) -> MenuPress,
+    fn(bool) -> MenuPress,
 );
 
 /// The rows of the display tab for one view (TASK-078): the switch between
-/// the private chat and the group, then its detail level, 💭 and turn view.
+/// the private chat and the group, then its detail level, 💭, rich messages
+/// (TASK-075) and turn view.
 fn display_rows(
     display: &Display,
     group: bool,
-    (detail_press, thinking_press, turn_press): DisplayPresses,
+    (detail_press, thinking_press, turn_press, rich_press): DisplayPresses,
     rows: &mut Vec<Vec<Value>>,
 ) {
     rows.push(vec![
@@ -820,6 +851,11 @@ fn display_rows(
         format!("💭 Размышления: {thinking}"),
         thinking_press(!display.thinking),
     )]);
+    let rich = if display.rich { "вкл" } else { "выкл" };
+    rows.push(vec![button(
+        format!("✨ Rich-разметка: {rich}"),
+        rich_press(!display.rich),
+    )]);
     let turn =
         |label: &str, turn: TurnView| button(radio(label, display.turn == turn), turn_press(turn));
     rows.push(vec![
@@ -834,13 +870,19 @@ const DISPLAY_HELP: &str = "Всё: промпты из терминала, те
 Только ответы: промпты из терминала и ответ хода.\n\
 💭 размышления включаются отдельно, при любой подробности.\n\
 Ход сжатый: строки инструментов и 💭 свёрнуты в цитату, нажмите на неё, чтобы раскрыть.\n\
+Rich-разметка: ответы и текст хода с таблицами, заголовками и списками. Telegram Web и Telegram X их не показывают: для них выключите.\n\
 Ответы хода, запросы разрешений, вопросы и субагенты видны всегда.";
 
 fn render_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
     display_rows(
         &settings.display(),
         false,
-        (MenuPress::Detail, MenuPress::Thinking, MenuPress::TurnView),
+        (
+            MenuPress::Detail,
+            MenuPress::Thinking,
+            MenuPress::TurnView,
+            MenuPress::Rich,
+        ),
         rows,
     );
     format!(
@@ -857,12 +899,13 @@ fn render_group_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> Stri
             MenuPress::GroupDetail,
             MenuPress::GroupThinking,
             MenuPress::GroupTurn,
+            MenuPress::GroupRich,
         ),
         rows,
     );
     format!(
         "Что показывать в темах группы (ваши сессии, добавленные в группу)\n\n{DISPLAY_HELP}\n\n\
-По умолчанию всё. Звук в группе не меняется."
+По умолчанию всё, rich-разметка выключена. Звук в группе не меняется."
     )
 }
 
@@ -1160,7 +1203,15 @@ mod tests {
         assert_eq!(settings.quiet, None);
         assert_eq!(settings.tz, None);
         assert_eq!(settings.group, Display::default());
-        assert_eq!(settings.display(), Display::default());
+        // TASK-075: rich messages on in the private chat, off in the group.
+        assert_eq!(
+            settings.display(),
+            Display {
+                rich: true,
+                ..Display::default()
+            }
+        );
+        assert!(!settings.group.rich);
         for piece in [
             Piece::Prompt,
             Piece::Text,
@@ -1199,19 +1250,21 @@ mod tests {
             thinking: false,
             turn: TurnView::Compact,
             group: Display::default(),
+            rich: true,
         })
         .unwrap();
         assert_eq!(
             written,
             json!({"detail": "answers", "thinking": false, "turn": "compact", "sound": "off",
-                   "quiet": {"from": 22, "to": 7}, "tz": 180})
+                   "quiet": {"from": 22, "to": 7}, "tz": 180, "rich": true})
         );
         let back: Settings = serde_json::from_value(written).unwrap();
         assert_eq!(back.detail, Detail::Answers);
         assert_eq!(back.turn, TurnView::Compact);
         assert_eq!(
             serde_json::to_value(Settings::default()).unwrap(),
-            json!({"detail": "full", "thinking": true, "turn": "full", "sound": "replies"})
+            json!({"detail": "full", "thinking": true, "turn": "full", "sound": "replies",
+                   "rich": true})
         );
     }
 
@@ -1455,6 +1508,8 @@ mod tests {
             MenuPress::GroupThinking(true),
             MenuPress::GroupTurn(TurnView::Full),
             MenuPress::GroupTurn(TurnView::Compact),
+            MenuPress::GroupRich(false),
+            MenuPress::GroupRich(true),
         ];
         for press in presses {
             let data = data(&press);
@@ -1488,6 +1543,13 @@ mod tests {
                 MenuPress::GroupTurn(TurnView::Compact),
                 Display {
                     turn: TurnView::Compact,
+                    ..Display::default()
+                },
+            ),
+            (
+                MenuPress::GroupRich(true),
+                Display {
+                    rich: true,
                     ..Display::default()
                 },
             ),
@@ -1545,6 +1607,7 @@ mod tests {
                 detail: Detail::Brief,
                 thinking: false,
                 turn: TurnView::Compact,
+                rich: true,
             },
             ..Settings::default()
         };
@@ -1558,14 +1621,18 @@ mod tests {
             "👥 Группа",
             "✅ Только ответы",
             "💭 Размышления: вкл",
+            "✨ Rich-разметка: вкл",
             "✅ Ход: полный",
         ] {
             assert!(private.contains(&want.to_owned()), "{want}: {private:?}");
         }
+        assert!(datas(&keyboard).contains(&"menu:rc:0".to_owned()));
         assert!(datas(&keyboard).contains(&"menu:dg".to_owned()));
         let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, 0);
         assert!(text.starts_with("Что показывать в темах группы"), "{text}");
-        assert!(text.ends_with("По умолчанию всё. Звук в группе не меняется."));
+        assert!(
+            text.ends_with("По умолчанию всё, rich-разметка выключена. Звук в группе не меняется.")
+        );
         let group = labels(&keyboard);
         for want in [
             "· 👁 Показ",
@@ -1573,14 +1640,66 @@ mod tests {
             "✅ 👥 Группа",
             "✅ Кратко",
             "💭 Размышления: выкл",
+            "✨ Rich-разметка: вкл",
             "✅ Ход: сжатый",
         ] {
             assert!(group.contains(&want.to_owned()), "{want}: {group:?}");
         }
         let datas = datas(&keyboard);
-        for want in ["menu:d", "menu:gdl:f", "menu:gth:1", "menu:gtv:f"] {
+        for want in [
+            "menu:d",
+            "menu:gdl:f",
+            "menu:gth:1",
+            "menu:gtv:f",
+            "menu:grc:0",
+        ] {
             assert!(datas.contains(&want.to_owned()), "{want}: {datas:?}");
         }
         assert!(!datas.iter().any(|data| data.starts_with("menu:dl:")));
+    }
+
+    /// TASK-075: rich messages are a setting of each view: on in the
+    /// private chat and off in the group by default, also for a file written
+    /// before; each press changes its own view only.
+    #[test]
+    fn rich_messages_are_a_setting_of_each_view() {
+        for press in [
+            MenuPress::Rich(false),
+            MenuPress::Rich(true),
+            MenuPress::GroupRich(false),
+            MenuPress::GroupRich(true),
+        ] {
+            let data = data(&press);
+            assert_eq!(parse_callback(&data), Some(press), "{data}");
+            assert!(!press.navigates());
+        }
+        assert_eq!(data(&MenuPress::Rich(true)), "menu:rc:1");
+        assert_eq!(data(&MenuPress::GroupRich(false)), "menu:grc:0");
+        let old: Settings =
+            serde_json::from_str(r#"{"detail":"brief","group":{"detail":"brief"}}"#).unwrap();
+        assert!(old.rich);
+        assert!(old.display().rich);
+        assert!(!old.group.rich);
+        let (off, page) = change(&Settings::default(), MenuPress::Rich(false)).unwrap();
+        assert_eq!(page, Page::Display);
+        assert_eq!(
+            off,
+            Settings {
+                rich: false,
+                ..Settings::default()
+            }
+        );
+        let (on, page) = change(&Settings::default(), MenuPress::GroupRich(true)).unwrap();
+        assert_eq!(page, Page::GroupDisplay);
+        assert_eq!(
+            on,
+            Settings {
+                group: Display {
+                    rich: true,
+                    ..Display::default()
+                },
+                ..Settings::default()
+            }
+        );
     }
 }

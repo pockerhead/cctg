@@ -392,6 +392,7 @@ pub async fn send_text(outbox: &Outbox, place: Place, text: String) -> Result<()
         thread_id: place.thread,
         text,
         html: None,
+        rich: None,
         reply_markup: None,
         permission: false,
         reply_to: None,

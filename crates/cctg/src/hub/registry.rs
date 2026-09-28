@@ -2808,6 +2808,7 @@ mod tests {
             quiet: Some(Quiet { from: 22, to: 7 }),
             tz: Some(-570),
             group: Default::default(),
+            rich: true,
         };
         assert!(registry.dirty, "a change of a known person too");
         registry.person_mut(boris);

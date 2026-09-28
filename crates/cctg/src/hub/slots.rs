@@ -276,6 +276,19 @@
 //! nothing is kept. A turn message goes on only in the view it was made
 //! in: a change of the view (the menu, a share) starts the next one.
 //!
+//! Rich (TASK-075): in a view whose rich setting is on (the private chat by
+//! default, the group not), turn answers and agent replies go as one rich
+//! message of their markdown while it fits one (32768), and the turn
+//! message carries a rich form of itself ([`stream::Open`]); everything
+//! else stays HTML. Each op carries today's messages too: the scheduler
+//! falls back to them when Telegram refuses the rich one. A view without
+//! rich gets today's form: an answer or reply is built rich when any view
+//! of its slot shows rich messages, and each view, the primary one at the
+//! hand-off, a twin or a lost message sent later where it goes, drops its
+//! markdown when it shows none ([`Slots::in_view`]), or takes today's
+//! document when the text is more than four messages (a streamed answer
+//! then goes outside the stream, as today).
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
 
@@ -288,7 +301,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, info, warn};
 use transcript::{
-    HtmlChunk, SplitOptions, escape_html, split_for_telegram, split_markdown_for_telegram,
+    HtmlChunk, SplitOptions, TELEGRAM_RICH_LIMIT, escape_html, rich_markdown, split_for_telegram,
+    split_markdown_for_telegram, telegram_len,
 };
 
 use super::api::{ApiError, Document};
@@ -307,7 +321,7 @@ use super::registry::{
     BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, Shared, SlotId, SlotState,
     StatusMessage, TopicJob, TwinLink, Unshared, UnsharedTopic, View, cut, share_line,
 };
-use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome};
+use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome, Rich};
 use super::status::{self, Activity, Buttons, Press, ShareButton};
 use super::stream::{self, Format, Held, Live, MirrorOp, Open, Step};
 use super::subagents::{
@@ -1232,19 +1246,50 @@ struct AfterSeparator {
     parts: usize,
 }
 
-/// The messages of [`Slots::send_text`]: the chunks of
+/// The messages of [`Slots::send_text`]: with `rich` (TASK-075) one rich
+/// message of the whole text while it fits one ([`rich_form`]), carrying
+/// today's messages for the fallback; else the chunks of
 /// `split_markdown_for_telegram`, or one document when it prefers a file.
-fn text_ops(place: Place, session: &str, text: &str, kind: &str, notify: bool) -> Vec<Op> {
+fn text_ops(
+    place: Place,
+    session: &str,
+    text: &str,
+    kind: &str,
+    notify: bool,
+    rich: bool,
+) -> Vec<Op> {
+    let document = || Document {
+        file_name: format!("{kind}-{}.txt", short(session)),
+        bytes: text.as_bytes().to_vec(),
+        caption: None,
+    };
+    if let Some((markdown, before, last, file)) = rich
+        .then(|| rich_parts(text))
+        .flatten()
+        .map(|(markdown, before, last, long)| (markdown, before, last, long.then(document)))
+    {
+        return vec![Op::Send {
+            chat: place.chat,
+            thread_id: place.thread,
+            text: last.text,
+            html: Some(last.html),
+            rich: Some(Box::new(Rich {
+                markdown: Some(markdown),
+                before,
+                file,
+            })),
+            reply_markup: None,
+            permission: false,
+            reply_to: None,
+            notify,
+        }];
+    }
     let split = split_markdown_for_telegram(text, SplitOptions::default());
     if split.prefer_file {
         vec![Op::SendDocument {
             chat: place.chat,
             thread_id: place.thread,
-            document: Document {
-                file_name: format!("{kind}-{}.txt", short(session)),
-                bytes: text.as_bytes().to_vec(),
-                caption: None,
-            },
+            document: document(),
             notify,
         }]
     } else {
@@ -1256,6 +1301,7 @@ fn text_ops(place: Place, session: &str, text: &str, kind: &str, notify: bool) -
                 thread_id: place.thread,
                 text: chunk.text,
                 html: Some(chunk.html),
+                rich: None,
                 reply_markup: None,
                 permission: false,
                 reply_to: None,
@@ -1263,6 +1309,41 @@ fn text_ops(place: Place, session: &str, text: &str, kind: &str, notify: bool) -
             })
             .collect()
     }
+}
+
+/// `text` as the markdown of one rich message (TASK-075): `None` when it is
+/// blank or longer than a rich message may be.
+fn rich_form(text: &str) -> Option<String> {
+    // The markdown is never shorter than the text.
+    if telegram_len(text) > TELEGRAM_RICH_LIMIT {
+        return None;
+    }
+    Some(rich_markdown(text)).filter(|markdown| {
+        !markdown.trim().is_empty() && telegram_len(markdown) <= TELEGRAM_RICH_LIMIT
+    })
+}
+
+/// A rich message of `text` ([`rich_form`]) with today's messages of it:
+/// the markdown, the earlier messages (text, HTML), the last one, and
+/// whether today it is a document (more than four messages).
+type RichParts = (String, Vec<(String, String)>, HtmlChunk, bool);
+
+fn rich_parts(text: &str) -> Option<RichParts> {
+    let markdown = rich_form(text)?;
+    let mut chunks = split_markdown_for_telegram(
+        text,
+        SplitOptions {
+            max_chunks: usize::MAX,
+        },
+    )
+    .chunks;
+    let long = chunks.len() > SplitOptions::default().max_chunks;
+    let last = chunks.pop()?;
+    let before = chunks
+        .into_iter()
+        .map(|chunk| (chunk.text, chunk.html))
+        .collect();
+    Some((markdown, before, last, long))
 }
 
 fn short(session_id: &str) -> &str {
@@ -4523,6 +4604,7 @@ impl Slots {
                     thread_id: place.thread,
                     text: buffer::resume_text(&session),
                     html: None,
+                    rich: None,
                     reply_markup,
                     permission: false,
                     reply_to: None,
@@ -4702,6 +4784,7 @@ impl Slots {
             }
             return;
         };
+        let (rich, rich_here) = (self.rich_anywhere(place), self.rich_in(place));
         if let Some(live) = self.streams.get_mut(session).filter(|_| streamed) {
             let now = Instant::now();
             let mut held = Held {
@@ -4710,6 +4793,8 @@ impl Slots {
                 until: now + self.options.hold_answer,
                 end: None,
                 gone: None,
+                rich,
+                rich_here,
             };
             if let Some(end) = live.claim_end(now) {
                 // A turn end read already: the lines before it are handed
@@ -4759,7 +4844,7 @@ impl Slots {
             self.stream_target(session).is_some() || self.current_slot(session).is_none();
         let room = MAX_QUEUED_MESSAGES.saturating_sub(self.queued_messages);
         let held = match self.streams.get_mut(session).filter(|_| streamed) {
-            Some(live) => match answer_ops(live, held, room) {
+            Some(live) => match answer_ops(live, held, room, session) {
                 Ok(ops) => {
                     self.stream_answer(session, ops);
                     return;
@@ -5073,7 +5158,15 @@ impl Slots {
         kind: &'static str,
         notify: bool,
     ) {
-        let parts = text_ops(place, session, text, kind, notify).len();
+        let parts = text_ops(
+            place,
+            session,
+            text,
+            kind,
+            notify,
+            self.rich_anywhere(place),
+        )
+        .len();
         if self.queued_messages + parts > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
@@ -5194,6 +5287,7 @@ impl Slots {
             absorbed: None,
             posted: 0,
             compact: display.turn == menu::TurnView::Compact,
+            rich: display.rich,
             joins,
         });
         // TASK-078: the primary status message at the start of the read,
@@ -5350,8 +5444,12 @@ impl Slots {
         let mut queued = self.queued_messages;
         // Answers held again whose turn end this read starts after go first.
         for held in live.overdue(from) {
-            let answered = match answer_ops(live, held, MAX_QUEUED_MESSAGES.saturating_sub(queued))
-            {
+            let answered = match answer_ops(
+                live,
+                held,
+                MAX_QUEUED_MESSAGES.saturating_sub(queued),
+                session,
+            ) {
                 Ok(ops) => {
                     queued += ops.len();
                     if let Some(rolling) = &mut rolling {
@@ -5488,6 +5586,7 @@ impl Slots {
                                 thread_id,
                                 text,
                                 html,
+                                rich: None,
                                 merge,
                                 restart: std::mem::take(&mut live.restart),
                                 notify: false,
@@ -5513,7 +5612,7 @@ impl Slots {
                     Step::TurnEnd => {
                         if let Some(held) = live.turn_end(line.end) {
                             let room = MAX_QUEUED_MESSAGES.saturating_sub(queued);
-                            let answered = match answer_ops(live, held, room) {
+                            let answered = match answer_ops(live, held, room, session) {
                                 Ok(ops) => {
                                     queued += ops.len();
                                     if let Some(rolling) = &mut rolling {
@@ -5847,7 +5946,14 @@ impl Slots {
         kind: &str,
         notify: bool,
     ) -> Option<usize> {
-        let ops = text_ops(place, session, text, kind, notify);
+        let ops = text_ops(
+            place,
+            session,
+            text,
+            kind,
+            notify,
+            self.rich_anywhere(place),
+        );
         let parts = ops.len();
         self.queue_messages(|| Work::Content, false, ops)
             .then_some(parts)
@@ -6351,6 +6457,7 @@ impl Slots {
                 thread_id: place.thread,
                 text: ask.text(),
                 html: None,
+                rich: None,
                 reply_markup: Some(ask.keyboard()),
                 permission: true,
                 reply_to: None,
@@ -6673,6 +6780,7 @@ impl Slots {
                 thread_id: place.thread,
                 text: prompt.text.clone(),
                 html: None,
+                rich: None,
                 reply_markup: Some(permissions::keyboard(&prompt.request_id)),
                 permission: true,
                 reply_to: None,
@@ -6871,9 +6979,10 @@ impl Slots {
             ordinal = self.ordinal(slot),
             "message for a slot whose topic is being made; it waits for it"
         );
-        // Pointed at the slot's primary topic once there is one.
+        // Pointed at the slot's primary topic once there is one; rich, which
+        // its target's view may drop then ([`Self::in_own_view`]).
         let nowhere = Place::new(Chat::Group, None);
-        for op in text_ops(nowhere, session, text, kind, notify) {
+        for op in text_ops(nowhere, session, text, kind, notify, true) {
             self.keep_lost(LostMessage {
                 slot,
                 chat: Chat::Group,
@@ -6918,7 +7027,8 @@ impl Slots {
                 *chat = target.chat;
                 *thread_id = target.thread;
             }
-            // Into the private topic made again: that view alone.
+            // Into the private topic made again: that view alone. Each view
+            // takes its own form at the hand-off.
             self.send_as(lost.gone, vec![op]);
         }
     }
@@ -7292,6 +7402,7 @@ impl Slots {
                 thread_id: place.thread,
                 text: status::outdated_text(agent.as_deref(), &crate::client::short(&hub)),
                 html: None,
+                rich: None,
                 reply_markup: Some(keyboard),
                 permission: false,
                 reply_to: None,
@@ -8313,6 +8424,7 @@ impl Slots {
                         thread_id: place.thread,
                         text,
                         html: None,
+                        rich: None,
                         reply_markup: Some(keyboard),
                         permission: false,
                         reply_to: None,
@@ -8917,6 +9029,8 @@ impl Slots {
             let kept = self.mirror.kept_chats(old);
             twins.retain(|twin| twin.op.chat().is_none_or(|chat| !kept.contains(&chat)));
         }
+        // After the twins, which take the rich form for their own views.
+        let op = self.in_own_view(op);
         // After the twins: the group sounds as before (TASK-073).
         let op = self.voiced(&work, op);
         if self.dispatch.send((work, op)).is_err() {
@@ -9110,7 +9224,101 @@ impl Slots {
             }
             _ => return None,
         }
-        Some(op)
+        Some(self.in_view(op, to))
+    }
+
+    /// `op` for view `to` (TASK-075): a view without rich messages gets
+    /// today's form of it: today's document when the text is more than four
+    /// messages, else the op without its markdown (the scheduler sends
+    /// today's messages).
+    fn in_view(&self, mut op: Op, to: Place) -> Op {
+        if self.rich_in(to) {
+            return op;
+        }
+        let (place, notify, rich) = match &mut op {
+            Op::Send {
+                chat,
+                thread_id,
+                notify,
+                rich: Some(rich),
+                ..
+            } => (Place::new(*chat, *thread_id), *notify, rich),
+            Op::Stream {
+                chat,
+                thread_id,
+                notify,
+                rich: Some(rich),
+                ..
+            } => (Place::topic(*chat, *thread_id), *notify, rich),
+            _ => return op,
+        };
+        if rich.markdown.take().is_none() {
+            return op;
+        }
+        match rich.file.take() {
+            Some(document) => Op::SendDocument {
+                chat: place.chat,
+                thread_id: place.thread,
+                document,
+                notify,
+            },
+            None => op,
+        }
+    }
+
+    /// `op` for the view of its own topic ([`Self::in_view`]): a new
+    /// message is built rich when any view of its slot shows rich messages
+    /// ([`Self::rich_anywhere`]), so that its twins can take that form. A
+    /// stream message stays one (its `restart` and its answer's pairing in
+    /// `Live` depend on it): without rich it goes as today's messages, never
+    /// as a document, even when the view changed while the answer was held.
+    fn in_own_view(&self, mut op: Op) -> Op {
+        match &mut op {
+            Op::Send {
+                chat,
+                thread_id,
+                rich: Some(_),
+                ..
+            } => {
+                let own = Place::new(*chat, *thread_id);
+                self.in_view(op, own)
+            }
+            Op::Stream {
+                chat,
+                thread_id,
+                rich: Some(form),
+                ..
+            } => {
+                if !self.rich_in(Place::topic(*chat, *thread_id)) {
+                    form.markdown = None;
+                    form.file = None;
+                }
+                op
+            }
+            _ => op,
+        }
+    }
+
+    /// Topic `place` or one of its mirror topics shows rich messages
+    /// (TASK-075): a text for it carries its rich form, and each view takes
+    /// its own form of it ([`Self::in_view`]).
+    fn rich_anywhere(&self, place: Place) -> bool {
+        self.rich_in(place)
+            || self
+                .primary_mirrors(place)
+                .into_iter()
+                .any(|to| self.rich_in(to))
+    }
+
+    /// The view of topic `place` shows rich messages (TASK-075): by the
+    /// settings of its slot's view; a topic of no slot by the default of
+    /// its chat.
+    fn rich_in(&self, place: Place) -> bool {
+        self.registry
+            .slot_by_topic(place)
+            .map_or(place.chat.is_private(), |slot| {
+                self.display_in(slot, place.chat).rich
+            })
     }
 
     /// `op`, a call about a primary message, for its twin `twin`.
@@ -9238,6 +9446,7 @@ impl Slots {
             MirrorOp::New {
                 text,
                 html,
+                rich,
                 merge,
                 into,
                 ..
@@ -9246,18 +9455,24 @@ impl Slots {
                 thread_id,
                 text,
                 html,
+                rich: rich_turn(rich),
                 merge,
                 restart: true,
                 notify: false,
                 into: into.map(|key| key.id),
             },
             MirrorOp::Write {
-                into, text, html, ..
+                into,
+                text,
+                html,
+                rich,
+                ..
             } => Op::Stream {
                 chat: place.chat,
                 thread_id,
                 text,
                 html,
+                rich: rich_turn(rich),
                 merge: true,
                 restart: true,
                 notify: false,
@@ -9322,6 +9537,7 @@ impl Slots {
                         thread_id: place.thread,
                         text,
                         html: None,
+                        rich: None,
                         reply_markup: Some(status::for_mirror(&keyboard)),
                         permission: false,
                         reply_to: None,
@@ -10002,6 +10218,7 @@ impl Slots {
                 thread_id: None,
                 text: content.0.clone(),
                 html: None,
+                rich: None,
                 reply_markup: Some(content.1.clone()),
                 permission: false,
                 reply_to: None,
@@ -10424,7 +10641,15 @@ impl Slots {
                     person.settings.display()
                 }
             })
-            .unwrap_or_default()
+            // A private chat without its person's settings: the private
+            // default (TASK-075: rich on), not the group's.
+            .unwrap_or_else(|| {
+                if group {
+                    menu::Display::default()
+                } else {
+                    menu::Settings::default().display()
+                }
+            })
     }
 
     /// `op` with the sound its person chose (TASK-073), when it is a new
@@ -11005,6 +11230,7 @@ impl Slots {
                 thread_id: notice.place.thread,
                 text: notice.text,
                 html: None,
+                rich: None,
                 reply_markup: None,
                 permission: false,
                 reply_to: Some(notice.reply_to),
@@ -11224,10 +11450,63 @@ impl Slots {
 /// may still wait for Telegram, [`MAX_QUEUED_MESSAGES`]): nothing is tracked
 /// for an answer [`Slots::send_text`] then drops. Either way, and for a blank
 /// answer, its turn end counts as answered ([`Live::answered_outside`]).
-fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>, Held> {
+///
+/// With `held.rich` (TASK-075) an answer that fits one rich message is one
+/// such message, carrying today's messages for the fallback (and today's
+/// document, `answer-<short id of session>.txt`, for a view without rich
+/// messages); it is not sent as a file for its length, unless its own view
+/// shows no rich messages (`held.rich_here`). It stays an `Op::Stream` for
+/// its pairing in `Live`; [`Slots::in_own_view`] drops its markdown for an
+/// own view without rich messages at the hand-off.
+fn answer_ops(
+    live: &mut Live,
+    held: Held,
+    room: usize,
+    session: &str,
+) -> Result<Vec<(u64, Op)>, Held> {
     if held.answer.trim().is_empty() {
         live.answered_outside(&held);
         return Ok(Vec::new());
+    }
+    if let Some((markdown, before, last, long)) =
+        held.rich.then(|| rich_parts(&held.answer)).flatten()
+    {
+        // Today's document in its own view goes outside the stream, as
+        // today; its twins still get the rich form ([`Slots::send_text`]).
+        if before.len() + 1 > room || (long && !held.rich_here) {
+            live.answered_outside(&held);
+            return Err(held);
+        }
+        let Place {
+            chat,
+            thread: Some(thread_id),
+        } = held.place
+        else {
+            live.answered_outside(&held);
+            return Err(held);
+        };
+        live.close_open();
+        let file = long.then(|| Document {
+            file_name: format!("answer-{}.txt", short(session)),
+            bytes: held.answer.as_bytes().to_vec(),
+            caption: None,
+        });
+        let op = Op::Stream {
+            chat,
+            thread_id,
+            text: last.text,
+            html: Some(last.html),
+            rich: Some(Box::new(Rich {
+                markdown: Some(markdown),
+                before,
+                file,
+            })),
+            merge: false,
+            restart: std::mem::take(&mut live.restart),
+            notify: true,
+            into: None,
+        };
+        return Ok(vec![(live.sent_answer(held, &op), op)]);
     }
     let split = split_markdown_for_telegram(&held.answer, SplitOptions::default());
     if split.prefer_file || split.chunks.len() > room {
@@ -11255,6 +11534,7 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
         thread_id,
         text: chunk.text,
         html: Some(chunk.html),
+        rich: None,
         merge: false,
         restart: std::mem::take(&mut live.restart),
         notify: true,
@@ -11360,8 +11640,16 @@ fn flush_mirror(
         return Vec::new();
     }
     let compact = mirror.display.turn == menu::TurnView::Compact;
-    let joined = stream::join_pieces(std::mem::take(&mut mirror.pieces), compact);
-    let ops = turn.roll(joined, compact, &mut mirror.twin, &mut mirror.posted, calls);
+    let rich = mirror.display.rich;
+    let joined = stream::join_pieces(std::mem::take(&mut mirror.pieces), compact, rich);
+    let ops = turn.roll(
+        joined,
+        compact,
+        rich,
+        &mut mirror.twin,
+        &mut mirror.posted,
+        calls,
+    );
     for op in &ops {
         if let MirrorOp::New {
             into: Some(twin), ..
@@ -11403,6 +11691,8 @@ struct Rolling {
     posted: usize,
     /// The owner's compact turn view (TASK-076).
     compact: bool,
+    /// The view shows rich messages (TASK-075).
+    rich: bool,
     /// A new message may be one the scheduler joins into the one before
     /// (`merge`); not while a mirror turn left in this topic still waits
     /// for its new message (TASK-078).
@@ -11423,12 +11713,13 @@ fn roll(
     thread_id: i64,
 ) -> Vec<(u64, Op)> {
     let mut ops = Vec::new();
-    for piece in stream::join_pieces(pieces, rolling.compact) {
+    for piece in stream::join_pieces(pieces, rolling.compact, rolling.rich) {
         let restart = std::mem::take(&mut live.restart);
         if let Ok((_, parts)) = &piece
             && let Some(open) = live.open.as_mut()
             && let Some(key) = open.key
             && open.compact == rolling.compact
+            && open.rich_view == rolling.rich
             && let Some(grown) = stream::grown(open, parts)
         {
             *open = grown;
@@ -11437,6 +11728,7 @@ fn roll(
                 thread_id,
                 text: open.text.clone(),
                 html: open.html.clone(),
+                rich: rich_turn(open.rich.clone()),
                 merge: true,
                 restart,
                 notify: false,
@@ -11458,6 +11750,7 @@ fn roll(
             thread_id,
             text,
             html,
+            rich: rich_turn(open.as_ref().and_then(|open| open.rich.clone())),
             // The status message becoming content goes at once, as a
             // foreground edit: the next status message waits for it.
             merge: open.is_some() && status.is_none() && rolling.joins,
@@ -11484,6 +11777,18 @@ fn roll(
         ops.push((number, op));
     }
     ops
+}
+
+/// The rich form of a turn message (TASK-075) as an op's: one message, no
+/// earlier ones.
+fn rich_turn(markdown: Option<String>) -> Option<Box<Rich>> {
+    markdown.map(|markdown| {
+        Box::new(Rich {
+            markdown: Some(markdown),
+            before: Vec::new(),
+            file: None,
+        })
+    })
 }
 
 /// The messages of a stream line: markdown as HTML with its plain source,
@@ -11600,6 +11905,7 @@ fn topic_op(job: &TopicJob) -> Op {
             thread_id: Some(*thread_id),
             text: text.clone(),
             html: None,
+            rich: None,
             reply_markup: None,
             permission: false,
             reply_to: None,
@@ -11731,6 +12037,7 @@ fn message_op(place: Place, text: String) -> Op {
         thread_id: place.thread,
         text,
         html: None,
+        rich: None,
         reply_markup: None,
         permission: false,
         reply_to: None,
@@ -25351,7 +25658,8 @@ again"
             .insert(mirror, stream::MirrorTurn::new(A, 0));
         let turn = slots.mirror_turns.get_mut(&mirror).unwrap();
         let ops = turn.roll(
-            stream::join_pieces(piece("x"), false),
+            stream::join_pieces(piece("x"), false, false),
+            false,
             false,
             &mut None,
             &mut 0,
@@ -25364,7 +25672,8 @@ again"
         assert!(all_work(&mut work).is_empty(), "dropped");
         let turn = slots.mirror_turns.get_mut(&mirror).unwrap();
         let ops = turn.roll(
-            stream::join_pieces(piece("y"), false),
+            stream::join_pieces(piece("y"), false, false),
+            false,
             false,
             &mut None,
             &mut 0,
@@ -27080,9 +27389,11 @@ again"
             group: boris_group,
             ..quiet.clone()
         };
+        // TASK-075: a private chat without settings by the private default
+        // (rich messages on), not the group's.
         assert_eq!(
             slots.display_in(SlotId(0), private_owner()),
-            menu::Display::default()
+            menu::Settings::default().display()
         );
         assert_eq!(
             slots.display_in(SlotId(1), Chat::Private(boris)),
@@ -27099,6 +27410,7 @@ again"
             thread_id: Some(thread),
             text: "done".into(),
             html: None,
+            rich: None,
             reply_markup: None,
             permission: false,
             reply_to: None,
@@ -28698,8 +29010,10 @@ again"
             until: Instant::now(),
             end: None,
             gone: None,
+            rich: false,
+            rich_here: false,
         };
-        let Ok(ops) = answer_ops(&mut live, held, 10) else {
+        let Ok(ops) = answer_ops(&mut live, held, 10, A) else {
             panic!("the answer rides the stream");
         };
         assert!(!ops.is_empty());
@@ -28709,6 +29023,7 @@ again"
             absorbed: None,
             posted: 0,
             compact: false,
+            rich: false,
             joins: true,
         };
         let piece = |text: &str| (text.to_owned(), None, true, false);
@@ -29116,5 +29431,541 @@ again"
         );
         group_took(&mut slots, last[0].0, &last[0].1, 800);
         assert!(slots.mirror_turns.is_empty(), "nothing owed: it goes");
+    }
+
+    // ------------------------------------------------------------ TASK-075
+
+    /// An answer with a heading, a table, nested lists, code with a `<`, a
+    /// `<` in the text, and `paragraphs` paragraphs of 3000 letters.
+    fn table_answer(paragraphs: u8) -> String {
+        let mut text = "# Итог\n\n| Файл | Строк |\n|:--|--:|\n| `Vec<T>` | 1 |\n\n\
+- один\n  - два\n    - три\n\nif a<b and c>d\n"
+            .to_owned();
+        for n in 0..paragraphs {
+            text.push('\n');
+            text.push_str(&char::from(b'a' + n).to_string().repeat(3000));
+            text.push('\n');
+        }
+        text
+    }
+
+    /// The chunks of `text` today, all of them.
+    fn today_chunks(text: &str) -> Vec<HtmlChunk> {
+        split_markdown_for_telegram(
+            text,
+            SplitOptions {
+                max_chunks: usize::MAX,
+            },
+        )
+        .chunks
+    }
+
+    /// The answers and replies among `handed`: of the primary view
+    /// (`Work::Content`) and the twins.
+    fn rich_contents(handed: &[(Work, Op)]) -> (Vec<Op>, Vec<Op>) {
+        let of = |twin: bool| {
+            handed
+                .iter()
+                .filter(|(work, _)| match work {
+                    Work::Content => !twin,
+                    Work::Twin { .. } => twin,
+                    _ => false,
+                })
+                .map(|(_, op)| op.clone())
+                .collect::<Vec<_>>()
+        };
+        (of(false), of(true))
+    }
+
+    /// `op` is one rich message of `text` (to `chat`): its markdown, today's
+    /// earlier chunks and its own last one.
+    fn assert_rich_of(op: &Op, chat: Chat, text: &str, markdown: bool) {
+        let mut chunks = today_chunks(text);
+        let last = chunks.pop().unwrap();
+        let before: Vec<(String, String)> = chunks
+            .into_iter()
+            .map(|chunk| (chunk.text, chunk.html))
+            .collect();
+        let Op::Send {
+            chat: to,
+            text: own,
+            html,
+            rich: Some(rich),
+            ..
+        } = op
+        else {
+            panic!("not a rich send: {op:?}");
+        };
+        assert_eq!(*to, chat);
+        assert_eq!((own, html), (&last.text, &Some(last.html)));
+        assert_eq!(rich.before, before);
+        let want = markdown.then(|| transcript::rich_markdown(text));
+        assert_eq!(rich.markdown, want);
+    }
+
+    /// A view with rich messages (the private default) gets a turn answer
+    /// and an agent reply as one rich message: its markdown as it is (a `<`
+    /// outside code as `&lt;`), today's chunks for the fallback.
+    #[tokio::test]
+    async fn a_rich_view_gets_answers_and_replies_as_one_rich_message() {
+        let dir = TempDir::new("slots-rich-answer");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        connect(&mut slots, 1, A, Some(10));
+        let answer = table_answer(2);
+        assert_eq!(today_chunks(&answer).len(), 2);
+        slots.on_hook(&stop(A, Some(&answer)));
+        slots.on_agent(reply(1, &answer));
+        slots.pump();
+        let (primary, twins) = rich_contents(&all_work(&mut work));
+        assert!(twins.is_empty());
+        assert_eq!(primary.len(), 2, "{primary:#?}");
+        for op in &primary {
+            assert_rich_of(op, private_owner(), &answer, true);
+            assert_eq!(op.place(), Some(Place::topic(private_owner(), 700)));
+        }
+        let markdown = transcript::rich_markdown(&answer);
+        assert!(markdown.contains("| `Vec<T>` | 1 |") && markdown.contains("if a&lt;b"));
+    }
+
+    /// A view without rich messages gets today's messages: the private chat
+    /// with rich turned off, and the group by default.
+    #[tokio::test]
+    async fn a_view_without_rich_gets_todays_messages() {
+        let answer = table_answer(2);
+        let want: Vec<(String, Option<String>)> = today_chunks(&answer)
+            .into_iter()
+            .map(|chunk| (chunk.text, Some(chunk.html)))
+            .collect();
+        let today = |ops: &[Op]| {
+            ops.iter()
+                .map(|op| match op {
+                    Op::Send {
+                        text,
+                        html,
+                        rich: None,
+                        ..
+                    } => (text.clone(), html.clone()),
+                    other => panic!("not today's message: {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let dir = TempDir::new("slots-rich-off");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        slots.registry.person_mut(owner_chat()).settings.rich = false;
+        slots.on_hook(&stop(A, Some(&answer)));
+        slots.pump();
+        let (primary, _) = rich_contents(&all_work(&mut work));
+        assert_eq!(today(&primary), want);
+
+        let dir = TempDir::new("slots-rich-group");
+        let mut slots = stalled_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_hook(&stop(A, Some(&answer)));
+        slots.pump();
+        let (primary, _) = rich_contents(&all_work(&mut work));
+        assert_eq!(today(&primary), want);
+    }
+
+    /// Longer than a rich message may be: today's document.
+    #[tokio::test]
+    async fn an_answer_longer_than_a_rich_message_goes_as_todays_document() {
+        let dir = TempDir::new("slots-rich-long");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        let answer = table_answer(11);
+        assert!(telegram_len(&answer) > TELEGRAM_RICH_LIMIT);
+        slots.on_hook(&stop(A, Some(&answer)));
+        slots.pump();
+        let (primary, _) = rich_contents(&all_work(&mut work));
+        assert!(
+            matches!(primary.as_slice(), [Op::SendDocument { document, .. }]
+                if document.bytes == answer.as_bytes() && document.file_name == "answer-aaaaaaaa.txt"),
+            "{primary:#?}"
+        );
+    }
+
+    /// A twin into the group (rich off by default) gets today's form: an
+    /// answer of more than four messages as today's document, a shorter one
+    /// without its markdown; with rich on in the group, as it is.
+    #[tokio::test]
+    async fn a_twin_into_a_view_without_rich_gets_todays_form() {
+        let long = table_answer(6);
+        assert!(today_chunks(&long).len() > 4);
+        let dir = TempDir::new("slots-rich-twin-long");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        slots.on_hook(&stop(A, Some(&long)));
+        slots.pump();
+        let (primary, twins) = rich_contents(&all_work(&mut work));
+        assert_eq!(primary.len(), 1, "{primary:#?}");
+        assert_rich_of(&primary[0], private_owner(), &long, true);
+        let Op::Send {
+            rich: Some(rich), ..
+        } = &primary[0]
+        else {
+            unreachable!()
+        };
+        let file = rich.file.as_ref().expect("today's document");
+        assert_eq!(
+            (file.file_name.as_str(), file.bytes.as_slice()),
+            ("answer-aaaaaaaa.txt", long.as_bytes())
+        );
+        assert!(
+            matches!(twins.as_slice(), [Op::SendDocument { chat: Chat::Group, thread_id: Some(100), document, .. }]
+                if document.file_name == "answer-aaaaaaaa.txt" && document.bytes == long.as_bytes()),
+            "{twins:#?}"
+        );
+
+        let short = table_answer(2);
+        for group_rich in [false, true] {
+            let dir = TempDir::new("slots-rich-twin");
+            let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+            slots.registry.person_mut(owner_chat()).settings.group.rich = group_rich;
+            slots.on_hook(&stop(A, Some(&short)));
+            slots.pump();
+            let (primary, twins) = rich_contents(&all_work(&mut work));
+            assert_rich_of(&primary[0], private_owner(), &short, true);
+            assert_eq!(twins.len(), 1, "{twins:#?}");
+            assert_rich_of(&twins[0], Chat::Group, &short, group_rich);
+        }
+    }
+
+    /// Each view by its own rich setting (review finding 4): private off and
+    /// group on gives the group rich answers and replies, the private chat
+    /// today's form of the same ops (the markdown dropped, or today's
+    /// document for more than four messages).
+    #[tokio::test]
+    async fn a_rich_group_gets_rich_answers_when_the_private_view_has_none() {
+        let short = table_answer(2);
+        let dir = TempDir::new("slots-rich-group-only");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        let settings = &mut slots.registry.person_mut(owner_chat()).settings;
+        (settings.rich, settings.group.rich) = (false, true);
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_hook(&stop(A, Some(&short)));
+        slots.on_agent(reply(1, &short));
+        slots.pump();
+        let (primary, twins) = rich_contents(&all_work(&mut work));
+        assert_eq!((primary.len(), twins.len()), (2, 2), "{primary:#?}");
+        for op in &primary {
+            assert_rich_of(op, private_owner(), &short, false);
+        }
+        for op in &twins {
+            assert_rich_of(op, Chat::Group, &short, true);
+        }
+
+        let long = table_answer(6);
+        let dir = TempDir::new("slots-rich-group-only-long");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        let settings = &mut slots.registry.person_mut(owner_chat()).settings;
+        (settings.rich, settings.group.rich) = (false, true);
+        slots.on_hook(&stop(A, Some(&long)));
+        slots.pump();
+        let (primary, twins) = rich_contents(&all_work(&mut work));
+        assert!(
+            matches!(primary.as_slice(), [Op::SendDocument { chat, document, .. }]
+                if *chat == private_owner() && document.bytes == long.as_bytes()),
+            "{primary:#?}"
+        );
+        assert_eq!(twins.len(), 1, "{twins:#?}");
+        assert_rich_of(&twins[0], Chat::Group, &long, true);
+    }
+
+    /// A long streamed answer held while its view showed rich messages, and
+    /// the owner turned rich off before it went (review 2 finding 3): it
+    /// stays a stream message with its `restart` (a document would leave a
+    /// broken topic broken), without its markdown and document.
+    #[tokio::test]
+    async fn a_stream_answer_held_across_a_rich_switch_stays_a_stream_message() {
+        let long = table_answer(6);
+        let mut live = Live::new(Some(0), Vec::new());
+        live.restart = true;
+        let held = Held {
+            place: Place::topic(private_owner(), 700),
+            answer: long.clone(),
+            until: Instant::now(),
+            end: None,
+            gone: None,
+            rich: true,
+            rich_here: true,
+        };
+        let Ok(ops) = answer_ops(&mut live, held, 10, A) else {
+            panic!("the answer rides the stream");
+        };
+        let [(_, op)] = ops.as_slice() else {
+            panic!("{ops:#?}");
+        };
+        let dir = TempDir::new("slots-rich-stale");
+        let (mut slots, _work) = private_slot(&dir, private_only_options());
+        slots.registry.person_mut(owner_chat()).settings.rich = false;
+        let own = slots.in_own_view(op.clone());
+        assert!(
+            matches!(&own, Op::Stream { rich: Some(form), restart: true, into: None, .. }
+                if form.markdown.is_none() && form.file.is_none() && form.before.len() > 4),
+            "{own:?}"
+        );
+    }
+
+    /// A streamed answer whose own view has no rich messages but a mirror's
+    /// has: one stream message carrying the rich form (the answer's pairing
+    /// in `Live` needs the `Op::Stream`), its markdown dropped for its own
+    /// view at the hand-off and kept for the twin; one that is a document
+    /// there today goes outside the stream.
+    #[tokio::test]
+    async fn a_streamed_answer_keeps_its_rich_form_for_a_rich_mirror() {
+        let owner = private_owner();
+        let held = |answer: &str| Held {
+            place: Place::topic(owner, 700),
+            answer: answer.to_owned(),
+            until: Instant::now(),
+            end: None,
+            gone: None,
+            rich: true,
+            rich_here: false,
+        };
+        let long = table_answer(6);
+        let mut live = Live::new(Some(0), Vec::new());
+        assert!(answer_ops(&mut live, held(&long), 10, A).is_err());
+
+        let short = table_answer(2);
+        let mut live = Live::new(Some(0), Vec::new());
+        let Ok(ops) = answer_ops(&mut live, held(&short), 10, A) else {
+            panic!("the answer rides the stream");
+        };
+        let [(_, op)] = ops.as_slice() else {
+            panic!("{ops:#?}");
+        };
+        assert!(is_answer(op));
+        assert_eq!(
+            rich_form(op),
+            Some(transcript::rich_markdown(&short).as_str())
+        );
+        let dir = TempDir::new("slots-rich-stream-twin");
+        let (mut slots, _work) = shared_slot(&dir, private_only_options());
+        let settings = &mut slots.registry.person_mut(owner_chat()).settings;
+        (settings.rich, settings.group.rich) = (false, true);
+        let own = slots.in_own_view(op.clone());
+        assert!(
+            matches!(&own, Op::Stream { rich: Some(form), into: None, .. }
+                if form.markdown.is_none() && !form.before.is_empty()),
+            "{own:?}"
+        );
+        let twin = slots
+            .as_new_twin(op, Place::topic(Chat::Group, 100))
+            .expect("a twin into the group");
+        assert_eq!(
+            rich_form(&twin),
+            Some(transcript::rich_markdown(&short).as_str())
+        );
+    }
+
+    /// A streamed answer in a rich view is one stream message with its
+    /// fallback, remembered as the answer; without rich, today's messages.
+    #[test]
+    fn a_rich_stream_answer_is_one_message() {
+        let owner = private_owner();
+        let answer = table_answer(2);
+        for rich in [true, false] {
+            let mut live = Live::new(Some(0), Vec::new());
+            let held = Held {
+                place: Place::topic(owner, 700),
+                answer: answer.clone(),
+                until: Instant::now(),
+                end: None,
+                gone: None,
+                rich,
+                rich_here: rich,
+            };
+            let Ok(ops) = answer_ops(&mut live, held, 10, A) else {
+                panic!("the answer rides the stream");
+            };
+            let chunks = today_chunks(&answer);
+            if !rich {
+                assert_eq!(ops.len(), chunks.len());
+                assert!(
+                    ops.iter()
+                        .all(|(_, op)| matches!(op, Op::Stream { rich: None, .. }))
+                );
+                continue;
+            }
+            let [(_, op)] = ops.as_slice() else {
+                panic!("{ops:#?}");
+            };
+            assert!(is_answer(op));
+            let Op::Stream {
+                text,
+                rich: Some(form),
+                into: None,
+                ..
+            } = op
+            else {
+                panic!("{op:?}");
+            };
+            assert_eq!(text, &chunks[1].text);
+            assert_eq!(
+                form.before,
+                [(chunks[0].text.clone(), chunks[0].html.clone())]
+            );
+            assert_eq!(form.markdown, Some(transcript::rich_markdown(&answer)));
+            assert!(form.file.is_none());
+        }
+    }
+
+    /// A lost answer (its topic was being made) takes the view of the topic
+    /// it goes to then.
+    #[tokio::test]
+    async fn a_lost_answer_takes_the_view_of_its_target() {
+        let answer = table_answer(2);
+        for rich in [true, false] {
+            let dir = TempDir::new("slots-rich-lost");
+            let mut slots = stalled_slots(&dir, private_only_options());
+            slots.on_hook(&start(A, 10));
+            slots.pump();
+            let mut work = capture_dispatch(&mut slots);
+            slots.registry.person_mut(owner_chat()).settings.rich = rich;
+            slots.on_hook(&stop(A, Some(&answer)));
+            assert_eq!(slots.lost_messages.len(), 1, "it waits for its topic");
+            slots
+                .registry
+                .topic_created(SlotId(0), private_owner(), 700, "t", None);
+            slots.send_lost_messages();
+            slots.pump();
+            let handed = all_work(&mut work);
+            let sent: Vec<&Op> = handed
+                .iter()
+                .map(|(_, op)| op)
+                .filter(|op| matches!(op, Op::Send { rich: Some(_), .. }))
+                .collect();
+            assert_eq!(sent.len(), 1, "{handed:#?}");
+            assert_rich_of(sent[0], private_owner(), &answer, rich);
+            assert_eq!(sent[0].place(), Some(Place::topic(private_owner(), 700)));
+        }
+    }
+
+    /// The rich form of the stream op (TASK-075).
+    fn rich_form(op: &Op) -> Option<&str> {
+        match op {
+            Op::Stream {
+                rich: Some(rich), ..
+            } => rich.markdown.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// In a rich view the turn message carries its rich form: text and 💭
+    /// as markdown, tool lines in one `<p>`, the compact quote with `<br>`;
+    /// it grows so; without rich it has none.
+    #[tokio::test]
+    async fn a_rich_turn_message_carries_its_rich_form() {
+        for (turn, rich, want) in [
+            (
+                menu::TurnView::Full,
+                true,
+                Some(
+                    "Looking.\n\n💭 Hmm.\n\n<p>• Bash: one ✓<br>• Bash: two ✓<br>• Bash: three ✓</p>",
+                ),
+            ),
+            (
+                menu::TurnView::Compact,
+                true,
+                Some(
+                    "Looking.\n\n<blockquote expandable>💭 Hmm.<br>• Bash: one ✓<br>• Bash: two ✓<br>• Bash: three ✓</blockquote>",
+                ),
+            ),
+            (menu::TurnView::Full, false, None),
+        ] {
+            let dir = TempDir::new("slots-rich-turn");
+            let settings = menu::Settings {
+                rich,
+                ..with_turn(turn, true)
+            };
+            let (mut slots, mut work) =
+                private_streaming(&dir, settings, Some(Duration::from_secs(3600)));
+            next_line(&mut slots, 0, 10, tool_turn());
+            let handed = all_work(&mut work);
+            let streams: Vec<&Op> = handed
+                .iter()
+                .filter(|(work, _)| matches!(work, Work::Stream { .. }))
+                .map(|(_, op)| op)
+                .collect();
+            assert_eq!(streams.len(), 1, "{handed:#?}");
+            assert_eq!(rich_form(streams[0]), want, "{turn:?} {rich}");
+            let message = accept_streams(&mut slots, &handed)[0].id;
+            next_line(&mut slots, 10, 20, finished_call("four", "• Bash: four"));
+            let handed = all_work(&mut work);
+            let grown: Vec<&Op> = handed
+                .iter()
+                .filter(|(work, _)| matches!(work, Work::Stream { .. }))
+                .map(|(_, op)| op)
+                .collect();
+            assert!(
+                matches!(grown.as_slice(), [Op::Stream { into: Some(id), .. }] if *id == message),
+                "{handed:#?}"
+            );
+            let four = want.map(|want| {
+                let close = if turn == menu::TurnView::Full {
+                    "</p>"
+                } else {
+                    "</blockquote>"
+                };
+                format!(
+                    "{}<br>• Bash: four ✓{close}",
+                    want.strip_suffix(close).unwrap()
+                )
+            });
+            assert_eq!(rich_form(grown[0]).map(str::to_owned), four);
+        }
+    }
+
+    /// The status message turning into the turn message is rich too; the
+    /// group's own turn stream by the group's rich setting (off by default).
+    #[tokio::test]
+    async fn an_absorbed_status_message_is_rich_by_its_view() {
+        let owner = private_owner();
+        for group_rich in [false, true] {
+            let dir = TempDir::new("slots-rich-absorb");
+            let mut settings = with_turn(menu::TurnView::Full, true);
+            settings.group.rich = group_rich;
+            let (mut slots, mut work) = shared_streaming(&dir, settings, true);
+            next_line(&mut slots, 0, 10, tool_turn());
+            let handed = all_work(&mut work);
+            let into = |chat: Chat| {
+                handed
+                    .iter()
+                    .find_map(|(_, op)| match op {
+                        Op::Stream {
+                            chat: to,
+                            into: Some(id),
+                            ..
+                        } if *to == chat => Some((*id, rich_form(op).is_some())),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{handed:#?}"))
+            };
+            assert_eq!(into(owner), (900, true));
+            assert_eq!(into(Chat::Group), (950, group_rich));
+        }
+    }
+
+    /// A turn message goes on only in the rich setting it was made in.
+    #[tokio::test]
+    async fn switching_rich_starts_a_new_turn_message() {
+        let dir = TempDir::new("slots-rich-switch");
+        let settings = with_turn(menu::TurnView::Full, true);
+        let (mut slots, mut work) =
+            private_streaming(&dir, settings, Some(Duration::from_secs(3600)));
+        next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+        let first = accept_streams(&mut slots, &all_work(&mut work));
+        assert_eq!(first.len(), 1, "{first:#?}");
+        slots.registry.person_mut(owner_chat()).settings.rich = false;
+        next_line(&mut slots, 10, 20, finished_call("two", "• Bash: two"));
+        let handed = all_work(&mut work);
+        let second = accept_streams(&mut slots, &handed);
+        assert_eq!(second.len(), 1, "{second:#?}");
+        assert_ne!(second[0].into, Some(first[0].id), "a new message");
+        assert!(handed.iter().all(|(_, op)| rich_form(op).is_none()));
     }
 }

@@ -280,7 +280,7 @@ pub async fn serve(
                     let (text, keyboard) = list(&devices, None);
                     submit(
                         &outbox,
-                        Op::Send { chat: input.chat, thread_id: None, text, html: None, reply_markup: keyboard,
+                        Op::Send { chat: input.chat, thread_id: None, text, html: None, rich: None, reply_markup: keyboard,
                             permission: false,
                             reply_to: None,
                             notify: false,
@@ -394,6 +394,7 @@ async fn on_join(
         thread_id: None,
         text,
         html,
+        rich: None,
         reply_markup: None,
         permission: false,
         reply_to: None,

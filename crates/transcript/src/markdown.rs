@@ -578,3 +578,493 @@ fn closing(s: &str, from: usize, c: u8, n: usize, budget: &mut usize) -> Option<
     }
     None
 }
+
+/// Tags Telegram rich markdown takes (Bot API 10.3), each with the only attributes it may carry
+/// here.
+const RICH_TAGS: &[(&str, &[&str])] = &[
+    ("a", &["href", "name"]),
+    ("b", &[]),
+    ("blockquote", &["expandable"]),
+    ("br", &[]),
+    ("code", &["class"]),
+    ("del", &[]),
+    ("details", &["open"]),
+    ("em", &[]),
+    ("h1", &[]),
+    ("h2", &[]),
+    ("h3", &[]),
+    ("h4", &[]),
+    ("h5", &[]),
+    ("h6", &[]),
+    ("hr", &[]),
+    ("i", &[]),
+    ("ins", &[]),
+    ("li", &[]),
+    ("mark", &[]),
+    ("ol", &["start", "type", "reversed"]),
+    ("p", &[]),
+    ("pre", &[]),
+    ("s", &[]),
+    ("strike", &[]),
+    ("strong", &[]),
+    ("sub", &[]),
+    ("summary", &[]),
+    ("sup", &[]),
+    ("table", &[]),
+    ("td", &["align", "valign", "colspan", "rowspan"]),
+    ("tg-spoiler", &[]),
+    ("th", &["align", "valign", "colspan", "rowspan"]),
+    ("tr", &[]),
+    ("u", &[]),
+    ("ul", &[]),
+];
+
+/// Markdown as it goes into a Telegram rich message (`rich_message.markdown`, TASK-075): the text
+/// as it is, but for `<`. Telegram rich markdown reads HTML tags, drops a tag it does not know
+/// with no error (`Vec<String>` shows as `Vec`), and a backslash does not help there, while
+/// `&lt;` does (probe TASK-075 R4, R9). So every `<` outside code that does not start a complete
+/// tag of [`RICH_TAGS`] on its line (lowercase name, attributes from that list only; `Request<B>`
+/// is text) becomes `&lt;`, and `\<` becomes `&lt;` too. Code is left alone, found by GFM rules:
+/// fenced blocks, also inside block quotes and list items (a fence ends with its container; an
+/// unclosed one is code to the end of the text, as Telegram reads it, and is closed at the end so
+/// that text added below is not swallowed), and code spans within a paragraph. Indentation is
+/// counted in columns, a tab to the next multiple of four. Indented code (four spaces) is not
+/// known here: a `<` in it shows as `&lt;`; neither are lazy continuation lines, which end their
+/// container here (a `<` in code there may show as `&lt;` too).
+pub fn rich_markdown(text: &str) -> String {
+    if !text.contains(['<', '`', '~']) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut containers: Vec<Container> = Vec::new();
+    // The open fence: its marker, its length, and how many containers hold it.
+    let mut fence: Option<(u8, usize, usize)> = None;
+    // The lines of the paragraph being read, each with where its text starts.
+    let mut paragraph: Vec<(&str, usize)> = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let (held, mut at) = open_containers(line, &containers);
+        if let Some((marker, len, depth)) = fence {
+            if held >= depth {
+                out.push_str(line);
+                if closes_rich_fence(line, at, marker, len) {
+                    fence = None;
+                }
+                continue;
+            }
+            // Its container ended, and the fence with it.
+            fence = None;
+        }
+        let ended = held < containers.len();
+        containers.truncate(held);
+        let mut started = false;
+        // Deeper markers are text (Telegram takes no more than 16 levels anyway); this keeps
+        // the work per line bounded.
+        while containers.len() < MAX_CONTAINERS
+            && let Some((container, next)) = new_container(line, at)
+        {
+            containers.push(container);
+            at = next;
+            started = true;
+        }
+        let rest = &line[at.at..];
+        let blank = is_blank(rest.as_bytes());
+        // A heading, a table row, a thematic break or a setext underline is a paragraph of its
+        // own.
+        let single = is_heading(rest)
+            || rest.trim_start_matches(' ').starts_with('|')
+            || is_rule(rest)
+            || is_underline(rest);
+        if ended || started || blank || single {
+            rich_paragraph(&mut paragraph, &mut out);
+        }
+        if let Some((marker, len)) = rich_fence(line, at) {
+            rich_paragraph(&mut paragraph, &mut out);
+            fence = Some((marker, len, containers.len()));
+            out.push_str(line);
+            continue;
+        }
+        if blank {
+            out.push_str(line);
+            continue;
+        }
+        paragraph.push((line, at.at));
+        if single {
+            rich_paragraph(&mut paragraph, &mut out);
+        }
+    }
+    rich_paragraph(&mut paragraph, &mut out);
+    if let Some((marker, len, _)) = fence {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        // The closing line stays in the fence's containers.
+        for container in &containers {
+            match *container {
+                Container::Quote => out.push_str("> "),
+                Container::Item(width) => out.extend(std::iter::repeat_n(' ', width)),
+            }
+        }
+        out.extend(std::iter::repeat_n(char::from(marker), len));
+    }
+    out
+}
+
+/// Containers a line is read in, at most: a marker deeper than this is text.
+const MAX_CONTAINERS: usize = 32;
+
+/// A container block (GFM) a line may be in: a block quote, or a list item whose content starts
+/// this many columns in.
+#[derive(Debug, Clone, Copy)]
+enum Container {
+    Quote,
+    Item(usize),
+}
+
+/// A place in a line, in columns as CommonMark counts them (a tab goes on to the next multiple of
+/// four): byte `at`, which starts at column `real`, read up to column `col`. `col` is past
+/// `real` only inside a tab a container took part of.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cursor {
+    at: usize,
+    real: usize,
+    col: usize,
+}
+
+impl Cursor {
+    /// The first byte after the blanks from here, and its column.
+    fn first(self, bytes: &[u8]) -> (usize, usize) {
+        let (mut at, mut col) = (self.at, self.real);
+        while let Some(&b) = bytes.get(at) {
+            col = match b {
+                b' ' => col + 1,
+                b'\t' => col / 4 * 4 + 4,
+                _ => break,
+            };
+            at += 1;
+        }
+        (at, col)
+    }
+
+    /// `n` more columns of blanks read, or as many as there are.
+    fn advance(self, bytes: &[u8], n: usize) -> Self {
+        let target = self.col + n;
+        let (mut at, mut real) = (self.at, self.real);
+        while real < target {
+            let next = match bytes.get(at) {
+                Some(b' ') => real + 1,
+                Some(b'\t') => real / 4 * 4 + 4,
+                _ => break,
+            };
+            if next > target {
+                // Into a tab: the rest of it is still to read.
+                return Self {
+                    at,
+                    real,
+                    col: target,
+                };
+            }
+            at += 1;
+            real = next;
+        }
+        Self {
+            at,
+            real,
+            col: real.max(self.col),
+        }
+    }
+
+    /// The cursor on the non-blank byte `at` of column `col`, `n` bytes further.
+    fn past(at: usize, col: usize, n: usize) -> Self {
+        Self {
+            at: at + n,
+            real: col + n,
+            col: col + n,
+        }
+    }
+}
+
+/// How many of `containers` (outermost first) `line` stays in, and where its text starts after
+/// their markers and indentation. A blank line stays in a list item, not in a quote.
+fn open_containers(line: &str, containers: &[Container]) -> (usize, Cursor) {
+    let bytes = line.as_bytes();
+    let mut cursor = Cursor::default();
+    for (held, container) in containers.iter().enumerate() {
+        let (first, first_col) = cursor.first(bytes);
+        let indent = first_col - cursor.col;
+        match *container {
+            Container::Quote if indent <= 3 && bytes.get(first) == Some(&b'>') => {
+                cursor = quote_space(bytes, Cursor::past(first, first_col, 1));
+            }
+            Container::Item(width) if indent >= width || is_blank(&bytes[first..]) => {
+                cursor = cursor.advance(bytes, indent.min(width));
+            }
+            _ => return (held, cursor),
+        }
+    }
+    (containers.len(), cursor)
+}
+
+/// After a `>`: its optional space (one column, also of a tab).
+fn quote_space(bytes: &[u8], cursor: Cursor) -> Cursor {
+    if matches!(bytes.get(cursor.at), Some(b' ' | b'\t')) {
+        cursor.advance(bytes, 1)
+    } else {
+        cursor
+    }
+}
+
+/// The container block whose marker `line` has at `cursor` (after at most three columns of
+/// blanks): `>`, or a list marker (`-`, `*`, `+`, `1.`, `1)`) followed by a blank or the end of
+/// the line; and where its content starts.
+fn new_container(line: &str, cursor: Cursor) -> Option<(Container, Cursor)> {
+    let bytes = line.as_bytes();
+    let (start, start_col) = cursor.first(bytes);
+    if start_col - cursor.col > 3 {
+        return None;
+    }
+    let marker = match *bytes.get(start)? {
+        b'>' => {
+            let next = quote_space(bytes, Cursor::past(start, start_col, 1));
+            return Some((Container::Quote, next));
+        }
+        b'-' | b'*' | b'+' => 1,
+        b'0'..=b'9' => {
+            let digits = bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if digits > 9 || !matches!(bytes.get(start + digits), Some(b'.' | b')')) {
+                return None;
+            }
+            digits + 1
+        }
+        _ => return None,
+    };
+    let end = Cursor::past(start, start_col, marker);
+    let (content, content_col) = end.first(bytes);
+    let gap = content_col - end.col;
+    let empty = is_blank(&bytes[content..]);
+    if gap == 0 && !empty {
+        return None;
+    }
+    // Content five or more columns in is indented code: the item starts one column after its
+    // marker.
+    let gap = if empty || gap > 4 { 1 } else { gap };
+    Some((
+        Container::Item(end.col + gap - cursor.col),
+        end.advance(bytes, gap),
+    ))
+}
+
+/// Spaces from `at` on.
+fn spaces(bytes: &[u8], at: usize) -> usize {
+    bytes[at..].iter().take_while(|&&b| b == b' ').count()
+}
+
+/// Nothing but blanks and the line end.
+fn is_blank(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// An ATX heading line: at most three spaces, one to six `#`, then a blank or the end.
+fn is_heading(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let start = spaces(bytes, 0);
+    let hashes = run(bytes, start);
+    start <= 3
+        && bytes.get(start) == Some(&b'#')
+        && hashes <= 6
+        && bytes
+            .get(start + hashes)
+            .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// A setext heading underline: a run of `=` or of `-`, blanks around it.
+fn is_underline(line: &str) -> bool {
+    let run = line.trim_matches([' ', '\t', '\r', '\n']);
+    !run.is_empty() && (run.bytes().all(|b| b == b'=') || run.bytes().all(|b| b == b'-'))
+}
+
+/// The paragraph `lines` (each with where its text starts) into `out`, emptied: the container
+/// markers as they are, the text read as one, so that a code span may go on to the next line.
+fn rich_paragraph(lines: &mut Vec<(&str, usize)>, out: &mut String) {
+    match lines.as_slice() {
+        [] => return,
+        [(line, at)] => {
+            out.push_str(&line[..*at]);
+            rich_inline(&line[*at..], out);
+        }
+        _ => {
+            let text: String = lines.iter().map(|(line, at)| &line[*at..]).collect();
+            let mut escaped = String::with_capacity(text.len() + 16);
+            rich_inline(&text, &mut escaped);
+            // Escaping never adds or takes a line end: one piece per line.
+            for ((line, at), piece) in lines.iter().zip(escaped.split_inclusive('\n')) {
+                out.push_str(&line[..*at]);
+                out.push_str(piece);
+            }
+        }
+    }
+    lines.clear();
+}
+
+/// The fence line `line` from `cursor` on without its indentation (at most three columns).
+fn fence_body(line: &str, cursor: Cursor) -> Option<&str> {
+    let (first, col) = cursor.first(line.as_bytes());
+    (col - cursor.col <= 3).then(|| &line[first..])
+}
+
+/// The marker and length of the fence `line` opens at `cursor` (GFM): three or more backticks
+/// (with no backtick after them on the line) or tildes.
+fn rich_fence(line: &str, cursor: Cursor) -> Option<(u8, usize)> {
+    let body = fence_body(line, cursor)?;
+    let marker = *body.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let len = run(body.as_bytes(), 0);
+    if len < 3 || (marker == b'`' && body[len..].contains('`')) {
+        return None;
+    }
+    Some((marker, len))
+}
+
+/// `line` closes, at `cursor`, a fence of `len` `marker`s: the same marker, at least as many,
+/// only blanks after them.
+fn closes_rich_fence(line: &str, cursor: Cursor, marker: u8, len: usize) -> bool {
+    let Some(body) = fence_body(line, cursor) else {
+        return false;
+    };
+    let n = run(body.as_bytes(), 0);
+    body.as_bytes().first() == Some(&marker)
+        && n >= len
+        && body[n..].trim_matches([' ', '\t', '\r', '\n']).is_empty()
+}
+
+/// Text outside fenced blocks (a paragraph, maybe of several lines), into `out`.
+fn rich_inline(line: &str, out: &mut String) {
+    let bytes = line.as_bytes();
+    let (mut i, mut plain) = (0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) => {
+                if bytes[i + 1] == b'<' {
+                    out.push_str(&line[plain..i]);
+                    out.push_str("&lt;");
+                    plain = i + 2;
+                }
+                i += 2;
+            }
+            b'`' => {
+                let n = run(bytes, i);
+                i = span_end(bytes, i + n, n).map_or(i + n, |close| close + n);
+            }
+            b'<' => match rich_tag(line, i) {
+                Some(end) => i = end,
+                None => {
+                    out.push_str(&line[plain..i]);
+                    out.push_str("&lt;");
+                    i += 1;
+                    plain = i;
+                }
+            },
+            _ => i += 1,
+        }
+    }
+    out.push_str(&line[plain..]);
+}
+
+/// Start of the next run of exactly `n` backticks at or after `from`.
+fn span_end(bytes: &[u8], from: usize, n: usize) -> Option<usize> {
+    let mut j = from;
+    while j < bytes.len() {
+        if bytes[j] == b'`' {
+            let r = run(bytes, j);
+            if r == n {
+                return Some(j);
+            }
+            j += r;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+/// Spaces and tabs from `i` on.
+fn skip_blanks(bytes: &[u8], i: usize) -> usize {
+    i + bytes[i..]
+        .iter()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count()
+}
+
+/// End of the complete tag of [`RICH_TAGS`] that starts at `at` on `line`: `</name>` or
+/// `<name attr="value" ...>` (`/>` too) with attributes of that tag only.
+fn rich_tag(line: &str, at: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = at + 1;
+    let closing = bytes.get(i) == Some(&b'/');
+    if closing {
+        i += 1;
+    }
+    let name_end = i + bytes[i..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
+        .count();
+    // Case matters: models write tags in lowercase, and `Request<B>` is a type.
+    let name = &line[i..name_end];
+    let attributes = RICH_TAGS.iter().find(|(tag, _)| *tag == name)?.1;
+    i = name_end;
+    if closing {
+        i = skip_blanks(bytes, i);
+        return (bytes.get(i) == Some(&b'>')).then_some(i + 1);
+    }
+    loop {
+        let next = skip_blanks(bytes, i);
+        match *bytes.get(next)? {
+            b'>' => return Some(next + 1),
+            b'/' => return (bytes.get(next + 1) == Some(&b'>')).then_some(next + 2),
+            // An attribute only after a blank.
+            _ if next == i => return None,
+            _ => {}
+        }
+        i = next;
+        let attribute_end = i + bytes[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphabetic() || **b == b'-')
+            .count();
+        let attribute = line[i..attribute_end].to_ascii_lowercase();
+        if attribute.is_empty() || !attributes.contains(&attribute.as_str()) {
+            return None;
+        }
+        i = attribute_end;
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        match *bytes.get(i)? {
+            quote @ (b'"' | b'\'') => {
+                let length = bytes[i + 1..]
+                    .iter()
+                    .position(|&b| b == quote || b == b'<' || b == b'\n')?;
+                if bytes[i + 1 + length] != quote {
+                    return None;
+                }
+                i += length + 2;
+            }
+            _ => {
+                let length = bytes[i..]
+                    .iter()
+                    .take_while(|b| !b.is_ascii_whitespace() && !b"\"'<>=`".contains(b))
+                    .count();
+                if length == 0 {
+                    return None;
+                }
+                i += length;
+            }
+        }
+    }
+}
