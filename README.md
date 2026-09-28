@@ -33,7 +33,7 @@ Hub это один процесс с ботом. Он живёт на серв�
 На сервере с Docker:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --hub
 ```
 
 Установщик спросит токен бота (не показывается при вводе), id группы, ваш id, адрес сервера и, если Telegram с сервера доступен только через прокси, адрес прокси. Он сам сделает секрет и сертификат, запустит hub в Docker и проверит бота и группу. В конце он печатает строку для установки клиента. В ней одноразовый код: он работает один раз и 10 минут, секрета hub в строке нет. Код для следующей машины: `cd ~/cctg-hub && docker compose exec hub cctg hub code`.
@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 ### Или hub на этой машине, без Docker
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub --local
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --hub --local
 ```
 
 Те же вопросы; прокси остаётся только в `hub.env`. Hub запускается при входе в систему без окон: в Windows запись автозагрузки (`HKCU\...\Run`, Windows Script Host запускает `cctg supervise` скрыто), в Linux пользовательский юнит systemd `cctg-hub.service`, в macOS LaunchAgent. Всё лежит в `~/.cctg/hub` (`hub.env`, состояние, лог `hub.log`). Без `--public-host ХОСТ` hub пускает только эту машину; с ним слушает все адреса по TLS, и строку для других машин даёт `/join`. В конце установщик печатает строку клиента для этой машины. Linux: hub живёт, пока вы в системе; чтобы работал и без входа, `loginctl enable-linger`.
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 Выполните строку, которую напечатал hub (в Windows это Git Bash). Она выглядит так:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --hub-host <сервер> --pin <отпечаток> --join XXXX-XXXX-XXXX-XXXX
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --hub-host <сервер> --pin <отпечаток> --join XXXX-XXXX-XXXX-XXXX
 ```
 
 Установщик обменяет код на собственный секрет этой машины и запишет его в `~/.cctg/device.env`, на экран секрет не попадает. Для каждой машины нужен свой код: `/join` в теме General отвечает готовой строкой с новым кодом (только людям из allowlist); сообщение потом говорит, что код использован (и каким устройством) или истёк. Список машин и кнопка «Отозвать»: `/devices` в теме General.
@@ -61,7 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh |
 Без строки можно так, установщик всё спросит:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh
 ```
 
 Установщик ставит `cctg` в `~/.cctg`, команду `claude-cctg` в `~/.local/bin` и проверяет связь с hub. Ваши `~/.claude/settings.json` и `~/.claude.json` он не трогает. Если `~/.local/bin` нет в `PATH`, он предлагает дописать его одной строкой в `~/.zshrc`, `~/.bashrc` или `~/.profile` (по вашему shell; с `--yes` без вопроса, `--uninstall` строку убирает). В Docker-контейнере имя машины это id контейнера, поэтому установщик спрашивает имя для тем (или `--host NAME`).
@@ -93,7 +93,7 @@ claude-cctg
 
 ## Обновление
 
-Команды выше ставят релиз `v0.1.0`. Новый релиз это та же команда с его тегом (актуальная строка в этом README на `main`).
+Команды выше берут установщик с `main`, он ставит последний релиз. Чтобы поставить конкретный релиз, замените `main` в ссылке на его тег (например `v0.1.18`).
 
 - Клиент: после обновления hub работающие сессии получают версию hub по кнопке «⬆️ Обновить» в теме: клиент сам скачивает сборку того же релиза из GitHub Releases, сверяет `SHA256SUMS` и ставит её на место старой. Конфиги и обёртку обновляет команда установки нового тега.
 - Hub: команда `--hub` нового тега (hub стоит на образе своего релиза, поэтому одного `docker compose pull` мало).
@@ -101,7 +101,7 @@ claude-cctg
 ## Удаление
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/v0.1.0/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/pockerhead/cctg/main/install.sh | sh -s -- --uninstall
 ```
 
 Удаляет только то, что поставил установщик. Hub: та же строка с `--hub --uninstall` вместо `--uninstall` (останавливает контейнер, `hub.env`, ключ и состояние остаются), hub на этой машине: `--hub --local --uninstall` (останавливает hub и убирает автозапуск, `~/.cctg/hub` остаётся). Пока стоит локальный hub, `--uninstall` клиента оставляет бинарник: hub работает из него.
