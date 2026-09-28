@@ -2,9 +2,10 @@
 //! stdout of the binary. stdout must carry one JSON object per line and
 //! nothing else, also while the hub link fails and logs.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -65,7 +66,14 @@ struct Run {
     stderr: String,
 }
 
-fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
+/// Upper bound for a log line the test waits for; a stall shows up as a
+/// hang, so a generous bound only protects against a loaded host.
+const WAIT: Duration = Duration::from_secs(60);
+
+/// Runs the agent on `lines`, then closes its stdin: once its stderr
+/// contains `logged` (the hub link's failure, which a loaded host can delay
+/// by seconds: TASK-071), or after a short pause when nothing is awaited.
+fn run_agent(envs: &[(&str, &str)], lines: &[&str], logged: Option<&str>) -> Run {
     let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("agent-stdio-home");
     std::fs::create_dir_all(&home).expect("home");
     // Never the developer's own device config or session.
@@ -80,13 +88,41 @@ fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
         command.env(key, value);
     }
     let mut child = common::spawn(&mut command).expect("cctg starts");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let mut pipe = child.stderr.take().expect("stderr");
+        let stderr = stderr.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                stderr.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        })
+    };
+    let logged_text = || String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
     let mut stdin = child.stdin.take().expect("stdin");
     for line in lines {
         stdin.write_all(line.as_bytes()).expect("write");
         stdin.write_all(b"\n").expect("write");
     }
     stdin.flush().expect("flush");
-    std::thread::sleep(linger);
+    match logged {
+        Some(needle) => {
+            let asked = Instant::now();
+            while !logged_text().contains(needle) {
+                assert!(
+                    asked.elapsed() < WAIT,
+                    "no {needle:?} in stderr: {}",
+                    logged_text()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        None => std::thread::sleep(Duration::from_millis(200)),
+    }
     drop(stdin);
     let started = Instant::now();
     let output = child.wait_with_output().expect("cctg ends");
@@ -94,6 +130,7 @@ fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
         started.elapsed() < Duration::from_secs(5),
         "closing stdin ends the agent"
     );
+    reader.join().expect("stderr read");
     let stdout_raw = String::from_utf8(output.stdout).expect("utf-8 stdout");
     let stdout = stdout_raw
         .lines()
@@ -109,7 +146,7 @@ fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
         status_ok: output.status.success(),
         stdout,
         stdout_raw,
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stderr: logged_text(),
     }
 }
 
@@ -158,7 +195,7 @@ fn a_full_session_with_a_failing_hub_keeps_stdout_pure() {
             ("CLAUDE_CODE_ENTRYPOINT", "cli"),
         ],
         SCRIPT,
-        Duration::from_millis(800),
+        Some("hub link"),
     );
     assert!(run.status_ok, "{}", run.stderr);
     // Nine answers (ids 1-6 and 8, one parse error, one invalid request
@@ -210,7 +247,7 @@ fn headless_and_unconfigured_agents_answer_without_a_hub() {
         )],
         vec![("CCTG_HUB_SECRET", SECRET)],
     ] {
-        let run = run_agent(&envs, SCRIPT, Duration::from_millis(200));
+        let run = run_agent(&envs, SCRIPT, None);
         assert!(run.status_ok, "{}", run.stderr);
         assert_eq!(run.stdout.len(), 9, "{}", run.stdout_raw);
         assert_eq!(by_id(&run, 3)["result"]["isError"], true);
@@ -236,7 +273,7 @@ fn an_unreachable_listener_does_not_block_mcp_stdio() {
             ("CLAUDE_CODE_ENTRYPOINT", "cli"),
         ],
         SCRIPT,
-        Duration::from_millis(200),
+        None,
     );
     assert_mcp_stayed_usable(&run);
 }
@@ -255,7 +292,7 @@ fn a_hub_version_rejection_does_not_block_mcp_stdio() {
             ("CLAUDE_CODE_ENTRYPOINT", "cli"),
         ],
         SCRIPT,
-        Duration::from_millis(500),
+        Some("Version"),
     );
     assert_mcp_stayed_usable(&run);
     assert!(run.stderr.contains("Version"), "{}", run.stderr);

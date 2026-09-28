@@ -2134,13 +2134,20 @@ fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
         env.lines().any(|l| l == format!("HTTPS_PROXY={PROXY}")),
         "the proxy is kept: {env}"
     );
-    assert_eq!(
-        log().matches("hub started, polling").count(),
-        before + 1,
-        "{}",
+    // One hub more than before, plus one for each time the old hub ran out
+    // of its getMe tries and the supervisor restarted it by itself: under
+    // load that restart comes before the installer's request, and its hub
+    // polls before the installer's restart replaces it (TASK-071).
+    let polls = log().matches("hub started, polling").count() - before;
+    let own_restarts = since_mark().matches("hub exited; restarting it").count();
+    assert!(
+        (1..=1 + own_restarts).contains(&polls),
+        "{polls} hubs polled, {own_restarts} restarted by the supervisor: {}",
         log()
     );
-    assert!(listening(agent_port), "{}", log());
+    // The installer may have seen that restarted hub, and its own restart
+    // can still be under way.
+    wait_until("the hub listening", || listening(agent_port));
 
     // Uninstall: the hub stops, the autostart goes, the settings stay.
     let (output, text) = run.install(&["--hub", "--local", "--dir", &hub_dir_arg, "--uninstall"]);

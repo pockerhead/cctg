@@ -1441,6 +1441,10 @@ EOF
 # ends the hub with "Error: ..." (the supervisor then tries again). Only
 # hubs the supervisor started after $offset count: an older hub still in
 # its start checks writes its own "Error: ..." while it is being stopped.
+# A hub is marked by "hub starting", which the supervisor writes before it
+# starts the hub; its "hub started pid=" comes after the start and can come
+# after the hub's own lines (TASK-071). A supervisor of an older release
+# writes only the latter.
 wait_local_hub() {
     i=0
     logs=
@@ -1449,12 +1453,13 @@ wait_local_hub() {
         [ "$(log_size)" -ge "$offset" ] || offset=0
         logs=$(tail -c "+$((offset + 1))" "$hub_log" 2>/dev/null || true)
         case $logs in
-            *"hub started pid="*)
-                case ${logs#*"hub started pid="} in
-                    *"hub started, polling"*) say "hub started: bot and group checked"; return 0 ;;
-                    *"Error: "*) break ;;
-                esac
-                ;;
+            *"hub starting"*) hub_lines=${logs#*"hub starting"} ;;
+            *"hub started pid="*) hub_lines=${logs#*"hub started pid="} ;;
+            *) hub_lines= ;;
+        esac
+        case $hub_lines in
+            *"hub started, polling"*) say "hub started: bot and group checked"; return 0 ;;
+            *"Error: "*) break ;;
         esac
         i=$((i + 1))
     done
