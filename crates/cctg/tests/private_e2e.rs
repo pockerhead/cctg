@@ -752,6 +752,13 @@ async fn e2e_a_message_from_either_view_reaches_the_session() {
         hub.fake.topic(owner()).unwrap().to_string()
     );
     assert!(!format!("{meta:?}").contains(&OWNER.to_string()));
+    // The echo goes once the burst reached the session; someone who writes
+    // in the group before that sees it after their own message, which is
+    // not what this test is about.
+    hub.until("the echo in the group", |fake| {
+        fake.layout(Chat::Group).contains(&echo("из лички"))
+    })
+    .await;
 
     let group_id = hub.say(Chat::Group, "из группы");
     let (content, meta) = agent.inbound().await;
