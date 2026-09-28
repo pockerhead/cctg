@@ -1104,6 +1104,43 @@ mod tests {
         );
     }
 
+    /// TASK-073: a menu press of someone not allowlisted, or on a message of
+    /// someone else's private chat, never reaches the slot actor.
+    #[test]
+    fn a_strangers_menu_press_is_ignored() {
+        let route = |update: Value| {
+            let (_, mut routed) = route_batch_with(vec![update], None, CHAT, &allowlist(), true);
+            routed.remove(0)
+        };
+        let private = |of: i64| {
+            let mut message = message(of, json!({ "text": "menu" }));
+            message["chat"] = json!({ "id": of, "type": "private", "first_name": "x" });
+            message
+        };
+        let press = |from: i64, of: i64| {
+            json!({ "update_id": 2, "callback_query": {
+                "id": "q1", "from": { "id": from, "is_bot": false, "first_name": "x" },
+                "chat_instance": "c", "data": "menu:dl:a",
+                "message": private(of),
+            }})
+        };
+        assert_eq!(
+            route(press(STRANGER, STRANGER)),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+        assert_eq!(
+            route(press(STRANGER, ALLOWED)),
+            Routed::Ignored(Ignored::NotAllowed)
+        );
+        let owner = Chat::Private(PrivateChat::of_user(ALLOWED));
+        let own = route(press(ALLOWED, ALLOWED));
+        assert!(
+            matches!(&own, Routed::Callback(CallbackInput { chat: Some(chat), data: Some(data), .. })
+                if *chat == owner && data == "menu:dl:a"),
+            "{own:?}"
+        );
+    }
+
     #[test]
     fn forum_service_messages_are_never_input() {
         let cases = [

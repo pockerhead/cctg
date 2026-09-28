@@ -557,6 +557,19 @@ impl BotApi {
             .map(drop)
     }
 
+    /// Pins one message without a notification (the menu in the General of
+    /// a private chat, TASK-073; a private chat needs no right for it).
+    pub async fn pin_chat_message(&self, chat: Chat, message_id: i64) -> Result<(), ApiError> {
+        let body = json!({
+            "chat_id": self.id_of(chat),
+            "message_id": message_id,
+            "disable_notification": true,
+        });
+        self.call::<IgnoredAny>("pinChatMessage", body, None)
+            .await
+            .map(drop)
+    }
+
     /// Unpins one message (the pinned status message of a hub before
     /// TASK-062).
     pub async fn unpin_chat_message(&self, chat: Chat, message_id: i64) -> Result<(), ApiError> {

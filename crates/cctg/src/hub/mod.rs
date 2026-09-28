@@ -9,6 +9,7 @@ pub mod console;
 pub mod devices;
 pub mod fetch;
 pub mod ingress;
+pub mod menu;
 pub mod mirror;
 pub mod offset;
 pub mod permissions;
@@ -408,6 +409,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         inbound_settle: slots::INBOUND_SETTLE,
         channel_wait: slots::CHANNEL_WAIT,
         owners,
+        menu: true,
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);

@@ -7,7 +7,7 @@
 //!    message where they fit (they happened before the prompt).
 //! 2. `answerCallbackQuery` from `Edit`; no token.
 //! 3. `Topic` - `createForumTopic`, `editForumTopic`, `deleteForumTopic`,
-//!    `deleteMessage`, `unpinChatMessage` - and foreground `Edit` - `editMessageText` and
+//!    `deleteMessage`, `pinChatMessage`, `unpinChatMessage` - and foreground `Edit` - `editMessageText` and
 //!    `setMessageReaction` that show what a user did or asked for
 //!    (decisions, questions, subagent blocks, reactions, ⏹). When both
 //!    wait they take turns, so neither waits behind more than one of the
@@ -188,8 +188,14 @@ pub enum Op {
         message_id: i64,
     },
     /// `unpinChatMessage`: a status message a hub pinned before TASK-062
-    /// that could not be deleted.
+    /// that could not be deleted, or an old menu (TASK-073).
     Unpin {
+        chat: Chat,
+        message_id: i64,
+    },
+    /// `pinChatMessage` without a notification: the menu in the General of a
+    /// private chat (TASK-073).
+    Pin {
         chat: Chat,
         message_id: i64,
     },
@@ -262,6 +268,7 @@ impl Op {
             Op::Edit { .. } | Op::AnswerCallback { .. } | Op::React { .. } => Lane::Edit(0),
             Op::Delete { .. }
             | Op::Unpin { .. }
+            | Op::Pin { .. }
             | Op::CreateTopic { .. }
             | Op::EditTopic { .. }
             | Op::DeleteTopic { .. } => Lane::Topic,
@@ -348,6 +355,7 @@ impl Op {
             | Op::Edit { chat, .. }
             | Op::Delete { chat, .. }
             | Op::Unpin { chat, .. }
+            | Op::Pin { chat, .. }
             | Op::CreateTopic { chat, .. }
             | Op::EditTopic { chat, .. }
             | Op::DeleteTopic { chat, .. }
@@ -492,6 +500,10 @@ impl Transport for BotApi {
                 .map(|()| Outcome::Done),
             Op::Unpin { chat, message_id } => self
                 .unpin_chat_message(*chat, *message_id)
+                .await
+                .map(|()| Outcome::Done),
+            Op::Pin { chat, message_id } => self
+                .pin_chat_message(*chat, *message_id)
                 .await
                 .map(|()| Outcome::Done),
             Op::CreateTopic {
@@ -3583,6 +3595,24 @@ mod tests {
             "{order:?}"
         );
         handle.abort();
+    }
+
+    /// TASK-073: the pin of the menu is a topic call like an unpin: no
+    /// message token, one edit token, no new message.
+    #[test]
+    fn a_pin_rides_the_topic_lane_and_takes_an_edit_token() {
+        let chat = Chat::Private(crate::hub::chat::PrivateChat::of_user(7));
+        let pin = Op::Pin {
+            chat,
+            message_id: 5,
+        };
+        assert_eq!(pin.lane(), Lane::Topic);
+        assert!(!pin.metered());
+        assert!(pin.edit_metered());
+        assert!(!pin.background());
+        assert_eq!(pin.chat(), Some(chat));
+        assert_eq!(pin.posts(), None);
+        assert_eq!(pin.message(), None);
     }
 
     #[tokio::test(start_paused = true)]
