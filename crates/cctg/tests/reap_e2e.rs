@@ -60,14 +60,15 @@ fn stand_in_binary(root: &Path) -> PathBuf {
 }
 
 fn spawn_claude(bin: &Path) -> Child {
-    Command::new(bin)
-        .args(["--exact", "stand_in", "--ignored", "--nocapture"])
-        .env(STAND_IN, "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start the stand-in")
+    common::spawn(
+        Command::new(bin)
+            .args(["--exact", "stand_in", "--ignored", "--nocapture"])
+            .env(STAND_IN, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("start the stand-in")
 }
 
 fn post(host: &str, session: &str, cwd: &str, pid: Option<u32>) -> HookPost {
@@ -138,14 +139,15 @@ async fn a_start_after_a_killed_session_takes_its_topic() {
     .to_string();
     let home = root.clone();
     let output = tokio::task::spawn_blocking(move || {
-        let mut child = common::cctg(&home)
-            .args(["hook", "SessionStart"])
-            .env("CLAUDE_PID", own_pid.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("cctg starts");
+        let mut child = common::spawn(
+            common::cctg(&home)
+                .args(["hook", "SessionStart"])
+                .env("CLAUDE_PID", own_pid.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("cctg starts");
         let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
         child.wait_with_output().unwrap()
     })

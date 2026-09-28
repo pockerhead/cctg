@@ -45,6 +45,41 @@ fn every_test_starts_cctg_through_the_isolating_helper() {
     assert!(checked >= 10, "only {checked} files checked");
 }
 
+/// Every test file starts its processes through `tests/common`, one spawn
+/// at a time in its binary (TASK-066: on macOS a child started by one test
+/// can inherit the pipes of a child another test starts meanwhile).
+#[test]
+fn every_test_starts_processes_through_the_spawn_lock() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    // Split, so this file does not match itself.
+    let calls = [
+        concat!(".spa", "wn()"),
+        concat!(".out", "put()"),
+        concat!(".sta", "tus()"),
+    ];
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("tests dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.ends_with(".rs") {
+            continue;
+        }
+        checked += 1;
+        let text = std::fs::read_to_string(&path).expect("test source");
+        for line in text.lines() {
+            // `run_pty_e2e`'s own scene, not a process.
+            if line.contains("scene.status()") {
+                continue;
+            }
+            assert!(
+                !calls.iter().any(|call| line.contains(call)),
+                "{name}: a process started without common::spawn: {line}"
+            );
+        }
+    }
+    assert!(checked >= 10, "only {checked} files checked");
+}
+
 /// With a session id, a hub secret and a hub address in the environment the
 /// tests run in, the agent started through the helper stays off the hub; the
 /// same agent started plainly connects (the TASK-042 leak).
@@ -60,20 +95,21 @@ fn connects(mode: &str) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap();
-    let mut inner = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "inner_agent", "--ignored", "--nocapture"])
-        .env(INNER, mode)
-        .env(
-            "CLAUDE_CODE_SESSION_ID",
-            "15015015-0000-4000-8000-000000000042",
-        )
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .env("CCTG_HUB_SECRET", SECRET)
-        .env("CCTG_HUB_AGENT_ADDR", addr.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut inner = common::spawn(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "inner_agent", "--ignored", "--nocapture"])
+            .env(INNER, mode)
+            .env(
+                "CLAUDE_CODE_SESSION_ID",
+                "15015015-0000-4000-8000-000000000042",
+            )
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env("CCTG_HUB_SECRET", SECRET)
+            .env("CCTG_HUB_AGENT_ADDR", addr.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut connected = false;
     loop {
@@ -107,14 +143,15 @@ fn inner_agent() {
         plain.env("USERPROFILE", &home).env("HOME", &home);
         plain
     };
-    let mut agent = command
-        .arg("agent")
-        .current_dir(&home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut agent = common::spawn(
+        command
+            .arg("agent")
+            .current_dir(&home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap();
     std::thread::sleep(Duration::from_secs(2));
     drop(agent.stdin.take());
     let output = agent.wait_with_output().unwrap();

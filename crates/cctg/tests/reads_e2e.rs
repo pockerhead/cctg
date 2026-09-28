@@ -330,19 +330,20 @@ impl Drop for Agent {
 }
 
 fn start_agent(s: &Session, port: u16) -> Agent {
-    let mut child = common::cctg(&s.home)
-        .arg("agent")
-        .current_dir(&s.workdir)
-        .env("CCTG_HUB_SECRET", SECRET)
-        .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
-        .env("CCTG_HOST", HOST)
-        .env("CLAUDE_CODE_SESSION_ID", &s.id)
-        .env("CLAUDE_CONFIG_DIR", &s.config)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(std::fs::File::create(s.agent_log()).expect("agent log"))
-        .spawn()
-        .expect("spawn cctg agent");
+    let mut child = common::spawn(
+        common::cctg(&s.home)
+            .arg("agent")
+            .current_dir(&s.workdir)
+            .env("CCTG_HUB_SECRET", SECRET)
+            .env("CCTG_HUB_AGENT_ADDR", format!("127.0.0.1:{port}"))
+            .env("CCTG_HOST", HOST)
+            .env("CLAUDE_CODE_SESSION_ID", &s.id)
+            .env("CLAUDE_CONFIG_DIR", &s.config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(s.agent_log()).expect("agent log")),
+    )
+    .expect("spawn cctg agent");
     let mut stdin = child.stdin.take().unwrap();
     let _ = stdin.write_all(
         b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",

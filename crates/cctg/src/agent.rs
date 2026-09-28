@@ -2505,6 +2505,10 @@ mod tests {
             .await
             .unwrap();
         let (_outbox, mut events) = spawn(beating(listener.local_addr().unwrap()));
+        // The agent's clock starts after it sent `Up`, before this task sees
+        // it (TASK-066: 598 ms on a slow runner), and never before it read
+        // `registered`, which the hub writes after this.
+        let before_registered = tokio::time::Instant::now();
         let (mut reader, _write) = fake_hub(&listener, true).await;
         assert_eq!(
             next(&mut events).await,
@@ -2513,7 +2517,6 @@ mod tests {
                 albums: false
             }
         );
-        let up = tokio::time::Instant::now();
         // The agent pings the quiet hub.
         let mut line = Vec::new();
         tokio::time::timeout(WAIT, wire::read_line(&mut reader, &mut line))
@@ -2523,7 +2526,8 @@ mod tests {
         assert_eq!(wire::decode::<AgentMsg>(&line), Ok(AgentMsg::Ping));
         // The hub never writes: the link is given up once the timeout passed.
         assert_eq!(next(&mut events).await, LinkEvent::Down);
-        assert!(up.elapsed() >= BEAT.timeout, "{:?}", up.elapsed());
+        let silent = before_registered.elapsed();
+        assert!(silent >= BEAT.timeout, "{silent:?}");
         let (_reader, _write) = fake_hub(&listener, true).await;
         assert_eq!(
             next(&mut events).await,

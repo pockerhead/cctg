@@ -112,29 +112,31 @@ fn status_file(home: &Path, ext: &str) -> PathBuf {
 
 /// The session's `cctg agent`; its stdin stays open until the caller drops it.
 fn agent(home: &Path) -> Child {
-    common::cctg(home)
-        .arg("agent")
-        .current_dir(home)
-        .env("CLAUDE_CODE_SESSION_ID", SESSION)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("cctg agent starts")
+    common::spawn(
+        common::cctg(home)
+            .arg("agent")
+            .current_dir(home)
+            .env("CLAUDE_CODE_SESSION_ID", SESSION)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .expect("cctg agent starts")
 }
 
 /// Runs `cctg statusline` with [`INPUT`]: its exit code and how long it took.
 fn statusline(home: &Path) -> (Option<i32>, Duration) {
     let started = Instant::now();
-    let mut child = common::cctg(home)
-        .current_dir(home)
-        .env("GIT_CEILING_DIRECTORIES", home.parent().unwrap())
-        .arg("statusline")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cctg statusline starts");
+    let mut child = common::spawn(
+        common::cctg(home)
+            .current_dir(home)
+            .env("GIT_CEILING_DIRECTORIES", home.parent().unwrap())
+            .arg("statusline")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("cctg statusline starts");
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(INPUT.as_bytes()).unwrap();
     drop(stdin);

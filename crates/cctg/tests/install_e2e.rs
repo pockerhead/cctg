@@ -262,7 +262,7 @@ impl Run {
         for (name, value) in &self.env {
             command.env(name, value);
         }
-        let mut child = command.spawn().expect("start the shell");
+        let mut child = common::spawn(&mut command).expect("start the shell");
         child
             .stdin
             .take()
@@ -528,12 +528,13 @@ fn install_update_and_uninstall_a_device() {
         // The wrapper starts claude through cctg run, the prompt last.
         let mut shell = shell();
         common::isolate(&mut shell, &run.home);
-        let status = shell
-            .arg(run.wrapper())
-            .arg("fix the bug")
-            .env("PATH", path_with(&run.fake))
-            .status()
-            .unwrap();
+        let status = common::status(
+            shell
+                .arg(run.wrapper())
+                .arg("fix the bug")
+                .env("PATH", path_with(&run.fake)),
+        )
+        .unwrap();
         assert!(status.success());
         let args = std::fs::read_to_string(run.home.join("claude-args")).unwrap();
         let args: Vec<&str> = args.lines().collect();
@@ -579,12 +580,13 @@ fn install_update_and_uninstall_a_device() {
     if cfg!(target_os = "macos") {
         release(&dist, &newer);
         assert!(
-            Command::new("codesign")
-                .args(["--force", "-s", "-", "-i", "cctg.install-e2e.newer"])
-                .arg(dist.join(asset()))
-                .status()
-                .unwrap()
-                .success()
+            common::status(
+                Command::new("codesign")
+                    .args(["--force", "-s", "-", "-i", "cctg.install-e2e.newer"])
+                    .arg(dist.join(asset()))
+            )
+            .unwrap()
+            .success()
         );
     } else {
         newer.extend_from_slice(b"\0newer build\0");
@@ -608,15 +610,16 @@ fn install_update_and_uninstall_a_device() {
         ("sleep", &["30"])
     };
     let session = Killed(
-        session
-            .arg("run")
-            .arg("--")
-            .args(args)
-            .env("CCTG_CLAUDE", program)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        common::spawn(
+            session
+                .arg("run")
+                .arg("--")
+                .args(args)
+                .env("CCTG_CLAUDE", program)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap(),
     );
     std::thread::sleep(Duration::from_millis(500));
     let (output, text) = run.install(&["--yes"]);
@@ -1333,14 +1336,15 @@ fn local_hub_listeners_follow_the_public_host_and_keep_the_users_lines() {
     );
     let path = hub_env.to_string_lossy().replace('\\', "/");
     let step = |public_host: &str| -> (String, String) {
-        let output = shell()
-            .arg("-c")
-            .arg(&script)
-            .arg("sh")
-            .arg(&path)
-            .arg(public_host)
-            .output()
-            .unwrap();
+        let output = common::output(
+            shell()
+                .arg("-c")
+                .arg(&script)
+                .arg("sh")
+                .arg(&path)
+                .arg(public_host),
+        )
+        .unwrap();
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(
             output.status.success(),
@@ -1654,14 +1658,6 @@ async fn serve_bot(bot: Arc<Bot>) -> u16 {
     port
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn listening(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -1749,7 +1745,7 @@ impl Drop for LocalHub {
     fn drop(&mut self) {
         if self.armed {
             if let Ok(pid) = std::fs::read_to_string(self.fake_state.join("hub.pid")) {
-                let _ = Command::new("kill").args(["-TERM", pid.trim()]).status();
+                let _ = common::status(Command::new("kill").args(["-TERM", pid.trim()]));
             }
             let stop = self.bin.join("cctg.stop");
             if std::fs::write(&stop, "").is_ok() {
@@ -1769,11 +1765,12 @@ impl Drop for LocalHub {
                 .starts_with("HKCU\\Software\\cctg-install-e2e-")
         {
             let parent = self.run_key.trim_end_matches("\\Run");
-            let _ = Command::new("reg")
-                .args(["delete", parent, "/f"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = common::status(
+                Command::new("reg")
+                    .args(["delete", parent, "/f"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            );
         }
     }
 }
@@ -1783,14 +1780,15 @@ impl Drop for LocalHub {
 #[cfg(windows)]
 fn run_value(key: &str) -> Option<String> {
     let file = std::env::temp_dir().join(format!("cctg-install-e2e-{}.reg", std::process::id()));
-    let exported = Command::new("reg")
-        .args(["export", key])
-        .arg(&file)
-        .arg("/y")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
+    let exported = common::status(
+        Command::new("reg")
+            .args(["export", key])
+            .arg(&file)
+            .arg("/y")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|status| status.success());
     let bytes = std::fs::read(&file).unwrap_or_default();
     let _ = std::fs::remove_file(&file);
     if !exported {
@@ -1829,7 +1827,7 @@ fn a_local_hub_starts_at_logon_and_join_gives_a_working_line() {
     let api = runtime.block_on(serve_bot(bot.clone()));
 
     let mut run = Run::new(&root);
-    let (agent_port, hook_port) = (free_port(), free_port());
+    let (agent_port, hook_port) = (common::free_port(), common::free_port());
     let hub_dir = root.0.join("мой hub");
     std::fs::create_dir_all(&hub_dir).unwrap();
     let hub_dir_arg = hub_dir.to_string_lossy().into_owned();

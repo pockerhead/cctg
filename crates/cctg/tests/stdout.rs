@@ -7,10 +7,7 @@ fn subcommands_do_not_write_to_stdout() {
     let home = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdout-home");
     std::fs::create_dir_all(&home).expect("temp home");
     for args in [&["agent"][..], &["hook", "SessionStart"][..]] {
-        let output = common::cctg(&home)
-            .args(args)
-            .output()
-            .expect("cctg should start");
+        let output = common::output(common::cctg(&home).args(args)).expect("cctg should start");
 
         assert!(
             output.status.success(),
@@ -30,11 +27,8 @@ fn hub_without_config_fails_on_stderr_only() {
     // Empty working directory: no ./.env, and no CCTG_* variables inherited.
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("hub-no-config");
     std::fs::create_dir_all(&dir).expect("temp dir");
-    let output = common::cctg(&dir)
-        .arg("hub")
-        .current_dir(&dir)
-        .output()
-        .expect("cctg should start");
+    let output =
+        common::output(common::cctg(&dir).arg("hub").current_dir(&dir)).expect("cctg should start");
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
@@ -59,13 +53,14 @@ fn malformed_env_file_does_not_echo_its_contents() {
     )
     .expect("write bad.env");
 
-    let output = common::cctg(&dir)
-        .arg("hub")
-        .arg("--env-file")
-        .arg(&env_file)
-        .current_dir(&dir)
-        .output()
-        .expect("cctg should start");
+    let output = common::output(
+        common::cctg(&dir)
+            .arg("hub")
+            .arg("--env-file")
+            .arg(&env_file)
+            .current_dir(&dir),
+    )
+    .expect("cctg should start");
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());

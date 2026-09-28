@@ -307,11 +307,6 @@ impl Drop for Proc {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 /// A command without any `CCTG_*` or Claude Code session variable of the
 /// environment this test runs in; home is `home`.
 fn clean_command(program: &Path, home: &Path) -> Command {
@@ -354,7 +349,7 @@ async fn deploy(exe: &Path, candidate: &Path, home: &Path) -> (bool, String) {
         .arg(candidate)
         .args(["--timeout-secs", "90", "--trial-secs", "3"])
         .stdin(Stdio::null());
-    let output = tokio::task::spawn_blocking(move || command.output())
+    let output = tokio::task::spawn_blocking(move || common::output(&mut command))
         .await
         .unwrap()
         .expect("cctg deploy runs");
@@ -377,9 +372,7 @@ fn stop_supervisor(child: &Child) {
     }
     #[cfg(unix)]
     {
-        let status = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
+        let status = common::status(Command::new("kill").args(["-TERM", &child.id().to_string()]))
             .expect("kill");
         assert!(status.success());
     }
@@ -403,7 +396,7 @@ async fn scenario() {
     let fake = Arc::new(Fake::default());
     fake.state.lock().unwrap().me_failures = 2;
     let api_port = serve_fake(fake.clone()).await;
-    let (agent_port, hook_port) = (free_port(), free_port());
+    let (agent_port, hook_port) = (common::free_port(), common::free_port());
     std::fs::write(
         home.join(".cctg").join("device.env"),
         format!(
@@ -435,7 +428,7 @@ async fn scenario() {
         // Its own group: Ctrl+Break goes to it alone, not to this test.
         command.creation_flags(0x0000_0200);
     }
-    let mut supervisor = Proc(command.spawn().expect("cctg supervise"));
+    let mut supervisor = Proc(common::spawn(&mut command).expect("cctg supervise"));
     let log = collect(supervisor.0.stderr.take().unwrap());
     let _ = SUPERVISOR_LOG.set(log.clone());
 
@@ -493,7 +486,7 @@ async fn scenario() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut agent = Proc(agent_command.spawn().expect("cctg agent"));
+    let mut agent = Proc(common::spawn(&mut agent_command).expect("cctg agent"));
     let mut agent_in = agent.0.stdin.take().unwrap();
     for line in [
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
@@ -684,7 +677,7 @@ async fn a_crash_looping_hub_stops_on_the_stop_file() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut supervisor = Proc(command.spawn().expect("cctg supervise"));
+    let mut supervisor = Proc(common::spawn(&mut command).expect("cctg supervise"));
 
     wait_for("two hub exits", || {
         read_log().matches("hub exited; restarting it").count() >= 2

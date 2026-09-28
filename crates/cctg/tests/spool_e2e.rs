@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use cctg::hub::ingress::{self, AgentEvent};
 use cctg::wire::{HookEvent, HookPost, Secret};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::mpsc;
 
 mod common;
@@ -73,13 +73,14 @@ fn command(home: &Path) -> Command {
 
 /// Runs `cctg hook <event>` with `input` as stdin; returns its stderr.
 fn hook(home: &Home, event: &str, input: serde_json::Value) -> String {
-    let mut child = command(&home.0)
-        .args(["hook", event])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cctg hook");
+    let mut child = common::spawn(
+        command(&home.0)
+            .args(["hook", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("cctg starts");
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input.to_string().as_bytes()).unwrap();
     drop(stdin);
@@ -105,9 +106,17 @@ fn input(event: &str, extra: serde_json::Value) -> serde_json::Value {
     value
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
+/// A held port is a hub that is down, and it stays so: no other socket can
+/// listen on it (tokio's bind sets `SO_REUSEADDR` on Unix; it still fails),
+/// and a connect to it fails (on Windows only after its SYN retries).
+#[tokio::test]
+async fn a_held_port_refuses_and_nobody_else_can_listen_on_it() {
+    let (_held, port) = common::held_port();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    assert!(std::net::TcpListener::bind(addr).is_err());
+    assert!(TcpListener::bind(addr).await.is_err());
+    let connect = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(addr)).await;
+    assert!(matches!(connect, Ok(Err(_))), "{connect:?}");
 }
 
 /// A hub that answers every hook 503 at once (down without a slow connect).
@@ -131,10 +140,8 @@ async fn refusing_hub() -> u16 {
     port
 }
 
-async fn hooks_hub(port: u16) -> mpsc::Receiver<HookPost> {
-    let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-        .await
-        .unwrap();
+fn hooks_hub(held: TcpSocket) -> mpsc::Receiver<HookPost> {
+    let listener = held.listen(1024).unwrap();
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(ingress::serve_hooks(
         listener,
@@ -167,8 +174,9 @@ fn blocking<T: Send + 'static>(
 /// delivered twice, also when a delivered file comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missed_session_start_reaches_the_hub_before_the_next_hook() {
-    let port = free_port();
-    let home = Home::new("next-hook", port, free_port());
+    let (hook_port, port) = common::held_port();
+    let (_agent_port, agent_port) = common::held_port();
+    let home = Home::new("next-hook", port, agent_port);
     // No listener on the port: the hub is down.
     let home = std::sync::Arc::new(home);
     let h = home.clone();
@@ -192,7 +200,7 @@ async fn a_missed_session_start_reaches_the_hub_before_the_next_hook() {
     assert_eq!(saved["event"]["type"], "session_start");
     assert_eq!(saved["session_id"], SESSION);
 
-    let mut events = hooks_hub(port).await;
+    let mut events = hooks_hub(hook_port);
     let h = home.clone();
     blocking(move || {
         hook(
@@ -241,7 +249,8 @@ async fn a_missed_session_start_reaches_the_hub_before_the_next_hook() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_spool_holds_no_text_and_is_bounded() {
     let port = refusing_hub().await;
-    let home = std::sync::Arc::new(Home::new("bounded", port, free_port()));
+    let (_agent_port, agent_port) = common::held_port();
+    let home = std::sync::Arc::new(Home::new("bounded", port, agent_port));
     let h = home.clone();
     blocking(move || {
         let stop = input(
@@ -326,7 +335,8 @@ impl Drop for Agent {
 /// start itself: the hub learns the session without another hook.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_agent_delivers_its_sessions_kept_start_when_it_registers() {
-    let (hook_port, agent_port) = (free_port(), free_port());
+    let (hooks_held, hook_port) = common::held_port();
+    let (agents_held, agent_port) = common::held_port();
     let home = std::sync::Arc::new(Home::new("agent", hook_port, agent_port));
     let h = home.clone();
     blocking(move || {
@@ -340,25 +350,24 @@ async fn the_agent_delivers_its_sessions_kept_start_when_it_registers() {
     .unwrap();
     assert_eq!(home.kept().len(), 1);
 
-    let mut hooks = hooks_hub(hook_port).await;
-    let agents_listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, agent_port)))
-        .await
-        .unwrap();
+    let mut hooks = hooks_hub(hooks_held);
+    let agents_listener = agents_held.listen(1024).unwrap();
     let (agents_tx, mut agents) = mpsc::channel(16);
     tokio::spawn(ingress::serve_agents(
         agents_listener,
         Secret::parse(SECRET).unwrap(),
         agents_tx,
     ));
-    let mut child = command(&home.0)
-        .arg("agent")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .env("CLAUDE_CODE_SESSION_ID", SESSION)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("cctg agent");
+    let mut child = common::spawn(
+        command(&home.0)
+            .arg("agent")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT")
+            .env("CLAUDE_CODE_SESSION_ID", SESSION)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .expect("cctg starts");
     // Keep stdin open (the agent stops at EOF); drain stdout.
     std::mem::forget(child.stdin.take());
     let mut stdout = child.stdout.take().unwrap();
@@ -403,7 +412,8 @@ async fn a_silent_hub_costs_a_hook_one_budget_however_much_is_kept() {
         }
     });
     let run = |name: &'static str, kept: usize| {
-        let home = std::sync::Arc::new(Home::new(name, port, free_port()));
+        let (agent_held, agent_port) = common::held_port();
+        let home = std::sync::Arc::new(Home::new(name, port, agent_port));
         for n in 0..kept {
             let post = HookPost::new(
                 "box".into(),
@@ -429,15 +439,15 @@ async fn a_silent_hub_costs_a_hook_one_budget_however_much_is_kept() {
             );
             (stderr, started.elapsed())
         });
-        (home, done)
+        (home, agent_held, done)
     };
     // The same hook with nothing kept: one POST that runs into its timeout.
     // Process start-up under load is in both runs and cancels out.
-    let (_empty, done) = run("silent-empty", 0);
+    let (_empty, _empty_agent, done) = run("silent-empty", 0);
     let (_, baseline) = done.await.unwrap();
     let connections_before = connections_through_sentinel(&accepted, port).await;
     let kept = cctg::spool::MAX_PER_SESSION - 1;
-    let (home, done) = run("silent", kept);
+    let (home, _agent, done) = run("silent", kept);
     let (stderr, took) = done.await.unwrap();
     // One budget: a timeout per kept file would add `POST_TIMEOUT` each
     // (15 of them: 7.5 s); a whole budget of margin keeps load noise out.

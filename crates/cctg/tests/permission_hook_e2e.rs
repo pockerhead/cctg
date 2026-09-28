@@ -277,14 +277,15 @@ fn input() -> Vec<u8> {
 async fn run_hook(home: PathBuf) -> (Output, Duration) {
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let mut child = common::cctg(&home)
-            .args(["hook", "PermissionRequest"])
-            .env("RUST_LOG", "trace")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("cctg starts");
+        let mut child = common::spawn(
+            common::cctg(&home)
+                .args(["hook", "PermissionRequest"])
+                .env("RUST_LOG", "trace")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("cctg starts");
         let mut stdin = child.stdin.take().unwrap();
         let _ = stdin.write_all(&input());
         drop(stdin);
@@ -442,10 +443,9 @@ async fn a_hub_that_stops_answers_the_waiting_hook_without_a_decision() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_hub_means_no_decision_and_a_quick_exit() {
-    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // Held: nothing listens there (TASK-066).
+    let (_held, port) = common::held_port();
+    let port = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let (output, elapsed) = run_hook(home("down", &port.to_string())).await;
     assert_clean(&output);
     assert!(output.stdout.is_empty());

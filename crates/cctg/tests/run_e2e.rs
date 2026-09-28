@@ -72,19 +72,20 @@ fn scenario() {
         "haiku",
         "the first prompt",
     ];
-    let mut child = common::cctg(&home)
-        .arg("run")
-        .arg("--")
-        .args(given)
-        .env("CCTG_CLAUDE", std::env::current_exe().unwrap())
-        .env("RUN_E2E_ROLE", "claude")
-        .env("RUN_E2E_LOG", &log)
-        .env("CCTG_STATE_DIR", &state)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("cctg run starts");
+    let mut child = common::spawn(
+        common::cctg(&home)
+            .arg("run")
+            .arg("--")
+            .args(given)
+            .env("CCTG_CLAUDE", std::env::current_exe().unwrap())
+            .env("RUN_E2E_ROLE", "claude")
+            .env("RUN_E2E_LOG", &log)
+            .env("CCTG_STATE_DIR", &state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .expect("cctg run starts");
     let pid = child.id().to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {

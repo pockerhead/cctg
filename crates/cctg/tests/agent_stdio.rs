@@ -26,13 +26,12 @@ fn slamming_hub() -> String {
     addr
 }
 
-/// A port with no listener. On Windows the connect may remain pending until
-/// the agent timeout; MCP stdio must keep progressing independently.
-fn unreachable_hub() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr").to_string();
-    drop(listener);
-    addr
+/// A port with no listener, held so none can come (TASK-066). On Windows
+/// the connect may remain pending until the agent timeout; MCP stdio must
+/// keep progressing independently.
+fn unreachable_hub() -> (tokio::net::TcpSocket, String) {
+    let (held, port) = common::held_port();
+    (held, format!("127.0.0.1:{port}"))
 }
 
 /// Completes the two agent writes, then rejects the wire version. The agent
@@ -80,7 +79,7 @@ fn run_agent(envs: &[(&str, &str)], lines: &[&str], linger: Duration) -> Run {
     for (key, value) in envs {
         command.env(key, value);
     }
-    let mut child = command.spawn().expect("cctg starts");
+    let mut child = common::spawn(&mut command).expect("cctg starts");
     let mut stdin = child.stdin.take().expect("stdin");
     for line in lines {
         stdin.write_all(line.as_bytes()).expect("write");
@@ -225,7 +224,7 @@ fn headless_and_unconfigured_agents_answer_without_a_hub() {
 
 #[test]
 fn an_unreachable_listener_does_not_block_mcp_stdio() {
-    let hub = unreachable_hub();
+    let (_held, hub) = unreachable_hub();
     let run = run_agent(
         &[
             ("CCTG_HUB_SECRET", SECRET),

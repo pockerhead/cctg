@@ -1242,14 +1242,15 @@ async fn pre_compact(home: &Path, trigger: &str) -> Output {
     .to_string();
     let home = home.to_owned();
     let output = tokio::task::spawn_blocking(move || {
-        let mut child = common::cctg(&home)
-            .args(["hook", "PreCompact"])
-            .env("RUST_LOG", "trace")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("cctg starts");
+        let mut child = common::spawn(
+            common::cctg(&home)
+                .args(["hook", "PreCompact"])
+                .env("RUST_LOG", "trace")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("cctg starts");
         let mut stdin = child.stdin.take().unwrap();
         let _ = stdin.write_all(input.as_bytes());
         drop(stdin);

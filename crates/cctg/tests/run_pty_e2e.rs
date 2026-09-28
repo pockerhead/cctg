@@ -32,6 +32,7 @@ fn main() {
 
 #[cfg(unix)]
 mod unix {
+    use crate::common;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -405,7 +406,7 @@ mod unix {
                 Ok(())
             });
         }
-        let child = command.spawn().expect("cctg run starts");
+        let child = common::spawn(&mut command).expect("cctg run starts");
         let scene = Scene {
             log: log.clone(),
             terminal,
