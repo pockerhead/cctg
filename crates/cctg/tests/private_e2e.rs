@@ -19,7 +19,7 @@ use cctg::hub::api::{ApiError, ForumTopic, Message};
 use cctg::hub::chat::{Chat, Place, PrivateChat};
 use cctg::hub::ingress::{bind, serve_agents};
 use cctg::hub::menu;
-use cctg::hub::registry::{ICON_DEAD, RegistryStore, share_line};
+use cctg::hub::registry::{ICON_ALIVE, ICON_DEAD, RegistryStore, share_line};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Transport};
 use cctg::hub::slots::{
     Control, ECHO_MARK, FALLBACK_END_NOTICE, FOREIGN_TOPIC_NOTICE, Options, Owners,
@@ -648,6 +648,19 @@ impl Hub {
         assert_eq!(self.fake.edits_of(owner(), menu), before + 1, "{data}");
     }
 
+    /// Stops the hub as an update or a restart does (`Control::Stop`): it
+    /// returns once the slot actor has its last registry snapshot on disk.
+    /// Dropping it instead cuts the actor off: a snapshot still being
+    /// written (a slow disk) leaves an older `registry.json` behind.
+    async fn stop(mut self) {
+        self.control.send(Control::Stop).unwrap();
+        let slots = self.tasks.pop().expect("the slot actor");
+        tokio::time::timeout(WAIT, slots)
+            .await
+            .expect("the hub stops")
+            .unwrap();
+    }
+
     /// The state directory's `registry.json`, as JSON.
     fn saved(&self) -> Value {
         let bytes = std::fs::read(self._state.0.join("registry.json")).unwrap_or_default();
@@ -684,7 +697,12 @@ impl Agent {
     }
 
     /// `console_keys`: it writes ⏹ into the console (TASK-073 menu tests).
+    /// It returns once the hub bound it to its session: `registered` only
+    /// says the link took the frame, and a message written before the slot
+    /// actor bound the agent waits in the buffer with a notice, as it would
+    /// for a real session whose agent is not up yet.
     async fn connect_as(hub: &Hub, private_place: bool, console_keys: bool) -> Self {
+        let from = hub.fake.ops().len();
         let stream = TcpStream::connect(hub.agent_addr).await.unwrap();
         let (read, mut write) = stream.into_split();
         let hello = AgentMsg::Hello {
@@ -717,6 +735,10 @@ impl Agent {
             agent.next().await,
             Some(HubMsg::Registered { .. })
         ));
+        hub.until("the agent bound: the alive icon", |fake| {
+            alive_since(fake, from)
+        })
+        .await;
         agent
     }
 
@@ -746,6 +768,16 @@ impl Agent {
     async fn send(&mut self, msg: AgentMsg) {
         wire::write_msg(&mut self.write, &msg).await.unwrap();
     }
+}
+
+/// A topic call after call `from` gives a topic the alive icon: the slot's
+/// session has its agent bound (the icon shows "no channel" until then).
+fn alive_since(fake: &Fake, from: usize) -> bool {
+    fake.ops()[from..].iter().any(|op| {
+        matches!(op,
+            Op::CreateTopic { icon_custom_emoji_id: Some(icon), .. }
+            | Op::EditTopic { icon_custom_emoji_id: Some(icon), .. } if icon == ICON_ALIVE)
+    })
 }
 
 fn permission(request_id: &str) -> AgentMsg {
@@ -1307,8 +1339,7 @@ async fn e2e_after_the_hub_update_a_group_slot_gets_its_private_view() {
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(agent);
-    drop(old);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    old.stop().await;
     let new = start_hub_on(&state, PRIVATE, fake.clone(), true).await;
     let mut agent = Agent::connect(&new, true).await;
     new.until("a private topic with the status", |f| {
@@ -1480,7 +1511,24 @@ async fn shared_hub(name: &str, fake: Fake) -> (Hub, Agent) {
         fake.layout(Chat::Group) == [line.as_str(), "STATUS"]
     })
     .await;
+    // The fake shows the group's status message a moment before the hub has
+    // Telegram's answer about it; an unshare that keeps the topic takes away
+    // only a status message the hub knows.
+    hub.until("the hub knows the group's status message", |fake| {
+        let status = fake.status(Chat::Group).map(|shown| shown.id);
+        status.is_some() && group_status(&hub.saved()) == status
+    })
+    .await;
     (hub, agent)
+}
+
+/// The status message of the group view in a saved `registry.json`.
+fn group_status(saved: &Value) -> Option<i64> {
+    saved["slots"][0]["views"]
+        .as_array()?
+        .iter()
+        .find(|view| view["chat"] == "group")?["status"]["message_id"]
+        .as_i64()
 }
 
 /// `/share` in the private topic: a group topic that starts with the share
@@ -1909,8 +1957,7 @@ async fn e2e_a_shared_slot_stays_shared_over_a_hub_restart() {
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     drop(agent);
-    drop(old);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    old.stop().await;
     let new = start_hub_on(&state, PRIVATE, fake.clone(), true).await;
     let mut agent = Agent::connect(&new, true).await;
     agent
@@ -2045,14 +2092,14 @@ async fn e2e_menu_sections_change_settings_and_they_survive_a_restart() {
             .starts_with("Что показывать")
     );
     hub.menu_press("menu:dl:b").await;
-    hub.menu_press("menu:th").await;
+    hub.menu_press("menu:th:0").await;
     let shown = fake.menu(owner()).unwrap();
     assert!(shown.buttons.contains(&"✅ Кратко".to_owned()), "{shown:?}");
     assert!(shown.buttons.contains(&"💭 Размышления: выкл".to_owned()));
     hub.menu_press("menu:n").await;
     hub.menu_press("menu:sn:o").await;
     // Quiet hours want the zone first.
-    hub.menu_press("menu:q").await;
+    hub.menu_press("menu:q:1").await;
     assert!(
         fake.menu(owner())
             .unwrap()
@@ -2060,7 +2107,7 @@ async fn e2e_menu_sections_change_settings_and_they_survive_a_restart() {
             .starts_with("Сколько у вас")
     );
     hub.menu_press("menu:tz:180").await;
-    hub.menu_press("menu:q").await;
+    hub.menu_press("menu:q:1").await;
     let shown = fake.menu(owner()).unwrap();
     assert!(shown.buttons.contains(&"✅ Ничего".to_owned()), "{shown:?}");
     assert!(

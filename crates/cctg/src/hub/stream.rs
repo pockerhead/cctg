@@ -52,6 +52,7 @@ use super::chat::{MessageKey, Place};
 use super::menu::Piece;
 use super::registry::{PendingCall, Stream};
 use super::scheduler::Op;
+use super::status::INTERRUPT_NOTE;
 use crate::wire::StreamItem;
 
 /// Tool calls of a turn waiting for their result, per session. A call past it
@@ -174,11 +175,18 @@ pub fn apply_line(
             }
             StreamItem::Note { text } => {
                 flush(calls, &mut steps);
+                // The interrupt note shows at every detail level: after ⏹
+                // no answer comes (TASK-073).
+                let piece = if text.starts_with(INTERRUPT_NOTE) {
+                    Piece::Interrupt
+                } else {
+                    Piece::Text
+                };
                 steps.push(Step::Send {
                     text: text.clone(),
                     merge: false,
                     format: Format::Markdown,
-                    piece: Piece::Text,
+                    piece,
                 });
             }
             // Its own message; under the rate limit it joins its neighbours like a tool line.
@@ -1053,6 +1061,9 @@ mod tests {
                 vec![result("a", None)],
                 vec![call("b", "• Bash: B")],
                 vec![result("b", Some("no"))],
+                vec![StreamItem::Note {
+                    text: "[Request interrupted by user]".into(),
+                }],
                 vec![StreamItem::TurnEnd],
             ],
         );
@@ -1071,6 +1082,7 @@ mod tests {
                 ("\u{1F4AD} Hmm.", Piece::Thinking),
                 ("• Bash: A ✓", Piece::Tool),
                 ("• Bash: B ✗ no", Piece::Tool),
+                ("[Request interrupted by user]", Piece::Interrupt),
             ]
         );
     }

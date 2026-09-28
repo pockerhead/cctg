@@ -61,6 +61,10 @@ pub struct Person {
     /// The current menu message in the General of the private chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu: Option<i64>,
+    /// No menu comes by itself, only on `/menu`: the person deleted theirs,
+    /// or Telegram refused it. Without it a person with no menu gets one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_request: bool,
     #[serde(default)]
     pub settings: Settings,
 }
@@ -70,6 +74,7 @@ impl Person {
         Self {
             chat,
             menu: None,
+            on_request: false,
             settings: Settings::default(),
         }
     }
@@ -84,7 +89,10 @@ pub struct Settings {
     /// 💭 thinking in the topics, at any detail level.
     pub thinking: bool,
     pub sound: Sound,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "hours_of_a_day"
+    )]
     pub quiet: Option<Quiet>,
     /// Minutes from UTC, [`ZONE_MIN`]..=[`ZONE_MAX`]; no daylight saving.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +150,15 @@ pub struct Quiet {
     pub to: u8,
 }
 
+/// Quiet hours as `registry.json` has them; an hour past 23 (only a hand
+/// edit writes one) reads as no quiet hours.
+fn hours_of_a_day<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Quiet>, D::Error> {
+    let quiet = Option::<Quiet>::deserialize(deserializer)?;
+    Ok(quiet.filter(|quiet| quiet.from < 24 && quiet.to < 24))
+}
+
 /// What a stream message is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Piece {
@@ -152,6 +169,8 @@ pub enum Piece {
     Thinking,
     /// A finished tool call.
     Tool,
+    /// Claude Code's own note that the user interrupted the turn.
+    Interrupt,
 }
 
 /// `piece` shows in the topics of a person with `settings`. Turn answers,
@@ -159,7 +178,7 @@ pub enum Piece {
 /// always show.
 pub fn shows(settings: &Settings, piece: Piece) -> bool {
     match piece {
-        Piece::Prompt => true,
+        Piece::Prompt | Piece::Interrupt => true,
         Piece::Thinking => settings.thinking,
         Piece::Text => settings.detail != Detail::Answers,
         Piece::Tool => settings.detail == Detail::Full,
@@ -187,8 +206,9 @@ fn local_minute(unix_secs: i64, tz: i16) -> i64 {
 
 /// A new message into the person's private chat rings. `ringing`: it would
 /// today; `asks`: a permission prompt or a question (they hold the session
-/// until answered); `counts`: a message of the session, not a status
-/// message or the menu.
+/// until answered); `counts`: what the session says (its stream, answers,
+/// replies, prompts, questions, blocks, files), not a notice, an echo, a
+/// status message or the menu.
 pub fn loud(settings: &Settings, ringing: bool, asks: bool, counts: bool, unix_secs: i64) -> bool {
     match settings.sound {
         Sound::Off => false,
@@ -212,22 +232,23 @@ pub fn change(
             new.detail = detail;
             Page::Display
         }
-        MenuPress::Thinking => {
-            new.thinking = !new.thinking;
+        MenuPress::Thinking(on) => {
+            new.thinking = on;
             Page::Display
         }
         MenuPress::SoundMode(sound) => {
             new.sound = sound;
             Page::Sound
         }
-        MenuPress::QuietToggle if new.quiet.is_some() => {
+        MenuPress::Quiet(false) => {
             new.quiet = None;
             Page::Sound
         }
-        MenuPress::QuietToggle if new.tz.is_none() => {
+        MenuPress::Quiet(true) if new.quiet.is_some() => Page::Sound,
+        MenuPress::Quiet(true) if new.tz.is_none() => {
             return Err((Page::Zone { fractions: false }, ANSWER_ZONE_FIRST));
         }
-        MenuPress::QuietToggle => {
+        MenuPress::Quiet(true) => {
             new.quiet = Some(QUIET_DEFAULT);
             Page::Sound
         }
@@ -312,9 +333,12 @@ pub enum MenuPress {
         page: u32,
     },
     Detail(Detail),
-    Thinking,
+    /// 💭 on or off: the value the button sets, so a double tap sets it
+    /// twice instead of undoing itself.
+    Thinking(bool),
     SoundMode(Sound),
-    QuietToggle,
+    /// Quiet hours on or off, as [`MenuPress::Thinking`].
+    Quiet(bool),
     QuietFrom(u8),
     QuietTo(u8),
     SetZone(i16),
@@ -356,9 +380,9 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::Slot { action, page, slot } => format!("{}:{page}:{slot}", action.code()),
         MenuPress::UpdateAll { page } => format!("up:{page}"),
         MenuPress::Detail(detail) => format!("dl:{}", detail_code(detail)),
-        MenuPress::Thinking => "th".to_owned(),
+        MenuPress::Thinking(on) => format!("th:{}", u8::from(on)),
         MenuPress::SoundMode(sound) => format!("sn:{}", sound_code(sound)),
-        MenuPress::QuietToggle => "q".to_owned(),
+        MenuPress::Quiet(on) => format!("q:{}", u8::from(on)),
         MenuPress::QuietFrom(hour) => format!("qf:{hour}"),
         MenuPress::QuietTo(hour) => format!("qt:{hour}"),
         MenuPress::SetZone(tz) => format!("tz:{tz}"),
@@ -394,13 +418,15 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
                 .into_iter()
                 .find(|detail| detail_code(*detail) == *code)?,
         ),
-        ["th"] => MenuPress::Thinking,
+        ["th", "0"] => MenuPress::Thinking(false),
+        ["th", "1"] => MenuPress::Thinking(true),
         ["sn", code] => MenuPress::SoundMode(
             [Sound::Replies, Sound::All, Sound::Off]
                 .into_iter()
                 .find(|sound| sound_code(*sound) == *code)?,
         ),
-        ["q"] => MenuPress::QuietToggle,
+        ["q", "0"] => MenuPress::Quiet(false),
+        ["q", "1"] => MenuPress::Quiet(true),
         ["qf", hour] => MenuPress::QuietFrom(hour.parse().ok()?),
         ["qt", hour] => MenuPress::QuietTo(hour.parse().ok()?),
         ["tz", minutes] => MenuPress::SetZone(minutes.parse().ok()?),
@@ -648,7 +674,7 @@ fn render_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
     };
     rows.push(vec![button(
         format!("💭 Размышления: {thinking}"),
-        MenuPress::Thinking,
+        MenuPress::Thinking(!settings.thinking),
     )]);
     "Что показывать в темах лички\n\n\
 Всё: промпты из терминала, текст Claude и строка на каждый вызов инструмента.\n\
@@ -676,10 +702,14 @@ fn render_sound(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
         None => "🌙 Тихие часы: выкл".to_owned(),
         Some(quiet) => format!("🌙 Тихие часы: с {:02} до {:02}", quiet.from, quiet.to),
     };
-    rows.push(vec![button(quiet, MenuPress::QuietToggle)]);
+    rows.push(vec![button(
+        quiet,
+        MenuPress::Quiet(settings.quiet.is_none()),
+    )]);
     if let Some(quiet) = settings.quiet {
-        let earlier = |hour: u8| (hour + 23) % 24;
-        let later = |hour: u8| (hour + 1) % 24;
+        // `% 24` first: never past `u8`, whatever the hour.
+        let earlier = |hour: u8| (hour % 24 + 23) % 24;
+        let later = |hour: u8| (hour % 24 + 1) % 24;
         rows.push(vec![
             button("с −1", MenuPress::QuietFrom(earlier(quiet.from))),
             button("с +1", MenuPress::QuietFrom(later(quiet.from))),
@@ -827,6 +857,10 @@ mod tests {
             "menu:xx:1:2",
             "status:stop",
             "menu:qf:256",
+            "menu:th",
+            "menu:q",
+            "menu:th:2",
+            "menu:q:x",
         ] {
             assert_eq!(parse_callback(junk), None, "{junk}");
         }
@@ -918,6 +952,7 @@ mod tests {
                     ..Settings::default()
                 };
                 assert!(shows(&settings, Piece::Prompt));
+                assert!(shows(&settings, Piece::Interrupt));
                 assert_eq!(shows(&settings, Piece::Thinking), thinking);
                 assert_eq!(shows(&settings, Piece::Text), detail != Detail::Answers);
                 assert_eq!(shows(&settings, Piece::Tool), detail == Detail::Full);
@@ -933,7 +968,13 @@ mod tests {
         assert_eq!(settings.sound, Sound::Replies);
         assert_eq!(settings.quiet, None);
         assert_eq!(settings.tz, None);
-        for piece in [Piece::Prompt, Piece::Text, Piece::Thinking, Piece::Tool] {
+        for piece in [
+            Piece::Prompt,
+            Piece::Text,
+            Piece::Thinking,
+            Piece::Tool,
+            Piece::Interrupt,
+        ] {
             assert!(shows(&settings, piece));
         }
         for ringing in [false, true] {
@@ -1093,6 +1134,62 @@ mod tests {
         assert!(labels.contains(&"🌙 Тихие часы: с 23 до 08".to_owned()));
         let datas = super::tests::datas(&keyboard);
         for want in ["menu:qf:22", "menu:qf:0", "menu:qt:7", "menu:qt:9"] {
+            assert!(datas.contains(&want.to_owned()), "{want}: {datas:?}");
+        }
+    }
+
+    /// A toggle carries the value it sets: a double tap (both presses on the
+    /// same keyboard) sets it twice, the second changes nothing.
+    #[test]
+    fn a_toggle_sets_its_value_and_a_repeat_changes_nothing() {
+        let before = Settings {
+            tz: Some(180),
+            ..Settings::default()
+        };
+        let (_, keyboard) = render(&Page::Display, &before, None, 0);
+        assert!(datas(&keyboard).contains(&"menu:th:0".to_owned()));
+        let (_, keyboard) = render(&Page::Sound, &before, None, 0);
+        assert!(datas(&keyboard).contains(&"menu:q:1".to_owned()));
+        for press in [MenuPress::Thinking(false), MenuPress::Quiet(true)] {
+            let (once, _) = change(&before, press).unwrap();
+            assert_ne!(once, before, "{press:?}");
+            let (twice, _) = change(&once, press).unwrap();
+            assert_eq!(twice, once, "{press:?}");
+        }
+        let on = Settings {
+            quiet: Some(QUIET_DEFAULT),
+            ..before.clone()
+        };
+        let (off, _) = change(&on, MenuPress::Quiet(false)).unwrap();
+        assert_eq!(off.quiet, None);
+        assert_eq!(change(&off, MenuPress::Quiet(false)).unwrap().0, off);
+        let (_, keyboard) = render(&Page::Sound, &on, None, 0);
+        assert!(datas(&keyboard).contains(&"menu:q:0".to_owned()));
+    }
+
+    /// An hour past 23 in `registry.json` reads as no quiet hours, and the
+    /// sound page never overflows on one.
+    #[test]
+    fn an_out_of_range_hour_reads_as_off_and_never_panics() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"quiet":{"from":250,"to":8},"tz":0}"#).unwrap();
+        assert_eq!(settings.quiet, None);
+        assert_eq!(settings.tz, Some(0));
+        let settings: Settings =
+            serde_json::from_str(r#"{"quiet":{"from":23,"to":24},"tz":0}"#).unwrap();
+        assert_eq!(settings.quiet, None);
+        let settings: Settings =
+            serde_json::from_str(r#"{"quiet":{"from":22,"to":7},"tz":0}"#).unwrap();
+        assert_eq!(settings.quiet, Some(Quiet { from: 22, to: 7 }));
+        // Made in memory past the check: the page still renders.
+        let wild = Settings {
+            quiet: Some(Quiet { from: 255, to: 250 }),
+            tz: Some(0),
+            ..Settings::default()
+        };
+        let (_, keyboard) = render(&Page::Sound, &wild, None, 0);
+        let datas = datas(&keyboard);
+        for want in ["menu:qf:14", "menu:qf:16", "menu:qt:9", "menu:qt:11"] {
             assert!(datas.contains(&want.to_owned()), "{want}: {datas:?}");
         }
     }

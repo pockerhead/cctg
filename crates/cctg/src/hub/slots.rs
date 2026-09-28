@@ -1059,6 +1059,9 @@ enum Work {
     /// A notice about a user's own message: like `Message`, but it stays in
     /// the view the user wrote in (TASK-063).
     Answer,
+    /// What the session says: a turn answer or a reply. Like `Message`, but
+    /// «Всё» rings it; notices stay quiet (TASK-073).
+    Content,
     Permission(u64),
     PromptEdit(u64),
     Question {
@@ -1538,6 +1541,9 @@ pub struct Slots {
     menus: HashMap<PrivateChat, (String, serde_json::Value)>,
     /// What the menu sent last and not answered yet shows.
     pending_menus: HashMap<PrivateChat, (String, serde_json::Value)>,
+    /// Private chats whose menu Telegram did not take for now: offered
+    /// again on the retry tick.
+    menu_later: HashSet<PrivateChat>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1680,6 +1686,7 @@ impl Slots {
             delete_later: HashSet::new(),
             menus: HashMap::new(),
             pending_menus: HashMap::new(),
+            menu_later: HashSet::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -5604,7 +5611,8 @@ impl Slots {
     ) -> Option<usize> {
         let ops = text_ops(place, session, text, kind, notify);
         let parts = ops.len();
-        self.send_messages(ops).then_some(parts)
+        self.queue_messages(|| Work::Content, false, ops)
+            .then_some(parts)
     }
 
     /// Remembers a relayed permission request; [`Self::send_prompts`] puts it
@@ -8566,6 +8574,16 @@ impl Slots {
     /// [`Self::send_messages`]; `answer`: they answer a user's own message
     /// ([`Work::Answer`]).
     fn send_as(&mut self, answer: bool, ops: Vec<Op>) -> bool {
+        let work: fn() -> Work = if answer {
+            || Work::Answer
+        } else {
+            || Work::Message
+        };
+        self.queue_messages(work, answer, ops)
+    }
+
+    /// [`Self::send_as`] with each op's job made by `work`.
+    fn queue_messages(&mut self, work: fn() -> Work, answer: bool, ops: Vec<Op>) -> bool {
         if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
@@ -8577,7 +8595,7 @@ impl Slots {
         }
         self.queued_messages += ops.len();
         for op in ops {
-            let work = if answer { Work::Answer } else { Work::Message };
+            let work = work();
             // A text for a private topic is sent again if it is lost there
             // (TASK-063).
             let text = (matches!(op, Op::Send { .. }) && op.chat().is_some_and(|c| c.is_private()))
@@ -9606,8 +9624,9 @@ impl Slots {
     }
 
     /// Every person with a topic in their usable private chat and no menu
-    /// yet gets one (TASK-073). A menu the person deleted is not sent again
-    /// by itself: `/menu` does.
+    /// gets one (TASK-073): also when the first was lost to a failure or a
+    /// hub crash before Telegram's answer. A menu the person deleted, or one
+    /// Telegram refused, is not sent again by itself: `/menu` does.
     fn offer_menus(&mut self) {
         if !self.options.menu || !self.registry.private {
             return;
@@ -9622,7 +9641,12 @@ impl Slots {
             }
         }
         for chat in chats {
-            if self.registry.person(chat).is_none() {
+            let wanted = self
+                .registry
+                .person(chat)
+                .is_none_or(|person| person.menu.is_none() && !person.on_request);
+            if wanted && !self.pending_menus.contains_key(&chat) && !self.menu_later.contains(&chat)
+            {
                 self.show_menu(chat, Page::Sessions(0));
             }
         }
@@ -9924,14 +9948,26 @@ impl Slots {
                         message.message_id
                     }
                     // A 403 closed the chat already (`Done::Landed`).
+                    Some(delivery) if forbidden(delivery) => return,
+                    // Refused: a new one would be too.
+                    Some(Err(ApiError::Telegram { code, .. })) if *code < 500 => {
+                        debug!("menu refused; it comes on /menu");
+                        if self.registry.person(chat).is_some_and(|p| p.menu.is_none()) {
+                            self.registry.person_mut(chat).on_request = true;
+                        }
+                        return;
+                    }
                     _ => {
-                        debug!("menu not sent");
+                        debug!("menu not sent; offered again later");
+                        self.menu_later.insert(chat);
                         return;
                     }
                 };
                 // The menu of then: two quick `/menu` leave the second.
                 let old = self.registry.person(chat).and_then(|person| person.menu);
-                self.registry.person_mut(chat).menu = Some(message);
+                let person = self.registry.person_mut(chat);
+                person.menu = Some(message);
+                person.on_request = false;
                 match content {
                     Some(content) => self.menus.insert(chat, content),
                     None => self.menus.remove(&chat),
@@ -9953,7 +9989,9 @@ impl Slots {
                 Some(delivery) if telegram_error(delivery, &["message to edit not found"]) => {
                     // The person deleted it: `/menu` brings a new one.
                     if self.registry.person(chat).and_then(|person| person.menu) == Some(message) {
-                        self.registry.person_mut(chat).menu = None;
+                        let person = self.registry.person_mut(chat);
+                        person.menu = None;
+                        person.on_request = true;
                         self.menus.remove(&chat);
                     }
                 }
@@ -10002,13 +10040,17 @@ impl Slots {
         let Some(person) = self.registry.person(chat) else {
             return op;
         };
-        let counts = !matches!(
+        // What the session says; notices, echoes and answers to the
+        // person's own actions stay as they are.
+        let counts = matches!(
             work,
-            Work::Status { .. }
-                | Work::Menu(_)
-                | Work::Retire(_)
-                | Work::Twin { .. }
-                | Work::Callback
+            Work::Content
+                | Work::Stream { .. }
+                | Work::Permission(_)
+                | Work::Question { .. }
+                | Work::Block(_)
+                | Work::File { .. }
+                | Work::Album { .. }
         );
         let asks = matches!(
             op,
@@ -10268,6 +10310,7 @@ impl Slots {
             self.questions.retry_edits();
             self.push_selected(None);
             self.delete_later.clear();
+            self.menu_later.clear();
             self.next_retry = now + self.options.retry_every;
         }
         self.check_candidates();
@@ -11210,7 +11253,7 @@ async fn dispatch_loop(
                 },
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
-                Work::Message | Work::Answer => Done::Message(delivery),
+                Work::Message | Work::Answer | Work::Content => Done::Message(delivery),
                 Work::Permission(key) => Done::Permission { key, seq, delivery },
                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
                 Work::Question { key, version } => Done::Question {
@@ -26057,6 +26100,49 @@ again"
         );
     }
 
+    /// TASK-073: «Только ответы» still shows that the turn was interrupted:
+    /// after ⏹ no answer comes, and the topic must say why.
+    #[tokio::test]
+    async fn only_answers_still_shows_the_interrupt_note() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-menu-interrupt");
+        let settings = menu::Settings {
+            detail: menu::Detail::Answers,
+            thinking: false,
+            ..menu::Settings::default()
+        };
+        let (mut slots, mut work) = private_streaming(&dir, settings, None);
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::TranscriptChunk {
+                session_id: A.into(),
+                from: 0,
+                to: 10,
+                lines: vec![StreamLine {
+                    end: 10,
+                    items: vec![
+                        StreamItem::Prompt { text: "go".into() },
+                        StreamItem::Note {
+                            text: "Looking.".into(),
+                        },
+                        StreamItem::Note {
+                            text: "[Request interrupted by user]".into(),
+                        },
+                    ],
+                }],
+                missing: false,
+                more: false,
+                reset: false,
+            },
+        });
+        let handed = all_work(&mut work);
+        let text = streamed(&mut slots, &handed);
+        assert!(text.contains("> go"), "{text:?}");
+        assert!(text.contains("[Request interrupted by user]"), "{text:?}");
+        assert!(!text.contains("Looking."), "{text:?}");
+    }
+
     /// TASK-073 (decision 3): while a slot shows in the group too, the
     /// owner's detail level does not apply: both views get every line. The
     /// owner's sound quiets their private chat only; the group's twin of the
@@ -26173,7 +26259,8 @@ again"
                 let kind = match work {
                     Work::Permission(_) => "permission",
                     Work::Question { .. } => "question",
-                    Work::Message | Work::Answer => "message",
+                    Work::Message | Work::Answer => "notice",
+                    Work::Content => "content",
                     Work::Status { .. } => "status",
                     Work::Menu(_) => "menu",
                     Work::Stream { .. } => "stream",
@@ -26237,10 +26324,10 @@ again"
         assert!(got.contains(&("permission", true)), "{got:?}");
         assert!(got.contains(&("question", true)), "{got:?}");
         assert!(
-            got.contains(&("message", false)),
+            got.contains(&("content", false)),
             "the answer is quiet: {got:?}"
         );
-        assert!(!got.contains(&("message", true)), "{got:?}");
+        assert!(!got.contains(&("content", true)), "{got:?}");
         // Outside the window: the answer rings again.
         let later = menu::Settings {
             quiet: Some(menu::Quiet {
@@ -26251,7 +26338,7 @@ again"
             ..menu::Settings::default()
         };
         let got = asked_sounds(later);
-        assert!(got.contains(&("message", true)), "{got:?}");
+        assert!(got.contains(&("content", true)), "{got:?}");
         assert!(got.contains(&("permission", true)), "{got:?}");
     }
 
@@ -26268,11 +26355,13 @@ again"
         // Today's behaviour without a choice.
         let got = asked_sounds(menu::Settings::default());
         assert!(got.contains(&("permission", true)), "{got:?}");
-        assert!(got.contains(&("message", true)), "{got:?}");
+        assert!(got.contains(&("content", true)), "{got:?}");
     }
 
     /// TASK-073: «Всё» rings every new message of the session, a reply too,
-    /// but not the status message or the menu.
+    /// but not the status message, the menu, or a notice: the one in
+    /// General, the one of a message that waits for the session, the
+    /// answers to the person's own actions.
     #[tokio::test]
     async fn everything_loud_rings_new_messages_but_not_the_status_or_the_menu() {
         let dir = TempDir::new("slots-menu-all");
@@ -26281,15 +26370,31 @@ again"
             sound: menu::Sound::All,
             ..menu::Settings::default()
         };
+        // No agent yet: the message waits and its notice goes.
+        slots.on_control(owner_says(Some(700), 5002, "early"));
         connect(&mut slots, 1, A, Some(10));
         slots.on_reply(1, "a reply");
         slots.on_control(owner_says(None, 5001, "/menu"));
+        slots.on_control(owner_says(None, 5003, "hello"));
         slots.pump();
-        let got = sounds(&all_work(&mut work), private_owner());
-        assert!(got.contains(&("message", true)), "{got:?}");
+        let handed = all_work(&mut work);
+        let got = sounds(&handed, private_owner());
+        assert!(got.contains(&("content", true)), "{got:?}");
         assert!(got.contains(&("menu", false)), "{got:?}");
+        let notices: Vec<&str> = handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (Work::Message | Work::Answer, Op::Send { text, .. }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(notices.contains(&buffer::QUEUED_NOTICE), "{notices:?}");
         assert!(
-            got.iter().all(|(kind, loud)| *loud == (*kind == "message")),
+            notices.contains(&PRIVATE_GENERAL_MENU_NOTICE),
+            "{notices:?}"
+        );
+        assert!(
+            got.iter().all(|(kind, loud)| *loud == (*kind == "content")),
             "{got:?}"
         );
         // A status message stays quiet; the same send as a message rings.
@@ -26308,9 +26413,16 @@ again"
             Op::Send { notify: false, .. }
         ));
         assert!(matches!(
-            slots.voiced(&Work::Message, send),
+            slots.voiced(&Work::Content, send.clone()),
             Op::Send { notify: true, .. }
         ));
+        // Notices, echoes, answers to the person's own actions: as today.
+        for work in [Work::Message, Work::Answer] {
+            assert!(matches!(
+                slots.voiced(&work, send.clone()),
+                Op::Send { notify: false, .. }
+            ));
+        }
     }
 
     /// TASK-073: in a team each person's choice applies to the slots of
@@ -26410,7 +26522,7 @@ again"
         slots.on_control(press_in(private_owner(), 700, 5900, "menu:s:0"));
         slots.on_control(menu_press(MENU - 1, "menu:d"));
         // A setting still counts, but the old message stays as it is.
-        slots.on_control(menu_press(MENU - 1, "menu:th"));
+        slots.on_control(menu_press(MENU - 1, "menu:th:0"));
         slots.pump();
         let handed = all_work(&mut work);
         assert!(
@@ -26496,8 +26608,111 @@ again"
             })),
         });
         assert_eq!(slots.registry.person(owner_chat()).unwrap().menu, None);
+        assert!(slots.registry.person(owner_chat()).unwrap().on_request);
+        slots.pump();
+        slots.next_retry = Instant::now();
+        slots.on_tick();
         slots.pump();
         assert!(menu_sends(&all_work(&mut work)).is_empty());
+        // `/menu` brings one; from then on it is an ordinary menu.
+        slots.on_control(owner_says(None, 5001, "/menu"));
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 1);
+        menu_sent(&mut slots, MENU + 1);
+        assert!(!slots.registry.person(owner_chat()).unwrap().on_request);
+    }
+
+    /// TASK-073: a first menu lost on its way (a 5xx, no connection) is
+    /// offered again on the retry tick, never while one is in flight; so is
+    /// one lost to a hub crash (a person in `registry.json` with no menu).
+    /// One Telegram refused comes on `/menu` only.
+    #[tokio::test]
+    async fn a_menu_lost_on_its_way_is_offered_again() {
+        let tick = |slots: &mut Slots| {
+            slots.next_retry = Instant::now();
+            slots.on_tick();
+            slots.pump();
+        };
+        let dir = TempDir::new("slots-menu-lost");
+        let mut slots = stalled_slots(&dir, menu_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.pump();
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 1);
+        slots.pump();
+        assert!(menu_sends(&all_work(&mut work)).is_empty(), "in flight");
+        for lost in [refused(502, "Bad Gateway"), None] {
+            slots.on_done(Done::Menu {
+                job: MenuJob::Show { chat: owner_chat() },
+                delivery: lost,
+            });
+            slots.pump();
+            assert!(menu_sends(&all_work(&mut work)).is_empty(), "not at once");
+            tick(&mut slots);
+            assert_eq!(menu_sends(&all_work(&mut work)).len(), 1, "again");
+        }
+        menu_sent(&mut slots, MENU);
+        tick(&mut slots);
+        assert!(menu_sends(&all_work(&mut work)).is_empty());
+        assert_eq!(
+            slots.registry.person(owner_chat()).unwrap().menu,
+            Some(MENU)
+        );
+
+        // After a crash: the person is known, the menu is not.
+        let dir = TempDir::new("slots-menu-crash");
+        let mut slots = stalled_slots(&dir, menu_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.registry.person_mut(owner_chat());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.pump();
+        assert_eq!(menu_sends(&all_work(&mut work)).len(), 1, "after a crash");
+        // Refused: not by itself any more.
+        slots.on_done(Done::Menu {
+            job: MenuJob::Show { chat: owner_chat() },
+            delivery: refused(400, "Bad Request: something"),
+        });
+        tick(&mut slots);
+        assert!(menu_sends(&all_work(&mut work)).is_empty(), "refused");
+        assert!(slots.registry.person(owner_chat()).unwrap().on_request);
+    }
+
+    /// TASK-073: a toggle's button carries the value it sets: a double tap
+    /// sets it once, the second press changes nothing.
+    #[tokio::test]
+    async fn a_double_tap_on_a_toggle_sets_it_once() {
+        let dir = TempDir::new("slots-menu-tap");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        let twice = [
+            Some(menu::ANSWER_SAVED.to_owned()),
+            Some(menu::ANSWER_UNCHANGED.to_owned()),
+        ];
+        slots.on_control(menu_press(MENU, "menu:th:0"));
+        slots.on_control(menu_press(MENU, "menu:th:0"));
+        assert_eq!(callback_answers(&all_work(&mut work)), twice);
+        let settings = |slots: &Slots| {
+            slots
+                .registry
+                .person(owner_chat())
+                .unwrap()
+                .settings
+                .clone()
+        };
+        assert!(!settings(&slots).thinking);
+        slots.registry.person_mut(owner_chat()).settings.tz = Some(0);
+        slots.on_control(menu_press(MENU, "menu:q:1"));
+        slots.on_control(menu_press(MENU, "menu:q:1"));
+        assert_eq!(callback_answers(&all_work(&mut work)), twice);
+        assert!(settings(&slots).quiet.is_some());
+        slots.on_control(menu_press(MENU, "menu:q:0"));
+        slots.on_control(menu_press(MENU, "menu:q:0"));
+        assert_eq!(callback_answers(&all_work(&mut work)), twice);
+        assert!(settings(&slots).quiet.is_none());
     }
 
     /// TASK-073: quiet hours come on only with a time zone; the zone page
@@ -26507,7 +26722,7 @@ again"
         let dir = TempDir::new("slots-menu-zone");
         let (mut slots, mut work) = menu_slot(&dir, menu_options());
         slots.on_control(menu_press(MENU, "menu:n"));
-        slots.on_control(menu_press(MENU, "menu:q"));
+        slots.on_control(menu_press(MENU, "menu:q:1"));
         let handed = all_work(&mut work);
         assert_eq!(
             callback_answers(&handed),
@@ -26521,7 +26736,7 @@ again"
         );
         slots.on_control(menu_press(MENU, "menu:tz:180"));
         slots.on_control(menu_press(MENU, "menu:tz:9999"));
-        slots.on_control(menu_press(MENU, "menu:q"));
+        slots.on_control(menu_press(MENU, "menu:q:1"));
         slots.on_control(menu_press(MENU, "menu:qf:22"));
         slots.on_control(menu_press(MENU, "menu:qt:99"));
         let handed = all_work(&mut work);
