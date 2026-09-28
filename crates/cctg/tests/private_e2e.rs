@@ -6,8 +6,8 @@
 //! message of the group and its twin in the private chat have different
 //! ids. Private chats are on (`Options::owners`) with one owner. Sharing a
 //! slot to the group and taking it out (TASK-064), then the menu in the
-//! private chat's General (TASK-073) and its compact turn view (TASK-076),
-//! at the end.
+//! private chat's General (TASK-073), its compact turn view (TASK-076) and
+//! the display of each view by its own settings (TASK-078), at the end.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -2574,4 +2574,225 @@ async fn e2e_a_refused_quote_falls_back_to_plain_text() {
         hub.fake.layout(owner()).last().map(String::as_str),
         Some("STATUS")
     );
+}
+
+// ---------------------------------------------------------------- TASK-078
+
+/// An agent in the private chat that reads transcripts (TASK-078), like
+/// [`Agent::serve`], and also acks every permission verdict and hands it on:
+/// its writer for the test's own frames, the verdicts.
+async fn serve_with_verdicts(
+    hub: &Hub,
+    transcript: Transcript,
+) -> (
+    Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
+    mpsc::UnboundedReceiver<(String, Behavior)>,
+    JoinHandle<()>,
+) {
+    let Agent { mut reader, write } = Agent::connect_with(hub, true, false, true).await;
+    let write = Arc::new(tokio::sync::Mutex::new(write));
+    let (verdicts, verdicts_rx) = mpsc::unbounded_channel();
+    let writer = write.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let mut line = Vec::new();
+            let read = tokio::time::timeout(
+                Duration::from_secs(3600),
+                wire::read_line(&mut reader, &mut line),
+            )
+            .await;
+            if !matches!(read, Ok(Ok(()))) {
+                return;
+            }
+            let answer = match wire::decode(&line).unwrap() {
+                HubMsg::TranscriptRead {
+                    session_id, from, ..
+                } => transcript.chunk(session_id, from),
+                HubMsg::PermissionVerdict {
+                    request_id,
+                    behavior,
+                    verdict_id: Some(verdict_id),
+                } => {
+                    let _ = verdicts.send((request_id, behavior));
+                    AgentMsg::PermissionAck { verdict_id }
+                }
+                _ => continue,
+            };
+            wire::write_msg(&mut *writer.lock().await, &answer)
+                .await
+                .unwrap();
+        }
+    });
+    (write, verdicts_rx, task)
+}
+
+/// The last turn message `chat` shows: the last message that starts with
+/// its text.
+fn turn_message_in(fake: &Fake, chat: Chat) -> Option<Shown> {
+    fake.shown(chat)
+        .into_iter()
+        .rev()
+        .find(|shown| shown.text.starts_with("Смотрю."))
+}
+
+/// One turn `n` through the transcript: a prompt, text, two calls, 💭, the
+/// answer and the turn's end. It returns once both topics show the answer
+/// with their one status message below it.
+async fn shared_turn(hub: &Hub, transcript: &Transcript, n: u32) {
+    transcript.push(vec![StreamItem::Prompt {
+        text: format!("go {n}"),
+    }]);
+    transcript.push(vec![StreamItem::Note {
+        text: "Смотрю.".into(),
+    }]);
+    for call in 1..=2 {
+        let id = format!("c{call}");
+        transcript.push(vec![
+            StreamItem::Call {
+                id: id.clone(),
+                line: format!("• Bash: {id}"),
+            },
+            StreamItem::Result { id, error: None },
+        ]);
+    }
+    transcript.push(vec![StreamItem::Thinking {
+        text: "Готовлю ответ.".into(),
+    }]);
+    let answer = format!("готово {n}");
+    hub.hook(HookEvent::Stop {
+        prompt_id: None,
+        last_assistant_message: Some(answer.clone()),
+    })
+    .await;
+    transcript.push(vec![StreamItem::TurnEnd]);
+    hub.until("the answer, then the one status, in both topics", |fake| {
+        [owner(), Chat::Group].into_iter().all(|chat| {
+            let layout = fake.layout(chat);
+            layout.ends_with(&[answer.clone(), "STATUS".to_owned()])
+                && layout.iter().filter(|text| *text == "STATUS").count() == 1
+        })
+    })
+    .await;
+}
+
+/// TASK-078: a shared slot shows each view by its own settings: the owner's
+/// private topic «Кратко», the group «Всё». Prompts, answers and the status
+/// show in both, a press on the group's twin decides the prompt; after
+/// «👥 Группа → Кратко» and «👤 Личка → Всё» the next turn is the other way
+/// round, and the group's setting is saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_shared_slot_shows_brief_in_private_and_everything_in_the_group() {
+    let hub = start_hub(
+        "per-view",
+        Mode::Private {
+            share_new: true,
+            menu: true,
+        },
+        Fake::default(),
+    )
+    .await;
+    hub.start_streamed().await;
+    let transcript = Transcript::default();
+    let (writer, mut verdicts, _agent) = serve_with_verdicts(&hub, transcript.clone()).await;
+    hub.until("the status in both topics and the pinned menu", |fake| {
+        fake.layout(owner()).contains(&"STATUS".to_owned())
+            && fake.layout(Chat::Group).contains(&"STATUS".to_owned())
+            && fake.menu(owner()).is_some()
+    })
+    .await;
+    hub.menu_press("menu:dl:b").await;
+
+    shared_turn(&hub, &transcript, 1).await;
+    let full = "Смотрю.\n• Bash: c1 ✓\n• Bash: c2 ✓\n💭 Готовлю ответ.";
+    hub.until("the group's turn message with every line", |fake| {
+        turn_message_in(fake, Chat::Group).is_some_and(|shown| shown.text == full)
+    })
+    .await;
+    let private = hub.fake.layout(owner());
+    assert!(
+        private.iter().all(|text| !text.contains("• Bash")),
+        "{private:#?}"
+    );
+    assert_eq!(
+        turn_message_in(&hub.fake, owner()).map(|shown| shown.text),
+        Some("Смотрю.\n💭 Готовлю ответ.".to_owned())
+    );
+    let group = hub.fake.layout(Chat::Group);
+    assert!(group.contains(&"> go 1".to_owned()), "{group:#?}");
+    let answer = hub
+        .fake
+        .shown(Chat::Group)
+        .into_iter()
+        .find(|shown| shown.text == "готово 1")
+        .expect("the answer in the group");
+    assert!(answer.loud, "{answer:?}");
+    assert_eq!(
+        hub.fake.layout(Chat::Group).last().map(String::as_str),
+        Some("STATUS")
+    );
+
+    // A prompt shows in both; a press on the group's twin decides it.
+    wire::write_msg(&mut *writer.lock().await, &permission("abcde"))
+        .await
+        .unwrap();
+    hub.until("the prompt in both topics", |fake| {
+        asks_in(fake, owner(), "abcde") && asks_in(fake, Chat::Group, "abcde")
+    })
+    .await;
+    let twin = prompt_in(&hub.fake, Chat::Group, "abcde").unwrap().id;
+    hub.press(Chat::Group, twin, "allow:abcde");
+    let verdict = tokio::time::timeout(WAIT, verdicts.recv())
+        .await
+        .expect("a verdict");
+    assert_eq!(verdict, Some(("abcde".to_owned(), Behavior::Allow)));
+    hub.until("both prompts show the decision", |fake| {
+        allowed_in(fake, owner(), "abcde") && allowed_in(fake, Chat::Group, "abcde")
+    })
+    .await;
+
+    // The other way round.
+    hub.menu_press("menu:dg").await;
+    let menu = hub.fake.menu(owner()).unwrap();
+    assert!(
+        menu.text.starts_with("Что показывать в темах группы"),
+        "{menu:?}"
+    );
+    assert!(menu.buttons.contains(&"· 👁 Показ".to_owned()), "{menu:?}");
+    assert!(
+        menu.buttons.contains(&"✅ 👥 Группа".to_owned()),
+        "{menu:?}"
+    );
+    hub.menu_press("menu:gdl:b").await;
+    hub.menu_press("menu:dl:f").await;
+    shared_turn(&hub, &transcript, 2).await;
+    hub.until("the private turn message with every line", |fake| {
+        turn_message_in(fake, owner()).is_some_and(|shown| shown.text == full)
+    })
+    .await;
+    assert_eq!(
+        turn_message_in(&hub.fake, Chat::Group).map(|shown| shown.text),
+        Some("Смотрю.\n💭 Готовлю ответ.".to_owned())
+    );
+    let group = hub.fake.layout(Chat::Group);
+    let second = group
+        .iter()
+        .position(|text| text == "> go 2")
+        .expect("the second prompt");
+    assert!(
+        group[second..].iter().all(|text| !text.contains("• Bash")),
+        "{group:#?}"
+    );
+    assert_eq!(
+        hub.fake.layout(Chat::Group).last().map(String::as_str),
+        Some("STATUS")
+    );
+    let saved = async {
+        while hub.saved()["people"][0]["settings"]["group"]["detail"] != "brief" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(WAIT, saved)
+        .await
+        .expect("the group's setting saved");
+    assert_eq!(hub.saved()["people"][0]["settings"]["detail"], "full");
 }

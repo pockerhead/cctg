@@ -4,9 +4,11 @@
 //! and in the group. The slots actor answers the session in one of them,
 //! the primary view (the owner's), exactly as it did in the group before;
 //! every message it puts there goes to each other view as a twin, and every
-//! later call about that message (an edit, a delete, the stream writing
-//! into it) goes to the twins as well. A press or a reply on a twin counts
-//! for its primary message, so the first press in any view decides.
+//! later call about that message (an edit or a delete) goes to the twins as
+//! well. A press or a reply on a twin counts for its primary message, so the
+//! first press in any view decides. Turn lines and the turn message are not
+//! twinned: a mirror topic has its own stream (TASK-078,
+//! [`super::stream::MirrorTurn`]); a turn answer is.
 //!
 //! This is the book of twins: which twin a primary message has in each
 //! mirror chat, known once Telegram answered both sends (like the message
@@ -24,9 +26,7 @@
 //! - A call about a primary message whose twin is still on its way waits
 //!   in the book, the newest one only (every call carries the whole text; a
 //!   delete wins over an edit), and goes once the twin's id is known.
-//! - A twin Telegram did not take is lost: calls about it are dropped,
-//!   except content the stream writes into it, which the actor sends as a
-//!   new twin message instead ([`Write::Lost`]).
+//! - A twin Telegram did not take is lost: calls about it are dropped.
 //! - At most [`MAX_TWINS`] primary messages are remembered; the oldest go.
 //! - The links of lasting messages (subagent blocks, Resume offers) are
 //!   also kept apart, at most [`MAX_LASTING`], for `registry.json`: after a
@@ -111,19 +111,23 @@ pub enum Write {
     Lost(Chat),
 }
 
+/// What [`Mirror::detach`] took from the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detached {
+    /// A twin Telegram shows.
+    Shown(MessageKey),
+    /// A twin send still on its way: it is deleted once it comes.
+    Sending(u64),
+    /// Nothing, or a twin that was lost.
+    None,
+}
+
 /// What an answer asks of the actor.
 #[derive(Debug)]
 pub enum Follow {
     /// A call kept for a twin whose id is known now: `op` is about the
     /// primary message, to be pointed at `twin`.
     Write { twin: MessageKey, op: Op },
-    /// A call kept for a twin that was lost: stream content goes as a new
-    /// twin message of `primary` in `chat`, anything else is dropped.
-    Lost {
-        primary: MessageKey,
-        chat: Chat,
-        op: Op,
-    },
     /// A twin whose primary send made no message: it goes.
     Delete(MessageKey),
 }
@@ -164,7 +168,8 @@ impl Mirror {
     }
 
     /// A new twin in topic `to` of `primary`, a message Telegram shows
-    /// already (stream content whose twin was lost, [`Follow::Lost`]).
+    /// already (the status message of a mirror topic whose own stream
+    /// buried the old twin, TASK-078).
     pub fn send_for(&mut self, primary: MessageKey, to: Place) -> Option<u64> {
         let id = self.open(to, Primary::Key(primary))?;
         self.set(primary, to, Twin::Sending(id));
@@ -259,11 +264,7 @@ impl Mirror {
             }
             (Primary::Key(primary), None) => {
                 self.set(primary, send.to, Twin::Lost);
-                send.queued.map(|op| Follow::Lost {
-                    primary,
-                    chat: send.to.chat,
-                    op,
-                })
+                None
             }
             (Primary::Nothing, Some(twin_id)) if send.ghost => {
                 Some(Follow::Delete(MessageKey::new(send.to.chat, twin_id)))
@@ -343,9 +344,8 @@ impl Mirror {
         }
     }
 
-    /// Where a call about `primary` (`op`, an edit, a delete or stream
-    /// content written into it) goes in each mirror chat the book knows a
-    /// twin in; one queued replaces the one queued before it, but never a
+    /// Where a call about `primary` (`op`, an edit or a delete) goes in each
+    /// mirror chat the book knows a twin in; one queued replaces the one queued before it, but never a
     /// delete. Empty: the book knows no twin of it.
     pub fn write(&mut self, primary: MessageKey, op: &Op) -> Vec<Write> {
         let Some(twins) = self.twins.get(&primary) else {
@@ -453,6 +453,47 @@ impl Mirror {
             }
         }
         shown
+    }
+
+    /// The twin of `primary` in `chat` leaves the book (TASK-078): a status
+    /// twin that became the mirror's own turn content or is cleared away.
+    /// No later call about `primary` goes to it; one still on its way is
+    /// deleted once it comes.
+    pub fn detach(&mut self, primary: MessageKey, chat: Chat) -> Detached {
+        let Some(twins) = self.twins.get_mut(&primary) else {
+            return Detached::None;
+        };
+        let Some(at) = twins.iter().position(|(of, _)| of.chat == chat) else {
+            return Detached::None;
+        };
+        let (to, twin) = twins.remove(at);
+        if twins.is_empty() {
+            self.twins.remove(&primary);
+        }
+        match twin {
+            Twin::Shown(id) => {
+                let key = MessageKey::new(to.chat, id);
+                self.back.remove(&key);
+                Detached::Shown(key)
+            }
+            Twin::Sending(id) => match self.sends.get_mut(&id) {
+                Some(send) if send.answer.is_none() => {
+                    send.primary = Primary::Nothing;
+                    send.ghost = true;
+                    send.queued = None;
+                    Detached::Sending(id)
+                }
+                Some(send) => {
+                    let answer = send.answer.flatten();
+                    self.sends.remove(&id);
+                    answer.map_or(Detached::None, |twin| {
+                        Detached::Shown(MessageKey::new(to.chat, twin))
+                    })
+                }
+                None => Detached::None,
+            },
+            Twin::Lost => Detached::None,
+        }
     }
 
     /// The twin of `primary` shown in `chat`.
@@ -695,33 +736,20 @@ mod tests {
         ));
     }
 
+    /// TASK-078: a call waiting for a twin Telegram did not take is dropped.
     #[test]
-    fn content_for_a_lost_twin_goes_back_to_the_actor() {
+    fn a_call_for_a_lost_twin_is_dropped() {
         let mut mirror = Mirror::default();
         let id = mirror.send(1, group(), true, false).unwrap();
         mirror.primary_answered(1, owner(), Landed::Message(5));
         let primary = MessageKey::new(owner(), 5);
-        let write = Op::Stream {
-            chat: owner(),
-            thread_id: 9,
-            text: "more".into(),
-            html: None,
-            merge: true,
-            restart: false,
-            notify: false,
-            into: Some(5),
-        };
-        mirror.write(primary, &write);
-        let follows = mirror.twin_answered(id, None);
-        assert!(matches!(
-            follows.as_slice(),
-            [Follow::Lost { primary: key, chat: Chat::Group, .. }] if *key == primary
-        ));
+        mirror.write(primary, &edit(owner(), 5, "waits"));
+        assert!(mirror.twin_answered(id, None).is_empty());
         assert_eq!(
             mirror.write(primary, &edit(owner(), 5, "x")),
             [Write::Lost(Chat::Group)]
         );
-        // The actor sends it as a new twin, which then takes the calls.
+        // A new twin of it (the status of a mirror topic) takes the calls.
         let again = mirror.send_for(primary, group()).unwrap();
         mirror.twin_answered(again, Some(60));
         assert_eq!(
@@ -873,5 +901,56 @@ mod tests {
             assert!(mirror.send(seq, group(), false, false).is_some());
         }
         assert!(mirror.send(9999, group(), false, false).is_none());
+    }
+
+    /// TASK-078: a detached twin takes no call about its primary message,
+    /// maps back to nothing, and one still on its way is deleted once it
+    /// comes.
+    #[test]
+    fn a_detached_twin_takes_no_call() {
+        let mut mirror = Mirror::default();
+        // Shown.
+        let shown = mirror.send(1, group(), true, false).unwrap();
+        mirror.primary_answered(1, owner(), Landed::Message(5));
+        mirror.twin_answered(shown, Some(50));
+        let primary = MessageKey::new(owner(), 5);
+        assert_eq!(
+            mirror.detach(primary, Chat::Group),
+            Detached::Shown(MessageKey::new(Chat::Group, 50))
+        );
+        assert!(mirror.write(primary, &edit(owner(), 5, "x")).is_empty());
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 50)), None);
+        assert!(!mirror.knows(primary, Chat::Group));
+        assert_eq!(mirror.detach(primary, Chat::Group), Detached::None);
+        // On its way: taken away once Telegram answers.
+        let sending = mirror.send(2, group(), true, false).unwrap();
+        mirror.primary_answered(2, owner(), Landed::Message(6));
+        let second = MessageKey::new(owner(), 6);
+        assert_eq!(
+            mirror.detach(second, Chat::Group),
+            Detached::Sending(sending)
+        );
+        assert!(!mirror.knows(second, Chat::Group));
+        assert!(matches!(
+            mirror.twin_answered(sending, Some(60)).as_slice(),
+            [Follow::Delete(key)] if *key == MessageKey::new(Chat::Group, 60)
+        ));
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 60)), None);
+        assert_eq!(mirror.waiting(), 0);
+        // A new twin of a shown message, answered: shown.
+        let again = mirror.send_for(second, group()).unwrap();
+        mirror.twin_answered(again, Some(61));
+        assert_eq!(
+            mirror.detach(second, Chat::Group),
+            Detached::Shown(MessageKey::new(Chat::Group, 61))
+        );
+        // Lost: nothing to clear away.
+        let lost = mirror.send(3, group(), true, false).unwrap();
+        mirror.primary_answered(3, owner(), Landed::Message(7));
+        mirror.twin_answered(lost, None);
+        assert_eq!(
+            mirror.detach(MessageKey::new(owner(), 7), Chat::Group),
+            Detached::None
+        );
     }
 }

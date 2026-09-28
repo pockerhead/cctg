@@ -194,11 +194,26 @@
 //! ([`Registry::primary_view`]): everything above happens there, the stream
 //! offset moves with it, and every message the actor puts there and every
 //! later call about it goes to the other views, the group's, as twins
-//! ([`mirror`]); at most [`MAX_TWIN_POSTS`] new twins wait for Telegram,
-//! more are dropped and the mirror topic is told once it caught up. A
-//! press or a reply on a twin counts for its primary message; a user's
-//! message, a notice or a command answer in a mirror topic moves the status
-//! message in every view. A user's message goes to the session once and
+//! ([`mirror`]); at most [`MAX_TWIN_POSTS`] new twins (also the new
+//! messages of a mirror topic's own turn stream) wait for Telegram, more
+//! are dropped and the mirror topic is told once it caught up. A press or a
+//! reply on a twin counts for its primary message; a user's message, a
+//! notice or a command answer in a mirror topic moves the status message in
+//! every view. Turn lines and the turn message are no twins (TASK-078): a
+//! mirror topic has a turn stream of its own ([`stream::MirrorTurn`]), fed
+//! the steps of the same reads and shown by that view's settings; turn
+//! answers, prompts, questions, blocks, Resume offers, notices, files and
+//! the status message stay twins. A mirror's stream turns the status twin
+//! into its turn message as the primary does with the status message; the
+//! twin goes when only the primary did, and a new twin of the primary
+//! status message goes below what the mirror's stream put there while the
+//! primary one stays where it is. What else comes into a mirror topic
+//! closes only that topic's turn message. Known limits: a mirror's turn
+//! message Telegram did not take loses its pieces; an answer the private
+//! chat refused and that went later may show in the group below the next
+//! turn's lines; a status twin a prompt pushed out of the group's queue
+//! comes back only with the next move of the status message or the
+//! mirror's next new turn message. A user's message goes to the session once and
 //! shows in the slot's other views as an echo signed with its author's name
 //! ([`ECHO_MARK`]). Every agent gets the private chat's messages; their ✍
 //! is tracked only for one that announced `private_place`. The twins of
@@ -238,17 +253,19 @@
 //! counts only in the private chat it came from, acts only on slots that
 //! show there, and edits only the person's current menu, once per press at
 //! most (nothing when it shows the same). The detail level filters the
-//! stream steps of a slot that shows in its owner's private chat alone; a
-//! slot that shows anywhere else too keeps the full layout in every view.
+//! stream steps of each view by that view's settings (TASK-078): the
+//! owner's in their private chat, the owner's group settings
+//! ([`menu::Settings::group`], by default everything) in the group topic of
+//! the slot; the owner is the person of the slot's first private view.
 //! The sound setting changes the sound of new messages into the private
 //! chat only, where they are handed out; the group's twins keep theirs. The
 //! menu does not refresh itself (↻ does). Its logs carry ordinals and fixed
 //! text: no titles, chat ids, times or time zones.
 //!
 //! Compact turn (TASK-076): the turn view of the menu acts where the detail
-//! level does. In the compact view the tool lines and 💭 of the turn
-//! message go into Telegram's collapsed quote ([`stream::Open`]); nothing
-//! else changes, no edit is added and nothing is kept. A turn message goes
+//! level does, in each view by that view's settings. In the compact view
+//! the tool lines and 💭 of the turn message go into Telegram's collapsed
+//! quote ([`stream::Open`]); nothing else changes, no edit is added and nothing is kept. A turn message goes
 //! on only in the view it was made in: a change of the view (the menu, a
 //! share) starts the next one.
 //!
@@ -276,7 +293,7 @@ use super::devices::Devices;
 use super::fetch::{self, Fetch, Fetched};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
 use super::menu::{self, MenuPress, Page, RowState, SlotAction};
-use super::mirror::{Follow, Landed, Mirror, Write};
+use super::mirror::{Detached, Follow, Landed, Mirror, Write};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
 use super::registry::{
@@ -285,7 +302,7 @@ use super::registry::{
 };
 use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome};
 use super::status::{self, Activity, Buttons, Press, ShareButton};
-use super::stream::{self, Format, Held, Live, Open, Step};
+use super::stream::{self, Format, Held, Live, MirrorOp, Open, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
 };
@@ -446,8 +463,7 @@ pub fn continue_text(agents: &[String]) -> String {
 /// mirror topic gets no twin until it caught up, then one notice.
 pub const MAX_TWIN_POSTS: usize = MAX_QUEUED_MESSAGES / 2;
 /// Told in a mirror topic once it caught up after twins were dropped.
-pub const MIRROR_GAP_NOTICE: &str =
-    "⋯ Часть сообщений сюда не попала: Telegram не успевал. Всё есть в личке владельца.";
+pub const MIRROR_GAP_NOTICE: &str = "⋯ Часть сообщений сюда не попала: Telegram не успевал.";
 /// Told in the group's General once per private chat the bot may not write
 /// to (TASK-063).
 pub const PRIVATE_CLOSED_NOTICE: &str = "Бот не может писать владельцу устройства в личку: откройте чат с ботом и нажмите Start (или разблокируйте бота). До этого сессии идут только сюда.";
@@ -734,10 +750,12 @@ enum Done {
         closed: bool,
     },
     /// A call in a mirror topic was answered (TASK-063): `id` its twin send
-    /// in the [`Mirror`], `place` the topic of a new message.
+    /// in the [`Mirror`], `place` the topic of a new message, `turn` a call
+    /// of that topic's own turn stream (TASK-078).
     Twin {
         id: Option<u64>,
         place: Option<Place>,
+        turn: Option<(Place, u64)>,
         delivery: Option<Delivery>,
     },
     /// A call that clears an old status message away.
@@ -1115,11 +1133,14 @@ enum Work {
     /// A call in a mirror topic (TASK-063): `id` its twin send in the
     /// [`Mirror`] when the answer links it, `place` the topic of a new
     /// message, `status` the text of a status message or of its edit (it
-    /// goes like the primary one: with the status of when it goes).
+    /// goes like the primary one: with the status of when it goes), `turn`
+    /// a message or write of a mirror topic's own turn stream, by its number
+    /// there (TASK-078).
     Twin {
         id: Option<u64>,
         place: Option<Place>,
         status: Option<LiveText>,
+        turn: Option<(Place, u64)>,
     },
 }
 
@@ -1130,6 +1151,9 @@ struct TwinCall {
     /// A status message of this slot, or its edit: it goes with the status
     /// of when it goes ([`Outbox::submit_status`]).
     status: Option<SlotId>,
+    /// A call of the mirror topic's own turn stream, by its number there
+    /// (TASK-078).
+    turn: Option<(Place, u64)>,
 }
 
 /// How a twin's answer is linked in the [`Mirror`].
@@ -1519,6 +1543,12 @@ pub struct Slots {
     status_twins: HashMap<u64, LiveText>,
     /// Mirror topics that missed twins; told once the mirror caught up.
     gaps: HashSet<Place>,
+    /// The turn stream of each mirror topic (TASK-078), in memory.
+    mirror_turns: HashMap<Place, stream::MirrorTurn>,
+    /// `on_chunk` hands out the actions it decided: the mirror turns were
+    /// closed when the read decided its answers, `hand_twin` closes none
+    /// again (TASK-078).
+    read_closes_mirrors: bool,
     /// Each slot's primary topic as last seen: a change moves the status.
     primaries: HashMap<SlotId, Place>,
     /// The owner of each top-level session by its SessionStart's device
@@ -1681,6 +1711,8 @@ impl Slots {
             twin_posts: 0,
             status_twins: HashMap::new(),
             gaps: HashSet::new(),
+            mirror_turns: HashMap::new(),
+            read_closes_mirrors: false,
             primaries,
             hook_owners: HashMap::new(),
             closed_told: HashSet::new(),
@@ -3338,9 +3370,14 @@ impl Slots {
             } => return self.on_pinned(chat, message_id, pinned),
             Control::Posted { place } => {
                 if let Some(slot) = self.registry.slot_by_topic(place) {
-                    // In a mirror topic the status moves in every view.
+                    // In a mirror topic the status moves in every view, and
+                    // that topic's own stream does not take the status twin
+                    // until a new one went in (TASK-078).
                     let primary = self.registry.place(slot).unwrap_or(place);
                     self.bottoms.entry(primary).or_default().foreign = true;
+                    if primary != place {
+                        self.bottoms.entry(place).or_default().foreign = true;
+                    }
                     self.close_turn_message(place);
                 }
                 return;
@@ -3442,6 +3479,9 @@ impl Slots {
                     // (TASK-063).
                     Some(primary) if primary != place => {
                         self.bottoms.entry(primary).or_default().foreign = true;
+                        // Below the status twin there (TASK-078).
+                        let bottom = self.bottoms.entry(place).or_default();
+                        bottom.last = bottom.last.max(input.message_id);
                     }
                     // It is below the status message now.
                     _ => {
@@ -5107,15 +5147,26 @@ impl Slots {
             Answer(Vec<(u64, Op)>),
             Release(Held),
             React(MessageKey),
+            /// A call of a mirror topic's own turn stream (TASK-078).
+            Mirror(Place, MirrorOp),
+            /// What becomes of a mirror topic's status twin after the read
+            /// (TASK-078): `clear` it goes, `fresh` a new one goes below.
+            MirrorStatus {
+                place: Place,
+                clear: bool,
+                fresh: bool,
+            },
         }
         let now = Instant::now();
         let every = self.options.stream_every;
         let hold = self.options.hold_answer;
         let slot = self.current_slot(session);
         let place = slot.and_then(|slot| self.registry.place(slot));
-        // TASK-073: what the owner chose to see, while the slot shows in
-        // their private chat alone.
-        let display = slot.map(|slot| self.display_of(slot)).unwrap_or_default();
+        // What this view shows (TASK-073), by its own settings (TASK-078).
+        let display = slot
+            .zip(place)
+            .map(|(slot, place)| self.display_in(slot, place.chat))
+            .unwrap_or_default();
         // TASK-062: the turn's content goes into one message, and the status
         // message may become the first one.
         let mut rolling = self.options.status_every.is_some().then(|| Rolling {
@@ -5126,6 +5177,40 @@ impl Slots {
             posted: 0,
             compact: display.turn == menu::TurnView::Compact,
         });
+        // TASK-078: the primary status message at the start of the read,
+        // and whether it stays the last message of its topic unless the read
+        // puts something below it.
+        let status_start = slot.and_then(|slot| self.registry.primary_view(slot)?.status_message());
+        let stays_start = place.is_some_and(|place| {
+            self.bottoms.get(&place).is_none_or(|bottom| {
+                bottom.posting == 0 && status_start.is_none_or(|status| !bottom.buries(status.id))
+            })
+        }) && slot.is_none_or(|slot| {
+            self.shown
+                .get(&slot)
+                .is_none_or(|shown| shown.sending.is_none())
+        });
+        // TASK-078: each mirror topic's own turn stream, by its settings.
+        let mut mirrors: Vec<MirrorRead> = slot
+            .map(|slot| self.registry.mirrors(slot))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|mirror| mirror.thread.is_some())
+            .filter_map(|mirror| {
+                let slot = slot?;
+                Some(MirrorRead {
+                    place: mirror,
+                    display: self.display_in(slot, mirror.chat),
+                    twin: rolling
+                        .as_ref()
+                        .and_then(|_| self.absorbable_twin(slot, mirror)),
+                    pieces: Vec::new(),
+                    posted: 0,
+                    absorbed: None,
+                    fresh: false,
+                })
+            })
+            .collect();
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
@@ -5138,6 +5223,9 @@ impl Slots {
         };
         live.reading = None;
         live.next_read = Some(now + every);
+        // A mirror's stream starts where the primary one read to before a
+        // rewind of this read: what the primary sends again is not new there.
+        let mirror_start = live.read_at.unwrap_or(from);
         let Some(Place {
             chat,
             thread: Some(thread_id),
@@ -5145,6 +5233,15 @@ impl Slots {
         else {
             return;
         };
+        for mirror in &mirrors {
+            let turn = self
+                .mirror_turns
+                .entry(mirror.place)
+                .or_insert_with(|| stream::MirrorTurn::new(session, mirror_start));
+            if turn.session != session {
+                turn.reset(session, mirror_start);
+            }
+        }
         if live.rewind_at.is_some() {
             if !live.stuck() {
                 // A message went out after the read was asked: the read is
@@ -5209,6 +5306,11 @@ impl Slots {
             }
             live.reset();
             live.next_read = Some(now);
+            for mirror in &mirrors {
+                if let Some(turn) = self.mirror_turns.get_mut(&mirror.place) {
+                    turn.reset(session, 0);
+                }
+            }
             return;
         }
         live.reset_warned = false;
@@ -5229,21 +5331,26 @@ impl Slots {
         let mut queued = self.queued_messages;
         // Answers held again whose turn end this read starts after go first.
         for held in live.overdue(from) {
-            match answer_ops(live, held, MAX_QUEUED_MESSAGES.saturating_sub(queued)) {
+            let answered = match answer_ops(live, held, MAX_QUEUED_MESSAGES.saturating_sub(queued))
+            {
                 Ok(ops) => {
                     queued += ops.len();
                     if let Some(rolling) = &mut rolling {
                         rolling.posted += ops.len();
                     }
+                    let n = ops.len();
                     actions.push(Action::Answer(ops));
+                    n
                 }
                 Err(held) => {
                     if let Some(rolling) = &mut rolling {
                         rolling.posted += 1;
                     }
                     actions.push(Action::Release(held));
+                    1
                 }
-            }
+            };
+            mirrors_answered(&mut self.mirror_turns, &mut mirrors, answered);
         }
         let mut read_to = to;
         let mut stopped = false;
@@ -5283,10 +5390,25 @@ impl Slots {
                 .items
                 .iter()
                 .any(|item| matches!(item, StreamItem::Channel { .. }));
+            // TASK-078: a line a mirror had before (a rewind reads it again)
+            // is not shown there twice.
+            for mirror in &mut mirrors {
+                mirror.fresh = self
+                    .mirror_turns
+                    .get_mut(&mirror.place)
+                    .is_some_and(|turn| turn.takes(line.end));
+            }
             // The quiet content of this line, not handed out yet (TASK-062):
             // one tool result line may finish several calls.
             let mut pieces = Vec::new();
             for step in stream::apply_line(&mut live.calls, &mut stream.receipts, &line.items) {
+                // TASK-078: each mirror gets the step by its own settings,
+                // before the primary handles it.
+                for mirror in mirrors.iter_mut().filter(|mirror| mirror.fresh) {
+                    let place = mirror.place;
+                    let ops = mirror_step(&mut self.mirror_turns, mirror, &step, rolling.is_some());
+                    actions.extend(ops.into_iter().map(|op| Action::Mirror(place, op)));
+                }
                 // Not shown (TASK-073): no message, in the turn message or
                 // on its own; receipts and turn ends go on as before.
                 if let Step::Send { piece, .. } = &step
@@ -5366,24 +5488,38 @@ impl Slots {
                     Step::TurnEnd => {
                         if let Some(held) = live.turn_end(line.end) {
                             let room = MAX_QUEUED_MESSAGES.saturating_sub(queued);
-                            match answer_ops(live, held, room) {
+                            let answered = match answer_ops(live, held, room) {
                                 Ok(ops) => {
                                     queued += ops.len();
                                     if let Some(rolling) = &mut rolling {
                                         rolling.posted += ops.len();
                                     }
+                                    let n = ops.len();
                                     actions.push(Action::Answer(ops));
+                                    n
                                 }
                                 Err(held) => {
                                     if let Some(rolling) = &mut rolling {
                                         rolling.posted += 1;
                                     }
                                     actions.push(Action::Release(held));
+                                    1
                                 }
-                            }
+                            };
+                            // Below each mirror's turn message, decided now
+                            // like the primary's (TASK-078).
+                            mirrors_answered(&mut self.mirror_turns, &mut mirrors, answered);
                         }
                     }
                 }
+            }
+            for mirror in mirrors.iter_mut().filter(|mirror| mirror.fresh) {
+                let place = mirror.place;
+                let ops = match self.mirror_turns.get_mut(&place) {
+                    Some(turn) => flush_mirror(turn, mirror),
+                    None => Vec::new(),
+                };
+                actions.extend(ops.into_iter().map(|op| Action::Mirror(place, op)));
             }
             if let Some(rolling) = &mut rolling {
                 for (number, op) in roll(live, rolling, pieces, chat, thread_id) {
@@ -5398,6 +5534,32 @@ impl Slots {
         live.barrier(read_to);
         if more || stopped {
             live.next_read = Some(now);
+        }
+        // TASK-078: the status twin of each mirror. The primary made its
+        // status message turn content: the twin goes (a new one comes with
+        // the new status message) unless the mirror made it its own. The
+        // primary status message stays where it is while a mirror's own
+        // stream put something below its twin: the twin goes below.
+        if let (Some(rolling), Some(_)) = (&rolling, status_start) {
+            let absorbed = rolling.absorbed.is_some();
+            let stays = !absorbed && rolling.posted == 0 && stays_start;
+            for mirror in &mirrors {
+                let own = mirror.absorbed.is_some();
+                let below = own || mirror.posted > 0;
+                if absorbed && !own {
+                    actions.push(Action::MirrorStatus {
+                        place: mirror.place,
+                        clear: true,
+                        fresh: false,
+                    });
+                } else if stays && below {
+                    actions.push(Action::MirrorStatus {
+                        place: mirror.place,
+                        clear: !own,
+                        fresh: true,
+                    });
+                }
+            }
         }
         if let (Some((number, message)), Some(slot)) =
             (rolling.and_then(|rolling| rolling.absorbed), slot)
@@ -5420,6 +5582,8 @@ impl Slots {
                 .or_default()
                 .absorbing = Some((session.to_owned(), number, message));
         }
+        // The mirror turns were closed where the read decided its answers.
+        self.read_closes_mirrors = true;
         for action in actions {
             match action {
                 Action::Stream(number, op) => {
@@ -5437,8 +5601,37 @@ impl Slots {
                 Action::Answer(ops) => self.stream_answer(session, ops),
                 Action::Release(held) => self.release(session, held),
                 Action::React(message_id) => self.react(message_id, stream::WORKING),
+                Action::Mirror(place, op) => {
+                    // The status twin is the mirror's turn content now.
+                    if let (
+                        MirrorOp::New {
+                            into: Some(twin), ..
+                        },
+                        Some(status),
+                    ) = (&op, status_start)
+                    {
+                        let detached = self.mirror.detach(status, place.chat);
+                        if detached != Detached::Shown(*twin) {
+                            debug!(
+                                ?detached,
+                                "a mirror's status twin changed before its stream took it"
+                            );
+                        }
+                    }
+                    self.hand_mirror_op(place, op);
+                }
+                Action::MirrorStatus {
+                    place,
+                    clear,
+                    fresh,
+                } => {
+                    if let (Some(slot), Some(status)) = (slot, status_start) {
+                        self.mirror_status(slot, session, status, place, clear, fresh);
+                    }
+                }
             }
         }
+        self.read_closes_mirrors = false;
         if interrupted {
             // Esc ended the turn like Stop does, also at an open prompt.
             self.prompts.quiet(session);
@@ -8325,13 +8518,58 @@ impl Slots {
         (!blocked).then(|| MessageKey::new(view.chat, status.message_id))
     }
 
-    /// Something came below the turn message of `place`'s current session:
-    /// the stream writes nothing more into it (TASK-062).
+    /// The twin of `slot`'s status message in mirror topic `mirror` that
+    /// the mirror's own turn stream may turn into content now (TASK-078),
+    /// like [`Self::absorbable`]: the primary status message is known, not
+    /// pinned and no new one is on its way; its twin shows in `mirror`, the
+    /// mirror's view has no separator waiting, and this run of the hub saw
+    /// the twin go in as the last message there with nothing of the hub on
+    /// its way after it.
+    fn absorbable_twin(&self, slot: SlotId, mirror: Place) -> Option<MessageKey> {
+        self.options.status_every?;
+        let primary = self.registry.primary_view(slot)?;
+        let status = primary.status.filter(|status| !status.pinned)?;
+        if self
+            .shown
+            .get(&slot)
+            .is_some_and(|shown| shown.sending.is_some())
+        {
+            return None;
+        }
+        let twin = self.mirror.twin(
+            MessageKey::new(primary.chat, status.message_id),
+            mirror.chat,
+        )?;
+        let view = self
+            .registry
+            .slot(slot)?
+            .views
+            .iter()
+            .find(|view| view.chat == mirror.chat)?;
+        if view.place() != Some(mirror) || view.pending_separator.is_some() {
+            return None;
+        }
+        let bottom = self.bottoms.get(&mirror)?;
+        (bottom.posting == 0 && bottom.last >= twin.id && !bottom.buries(twin.id)).then_some(twin)
+    }
+
+    /// Something came below the turn message of `place`: the stream writes
+    /// nothing more into it (TASK-062). In a mirror topic that is the
+    /// mirror's own turn message (TASK-078).
     fn close_turn_message(&mut self, place: Place) {
+        let Some(slot) = self.registry.slot_by_topic(place) else {
+            return;
+        };
+        if self.registry.place(slot) != Some(place) {
+            if let Some(turn) = self.mirror_turns.get_mut(&place) {
+                turn.close();
+            }
+            return;
+        }
         let Some(session) = self
             .registry
-            .slot_by_topic(place)
-            .and_then(|slot| self.registry.slot(slot)?.current_session.clone())
+            .slot(slot)
+            .and_then(|entry| entry.current_session.clone())
         else {
             return;
         };
@@ -8695,9 +8933,10 @@ impl Slots {
     /// The calls for the mirror topics that go with `op` (TASK-063): a new
     /// message of a primary topic gets a twin in each mirror topic (none
     /// when it answers a message the mirror has no twin of: a user's), and
-    /// an edit, a delete or stream content written into a message goes to
-    /// its twins. Separators, service message deletes and reactions stay in
-    /// their topic.
+    /// an edit or a delete of a message goes to its twins. Separators,
+    /// service message deletes and reactions stay in their topic, and of
+    /// the stream only turn answers are twinned: a mirror topic has its own
+    /// turn stream (TASK-078).
     fn twin_calls(&mut self, work: &Work, op: &Op) -> Vec<TwinCall> {
         if !self.registry.private
             || matches!(
@@ -8710,6 +8949,9 @@ impl Slots {
                     | Work::Menu(_)
             )
         {
+            return Vec::new();
+        }
+        if matches!(work, Work::Stream { .. }) && !is_answer(op) {
             return Vec::new();
         }
         if let Some(place) = op.posts() {
@@ -8736,24 +8978,16 @@ impl Slots {
                         op,
                         link: Link::Seq { ghost, lasting },
                         status,
+                        turn: None,
                     })
                 })
                 .collect();
         }
-        let (primary, place) = match op {
+        let primary = match op {
             Op::Edit {
                 chat, message_id, ..
             }
-            | Op::Delete { chat, message_id } => (MessageKey::new(*chat, *message_id), None),
-            Op::Stream {
-                chat,
-                thread_id,
-                into: Some(into),
-                ..
-            } => (
-                MessageKey::new(*chat, *into),
-                Some(Place::topic(*chat, *thread_id)),
-            ),
+            | Op::Delete { chat, message_id } => MessageKey::new(*chat, *message_id),
             _ => return Vec::new(),
         };
         let writes = self.mirror.write(primary, op);
@@ -8768,24 +9002,6 @@ impl Slots {
                 }
             }
         }
-        // Stream content the mirror has no twin to write into goes there as
-        // a new message, which takes the next writes.
-        let lost: Vec<Chat> = if writes.is_empty() {
-            place
-                .map(|place| self.primary_mirrors(place))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|to| to.chat)
-                .collect()
-        } else {
-            writes
-                .iter()
-                .filter_map(|write| match write {
-                    Write::Lost(chat) => Some(*chat),
-                    _ => None,
-                })
-                .collect()
-        };
         let status = match work {
             Work::Status { slot, .. } if matches!(op, Op::Edit { .. }) => Some(*slot),
             _ => None,
@@ -8799,12 +9015,8 @@ impl Slots {
                     op,
                     link: Link::None,
                     status,
+                    turn: None,
                 });
-            }
-        }
-        if let Some(place) = place {
-            for chat in lost {
-                calls.extend(self.lost_content(primary, place, chat, op));
             }
         }
         calls
@@ -8819,41 +9031,6 @@ impl Slots {
             return Vec::new();
         }
         self.registry.mirrors(slot)
-    }
-
-    /// Stream content written into primary message `primary` of `place`,
-    /// whose twin in `chat` is lost or unknown: a new twin message there.
-    fn lost_content(
-        &self,
-        primary: MessageKey,
-        place: Place,
-        chat: Chat,
-        op: &Op,
-    ) -> Option<TwinCall> {
-        let to = self
-            .primary_mirrors(place)
-            .into_iter()
-            .find(|to| to.chat == chat)?;
-        let Op::Stream {
-            text, html, notify, ..
-        } = op
-        else {
-            return None;
-        };
-        Some(TwinCall {
-            op: Op::Stream {
-                chat: to.chat,
-                thread_id: to.thread?,
-                text: text.clone(),
-                html: html.clone(),
-                merge: false,
-                restart: true,
-                notify: *notify,
-                into: None,
-            },
-            link: Link::Of(primary),
-            status: None,
-        })
     }
 
     /// `op`, a new message of a primary topic, for mirror topic `to`; `None`
@@ -8932,31 +9109,19 @@ impl Slots {
                 *chat = twin.chat;
                 *message_id = twin.id;
             }
-            Op::Stream {
-                chat,
-                thread_id,
-                restart,
-                into: Some(into),
-                ..
-            } => {
-                let to = self
-                    .primary_mirrors(Place::topic(*chat, *thread_id))
-                    .into_iter()
-                    .find(|to| to.chat == twin.chat)?;
-                *chat = twin.chat;
-                *thread_id = to.thread?;
-                *into = twin.id;
-                *restart = true;
-            }
             _ => return None,
         }
         Some(op)
     }
 
-    /// Hands a call for a mirror topic to the dispatch task. A new twin
-    /// message waits only while fewer than [`MAX_TWIN_POSTS`] do (a prompt
-    /// or question always goes); a dropped one is told in its topic later.
-    fn hand_twin(&mut self, seq: u64, call: TwinCall) {
+    /// Hands a call for a mirror topic to the dispatch task; `false`: it
+    /// did not go. A new twin message waits only while fewer than
+    /// [`MAX_TWIN_POSTS`] do (a prompt or question always goes); a dropped
+    /// one is told in its topic later. A new message counts as on its way
+    /// into its topic (TASK-078), and one that is neither the topic's own
+    /// stream nor its status closes the topic's turn message, except while
+    /// `on_chunk` hands out what it decided.
+    fn hand_twin(&mut self, seq: u64, call: TwinCall) -> bool {
         let posts = call.op.posts();
         let asks = matches!(
             call.op,
@@ -8972,7 +9137,7 @@ impl Slots {
             if self.gaps.insert(place) {
                 warn!("a mirror topic falls behind; its twins are dropped until it caught up");
             }
-            return;
+            return false;
         }
         let to = posts.unwrap_or_else(|| Place::new(call.op.chat().unwrap_or(Chat::Group), None));
         let id = match call.link {
@@ -8984,7 +9149,7 @@ impl Slots {
             if let Some(place) = posts {
                 self.gaps.insert(place);
             }
-            return;
+            return false;
         }
         // The pump keeps its text the slot's status until it goes.
         let status = call.status.and_then(|slot| {
@@ -9014,18 +9179,169 @@ impl Slots {
         {
             self.status_twins.insert(id, text.clone());
         }
+        let (own, status_slot) = (call.turn, call.status);
         let work = Work::Twin {
             id,
             place: posts,
             status,
+            turn: own,
         };
         if self.dispatch.send((work, call.op)).is_err() {
             debug!("dispatch task stopped; twin dropped");
-            return;
+            return false;
         }
         self.handed += 1;
-        if posts.is_some() {
+        if let Some(place) = posts {
             self.twin_posts += 1;
+            self.bottoms.entry(place).or_default().posting += 1;
+            if own.is_none() && status_slot.is_none() && !self.read_closes_mirrors {
+                self.close_turn_message(place);
+            }
+        }
+        true
+    }
+
+    /// Hands call `op` of mirror topic `place`'s own turn stream out
+    /// (TASK-078); one that did not go counts as refused.
+    fn hand_mirror_op(&mut self, place: Place, op: MirrorOp) {
+        let Some(thread_id) = place.thread else {
+            return;
+        };
+        let number = op.number();
+        let op = match op {
+            MirrorOp::New {
+                text,
+                html,
+                merge,
+                into,
+                ..
+            } => Op::Stream {
+                chat: place.chat,
+                thread_id,
+                text,
+                html,
+                merge,
+                restart: true,
+                notify: false,
+                into: into.map(|key| key.id),
+            },
+            MirrorOp::Write {
+                into, text, html, ..
+            } => Op::Stream {
+                chat: place.chat,
+                thread_id,
+                text,
+                html,
+                merge: true,
+                restart: true,
+                notify: false,
+                into: Some(into.id),
+            },
+        };
+        let call = TwinCall {
+            op,
+            link: Link::None,
+            status: None,
+            turn: Some((place, number)),
+        };
+        if !self.hand_twin(0, call)
+            && let Some(turn) = self.mirror_turns.get_mut(&place)
+        {
+            turn.answered(number, None, false, false);
+        }
+    }
+
+    /// The status twin of mirror topic `place` after a read (TASK-078):
+    /// `clear` takes the twin of primary status message `status` away (one
+    /// still on its way does not go), `fresh` puts a new twin of it below
+    /// what the mirror's own stream put there.
+    fn mirror_status(
+        &mut self,
+        slot: SlotId,
+        session: &str,
+        status: MessageKey,
+        place: Place,
+        clear: bool,
+        fresh: bool,
+    ) {
+        if clear {
+            match self.mirror.detach(status, place.chat) {
+                Detached::Shown(twin) => {
+                    self.hand_twin(
+                        0,
+                        TwinCall {
+                            op: Op::Delete {
+                                chat: twin.chat,
+                                message_id: twin.id,
+                            },
+                            link: Link::None,
+                            status: None,
+                            turn: None,
+                        },
+                    );
+                }
+                Detached::Sending(id) => {
+                    if let Some(text) = self.status_twins.get(&id) {
+                        text.cancel();
+                    }
+                }
+                Detached::None => {}
+            }
+        }
+        if fresh {
+            let (text, keyboard) = self.status_view(slot, session, Instant::now());
+            self.hand_twin(
+                0,
+                TwinCall {
+                    op: Op::Send {
+                        chat: place.chat,
+                        thread_id: place.thread,
+                        text,
+                        html: None,
+                        reply_markup: Some(status::for_mirror(&keyboard)),
+                        permission: false,
+                        reply_to: None,
+                        notify: false,
+                    },
+                    link: Link::Of(status),
+                    status: Some(slot),
+                    turn: None,
+                },
+            );
+        }
+    }
+
+    /// Telegram answered call `number` of mirror topic `place`'s turn
+    /// stream (TASK-078): the write it owes goes now, and a status twin
+    /// that may still show the old status is cleared away.
+    fn mirror_turn_answered(
+        &mut self,
+        place: Place,
+        number: u64,
+        made: Option<MessageKey>,
+        accepted: bool,
+        gone: bool,
+    ) {
+        let Some(turn) = self.mirror_turns.get_mut(&place) else {
+            return;
+        };
+        let answered = turn.answered(number, made, accepted, gone);
+        if let Some(op) = answered.write {
+            self.hand_mirror_op(place, op);
+        }
+        if let Some(twin) = answered.retire {
+            self.hand_twin(
+                0,
+                TwinCall {
+                    op: Op::Delete {
+                        chat: twin.chat,
+                        message_id: twin.id,
+                    },
+                    link: Link::None,
+                    status: None,
+                    turn: None,
+                },
+            );
         }
     }
 
@@ -9037,16 +9353,8 @@ impl Slots {
                     op,
                     link: Link::None,
                     status: None,
+                    turn: None,
                 }),
-                Follow::Lost { primary, chat, op } => match &op {
-                    Op::Stream {
-                        chat: from,
-                        thread_id,
-                        into: Some(_),
-                        ..
-                    } => self.lost_content(primary, Place::topic(*from, *thread_id), chat, &op),
-                    _ => None,
-                },
                 Follow::Delete(twin) => Some(TwinCall {
                     op: Op::Delete {
                         chat: twin.chat,
@@ -9054,6 +9362,7 @@ impl Slots {
                     },
                     link: Link::None,
                     status: None,
+                    turn: None,
                 }),
             };
             if let Some(call) = call {
@@ -9063,20 +9372,51 @@ impl Slots {
     }
 
     /// Telegram answered a call in a mirror topic.
-    fn on_twin_done(&mut self, id: Option<u64>, place: Option<Place>, delivery: Option<Delivery>) {
+    fn on_twin_done(
+        &mut self,
+        id: Option<u64>,
+        place: Option<Place>,
+        turn: Option<(Place, u64)>,
+        delivery: Option<Delivery>,
+    ) {
         if place.is_some() {
             self.twin_posts = self.twin_posts.saturating_sub(1);
         }
+        let made = match &delivery {
+            Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => Some(message.message_id),
+            _ => None,
+        };
+        // TASK-078: what the mirror topic's bottom is now. A status twin
+        // that went in is the last message there.
+        let status_twin = id.is_some_and(|id| self.status_twins.contains_key(&id));
+        if let Some(place) = place {
+            let bottom = self.bottoms.entry(place).or_default();
+            bottom.posting = bottom.posting.saturating_sub(1);
+            if let Some(made) = made {
+                bottom.last = bottom.last.max(made);
+                if status_twin {
+                    bottom.foreign = false;
+                }
+            }
+        }
         if let Some(id) = id {
             self.status_twins.remove(&id);
-            let made = match &delivery {
-                Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
-                    Some(message.message_id)
-                }
-                _ => None,
-            };
             let follows = self.mirror.twin_answered(id, made);
             self.follow(follows);
+        }
+        if let Some((at, number)) = turn {
+            let accepted = matches!(delivery, Some(Ok(Outcome::Sent(_) | Outcome::Merged)))
+                || delivery
+                    .as_ref()
+                    .is_some_and(|delivery| telegram_error(delivery, &["message is not modified"]));
+            let gone = delivery.as_ref().is_some_and(|delivery| {
+                telegram_error(
+                    delivery,
+                    &["message to edit not found", "message can't be edited"],
+                )
+            });
+            let made = made.map(|id| MessageKey::new(at.chat, id));
+            self.mirror_turn_answered(at, number, made, accepted, gone);
         }
         match (&delivery, place) {
             (Some(delivery), Some(place)) if topic_gone(delivery) => self.topic_gone_at(place),
@@ -9816,6 +10156,7 @@ impl Slots {
         let (page, answer) = match press {
             MenuPress::Sessions { page } => (Page::Sessions(page as usize), String::new()),
             MenuPress::Display => (Page::Display, String::new()),
+            MenuPress::GroupDisplay => (Page::GroupDisplay, String::new()),
             MenuPress::Sound => (Page::Sound, String::new()),
             MenuPress::Zone { fractions } => (Page::Zone { fractions }, String::new()),
             MenuPress::Slot { action, page, slot } => (
@@ -10028,26 +10369,33 @@ impl Slots {
         }
     }
 
-    /// What the stream of `slot` shows (TASK-073): its owner's choice while
-    /// the slot shows in their private chat alone; with any other view (the
-    /// group's, shared or a fallback still mirrored) the full layout, so
-    /// every view gets the same.
-    fn display_of(&self, slot: SlotId) -> menu::Settings {
-        let Some(Chat::Private(chat)) = self.registry.place(slot).map(|place| place.chat) else {
-            return menu::Settings::default();
+    /// What the view of `slot` in `chat` shows: each view by its own
+    /// settings (TASK-078; the TASK-073 rule "a shared slot is full
+    /// everywhere" is gone). A private chat by its person's settings; the
+    /// group by the group settings of the slot's owner, the person of its
+    /// first private view (a closed one too); the default without one.
+    fn display_in(&self, slot: SlotId, chat: Chat) -> menu::Display {
+        let (owner, group) = match chat {
+            Chat::Private(private) => (Some(private), false),
+            Chat::Group => (
+                self.registry.slot(slot).and_then(|entry| {
+                    entry.views.iter().find_map(|view| match view.chat {
+                        Chat::Private(private) => Some(private),
+                        Chat::Group => None,
+                    })
+                }),
+                true,
+            ),
         };
-        let alone = self.registry.slot(slot).is_some_and(|entry| {
-            entry
-                .views
-                .iter()
-                .all(|view| view.chat == Chat::Private(chat))
-        });
-        if !alone {
-            return menu::Settings::default();
-        }
-        self.registry
-            .person(chat)
-            .map(|person| person.settings.clone())
+        owner
+            .and_then(|owner| self.registry.person(owner))
+            .map(|person| {
+                if group {
+                    person.settings.group
+                } else {
+                    person.settings.display()
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -10213,6 +10561,21 @@ impl Slots {
                 self.primary_moved(slot, old);
             }
             self.sync_mirror_status(slot);
+        }
+        // TASK-078: the turn stream of a topic that is no mirror any more.
+        let gone: Vec<Place> = self
+            .mirror_turns
+            .keys()
+            .copied()
+            .filter(|place| {
+                !self
+                    .registry
+                    .slot_by_topic(*place)
+                    .is_some_and(|slot| self.registry.mirrors(slot).contains(place))
+            })
+            .collect();
+        for place in gone {
+            self.mirror_turns.remove(&place);
         }
     }
 
@@ -10406,8 +10769,9 @@ impl Slots {
             Done::Twin {
                 id,
                 place,
+                turn,
                 delivery,
-            } => self.on_twin_done(id, place, delivery),
+            } => self.on_twin_done(id, place, turn, delivery),
             Done::Retire { retire, delivery } => self.on_retire_done(retire, delivery),
             Done::Topic { job, delivery } => self.on_topic_done(job, delivery),
             Done::Delete(delivery) => match delivery {
@@ -10866,6 +11230,122 @@ fn answer_ops(live: &mut Live, held: Held, room: usize) -> Result<Vec<(u64, Op)>
     Ok(ops)
 }
 
+/// The only loud stream messages are turn answers ([`answer_ops`]); lines
+/// and writes are always quiet. `twin_calls` sees an op before `voiced`, and
+/// `Live` keeps it so for a resend.
+fn is_answer(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Stream {
+            notify: true,
+            into: None,
+            ..
+        }
+    )
+}
+
+/// What one read gives a mirror topic's own turn stream (TASK-078).
+struct MirrorRead {
+    place: Place,
+    /// What the mirror shows: its own settings.
+    display: menu::Display,
+    /// The status twin its first new message of this read may turn into.
+    twin: Option<MessageKey>,
+    /// The line's pieces it shows, not handed out yet (see [`roll`]).
+    pieces: Vec<(String, Option<String>, bool, bool)>,
+    /// New messages of the mirror this read, answers' twins included.
+    posted: usize,
+    /// It turned the status twin into content.
+    absorbed: Option<MessageKey>,
+    /// The current line is new to it.
+    fresh: bool,
+}
+
+/// Step `step` of a line new to mirror `mirror` (TASK-078): a piece it
+/// shows waits for the line's end or the next other step, which lets the
+/// waiting pieces go first; with no turn message (`rolling` false) each
+/// piece is a message of its own.
+fn mirror_step(
+    turns: &mut HashMap<Place, stream::MirrorTurn>,
+    mirror: &mut MirrorRead,
+    step: &Step,
+    rolling: bool,
+) -> Vec<MirrorOp> {
+    let Some(turn) = turns.get_mut(&mirror.place) else {
+        return Vec::new();
+    };
+    let Step::Send {
+        text,
+        merge,
+        format,
+        piece,
+    } = step
+    else {
+        return flush_mirror(turn, mirror);
+    };
+    if !menu::shows(&mirror.display, *piece) {
+        return Vec::new();
+    }
+    let chunks = stream_chunks(text, *format);
+    if rolling {
+        // TASK-076: tool lines and 💭 in the quote.
+        let quoted = mirror.display.turn == menu::TurnView::Compact
+            && matches!(piece, menu::Piece::Tool | menu::Piece::Thinking);
+        for (text, html) in chunks {
+            let quoted = quoted && stream::quotable(html.as_deref());
+            mirror
+                .pieces
+                .push((text, html, *format != Format::Code, quoted));
+        }
+        return Vec::new();
+    }
+    let merge = *merge && chunks.len() == 1;
+    chunks
+        .into_iter()
+        .map(|(text, html)| {
+            mirror.posted += 1;
+            turn.line(text, html, merge)
+        })
+        .collect()
+}
+
+/// The pieces mirror `mirror` holds go into its turn stream.
+fn flush_mirror(turn: &mut stream::MirrorTurn, mirror: &mut MirrorRead) -> Vec<MirrorOp> {
+    if mirror.pieces.is_empty() {
+        return Vec::new();
+    }
+    let compact = mirror.display.turn == menu::TurnView::Compact;
+    let joined = stream::join_pieces(std::mem::take(&mut mirror.pieces), compact);
+    let ops = turn.roll(joined, compact, &mut mirror.twin, &mut mirror.posted);
+    for op in &ops {
+        if let MirrorOp::New {
+            into: Some(twin), ..
+        } = op
+        {
+            mirror.absorbed = Some(*twin);
+        }
+    }
+    ops
+}
+
+/// A turn answer of `n` messages was decided in a read: it goes below each
+/// mirror's turn message (TASK-078), as it does below the primary's.
+fn mirrors_answered(
+    turns: &mut HashMap<Place, stream::MirrorTurn>,
+    mirrors: &mut [MirrorRead],
+    n: usize,
+) {
+    if n == 0 {
+        return;
+    }
+    for mirror in mirrors {
+        if let Some(turn) = turns.get_mut(&mirror.place) {
+            turn.close();
+        }
+        mirror.posted += n;
+    }
+}
+
 /// Where the stream messages of one read go (TASK-062, status messages on).
 struct Rolling {
     /// The status message of the topic this read may turn into content,
@@ -10880,10 +11360,6 @@ struct Rolling {
     compact: bool,
 }
 
-/// Quiet pieces of one line that go together: as one turn message of their
-/// own, and each piece (text, HTML, quoted) for the turn message above.
-type Group = (Open, Vec<(String, Option<String>, bool)>);
-
 /// The stream messages of `pieces` (text, HTML, whether it is quiet turn
 /// content (a terminal prompt is not), whether it goes into the quote of a
 /// compact turn message), in order (TASK-062, TASK-076). Quiet pieces go
@@ -10897,31 +11373,14 @@ fn roll(
     chat: Chat,
     thread_id: i64,
 ) -> Vec<(u64, Op)> {
-    // Pieces of one line go together where they fit: a result line may end
-    // several calls. `Err`: a terminal prompt, on its own.
-    let mut joined: Vec<Result<Group, (String, Option<String>)>> = Vec::new();
-    for (text, html, quiet, quoted) in pieces {
-        if !quiet {
-            joined.push(Err((text, html)));
-            continue;
-        }
-        if let Some(Ok((together, parts))) = joined.last_mut()
-            && together.push(&text, html.as_deref(), quoted)
-        {
-            parts.push((text, html, quoted));
-            continue;
-        }
-        let together = Open::new(None, 0, text.clone(), html.clone(), rolling.compact, quoted);
-        joined.push(Ok((together, vec![(text, html, quoted)])));
-    }
     let mut ops = Vec::new();
-    for piece in joined {
+    for piece in stream::join_pieces(pieces, rolling.compact) {
         let restart = std::mem::take(&mut live.restart);
         if let Ok((_, parts)) = &piece
             && let Some(open) = live.open.as_mut()
             && let Some(key) = open.key
             && open.compact == rolling.compact
-            && let Some(grown) = grown(open, parts)
+            && let Some(grown) = stream::grown(open, parts)
         {
             *open = grown;
             let op = Op::Stream {
@@ -10976,16 +11435,6 @@ fn roll(
         ops.push((number, op));
     }
     ops
-}
-
-/// `open` with every one of `parts` below it; `None` when they do not all
-/// fit.
-fn grown(open: &Open, parts: &[(String, Option<String>, bool)]) -> Option<Open> {
-    let mut grown = open.clone();
-    parts
-        .iter()
-        .all(|(text, html, quoted)| grown.push(text, html.as_deref(), *quoted))
-        .then_some(grown)
 }
 
 /// The messages of a stream line: markdown as HTML with its plain source,
@@ -11290,9 +11739,12 @@ async fn dispatch_loop(
                 });
             }
             let _ = done.send(match work {
-                Work::Twin { id, place, .. } => Done::Twin {
+                Work::Twin {
+                    id, place, turn, ..
+                } => Done::Twin {
                     id,
                     place,
+                    turn,
                     delivery,
                 },
                 Work::Topic(job) => Done::Topic { job, delivery },
@@ -24554,6 +25006,7 @@ again"
         slots.on_done(Done::Twin {
             id,
             place,
+            turn: None,
             delivery: Some(Ok(Outcome::Sent(Message {
                 message_id: 950,
                 ..Message::default()
@@ -24828,10 +25281,37 @@ again"
         assert_eq!(twins.len(), MAX_TWIN_POSTS);
         assert!(twins.iter().all(|(_, place)| *place == Some(mirror)));
         assert!(slots.gaps.contains(&mirror));
+        // TASK-078: a new message of the mirror's own turn stream is dropped
+        // too, and its turn message is given up: the next piece is new.
+        let piece = |text: &str| vec![(text.to_owned(), None, true, false)];
+        slots
+            .mirror_turns
+            .insert(mirror, stream::MirrorTurn::new(A, 0));
+        let turn = slots.mirror_turns.get_mut(&mirror).unwrap();
+        let ops = turn.roll(
+            stream::join_pieces(piece("x"), false),
+            false,
+            &mut None,
+            &mut 0,
+        );
+        assert!(matches!(ops.as_slice(), [MirrorOp::New { .. }]));
+        for op in ops {
+            slots.hand_mirror_op(mirror, op);
+        }
+        assert!(all_work(&mut work).is_empty(), "dropped");
+        let turn = slots.mirror_turns.get_mut(&mirror).unwrap();
+        let ops = turn.roll(
+            stream::join_pieces(piece("y"), false),
+            false,
+            &mut None,
+            &mut 0,
+        );
+        assert!(matches!(ops.as_slice(), [MirrorOp::New { .. }]), "{ops:?}");
         for (n, (id, place)) in twins.into_iter().enumerate() {
             slots.on_done(Done::Twin {
                 id,
                 place,
+                turn: None,
                 delivery: Some(Ok(Outcome::Sent(Message {
                     message_id: 2000 + n as i64,
                     ..Message::default()
@@ -25574,6 +26054,7 @@ again"
         slots.on_done(Done::Twin {
             id,
             place,
+            turn: None,
             delivery: Some(Ok(Outcome::Sent(Message {
                 message_id: 950,
                 ..Message::default()
@@ -26187,82 +26668,81 @@ again"
         assert!(!text.contains("Looking."), "{text:?}");
     }
 
-    /// TASK-073 (decision 3): while a slot shows in the group too, the
-    /// owner's detail level does not apply: both views get every line. The
-    /// owner's sound quiets their private chat only; the group's twin of the
-    /// answer rings as before.
+    /// TASK-078: while a slot shows in the group too, each view shows by
+    /// its own settings: the owner's in the private chat, the owner's group
+    /// settings in the group. The owner's sound quiets their private chat
+    /// only; the group's twin of the answer rings as before.
     #[tokio::test]
-    async fn a_shared_slot_keeps_the_full_layout_and_the_groups_sound() {
+    async fn a_shared_slot_shows_each_view_by_its_own_display() {
         use crate::wire::StreamItem;
-        let dir = TempDir::new("slots-menu-shared");
-        let path = transcript_file(&dir, A);
-        let options = Options {
-            owners: private_options().owners,
-            menu: true,
-            ..stream_options()
-        };
-        let mut slots = stalled_slots(&dir, options);
-        slots.on_hook(&start_with(A, 10, &path, "startup"));
         let owner = private_owner();
-        slots.registry.slots[0].views = vec![
-            crate::hub::registry::View::new(Chat::Group),
-            crate::hub::registry::View::new(owner),
-        ];
-        slots
-            .registry
-            .topic_created(SlotId(0), owner, 700, "a", None);
-        slots
-            .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
-        slots.registry.person_mut(owner_chat()).settings = menu::Settings {
-            detail: menu::Detail::Answers,
-            sound: menu::Sound::Off,
-            ..menu::Settings::default()
+        let run = |settings: menu::Settings| -> Vec<(Work, Op)> {
+            let dir = TempDir::new("slots-menu-shared");
+            let path = transcript_file(&dir, A);
+            let options = Options {
+                owners: private_options().owners,
+                menu: true,
+                ..stream_options()
+            };
+            let mut slots = stalled_slots(&dir, options);
+            slots.on_hook(&start_with(A, 10, &path, "startup"));
+            slots.registry.slots[0].views = vec![
+                crate::hub::registry::View::new(Chat::Group),
+                crate::hub::registry::View::new(owner),
+            ];
+            slots
+                .registry
+                .topic_created(SlotId(0), owner, 700, "a", None);
+            slots
+                .registry
+                .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            assert!(slots.registry.shared(SlotId(0), Chat::Group));
+            slots.registry.person_mut(owner_chat()).settings = settings.clone();
+            assert_eq!(slots.display_in(SlotId(0), owner), settings.display());
+            assert_eq!(slots.display_in(SlotId(0), Chat::Group), settings.group);
+            let (to_agent, _from_hub) = mpsc::channel(4);
+            slots.on_agent(AgentEvent::Registered {
+                conn: 1,
+                register: Register {
+                    transcript_reads: true,
+                    session_reads: false,
+                    private_place: true,
+                    ..reads_register(A, Some(10))
+                },
+                to_agent,
+            });
+            slots.pump();
+            let mut work = capture_dispatch(&mut slots);
+            slots.on_hook(&stop(A, Some("done")));
+            slots.on_agent(AgentEvent::Message {
+                conn: 1,
+                received_at: StdInstant::now(),
+                msg: AgentMsg::TranscriptChunk {
+                    session_id: A.into(),
+                    from: 0,
+                    to: 10,
+                    lines: vec![StreamLine {
+                        end: 10,
+                        items: vec![
+                            StreamItem::Call {
+                                id: "t1".into(),
+                                line: "• Bash: ls".into(),
+                            },
+                            StreamItem::Result {
+                                id: "t1".into(),
+                                error: None,
+                            },
+                            StreamItem::TurnEnd,
+                        ],
+                    }],
+                    missing: false,
+                    more: false,
+                    reset: false,
+                },
+            });
+            all_work(&mut work)
         };
-        let (to_agent, _from_hub) = mpsc::channel(4);
-        slots.on_agent(AgentEvent::Registered {
-            conn: 1,
-            register: Register {
-                transcript_reads: true,
-                session_reads: false,
-                private_place: true,
-                ..reads_register(A, Some(10))
-            },
-            to_agent,
-        });
-        slots.pump();
-        let mut work = capture_dispatch(&mut slots);
-        assert_eq!(slots.display_of(SlotId(0)), menu::Settings::default());
-        slots.on_hook(&stop(A, Some("done")));
-        slots.on_agent(AgentEvent::Message {
-            conn: 1,
-            received_at: StdInstant::now(),
-            msg: AgentMsg::TranscriptChunk {
-                session_id: A.into(),
-                from: 0,
-                to: 10,
-                lines: vec![StreamLine {
-                    end: 10,
-                    items: vec![
-                        StreamItem::Call {
-                            id: "t1".into(),
-                            line: "• Bash: ls".into(),
-                        },
-                        StreamItem::Result {
-                            id: "t1".into(),
-                            error: None,
-                        },
-                        StreamItem::TurnEnd,
-                    ],
-                }],
-                missing: false,
-                more: false,
-                reset: false,
-            },
-        });
-        let handed = all_work(&mut work);
-        let lines = |chat: Chat| -> Vec<(String, bool)> {
+        let lines = |handed: &[(Work, Op)], chat: Chat| -> Vec<(String, bool)> {
             handed
                 .iter()
                 .filter_map(|(_, op)| match op {
@@ -26277,20 +26757,62 @@ again"
                 })
                 .collect()
         };
+        let tool = || ("• Bash: ls ✓".to_owned(), false);
+        // The owner sees only answers, quietly; the group everything.
+        let handed = run(menu::Settings {
+            detail: menu::Detail::Answers,
+            sound: menu::Sound::Off,
+            ..menu::Settings::default()
+        });
         assert_eq!(
-            lines(owner),
-            [
-                ("• Bash: ls ✓".to_owned(), false),
-                ("done".to_owned(), false)
-            ],
+            lines(&handed, owner),
+            [("done".to_owned(), false)],
             "{handed:#?}"
         );
         assert_eq!(
-            lines(Chat::Group),
-            [
-                ("• Bash: ls ✓".to_owned(), false),
-                ("done".to_owned(), true)
-            ],
+            lines(&handed, Chat::Group),
+            [tool(), ("done".to_owned(), true)],
+            "{handed:#?}"
+        );
+        // The group's line is its own stream's, before the answer's twin.
+        let line_at = handed
+            .iter()
+            .position(|(work, op)| {
+                matches!(work, Work::Twin { turn: Some(_), .. })
+                    && matches!(op, Op::Stream { chat: Chat::Group, text, .. } if text == "• Bash: ls ✓")
+            })
+            .expect("the group's own line");
+        let answer_at = handed
+            .iter()
+            .position(|(work, op)| {
+                matches!(work, Work::Twin { turn: None, .. })
+                    && matches!(
+                        op,
+                        Op::Stream {
+                            chat: Chat::Group,
+                            notify: true,
+                            ..
+                        }
+                    )
+            })
+            .expect("the answer's twin");
+        assert!(line_at < answer_at, "{handed:#?}");
+        // The other way round: the group sees only answers.
+        let handed = run(menu::Settings {
+            group: menu::Display {
+                detail: menu::Detail::Answers,
+                ..menu::Display::default()
+            },
+            ..menu::Settings::default()
+        });
+        assert_eq!(
+            lines(&handed, owner),
+            [tool(), ("done".to_owned(), true)],
+            "{handed:#?}"
+        );
+        assert_eq!(
+            lines(&handed, Chat::Group),
+            [("done".to_owned(), true)],
             "{handed:#?}"
         );
     }
@@ -26486,9 +27008,28 @@ again"
             sound: menu::Sound::Off,
             ..menu::Settings::default()
         };
-        slots.registry.person_mut(boris).settings = quiet.clone();
-        assert_eq!(slots.display_of(SlotId(0)), menu::Settings::default());
-        assert_eq!(slots.display_of(SlotId(1)), quiet);
+        let boris_group = menu::Display {
+            detail: menu::Detail::Brief,
+            ..menu::Display::default()
+        };
+        slots.registry.person_mut(boris).settings = menu::Settings {
+            group: boris_group,
+            ..quiet.clone()
+        };
+        assert_eq!(
+            slots.display_in(SlotId(0), private_owner()),
+            menu::Display::default()
+        );
+        assert_eq!(
+            slots.display_in(SlotId(1), Chat::Private(boris)),
+            quiet.display()
+        );
+        // TASK-078: the group view of a slot by its owner's group settings.
+        assert_eq!(slots.display_in(SlotId(1), Chat::Group), boris_group);
+        assert_eq!(
+            slots.display_in(SlotId(0), Chat::Group),
+            menu::Display::default()
+        );
         let answer = |chat: Chat, thread: i64| Op::Send {
             chat,
             thread_id: Some(thread),
@@ -27397,42 +27938,770 @@ again"
         assert_eq!(stream_offset(&slots), Some(40));
     }
 
-    /// A slot that shows in the group too keeps the full turn message in
-    /// both views, whatever its owner chose (the rule of TASK-073).
+    /// TASK-078: each view quotes the tool lines by its own turn view: the
+    /// owner's in the private chat, the owner's group setting in the group.
     #[tokio::test]
-    async fn a_shared_slot_keeps_the_full_turn_message() {
-        let dir = TempDir::new("slots-compact-shared");
-        let settings = with_turn(menu::TurnView::Compact, true);
+    async fn each_view_quotes_by_its_own_turn_view() {
+        let owner = private_owner();
+        for group_compact in [false, true] {
+            let dir = TempDir::new("slots-compact-shared");
+            let mut settings = with_turn(
+                if group_compact {
+                    menu::TurnView::Full
+                } else {
+                    menu::TurnView::Compact
+                },
+                true,
+            );
+            if group_compact {
+                settings.group.turn = menu::TurnView::Compact;
+            }
+            let (mut slots, mut work) = shared_streaming(&dir, settings, false);
+            next_line(&mut slots, 0, 10, tool_turn());
+            let handed = all_work(&mut work);
+            let sent = |chat: Chat| {
+                handed
+                    .iter()
+                    .filter_map(|(_, op)| match op {
+                        Op::Stream { chat: to, html, .. } if *to == chat => Some(html.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let quoted = |chat: Chat| {
+                sent(chat).iter().any(|html| {
+                    html.as_deref()
+                        .is_some_and(|html| html.contains("<blockquote"))
+                })
+            };
+            assert!(
+                !sent(owner).is_empty() && !sent(Chat::Group).is_empty(),
+                "{handed:#?}"
+            );
+            assert_eq!(quoted(owner), !group_compact, "{handed:#?}");
+            assert_eq!(quoted(Chat::Group), group_compact, "{handed:#?}");
+        }
+    }
+
+    // ------------------------------------------------------------ TASK-078
+
+    fn group_topic() -> Place {
+        Place::topic(Chat::Group, 100)
+    }
+
+    /// Session A streaming in the owner's private chat (topic 700) with its
+    /// slot shared to the group (topic 100), status messages on, the owner's
+    /// `settings`, its first read asked, the dispatch captured. With
+    /// `status`, the private status message 900 is the last message of its
+    /// topic and its twin 950 the last of the group topic, both seen go in
+    /// by this run of the hub.
+    fn shared_streaming(
+        dir: &TempDir,
+        settings: menu::Settings,
+        status: bool,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
         let (mut slots, mut work) =
-            private_streaming(&dir, settings.clone(), Some(Duration::from_secs(3600)));
+            private_streaming(dir, settings, Some(Duration::from_secs(3600)));
+        let owner = private_owner();
         slots.registry.slots[0]
             .views
             .push(crate::hub::registry::View::new(Chat::Group));
         slots
             .registry
             .topic_created(SlotId(0), Chat::Group, 100, "a", None);
-        assert_eq!(slots.display_of(SlotId(0)), menu::Settings::default());
-        next_line(&mut slots, 0, 10, tool_turn());
-        let handed = all_work(&mut work);
-        let streams: Vec<&Op> = handed
+        for view in &mut slots.registry.slots[0].views {
+            view.pending_separator = None;
+        }
+        // No status call of the first pump is on its way.
+        slots.shown.remove(&SlotId(0));
+        slots.bottoms.clear();
+        if status {
+            slots.registry.slots[0].view_mut(owner).unwrap().status = Some(StatusMessage {
+                message_id: 900,
+                pinned: false,
+            });
+            slots
+                .bottoms
+                .entry(Place::topic(owner, 700))
+                .or_default()
+                .last = 900;
+            slots.mirror.link(
+                MessageKey::new(owner, 900),
+                MessageKey::new(Chat::Group, 950),
+                Some(100),
+            );
+            slots.bottoms.entry(group_topic()).or_default().last = 950;
+        }
+        let _ = all_work(&mut work);
+        (slots, work)
+    }
+
+    /// The calls of the group topic's own turn stream among `handed`: the
+    /// number there and the op.
+    fn group_turn(handed: &[(Work, Op)]) -> Vec<(u64, Op)> {
+        handed
             .iter()
-            .map(|(_, op)| op)
-            .filter(|op| matches!(op, Op::Stream { .. }))
-            .collect();
-        assert!(!streams.is_empty(), "{handed:#?}");
-        for op in streams {
-            let Op::Stream { html, .. } = op else {
-                continue;
+            .filter_map(|(work, op)| match work {
+                Work::Twin {
+                    turn: Some((place, number)),
+                    ..
+                } if *place == group_topic() => Some((*number, op.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Telegram took the group's turn call `number`: a new message as `id`,
+    /// a write into its message.
+    fn group_took(slots: &mut Slots, number: u64, op: &Op, id: i64) {
+        let message_id = match op {
+            Op::Stream {
+                into: Some(into), ..
+            } => *into,
+            _ => id,
+        };
+        slots.on_done(Done::Twin {
+            id: None,
+            place: op.posts(),
+            turn: Some((group_topic(), number)),
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id,
+                ..Message::default()
+            }))),
+        });
+    }
+
+    fn stream_text(op: &Op) -> (&str, Option<i64>) {
+        match op {
+            Op::Stream { text, into, .. } => (text.as_str(), *into),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn private_brief() -> menu::Settings {
+        menu::Settings {
+            detail: menu::Detail::Brief,
+            ..menu::Settings::default()
+        }
+    }
+
+    /// With the same settings in both views, the group's own stream turns
+    /// the twin of the status message into its turn message, as the primary
+    /// does with the status message; no new twin comes for it.
+    #[tokio::test]
+    async fn the_group_stream_absorbs_its_status_twin_like_the_primary() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-group-absorb");
+        let (mut slots, mut work) = shared_streaming(&dir, menu::Settings::default(), true);
+        let owner = private_owner();
+        let mut items = vec![StreamItem::Note {
+            text: "Looking.".into(),
+        }];
+        items.extend(finished_call("one", "• Bash: one"));
+        next_line(&mut slots, 0, 10, items);
+        let handed = all_work(&mut work);
+        assert!(
+            handed
+                .iter()
+                .any(|(work, op)| matches!(work, Work::Stream { .. })
+                    && matches!(op, Op::Stream { chat, into: Some(900), .. } if *chat == owner)),
+            "{handed:#?}"
+        );
+        let group = group_turn(&handed);
+        assert!(
+            matches!(
+                group.as_slice(),
+                [(_, Op::Stream { chat: Chat::Group, into: Some(950), merge: false, text, .. })]
+                    if text == "Looking.\n• Bash: one ✓"
+            ),
+            "{handed:#?}"
+        );
+        assert!(
+            !handed.iter().any(|(work, op)| matches!(
+                work,
+                Work::Twin {
+                    status: Some(_),
+                    ..
+                }
+            ) || matches!(op, Op::Delete { .. })),
+            "{handed:#?}"
+        );
+        assert!(!slots.mirror.knows(MessageKey::new(owner, 900), Chat::Group));
+    }
+
+    /// A turn only the group shows: the group's stream takes the status
+    /// twin, and a new twin of the private status message (which stays)
+    /// goes below it; that twin goes with the status message later.
+    #[tokio::test]
+    async fn a_group_only_turn_gets_its_status_twin_back_below() {
+        let dir = TempDir::new("slots-group-only");
+        let (mut slots, mut work) = shared_streaming(&dir, private_brief(), true);
+        let owner = private_owner();
+        let status = MessageKey::new(owner, 900);
+        next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+        let handed = all_work(&mut work);
+        assert!(
+            !handed
+                .iter()
+                .any(|(_, op)| matches!(op, Op::Stream { chat, .. } if *chat == owner)),
+            "nothing in the private chat: {handed:#?}"
+        );
+        let absorbed = handed
+            .iter()
+            .position(|(work, op)| {
+                matches!(work, Work::Twin { turn: Some(_), .. })
+                    && matches!(
+                        op,
+                        Op::Stream {
+                            into: Some(950),
+                            merge: false,
+                            ..
+                        }
+                    )
+            })
+            .expect("the twin becomes the group's turn message");
+        let fresh = handed
+            .iter()
+            .position(|(work, op)| {
+                matches!(
+                    work,
+                    Work::Twin {
+                        status: Some(_),
+                        ..
+                    }
+                ) && matches!(
+                    op,
+                    Op::Send {
+                        chat: Chat::Group,
+                        thread_id: Some(100),
+                        ..
+                    }
+                )
+            })
+            .expect("a new status twin");
+        assert!(absorbed < fresh, "{handed:#?}");
+        assert!(!handed.iter().any(|(_, op)| matches!(op, Op::Delete { .. })));
+        assert!(slots.mirror.knows(status, Chat::Group));
+        let (Work::Twin { id, place, .. }, _) = &handed[fresh] else {
+            unreachable!()
+        };
+        slots.on_done(Done::Twin {
+            id: *id,
+            place: *place,
+            turn: None,
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 960,
+                ..Message::default()
+            }))),
+        });
+        assert_eq!(
+            slots.mirror.twin(status, Chat::Group),
+            Some(MessageKey::new(Chat::Group, 960))
+        );
+        let bottom = &slots.bottoms[&group_topic()];
+        assert_eq!(
+            (bottom.last, bottom.foreign, bottom.posting),
+            (960, false, 0)
+        );
+        // The private status message moves: its twin goes with it.
+        slots.hand_off(
+            Work::Retire(Retire::Delete {
+                message: status,
+                pinned: false,
+            }),
+            Op::Delete {
+                chat: owner,
+                message_id: 900,
+            },
+        );
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(|(_, op)| matches!(
+                op,
+                Op::Delete {
+                    chat: Chat::Group,
+                    message_id: 960
+                }
+            )),
+            "{handed:#?}"
+        );
+    }
+
+    /// A turn only the private chat shows: the private status message
+    /// becomes turn content, and the group's twin of it goes (a new one
+    /// comes with the next status message); the group gets nothing new.
+    #[tokio::test]
+    async fn a_primary_absorption_retires_the_groups_status_twin() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-group-retire");
+        let settings = menu::Settings {
+            group: menu::Display {
+                detail: menu::Detail::Answers,
+                ..menu::Display::default()
+            },
+            ..menu::Settings::default()
+        };
+        let (mut slots, mut work) = shared_streaming(&dir, settings, true);
+        let owner = private_owner();
+        next_line(
+            &mut slots,
+            0,
+            10,
+            vec![StreamItem::Note {
+                text: "Looking.".into(),
+            }],
+        );
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(
+                |(_, op)| matches!(op, Op::Stream { chat, into: Some(900), .. } if *chat == owner)
+            ),
+            "{handed:#?}"
+        );
+        assert!(group_turn(&handed).is_empty(), "{handed:#?}");
+        assert!(
+            handed.iter().any(|(_, op)| matches!(
+                op,
+                Op::Delete {
+                    chat: Chat::Group,
+                    message_id: 950
+                }
+            )),
+            "{handed:#?}"
+        );
+        assert!(
+            !handed.iter().any(|(work, _)| matches!(
+                work,
+                Work::Twin {
+                    status: Some(_),
+                    ..
+                }
+            )),
+            "{handed:#?}"
+        );
+        assert!(!slots.mirror.knows(MessageKey::new(owner, 900), Chat::Group));
+    }
+
+    /// Review finding 3: a twin this run of the hub did not see go in as
+    /// the last message of the group topic (linked from registry.json after
+    /// a restart, or buried by what came since) is never turned into turn
+    /// content, which could edit a message far up the topic: the group's
+    /// line is a new message, the old twin goes and a new one comes below.
+    #[tokio::test]
+    async fn a_twin_seen_before_a_restart_is_not_absorbed() {
+        for last in [0, 940] {
+            let dir = TempDir::new("slots-group-restart");
+            let (mut slots, mut work) = shared_streaming(&dir, private_brief(), true);
+            *slots.bottoms.get_mut(&group_topic()).unwrap() = Bottom {
+                last,
+                ..Bottom::default()
             };
+            next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+            let handed = all_work(&mut work);
+            let group = group_turn(&handed);
             assert!(
-                !html
-                    .as_deref()
-                    .is_some_and(|html| html.contains("<blockquote")),
-                "{op:?}"
+                matches!(group.as_slice(), [(_, op)] if stream_text(op) == ("• Bash: one ✓", None)),
+                "last {last}: {handed:#?}"
+            );
+            assert!(
+                handed.iter().any(|(_, op)| matches!(
+                    op,
+                    Op::Delete {
+                        chat: Chat::Group,
+                        message_id: 950
+                    }
+                )),
+                "last {last}: {handed:#?}"
+            );
+            assert!(
+                handed.iter().any(|(work, _)| matches!(
+                    work,
+                    Work::Twin {
+                        status: Some(_),
+                        ..
+                    }
+                )),
+                "last {last}: {handed:#?}"
             );
         }
-        // Back in the private chat alone, the owner's view applies again.
-        slots.registry.slots[0].views.pop();
-        assert_eq!(slots.display_of(SlotId(0)), settings);
+    }
+
+    /// The primary's refused line is read again after a rewind; the group
+    /// had it already and gets each line once, its turn message growing on.
+    #[tokio::test]
+    async fn a_rewind_gives_the_group_no_line_twice() {
+        let dir = TempDir::new("slots-group-rewind");
+        let (mut slots, mut work) = shared_streaming(&dir, menu::Settings::default(), false);
+        next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+        let handed = all_work(&mut work);
+        let group = group_turn(&handed);
+        assert_eq!(group.len(), 1, "{handed:#?}");
+        group_took(&mut slots, group[0].0, &group[0].1, 800);
+        for (work, _) in &handed {
+            if let Work::Stream { session, number } = work {
+                slots.on_stream_done(session, *number, None);
+            }
+        }
+        assert!(slots.streams[A].rewind_at.is_some());
+        // Read again from the offset, with the next line.
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(
+            A,
+            0,
+            vec![
+                StreamLine {
+                    end: 10,
+                    items: finished_call("one", "• Bash: one"),
+                },
+                StreamLine {
+                    end: 20,
+                    items: finished_call("two", "• Bash: two"),
+                },
+            ],
+        ));
+        let mut group = Vec::new();
+        for _ in 0..4 {
+            let handed = all_work(&mut work);
+            group.extend(group_turn(&handed));
+            accept_streams(&mut slots, &handed);
+            if stream_offset(&slots) == Some(20) {
+                break;
+            }
+            let at = slots.streams[A].read_at.unwrap_or(0);
+            slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+            slots.on_agent(stream_chunk(
+                A,
+                at,
+                vec![StreamLine {
+                    end: 20,
+                    items: finished_call("two", "• Bash: two"),
+                }],
+            ));
+        }
+        assert_eq!(stream_offset(&slots), Some(20));
+        let texts: Vec<(&str, Option<i64>)> = group.iter().map(|(_, op)| stream_text(op)).collect();
+        assert_eq!(
+            texts,
+            [("• Bash: one ✓\n• Bash: two ✓", Some(800))],
+            "{group:#?}"
+        );
+    }
+
+    /// While a write of the group's turn message waits for Telegram, the
+    /// next lines wait too and go in one write of the whole text.
+    #[tokio::test]
+    async fn the_group_turn_message_takes_one_write_at_a_time() {
+        let dir = TempDir::new("slots-group-writes");
+        let (mut slots, mut work) = shared_streaming(&dir, private_brief(), false);
+        next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+        let group = group_turn(&all_work(&mut work));
+        assert_eq!(group.len(), 1);
+        group_took(&mut slots, group[0].0, &group[0].1, 800);
+        next_line(&mut slots, 10, 20, finished_call("two", "• Bash: two"));
+        let group = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op) == ("• Bash: one ✓\n• Bash: two ✓", Some(800))),
+            "{group:#?}"
+        );
+        let (write, op) = group[0].clone();
+        next_line(&mut slots, 20, 30, finished_call("three", "• Bash: three"));
+        next_line(&mut slots, 30, 40, finished_call("four", "• Bash: four"));
+        assert!(
+            group_turn(&all_work(&mut work)).is_empty(),
+            "one write in flight"
+        );
+        group_took(&mut slots, write, &op, 800);
+        let group = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op)
+                == ("• Bash: one ✓\n• Bash: two ✓\n• Bash: three ✓\n• Bash: four ✓", Some(800))),
+            "{group:#?}"
+        );
+        assert_eq!(stream_offset(&slots), Some(40));
+    }
+
+    /// Review finding 1: the last lines of a turn that wait behind a write
+    /// in flight when the answer's twin closes the group's turn message
+    /// still go into it, in one last write; the next turn starts a new one.
+    #[tokio::test]
+    async fn the_answer_twin_leaves_the_last_group_lines_written() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-group-last-write");
+        let (mut slots, mut work) = shared_streaming(&dir, private_brief(), false);
+        slots.on_hook(&stop(A, Some("done")));
+        next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+        let group = group_turn(&all_work(&mut work));
+        group_took(&mut slots, group[0].0, &group[0].1, 800);
+        next_line(&mut slots, 10, 20, finished_call("two", "• Bash: two"));
+        let group = group_turn(&all_work(&mut work));
+        let (write, op) = group[0].clone();
+        assert_eq!(stream_text(&op).1, Some(800));
+        let mut items = finished_call("three", "• Bash: three");
+        items.push(StreamItem::TurnEnd);
+        next_line(&mut slots, 20, 30, items);
+        let handed = all_work(&mut work);
+        assert!(group_turn(&handed).is_empty(), "{handed:#?}");
+        assert!(
+            handed.iter().any(|(work, op)| matches!(work, Work::Twin { turn: None, .. })
+                && matches!(op, Op::Stream { chat: Chat::Group, notify: true, text, .. } if text == "done")),
+            "the answer's twin: {handed:#?}"
+        );
+        group_took(&mut slots, write, &op, 800);
+        let group = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op)
+                == ("• Bash: one ✓\n• Bash: two ✓\n• Bash: three ✓", Some(800))),
+            "{group:#?}"
+        );
+        group_took(&mut slots, group[0].0, &group[0].1, 800);
+        next_line(&mut slots, 30, 40, finished_call("four", "• Bash: four"));
+        let group = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op) == ("• Bash: four ✓", None)),
+            "{group:#?}"
+        );
+    }
+
+    /// Review finding 2: an answer held again by a rewind goes first in the
+    /// read that reads its turn end no more: it closes the group's turn
+    /// message when the read decides it, so the next turn's lines of that
+    /// read start a new message below its twin, and the status twin, no
+    /// longer the last message there, is not taken.
+    #[tokio::test]
+    async fn an_overdue_answer_closes_the_group_turn_before_later_lines() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-group-overdue");
+        let (mut slots, mut work) = shared_streaming(&dir, private_brief(), false);
+        let owner = private_owner();
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(
+            A,
+            0,
+            vec![
+                StreamLine {
+                    end: 10,
+                    items: finished_call("one", "• Bash: one"),
+                },
+                StreamLine {
+                    end: 20,
+                    items: vec![StreamItem::TurnEnd],
+                },
+            ],
+        ));
+        let group = group_turn(&all_work(&mut work));
+        group_took(&mut slots, group[0].0, &group[0].1, 800);
+        assert_eq!(stream_offset(&slots), Some(20));
+        // The Stop comes after its turn end: the answer goes at once.
+        slots.on_hook(&stop(A, Some("first")));
+        let answers: Vec<u64> = all_work(&mut work)
+            .iter()
+            .filter_map(|(work, _)| match work {
+                Work::Stream { number, .. } => Some(*number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers.len(), 1);
+        next_line(&mut slots, 20, 30, finished_call("two", "• Bash: two"));
+        let group = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op) == ("• Bash: two ✓", None)),
+            "{group:#?}"
+        );
+        group_took(&mut slots, group[0].0, &group[0].1, 801);
+        // The private chat refuses the answer: the stream reads again.
+        slots.on_stream_done(A, answers[0], bad_gateway());
+        assert!(slots.streams[A].rewind_at.is_some());
+        // Meanwhile the group's status twin is its last message.
+        slots.registry.slots[0].view_mut(owner).unwrap().status = Some(StatusMessage {
+            message_id: 900,
+            pinned: false,
+        });
+        slots.mirror.link(
+            MessageKey::new(owner, 900),
+            MessageKey::new(Chat::Group, 950),
+            Some(100),
+        );
+        *slots.bottoms.entry(group_topic()).or_default() = Bottom {
+            last: 950,
+            ..Bottom::default()
+        };
+        if let Some(shown) = slots.shown.get_mut(&SlotId(0)) {
+            shown.sending = None;
+        }
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(
+            A,
+            20,
+            vec![
+                StreamLine {
+                    end: 30,
+                    items: finished_call("two", "• Bash: two"),
+                },
+                StreamLine {
+                    end: 40,
+                    items: finished_call("three", "• Bash: three"),
+                },
+            ],
+        ));
+        let handed = all_work(&mut work);
+        let answer = handed
+            .iter()
+            .position(|(work, op)| {
+                matches!(work, Work::Twin { turn: None, .. })
+                    && matches!(op, Op::Stream { chat: Chat::Group, notify: true, text, .. } if text == "first")
+            })
+            .expect("the answer's twin");
+        let line = handed
+            .iter()
+            .position(|(work, _)| matches!(work, Work::Twin { turn: Some(_), .. }))
+            .expect("the next turn's line");
+        assert!(answer < line, "{handed:#?}");
+        let group = group_turn(&handed);
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op) == ("• Bash: three ✓", None)),
+            "a new message, not a write into 801 or 950: {group:#?}"
+        );
+    }
+
+    /// Review finding 2, second half: an answer decided in a read closes the
+    /// group's turn message then, not again when its twin is handed out:
+    /// the next turn's message begun later in the same read goes on in the
+    /// next read.
+    #[tokio::test]
+    async fn a_read_with_an_answer_and_the_next_turn_grows_the_new_group_message() {
+        use crate::wire::StreamItem;
+        let dir = TempDir::new("slots-group-next-turn");
+        let (mut slots, mut work) = shared_streaming(&dir, private_brief(), false);
+        slots.on_hook(&stop(A, Some("done")));
+        slots.streams.get_mut(A).unwrap().reading = Some((1, Instant::now()));
+        slots.on_agent(stream_chunk(
+            A,
+            0,
+            vec![
+                StreamLine {
+                    end: 10,
+                    items: finished_call("one", "• Bash: one"),
+                },
+                StreamLine {
+                    end: 20,
+                    items: vec![StreamItem::TurnEnd],
+                },
+                StreamLine {
+                    end: 30,
+                    items: vec![StreamItem::Prompt {
+                        text: "next".into(),
+                    }],
+                },
+                StreamLine {
+                    end: 40,
+                    items: finished_call("two", "• Bash: two"),
+                },
+            ],
+        ));
+        let handed = all_work(&mut work);
+        let group = group_turn(&handed);
+        let texts: Vec<(&str, Option<i64>)> = group.iter().map(|(_, op)| stream_text(op)).collect();
+        assert_eq!(
+            texts,
+            [
+                ("• Bash: one ✓", None),
+                ("> next", None),
+                ("• Bash: two ✓", None)
+            ],
+            "{handed:#?}"
+        );
+        for (index, (number, op)) in group.iter().enumerate() {
+            group_took(&mut slots, *number, op, 800 + index as i64);
+        }
+        accept_streams(&mut slots, &handed);
+        next_line(&mut slots, 40, 50, finished_call("three", "• Bash: three"));
+        let group = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(group.as_slice(), [(_, op)] if stream_text(op) == ("• Bash: two ✓\n• Bash: three ✓", Some(802))),
+            "{group:#?}"
+        );
+    }
+
+    /// Turn answers are the only loud stream messages: lines, the turn
+    /// message and writes into it are quiet.
+    #[test]
+    fn is_answer_marks_only_answers() {
+        let owner = private_owner();
+        let mut live = Live::new(Some(0), Vec::new());
+        let held = Held {
+            place: Place::topic(owner, 700),
+            answer: "done".into(),
+            until: Instant::now(),
+            end: None,
+            gone: None,
+        };
+        let Ok(ops) = answer_ops(&mut live, held, 10) else {
+            panic!("the answer rides the stream");
+        };
+        assert!(!ops.is_empty());
+        assert!(ops.iter().all(|(_, op)| is_answer(op)));
+        let mut rolling = Rolling {
+            status: None,
+            absorbed: None,
+            posted: 0,
+            compact: false,
+        };
+        let piece = |text: &str| (text.to_owned(), None, true, false);
+        let mut ops = roll(&mut live, &mut rolling, vec![piece("a")], owner, 700);
+        live.opened(ops[0].0, Some(MessageKey::new(owner, 800)));
+        ops.extend(roll(&mut live, &mut rolling, vec![piece("b")], owner, 700));
+        ops.extend(roll(
+            &mut live,
+            &mut rolling,
+            vec![("> go".to_owned(), None, false, false)],
+            owner,
+            700,
+        ));
+        assert!(ops.iter().any(|(_, op)| matches!(
+            op,
+            Op::Stream {
+                into: Some(800),
+                ..
+            }
+        )));
+        assert!(ops.iter().all(|(_, op)| !is_answer(op)), "{ops:#?}");
+    }
+
+    /// Review finding 4: the switch «👥 Группа» opens the group's page of
+    /// the display tab, and a group setting stays on it.
+    #[tokio::test]
+    async fn the_group_display_button_opens_the_group_page() {
+        let dir = TempDir::new("slots-menu-group");
+        let (mut slots, mut work) = menu_slot(&dir, menu_options());
+        slots.on_control(menu_press(MENU, "menu:dg"));
+        let handed = all_work(&mut work);
+        let edits = menu_edits(&handed);
+        assert_eq!(edits.len(), 1, "{handed:#?}");
+        assert!(
+            edits[0].1.starts_with("Что показывать в темах группы"),
+            "{}",
+            edits[0].1
+        );
+        let labels = button_texts(&edits[0].2);
+        assert!(labels.contains(&"· 👁 Показ".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"✅ 👥 Группа".to_owned()), "{labels:?}");
+        assert_eq!(callback_answers(&handed), [None]);
+        slots.on_control(menu_press(MENU, "menu:gdl:b"));
+        let handed = all_work(&mut work);
+        let edits = menu_edits(&handed);
+        assert_eq!(edits.len(), 1, "{handed:#?}");
+        assert!(edits[0].1.starts_with("Что показывать в темах группы"));
+        assert!(button_texts(&edits[0].2).contains(&"✅ Кратко".to_owned()));
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(menu::ANSWER_SAVED.to_owned())]
+        );
+        let settings = &slots.registry.person(owner_chat()).unwrap().settings;
+        assert_eq!(settings.group.detail, menu::Detail::Brief);
+        assert_eq!(settings.detail, menu::Detail::Full);
+        // Back to the private page.
+        slots.on_control(menu_press(MENU, "menu:d"));
+        let edits = menu_edits(&all_work(&mut work));
+        assert!(edits[0].1.starts_with("Что показывать в темах лички"));
     }
 }
