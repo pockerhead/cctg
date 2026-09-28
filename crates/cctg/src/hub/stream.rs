@@ -309,7 +309,9 @@ pub struct MirrorTurn {
     /// Messages closed while an answer or a last write was due.
     closing: VecDeque<MirrorMessage>,
     /// New messages the scheduler may join later ones into (`merge`) whose
-    /// answer has not come: until it came, a new message does not join.
+    /// answer has not come: until it came, a new message does not join. It
+    /// holds at most one of the new messages waiting in a row (those after
+    /// it are not `merge`, nothing joins them).
     joining: Vec<u64>,
 }
 
@@ -399,6 +401,14 @@ impl MirrorTurn {
     pub fn leave(&mut self) {
         self.close();
         self.session.clear();
+    }
+
+    /// A new message of it that the scheduler may join later ones into
+    /// still waits: no other new message of its topic may be `merge` now,
+    /// the primary stream's included (a turn left by [`Self::leave`] would
+    /// erase what joined it with its last write).
+    pub fn joinable(&self) -> bool {
+        !self.joining.is_empty()
     }
 
     /// Nothing it sent waits for an answer, nothing is owed.
@@ -2872,5 +2882,22 @@ mod tests {
         turn.reset("s", 30);
         assert!(!turn.takes(30));
         assert!(turn.takes(40));
+    }
+
+    /// A new message whose answer never came (the sender dropped: no
+    /// delivery, not accepted) lets the next new one be joined again.
+    #[test]
+    fn a_message_without_an_answer_lets_the_next_one_join() {
+        let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
+        let a = roll_quiet(&mut turn, &mut calls, &["a"])[0].number();
+        assert!(turn.joinable());
+        turn.answered(a, None, false, false, &mut calls);
+        assert!(!turn.joinable());
+        let b = roll_quiet(&mut turn, &mut calls, &["b"]);
+        assert!(
+            matches!(b.as_slice(), [MirrorOp::New { merge: true, .. }]),
+            "{b:?}"
+        );
     }
 }

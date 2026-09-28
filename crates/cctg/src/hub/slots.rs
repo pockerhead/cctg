@@ -211,7 +211,11 @@
 //! closes only that topic's turn message. A topic that stops being a
 //! mirror while the slot still shows there (its private chat closed, the
 //! private topic made again) still gets the last write its turn message
-//! owes. Known limits: a mirror's turn
+//! owes; while that turn's new message waits, the lines of the primary
+//! stream there are not joined into it. Known limits: a mirror's turn
+//! message joined by the scheduler into a primary line still waiting in
+//! that topic (the private chat opened again within the group's debounce)
+//! loses what grew in it after it was sent; a mirror's turn
 //! message Telegram did not take loses its pieces; an answer the private
 //! chat refused and that went later may show in the group below the next
 //! turn's lines; a status twin a prompt pushed out of the group's queue
@@ -5175,6 +5179,12 @@ impl Slots {
             .zip(place)
             .map(|(slot, place)| self.display_in(slot, place.chat))
             .unwrap_or_default();
+        // TASK-078: a mirror turn left in this topic (it is the primary one
+        // now) still waits for a new message whose last write would erase a
+        // line joined into it: no line joins it.
+        let joins = !place
+            .and_then(|place| self.mirror_turns.get(&place))
+            .is_some_and(stream::MirrorTurn::joinable);
         // TASK-062: the turn's content goes into one message, and the status
         // message may become the first one.
         let mut rolling = self.options.status_every.is_some().then(|| Rolling {
@@ -5184,6 +5194,7 @@ impl Slots {
             absorbed: None,
             posted: 0,
             compact: display.turn == menu::TurnView::Compact,
+            joins,
         });
         // TASK-078: the primary status message at the start of the read,
         // and whether it stays the last message of its topic unless the read
@@ -5469,7 +5480,7 @@ impl Slots {
                         ..
                     } => {
                         let chunks = stream_chunks(&text, format);
-                        let merge = merge && chunks.len() == 1;
+                        let merge = merge && chunks.len() == 1 && joins;
                         for (text, html) in chunks {
                             queued += 1;
                             let op = Op::Stream {
@@ -11392,6 +11403,10 @@ struct Rolling {
     posted: usize,
     /// The owner's compact turn view (TASK-076).
     compact: bool,
+    /// A new message may be one the scheduler joins into the one before
+    /// (`merge`); not while a mirror turn left in this topic still waits
+    /// for its new message (TASK-078).
+    joins: bool,
 }
 
 /// The stream messages of `pieces` (text, HTML, whether it is quiet turn
@@ -11445,7 +11460,7 @@ fn roll(
             html,
             // The status message becoming content goes at once, as a
             // foreground edit: the next status message waits for it.
-            merge: open.is_some() && status.is_none(),
+            merge: open.is_some() && status.is_none() && rolling.joins,
             restart,
             notify: false,
             into: status.map(|status| status.id),
@@ -28681,6 +28696,7 @@ again"
             absorbed: None,
             posted: 0,
             compact: false,
+            joins: true,
         };
         let piece = |text: &str| (text.to_owned(), None, true, false);
         let mut ops = roll(&mut live, &mut rolling, vec![piece("a")], owner, 700);
@@ -29019,5 +29035,73 @@ again"
         });
         let bottom = &slots.bottoms[&group_topic()];
         assert_eq!((bottom.last, bottom.foreign), (960, false));
+    }
+
+    /// Review round 2, finding 1: the private chat closes while the group's
+    /// new turn message A still waits for Telegram and grew; the group is the
+    /// primary view now and its stream's next line P must not be one the
+    /// scheduler joins into A (P would be answered `Merged`, and the left
+    /// turn's last write of A would erase it). Every line stays.
+    #[tokio::test]
+    async fn a_primary_line_never_joins_a_left_group_message_on_its_way() {
+        let dir = TempDir::new("slots-group-left-join");
+        let (mut slots, mut work) = shared_streaming(&dir, private_brief(), false);
+        let Chat::Private(private) = private_owner() else {
+            unreachable!()
+        };
+        next_line(&mut slots, 0, 10, finished_call("one", "• Bash: one"));
+        let group = group_turn(&all_work(&mut work));
+        let (a, a_op) = group[0].clone();
+        assert!(matches!(
+            a_op,
+            Op::Stream {
+                merge: true,
+                into: None,
+                ..
+            }
+        ));
+        next_line(&mut slots, 10, 20, finished_call("two", "• Bash: two"));
+        assert!(group_turn(&all_work(&mut work)).is_empty(), "A grows");
+        slots.registry.closed.insert(private);
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(slots.mirror_turns.contains_key(&group_topic()));
+        next_line(&mut slots, 20, 30, finished_call("three", "• Bash: three"));
+        let handed = all_work(&mut work);
+        let primary: Vec<(u64, Op)> = handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (
+                    Work::Stream { number, .. },
+                    Op::Stream {
+                        chat: Chat::Group, ..
+                    },
+                ) => Some((*number, op.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(primary.as_slice(), [(_, Op::Stream { merge: false, into: None, text, .. })]
+                if text == "• Bash: three ✓"),
+            "the scheduler may not join P into A: {handed:#?}"
+        );
+        // Each goes as a message of its own; A gets its last write.
+        group_took(&mut slots, a, &a_op, 800);
+        slots.on_stream_done(
+            A,
+            primary[0].0,
+            Some(Ok(Outcome::Sent(Message {
+                message_id: 801,
+                ..Message::default()
+            }))),
+        );
+        let last = group_turn(&all_work(&mut work));
+        assert!(
+            matches!(last.as_slice(), [(_, op)]
+                if stream_text(op) == ("• Bash: one ✓\n• Bash: two ✓", Some(800))),
+            "{last:#?}"
+        );
+        group_took(&mut slots, last[0].0, &last[0].1, 800);
+        assert!(slots.mirror_turns.is_empty(), "nothing owed: it goes");
     }
 }
