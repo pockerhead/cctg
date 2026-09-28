@@ -617,6 +617,15 @@ impl BotApi {
             .map(drop)
     }
 
+    /// Deletes the topic with all its messages (TASK-064); in the group the
+    /// bot needs `can_delete_messages`.
+    pub async fn delete_forum_topic(&self, chat: Chat, thread_id: i64) -> Result<(), ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat), "message_thread_id": thread_id });
+        self.call::<IgnoredAny>("deleteForumTopic", body, None)
+            .await
+            .map(drop)
+    }
+
     pub async fn get_forum_topic_icon_stickers(&self) -> Result<Vec<Sticker>, ApiError> {
         self.call("getForumTopicIconStickers", json!({}), None)
             .await

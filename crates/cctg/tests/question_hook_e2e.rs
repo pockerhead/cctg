@@ -348,6 +348,7 @@ fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
             message_id: Some(message_id),
             thread_id: Some(100),
             from_name: None,
+            author: None,
         }))
         .unwrap();
 }

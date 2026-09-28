@@ -341,6 +341,7 @@ fn press(hub: &Hub, message_id: i64, data: String) {
             message_id: Some(message_id),
             thread_id: Some(100),
             from_name: None,
+            author: None,
         }))
         .unwrap();
 }

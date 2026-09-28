@@ -150,6 +150,9 @@ pub struct CallbackInput {
     pub thread_id: Option<i64>,
     /// Who pressed, as [`Inbound::from_name`].
     pub from_name: Option<String>,
+    /// Who pressed, as [`Inbound::author`]: it signs the share line
+    /// (TASK-064). Never logged.
+    pub author: Option<String>,
 }
 
 /// UTF-16 units kept of an author's name.
@@ -326,6 +329,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             message_id: query.message.map(|message| message.message_id),
             thread_id,
             from_name: author_name(&from).filter(|_| allowlist.is_team()),
+            author: author_name(&from),
         });
     }
 
@@ -642,6 +646,7 @@ mod tests {
                 message_id: Some(10),
                 thread_id: Some(7),
                 from_name: None,
+                author: Some("x".to_owned()),
             })
         );
     }
@@ -680,12 +685,14 @@ mod tests {
                 ..
             })
         ));
+        // The author signs a share line either way (TASK-064).
         assert!(matches!(
             route(press, &alone),
             Routed::Callback(CallbackInput {
                 from_name: None,
+                author: Some(ref author),
                 ..
-            })
+            }) if author == "anna_k"
         ));
     }
 

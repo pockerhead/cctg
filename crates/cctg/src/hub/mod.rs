@@ -650,6 +650,7 @@ mod tests {
             message_id: Some(8),
             thread_id: None,
             from_name: None,
+            author: None,
         }));
         route(Routed::Input(Inbound {
             text: None,
@@ -662,6 +663,7 @@ mod tests {
             message_id: Some(9),
             thread_id: None,
             from_name: None,
+            author: None,
         };
         route(Routed::Callback(press.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {

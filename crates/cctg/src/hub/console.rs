@@ -3,11 +3,13 @@
 //!
 //! A topic message that starts with `!` (Claude Code's bash mode) or with a
 //! slash command the hub does not serve itself (`/compact`, `/model`, `/cost`,
-//! a skill `/plugin:name`; `/brief` and `/full` never get here) is typed into
-//! the input box of the claude console of the slot's live session by its
-//! agent, as if the user typed it at the terminal ([`crate::keys::type_line`]:
-//! typed, read back from the screen, Enter only on an exact match). Its output
-//! comes back through the ordinary transcript stream.
+//! a skill `/plugin:name`; `/brief` and `/full` never get here, nor do
+//! `/share` and `/unshare` while the bot has topics in private chats) is
+//! typed into the input box of the claude console of the slot's live
+//! session by its agent, as if the user typed it at the terminal
+//! ([`crate::keys::type_line`]: typed, read back from the screen, Enter only
+//! on an exact match). Its output comes back through the ordinary
+//! transcript stream.
 //!
 //! A command is refused with an answer in the topic, never queued and never
 //! passed to the model as text: while a turn runs or a permission prompt

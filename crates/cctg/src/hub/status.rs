@@ -10,6 +10,12 @@
 //! answers the prompt instead of stopping the turn, so ⏹ is never offered
 //! then.
 //!
+//! In the owner's private view the message also carries, in a row of its
+//! own, the share button (TASK-064): «👥 В группу» shares the slot to the
+//! group, «🙈 Убрать из группы» asks for a confirming second press, like ⏹,
+//! and then takes it out. Its twins in the group never carry it
+//! ([`for_mirror`]).
+//!
 //! While Claude Code compacts the context (TASK-053) the first line says so,
 //! with the minutes it takes; the topic gets one silent line when it starts
 //! ([`compacting_line`]) and one when it is done ([`compacted_line`]).
@@ -46,6 +52,9 @@ pub const INTERRUPT_NOTE: &str = "[Request interrupted by user";
 const STOP: &str = "status:stop";
 const CONFIRM: &str = "status:confirm";
 const UPDATE: &str = "status:update";
+const SHARE: &str = "status:share";
+const UNSHARE: &str = "status:unshare";
+const UNSHARE_CONFIRM: &str = "status:unshare_confirm";
 /// The update button of an outdated-client warning: `update:<session id>`.
 const UPDATE_PREFIX: &str = "update:";
 
@@ -70,6 +79,19 @@ pub const ANSWER_CURRENT: &str = "Клиент уже обновлён";
 pub const ANSWER_OLD_CLIENT: &str =
     "Этот клиент старше обновлений из Telegram: перезапустите сессию вручную";
 pub const UPDATED_NOTICE: &str = "✅ Клиент cctg обновлён.";
+
+pub const SHARE_BUTTON: &str = "👥 В группу";
+pub const UNSHARE_BUTTON: &str = "🙈 Убрать из группы";
+pub const UNSHARE_CONFIRM_BUTTON: &str = "Точно убрать из группы?";
+pub const ANSWER_SHARED: &str = "Сессия теперь видна в группе";
+pub const ANSWER_ALREADY_SHARED: &str = "Сессия уже в группе";
+pub const ANSWER_UNSHARE_CONFIRM: &str =
+    "Нажмите ещё раз: тема в группе удалится вместе с сообщениями";
+pub const ANSWER_UNSHARED: &str = "Сессия убрана из группы";
+pub const ANSWER_NOT_SHARED: &str = "Сессия и так не в группе";
+pub const ANSWER_OWNER_ONLY: &str =
+    "Добавить в группу или убрать может только владелец, в теме сессии в своей личке с ботом";
+pub const ANSWER_SHARE_LATER: &str = "Сейчас нельзя: тема сессии или её тема в группе ещё не готова, повторите через несколько секунд";
 /// The client found no newer file of itself (TASK-040). The hub cannot tell
 /// whether that machine is its own, so the text covers both (TASK-035).
 pub const NO_NEW_BUILD_NOTICE: &str = "На машине этой сессии нет новой сборки cctg. Если hub на этой же машине: cctg deploy, потом «Обновить». Если нет: положите на место файла cctg этой машины сборку того же коммита, что у hub (GitHub Releases, номер сборки в предупреждении), потом «Обновить».";
@@ -97,6 +119,12 @@ pub enum Press {
     Confirm,
     /// ⬆️ Обновить.
     Update,
+    /// 👥 В группу (TASK-064).
+    Share,
+    /// 🙈 Убрать из группы, first press.
+    Unshare,
+    /// 🙈 Убрать из группы, the confirming press.
+    UnshareConfirm,
 }
 
 /// The status button of `data`; anything else is not one.
@@ -105,6 +133,9 @@ pub fn parse_callback(data: &str) -> Option<Press> {
         STOP => Some(Press::Stop),
         CONFIRM => Some(Press::Confirm),
         UPDATE => Some(Press::Update),
+        SHARE => Some(Press::Share),
+        UNSHARE => Some(Press::Unshare),
+        UNSHARE_CONFIRM => Some(Press::UnshareConfirm),
         _ => None,
     }
 }
@@ -326,6 +357,19 @@ pub struct Buttons {
     pub confirm: bool,
     /// The session's client is outdated: a line and ⬆️ Обновить.
     pub update: bool,
+    /// The share button of the owner's private view (TASK-064).
+    pub share: Option<ShareButton>,
+}
+
+/// Which share button the status message carries (TASK-064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareButton {
+    /// 👥 В группу.
+    Share,
+    /// 🙈 Убрать из группы.
+    Unshare,
+    /// It asks for the confirming press.
+    Confirm,
 }
 
 /// The text and keyboard of the status message. The keyboard is always
@@ -369,23 +413,80 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
     if buttons.update {
         row.push(json!({ "text": UPDATE_BUTTON, "callback_data": UPDATE }));
     }
-    let keyboard = if row.is_empty() {
+    let mut rows = Vec::new();
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if let Some(share) = buttons.share {
+        let (label, data) = match share {
+            ShareButton::Share => (SHARE_BUTTON, SHARE),
+            ShareButton::Unshare => (UNSHARE_BUTTON, UNSHARE),
+            ShareButton::Confirm => (UNSHARE_CONFIRM_BUTTON, UNSHARE_CONFIRM),
+        };
+        rows.push(vec![json!({ "text": label, "callback_data": data })]);
+    }
+    let keyboard = if rows.is_empty() {
         permissions::no_keyboard()
     } else {
-        json!({ "inline_keyboard": [row] })
+        json!({ "inline_keyboard": rows })
     };
     (text, keyboard)
 }
 
-/// The keyboard asks for the confirming ⏹ press.
-pub fn asks_confirm(keyboard: &Value) -> bool {
+/// The keyboard has a button with callback data `data`.
+fn has_button(keyboard: &Value, data: &str) -> bool {
     keyboard["inline_keyboard"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_array)
         .flatten()
-        .any(|button| button["callback_data"] == CONFIRM)
+        .any(|button| button["callback_data"] == data)
+}
+
+/// The keyboard asks for the confirming ⏹ press.
+pub fn asks_confirm(keyboard: &Value) -> bool {
+    has_button(keyboard, CONFIRM)
+}
+
+/// The keyboard asks for the confirming unshare press (TASK-064).
+pub fn asks_unshare_confirm(keyboard: &Value) -> bool {
+    has_button(keyboard, UNSHARE_CONFIRM)
+}
+
+/// `keyboard` as a twin in the group shows it (TASK-064): without the share
+/// button, empty rows dropped; an explicit empty keyboard when nothing is
+/// left. Anything that is no inline keyboard stays as it is.
+pub fn for_mirror(keyboard: &Value) -> Value {
+    let Some(rows) = keyboard["inline_keyboard"].as_array() else {
+        return keyboard.clone();
+    };
+    let share = |button: &Value| {
+        [SHARE, UNSHARE, UNSHARE_CONFIRM]
+            .iter()
+            .any(|data| button["callback_data"] == *data)
+    };
+    let rows: Vec<Value> = rows
+        .iter()
+        .map(|row| match row.as_array() {
+            Some(buttons) => Value::Array(
+                buttons
+                    .iter()
+                    .filter(|button| !share(button))
+                    .cloned()
+                    .collect(),
+            ),
+            None => row.clone(),
+        })
+        .filter(|row| row.as_array().is_none_or(|buttons| !buttons.is_empty()))
+        .collect();
+    if rows.is_empty() {
+        permissions::no_keyboard()
+    } else {
+        let mut mirrored = keyboard.clone();
+        mirrored["inline_keyboard"] = Value::Array(rows);
+        mirrored
+    }
 }
 
 /// The words for how a compaction began.
@@ -560,6 +661,7 @@ mod tests {
             interrupt: true,
             confirm: false,
             update: false,
+            share: None,
         };
         let (text, keyboard) = render(&running, None, stop);
         assert_eq!(text, "⚙️ Bash: Run tests (+2)");
@@ -613,6 +715,9 @@ mod tests {
         assert_eq!(parse_callback(STOP), Some(Press::Stop));
         assert_eq!(parse_callback(CONFIRM), Some(Press::Confirm));
         assert_eq!(parse_callback(UPDATE), Some(Press::Update));
+        assert_eq!(parse_callback(SHARE), Some(Press::Share));
+        assert_eq!(parse_callback(UNSHARE), Some(Press::Unshare));
+        assert_eq!(parse_callback(UNSHARE_CONFIRM), Some(Press::UnshareConfirm));
         for other in [
             "allow:abcde",
             "resume:x",
@@ -624,7 +729,7 @@ mod tests {
             assert_eq!(parse_callback(other), None, "{other}");
         }
         // Telegram allows 1-64 bytes of callback data.
-        for data in [STOP, CONFIRM, UPDATE] {
+        for data in [STOP, CONFIRM, UPDATE, SHARE, UNSHARE, UNSHARE_CONFIRM] {
             assert!(data.len() <= 64);
         }
         let session = "5e551017-0000-4000-8000-000000000001";
@@ -642,6 +747,70 @@ mod tests {
         );
         assert!(outdated_text(Some("ab12cd34"), "ffee0011").contains("ab12cd34"));
         assert!(outdated_text(None, "ffee0011").contains("ffee0011"));
+    }
+
+    /// TASK-064: the share button is a row of its own, and a twin in the
+    /// group shows the keyboard without it.
+    #[test]
+    fn the_share_button_is_its_own_row_and_the_mirror_drops_it() {
+        let rows = |keyboard: &Value| -> Vec<Vec<String>> {
+            keyboard["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|button| button["callback_data"].as_str().unwrap().to_owned())
+                        .collect()
+                })
+                .collect()
+        };
+        for (share, label, data) in [
+            (ShareButton::Share, SHARE_BUTTON, SHARE),
+            (ShareButton::Unshare, UNSHARE_BUTTON, UNSHARE),
+            (
+                ShareButton::Confirm,
+                UNSHARE_CONFIRM_BUTTON,
+                UNSHARE_CONFIRM,
+            ),
+        ] {
+            let all = Buttons {
+                interrupt: true,
+                confirm: false,
+                update: true,
+                share: Some(share),
+            };
+            let (_, keyboard) = render(&Phase::Thinking, None, all);
+            assert_eq!(
+                rows(&keyboard),
+                [
+                    vec![STOP.to_owned(), UPDATE.to_owned()],
+                    vec![data.to_owned()]
+                ]
+            );
+            assert_eq!(buttons(&keyboard)[2].0, label);
+            assert_eq!(
+                asks_unshare_confirm(&keyboard),
+                share == ShareButton::Confirm
+            );
+            let mirrored = for_mirror(&keyboard);
+            assert_eq!(rows(&mirrored), [vec![STOP.to_owned(), UPDATE.to_owned()]]);
+            // A keyboard with the share button alone: the twin has none.
+            let alone = Buttons {
+                share: Some(share),
+                ..Buttons::default()
+            };
+            let (_, keyboard) = render(&Phase::Idle, None, alone);
+            assert_eq!(rows(&keyboard), [vec![data.to_owned()]]);
+            assert_eq!(for_mirror(&keyboard), permissions::no_keyboard());
+        }
+        assert_eq!(
+            for_mirror(&permissions::no_keyboard()),
+            permissions::no_keyboard()
+        );
+        assert_eq!(for_mirror(&Value::Null), Value::Null);
     }
 
     #[test]

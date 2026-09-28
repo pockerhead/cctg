@@ -189,7 +189,7 @@
 //! Private chats (TASK-063): when the bot has topics in private chats
 //! (`Options::owners`), a slot with a live session also shows in its
 //! owner's private chat ([`Owners`]); a slot made then shows there alone
-//! (decision 2026-09-28; sharing it to the group is TASK-064), and a slot
+//! (decision 2026-09-28; sharing it to the group: below), and a slot
 //! with no usable view shows in the group. That view is the primary one
 //! ([`Registry::primary_view`]): everything above happens there, the stream
 //! offset moves with it, and every message the actor puts there and every
@@ -214,6 +214,22 @@
 //! prompt then); a lost reply, notice or echo goes again into the topic made
 //! again (after a 403: into the group, unless its twin shows it there), and
 //! a reply for a slot whose topic is being made waits for it.
+//!
+//! Sharing (TASK-064): sharing to the group is a property of the slot (a
+//! group view that is no fallback) and holds for its later sessions. The
+//! owner shares or unshares with `/share` and `/unshare` in the slot's
+//! private topic, or with the share button of its private status message
+//! (unshare asks for a second press, like ⏹); the owner is known by the
+//! place alone (a private chat is its user's), checked before a press on a
+//! twin counts as one on its primary. The commands never go to the console.
+//! A share starts the group topic with the share line
+//! ([`super::registry::share_line`], the first message there) and copies no
+//! history; a fallback group view is kept as the shared one. An unshare
+//! removes the group view and deletes its topic (`deleteForumTopic`, kept in
+//! `registry.unshared` until Telegram answered); without the right to delete
+//! messages, or when Telegram refuses, the topic is told, gets the dead icon
+//! and nothing more. A press on a twin in a topic that is no slot's view any
+//! more counts for nothing.
 //!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
@@ -242,11 +258,11 @@ use super::mirror::{Follow, Landed, Mirror, Write};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
 use super::registry::{
-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
-    StatusMessage, TopicJob, TwinLink, cut,
+    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, Shared, SlotId, SlotState,
+    StatusMessage, TopicJob, TwinLink, Unshared, UnsharedTopic, View, cut, share_line,
 };
 use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome};
-use super::status::{self, Activity, Buttons, Press};
+use super::status::{self, Activity, Buttons, Press, ShareButton};
 use super::stream::{self, Format, Held, Live, Open, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
@@ -425,6 +441,19 @@ pub const PRIVATE_GENERAL_NOTICE: &str =
 /// chat was closed, once that chat takes the session again (TASK-063).
 pub const FALLBACK_END_NOTICE: &str =
     "Личка владельца снова доступна: сессия идёт там, эта тема больше не обновляется.";
+/// The answers to `/share` and `/unshare` (TASK-064), in the topic they came
+/// from.
+pub const SHARED_NOTICE: &str =
+    "Сессия теперь видна в группе, с этого места. Убрать: /unshare или кнопка на статусе.";
+pub const ALREADY_SHARED_NOTICE: &str = "Сессия уже в группе.";
+pub const UNSHARED_NOTICE: &str =
+    "Сессия убрана из группы: тема в группе удаляется, сессия идёт только здесь.";
+pub const NOT_SHARED_NOTICE: &str = "Сессия и так не в группе.";
+pub const SHARE_OWNER_ONLY_NOTICE: &str = "Добавить сессию в группу или убрать из неё может только владелец: /share и /unshare в теме сессии в личке с ботом.";
+pub const SHARE_LATER_NOTICE: &str = "Сейчас нельзя: тема сессии или её тема в группе ещё не готова. Повторите через несколько секунд.";
+pub const SHARE_GENERAL_NOTICE: &str = "/share и /unshare работают в теме сессии.";
+/// Told in a group topic an unshare could not delete (TASK-064).
+pub const UNSHARED_KEPT_NOTICE: &str = "Сессию убрали из группы, но удалить эту тему бот не смог (нужно право удалять сообщения): она больше не обновляется.";
 /// Starts the echo of a user's message in the slot's other views (TASK-063):
 /// `✉ <author>: <text>`.
 pub const ECHO_MARK: &str = "✉";
@@ -438,7 +467,8 @@ pub const ECHO_NO_NAME: &str = "без имени";
 /// secret, or one joined before owners were recorded, is the first user's.
 ///
 /// A slot made while its owner's private chat is usable shows there alone
-/// (user decision 2026-09-28; TASK-064 shares a slot to the group); one
+/// (user decision 2026-09-28; the owner shares it to the group, see
+/// "Sharing" in the module doc); one
 /// made in the group, or with no usable private chat, keeps its group view
 /// and is mirrored there.
 #[derive(Debug, Clone)]
@@ -768,6 +798,11 @@ enum Done {
         parts: Vec<usize>,
         delivery: Option<Delivery>,
     },
+    /// The delete of the group topic `place` of an unshared slot (TASK-064).
+    TopicDeleted {
+        place: Place,
+        delivery: Option<Delivery>,
+    },
 }
 
 /// A call about a slot's status message; at most one per slot in flight,
@@ -851,6 +886,8 @@ struct Shown {
     move_at: Option<Instant>,
     /// A first ⏹ press of this session waits for its second until then.
     confirm: Option<(String, Instant)>,
+    /// A first unshare press waits for its second until then (TASK-064).
+    unshare_confirm: Option<Instant>,
     /// A `Create` or `Replace` is in flight, with what it is to show: the
     /// status message is not known to be the last one of its topic.
     sending: Option<LiveText>,
@@ -881,6 +918,16 @@ impl Shown {
         if !asked
             && status::asks_confirm(&keyboard)
             && let Some((_, until)) = self.confirm.as_mut()
+        {
+            *until = now + status::CONFIRM_FOR;
+        }
+        let asked = self
+            .content
+            .as_ref()
+            .is_some_and(|(_, shown)| status::asks_unshare_confirm(shown));
+        if !asked
+            && status::asks_unshare_confirm(&keyboard)
+            && let Some(until) = self.unshare_confirm.as_mut()
         {
             *until = now + status::CONFIRM_FOR;
         }
@@ -1007,6 +1054,8 @@ enum Work {
         size: u64,
         parts: Vec<usize>,
     },
+    /// The delete of the group topic of an unshared slot (TASK-064).
+    DeleteTopic(Place),
     /// A call in a mirror topic (TASK-063): `id` its twin send in the
     /// [`Mirror`] when the answer links it, `place` the topic of a new
     /// message, `status` the text of a status message or of its edit (it
@@ -1434,6 +1483,10 @@ pub struct Slots {
     /// Private chats the bot wrote to, or whose user wrote, since they were
     /// last closed: a group view the slot got only for a closed chat goes.
     proven: HashSet<PrivateChat>,
+    /// Group topics of unshared slots whose delete is in flight (TASK-064).
+    deleting: HashSet<Place>,
+    /// Those whose delete failed for now: tried again on the retry tick.
+    delete_later: HashSet<Place>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1564,6 +1617,8 @@ impl Slots {
             unlanded: HashMap::new(),
             lost_messages: VecDeque::new(),
             proven: HashSet::new(),
+            deleting: HashSet::new(),
+            delete_later: HashSet::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -3265,6 +3320,15 @@ impl Slots {
     /// the agent of its live current session, when there is one. General and
     /// topics that are not slots reach no agent and get no answer.
     fn on_topic_message(&mut self, input: Inbound) {
+        // `/share` and `/unshare` (TASK-064) never reach the console.
+        if self.registry.private
+            && !input.forwarded
+            && input.media.is_none()
+            && let Some(command) = share_command(input.text.as_deref())
+        {
+            self.on_share_command(input, command);
+            return;
+        }
         self.reopen(input.chat);
         let Some(thread_id) = input.thread_id else {
             if input.chat.is_private() && is_start(input.text.as_deref()) {
@@ -6553,6 +6617,21 @@ impl Slots {
     /// Answers every button press at once; the final edit follows when the
     /// prompt ends.
     fn on_callback(&mut self, input: CallbackInput) {
+        // The share button counts only where it was pressed (TASK-064):
+        // before a press on a twin becomes one on its primary.
+        if let Some(press @ (Press::Share | Press::Unshare | Press::UnshareConfirm)) =
+            input.data.as_deref().and_then(status::parse_callback)
+        {
+            let answer = self.press_share(&input, press);
+            self.hand_off(
+                Work::Callback,
+                Op::AnswerCallback {
+                    query_id: input.query_id,
+                    text: Some(answer.to_owned()),
+                },
+            );
+            return;
+        }
         if let Some(chat) = input.chat {
             self.reopen(chat);
         }
@@ -6567,8 +6646,15 @@ impl Slots {
         );
     }
 
-    /// A press on a twin (TASK-063) is a press on its primary message.
+    /// A press on a twin (TASK-063) is a press on its primary message. One
+    /// in a topic that is no slot's view any more (unshared, TASK-064; left
+    /// after a fallback) counts for nothing there.
     fn press_as_primary(&self, mut input: CallbackInput) -> CallbackInput {
+        if let Some(topic) = input.topic()
+            && self.registry.slot_by_topic(topic).is_none()
+        {
+            return input;
+        }
         let Some(primary) = input
             .message()
             .and_then(|message| self.mirror.primary_of(message))
@@ -6775,6 +6861,8 @@ impl Slots {
         }
         match press {
             Press::Update => unreachable!("answered above"),
+            // Answered by `press_share` before a press gets here.
+            Press::Share | Press::Unshare | Press::UnshareConfirm => status::ANSWER_STALE,
             _ if !busy => status::ANSWER_IDLE,
             Press::Confirm if armed => {
                 shown.confirm = None;
@@ -7656,8 +7744,35 @@ impl Slots {
             interrupt: keys && !waiting && self.busy(session),
             confirm,
             update,
+            share: self.share_button(slot, now),
         };
         status::render(&phase, metrics, buttons)
+    }
+
+    /// The share button of `slot`'s status message (TASK-064): only in its
+    /// owner's private view; the confirming one while a first unshare press
+    /// waits (counted from when it shows, like ⏹).
+    fn share_button(&self, slot: SlotId, now: Instant) -> Option<ShareButton> {
+        if !self.registry.private || !self.registry.place(slot)?.chat.is_private() {
+            return None;
+        }
+        let confirm = self.shown.get(&slot).is_some_and(|shown| {
+            let unseen = (shown.editing.is_some() || shown.sending.is_some())
+                && !shown
+                    .content
+                    .as_ref()
+                    .is_some_and(|(_, keyboard)| status::asks_unshare_confirm(keyboard));
+            shown
+                .unshare_confirm
+                .is_some_and(|until| now < until || unseen)
+        });
+        Some(if confirm {
+            ShareButton::Confirm
+        } else if self.registry.shared(slot, Chat::Group) {
+            ShareButton::Unshare
+        } else {
+            ShareButton::Share
+        })
     }
 
     /// Sends and edits the status messages that need it: one call per slot
@@ -7703,24 +7818,31 @@ impl Slots {
                 .map_or((0, false), |shown| (shown.in_flight, shown.urgent));
             // A status message or edit still on its way shows the newest
             // status when it goes (TASK-062), in the mirror topics too.
-            let live_texts: Vec<LiveText> = self
+            // The twins never carry the share button (TASK-064).
+            let (own, twins): (Vec<LiveText>, Vec<LiveText>) = self
                 .shown
                 .get_mut(&slot)
                 .map(|shown| {
                     shown.twins.retain(|twin| !twin.went() && !twin.cancelled());
-                    shown
-                        .sending
-                        .iter()
-                        .chain(&shown.editing)
-                        .chain(&shown.twins)
-                        .cloned()
-                        .collect()
+                    (
+                        shown
+                            .sending
+                            .iter()
+                            .chain(&shown.editing)
+                            .cloned()
+                            .collect(),
+                        shown.twins.clone(),
+                    )
                 })
                 .unwrap_or_default();
-            if !live_texts.is_empty() {
+            if !own.is_empty() || !twins.is_empty() {
                 let (text, keyboard) = self.status_view(slot, &session, now);
-                for content in live_texts {
+                let mirrored = status::for_mirror(&keyboard);
+                for content in own {
                     content.set(text.clone(), keyboard.clone());
+                }
+                for content in twins {
+                    content.set(text.clone(), mirrored.clone());
                 }
             }
             // Only a ⏹ edit goes next to a call in flight.
@@ -8587,6 +8709,7 @@ impl Slots {
                 chat,
                 thread_id,
                 reply_to,
+                reply_markup,
                 ..
             } => {
                 if let Some(reply_to) = reply_to {
@@ -8597,6 +8720,10 @@ impl Slots {
                 }
                 *chat = to.chat;
                 *thread_id = to.thread;
+                // The share button stays in the private view (TASK-064).
+                if let Some(markup) = reply_markup {
+                    *markup = status::for_mirror(markup);
+                }
             }
             Op::SendDocument {
                 chat, thread_id, ..
@@ -8633,9 +8760,19 @@ impl Slots {
         let mut op = op.clone();
         match &mut op {
             Op::Edit {
-                chat, message_id, ..
+                chat,
+                message_id,
+                reply_markup,
+                ..
+            } => {
+                *chat = twin.chat;
+                *message_id = twin.id;
+                // The share button stays in the private view (TASK-064).
+                if let Some(markup) = reply_markup {
+                    *markup = status::for_mirror(markup);
+                }
             }
-            | Op::Delete { chat, message_id } => {
+            Op::Delete { chat, message_id } => {
                 *chat = twin.chat;
                 *message_id = twin.id;
             }
@@ -8874,8 +9011,8 @@ impl Slots {
 
     /// A SessionStart made slot `made` (the first index past the slots
     /// before it): with its owner's private chat usable the slot shows
-    /// there alone (TASK-063, decision 2026-09-28), else in the group as
-    /// before.
+    /// there alone (TASK-063, decision 2026-09-28; the owner may share it,
+    /// TASK-064), else in the group as before.
     fn home_new_slot(&mut self, post: &HookPost, made: usize) {
         let Some(owner) = self.owner_of_post(post) else {
             return;
@@ -8980,49 +9117,346 @@ impl Slots {
             let Some(view) = self.registry.remove_view(slot, Chat::Group) else {
                 continue;
             };
-            info!(
-                ordinal = self.ordinal(slot),
-                "slot leaves the group: its private chat takes the session again"
+            self.leave_group(
+                slot,
+                GroupEnd::Fallback {
+                    view: Box::new(view),
+                    mirrored,
+                },
             );
-            if let Some(status) = view.status {
-                self.retire(
-                    MessageKey::new(Chat::Group, status.message_id),
-                    status.pinned,
+        }
+    }
+
+    /// `slot` no longer shows in the group, its group view gone: a fallback
+    /// view ended (TASK-063) or the owner unshared it (TASK-064). An ended
+    /// fallback's topic is told, gets the dead icon and loses its status
+    /// message (an unshared topic is deleted instead, [`Self::delete_unshared`]).
+    /// When the group mirrored the private view, the status moves there.
+    fn leave_group(&mut self, slot: SlotId, end: GroupEnd) {
+        let mirrored = match end {
+            GroupEnd::Fallback { view, mirrored } => {
+                info!(
+                    ordinal = self.ordinal(slot),
+                    "slot leaves the group: its private chat takes the session again"
                 );
-            }
-            if let Some(thread_id) = view.topic_id {
-                self.send_messages(vec![message_op(
-                    Place::topic(Chat::Group, thread_id),
-                    FALLBACK_END_NOTICE.to_owned(),
-                )]);
-                let icon = self
-                    .options
-                    .icons
-                    .for_state(SlotState::Dead)
-                    .map(str::to_owned);
-                if icon.is_some() {
-                    self.hand_off(
-                        Work::Callback,
-                        Op::EditTopic {
-                            chat: Chat::Group,
-                            thread_id,
-                            name: None,
-                            icon_custom_emoji_id: icon,
-                        },
+                if let Some(status) = view.status {
+                    self.retire(
+                        MessageKey::new(Chat::Group, status.message_id),
+                        status.pinned,
                     );
                 }
+                if let Some(place) = view.place() {
+                    self.end_group_topic(place, FALLBACK_END_NOTICE);
+                }
+                mirrored
             }
-            if mirrored {
-                // The status moves: its old message takes its twin along,
-                // and a twin not sent yet never goes.
-                if let Some(shown) = self.shown.get(&slot) {
-                    for twin in &shown.twins {
-                        twin.cancel();
-                    }
+            GroupEnd::Unshare => true,
+        };
+        if mirrored {
+            // The status moves: its old message takes its twin along,
+            // and a twin not sent yet never goes.
+            if let Some(shown) = self.shown.get(&slot) {
+                for twin in &shown.twins {
+                    twin.cancel();
                 }
-                if let Some(place) = self.registry.place(slot) {
-                    self.bottoms.entry(place).or_default().foreign = true;
-                }
+            }
+            if let Some(place) = self.registry.place(slot) {
+                self.bottoms.entry(place).or_default().foreign = true;
+            }
+        }
+    }
+
+    /// A group topic no slot shows in any more gets `notice` and the dead
+    /// icon.
+    fn end_group_topic(&mut self, place: Place, notice: &'static str) {
+        let Some(thread_id) = place.thread else {
+            return;
+        };
+        self.send_messages(vec![message_op(place, notice.to_owned())]);
+        let icon = self
+            .options
+            .icons
+            .for_state(SlotState::Dead)
+            .map(str::to_owned);
+        if icon.is_some() {
+            self.hand_off(
+                Work::Callback,
+                Op::EditTopic {
+                    chat: place.chat,
+                    thread_id,
+                    name: None,
+                    icon_custom_emoji_id: icon,
+                },
+            );
+        }
+    }
+
+    /// `/share` or `/unshare` (TASK-064). Only the slot's topic in its
+    /// owner's private chat acts (a private chat is its user's); the slot's
+    /// group topic is told who may, the private chat's General and topics
+    /// that are no slot's where to write. It never reaches the console.
+    fn on_share_command(&mut self, input: Inbound, command: ShareCommand) {
+        let place = input.place();
+        if input.thread_id.is_none() {
+            if input.chat.is_private() {
+                self.reopen(input.chat);
+                self.tell_foreign(place, SHARE_GENERAL_NOTICE);
+            } else {
+                debug!("share command outside a topic; ignored");
+            }
+            return;
+        }
+        let Some(slot) = self.registry.slot_by_topic(place) else {
+            if input.chat.is_private() {
+                self.reopen(input.chat);
+                self.tell_foreign(place, FOREIGN_TOPIC_NOTICE);
+            } else {
+                debug!("share command in a topic without a slot; ignored");
+            }
+            return;
+        };
+        if !input.chat.is_private() {
+            // In a mirror topic: the status moves in every view.
+            if let Some(primary) = self
+                .registry
+                .place(slot)
+                .filter(|primary| *primary != place)
+            {
+                self.bottoms.entry(primary).or_default().foreign = true;
+            }
+            self.close_turn_message(place);
+            self.notify_author(slot, place, SHARE_OWNER_ONLY_NOTICE);
+            return;
+        }
+        // Before `reopen`, which would drop a fallback group view.
+        let adopted = match command {
+            ShareCommand::Share => self.adopt_fallback(slot, input.author.as_deref()),
+            ShareCommand::Unshare => None,
+        };
+        self.reopen(input.chat);
+        let bottom = self.bottoms.entry(place).or_default();
+        bottom.last = bottom.last.max(input.message_id);
+        self.close_turn_message(place);
+        let outcome = match (adopted, command) {
+            (Some(outcome), _) => outcome,
+            (None, ShareCommand::Share) => self.share_slot(slot, input.author.as_deref()),
+            (None, ShareCommand::Unshare) => self.unshare_slot(slot),
+        };
+        self.send_as(true, vec![message_op(place, outcome.notice().to_owned())]);
+    }
+
+    /// The share button of a status message (TASK-064): only on the status
+    /// message of a slot's private view, as Telegram named where it was
+    /// pressed.
+    fn press_share(&mut self, input: &CallbackInput, press: Press) -> &'static str {
+        let Some(chat @ Chat::Private(_)) = input.chat else {
+            return status::ANSWER_OWNER_ONLY;
+        };
+        let Some(message) = input.message() else {
+            return status::ANSWER_STALE;
+        };
+        let own = |slot: &SlotId| {
+            self.registry.slot(*slot).is_some_and(|entry| {
+                entry
+                    .views
+                    .iter()
+                    .any(|view| view.chat == chat && view.status_message() == Some(message))
+            })
+        };
+        let Some(slot) = self.status_slot(message).filter(own) else {
+            debug!("share button of a message that is no private status message");
+            return status::ANSWER_STALE;
+        };
+        if press == Press::Share {
+            // Before `reopen`, which would drop a fallback group view.
+            let adopted = self.adopt_fallback(slot, input.author.as_deref());
+            self.reopen(chat);
+            return adopted
+                .unwrap_or_else(|| self.share_slot(slot, input.author.as_deref()))
+                .answer();
+        }
+        self.reopen(chat);
+        let now = Instant::now();
+        let armed = self
+            .shown
+            .get(&slot)
+            .and_then(|shown| shown.unshare_confirm)
+            .is_some_and(|until| now < until);
+        if press == Press::UnshareConfirm && armed {
+            if let Some(shown) = self.shown.get_mut(&slot) {
+                shown.unshare_confirm = None;
+            }
+            return self.unshare_slot(slot).answer();
+        }
+        if !self.registry.shared(slot, Chat::Group) {
+            return status::ANSWER_NOT_SHARED;
+        }
+        // A first press, or a second one after the wait ran out.
+        let shown = self.shown.entry(slot).or_default();
+        shown.unshare_confirm = Some(now + status::CONFIRM_FOR);
+        shown.next_at = Some(now);
+        shown.urgent = true;
+        status::ANSWER_UNSHARE_CONFIRM
+    }
+
+    /// A fallback group view of `slot` becomes the shared one (TASK-064):
+    /// its topic stays, with the share line next. `None`: there is none.
+    fn adopt_fallback(&mut self, slot: SlotId, author: Option<&str>) -> Option<ShareOutcome> {
+        let fallback = self
+            .registry
+            .slot(slot)?
+            .views
+            .iter()
+            .any(|view| view.chat == Chat::Group && view.fallback);
+        if !fallback {
+            return None;
+        }
+        self.registry.share(
+            slot,
+            Chat::Group,
+            share_line(author.unwrap_or(ECHO_NO_NAME)),
+        )?;
+        self.after_share(slot);
+        Some(ShareOutcome::Shared)
+    }
+
+    /// Shares `slot` to the group (TASK-064), from its private view.
+    fn share_slot(&mut self, slot: SlotId, author: Option<&str>) -> ShareOutcome {
+        let private = self
+            .registry
+            .place(slot)
+            .is_some_and(|place| place.chat.is_private());
+        if !self.registry.private || !private {
+            return ShareOutcome::Later;
+        }
+        let line = share_line(author.unwrap_or(ECHO_NO_NAME));
+        match self.registry.share(slot, Chat::Group, line) {
+            Some(Shared::Added | Shared::Adopted) => {
+                self.after_share(slot);
+                ShareOutcome::Shared
+            }
+            Some(Shared::Already) => ShareOutcome::Already,
+            None => ShareOutcome::Later,
+        }
+    }
+
+    /// The group shows `slot` from here on: the turn message so far stays
+    /// the private view's, and the status shows the unshare button at once.
+    fn after_share(&mut self, slot: SlotId) {
+        info!(ordinal = self.ordinal(slot), "slot shared to the group");
+        if let Some(place) = self.registry.place(slot) {
+            self.close_turn_message(place);
+        }
+        let shown = self.shown.entry(slot).or_default();
+        shown.next_at = Some(Instant::now());
+        shown.urgent = true;
+    }
+
+    /// Takes `slot` out of the group (TASK-064), from its private view: its
+    /// group topic is deleted ([`Self::delete_unshared`]).
+    fn unshare_slot(&mut self, slot: SlotId) -> ShareOutcome {
+        let Some(place) = self
+            .registry
+            .place(slot)
+            .filter(|place| place.chat.is_private())
+        else {
+            return ShareOutcome::Later;
+        };
+        match self.registry.unshare(slot, Chat::Group) {
+            Unshared::NotShared => ShareOutcome::NotShared,
+            Unshared::Creating => ShareOutcome::Later,
+            Unshared::Removed => {
+                info!(ordinal = self.ordinal(slot), "slot unshared from the group");
+                self.leave_group(slot, GroupEnd::Unshare);
+                self.close_turn_message(place);
+                let shown = self.shown.entry(slot).or_default();
+                shown.unshare_confirm = None;
+                shown.next_at = Some(Instant::now());
+                shown.urgent = true;
+                ShareOutcome::Unshared
+            }
+        }
+    }
+
+    /// Deletes the group topics of unshared slots (TASK-064); without the
+    /// right to, each is told and marked instead.
+    fn delete_unshared(&mut self) {
+        let due: Vec<UnsharedTopic> = self
+            .registry
+            .unshared
+            .iter()
+            .copied()
+            .filter(|entry| {
+                !self.deleting.contains(&entry.place) && !self.delete_later.contains(&entry.place)
+            })
+            .collect();
+        for entry in due {
+            let Some(thread_id) = entry.place.thread else {
+                self.forget_unshared(entry.place);
+                continue;
+            };
+            if !self.options.can_delete {
+                self.end_unshared(entry);
+                continue;
+            }
+            self.deleting.insert(entry.place);
+            self.hand_off(
+                Work::DeleteTopic(entry.place),
+                Op::DeleteTopic {
+                    chat: entry.place.chat,
+                    thread_id,
+                },
+            );
+        }
+    }
+
+    fn forget_unshared(&mut self, place: Place) {
+        self.registry.unshared.retain(|entry| entry.place != place);
+        self.registry.dirty = true;
+    }
+
+    /// An unshared slot's group topic that stays: told, dead icon, its
+    /// status message cleared away.
+    fn end_unshared(&mut self, entry: UnsharedTopic) {
+        self.forget_unshared(entry.place);
+        self.end_group_topic(entry.place, UNSHARED_KEPT_NOTICE);
+        if let Some(id) = entry.status {
+            self.retire(MessageKey::new(entry.place.chat, id), false);
+        }
+    }
+
+    /// Telegram answered the delete of an unshared slot's group topic.
+    fn on_topic_deleted(&mut self, place: Place, delivery: Option<Delivery>) {
+        self.deleting.remove(&place);
+        let Some(entry) = self
+            .registry
+            .unshared
+            .iter()
+            .copied()
+            .find(|entry| entry.place == place)
+        else {
+            return;
+        };
+        match &delivery {
+            Some(Ok(_)) => {
+                self.forget_unshared(place);
+                info!("group topic of an unshared slot deleted");
+            }
+            Some(delivery) if topic_gone(delivery) => {
+                self.forget_unshared(place);
+                info!("group topic of an unshared slot was gone already");
+            }
+            None | Some(Err(ApiError::Http(_) | ApiError::RetryAfter(_))) => {
+                debug!("group topic of an unshared slot not deleted yet; retrying later");
+                self.delete_later.insert(place);
+            }
+            Some(Err(ApiError::Telegram { code, .. })) if *code >= 500 => {
+                debug!("group topic of an unshared slot not deleted yet; retrying later");
+                self.delete_later.insert(place);
+            }
+            Some(Err(error)) => {
+                warn!(%error, "cannot delete the group topic of an unshared slot; it is marked instead");
+                self.end_unshared(entry);
             }
         }
     }
@@ -9133,6 +9567,17 @@ impl Slots {
         }
         if let Some(shown) = self.shown.get_mut(&slot) {
             shown.content = None;
+            // What is still on its way into the old view goes like a twin
+            // there: without the share button of the private view (TASK-064).
+            if !old.chat.is_private() {
+                let stale: Vec<LiveText> = shown
+                    .sending
+                    .iter()
+                    .chain(&shown.editing)
+                    .cloned()
+                    .collect();
+                shown.twins.extend(stale);
+            }
         }
     }
 
@@ -9206,6 +9651,7 @@ impl Slots {
             self.prompts.retry_failed_edits();
             self.questions.retry_edits();
             self.push_selected(None);
+            self.delete_later.clear();
             self.next_retry = now + self.options.retry_every;
         }
         self.check_candidates();
@@ -9415,6 +9861,7 @@ impl Slots {
                 parts,
                 delivery,
             } => self.on_album_done(conn, transfer_id, size, &parts, delivery),
+            Done::TopicDeleted { place, delivery } => self.on_topic_deleted(place, delivery),
         }
     }
 
@@ -9546,6 +9993,12 @@ impl Slots {
                         &name,
                         icon.as_deref(),
                     );
+                    // A topic made by a share starts with its line (TASK-064),
+                    // before what the next pump sends there.
+                    if let Some(job) = self.registry.separator_job(slot, chat) {
+                        let op = topic_op(&job);
+                        self.hand_off(Work::Topic(job), op);
+                    }
                 }
                 Ok(_) => {
                     warn!("createForumTopic answered without a topic id");
@@ -9626,48 +10079,14 @@ impl Slots {
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
         self.ensure_private_views();
+        self.delete_unshared();
         self.pump_drains();
         let draining = self.draining_slots(Instant::now());
         for job in self
             .registry
             .topic_work_except(&self.options.icons, edits, &draining)
         {
-            let op = match &job {
-                TopicJob::Create {
-                    chat, name, icon, ..
-                } => Op::CreateTopic {
-                    chat: *chat,
-                    name: name.clone(),
-                    icon_custom_emoji_id: icon.clone(),
-                },
-                TopicJob::Edit {
-                    chat,
-                    thread_id,
-                    name,
-                    icon,
-                    ..
-                } => Op::EditTopic {
-                    chat: *chat,
-                    thread_id: *thread_id,
-                    name: name.clone(),
-                    icon_custom_emoji_id: icon.clone(),
-                },
-                TopicJob::Separator {
-                    chat,
-                    thread_id,
-                    text,
-                    ..
-                } => Op::Send {
-                    chat: *chat,
-                    thread_id: Some(*thread_id),
-                    text: text.clone(),
-                    html: None,
-                    reply_markup: None,
-                    permission: false,
-                    reply_to: None,
-                    notify: false,
-                },
-            };
+            let op = topic_op(&job);
             self.hand_off(Work::Topic(job), op);
         }
         self.follow_primaries();
@@ -9948,6 +10367,110 @@ fn lost_in_private(chat: Chat, delivery: Option<&Delivery>) -> bool {
         && delivery.is_some_and(|delivery| topic_gone(delivery) || forbidden(delivery))
 }
 
+/// The Bot API call of a topic job.
+fn topic_op(job: &TopicJob) -> Op {
+    match job {
+        TopicJob::Create {
+            chat, name, icon, ..
+        } => Op::CreateTopic {
+            chat: *chat,
+            name: name.clone(),
+            icon_custom_emoji_id: icon.clone(),
+        },
+        TopicJob::Edit {
+            chat,
+            thread_id,
+            name,
+            icon,
+            ..
+        } => Op::EditTopic {
+            chat: *chat,
+            thread_id: *thread_id,
+            name: name.clone(),
+            icon_custom_emoji_id: icon.clone(),
+        },
+        TopicJob::Separator {
+            chat,
+            thread_id,
+            text,
+            ..
+        } => Op::Send {
+            chat: *chat,
+            thread_id: Some(*thread_id),
+            text: text.clone(),
+            html: None,
+            reply_markup: None,
+            permission: false,
+            reply_to: None,
+            notify: false,
+        },
+    }
+}
+
+/// How a slot leaves the group ([`Slots::leave_group`]).
+enum GroupEnd {
+    /// Its fallback view ended (TASK-063); `mirrored`: the group mirrored
+    /// the private view.
+    Fallback { view: Box<View>, mirrored: bool },
+    /// The owner unshared it (TASK-064).
+    Unshare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShareCommand {
+    Share,
+    Unshare,
+}
+
+/// What a share or an unshare came to (TASK-064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShareOutcome {
+    Shared,
+    Already,
+    NotShared,
+    Unshared,
+    /// The slot's private topic or its group topic is not ready.
+    Later,
+}
+
+impl ShareOutcome {
+    /// The answer to the command.
+    fn notice(self) -> &'static str {
+        match self {
+            Self::Shared => SHARED_NOTICE,
+            Self::Already => ALREADY_SHARED_NOTICE,
+            Self::NotShared => NOT_SHARED_NOTICE,
+            Self::Unshared => UNSHARED_NOTICE,
+            Self::Later => SHARE_LATER_NOTICE,
+        }
+    }
+
+    /// The answer to the button.
+    fn answer(self) -> &'static str {
+        match self {
+            Self::Shared => status::ANSWER_SHARED,
+            Self::Already => status::ANSWER_ALREADY_SHARED,
+            Self::NotShared => status::ANSWER_NOT_SHARED,
+            Self::Unshared => status::ANSWER_UNSHARED,
+            Self::Later => status::ANSWER_SHARE_LATER,
+        }
+    }
+}
+
+/// `/share` or `/unshare` (TASK-064), optionally `@bot`, any case; words
+/// after it are ignored (kept for TASK-069).
+fn share_command(text: Option<&str>) -> Option<ShareCommand> {
+    let word = text?.split_whitespace().next()?;
+    let name = word.split_once('@').map_or(word, |(name, _)| name);
+    if name.eq_ignore_ascii_case("/share") {
+        Some(ShareCommand::Share)
+    } else if name.eq_ignore_ascii_case("/unshare") {
+        Some(ShareCommand::Unshare)
+    } else {
+        None
+    }
+}
+
 /// `/start` (optionally `@bot`, a payload after it): what Telegram sends
 /// when a user presses Start in the bot's private chat.
 fn is_start(text: Option<&str>) -> bool {
@@ -10111,6 +10634,7 @@ async fn dispatch_loop(
                     parts,
                     delivery,
                 },
+                Work::DeleteTopic(place) => Done::TopicDeleted { place, delivery },
             });
         });
     }
@@ -11144,6 +11668,7 @@ again"
             message_id,
             thread_id: None,
             from_name: None,
+            author: None,
         })
     }
 
@@ -12008,6 +12533,7 @@ again"
             message_id: Some(message_id),
             thread_id: Some(thread),
             from_name: None,
+            author: None,
         });
         rig.control.send(elsewhere).unwrap();
         let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
@@ -23594,5 +24120,791 @@ again"
             .collect();
         assert_eq!(told, [MIRROR_GAP_NOTICE]);
         assert!(slots.gaps.is_empty());
+    }
+
+    // ------------------------------------------------------------ TASK-064
+
+    /// Who shares in these tests.
+    const SHARER: &str = "Анна";
+
+    /// A message of the owner in their private chat: in topic `thread`, or
+    /// its General.
+    fn owner_says(thread: Option<i64>, message_id: i64, text: &str) -> Control {
+        Control::Message(Inbound {
+            chat: private_owner(),
+            sender: PrivateChat::of_user(7),
+            message_id,
+            thread_id: thread,
+            text: Some(text.into()),
+            reply_to: None,
+            quote: None,
+            forwarded: false,
+            media: None,
+            from_name: None,
+            author: Some(SHARER.into()),
+        })
+    }
+
+    /// A press of `data` on message `message_id` of topic `thread` in `chat`.
+    fn press_in(chat: Chat, thread: i64, message_id: i64, data: &str) -> Control {
+        Control::Callback(CallbackInput {
+            query_id: format!("q-{data}-{message_id}"),
+            data: Some(data.into()),
+            chat: Some(chat),
+            message_id: Some(message_id),
+            thread_id: Some(thread),
+            from_name: None,
+            author: Some(SHARER.into()),
+        })
+    }
+
+    /// Slot 0 of session A in the owner's private chat alone (topic 700),
+    /// the dispatch captured.
+    fn private_slot(
+        dir: &TempDir,
+        options: Options,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let mut slots = stalled_slots(dir, options);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 700, "t", None);
+        slots.pump();
+        let work = capture_dispatch(&mut slots);
+        (slots, work)
+    }
+
+    /// Agent `conn` of session A that types console commands; what it gets.
+    fn connect_typing(slots: &mut Slots, conn: u64) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(16);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                session_id: A.into(),
+                host: "box".into(),
+                cwd: CWD.into(),
+                claude_pid: Some(10),
+                verdict_ack: false,
+                transcript_reads: false,
+                console_keys: true,
+                console_commands: true,
+                client: None,
+                files: false,
+                session_reads: false,
+                status_lines: false,
+                private_place: true,
+                enrolled: None,
+                heartbeat: false,
+            },
+            to_agent,
+        });
+        from_hub
+    }
+
+    /// Telegram made the group topic `thread` of slot 0 that `work` asked
+    /// for; what was handed out before, and the jobs after that.
+    fn group_topic_made(
+        slots: &mut Slots,
+        work: &mut mpsc::UnboundedReceiver<(Work, Op)>,
+        thread: i64,
+    ) -> Vec<(Work, Op)> {
+        let before = all_work(work);
+        let job = before
+            .into_iter()
+            .find_map(|(job, _)| match job {
+                Work::Topic(
+                    job @ TopicJob::Create {
+                        chat: Chat::Group, ..
+                    },
+                ) => Some(job),
+                _ => None,
+            })
+            .expect("the group topic is asked for");
+        slots.on_done(Done::Topic {
+            job,
+            delivery: Some(Ok(Outcome::Topic(ForumTopic {
+                message_thread_id: thread,
+                name: "t".into(),
+                icon_custom_emoji_id: None,
+            }))),
+        });
+        all_work(work)
+    }
+
+    /// The texts of the sends into `place` among `handed`, in order.
+    fn sends_into(handed: &[(Work, Op)], place: Place) -> Vec<String> {
+        handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::Send { text, .. } if op.place() == Some(place) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn callback_answers(handed: &[(Work, Op)]) -> Vec<Option<String>> {
+        handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::AnswerCallback { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn topic_deletes(handed: &[(Work, Op)]) -> Vec<Place> {
+        handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::DeleteTopic { chat, thread_id } => Some(Place::topic(*chat, *thread_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn share_commands_parse_and_the_rest_do_not() {
+        for (text, command) in [
+            ("/share", ShareCommand::Share),
+            ("/UNSHARE@cctg_bot", ShareCommand::Unshare),
+            ("/share x", ShareCommand::Share),
+            (" /unshare", ShareCommand::Unshare),
+        ] {
+            assert_eq!(share_command(Some(text)), Some(command), "{text}");
+        }
+        for text in ["/shared", "/sharex", "share", "/ share", "/unshared@b", ""] {
+            assert_eq!(share_command(Some(text)), None, "{text}");
+        }
+        assert_eq!(share_command(None), None);
+    }
+
+    /// `/share` and `/unshare` are the hub's: the session's console never
+    /// gets them, and they get their answer in the topic they came from.
+    #[tokio::test]
+    async fn a_share_command_is_never_typed_into_the_console() {
+        let dir = TempDir::new("slots-share-console");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        let mut from_hub = connect_typing(&mut slots, 1);
+        slots.pump();
+        let _ = all_work(&mut work);
+        while from_hub.try_recv().is_ok() {}
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(|(job, _)| matches!(
+                job,
+                Work::Topic(TopicJob::Create {
+                    chat: Chat::Group,
+                    ..
+                })
+            )),
+            "{handed:#?}"
+        );
+        let answer: Vec<&Work> = handed
+            .iter()
+            .filter(|(_, op)| {
+                matches!(op, Op::Send { text, .. } if text == SHARED_NOTICE)
+                    && op.place() == Some(Place::topic(private_owner(), 700))
+            })
+            .map(|(job, _)| job)
+            .collect();
+        assert!(matches!(answer.as_slice(), [Work::Answer]), "{handed:#?}");
+        let got: Vec<HubMsg> = std::iter::from_fn(|| from_hub.try_recv().ok()).collect();
+        assert!(
+            got.iter()
+                .all(|msg| !matches!(msg, HubMsg::Inbound { .. } | HubMsg::ConsoleCommand { .. })),
+            "{got:?}"
+        );
+    }
+
+    /// A share of a dead slot that offers Resume: the first message of the
+    /// new group topic is the share line, handed out as the topic is made.
+    #[tokio::test]
+    async fn the_first_message_of_a_shared_topic_is_its_line() {
+        let dir = TempDir::new("slots-share-first");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        slots.on_control(owner_says(Some(700), 5001, "привет"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(owner_says(Some(700), 5002, "/share"));
+        slots.pump();
+        let after = group_topic_made(&mut slots, &mut work, 100);
+        let group = Place::topic(Chat::Group, 100);
+        let line = crate::hub::registry::share_line(SHARER);
+        assert!(
+            matches!(after.first(), Some((Work::Topic(TopicJob::Separator { text, .. }), _)) if *text == line),
+            "{after:#?}"
+        );
+        slots.pump();
+        let mut handed = after;
+        handed.extend(all_work(&mut work));
+        let into_group: Vec<&Op> = handed
+            .iter()
+            .map(|(_, op)| op)
+            .filter(|op| op.place() == Some(group))
+            .collect();
+        assert!(
+            matches!(into_group.first(), Some(Op::Send { text, .. }) if *text == line),
+            "{into_group:#?}"
+        );
+    }
+
+    /// The turn message from before a share stays in the private view: the
+    /// group gets only what comes after the share, below its line.
+    #[tokio::test]
+    async fn a_turn_message_from_before_the_share_is_not_mirrored() {
+        let dir = TempDir::new("slots-share-turn");
+        let path = transcript_file(&dir, A);
+        let fake = Fake {
+            stream_ids: true,
+            ..Fake::default()
+        };
+        let options = Options {
+            owners: private_only_options().owners,
+            ..status_options()
+        };
+        let mut rig = stream_rig(fake, options, dir);
+        rig.hook(start_with(A, 10, &path, "startup")).await;
+        let _kept = rig.reader(1, A, 10).await;
+        append(&path, &tool_call("t1", "one"));
+        append(&path, &tool_result("t1", None));
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 100) == ["• Bash: one ✓", "STATUS"]
+        })
+        .await;
+        let user = rig.fake.next_id();
+        rig.control
+            .send(owner_says(Some(100), user, "/share"))
+            .unwrap();
+        let line = crate::hub::registry::share_line(SHARER);
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 101) == [line.clone(), "STATUS".to_owned()]
+        })
+        .await;
+        append(&path, &tool_call("t2", "two"));
+        append(&path, &tool_result("t2", None));
+        settled(&rig, |_| {
+            topic_layout(&rig.fake, 101).contains(&"• Bash: two ✓".to_owned())
+        })
+        .await;
+        let group = topic_layout(&rig.fake, 101);
+        assert!(group.iter().all(|text| !text.contains("one")), "{group:?}");
+        assert_eq!(group[0], line);
+    }
+
+    /// The share button is the private status message's alone: its twin in
+    /// the group, sent or edited, keeps ⏹ and the rest but not it.
+    #[tokio::test]
+    async fn the_status_twin_carries_no_share_button() {
+        let options = Options {
+            status_every: Some(Duration::from_millis(20)),
+            ..private_options()
+        };
+        let mut rig = rig(Fake::default(), options);
+        rig.hook(start(A, 10)).await;
+        rig.agent_of(1, A, Some(10)).await;
+        let has = |markup: &Option<serde_json::Value>, data: &str| {
+            markup.as_ref().is_some_and(|markup| {
+                markup["inline_keyboard"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_array)
+                    .flatten()
+                    .any(|button| button["callback_data"] == data)
+            })
+        };
+        let status_sends = |ops: &[Op], chat: Chat| -> Vec<(usize, Option<serde_json::Value>)> {
+            ops.iter()
+                .enumerate()
+                .filter_map(|(index, op)| match op {
+                    Op::Send {
+                        chat: to,
+                        reply_markup,
+                        permission: false,
+                        ..
+                    } if *to == chat && reply_markup.is_some() => {
+                        Some((index, reply_markup.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let ops = settled(&rig, |ops| {
+            !status_sends(ops, private_owner()).is_empty()
+                && !status_sends(ops, Chat::Group).is_empty()
+        })
+        .await;
+        let (index, markup) = status_sends(&ops, private_owner()).pop().unwrap();
+        assert!(has(&markup, "status:unshare"), "{markup:?}");
+        for (_, markup) in status_sends(&ops, Chat::Group) {
+            assert!(
+                !has(&markup, "status:unshare") && !has(&markup, "status:share"),
+                "{ops:#?}"
+            );
+        }
+        let status = rig.fake.ids.lock().unwrap()[&index];
+        let thread = rig
+            .fake
+            .ops()
+            .iter()
+            .find_map(|op| match op {
+                Op::Send {
+                    chat,
+                    thread_id: Some(thread),
+                    ..
+                } if *chat == private_owner() => Some(*thread),
+                _ => None,
+            })
+            .unwrap();
+        rig.control
+            .send(press_in(private_owner(), thread, status, "status:unshare"))
+            .unwrap();
+        let ops = settled(&rig, |ops| {
+            ops.iter().any(|op| {
+                matches!(op, Op::Edit { chat, message_id, reply_markup, .. }
+                    if *chat == private_owner() && *message_id == status
+                        && has(reply_markup, "status:unshare_confirm"))
+            })
+        })
+        .await;
+        for op in &ops {
+            if let Op::Edit {
+                chat: Chat::Group,
+                reply_markup,
+                ..
+            }
+            | Op::Send {
+                chat: Chat::Group,
+                reply_markup,
+                ..
+            } = op
+            {
+                assert!(
+                    !has(reply_markup, "status:unshare_confirm")
+                        && !has(reply_markup, "status:unshare"),
+                    "{op:?}"
+                );
+            }
+        }
+    }
+
+    /// Slot 0 shared, its group topic 100 made with status message 900
+    /// there, its private status message 5900.
+    fn shared_slot(
+        dir: &TempDir,
+        options: Options,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = private_slot(dir, options);
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        group_topic_made(&mut slots, &mut work, 100);
+        let views = &mut slots.registry.slots[0].views;
+        views[0].status = Some(StatusMessage {
+            message_id: 5900,
+            pinned: false,
+        });
+        views[1].status = Some(StatusMessage {
+            message_id: 900,
+            pinned: false,
+        });
+        slots.mirror.link(
+            MessageKey::new(private_owner(), 5900),
+            MessageKey::new(Chat::Group, 900),
+        );
+        slots.pump();
+        let _ = all_work(&mut work);
+        (slots, work)
+    }
+
+    /// Unshare by button takes two presses; the confirming press on the
+    /// status twin in the group (its button data) does nothing, and a
+    /// second press after the wait asks again.
+    #[tokio::test]
+    async fn unshare_needs_a_second_press_and_a_group_press_does_nothing() {
+        let dir = TempDir::new("slots-unshare-press");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        let owner = private_owner();
+        slots.on_control(press_in(owner, 700, 5900, "status:unshare"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_UNSHARE_CONFIRM.to_owned())]
+        );
+        assert!(topic_deletes(&handed).is_empty());
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        let (_, keyboard) = slots.status_view(SlotId(0), A, Instant::now());
+        assert!(status::asks_unshare_confirm(&keyboard), "{keyboard}");
+        slots.on_control(press_in(Chat::Group, 100, 900, "status:unshare_confirm"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_OWNER_ONLY.to_owned())]
+        );
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        slots.on_control(press_in(owner, 700, 5900, "status:unshare_confirm"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_UNSHARED.to_owned())]
+        );
+        assert!(!slots.registry.shared(SlotId(0), Chat::Group));
+        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::Group, 100)]);
+        // The wait ran out: the confirming press asks again.
+        slots.on_control(press_in(owner, 700, 5900, "status:share"));
+        slots.on_control(press_in(owner, 700, 5900, "status:unshare"));
+        slots.shown.get_mut(&SlotId(0)).unwrap().unshare_confirm =
+            Instant::now().checked_sub(Duration::from_secs(1));
+        slots.on_control(press_in(owner, 700, 5900, "status:unshare_confirm"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(status::ANSWER_SHARED.to_owned()),
+                Some(status::ANSWER_UNSHARE_CONFIRM.to_owned()),
+                Some(status::ANSWER_UNSHARE_CONFIRM.to_owned())
+            ]
+        );
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+    }
+
+    /// An unshare while the group topic is being made waits: the view
+    /// stays, the owner is asked to try again.
+    #[tokio::test]
+    async fn an_unshare_while_the_group_topic_is_made_waits() {
+        let dir = TempDir::new("slots-unshare-creating");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(owner_says(Some(700), 5002, "/unshare"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            sends_into(&handed, Place::topic(private_owner(), 700)),
+            [SHARE_LATER_NOTICE]
+        );
+        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(topic_deletes(&handed).is_empty());
+    }
+
+    /// The group topic an unshare leaves (no right to delete, or Telegram
+    /// refused): told, the dead icon, its status twin cleared away.
+    fn assert_kept_and_dead(slots: &Slots, handed: &[(Work, Op)]) {
+        let group = Place::topic(Chat::Group, 100);
+        assert_eq!(sends_into(handed, group), [UNSHARED_KEPT_NOTICE]);
+        assert!(
+            handed.iter().any(|(_, op)| matches!(op, Op::EditTopic { thread_id: 100, icon_custom_emoji_id: Some(icon), .. }
+                if Some(icon.as_str()) == slots.options.icons.for_state(SlotState::Dead))),
+            "{handed:#?}"
+        );
+        assert!(
+            handed.iter().any(|(_, op)| matches!(
+                op,
+                Op::Delete {
+                    chat: Chat::Group,
+                    message_id: 900
+                }
+            )),
+            "{handed:#?}"
+        );
+        assert!(slots.registry.unshared.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unshare_without_the_delete_right_leaves_the_topic_told_and_dead() {
+        let dir = TempDir::new("slots-unshare-no-right");
+        let options = Options {
+            can_delete: false,
+            ..private_only_options()
+        };
+        let (mut slots, mut work) = shared_slot(&dir, options);
+        slots.on_control(owner_says(Some(700), 5002, "/unshare"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(topic_deletes(&handed).is_empty());
+        assert_eq!(
+            sends_into(&handed, Place::topic(private_owner(), 700)),
+            [UNSHARED_NOTICE]
+        );
+        assert_kept_and_dead(&slots, &handed);
+    }
+
+    /// Slot 0 unshared, the delete of group topic 100 handed out.
+    fn unshared_slot(dir: &TempDir) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = shared_slot(dir, private_only_options());
+        slots.on_control(owner_says(Some(700), 5002, "/unshare"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::Group, 100)]);
+        assert_eq!(slots.registry.unshared.len(), 1);
+        (slots, work)
+    }
+
+    fn deleted(slots: &mut Slots, delivery: Option<Delivery>) {
+        slots.on_done(Done::TopicDeleted {
+            place: Place::topic(Chat::Group, 100),
+            delivery,
+        });
+        slots.pump();
+    }
+
+    fn refused(code: i64, description: &str) -> Option<Delivery> {
+        Some(Err(ApiError::Telegram {
+            code,
+            description: description.into(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_refused_topic_delete_ends_like_a_kept_topic() {
+        let dir = TempDir::new("slots-unshare-refused");
+        let (mut slots, mut work) = unshared_slot(&dir);
+        deleted(
+            &mut slots,
+            refused(400, "Bad Request: not enough rights to delete a topic"),
+        );
+        let handed = all_work(&mut work);
+        assert_kept_and_dead(&slots, &handed);
+        assert!(topic_deletes(&handed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_delete_of_a_topic_already_gone_is_done() {
+        let dir = TempDir::new("slots-unshare-gone");
+        let (mut slots, mut work) = unshared_slot(&dir);
+        deleted(
+            &mut slots,
+            refused(400, "Bad Request: message thread not found"),
+        );
+        let handed = all_work(&mut work);
+        assert!(slots.registry.unshared.is_empty());
+        assert!(
+            handed.iter().all(|(_, op)| op.chat() != Some(Chat::Group)),
+            "{handed:#?}"
+        );
+        // Done: never asked again.
+        slots.next_retry = Instant::now();
+        slots.on_tick();
+        slots.pump();
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_topic_delete_waits_for_the_retry_tick() {
+        let dir = TempDir::new("slots-unshare-retry");
+        let (mut slots, mut work) = unshared_slot(&dir);
+        deleted(&mut slots, refused(502, "Bad Gateway"));
+        slots.pump();
+        assert!(
+            topic_deletes(&all_work(&mut work)).is_empty(),
+            "not at once"
+        );
+        assert_eq!(slots.registry.unshared.len(), 1);
+        // The scheduler stopped: the same.
+        slots.next_retry = Instant::now();
+        slots.on_tick();
+        slots.pump();
+        assert_eq!(
+            topic_deletes(&all_work(&mut work)),
+            [Place::topic(Chat::Group, 100)]
+        );
+        deleted(&mut slots, None);
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+        slots.next_retry = Instant::now();
+        slots.on_tick();
+        slots.pump();
+        assert_eq!(
+            topic_deletes(&all_work(&mut work)),
+            [Place::topic(Chat::Group, 100)]
+        );
+        deleted(&mut slots, Some(Ok(Outcome::Done)));
+        assert!(slots.registry.unshared.is_empty());
+    }
+
+    /// A topic delete that did not happen before a restart is asked for by
+    /// the next hub.
+    #[tokio::test]
+    async fn a_pending_topic_delete_survives_a_restart() {
+        let dir = TempDir::new("slots-unshare-restart");
+        let mut registry = Registry::default();
+        registry.unshared.push(UnsharedTopic {
+            place: Place::topic(Chat::Group, 100),
+            status: Some(900),
+        });
+        let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
+        assert_eq!(saved.unshared, registry.unshared);
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(saved, store, outbox, private_only_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.pump();
+        assert_eq!(
+            topic_deletes(&all_work(&mut work)),
+            [Place::topic(Chat::Group, 100)]
+        );
+    }
+
+    /// A slot in the group only because its private chat was closed: a
+    /// share from its private topic keeps that group view and its topic as
+    /// the shared ones, instead of dropping them as the chat opens.
+    #[tokio::test]
+    async fn a_share_keeps_a_fallback_group_view_across_the_reopen() {
+        let dir = TempDir::new("slots-share-fallback");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        connect(&mut slots, 1, A, Some(10));
+        let owner = private_owner();
+        slots.close_chat(owner);
+        slots.pump();
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        assert!(slots.registry.slots[0].views[1].fallback);
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        let views = &slots.registry.slots[0].views;
+        assert_eq!(views.len(), 2);
+        assert!(!views[1].fallback);
+        assert_eq!(views[1].topic_id, Some(100));
+        assert!(
+            !handed
+                .iter()
+                .any(|(_, op)| matches!(op, Op::CreateTopic { .. })),
+            "{handed:#?}"
+        );
+        let group = sends_into(&handed, Place::topic(Chat::Group, 100));
+        assert!(!group.iter().any(|text| text == FALLBACK_END_NOTICE));
+        // Next in that topic, once its name edit is answered.
+        assert_eq!(
+            views[1].pending_separator,
+            Some(crate::hub::registry::share_line(SHARER))
+        );
+        assert_eq!(
+            sends_into(&handed, Place::topic(owner, 700)),
+            [SHARED_NOTICE]
+        );
+    }
+
+    /// Slot 0 shown in the group (topic 100) and the private chat (700),
+    /// agent 1 bound, a prompt open in 700 as message 5950 with its twin 950
+    /// in the group.
+    fn prompt_with_twin(
+        dir: &TempDir,
+        options: Options,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>, u64) {
+        let owner = private_owner();
+        let mut slots = stalled_slots(dir, options);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        slots.registry.add_view(SlotId(0), owner);
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_agent(permission(1, "abcde", "ls"));
+        let before = slots.handed;
+        slots.pump();
+        let mut seq = None;
+        let mut twin = None;
+        for (n, (job, _)) in all_work(&mut work).into_iter().enumerate() {
+            match job {
+                Work::Permission(_) => seq = Some(before + 1 + n as u64),
+                Work::Twin { id, place, .. } => twin = Some((id, place)),
+                _ => {}
+            }
+        }
+        let (seq, (id, place)) = (seq.unwrap(), twin.unwrap());
+        let key = slots.prompts.active()[0];
+        slots.on_done(Done::Twin {
+            id,
+            place,
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 950,
+                ..Message::default()
+            }))),
+        });
+        slots.on_done(Done::Landed {
+            place: Place::topic(owner, 700),
+            seq,
+            landed: Landed::Message(5950),
+            gone: false,
+            closed: false,
+        });
+        slots.on_done(Done::Permission {
+            key,
+            seq,
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 5950,
+                ..Message::default()
+            }))),
+        });
+        assert_eq!(
+            slots.mirror.primary_of(MessageKey::new(Chat::Group, 950)),
+            Some(MessageKey::new(owner, 5950))
+        );
+        (slots, work, key)
+    }
+
+    /// After an unshare the group topic stays when the bot may not delete
+    /// it; a press on a prompt's twin there decides nothing. With the
+    /// private chat closed the group is the primary view, and a press on
+    /// the twin decides the prompt as before (TASK-063).
+    #[tokio::test]
+    async fn a_press_on_a_twin_outside_any_view_counts_for_nothing() {
+        let dir = TempDir::new("slots-unshare-twin-press");
+        let options = Options {
+            can_delete: false,
+            ..private_options()
+        };
+        let (mut slots, _work, key) = prompt_with_twin(&dir, options);
+        slots.on_control(owner_says(Some(700), 5001, "/unshare"));
+        slots.pump();
+        assert!(!slots.registry.shared(SlotId(0), Chat::Group));
+        slots.on_control(press_in(Chat::Group, 100, 950, "allow:abcde"));
+        assert!(
+            matches!(
+                slots.prompts.get(key).map(|prompt| prompt.state),
+                Some(State::Open)
+            ),
+            "the group decides nothing"
+        );
+
+        let dir = TempDir::new("slots-closed-twin-press");
+        let (mut slots, _work, key) = prompt_with_twin(&dir, private_options());
+        slots.close_chat(private_owner());
+        slots.pump();
+        assert_eq!(
+            slots.registry.place(SlotId(0)),
+            Some(Place::topic(Chat::Group, 100))
+        );
+        slots.on_control(press_in(Chat::Group, 100, 950, "allow:abcde"));
+        assert!(matches!(
+            slots.prompts.get(key).map(|prompt| prompt.state),
+            Some(State::Selected {
+                behavior: Behavior::Allow,
+                ..
+            })
+        ));
     }
 }

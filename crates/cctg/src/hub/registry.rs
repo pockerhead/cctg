@@ -16,6 +16,12 @@
 //! names the one group of TASK-061; views and places carry their chat, so
 //! more groups would be more `Chat` values, not a new model.
 //!
+//! Sharing a slot to the group (TASK-064) is a property of the slot: a group
+//! view that is no fallback. It holds for every later session of the slot.
+//! A group view made by a share starts its topic with the share line
+//! ([`View::opening`], [`share_line`]); an unshare removes the view and keeps
+//! its topic in [`Registry::unshared`] until Telegram deleted it.
+//!
 //! Paths, folder names and titles are private: nothing here logs them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -287,6 +293,12 @@ pub fn separator(session_id: &str, resumed: bool) -> String {
     format!("── session {} · {how} ──", short(session_id))
 }
 
+/// The first line of a group topic made by a share (TASK-064): `name` is
+/// who shared the slot.
+pub fn share_line(name: &str) -> String {
+    format!("── общий доступ: {name} ──")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SlotId(pub usize);
@@ -341,6 +353,10 @@ pub struct View {
     /// chat takes the session again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fallback: bool,
+    /// The line this view's topic starts with once it is made (the share
+    /// line, TASK-064).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening: Option<String>,
     /// A topic call for this view is in flight.
     #[serde(skip)]
     pub busy: bool,
@@ -360,6 +376,7 @@ impl View {
             pending_separator: None,
             status: None,
             fallback: false,
+            opening: None,
             busy: false,
             failed: None,
         }
@@ -677,6 +694,41 @@ pub struct Registry {
     /// it went, also after a restart of the hub.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub twins: Vec<TwinLink>,
+    /// Group topics of slots taken out of the group (TASK-064) that
+    /// Telegram has not deleted yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unshared: Vec<UnsharedTopic>,
+}
+
+/// The group topic of a slot taken out of the group (TASK-064), to delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsharedTopic {
+    pub place: Place,
+    /// Its status message (a twin), for when the topic stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<i64>,
+}
+
+/// What a share did (TASK-064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shared {
+    /// A new group view, its topic to be made.
+    Added,
+    /// The fallback group view became the shared one, its topic kept.
+    Adopted,
+    Already,
+}
+
+/// What an unshare did (TASK-064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unshared {
+    /// The group view is gone; its topic, if any, is in
+    /// [`Registry::unshared`].
+    Removed,
+    NotShared,
+    /// Its topic is being made: removing the view now would leave that
+    /// topic without anyone to delete it.
+    Creating,
 }
 
 /// A message of a primary topic and its twin in a mirror topic (TASK-063).
@@ -701,6 +753,7 @@ impl Default for Registry {
             private: false,
             closed: HashSet::new(),
             twins: Vec::new(),
+            unshared: Vec::new(),
         }
     }
 }
@@ -819,6 +872,70 @@ impl Registry {
         let at = slot.views.iter().position(|view| view.chat == chat)?;
         self.dirty = true;
         Some(slot.views.remove(at))
+    }
+
+    /// The slot is shared to `chat` (TASK-064): it has a view there that is
+    /// no fallback.
+    pub fn shared(&self, id: SlotId, chat: Chat) -> bool {
+        self.slot(id)
+            .is_some_and(|slot| slot.views.iter().any(|v| v.chat == chat && !v.fallback))
+    }
+
+    /// Shares the slot to `chat` (TASK-064): a new view whose topic starts
+    /// with `line`, or the fallback view kept as the shared one (its topic
+    /// gets `line` next). `None`: no such slot.
+    pub fn share(&mut self, id: SlotId, chat: Chat, line: String) -> Option<Shared> {
+        let slot = self.slots.get_mut(id.0)?;
+        let Some(view) = slot.view_mut(chat) else {
+            slot.views.push(View {
+                opening: Some(line),
+                ..View::new(chat)
+            });
+            self.dirty = true;
+            return Some(Shared::Added);
+        };
+        if !view.fallback {
+            return Some(Shared::Already);
+        }
+        view.fallback = false;
+        if view.topic_id.is_some() {
+            view.pending_separator = Some(match view.pending_separator.take() {
+                Some(separator) => format!(
+                    "{line}
+{separator}"
+                ),
+                None => line,
+            });
+        } else {
+            view.opening = Some(line);
+        }
+        self.dirty = true;
+        Some(Shared::Adopted)
+    }
+
+    /// Takes the slot out of `chat` (TASK-064): its shared view goes, and
+    /// its topic waits in [`Registry::unshared`] to be deleted.
+    pub fn unshare(&mut self, id: SlotId, chat: Chat) -> Unshared {
+        if !self.shared(id, chat) {
+            return Unshared::NotShared;
+        }
+        let creating = self.slots[id.0]
+            .views
+            .iter()
+            .any(|view| view.chat == chat && view.topic_id.is_none() && view.busy);
+        if creating {
+            return Unshared::Creating;
+        }
+        let Some(view) = self.remove_view(id, chat) else {
+            return Unshared::NotShared;
+        };
+        if let Some(place) = view.place() {
+            self.unshared.push(UnsharedTopic {
+                place,
+                status: view.status.map(|status| status.message_id),
+            });
+        }
+        Unshared::Removed
     }
 
     /// A slot is free when no session that is still running holds it.
@@ -1826,9 +1943,29 @@ impl Registry {
         view.topic_id = Some(thread_id);
         view.applied_title = Some(name.to_owned());
         view.applied_icon = icon.map(str::to_owned);
-        // A new topic starts with its first session: nothing to separate.
-        view.pending_separator = None;
+        // A new topic starts with its first session, and a topic made by
+        // a share with its line (TASK-064).
+        view.pending_separator = view.opening.take();
         self.dirty = true;
+    }
+
+    /// The separator of the view of `chat` whose topic was just made
+    /// (TASK-064: the share line), handed out at once so it is the first
+    /// message there. Marks the view busy.
+    pub fn separator_job(&mut self, id: SlotId, chat: Chat) -> Option<TopicJob> {
+        let usable = self.usable(chat);
+        let view = self.slots.get_mut(id.0)?.view_mut(chat)?;
+        if !usable || view.busy || view.failed.is_some() {
+            return None;
+        }
+        let (thread_id, text) = (view.topic_id?, view.pending_separator.clone()?);
+        view.busy = true;
+        Some(TopicJob::Separator {
+            slot: id,
+            chat,
+            thread_id,
+            text,
+        })
     }
 
     /// Records a successful (or not-modified) edit of `thread_id`. A result
@@ -1900,6 +2037,7 @@ impl Registry {
             // Its status message went with the topic.
             *view = View {
                 fallback: view.fallback,
+                opening: view.opening.take(),
                 ..View::new(chat)
             };
             self.dirty = true;
@@ -2350,6 +2488,182 @@ mod tests {
         let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
         assert_eq!(saved.slots[slot.0].views[1].chat, owner);
         assert_eq!(saved.slots[slot.0].views[1].topic_id, Some(700));
+    }
+
+    /// A registry with slot A in the private chat alone, its topic made.
+    fn private_slot() -> (Registry, SlotId, Chat) {
+        let owner = Chat::Private(PrivateChat::of_user(7));
+        let mut registry = Registry {
+            private: true,
+            ..Registry::default()
+        };
+        registry.apply_hook(&start(A, CWD, Some(1), None));
+        let slot = slot_of(&registry, A).unwrap();
+        assert!(registry.make_private(slot, owner));
+        registry.topic_created(slot, owner, 700, "t", None);
+        (registry, slot, owner)
+    }
+
+    /// TASK-064: a share adds a group view whose new topic starts with the
+    /// share line, handed out once.
+    #[test]
+    fn a_share_opens_the_new_group_topic_with_its_line() {
+        let (mut registry, slot, owner) = private_slot();
+        let line = share_line("Анна");
+        assert_eq!(line, "── общий доступ: Анна ──");
+        assert!(!registry.shared(slot, Chat::Group));
+        assert_eq!(
+            registry.share(slot, Chat::Group, line.clone()),
+            Some(Shared::Added)
+        );
+        assert!(registry.shared(slot, Chat::Group));
+        assert_eq!(registry.share(SlotId(9), Chat::Group, line.clone()), None);
+        let jobs = registry.topic_work(&Icons::default(), true);
+        assert!(
+            jobs.iter().any(|job| matches!(
+                job,
+                TopicJob::Create {
+                    chat: Chat::Group,
+                    ..
+                }
+            )),
+            "{jobs:?}"
+        );
+        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        let group = &registry.slots[slot.0].views[1];
+        assert_eq!(group.pending_separator.as_deref(), Some(line.as_str()));
+        assert_eq!(group.opening, None);
+        let job = registry.separator_job(slot, Chat::Group);
+        assert_eq!(
+            job,
+            Some(TopicJob::Separator {
+                slot,
+                chat: Chat::Group,
+                thread_id: 100,
+                text: line.clone(),
+            })
+        );
+        assert_eq!(registry.separator_job(slot, Chat::Group), None, "once");
+        assert_eq!(registry.separator_job(slot, owner), None, "none there");
+        registry.topic_separated(slot, Chat::Group, 100, &line);
+        assert_eq!(registry.slots[slot.0].views[1].pending_separator, None);
+        assert_eq!(registry.place(slot), Some(Place::topic(owner, 700)));
+        assert_eq!(registry.mirrors(slot), [Place::topic(Chat::Group, 100)]);
+    }
+
+    /// TASK-064: a share keeps a fallback group view as the shared one: its
+    /// topic gets the line next (before a separator that waits), or starts
+    /// with it when it is not made yet.
+    #[test]
+    fn a_share_makes_a_fallback_group_view_explicit_and_keeps_its_topic() {
+        let (mut registry, slot, _) = private_slot();
+        let line = share_line("Анна");
+        assert!(registry.add_view(slot, Chat::Group));
+        registry.slots[slot.0].views[1].fallback = true;
+        assert!(!registry.shared(slot, Chat::Group));
+        registry.slots[slot.0].views[1].topic_id = Some(100);
+        registry.slots[slot.0].views[1].pending_separator = Some(separator(B, false));
+        assert_eq!(
+            registry.share(slot, Chat::Group, line.clone()),
+            Some(Shared::Adopted)
+        );
+        let group = &registry.slots[slot.0].views[1];
+        assert!(!group.fallback);
+        assert_eq!(group.topic_id, Some(100));
+        assert_eq!(
+            group.pending_separator,
+            Some(format!("{line}\n{}", separator(B, false)))
+        );
+        assert_eq!(
+            registry.share(slot, Chat::Group, line.clone()),
+            Some(Shared::Already)
+        );
+        // Without its topic yet: the topic starts with the line.
+        registry.slots[slot.0].views[1] = View {
+            fallback: true,
+            ..View::new(Chat::Group)
+        };
+        assert_eq!(
+            registry.share(slot, Chat::Group, line.clone()),
+            Some(Shared::Adopted)
+        );
+        assert_eq!(registry.slots[slot.0].views[1].opening, Some(line));
+    }
+
+    /// TASK-064: an unshare removes the shared group view and keeps its
+    /// topic to delete; a fallback view is not shared, a topic being made
+    /// waits, and a slot's only view stays.
+    #[test]
+    fn an_unshare_forgets_the_group_view_and_keeps_its_topic_to_delete() {
+        let (mut registry, slot, owner) = private_slot();
+        assert!(registry.add_view(slot, Chat::Group));
+        registry.slots[slot.0].views[1].fallback = true;
+        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::NotShared);
+        registry.slots[slot.0].views[1].fallback = false;
+        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        registry.slots[slot.0].views[1].status = Some(StatusMessage {
+            message_id: 900,
+            pinned: false,
+        });
+        let group = Place::topic(Chat::Group, 100);
+        assert_eq!(registry.slot_by_topic(group), Some(slot));
+        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Removed);
+        assert_eq!(
+            registry.unshared,
+            [UnsharedTopic {
+                place: group,
+                status: Some(900)
+            }]
+        );
+        assert_eq!(registry.slot_by_topic(group), None);
+        assert_eq!(
+            registry.primary_view(slot).map(|view| view.chat),
+            Some(owner)
+        );
+        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::NotShared);
+        // Its topic being made: nothing changes.
+        registry.unshared.clear();
+        registry.share(slot, Chat::Group, share_line("x"));
+        registry.slots[slot.0].views[1].busy = true;
+        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Creating);
+        assert_eq!(registry.slots[slot.0].views.len(), 2);
+        // Not made and not being made: nothing to delete.
+        registry.slots[slot.0].views[1].busy = false;
+        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Removed);
+        assert!(registry.unshared.is_empty());
+        // A slot in the group alone is not taken out of it.
+        registry.apply_hook(&start(B, "/work/other", Some(2), None));
+        let other = slot_of(&registry, B).unwrap();
+        assert_eq!(registry.unshare(other, Chat::Group), Unshared::NotShared);
+        assert_eq!(registry.slots[other.0].views.len(), 1);
+    }
+
+    /// TASK-064: the share state survives `registry.json`; a file of a hub
+    /// before it loads, and an empty state writes nothing new.
+    #[test]
+    fn share_state_round_trips_and_an_older_hub_reads_it() {
+        let dir = TempDir::new("registry-share");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let (mut registry, slot, _) = private_slot();
+        let plain = String::from_utf8(RegistryStore::encode(&registry)).unwrap();
+        assert!(!plain.contains("opening") && !plain.contains("unshared"));
+        // As v0.1.16 wrote it: loads.
+        store.save(plain.as_bytes()).unwrap();
+        let old = store.load().unwrap();
+        assert_eq!(old.slots, registry.slots);
+        assert!(old.unshared.is_empty());
+        registry.share(slot, Chat::Group, share_line("Анна"));
+        registry.unshared.push(UnsharedTopic {
+            place: Place::topic(Chat::Group, 55),
+            status: None,
+        });
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.slots[slot.0].views[1].opening,
+            Some(share_line("Анна"))
+        );
+        assert_eq!(loaded.unshared, registry.unshared);
     }
 
     #[test]

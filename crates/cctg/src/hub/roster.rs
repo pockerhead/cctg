@@ -622,6 +622,7 @@ mod tests {
             message_id: Some(77),
             thread_id: None,
             from_name: Some("Иван".into()),
+            author: None,
         }
     }
 

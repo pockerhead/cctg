@@ -430,6 +430,7 @@ impl Hub {
                 message_id: Some(message_id),
                 thread_id: None,
                 from_name: None,
+                author: None,
             }))
             .unwrap();
     }
