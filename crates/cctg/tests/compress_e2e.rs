@@ -6,14 +6,17 @@
 //! the role in `role.txt` there. No real claude, no console window
 //! (`Compressor` starts it without one), everything in a temp folder.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use cctg::compress::Compressor;
-use cctg::wire::{AgentMsg, SessionAnswer};
+use cctg::wire::{AgentMsg, HubMsg, SessionAnswer, SessionAsk, encode};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+mod common;
 
 /// What `Compressor` passes before the system prompt.
 const FLAGS: [&str; 11] = [
@@ -178,7 +181,7 @@ async fn scenario() {
     // `unreadable` without a compressor or on a failure.
     let (outbox, mut hub) = mpsc::channel(8);
     let jobs = cctg::agent::spawn_compressor(outbox, Some(compressor(&root.join("ok"), timeout)));
-    jobs.send((7, "Анна: да".into(), 5)).await.unwrap();
+    jobs.requests.send((7, "Анна: да".into(), 5)).await.unwrap();
     let answer = tokio::time::timeout(timeout, hub.recv()).await.unwrap();
     assert_eq!(
         answer,
@@ -193,7 +196,7 @@ async fn scenario() {
     let (outbox, mut hub) = mpsc::channel(8);
     let jobs =
         cctg::agent::spawn_compressor(outbox, Some(compressor(&root.join("error"), timeout)));
-    jobs.send((8, "x".into(), 5)).await.unwrap();
+    jobs.requests.send((8, "x".into(), 5)).await.unwrap();
     let answer = tokio::time::timeout(timeout, hub.recv()).await.unwrap();
     assert_eq!(
         answer,
@@ -204,7 +207,7 @@ async fn scenario() {
     );
     let (outbox, mut hub) = mpsc::channel(8);
     let jobs = cctg::agent::spawn_compressor(outbox, None);
-    jobs.send((9, "x".into(), 5)).await.unwrap();
+    jobs.requests.send((9, "x".into(), 5)).await.unwrap();
     let answer = tokio::time::timeout(timeout, hub.recv()).await.unwrap();
     assert_eq!(
         answer,
@@ -214,5 +217,83 @@ async fn scenario() {
         })
     );
 
+    // The worker agent ends (Claude Code closed its stdin) while its helper
+    // runs: the helper goes with it, though the worker leaves by
+    // `std::process::exit` (TASK-077 review F4).
+    let work = root.join("orphan");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("role.txt"), "slow").unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let hub = asking_hub();
+    let mut command = common::cctg(&home);
+    command
+        .arg("agent-worker")
+        .current_dir(&work)
+        .env("CCTG_CLAUDE", std::env::current_exe().unwrap())
+        .env("CCTG_HUB_SECRET", SECRET)
+        .env("CCTG_HUB_AGENT_ADDR", &hub)
+        .env("CLAUDE_CODE_SESSION_ID", SESSION)
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut agent = common::spawn(&mut command).unwrap();
+    let asked = Instant::now();
+    while !work.join("log.json").is_file() {
+        assert!(asked.elapsed() < timeout, "the helper never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let started = Instant::now();
+    drop(agent.stdin.take());
+    assert!(agent.wait().unwrap().success());
+    tokio::time::sleep((SLOW + Duration::from_secs(2)).saturating_sub(started.elapsed())).await;
+    assert!(
+        !work.join("survived").exists(),
+        "the helper outlived its agent"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
+}
+
+const SECRET: &str = "compress-e2e-secret-0123456789";
+const SESSION: &str = "5e551077-0000-4000-8000-0000000000f4";
+
+/// A hub on loopback that registers the agent and asks it at once to
+/// compress a history; the link stays open until the agent goes.
+fn asking_hub() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let Ok(read) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(read);
+            // `hello`, then `register`.
+            let mut line = String::new();
+            for _ in 0..2 {
+                line.clear();
+                let _ = reader.read_line(&mut line);
+            }
+            let mut stream = stream;
+            let registered = HubMsg::Registered {
+                files: false,
+                albums: false,
+                heartbeat: false,
+            };
+            let ask = HubMsg::SessionRead {
+                read_id: 1,
+                session_id: SESSION.into(),
+                ask: SessionAsk::Compress {
+                    text: "Анна: да".into(),
+                    limit: 5,
+                },
+            };
+            let _ = stream.write_all(&encode(&registered));
+            let _ = stream.write_all(&encode(&ask));
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        }
+    });
+    addr
 }

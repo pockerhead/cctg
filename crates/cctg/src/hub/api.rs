@@ -126,6 +126,9 @@ pub struct Message {
 pub struct MessageMedia {
     /// The words that came with a file.
     pub caption: Option<String>,
+    /// The album the file belongs to: its files come as messages of their
+    /// own, the caption on one of them (TASK-077).
+    pub media_group_id: Option<String>,
     /// Every size of a photo, the largest usually last.
     pub photo: Option<Vec<PhotoSize>>,
     /// A GIF or a silent video; Telegram also fills `document` for it.

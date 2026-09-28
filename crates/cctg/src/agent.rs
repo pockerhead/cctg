@@ -921,7 +921,44 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 /// claude closes stdin. Without `worker` an `update` is ignored. A resumed
 /// worker first tells Claude Code to list the tools again: it may offer
 /// more than the worker Claude Code met.
+///
+/// A helper claude of a group history compression still running when the
+/// loop returns is killed before this returns: the worker ends with
+/// `std::process::exit`, which drops nothing (TASK-077).
 pub async fn serve_channel<W: AsyncWrite + Unpin>(
+    frames: mpsc::Receiver<Frame>,
+    output: W,
+    hub: Hub,
+    events: Option<mpsc::Receiver<LinkEvent>>,
+    dirs: Dirs,
+    console: Option<Console>,
+    worker: Option<Arc<Worker>>,
+) -> std::io::Result<Ended> {
+    let compressions = match &hub {
+        Hub::Link(outbox) => {
+            let compressor = dirs.claude.clone().map(|program| Compressor {
+                program,
+                work: dirs.work.clone(),
+                timeout: COMPRESS_TIMEOUT,
+            });
+            Some(spawn_compressor(outbox.clone(), compressor))
+        }
+        Hub::Off(_) => None,
+    };
+    let requests = compressions
+        .as_ref()
+        .map(|compressions| compressions.requests.clone());
+    let ended = serve_loop(frames, output, hub, events, dirs, console, worker, requests).await;
+    if let Some(compressions) = compressions {
+        compressions.stop().await;
+    }
+    ended
+}
+
+/// The loop of [`serve_channel`]; group histories to compress go to
+/// `compressions`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_loop<W: AsyncWrite + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     mut output: W,
     hub: Hub,
@@ -929,6 +966,7 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     dirs: Dirs,
     console: Option<Console>,
     worker: Option<Arc<Worker>>,
+    compressions: Option<mpsc::Sender<Compression>>,
 ) -> std::io::Result<Ended> {
     let (reads, session_reads, console_jobs, outbox) = match &hub {
         Hub::Link(outbox) => (
@@ -939,14 +977,6 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
         ),
         Hub::Off(_) => (None, None, None, None),
     };
-    let compressions = outbox.as_ref().map(|outbox| {
-        let compressor = dirs.claude.clone().map(|program| Compressor {
-            program,
-            work: dirs.work.clone(),
-            timeout: COMPRESS_TIMEOUT,
-        });
-        spawn_compressor(outbox.clone(), compressor)
-    });
     // Whether the hub on line takes albums, read by the sender when a
     // transfer starts (a call can wait while the link reconnects).
     let (hub_albums, albums) = watch::channel(false);
@@ -1997,15 +2027,31 @@ type Compression = (u64, String, u32);
 /// agent's session has one slot.
 const COMPRESSIONS: usize = 2;
 
+/// The compressor worker of [`spawn_compressor`].
+pub struct Compressions {
+    /// Where the histories to compress go.
+    pub requests: mpsc::Sender<Compression>,
+    task: JoinHandle<()>,
+}
+
+impl Compressions {
+    /// Ends the worker; a helper claude still running is killed (its child
+    /// handle is dropped with `kill_on_drop`) before this returns.
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
 /// The one worker that runs the helper claude of [`crate::compress`], one
 /// run at a time, off the loop: its answer is the summary as `text` pieces,
 /// or `unreadable` when there is no compressor or the run failed.
 pub fn spawn_compressor(
     outbox: mpsc::Sender<AgentMsg>,
     compressor: Option<Compressor>,
-) -> mpsc::Sender<Compression> {
+) -> Compressions {
     let (requests, mut pending) = mpsc::channel::<Compression>(COMPRESSIONS);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some((read_id, text, limit)) = pending.recv().await {
             let summary = match &compressor {
                 Some(compressor) => compressor.run(&text, limit).await,
@@ -2027,7 +2073,7 @@ pub fn spawn_compressor(
             }
         }
     });
-    requests
+    Compressions { requests, task }
 }
 
 /// A key to press or a line to type, with the hub's id for the answer.

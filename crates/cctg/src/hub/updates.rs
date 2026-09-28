@@ -84,6 +84,9 @@ pub struct Inbound {
 pub struct Media {
     pub file: Attachment,
     pub caption: Option<String>,
+    /// Telegram's `media_group_id`: the album of the file (TASK-077).
+    /// Never logged.
+    pub album: Option<String>,
 }
 
 /// The file of a message: an animation before its `document` twin, the
@@ -144,6 +147,7 @@ fn media(message: &mut Message) -> Option<Media> {
     Some(Media {
         file,
         caption: message.media.caption.take(),
+        album: message.media.media_group_id.take(),
     })
 }
 
@@ -1095,6 +1099,12 @@ mod tests {
         assert_eq!(photo.text, None);
         let media = photo.media.unwrap();
         assert_eq!(media.caption.as_deref(), Some("/brief"));
+        assert_eq!(media.album, None);
+        let album = input(json!({
+            "media_group_id": "13579",
+            "photo": [{ "file_id": "p", "file_unique_id": "u", "width": 1, "height": 1 }],
+        }));
+        assert_eq!(album.media.unwrap().album.as_deref(), Some("13579"));
         assert_eq!(
             media.file,
             Attachment {

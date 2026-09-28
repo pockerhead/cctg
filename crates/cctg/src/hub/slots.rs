@@ -668,6 +668,20 @@ struct Gather {
     due: Instant,
 }
 
+/// The album of the latest group file of a slot (TASK-077): Telegram sends
+/// each file of an album as a message of its own, the caption on one of
+/// them. Its files address the agent when one of them does.
+#[derive(Debug)]
+struct MentionAlbum {
+    /// Telegram's `media_group_id`.
+    id: String,
+    /// A file of it addressed the agent: the later ones are not kept.
+    mentioned: bool,
+    /// Its files kept for the next mention before one of them addressed
+    /// the agent, oldest first, each with its part in the group backlog.
+    kept: Vec<(Inbound, String)>,
+}
+
 /// The kept file of a slot on its way to an agent.
 #[derive(Debug, Clone, Copy)]
 struct Fetching {
@@ -1573,6 +1587,8 @@ pub struct Slots {
     /// Slots whose front message waits for its history's compression
     /// (TASK-077): at most one per slot.
     compressing: HashSet<SlotId>,
+    /// The album of each slot's latest group file (TASK-077).
+    mention_albums: HashMap<SlotId, MentionAlbum>,
     /// Hooks waiting for their channel twin, oldest first.
     hook_asks: Vec<HookAsk>,
     /// Hooks waiting for a press, by the key of their prompt.
@@ -1805,6 +1821,7 @@ impl Slots {
             transcript_asks: None,
             reads: HashMap::new(),
             compressing: HashSet::new(),
+            mention_albums: HashMap::new(),
             hook_asks: Vec::new(),
             hook_waiters: HashMap::new(),
             relayed: VecDeque::new(),
@@ -3647,7 +3664,7 @@ impl Slots {
             }
             return;
         };
-        let (place, key) = (input.place(), input.key());
+        let place = input.place();
         // Kept for the next mention, it reaches no view but its own
         // (TASK-077).
         let holds = self
@@ -3708,6 +3725,18 @@ impl Slots {
             self.keep_for_mention(slot, place, input);
             return;
         }
+        // The files of its album kept before it go first, as files.
+        for earlier in self.album_mention(slot, place, &input) {
+            self.take_in(slot, place, thread_id, earlier);
+        }
+        self.take_in(slot, place, thread_id, input);
+    }
+
+    /// Message `input` of topic `place` (thread `thread_id`) of `slot`, not
+    /// kept for a mention: a console command, or a message parked for the
+    /// slot's session.
+    fn take_in(&mut self, slot: SlotId, place: Place, thread_id: i64, input: Inbound) {
+        let key = input.key();
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
             (None, Some(media)) => {
@@ -3777,7 +3806,8 @@ impl Slots {
     /// Message `input` in topic `place` of `slot` is kept for the agent's
     /// next mention (TASK-077): the group topic of a slot shared from its
     /// owner's private chat, in mention mode, and it neither addresses the
-    /// agent nor is a console command.
+    /// agent (itself or as a file of an album that did) nor is a console
+    /// command.
     fn holds(&self, slot: SlotId, place: Place, input: &Inbound) -> bool {
         let Some(bot) = &self.options.mentions else {
             return false;
@@ -3799,7 +3829,66 @@ impl Slots {
             && self.registry.shared(slot, Chat::Group)
             && group_view.is_some_and(|view| !view.every_message)
             && !mentioned(bot, input)
+            && !self.album_mentioned(slot, input)
             && !console
+    }
+
+    /// `input` is a file of the album of `slot` that addressed the agent.
+    fn album_mentioned(&self, slot: SlotId, input: &Inbound) -> bool {
+        album_of(input).is_some_and(|id| {
+            self.mention_albums
+                .get(&slot)
+                .is_some_and(|album| album.mentioned && album.id == id)
+        })
+    }
+
+    /// Group message `input` of `slot` addresses the agent: when it is a
+    /// file of an album, the album's files kept for the next mention before
+    /// it leave the group backlog and come back to go as files, oldest
+    /// first, and the album's later files address the agent too.
+    fn album_mention(&mut self, slot: SlotId, place: Place, input: &Inbound) -> Vec<Inbound> {
+        let Some(id) = album_of(input) else {
+            return Vec::new();
+        };
+        let addressed = self
+            .options
+            .mentions
+            .as_ref()
+            .is_some_and(|bot| mentioned(bot, input));
+        if place.chat != Chat::Group || !addressed {
+            return Vec::new();
+        }
+        let album = MentionAlbum {
+            id: id.to_owned(),
+            mentioned: true,
+            kept: Vec::new(),
+        };
+        let kept = match self.mention_albums.insert(slot, album) {
+            Some(album) if album.id == id => album.kept,
+            _ => return Vec::new(),
+        };
+        if kept.is_empty() {
+            return Vec::new();
+        }
+        if let Some(view) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(Chat::Group))
+        {
+            // Newest first: each is the latest part equal to it.
+            for (_, part) in kept.iter().rev() {
+                if let Some(at) = view.backlog.parts.iter().rposition(|kept| kept == part) {
+                    view.backlog.parts.remove(at);
+                }
+            }
+            self.registry.dirty = true;
+        }
+        info!(
+            ordinal = self.ordinal(slot),
+            files = kept.len(),
+            "kept files of an album go with its mention"
+        );
+        kept.into_iter().map(|(input, _)| input).collect()
     }
 
     /// Keeps group message `input` of `slot` in its group view's backlog,
@@ -3807,6 +3896,11 @@ impl Slots {
     /// neither words nor a file is dropped without a word. The topic is
     /// told once how to address the agent.
     fn keep_for_mention(&mut self, slot: SlotId, place: Place, input: Inbound) {
+        // A file of an album is remembered: a later file of the album may
+        // address the agent.
+        let album = album_of(&input)
+            .map(str::to_owned)
+            .map(|id| (id, input.clone()));
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
             (None, Some(media)) => (media.caption.unwrap_or_default(), Some(media.file)),
@@ -3827,10 +3921,27 @@ impl Slots {
         else {
             return;
         };
-        view.backlog.push(part);
+        view.backlog.push(part.clone());
         let (kept, told) = (view.backlog.parts.len(), view.mention_told);
         self.registry.dirty = true;
         info!(ordinal, kept, "group message kept for the next mention");
+        if let Some((id, input)) = album {
+            match self.mention_albums.get_mut(&slot) {
+                Some(album) if album.id == id => {
+                    if album.kept.len() < MAX_ALBUM {
+                        album.kept.push((input, part));
+                    }
+                }
+                _ => {
+                    let album = MentionAlbum {
+                        id,
+                        mentioned: false,
+                        kept: vec![(input, part)],
+                    };
+                    self.mention_albums.insert(slot, album);
+                }
+            }
+        }
         let Some(hint) = self
             .options
             .mentions
@@ -4202,12 +4313,22 @@ impl Slots {
             return FileStep::Wait;
         }
         let Some(fetcher) = &self.fetcher else {
+            // A mention's history (TASK-077) goes without the file.
+            let history = parked.history.is_some();
+            if history
+                && bound
+                    .to_agent
+                    .try_send(self.inbound(session, parked))
+                    .is_err()
+            {
+                return FileStep::Wait;
+            }
             warn!(
                 ordinal,
                 kind, "no download task; a file from the topic is dropped"
             );
             self.notify_author(slot, parked.place(), buffer::FETCH_FAILED_NOTICE);
-            return FileStep::Gone { delivered: false };
+            return FileStep::Gone { delivered: history };
         };
         let transfer_id = self.transfers + 1;
         let job = fetch::Job {
@@ -4241,7 +4362,8 @@ impl Slots {
     }
 
     /// The download task is done with the kept file of `slot`: it leaves
-    /// the slot, and the topic hears of a file that did not go. It stays
+    /// the slot, and the topic hears of a file that did not go (a message
+    /// with a group history stays, without the file: TASK-077). It stays
     /// for the next agent when its link closed first (up to
     /// [`MAX_LINK_LOSSES`] times in a row) or when it went to a link that
     /// is no longer the slot's live agent (its session ended meanwhile:
@@ -4304,7 +4426,18 @@ impl Slots {
             return;
         };
         if let Some(entry) = self.registry.slot_mut(slot) {
-            entry.buffer.messages.pop_front();
+            match entry.buffer.messages.front_mut() {
+                // A mention's history (TASK-077) does not go with a file
+                // that did not come: the message stays, as words only.
+                Some(parked)
+                    if parked.history.is_some() && !matches!(outcome, Fetched::Handed { .. }) =>
+                {
+                    parked.file = None;
+                }
+                _ => {
+                    entry.buffer.messages.pop_front();
+                }
+            }
         }
         self.registry.dirty = true;
         match outcome {
@@ -12370,7 +12503,14 @@ fn echo_text(
     )
 }
 
-/// A plain message without a sound.
+/// The album of a file message (Telegram's `media_group_id`).
+fn album_of(input: &Inbound) -> Option<&str> {
+    input
+        .media
+        .as_ref()
+        .and_then(|media| media.album.as_deref())
+}
+
 /// `input` addresses the agent (TASK-077): `@<username>` in its own words
 /// (a forward's are someone else's), or an explicit reply to one of the
 /// bot's messages (by the bot's id: other bots and anonymous admins do not
@@ -12389,6 +12529,7 @@ fn mentioned(bot: &MentionBot, input: &Inbound) -> bool {
         || input.reply_from == Some(bot.id)
 }
 
+/// A plain message without a sound.
 fn message_op(place: Place, text: String) -> Op {
     Op::Send {
         chat: place.chat,
@@ -23210,6 +23351,7 @@ again"
                     size,
                 },
                 caption: caption.map(str::to_owned),
+                album: None,
             }),
             from_name: None,
             author: None,
@@ -30910,6 +31052,7 @@ again"
                         size: Some(1),
                     },
                     caption: Some(caption.into()),
+                    album: None,
                 }),
                 text: None,
                 ..match group_by(message_id, "", "Анна", None) {
@@ -30933,5 +31076,173 @@ again"
               Анна: [фото] схема\n(конец истории)\n\nАнна: @cctg_bot смотри"
             ]
         );
+    }
+
+    /// Photo `file_id` of album `album` by Анна in group topic 100, with
+    /// `caption` (TASK-077 review F1).
+    fn album_photo(message_id: i64, file_id: &str, album: &str, caption: Option<&str>) -> Control {
+        Control::Message(Inbound {
+            media: Some(crate::hub::updates::Media {
+                file: Attachment {
+                    kind: crate::wire::FileKind::Photo,
+                    file_id: file_id.into(),
+                    name: None,
+                    size: Some(1),
+                },
+                caption: caption.map(str::to_owned),
+                album: Some(album.into()),
+            }),
+            text: None,
+            ..match group_by(message_id, "", "Анна", None) {
+                Control::Message(input) => input,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    /// Review F1: Telegram sends an album as one message per file, the
+    /// caption on one of them. When the caption addresses the agent, every
+    /// file of the album goes to the session, the ones before it too, and
+    /// none stays in the history as a placeholder; an album nobody
+    /// addressed stays kept.
+    #[tokio::test]
+    async fn the_files_of_an_album_whose_caption_addresses_the_agent_all_go() {
+        let dir = TempDir::new("slots-mention-album");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        let files: HashMap<String, Vec<u8>> = ["p", "q", "r", "s", "t", "u", "v"]
+            .into_iter()
+            .map(|id| (id.to_owned(), b"x".to_vec()))
+            .collect();
+        slots.fetch_files(Arc::new(TelegramFiles(files)));
+        let mut done = slots.done_rx.take().unwrap();
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        // An album nobody addressed: kept.
+        slots.on_control(album_photo(5, "v", "c", None));
+        slots.on_control(group_by(6, "решили: релиз в пятницу", "Иван", None));
+        slots.pump();
+        // The caption on the first file.
+        slots.on_control(album_photo(10, "p", "a", Some("@cctg_bot смотри все")));
+        slots.on_control(album_photo(11, "q", "a", None));
+        slots.on_control(album_photo(12, "r", "a", None));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [10, 11, 12], "none of it kept");
+        // One by one: the agent takes each before the next comes.
+        let mut files = Vec::new();
+        for _ in 0..3 {
+            fetched(&mut slots, &mut done).await;
+            files.extend(got(&mut agent).files);
+        }
+        assert_eq!(
+            files,
+            [
+                "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
+                 Анна: [фото]\n\n---\n\nИван: решили: релиз в пятницу\n(конец истории)\n\n\
+                 Анна: @cctg_bot смотри все",
+                "Анна:",
+                "Анна:",
+            ]
+        );
+        assert!(backlog_of(&slots).is_empty());
+        // The caption on the last file, as for an album of documents.
+        slots.on_control(group_by(19, "а вот ещё", "Иван", None));
+        slots.on_control(album_photo(20, "s", "b", None));
+        slots.on_control(album_photo(21, "t", "b", None));
+        slots.pump();
+        assert_eq!(
+            backlog_of(&slots),
+            ["Иван: а вот ещё", "Анна: [фото]", "Анна: [фото]"]
+        );
+        assert!(slots.fetching.is_empty(), "kept files are not downloaded");
+        slots.on_control(album_photo(22, "u", "b", Some("@cctg_bot и эти")));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [20, 21, 22], "the album in order");
+        let (mut files, mut inbounds) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            fetched(&mut slots, &mut done).await;
+            let got = got(&mut agent);
+            files.extend(got.files);
+            inbounds.extend(got.inbounds);
+        }
+        assert_eq!(
+            files,
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Иван: а вот ещё\n(конец истории)\n\nАнна:",
+                "Анна:",
+                "Анна: @cctg_bot и эти",
+            ]
+        );
+        assert!(inbounds.is_empty());
+        assert!(backlog_of(&slots).is_empty());
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+    }
+
+    /// Review F2: a file that addresses the agent but cannot be downloaded
+    /// still brings the group history, as words, with the notice.
+    #[tokio::test]
+    async fn a_file_mention_whose_file_fails_still_brings_the_history() {
+        let dir = TempDir::new("slots-mention-lost");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        slots.fetch_files(Arc::new(TelegramFiles(HashMap::new())));
+        let mut done = slots.done_rx.take().unwrap();
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(group_by(9, "решили: релиз в пятницу", "Иван", None));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(album_photo(10, "gone", "a", Some("@cctg_bot смотри")));
+        slots.pump();
+        assert!(backlog_of(&slots).is_empty(), "taken by the mention");
+        fetched(&mut slots, &mut done).await;
+        let got = got(&mut agent);
+        assert!(got.files.is_empty());
+        assert_eq!(
+            mention_contents(&got),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Иван: решили: релиз в пятницу\n(конец истории)\n\nАнна: @cctg_bot смотри"
+            ]
+        );
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+        let handed = all_work(&mut work);
+        let notices: Vec<&str> = handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::Send {
+                    chat: Chat::Group,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, [buffer::FETCH_FAILED_NOTICE]);
+        assert_eq!(reactions_on(&handed), [10]);
+    }
+
+    /// Review F2, without a download task: the history goes as words too.
+    #[tokio::test]
+    async fn a_file_mention_without_a_download_task_still_brings_the_history() {
+        let dir = TempDir::new("slots-mention-nofetch");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        slots.on_control(group_by(9, "решили", "Иван", None));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(album_photo(10, "p", "a", Some("@cctg_bot смотри")));
+        slots.pump();
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Иван: решили\n(конец истории)\n\nАнна: @cctg_bot смотри"
+            ]
+        );
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+        assert_eq!(reactions_on(&all_work(&mut work)), [10]);
     }
 }
