@@ -69,6 +69,12 @@ pub struct User {
     pub is_bot: bool,
     pub username: Option<String>,
     pub first_name: Option<String>,
+    /// The bot has topics in private chats (Threaded Mode in @BotFather);
+    /// only `getMe` says it (Bot API 9.3, TASK-063).
+    pub has_topics_enabled: bool,
+    /// Users may create and delete topics in their private chat with the
+    /// bot; only `getMe` says it (Bot API 9.4).
+    pub allows_users_to_create_topics: bool,
 }
 
 /// The chat of a message as Telegram describes it.

@@ -64,6 +64,7 @@ impl Transport for Fake {
 fn input(text: &str) -> Inbound {
     Inbound {
         chat: Chat::Group,
+        sender: cctg::hub::chat::PrivateChat::of_user(1001),
         message_id: 1,
         thread_id: None,
         text: Some(text.to_owned()),
@@ -72,6 +73,7 @@ fn input(text: &str) -> Inbound {
         forwarded: false,
         media: None,
         from_name: None,
+        author: None,
     }
 }
 
@@ -165,6 +167,8 @@ async fn command_logs_carry_no_paths() {
                 files: false,
                 session_reads: true,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,

@@ -41,6 +41,19 @@
 //! prompt goes within three refills of the group's budget (+3 s) of its
 //! request.
 //!
+//! `CCTG_SOAK_PRIVATE=1` (fake Telegram only, TASK-063) runs the status mode
+//! with topics in private chats on: the one allowlisted user owns the
+//! device, so every slot also shows in that user's private chat, the
+//! primary view, and the group mirrors it; each chat has its own scheduler
+//! (the group `Limits::default()`, the private chat `Limits::private()`).
+//! The fake numbers topics and messages of both chats with one counter;
+//! calls into the private chat show as `p_<kind>`. The planned 429s hit the
+//! group only. Every check of the status mode then holds for the group
+//! (the mirror) and for the private topics (the primary ones); the prompts
+//! are pressed on their twins in the group, one message is written in the
+//! private topic of A, and a 429 of the group holds back no call into the
+//! private chat.
+//!
 //! Slow (about a minute), so it runs only when asked:
 //! `cargo test -p cctg --test soak -- --ignored`.
 
@@ -48,21 +61,23 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::device::canonical_cwd;
 use cctg::hub::api::{ApiError, BotApi, ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, PrivateChat};
 use cctg::hub::config::{Allowlist, BotToken, Config};
 use cctg::hub::ingress::{serve_agents, serve_hooks};
 use cctg::hub::offset::OffsetStore;
 use cctg::hub::registry::{
     Icons, RegistryStore, folder_name, nested_header, separator, topic_title,
 };
-use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outcome, Scheduler, Transport};
-use cctg::hub::slots::{Control, Options, STATUS_EVERY, Slots};
+use cctg::hub::scheduler::{
+    BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Scheduler, Transport,
+};
+use cctg::hub::slots::{Control, Options, Owners, STATUS_EVERY, Slots};
 use cctg::hub::updates::{self, Inbound, Routed, ServiceKind, UpdateSource};
 use cctg::wire::Secret;
 use serde_json::{Value, json};
@@ -86,6 +101,9 @@ const SYNTHETIC_QUERY: &str = "soak-";
 /// Waits are this many times longer against the real bot (20 messages a
 /// minute instead of the fake's fast bucket).
 static SLOW: AtomicU64 = AtomicU64::new(1);
+/// `CCTG_SOAK_PRIVATE`: calls into the private chat of `FAKE_USER` are
+/// expected (TASK-063).
+static PRIVATE: AtomicBool = AtomicBool::new(false);
 
 const A1: &str = "a1a1a1a1-0000-4000-8000-000000000001";
 const A2: &str = "a2a2a2a2-0000-4000-8000-000000000002";
@@ -117,17 +135,20 @@ fn main() {
         return;
     }
     let live = std::env::var("CCTG_SOAK_LIVE").is_ok_and(|value| value == "1");
-    let status = std::env::var("CCTG_SOAK_STATUS").is_ok_and(|value| value == "1");
+    let private = std::env::var("CCTG_SOAK_PRIVATE").is_ok_and(|value| value == "1");
+    // The private mode is the status mode with private chats on.
+    let status = private || std::env::var("CCTG_SOAK_STATUS").is_ok_and(|value| value == "1");
     assert!(
         !(live && status),
-        "CCTG_SOAK_STATUS runs against the fake Telegram only"
+        "CCTG_SOAK_STATUS and CCTG_SOAK_PRIVATE run against the fake Telegram only"
     );
+    PRIVATE.store(private, Ordering::SeqCst);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("runtime");
-    let report = runtime.block_on(soak(live, status));
+    let report = runtime.block_on(soak(live, status, private));
     println!("{report}");
     if let Ok(path) = std::env::var("CCTG_SOAK_REPORT") {
         std::fs::write(path, &report).expect("write the report");
@@ -485,7 +506,58 @@ struct Call {
     wait: Duration,
 }
 
+/// The chat of the owner, `FAKE_USER` (TASK-063).
+fn owner_chat() -> Chat {
+    Chat::Private(PrivateChat::of_user(FAKE_USER))
+}
+
+/// The kind of a call into the owner's private chat (TASK-063).
+fn private_kind(kind: &'static str) -> &'static str {
+    match kind {
+        "send" => "p_send",
+        "permission" => "p_permission",
+        "document" => "p_document",
+        "photo" => "p_photo",
+        "album" => "p_album",
+        "stream" => "p_stream",
+        "write" => "p_write",
+        "edit" => "p_edit",
+        "react" => "p_react",
+        "delete" => "p_delete",
+        "unpin" => "p_unpin",
+        "create_topic" => "p_create_topic",
+        "edit_topic" => "p_edit_topic",
+        other => other,
+    }
+}
+
+/// A call of the private chat's kinds (`p_*`).
+fn private(kind: &str) -> bool {
+    kind.starts_with("p_")
+}
+
 fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
+    // TASK-063: with private chats on, the owner's chat is the second chat
+    // the hub writes to; any other private chat is a crossed route.
+    if PRIVATE.load(Ordering::SeqCst) && op.chat() == Some(owner_chat()) {
+        let mut in_group = op.clone();
+        match &mut in_group {
+            Op::Send { chat, .. }
+            | Op::SendDocument { chat, .. }
+            | Op::SendPhoto { chat, .. }
+            | Op::SendAlbum { chat, .. }
+            | Op::Edit { chat, .. }
+            | Op::Delete { chat, .. }
+            | Op::Unpin { chat, .. }
+            | Op::CreateTopic { chat, .. }
+            | Op::EditTopic { chat, .. }
+            | Op::Stream { chat, .. }
+            | Op::React { chat, .. } => *chat = Chat::Group,
+            Op::AnswerCallback { .. } => {}
+        }
+        let (kind, thread, text, message) = describe(&in_group);
+        return (private_kind(kind), thread, text, message);
+    }
     match op {
         Op::Send {
             chat: Chat::Group,
@@ -714,7 +786,17 @@ impl Tg {
             .filter(|call| {
                 call.thread == Some(thread)
                     && call.outcome == "ok"
-                    && matches!(call.kind, "send" | "permission" | "stream" | "write")
+                    && matches!(
+                        call.kind,
+                        "send"
+                            | "permission"
+                            | "stream"
+                            | "write"
+                            | "p_send"
+                            | "p_permission"
+                            | "p_stream"
+                            | "p_write"
+                    )
             })
             .flat_map(|call| call.text.lines().map(str::to_owned).collect::<Vec<_>>())
             .collect()
@@ -723,9 +805,11 @@ impl Tg {
     /// Status mode: a 429 when `group_limit` requests went in the 60 s
     /// before `at`, with a `retry_after` (whole seconds, as Telegram's) that
     /// ends when the oldest of them leaves the window; else `at` counts.
+    /// Only requests into the group count (TASK-063: a private chat has its
+    /// own limit, which this fake does not enforce).
     fn group_flood(&self, op: &Op, at: Instant) -> Option<Duration> {
         let limit = self.group_limit?;
-        if matches!(op, Op::AnswerCallback { .. }) {
+        if op.chat() != Some(Chat::Group) {
             return None;
         }
         let window = Duration::from_secs(60);
@@ -766,14 +850,17 @@ impl Tg {
                 icon_custom_emoji_id: None,
             })),
             Op::Stream {
+                chat,
                 thread_id,
                 text,
                 notify,
                 into,
                 ..
             } => {
-                let seen = self.streams_seen.fetch_add(1, Ordering::SeqCst) + 1;
-                {
+                // The planned 429s hit the group (TASK-063: its pause must
+                // not hold the private chat back).
+                if *chat == Chat::Group {
+                    let seen = self.streams_seen.fetch_add(1, Ordering::SeqCst) + 1;
                     let mut flood = self.flood.lock().unwrap();
                     if flood.front() == Some(&seen) {
                         flood.pop_front();
@@ -825,7 +912,9 @@ impl Tg {
                     not_found("delete")
                 }
             }
-            Op::EditTopic { thread_id, .. } => {
+            Op::EditTopic {
+                chat, thread_id, ..
+            } => {
                 // Telegram posts a service message into the topic.
                 let id = self.show(
                     Some(*thread_id),
@@ -837,7 +926,7 @@ impl Tg {
                 self.service.lock().unwrap().push((Some(*thread_id), id));
                 self.updates.push(json!({"message": {
                     "message_id": id, "message_thread_id": thread_id, "is_topic_message": true,
-                    "date": 1, "chat": {"id": FAKE_CHAT, "type": "supergroup", "is_forum": true},
+                    "date": 1, "chat": chat_json(*chat),
                     "from": {"id": BOT, "is_bot": true, "first_name": "bot"},
                     "forum_topic_edited": {"name": "x"},
                 }}));
@@ -845,6 +934,15 @@ impl Tg {
             }
             _ => Ok(Outcome::Done),
         }
+    }
+}
+
+/// The `chat` of an update of the fake: the group, or the owner's private
+/// chat (its id is the user's).
+fn chat_json(chat: Chat) -> Value {
+    match chat {
+        Chat::Group => json!({"id": FAKE_CHAT, "type": "supergroup", "is_forum": true}),
+        Chat::Private(_) => json!({"id": FAKE_USER, "type": "private", "first_name": "u"}),
     }
 }
 
@@ -948,6 +1046,8 @@ struct Soak {
     live: bool,
     /// `CCTG_SOAK_STATUS`: the hub's status settings and pacing (TASK-062).
     status: bool,
+    /// `CCTG_SOAK_PRIVATE`: private chats on (TASK-063).
+    private: bool,
     /// Live only: for deleting this run's topics at the end.
     /// Live only, with the group's id.
     token: Option<(BotToken, i64)>,
@@ -999,7 +1099,15 @@ impl Soak {
         self.tg.run.store(run, Ordering::SeqCst);
         let agents_listener = bind(self.agent_port).await;
         let hooks_listener = bind(self.hook_port).await;
-        let (scheduler, outbox) = Scheduler::new(self.tg.clone(), self.limits);
+        let mut tasks = Vec::new();
+        // A scheduler per chat with private chats on (TASK-063), as the hub.
+        let outbox = if self.private {
+            Outbox::per_chat(self.tg.clone(), self.limits, Limits::private())
+        } else {
+            let (scheduler, outbox) = Scheduler::new(self.tg.clone(), self.limits);
+            tasks.push(tokio::spawn(scheduler.run()));
+            outbox
+        };
         let store = RegistryStore::open(&self.state).expect("registry store");
         let registry = store.load().expect("registry loads");
         let slots = Slots::new(registry, store, outbox, self.options.clone());
@@ -1007,12 +1115,11 @@ impl Soak {
         let (hooks, hooks_rx) = mpsc::channel(256);
         let (control, control_rx) = mpsc::unbounded_channel();
         let secret = Secret::parse(SECRET).expect("secret");
-        let mut tasks = vec![
-            tokio::spawn(scheduler.run()),
+        tasks.extend([
             tokio::spawn(slots.run(agents_rx, hooks_rx, control_rx)),
             tokio::spawn(serve_agents(agents_listener, secret.clone(), agents)),
             tokio::spawn(serve_hooks(hooks_listener, secret, hooks)),
-        ];
+        ]);
         let offsets = OffsetStore::open(&self.state).expect("offset store");
         let (allowlist, tg, router) = (self.allowlist.clone(), self.tg.clone(), control.clone());
         let live = self.live;
@@ -1025,7 +1132,7 @@ impl Soak {
                         .push((service.thread_id, service.message_id));
                 }
                 let _ = router.send(Control::TopicEdited {
-                    chat: Chat::Group,
+                    chat: service.chat,
                     thread_id: service.thread_id,
                     message_id: service.message_id,
                 });
@@ -1049,8 +1156,17 @@ impl Soak {
             }
             None => {
                 let source = self.tg.updates.clone();
+                let private = self.private;
                 tokio::spawn(async move {
-                    updates::poll(&source, &allowlist, &offsets, route).await;
+                    updates::poll_until(
+                        &source,
+                        &allowlist,
+                        private,
+                        &offsets,
+                        route,
+                        std::future::pending(),
+                    )
+                    .await;
                 })
             }
         });
@@ -1059,10 +1175,17 @@ impl Soak {
 
     /// A user message in a topic.
     fn say(&self, hub: &Hub, thread: i64, text: &str) {
+        self.say_in(hub, Chat::Group, thread, text);
+    }
+
+    /// A user message in a topic of `chat` (TASK-063: the owner's private
+    /// chat too).
+    fn say_in(&self, hub: &Hub, in_chat: Chat, thread: i64, text: &str) {
         if self.live {
             let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
             let _ = hub.control.send(Control::Message(Inbound {
                 chat: Chat::Group,
+                sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
                 thread_id: Some(thread),
                 text: Some(text.to_owned()),
@@ -1071,12 +1194,13 @@ impl Soak {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             }));
             return;
         }
         // The fake numbers it with the bot's messages and shows it.
         let message_id = self.tg.user_message(thread, text);
-        let chat = json!({"id": FAKE_CHAT, "type": "supergroup", "is_forum": true});
+        let chat = chat_json(in_chat);
         self.tg.updates.push(json!({"message": {
             "message_id": message_id, "message_thread_id": thread, "is_topic_message": true,
             "date": 1, "chat": chat, "text": text,
@@ -1322,7 +1446,7 @@ fn last_icon(tg: &Tg, thread: i64, run: usize) -> Option<String> {
 
 // ------------------------------------------------------------ scenario
 
-async fn soak(live: bool, status: bool) -> String {
+async fn soak(live: bool, status: bool, private: bool) -> String {
     let started = Instant::now();
     let root = std::env::temp_dir().join(format!("cctg-soak-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1422,11 +1546,19 @@ async fn soak(live: bool, status: bool) -> String {
         )
     } else if status {
         // The hub's status settings and pacing (`hub::run`); only the grace
-        // for a lost agent link is cut, as in the live run.
+        // for a lost agent link is cut, as in the live run. Private: the one
+        // allowlisted user owns the device (TASK-063).
         let options = Options {
             grace: Duration::ZERO,
             status_every: Some(STATUS_EVERY),
             can_pin: true,
+            // The soak's slots are shared ones (as slots made in the group
+            // before TASK-063): it drives the mirror.
+            owners: private.then(|| Owners {
+                share_new: true,
+                first: PrivateChat::of_user(FAKE_USER),
+                devices: None,
+            }),
             ..Options::default()
         };
         (
@@ -1476,6 +1608,7 @@ async fn soak(live: bool, status: bool) -> String {
     let soak = Arc::new(Soak {
         live,
         status,
+        private,
         token,
         root: root.clone(),
         home,
@@ -1649,6 +1782,32 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let t_a = topic_of(&tg, &names[0]).unwrap();
     let t_a2 = topic_of(&tg, &names[1]).unwrap();
     let t_b = topic_of(&tg, &names[2]).unwrap();
+    // TASK-063: each slot has a topic in the owner's private chat too.
+    let private_topic = |name: &str| {
+        tg.calls()
+            .iter()
+            .find(|call| call.kind == "p_create_topic" && call.outcome == "ok" && call.text == name)
+            .and_then(|call| call.message_id)
+    };
+    let (q_a, q_a2, q_b) = if soak.private {
+        wait_for("three private topics", 30, || {
+            names.iter().all(|name| private_topic(name).is_some())
+        })
+        .await;
+        (
+            private_topic(&names[0]).unwrap(),
+            private_topic(&names[1]).unwrap(),
+            private_topic(&names[2]).unwrap(),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    // The topics each check covers: the group's, and the private ones.
+    let views: Vec<[i64; 3]> = if soak.private {
+        vec![[t_a, t_a2, t_b], [q_a, q_a2, q_b]]
+    } else {
+        vec![[t_a, t_a2, t_b]]
+    };
     let alive = soak.options.icons.alive.clone();
     wait_for("three agents bound", 30, || {
         [t_a, t_a2, t_b]
@@ -1665,6 +1824,15 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     ]
     .into_iter()
     .collect();
+    let private_owner: BTreeMap<&str, i64> = [
+        (short(A1), q_a),
+        (short(A2), q_a2),
+        (short(B1), q_b),
+        (short(NESTED), q_a),
+        (short(A5), q_a),
+    ]
+    .into_iter()
+    .collect();
 
     // ---- phase 2: routing both ways
     for (sim, thread) in [(&a1, t_a), (&a2, t_a2), (&b1, t_b)] {
@@ -1674,6 +1842,15 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         let want = format!("to {}", short(sim.id));
         wait_for(&format!("inbound of {}", short(sim.id)), 20, || {
             sim.inbound().contains(&want)
+        })
+        .await;
+    }
+    // TASK-063: a message in the owner's private topic reaches the session.
+    let private_to_a1 = format!("to {} in private", short(A1));
+    if soak.private {
+        soak.say_in(&hub, owner_chat(), q_a, &private_to_a1);
+        wait_for("inbound from the private topic", 20, || {
+            a1.inbound().contains(&private_to_a1)
         })
         .await;
     }
@@ -1692,19 +1869,21 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         )
         .await;
     }
-    for (sim, thread) in [(&a1, t_a), (&a2, t_a2), (&b1, t_b)] {
-        let s = short(sim.id);
-        let want = [
-            format!("reply from {s}"),
-            format!("> task {s}"),
-            format!("• Bash: step {s} ✓"),
-            format!("answer {s}"),
-        ];
-        wait_for(&format!("topic lines of {s}"), 30, || {
-            let got = tg.texts(thread);
-            want.iter().all(|line| got.contains(line))
-        })
-        .await;
+    for topics in &views {
+        for (sim, thread) in [(&a1, topics[0]), (&a2, topics[1]), (&b1, topics[2])] {
+            let s = short(sim.id);
+            let want = [
+                format!("reply from {s}"),
+                format!("> task {s}"),
+                format!("• Bash: step {s} ✓"),
+                format!("answer {s}"),
+            ];
+            wait_for(&format!("topic lines of {s}"), 30, || {
+                let got = tg.texts(thread);
+                want.iter().all(|line| got.contains(line))
+            })
+            .await;
+        }
     }
 
     // ---- phase 3: a nested `claude -p` inside A1
@@ -1743,10 +1922,13 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     })
     .await;
     let header = nested_header(NESTED);
-    assert!(
-        tg.texts(t_a).iter().any(|line| line == &header),
-        "the nested block opens in its parent's topic"
-    );
+    for topics in &views {
+        let thread = topics[0];
+        wait_for("the nested block in each view", 30, || {
+            tg.texts(thread).iter().any(|line| line == &header)
+        })
+        .await;
+    }
     let nested_kind = json!({"kind": "nested", "parent": A1});
     wait_for("nesting found through the process tree", 20, || {
         soak.registry()["sessions"][NESTED]["kind"] == nested_kind
@@ -1798,6 +1980,24 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         prompt_of(t_a).is_some() && prompt_of(t_a2).is_some()
     })
     .await;
+    // In the private mode these are the twins in the group; the primary
+    // prompts went into the private topics.
+    let private_prompt_of = |thread: i64| {
+        tg.calls().into_iter().find(|call| {
+            call.kind == "p_permission" && call.outcome == "ok" && call.thread == Some(thread)
+        })
+    };
+    let private_latency = if soak.private {
+        wait_for("both private prompts", 30, || {
+            private_prompt_of(q_a).is_some() && private_prompt_of(q_a2).is_some()
+        })
+        .await;
+        let latest =
+            [q_a, q_a2].map(|thread| private_prompt_of(thread).unwrap().at.duration_since(t0));
+        Some(latest[0].max(latest[1]))
+    } else {
+        None
+    };
     let (p_a, p_a2) = (prompt_of(t_a).unwrap(), prompt_of(t_a2).unwrap());
     // The 429s go into the rest of the burst, after the prompts: the
     // latencies above measure the priority of a prompt, not a 429 pause.
@@ -1849,6 +2049,20 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             );
         }
     }
+    // The same bound in the private chat's own budget (TASK-063).
+    if let Some(latency) = private_latency {
+        let bound = Limits::private().messages.refill_every * 3 + Duration::from_secs(3);
+        assert!(
+            latency <= bound,
+            "a private prompt went {} ms after its request (bound {} ms)",
+            latency.as_millis(),
+            bound.as_millis()
+        );
+        notes.push(format!(
+            "private prompts: the later one {} ms after its request",
+            latency.as_millis()
+        ));
+    }
     soak.press(&hub, p_a.message_id.unwrap(), "allow:qwert");
     soak.press(&hub, p_a2.message_id.unwrap(), "deny:asdfg");
     wait_for("verdicts reach their agents", 30, || {
@@ -1862,11 +2076,14 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         .map(|n| format!("> burst {} {n:02}", short(A2)))
         .chain((0..burst_a2).map(|n| format!("• Bash: merge {} {n:02} ✓", short(A2))))
         .collect();
-    wait_for("the burst drained", 120, || {
-        let got = tg.texts(t_a2);
-        want_a2.iter().all(|line| got.contains(line))
-    })
-    .await;
+    for topics in &views {
+        let thread = topics[1];
+        wait_for("the burst drained", 120, || {
+            let got = tg.texts(thread);
+            want_a2.iter().all(|line| got.contains(line))
+        })
+        .await;
+    }
     assert!(
         soak.status || tg.flood.lock().unwrap().is_empty(),
         "both planned 429s fell into the burst"
@@ -1888,21 +2105,27 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     );
     // Rolling (TASK-062): a write into a turn message above can go after a
     // newer message, so the order is the one the topic shows.
-    let got_a2: Vec<String> = if soak.status {
-        shown_lines(&tg, t_a2)
-    } else {
-        tg.texts(t_a2)
-    }
-    .into_iter()
-    .filter(|line| line.contains("burst") || line.contains("merge"))
-    .collect();
-    let mut firsts = Vec::new();
-    for line in got_a2 {
-        if !firsts.contains(&line) {
-            firsts.push(line);
+    for topics in &views {
+        let thread = topics[1];
+        let got_a2: Vec<String> = if soak.status {
+            shown_lines(&tg, thread)
+        } else {
+            tg.texts(thread)
         }
+        .into_iter()
+        .filter(|line| line.contains("burst") || line.contains("merge"))
+        .collect();
+        let mut firsts = Vec::new();
+        for line in got_a2 {
+            if !firsts.contains(&line) {
+                firsts.push(line);
+            }
+        }
+        assert_eq!(
+            firsts, want_a2,
+            "FIFO within the topic {thread}, nothing lost"
+        );
     }
-    assert_eq!(firsts, want_a2, "FIFO within the topic, nothing lost");
     notes.push(format!(
         "burst: {} lines in topic A #2, {} in B; {} of A #2 sent before the prompts were asked",
         2 * burst_a2,
@@ -1978,30 +2201,57 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let calls = tg.calls();
     assert_eq!(tg.count("create_topic"), 3, "five runs, three topics");
     assert_eq!(creates_before, 3);
-    assert_eq!(
-        tg.texts(t_a).iter().filter(|line| **line == sep).count(),
-        1,
-        "one separator"
-    );
-    let separators: usize = [t_a, t_a2, t_b]
-        .iter()
-        .map(|&t| {
-            tg.texts(t)
+    if soak.private {
+        assert_eq!(
+            tg.count("p_create_topic"),
+            3,
+            "five runs, three private topics"
+        );
+    }
+    let mut separators = 0;
+    for topics in &views {
+        assert_eq!(
+            tg.texts(topics[0])
                 .iter()
-                .filter(|line| line.starts_with("── session"))
-                .count()
-        })
-        .sum();
-    assert_eq!(separators, 1, "no other separator anywhere");
+                .filter(|line| **line == sep)
+                .count(),
+            1,
+            "one separator"
+        );
+        separators += topics
+            .iter()
+            .map(|&t| {
+                tg.texts(t)
+                    .iter()
+                    .filter(|line| line.starts_with("── session"))
+                    .count()
+            })
+            .sum::<usize>();
+    }
+    assert_eq!(separators, views.len(), "no other separator anywhere");
     // No crossed route: every text naming a session is in that session's topic.
     for call in calls.iter().filter(|call| call.outcome == "ok") {
-        let Some(thread) = call
-            .thread
-            .filter(|_| matches!(call.kind, "send" | "permission" | "stream" | "write"))
-        else {
+        let Some(thread) = call.thread.filter(|_| {
+            matches!(
+                call.kind,
+                "send"
+                    | "permission"
+                    | "stream"
+                    | "write"
+                    | "p_send"
+                    | "p_permission"
+                    | "p_stream"
+                    | "p_write"
+            )
+        }) else {
             continue;
         };
-        for (session, &home) in &owner {
+        let homes = if private(call.kind) {
+            &private_owner
+        } else {
+            &owner
+        };
+        for (session, &home) in homes {
             if call.text.contains(session) {
                 assert_eq!(
                     thread, home,
@@ -2020,16 +2270,20 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             );
         }
     }
-    assert_eq!(a1.inbound(), [format!("to {}", short(A1))]);
+    if soak.private {
+        assert_eq!(a1.inbound(), [format!("to {}", short(A1)), private_to_a1]);
+    } else {
+        assert_eq!(a1.inbound(), [format!("to {}", short(A1))]);
+    }
     // Service messages: every forum_topic_edited of this run's topics was
     // deleted (live: the real queue may carry other topics' ones; the hub
     // never touches those, and they are not counted).
     let deleted: Vec<i64> = calls
         .iter()
-        .filter(|call| call.kind == "delete" && call.outcome == "ok")
+        .filter(|call| matches!(call.kind, "delete" | "p_delete") && call.outcome == "ok")
         .filter_map(|call| call.message_id)
         .collect();
-    let own = [t_a, t_a2, t_b];
+    let own: Vec<i64> = views.iter().flatten().copied().collect();
     let service: Vec<(Option<i64>, i64)> = tg
         .service
         .lock()
@@ -2044,7 +2298,11 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             "no forum_topic_edited seen: is another getUpdates consumer (the hub) running?"
         );
     } else {
-        assert_eq!(service.len(), tg.count("edit_topic"), "one per topic edit");
+        assert_eq!(
+            service.len(),
+            tg.count("edit_topic") + tg.count("p_edit_topic"),
+            "one per topic edit"
+        );
     }
     let left: Vec<_> = service
         .iter()
@@ -2058,9 +2316,10 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     // first, nothing was tried more than once again.
     let floods: Vec<&Call> = calls.iter().filter(|call| call.outcome == "429").collect();
     for flood in &floods {
+        // Of the group: a 429 pauses only its own chat (TASK-063).
         let next = calls
             .iter()
-            .find(|call| call.at > flood.at)
+            .find(|call| call.at > flood.at && !private(call.kind) && call.kind != "callback")
             .expect("a call after the 429");
         assert!(
             next.at.duration_since(flood.at) >= flood.wait - Duration::from_millis(20),
@@ -2126,6 +2385,36 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         min_gap + Duration::from_millis(5) >= soak.limits.messages.min_gap,
         "sends closer than min_gap: {min_gap:?}"
     );
+    // The private chat within its own bucket (TASK-063).
+    if soak.private {
+        let bucket = Limits::private().messages;
+        let sends: Vec<(usize, Instant)> = calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call.kind,
+                    "p_send" | "p_permission" | "p_stream" | "p_document"
+                ) && call.outcome == "ok"
+            })
+            .map(|call| (call.run, call.at))
+            .collect();
+        for (i, (run, at)) in sends.iter().enumerate() {
+            let inside = sends[i..]
+                .iter()
+                .take_while(|(r, t)| r == run && t.duration_since(*at) < Duration::from_secs(60))
+                .count() as f64;
+            let allowed =
+                f64::from(bucket.capacity) + 60.0 / bucket.refill_every.as_secs_f64() + 1.0;
+            assert!(inside <= allowed, "{inside} private sends in 60 s");
+        }
+        notes.push(format!(
+            "private chat: {} sends, {} writes, {} edits, {} deletes; each 429 of the group paused the group only",
+            sends.len(),
+            tg.count("p_write"),
+            tg.count("p_edit"),
+            tg.count("p_delete")
+        ));
+    }
     // registry.json, field by field.
     let registry = soak.registry();
     let keys = |value: &Value| -> Vec<String> {
@@ -2134,11 +2423,22 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             .map(|object| object.keys().cloned().collect())
             .unwrap_or_default()
     };
-    assert_eq!(
-        keys(&registry),
-        ["pids", "seq", "sessions", "slots", "subagents", "version"],
-        "no other durable state"
-    );
+    // Private mode keeps the twins of lasting messages (TASK-063: Resume
+    // offers, subagent blocks) for a restart: a private primary, a group twin.
+    let mut durable = vec!["pids", "seq", "sessions", "slots", "subagents", "version"];
+    if soak.private {
+        durable.insert(5, "twins");
+        let group = serde_json::to_value(Chat::Group).unwrap();
+        let twins = registry["twins"].as_array().expect("twins");
+        assert!(
+            twins
+                .iter()
+                .all(|link| link["twin"]["chat"] == group && link["primary"]["chat"] != group),
+            "{twins:?}"
+        );
+        notes.push(format!("registry.json: {} lasting twins", twins.len()));
+    }
+    assert_eq!(keys(&registry), durable, "no other durable state");
     assert_eq!(registry["version"], 2);
     assert!(registry["seq"].as_u64().is_some_and(|seq| seq > 0));
     assert_eq!(registry["subagents"], json!({}), "no subagent records");
@@ -2146,6 +2446,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     assert_eq!(slots.len(), 3);
     // Status mode: the status message of each topic, (thread, id).
     let mut statuses = Vec::new();
+    let mut private_statuses = Vec::new();
     for (slot, (folder, ordinal, thread, current)) in slots.iter().zip([
         (&a1.cwd, 1, t_a, A5),
         (&a2.cwd, 2, t_a2, A2),
@@ -2168,10 +2469,22 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             ],
             "no kept messages, nothing else"
         );
-        // TASK-061: one view, the group's, with what the slot had.
-        let views = slot["views"].as_array().expect("views");
-        assert_eq!(views.len(), 1);
-        let view = &views[0];
+        // TASK-061: one view, the group's, with what the slot had; TASK-063:
+        // with private chats on the owner's private view after it.
+        let slot_views = slot["views"].as_array().expect("views");
+        assert_eq!(slot_views.len(), views.len());
+        if let Some(private_view) = slot_views.get(1) {
+            assert_eq!(private_view["chat"], json!({"private": FAKE_USER}));
+            let index = [t_a, t_a2, t_b].iter().position(|t| *t == thread).unwrap();
+            let private_thread = views[1][index];
+            assert_eq!(private_view["topic_id"], private_thread);
+            assert_eq!(private_view["pending_separator"], Value::Null);
+            let id = private_view["status"]["message_id"]
+                .as_i64()
+                .expect("private status id");
+            private_statuses.push((private_thread, id));
+        }
+        let view = &slot_views[0];
         assert_eq!(view["chat"], "group");
         assert_eq!(view["topic_id"], thread);
         assert_eq!(view["pending_separator"], Value::Null);
@@ -2243,13 +2556,14 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             .len();
         assert_eq!(entry["stream"]["offset"], written, "{id}: stream offset");
         assert_eq!(entry["stream"]["calls"], json!([]), "{id}: open calls");
-        // TASK-061: a receipt is a message of the group.
+        // TASK-061: a receipt is a message of the group (TASK-063: or of
+        // the owner's private chat).
         assert!(
             entry["stream"]["receipts"]
                 .as_array()
-                .is_some_and(|keys| keys
-                    .iter()
-                    .all(|key| key["chat"] == "group" && key["id"].is_i64())),
+                .is_some_and(|keys| keys.iter().all(|key| (key["chat"] == "group"
+                    || (soak.private && key["chat"] == json!({"private": FAKE_USER})))
+                    && key["id"].is_i64())),
             "{id}: receipts"
         );
     }
@@ -2290,10 +2604,14 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     assert_eq!(seen.len(), 5, "every session has its own `seen` number");
     let block = &nested["block"];
     assert_eq!(block["header"], nested_header(NESTED));
+    let block_place = if soak.private {
+        json!({"chat": {"private": FAKE_USER}, "thread": q_a})
+    } else {
+        json!({"chat": "group", "thread": t_a})
+    };
     assert_eq!(
-        block["place"],
-        json!({"chat": "group", "thread": t_a}),
-        "the block is in the parent's topic"
+        block["place"], block_place,
+        "the block is in the parent's (primary) topic"
     );
     assert!(block["message_id"].is_i64());
     assert_eq!(
@@ -2397,6 +2715,18 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
                 .map(|(_, id)| *id)
                 .expect("a status message");
             layout_notes.push(check_layout(&tg, thread, status, &lines, &answers));
+            // The private topic of the slot shows the same (TASK-063).
+            if soak.private {
+                let index = [t_a, t_a2, t_b].iter().position(|t| *t == thread).unwrap();
+                let (private_thread, private_status) = private_statuses[index];
+                layout_notes.push(check_layout(
+                    &tg,
+                    private_thread,
+                    private_status,
+                    &lines,
+                    &answers,
+                ));
+            }
         }
         // All requests into the group (callback answers go to the user)
         // stay within the group's budget (TASK-068), per hub run and any
@@ -2407,7 +2737,11 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             f64::from(group.capacity) + window.as_secs_f64() / group.refill_every.as_secs_f64();
         let requests: Vec<(usize, Instant)> = calls
             .iter()
-            .filter(|call| call.kind != "callback" && !matches!(call.outcome, "synthetic" | "429"))
+            .filter(|call| {
+                call.kind != "callback"
+                    && !matches!(call.outcome, "synthetic" | "429")
+                    && !private(call.kind)
+            })
             .map(|call| (call.run, call.at))
             .collect();
         let mut peak = 0;
@@ -2442,6 +2776,8 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let mut report = String::new();
     let mode = if soak.live {
         "live (real bot)"
+    } else if soak.private {
+        "fake Telegram, private chats on"
     } else {
         "fake Telegram"
     };

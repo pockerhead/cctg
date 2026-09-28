@@ -182,6 +182,18 @@ pub struct Register {
     /// session. Agents built before leave it out and get no `bound`.
     #[serde(default)]
     pub status_lines: bool,
+    /// The agent tells a message of the owner's private chat from one of the
+    /// group in its session's transcript (`place` of the `<channel>` tag,
+    /// [`StreamItem::Channel::private`], TASK-061) and says so (TASK-063).
+    /// Agents built before leave it out: they still get private messages
+    /// (v0.1.13+ read `place`), but the hub keeps no ✍ receipts for them.
+    #[serde(default)]
+    pub private_place: bool,
+    /// The enrolled device whose secret the agent's link came in with
+    /// (TASK-045); set by the hub, never on the wire (TASK-063: the owner of
+    /// the device).
+    #[serde(skip)]
+    pub enrolled: Option<String>,
 }
 
 /// The agent's build and update abilities.
@@ -1037,6 +1049,11 @@ pub struct HookPost {
     /// `CARGO_PKG_VERSION` of the hook (TASK-040), for the hub log only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// The enrolled device whose secret the hook came with; `None` for the
+    /// shared secret. Set by the hub, never on the wire (TASK-063: whose
+    /// private chat a new slot shows in).
+    #[serde(skip)]
+    pub enrolled: Option<String>,
 }
 
 impl HookPost {
@@ -1058,6 +1075,7 @@ impl HookPost {
             event,
             live_claude_pids: None,
             client_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            enrolled: None,
         }
     }
 }
@@ -1381,6 +1399,8 @@ mod tests {
                 files: true,
                 session_reads: true,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: true,
             }),
             AgentMsg::Reply {
@@ -1797,6 +1817,8 @@ mod tests {
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             }))
         );
@@ -2035,6 +2057,8 @@ mod tests {
             files: false,
             session_reads: false,
             status_lines: false,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
             client: Some(Client {
                 version: "0.1.0".into(),

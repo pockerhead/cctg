@@ -9,6 +9,7 @@ pub mod console;
 pub mod devices;
 pub mod fetch;
 pub mod ingress;
+pub mod mirror;
 pub mod offset;
 pub mod permissions;
 pub mod questions;
@@ -33,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use api::{ApiError, BotApi, ChatMember, Sticker};
-use chat::Chat;
+use chat::{Chat, PrivateChat};
 use config::{
     AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, SHARED_VAR, STATE_VAR,
 };
@@ -41,7 +42,7 @@ use devices::Devices;
 use ingress::Listener;
 use offset::OffsetStore;
 use registry::{Icons, RegistryStore};
-use scheduler::{Limits, Scheduler};
+use scheduler::{Limits, Outbox, Scheduler};
 use slots::{Control, Slots};
 use updates::{Inbound, Routed, ServiceKind};
 
@@ -360,8 +361,41 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         "hub started, polling"
     );
 
-    let (scheduler, outbox) = Scheduler::new(api.clone(), Limits::default());
-    tokio::spawn(scheduler.run());
+    // Topics in private chats (TASK-063): Threaded Mode of the bot in
+    // @BotFather. Each chat is paced on its own then.
+    let private = me.has_topics_enabled;
+    let outbox = if private {
+        info!(
+            "the bot has topics in private chats: sessions show in their owner's private chat too"
+        );
+        if me.allows_users_to_create_topics {
+            warn!(
+                "users may create and delete topics in their private chat with the bot; turn that off in @BotFather (Threaded Mode)"
+            );
+        }
+        if config.allowlist.is_team() {
+            info!(
+                "several allowed users: a device shows in the private chat of who ran its /join, else of the first allowed user"
+            );
+        }
+        Outbox::per_chat(api.clone(), Limits::default(), Limits::private())
+    } else {
+        warn!(
+            "the bot has no topics in private chats (Threaded Mode in @BotFather); sessions show in the group only"
+        );
+        let (scheduler, outbox) = Scheduler::new(api.clone(), Limits::default());
+        tokio::spawn(scheduler.run());
+        outbox
+    };
+    let owners = config
+        .allowlist
+        .first()
+        .filter(|_| private)
+        .map(|first| slots::Owners {
+            first: PrivateChat::of_user(first),
+            devices: config.allowlist.is_team().then(|| devices.clone()),
+            share_new: false,
+        });
     let options = slots::Options {
         icons,
         can_delete,
@@ -373,6 +407,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         gather_max: slots::GATHER_MAX,
         inbound_settle: slots::INBOUND_SETTLE,
         channel_wait: slots::CHANNEL_WAIT,
+        owners,
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
@@ -415,6 +450,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     updates::poll_until(
         api.as_ref(),
         &config.allowlist,
+        private,
         &offsets,
         route_inbound(&commands_tx, &roster_tx, &control_tx, me.id),
         stop_requested(stop_on_stdin),
@@ -582,6 +618,7 @@ mod tests {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let input = |text: &str| Inbound {
             chat: Chat::Group,
+            sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 5,
             thread_id: Some(100),
             text: Some(text.to_owned()),
@@ -590,6 +627,7 @@ mod tests {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         };
         let mut route = route_inbound(&commands_tx, &roster_tx, &control_tx, BOT);
         route(Routed::Input(input("hello")));

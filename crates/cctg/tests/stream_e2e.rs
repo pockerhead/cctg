@@ -682,6 +682,7 @@ async fn e2e_reactions() {
     hub.control
         .send(Control::Message(Inbound {
             chat: Chat::Group,
+            sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id: 555,
             thread_id: Some(THREAD),
             text: Some("from telegram".into()),
@@ -690,6 +691,7 @@ async fn e2e_reactions() {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         }))
         .unwrap();
     wait_for("eyes", 10, || fake.reactions() == [(555, "👀".to_owned())]).await;

@@ -2,7 +2,7 @@
 //!
 //! Values are never echoed back: errors name the variable, not its content.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -114,9 +114,11 @@ impl fmt::Debug for BotToken {
     }
 }
 
-/// Telegram user ids allowed to reach handlers. `Debug` prints only the count.
+/// Telegram user ids allowed to reach handlers, in the order of
+/// `CCTG_ALLOWED_USER_IDS` (TASK-063: the first one owns the devices no
+/// `/join` gave an owner). `Debug` prints only the count.
 #[derive(Clone, Default)]
-pub struct Allowlist(HashSet<i64>);
+pub struct Allowlist(Vec<i64>);
 
 impl Allowlist {
     pub fn contains(&self, user_id: i64) -> bool {
@@ -128,11 +130,24 @@ impl Allowlist {
     pub fn is_team(&self) -> bool {
         self.0.len() > 1
     }
+
+    /// The first allowed user (TASK-063): the owner of every device whose
+    /// owner no `/join` recorded, and with one user of all of them.
+    pub fn first(&self) -> Option<i64> {
+        self.0.first().copied()
+    }
 }
 
 impl FromIterator<i64> for Allowlist {
+    /// Keeps the first of repeated ids.
     fn from_iter<I: IntoIterator<Item = i64>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        let mut ids = Vec::new();
+        for id in iter {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Self(ids)
     }
 }
 
@@ -439,6 +454,13 @@ mod tests {
         assert_eq!(config.chat_id, -1001234);
         assert!(config.allowlist.contains(11) && config.allowlist.contains(22));
         assert!(!config.allowlist.contains(33));
+        // The first id owns the devices without a recorded owner (TASK-063).
+        assert_eq!(config.allowlist.first(), Some(11));
+        let repeated: Allowlist = [22, 11, 22].into_iter().collect();
+        assert_eq!(repeated.first(), Some(22));
+        assert!(repeated.is_team() && repeated.contains(11));
+        let one: Allowlist = [11, 11].into_iter().collect();
+        assert!(!one.is_team());
     }
 
     #[test]

@@ -32,6 +32,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, watch};
 use tracing::warn;
 
+use super::chat::PrivateChat;
 use crate::wire::Secret;
 
 /// How long a join code is good.
@@ -74,6 +75,11 @@ pub struct Device {
     pub joined: u64,
     /// sha256 of the whole secret, hex.
     hash: String,
+    /// The allowlisted user who ran the `/join` that enrolled it (TASK-063):
+    /// its sessions show in that user's private chat too. `Debug` never
+    /// prints the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<PrivateChat>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -350,6 +356,7 @@ impl Devices {
             name: clean_name(name),
             joined: unix(SystemTime::now()),
             hash: sha256_hex(token.as_bytes()),
+            owner: None,
         };
         let name = device.name.clone();
         inner.devices.push(device);
@@ -405,6 +412,30 @@ impl Devices {
             None => SharedState::Off,
         };
         (devices, shared)
+    }
+
+    /// Device `id` belongs to `owner` (TASK-063), kept in `devices.json`.
+    /// `false`: no such device. Blocking file I/O.
+    pub fn set_owner(&self, id: &str, owner: PrivateChat) -> io::Result<bool> {
+        let mut inner = self.lock();
+        let Some(at) = inner.devices.iter().position(|device| device.id == id) else {
+            return Ok(false);
+        };
+        let before = inner.devices[at].owner.replace(owner);
+        if let Err(error) = self.save(&inner.devices) {
+            inner.devices[at].owner = before;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// The owner of device `id` ([`Self::set_owner`]).
+    pub fn owner(&self, id: &str) -> Option<PrivateChat> {
+        self.lock()
+            .devices
+            .iter()
+            .find(|device| device.id == id)
+            .and_then(|device| device.owner)
     }
 
     /// The name of device `id`.
@@ -913,6 +944,25 @@ mod tests {
         assert!(devices.join(&code, "again").is_err());
         assert!(devices.join("ABCD-EFGH-JKMN-PQRS", "other").is_err());
         assert!(spent.try_recv().is_err(), "a refused code sends nothing");
+    }
+
+    /// TASK-063: the owner of a device is kept with it, survives a restart
+    /// and never shows in `Debug`.
+    #[test]
+    fn a_device_keeps_its_owner() {
+        let dir = TempDir::new("devices-owner");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let code = devices.mint_code().unwrap();
+        let joined = devices.join(&code, "box").unwrap();
+        assert_eq!(devices.owner(&joined.id), None);
+        let owner = PrivateChat::of_user(7_319_402_518);
+        assert!(devices.set_owner(&joined.id, owner).unwrap());
+        assert!(!devices.set_owner("0badc0de", owner).unwrap());
+        assert_eq!(devices.owner(&joined.id), Some(owner));
+        let reopened = Devices::open(dir.path(), None).unwrap();
+        assert_eq!(reopened.owner(&joined.id), Some(owner));
+        let shown = format!("{:?}", reopened.0.inner.lock().unwrap().devices);
+        assert!(!shown.contains("7319402518"), "{shown}");
     }
 
     #[test]

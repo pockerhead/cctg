@@ -186,6 +186,35 @@
 //! and none came, the topic gets [`CHANNEL_OFF_NOTICE`], once per session
 //! until one of its channel records shows up.
 //!
+//! Private chats (TASK-063): when the bot has topics in private chats
+//! (`Options::owners`), a slot with a live session also shows in its
+//! owner's private chat ([`Owners`]); a slot made then shows there alone
+//! (decision 2026-09-28; sharing it to the group is TASK-064), and a slot
+//! with no usable view shows in the group. That view is the primary one
+//! ([`Registry::primary_view`]): everything above happens there, the stream
+//! offset moves with it, and every message the actor puts there and every
+//! later call about it goes to the other views, the group's, as twins
+//! ([`mirror`]); at most [`MAX_TWIN_POSTS`] new twins wait for Telegram,
+//! more are dropped and the mirror topic is told once it caught up. A
+//! press or a reply on a twin counts for its primary message; a user's
+//! message, a notice or a command answer in a mirror topic moves the status
+//! message in every view. A user's message goes to the session once and
+//! shows in the slot's other views as an echo signed with its author's name
+//! ([`ECHO_MARK`]). Every agent gets the private chat's messages; their ✍
+//! is tracked only for one that announced `private_place`. The twins of
+//! subagent blocks and Resume offers are kept in `registry.json`. A
+//! private chat the bot may not write to (403: no Start, blocked) is closed
+//! until its user writes to the bot; the group is told once, and its slots
+//! go on in the group alone (its view keeps its status message, stale, for
+//! when it opens). A slot that got a group view only for that leaves the
+//! group once the chat opens and the bot or its user wrote there. A private
+//! topic the user deleted is made again. A prompt or question lost in a
+//! private chat (deleted topic, 403) stays open and goes again once the slot
+//! has a primary topic, its twins kept for it (a twin in that topic is the
+//! prompt then); a lost reply, notice or echo goes again into the topic made
+//! again (after a 403: into the group, unless its twin shows it there), and
+//! a reply for a slot whose topic is being made waits for it.
+//!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
 
@@ -203,16 +232,18 @@ use transcript::{
 
 use super::api::{ApiError, Document};
 use super::buffer::{self, Attachment, Parked, ResumeNote};
-use super::chat::{Chat, MessageKey, Place};
+use super::chat::{Chat, MessageKey, Place, PrivateChat};
 use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
 use super::console;
+use super::devices::Devices;
 use super::fetch::{self, Fetch, Fetched};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
+use super::mirror::{Follow, Landed, Mirror, Write};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
 use super::registry::{
-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, Slot, SlotId, SlotState,
-    StatusMessage, TopicJob, cut,
+    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, SlotId, SlotState,
+    StatusMessage, TopicJob, TwinLink, cut,
 };
 use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome};
 use super::status::{self, Activity, Buttons, Press};
@@ -373,6 +404,53 @@ pub fn continue_text(agents: &[String]) -> String {
     )
 }
 
+/// New twin messages waiting for Telegram at a time (TASK-063); beyond this a
+/// mirror topic gets no twin until it caught up, then one notice.
+pub const MAX_TWIN_POSTS: usize = MAX_QUEUED_MESSAGES / 2;
+/// Told in a mirror topic once it caught up after twins were dropped.
+pub const MIRROR_GAP_NOTICE: &str =
+    "⋯ Часть сообщений сюда не попала: Telegram не успевал. Всё есть в личке владельца.";
+/// Told in the group's General once per private chat the bot may not write
+/// to (TASK-063).
+pub const PRIVATE_CLOSED_NOTICE: &str = "Бот не может писать владельцу устройства в личку: откройте чат с ботом и нажмите Start (или разблокируйте бота). До этого сессии идут только сюда.";
+/// The answer to `/start` in the private chat (TASK-063).
+pub const PRIVATE_START_TEXT: &str = "Готово: сессии ваших устройств приходят сюда, каждая в своей теме. Сессии, у которых уже есть тема в группе, видны и там. Пишите в тему сессии, как в группе.";
+/// The answer in a private topic that is no slot's (the user made it).
+pub const FOREIGN_TOPIC_NOTICE: &str = "Эта тема не связана с сессией cctg: пишите в темы сессий.";
+/// The answer to a message in the private chat's General other than
+/// `/start` (TASK-063): it reaches no session.
+pub const PRIVATE_GENERAL_NOTICE: &str =
+    "Отсюда сообщения в сессии не идут: пишите в тему нужной сессии.";
+/// Told in a group topic a slot showed in only while its owner's private
+/// chat was closed, once that chat takes the session again (TASK-063).
+pub const FALLBACK_END_NOTICE: &str =
+    "Личка владельца снова доступна: сессия идёт там, эта тема больше не обновляется.";
+/// Starts the echo of a user's message in the slot's other views (TASK-063):
+/// `✉ <author>: <text>`.
+pub const ECHO_MARK: &str = "✉";
+/// The author of an echo when Telegram gave no usable name.
+pub const ECHO_NO_NAME: &str = "без имени";
+
+/// Whose private chat shows a slot (TASK-063): the first allowlisted user,
+/// the only one when there is one. In a team (`devices` set) it is the
+/// owner of the enrolled device the session's agent came in with (who ran
+/// its `/join`), known once that agent is bound; a device on the shared
+/// secret, or one joined before owners were recorded, is the first user's.
+///
+/// A slot made while its owner's private chat is usable shows there alone
+/// (user decision 2026-09-28; TASK-064 shares a slot to the group); one
+/// made in the group, or with no usable private chat, keeps its group view
+/// and is mirrored there.
+#[derive(Debug, Clone)]
+pub struct Owners {
+    pub first: PrivateChat,
+    /// The team's devices; `None`: one allowlisted user.
+    pub devices: Option<Devices>,
+    /// New slots show in the group too, as shared ones (tests of the
+    /// mirror; the hub: `false`).
+    pub share_new: bool,
+}
+
 /// A call of a session that starts or ends this long after one of its
 /// permission prompts came in means the prompt was answered in the terminal
 /// (the tool hooks reach the hub ~0.1 s after the call).
@@ -441,6 +519,9 @@ pub struct Options {
     /// [`CHANNEL_WAIT`] in the hub; `ZERO`: the channel is never reported
     /// off.
     pub channel_wait: Duration,
+    /// The bot has topics in private chats (TASK-063): slots show in their
+    /// owner's private chat too; `None`: the group only.
+    pub owners: Option<Owners>,
 }
 
 /// A burst of topic messages of a slot being gathered into one inbound
@@ -541,6 +622,7 @@ impl Default for Options {
             gather_max: Duration::ZERO,
             inbound_settle: Duration::ZERO,
             channel_wait: Duration::ZERO,
+            owners: None,
         }
     }
 }
@@ -581,6 +663,24 @@ enum Done {
         place: Place,
         message_id: Option<i64>,
     },
+    /// Right after `Posted` (TASK-063): `seq` is the dispatch number of
+    /// that new message (its twins wait for it), `landed` what Telegram made
+    /// of it, `gone` its topic is gone and `closed` the bot may not write to
+    /// the chat (403).
+    Landed {
+        place: Place,
+        seq: u64,
+        landed: Landed,
+        gone: bool,
+        closed: bool,
+    },
+    /// A call in a mirror topic was answered (TASK-063): `id` its twin send
+    /// in the [`Mirror`], `place` the topic of a new message.
+    Twin {
+        id: Option<u64>,
+        place: Option<Place>,
+        delivery: Option<Delivery>,
+    },
     /// A call that clears an old status message away.
     Retire {
         retire: Retire,
@@ -594,9 +694,11 @@ enum Done {
     Delete(Option<Delivery>),
     /// A reply chunk or a notice.
     Message(Option<Delivery>),
-    /// A permission prompt, by its key in [`Prompts`].
+    /// A permission prompt, by its key in [`Prompts`]; `seq` its dispatch
+    /// number.
     Permission {
         key: u64,
+        seq: u64,
         delivery: Option<Delivery>,
     },
     /// The final edit of a prompt, by its key.
@@ -604,10 +706,12 @@ enum Done {
         key: u64,
         delivery: Option<Delivery>,
     },
-    /// A question message sent as `version`, by its key in [`Asks`].
+    /// A question message sent as `version`, by its key in [`Asks`]; `seq`
+    /// its dispatch number.
     Question {
         key: u64,
         version: u64,
+        seq: u64,
         delivery: Option<Delivery>,
     },
     /// An edit of a question message to `version`.
@@ -760,6 +864,9 @@ struct Shown {
     retry_at: Option<Instant>,
     /// A failed send was warned about; the next warn waits for a success.
     send_warned: bool,
+    /// Status messages and edits of the mirror topics on their way
+    /// (TASK-063): each goes with the status of when it goes.
+    twins: Vec<LiveText>,
 }
 
 impl Shown {
@@ -858,6 +965,9 @@ enum Work {
     Topic(TopicJob),
     Delete,
     Message,
+    /// A notice about a user's own message: like `Message`, but it stays in
+    /// the view the user wrote in (TASK-063).
+    Answer,
     Permission(u64),
     PromptEdit(u64),
     Question {
@@ -897,7 +1007,82 @@ enum Work {
         size: u64,
         parts: Vec<usize>,
     },
+    /// A call in a mirror topic (TASK-063): `id` its twin send in the
+    /// [`Mirror`] when the answer links it, `place` the topic of a new
+    /// message, `status` the text of a status message or of its edit (it
+    /// goes like the primary one: with the status of when it goes).
+    Twin {
+        id: Option<u64>,
+        place: Option<Place>,
+        status: Option<LiveText>,
+    },
 }
+
+/// A call for a mirror topic (TASK-063).
+struct TwinCall {
+    op: Op,
+    link: Link,
+    /// A status message of this slot, or its edit: it goes with the status
+    /// of when it goes ([`Outbox::submit_status`]).
+    status: Option<SlotId>,
+}
+
+/// How a twin's answer is linked in the [`Mirror`].
+#[derive(Clone, Copy)]
+enum Link {
+    /// A twin of the primary send handed out just before it; `ghost`: it
+    /// goes when that send makes no message; `lasting`: its link is kept in
+    /// `registry.json` (a subagent block, a Resume offer).
+    Seq { ghost: bool, lasting: bool },
+    /// A new twin of this primary message.
+    Of(MessageKey),
+    /// A call about a known twin; its answer links nothing.
+    None,
+}
+
+/// A prompt or a question, by its key in its book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    Prompt(u64),
+    Question(u64),
+}
+
+/// A prompt or question whose send was lost in a private chat (its topic
+/// deleted, the bot blocked, TASK-063): it goes again, and the twins of the
+/// lost send are kept for it ([`Mirror::kept`]).
+#[derive(Debug, Clone, Copy)]
+struct Lost {
+    asked: Asked,
+    /// The private chat it was lost in.
+    chat: Chat,
+    /// The question's version that send showed (its kept twin shows it).
+    version: u64,
+}
+
+/// Where a lost prompt or question goes now.
+enum Again {
+    /// Nowhere yet: its private topic is being made again, or its twin in
+    /// the chat it would go to has not been answered.
+    Wait,
+    /// Its kept twin `MessageKey` of lost send `u64` is in the topic it
+    /// would go to: that twin is the prompt now.
+    Adopt(u64, MessageKey),
+    /// A new send; its kept twins, of lost send `u64`, take it.
+    Send(Option<u64>),
+}
+
+/// A reply, notice or echo lost in a private chat (TASK-063), sent again:
+/// into the same chat's new topic when it was deleted (`gone`), else (403)
+/// into the slot's primary topic.
+struct LostMessage {
+    slot: SlotId,
+    chat: Chat,
+    gone: bool,
+    op: Op,
+}
+
+/// Lost messages that wait for their topic, at most; the oldest go.
+const MAX_LOST_MESSAGES: usize = 64;
 
 /// A turn answer or reply of a slot's new session held back until the
 /// slot's separator is out (TASK-024, [`Slots::behind_drain`]).
@@ -985,6 +1170,12 @@ fn topic_gone(delivery: &Delivery) -> bool {
     )
 }
 
+/// The bot may not write to the chat: a user who never pressed Start or
+/// blocked the bot (TASK-063).
+fn forbidden(delivery: &Delivery) -> bool {
+    matches!(delivery, Err(ApiError::Telegram { code: 403, .. }))
+}
+
 /// `editForumTopic` with the name and icon it already has.
 fn not_modified(delivery: &Delivery) -> bool {
     telegram_error(delivery, &["topic_not_modified"])
@@ -1055,6 +1246,11 @@ struct Conn {
     /// It is leaving after an update answer: bound to nothing, never
     /// rebound by its claude pid.
     leaving: bool,
+    /// It takes messages of a private chat
+    /// ([`crate::wire::Register::private_place`]).
+    private_place: bool,
+    /// The enrolled device it came in with, when not on the shared secret.
+    enrolled: Option<String>,
 }
 
 /// An update press of a session, until its last answer.
@@ -1206,6 +1402,38 @@ pub struct Slots {
     /// A status message could not be cleared away; later failures are
     /// logged at debug level only.
     retire_warned: bool,
+    /// The twins of messages in primary topics (TASK-063).
+    mirror: Mirror,
+    /// Jobs handed to the dispatch task so far: the dispatch number of the
+    /// next one is one more.
+    handed: u64,
+    /// New twin messages waiting for Telegram, at most [`MAX_TWIN_POSTS`].
+    twin_posts: usize,
+    /// The text of each status twin send still waiting, by its twin send id
+    /// in the [`Mirror`]: cancelled when its primary goes away first.
+    status_twins: HashMap<u64, LiveText>,
+    /// Mirror topics that missed twins; told once the mirror caught up.
+    gaps: HashSet<Place>,
+    /// Each slot's primary topic as last seen: a change moves the status.
+    primaries: HashMap<SlotId, Place>,
+    /// The owner of each top-level session by its SessionStart's device
+    /// (TASK-063), for a team.
+    hook_owners: HashMap<String, PrivateChat>,
+    /// Private chats the group was told the bot cannot write to.
+    closed_told: HashSet<PrivateChat>,
+    /// Private topics that are no slot's, when they were last answered.
+    foreign_told: HashMap<Place, Instant>,
+    /// Prompts and questions lost in a private chat, by the dispatch number
+    /// of the lost send, until they went again or ended (TASK-063).
+    again: HashMap<u64, Lost>,
+    /// Replies, notices and echoes for a private topic that Telegram has
+    /// not answered, by dispatch number: the text a lost one sends again.
+    unlanded: HashMap<u64, (Op, bool)>,
+    /// Replies, notices and echoes lost in a private chat, oldest first.
+    lost_messages: VecDeque<LostMessage>,
+    /// Private chats the bot wrote to, or whose user wrote, since they were
+    /// last closed: a group view the slot got only for a closed chat goes.
+    proven: HashSet<PrivateChat>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1229,6 +1457,34 @@ impl Slots {
             .map(|(id, _)| id.clone())
             .collect();
         registry.lose_blocks(&ended);
+        registry.private = options.owners.is_some();
+        // The twins kept in `registry.json` (TASK-063): of lasting messages,
+        // and of the status messages below.
+        let mut mirror = Mirror::default();
+        for link in &registry.twins {
+            mirror.link_lasting(link.primary, link.twin);
+        }
+        let mut primaries = HashMap::new();
+        for index in 0..registry.slots.len() {
+            let slot = SlotId(index);
+            let Some(primary) = registry.primary_view(slot) else {
+                continue;
+            };
+            if let Some(place) = primary.place() {
+                primaries.insert(slot, place);
+            }
+            let Some(status) = primary.status_message() else {
+                continue;
+            };
+            for view in &registry.slots[index].views {
+                if let Some(twin) = view
+                    .status_message()
+                    .filter(|twin| twin.chat != status.chat)
+                {
+                    mirror.link(status, twin);
+                }
+            }
+        }
         let (saver, saves) = watch::channel(None);
         let save_task = tokio::spawn(save_loop(store, saves));
         let (done_tx, done_rx) = mpsc::unbounded_channel();
@@ -1295,6 +1551,19 @@ impl Slots {
             file_bytes: 0,
             albums: HashMap::new(),
             retire_warned: false,
+            mirror,
+            handed: 0,
+            twin_posts: 0,
+            status_twins: HashMap::new(),
+            gaps: HashSet::new(),
+            primaries,
+            hook_owners: HashMap::new(),
+            closed_told: HashSet::new(),
+            foreign_told: HashMap::new(),
+            again: HashMap::new(),
+            unlanded: HashMap::new(),
+            lost_messages: VecDeque::new(),
+            proven: HashSet::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -1592,6 +1861,8 @@ impl Slots {
                         status_lines: register.status_lines,
                         untold: false,
                         leaving: false,
+                        private_place: register.private_place,
+                        enrolled: register.enrolled,
                     },
                 );
                 self.tell_bound(conn);
@@ -1874,8 +2145,12 @@ impl Slots {
     }
 
     fn on_hook(&mut self, post: &HookPost) {
+        let made = self.registry.slots.len();
         let followup = self.registry.apply_hook(post);
         let session = post.session_id.as_str();
+        if matches!(post.event, HookEvent::SessionStart { .. }) {
+            self.home_new_slot(post, made);
+        }
         if matches!(post.event, HookEvent::SessionEnd { .. }) {
             self.scanned.remove(session);
             self.title_failures.remove(session);
@@ -2932,8 +3207,10 @@ impl Slots {
                 pinned,
             } => return self.on_pinned(chat, message_id, pinned),
             Control::Posted { place } => {
-                if self.registry.slot_by_topic(place).is_some() {
-                    self.bottoms.entry(place).or_default().foreign = true;
+                if let Some(slot) = self.registry.slot_by_topic(place) {
+                    // In a mirror topic the status moves in every view.
+                    let primary = self.registry.place(slot).unwrap_or(place);
+                    self.bottoms.entry(primary).or_default().foreign = true;
                     self.close_turn_message(place);
                 }
                 return;
@@ -2988,25 +3265,60 @@ impl Slots {
     /// the agent of its live current session, when there is one. General and
     /// topics that are not slots reach no agent and get no answer.
     fn on_topic_message(&mut self, input: Inbound) {
+        self.reopen(input.chat);
         let Some(thread_id) = input.thread_id else {
-            debug!("message outside a topic; not forwarded");
+            if input.chat.is_private() && is_start(input.text.as_deref()) {
+                self.send_messages(vec![message_op(
+                    input.place(),
+                    PRIVATE_START_TEXT.to_owned(),
+                )]);
+            } else if input.chat.is_private() {
+                // Not silence: the owner learns where to write (TASK-063).
+                self.tell_foreign(input.place(), PRIVATE_GENERAL_NOTICE);
+            } else {
+                debug!("message outside a topic; not forwarded");
+            }
             return;
         };
         let (place, key) = (input.place(), input.key());
-        if self.registry.slot_by_topic(place).is_some() {
-            // It is below the status message now, and below the turn message.
-            let bottom = self.bottoms.entry(place).or_default();
-            bottom.last = bottom.last.max(input.message_id);
-            self.close_turn_message(place);
+        match self.registry.slot_by_topic(place) {
+            Some(slot) => {
+                match self.registry.place(slot) {
+                    // In a mirror topic: the status moves in every view
+                    // (TASK-063).
+                    Some(primary) if primary != place => {
+                        self.bottoms.entry(primary).or_default().foreign = true;
+                    }
+                    // It is below the status message now.
+                    _ => {
+                        let bottom = self.bottoms.entry(place).or_default();
+                        bottom.last = bottom.last.max(input.message_id);
+                    }
+                }
+                // And below the turn message.
+                self.close_turn_message(place);
+            }
+            // A topic the user made in the private chat (TASK-063).
+            None if input.chat.is_private() => {
+                self.tell_foreign(place, FOREIGN_TOPIC_NOTICE);
+                return;
+            }
+            None => {}
         }
 
-        let Some(input) = self.hold(Place::topic(input.chat, thread_id), input) else {
+        // Questions and prompts live in the primary topic: a reply to a
+        // twin counts for its primary message (TASK-063).
+        let asked = self.as_primary(place, input.reply_to);
+        let Some(input) = self.hold(Place::topic(input.chat, thread_id), asked, input) else {
             return;
         };
         // An answer to an open question never goes to the session.
+        // A question that went on as its twin in a mirror topic (lost in a
+        // private chat, TASK-063) is answered there too.
         if let Some(text) = input.text.as_deref()
             && !input.forwarded
-            && self.answer_question(input.place(), input.reply_to, text)
+            && (self.answer_question(asked.0, asked.1, text)
+                || (asked.0 != place && self.answer_question(place, input.reply_to, text)))
         {
             return;
         }
@@ -3025,13 +3337,13 @@ impl Slots {
                         size,
                         "file from the topic larger than a bot may download"
                     );
-                    self.notify(slot, place, buffer::TOO_BIG_NOTICE);
+                    self.notify_author(slot, place, buffer::TOO_BIG_NOTICE);
                     return;
                 }
                 (media.caption.unwrap_or_default(), Some(media.file))
             }
             (None, None) => {
-                self.notify(slot, place, buffer::UNSUPPORTED_NOTICE);
+                self.notify_author(slot, place, buffer::UNSUPPORTED_NOTICE);
                 return;
             }
         };
@@ -3047,6 +3359,15 @@ impl Slots {
             self.on_console_command(slot, place, input.message_id, command);
             return;
         }
+        // Whoever reads another view of the slot sees what the session is
+        // told, signed (TASK-063); the session gets it once, from here.
+        let echo = echo_text(
+            input.author.as_deref(),
+            input.forwarded,
+            &text,
+            file.as_ref(),
+        );
+        self.echo(slot, place, echo);
         if file.is_some() {
             self.end_gather(slot);
         } else {
@@ -3222,13 +3543,14 @@ impl Slots {
             }
             handed += taken.len();
             let ids: Vec<MessageKey> = taken.iter().map(Parked::key).collect();
+            let seen = self.receipts_of(conn, &ids);
             if let Some(stream) = self
                 .registry
                 .sessions
                 .get_mut(&session)
                 .and_then(|entry| entry.stream.as_mut())
             {
-                stream::receipt_parts(stream, &ids);
+                stream::receipt_parts(stream, &seen);
             }
             for &id in &ids {
                 self.react(id, stream::ACCEPTED);
@@ -3300,7 +3622,7 @@ impl Slots {
                 return FileStep::Wait;
             }
             info!(ordinal, kind, "agent takes no files; the file is dropped");
-            self.notify(slot, parked.place(), buffer::OLD_AGENT_NOTICE);
+            self.notify_author(slot, parked.place(), buffer::OLD_AGENT_NOTICE);
             return FileStep::Gone {
                 delivered: !parked.text.is_empty(),
             };
@@ -3313,7 +3635,7 @@ impl Slots {
                 ordinal,
                 kind, "no download task; a file from the topic is dropped"
             );
-            self.notify(slot, parked.place(), buffer::FETCH_FAILED_NOTICE);
+            self.notify_author(slot, parked.place(), buffer::FETCH_FAILED_NOTICE);
             return FileStep::Gone { delivered: false };
         };
         let transfer_id = self.transfers + 1;
@@ -3420,7 +3742,8 @@ impl Slots {
                     ordinal,
                     size, "file of a kept message handed to the session agent"
                 );
-                if let Some((session, _)) = self.live_agent(slot)
+                if let Some((session, conn)) = self.live_agent(slot)
+                    && !self.receipts_of(conn, &[message]).is_empty()
                     && let Some(stream) = self
                         .registry
                         .sessions
@@ -3431,9 +3754,9 @@ impl Slots {
                 }
                 self.react(message, stream::ACCEPTED);
             }
-            Fetched::TooBig => self.notify(slot, place, buffer::TOO_BIG_NOTICE),
-            Fetched::Failed => self.notify(slot, place, buffer::FETCH_FAILED_NOTICE),
-            Fetched::LinkClosed => self.notify(slot, place, buffer::LINK_LOST_NOTICE),
+            Fetched::TooBig => self.notify_author(slot, place, buffer::TOO_BIG_NOTICE),
+            Fetched::Failed => self.notify_author(slot, place, buffer::FETCH_FAILED_NOTICE),
+            Fetched::LinkClosed => self.notify_author(slot, place, buffer::LINK_LOST_NOTICE),
         }
         // The next kept message goes, or the offline period ends.
         self.flush(slot);
@@ -3842,9 +4165,9 @@ impl Slots {
             meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
             // A reply to a block of this session's subagent is for that
             // subagent; Claude forwards it (channel instructions).
-            if let Some(agent_id) =
-                self.registry
-                    .subagent_of_message(parked.place(), reply_to, session)
+            let (place, reply_to) = self.as_primary(parked.place(), Some(reply_to));
+            if let Some(agent_id) = reply_to
+                .and_then(|reply_to| self.registry.subagent_of_message(place, reply_to, session))
             {
                 meta.insert("target_agent".to_owned(), agent_id.to_owned());
             }
@@ -4162,10 +4485,15 @@ impl Slots {
         };
         let ordinal = self.ordinal(slot);
         let Some(place) = self.registry.place(slot) else {
-            info!(
-                ordinal,
-                "turn answer for a slot without a topic yet; not sent"
-            );
+            if streamed
+                || answer.trim().is_empty()
+                || !self.wait_for_topic(slot, session, answer, "answer", true)
+            {
+                info!(
+                    ordinal,
+                    "turn answer for a slot without a topic yet; not sent"
+                );
+            }
             return;
         };
         if let Some(live) = self.streams.get_mut(session).filter(|_| streamed) {
@@ -4284,7 +4612,7 @@ impl Slots {
     /// session separator is out, with a bound agent that reads transcripts.
     fn stream_target(&self, session: &str) -> Option<(u64, String)> {
         let slot = self.current_slot(session)?;
-        let view = self.registry.slot(slot)?.primary()?;
+        let view = self.registry.primary_view(slot)?;
         if view.topic_id.is_none() || view.pending_separator.is_some() {
             return None;
         }
@@ -4498,7 +4826,7 @@ impl Slots {
     /// after the drain, or [`Options::stream_retry`] after the first such
     /// message began to wait.
     fn behind_drain(&mut self, slot: SlotId, now: Instant) -> bool {
-        let Some(view) = self.registry.slot(slot).and_then(Slot::primary) else {
+        let Some(view) = self.registry.primary_view(slot) else {
             return false;
         };
         if view.topic_id.is_none() || view.pending_separator.is_none() || view.failed.is_some() {
@@ -5092,7 +5420,9 @@ impl Slots {
         };
         let ordinal = self.ordinal(slot);
         let Some(place) = self.registry.place(slot) else {
-            warn!(ordinal, "reply for a slot without a topic yet; dropped");
+            if !self.wait_for_topic(slot, &session, text, "reply", false) {
+                warn!(ordinal, "reply for a slot without a topic yet; dropped");
+            }
             return;
         };
         if self.behind_drain(slot, Instant::now()) {
@@ -5584,19 +5914,38 @@ impl Slots {
             if !ask.is_open() || ask.place.is_some() {
                 continue;
             }
+            let lost = self
+                .again
+                .values()
+                .any(|lost| lost.asked == Asked::Question(key));
             let Some(place) = self.session_topic(&ask.session) else {
+                // Lost in a private chat: it waits for its topic (TASK-063).
+                if lost {
+                    continue;
+                }
                 // Nowhere to show it: the terminal dialog, not a silent wait.
                 self.end_question(key, questions::State::Expired);
                 continue;
             };
-            let slot = self
+            let Some(slot) = self
                 .registry
                 .sessions
                 .get(&ask.session)
-                .and_then(|entry| entry.slot);
-            if slot.is_some_and(|slot| self.behind_drain(slot, Instant::now())) {
+                .and_then(|entry| entry.slot)
+            else {
+                continue;
+            };
+            if self.behind_drain(slot, Instant::now()) {
                 continue;
             }
+            let again = match self.again_to(Asked::Question(key), slot, place) {
+                Again::Wait => continue,
+                Again::Adopt(old, twin) => {
+                    self.adopt(old, twin, place);
+                    continue;
+                }
+                Again::Send(again) => again,
+            };
             let Some(ask) = self.questions.get(key) else {
                 continue;
             };
@@ -5615,7 +5964,11 @@ impl Slots {
                 ask.place = Some(place);
                 ask.sending = true;
             }
-            self.hand_off(Work::Question { key, version }, op);
+            if let Some(old) = again {
+                self.again.remove(&old);
+                info!("question lost in a private chat goes again");
+            }
+            self.hand_off_again(Work::Question { key, version }, op, again);
         }
     }
 
@@ -5643,11 +5996,36 @@ impl Slots {
         }
     }
 
-    fn on_question_done(&mut self, key: u64, version: u64, delivery: Option<Delivery>) {
+    fn on_question_done(&mut self, key: u64, version: u64, seq: u64, delivery: Option<Delivery>) {
+        // Lost in a private chat (TASK-063): like a prompt, it goes again.
+        let lost_in = self
+            .questions
+            .get(key)
+            .and_then(|ask| ask.place)
+            .map(|place| place.chat)
+            .filter(|chat| lost_in_private(*chat, delivery.as_ref()));
+        if let Some(chat) = lost_in {
+            self.again.insert(
+                seq,
+                Lost {
+                    asked: Asked::Question(key),
+                    chat,
+                    version,
+                },
+            );
+        }
         let Some(ask) = self.questions.get_mut(key) else {
             return;
         };
         ask.sending = false;
+        if lost_in.is_some() && ask.is_open() {
+            ask.place = None;
+            info!(
+                session = short(&ask.session),
+                "question lost in a private chat; it goes again"
+            );
+            return;
+        }
         match delivery {
             Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
                 ask.message_id = Some(message.message_id);
@@ -5710,11 +6088,21 @@ impl Slots {
         question: usize,
         press: questions::Press,
     ) -> Option<&'static str> {
-        let Some(key) = input
+        let found = input
             .message()
             .and_then(|message| self.questions.by_message(message))
             .or_else(|| self.questions.in_flight(id, input.topic()))
-        else {
+            // A twin pressed before Telegram's answer linked it (TASK-063).
+            .or_else(|| {
+                let primary = self.mirror_primary(input.topic()?)?;
+                self.questions.open_in(id, primary)
+            });
+        // The kept twin of a question lost in a private chat (TASK-063).
+        let found = found.or_else(|| match self.adopt_pressed(input) {
+            Some(Asked::Question(key)) => Some(key),
+            _ => None,
+        });
+        let Some(key) = found else {
             debug!("button of a question this hub does not know");
             return Some(questions::ANSWER_STALE);
         };
@@ -5745,16 +6133,24 @@ impl Slots {
     /// reply to a message the hub cannot match, in a topic with such a
     /// question (TASK-060). Later messages of that topic wait behind it, so
     /// the session gets them in order. `Some`: it goes on now.
-    fn hold(&mut self, place: Place, input: Inbound) -> Option<Inbound> {
+    /// `asked`: the topic and reply of `input` as the questions see them
+    /// ([`Self::as_primary`]).
+    fn hold(
+        &mut self,
+        place: Place,
+        asked: (Place, Option<i64>),
+        input: Inbound,
+    ) -> Option<Inbound> {
         let behind = self.held.iter().any(|held| held.place() == place);
+        let (asked_place, asked_reply) = asked;
         let unknown_reply = input.text.is_some()
             && !input.forwarded
-            && input.reply_to.is_some_and(|reply_to| {
+            && asked_reply.is_some_and(|reply_to| {
                 self.questions
-                    .by_message(MessageKey::new(place.chat, reply_to))
+                    .by_message(MessageKey::new(asked_place.chat, reply_to))
                     .is_none()
             })
-            && self.questions.sending_in(place);
+            && self.questions.sending_in(asked_place);
         if !(behind || unknown_reply) || self.held.len() >= MAX_HELD {
             return Some(input);
         }
@@ -5855,13 +6251,23 @@ impl Slots {
                 self.finish(key, State::Closed);
                 continue;
             }
-            let slot = entry.slot;
-            let Some(place) = slot.and_then(|slot| self.registry.place(slot)) else {
+            let Some(slot) = entry.slot else {
                 continue;
             };
-            if slot.is_some_and(|slot| self.behind_drain(slot, Instant::now())) {
+            let Some(place) = self.registry.place(slot) else {
+                continue;
+            };
+            if self.behind_drain(slot, Instant::now()) {
                 continue;
             }
+            let again = match self.again_to(Asked::Prompt(key), slot, place) {
+                Again::Wait => continue,
+                Again::Adopt(old, twin) => {
+                    self.adopt(old, twin, place);
+                    continue;
+                }
+                Again::Send(again) => again,
+            };
             let Some(prompt) = self.prompts.get(key) else {
                 continue;
             };
@@ -5879,7 +6285,244 @@ impl Slots {
                 prompt.sent = true;
                 prompt.place = Some(place);
             }
-            self.hand_off(Work::Permission(key), op);
+            if let Some(old) = again {
+                self.again.remove(&old);
+                info!("permission prompt lost in a private chat goes again");
+            }
+            self.hand_off_again(Work::Permission(key), op, again);
+        }
+    }
+
+    /// Where lost prompt or question `asked` of `slot` goes now that the
+    /// slot's primary topic is `place` (TASK-063): back into its private
+    /// chat once the topic there is made again (the group's view of a
+    /// shared slot is primary meanwhile, and keeps the twin), anywhere once
+    /// that chat is closed. A kept twin already in that topic becomes the
+    /// prompt. Not lost: a plain send.
+    fn again_to(&self, asked: Asked, slot: SlotId, place: Place) -> Again {
+        let Some((&old, lost)) = self.again.iter().find(|(_, lost)| lost.asked == asked) else {
+            return Again::Send(None);
+        };
+        let back_home = self
+            .registry
+            .slot(slot)
+            .is_some_and(|entry| entry.views.iter().any(|view| view.chat == lost.chat));
+        if place.chat != lost.chat && self.registry.usable(lost.chat) && back_home {
+            return Again::Wait;
+        }
+        match self
+            .mirror
+            .kept(old)
+            .into_iter()
+            .find(|(chat, _)| *chat == place.chat)
+        {
+            Some((_, None)) => Again::Wait,
+            Some((chat, Some(Some(id)))) => Again::Adopt(old, MessageKey::new(chat, id)),
+            _ => Again::Send(Some(old)),
+        }
+    }
+
+    /// Lost prompt or question of send `old` is its kept twin `twin` in
+    /// topic `place` now (TASK-063): shown and pressed there, edited there
+    /// when it ends. Its other kept twins lose their buttons.
+    fn adopt(&mut self, old: u64, twin: MessageKey, place: Place) {
+        let Some(lost) = self.again.remove(&old) else {
+            return;
+        };
+        match lost.asked {
+            Asked::Prompt(key) => {
+                if let Some(prompt) = self.prompts.get_mut(key) {
+                    prompt.sent = true;
+                    prompt.place = Some(place);
+                }
+                self.prompts.delivered(key, twin.id);
+            }
+            Asked::Question(key) => {
+                if let Some(ask) = self.questions.get_mut(key) {
+                    ask.place = Some(place);
+                    ask.sending = false;
+                    ask.message_id = Some(twin.id);
+                    ask.shown = lost.version;
+                }
+            }
+        }
+        info!("a prompt lost in a private chat goes on as its twin");
+        let others: Vec<MessageKey> = self
+            .mirror
+            .release(old)
+            .into_iter()
+            .filter(|other| *other != twin)
+            .collect();
+        self.clear_kept(lost.asked, others);
+    }
+
+    /// Lost prompt or question `asked` still waits to go again: open, and
+    /// not handed out.
+    fn waits_again(&self, asked: Asked) -> bool {
+        match asked {
+            Asked::Prompt(key) => self
+                .prompts
+                .get(key)
+                .is_some_and(|prompt| prompt.state.is_active() && !prompt.sent),
+            Asked::Question(key) => self
+                .questions
+                .get(key)
+                .is_some_and(|ask| ask.is_open() && ask.place.is_none()),
+        }
+    }
+
+    /// A press on the kept twin of a lost prompt or question (TASK-063):
+    /// that twin is the prompt now. `None`: `input` is no such press.
+    fn adopt_pressed(&mut self, input: &CallbackInput) -> Option<Asked> {
+        let twin = input.message()?;
+        let old = self.mirror.kept_of(twin)?;
+        let asked = self.again.get(&old)?.asked;
+        if !self.waits_again(asked) {
+            return None;
+        }
+        let place = input
+            .topic()
+            .filter(|place| place.chat == twin.chat)
+            .unwrap_or(Place::new(twin.chat, None));
+        self.adopt(old, twin, place);
+        Some(asked)
+    }
+
+    /// Lost prompts and questions that no longer go again (they ended or
+    /// were forgotten meanwhile): their kept twins lose the buttons.
+    fn release_kept(&mut self) {
+        let done: Vec<u64> = self
+            .again
+            .iter()
+            .filter(|(_, lost)| !self.waits_again(lost.asked))
+            .map(|(old, _)| *old)
+            .collect();
+        for old in done {
+            let Some(lost) = self.again.remove(&old) else {
+                continue;
+            };
+            let kept = self.mirror.release(old);
+            self.clear_kept(lost.asked, kept);
+        }
+    }
+
+    /// Kept twins of `asked` it does not show in: edited to how it ended,
+    /// without buttons.
+    fn clear_kept(&mut self, asked: Asked, twins: Vec<MessageKey>) {
+        if twins.is_empty() {
+            return;
+        }
+        let text = match asked {
+            Asked::Prompt(key) => self
+                .prompts
+                .get(key)
+                .and_then(Prompt::final_text)
+                .unwrap_or_else(|| permissions::ANSWER_EXPIRED.to_owned()),
+            Asked::Question(key) => self
+                .questions
+                .get(key)
+                .filter(|ask| !ask.is_open())
+                .map_or_else(|| questions::EXPIRED_TITLE.to_owned(), questions::Ask::text),
+        };
+        for twin in twins {
+            self.hand_off(
+                Work::Callback,
+                Op::Edit {
+                    chat: twin.chat,
+                    message_id: twin.id,
+                    text: text.clone(),
+                    reply_markup: Some(permissions::no_keyboard()),
+                    background: false,
+                },
+            );
+        }
+    }
+
+    /// Keeps a lost reply, notice or echo to send again (TASK-063).
+    fn keep_lost(&mut self, lost: LostMessage) {
+        if self.lost_messages.len() >= MAX_LOST_MESSAGES {
+            self.lost_messages.pop_front();
+            warn!("too many messages lost in private chats wait; the oldest is dropped");
+        }
+        self.lost_messages.push_back(lost);
+    }
+
+    /// A reply or turn answer for `slot` while its topic is being made
+    /// (its private topic deleted, or it moved to the group after a 403,
+    /// TASK-063) waits for that topic instead of being dropped. `false`:
+    /// the slot makes no topic now, or private chats are off (the group
+    /// alone drops it, as before).
+    fn wait_for_topic(
+        &mut self,
+        slot: SlotId,
+        session: &str,
+        text: &str,
+        kind: &str,
+        notify: bool,
+    ) -> bool {
+        let making = self.registry.private
+            && self.registry.slot(slot).is_some_and(|entry| {
+                entry
+                    .views
+                    .iter()
+                    .any(|view| view.topic_id.is_none() && self.registry.usable(view.chat))
+            });
+        if !making {
+            return false;
+        }
+        info!(
+            ordinal = self.ordinal(slot),
+            "message for a slot whose topic is being made; it waits for it"
+        );
+        // Pointed at the slot's primary topic once there is one.
+        let nowhere = Place::new(Chat::Group, None);
+        for op in text_ops(nowhere, session, text, kind, notify) {
+            self.keep_lost(LostMessage {
+                slot,
+                chat: Chat::Group,
+                gone: false,
+                op,
+            });
+        }
+        true
+    }
+
+    /// Sends lost replies, notices and echoes again once their topic is
+    /// there: a deleted private topic's into the one made again (the other
+    /// views have their twin already), one lost to a 403 into the slot's
+    /// primary topic. One whose chat no longer shows the slot is dropped.
+    fn send_lost_messages(&mut self) {
+        for lost in std::mem::take(&mut self.lost_messages) {
+            let view = self
+                .registry
+                .slot(lost.slot)
+                .and_then(|entry| entry.views.iter().find(|view| view.chat == lost.chat));
+            let target = if lost.gone {
+                let Some(view) = view.filter(|_| self.registry.usable(lost.chat)) else {
+                    debug!("a lost message's private chat is gone or closed; dropped");
+                    continue;
+                };
+                view.place()
+            } else {
+                self.registry.place(lost.slot)
+            };
+            let Some(target) = target else {
+                self.lost_messages.push_back(lost);
+                continue;
+            };
+            let mut op = lost.op;
+            if let Op::Send {
+                chat, thread_id, ..
+            }
+            | Op::SendDocument {
+                chat, thread_id, ..
+            } = &mut op
+            {
+                *chat = target.chat;
+                *thread_id = target.thread;
+            }
+            // Into the private topic made again: that view alone.
+            self.send_as(lost.gone, vec![op]);
         }
     }
 
@@ -5910,6 +6553,10 @@ impl Slots {
     /// Answers every button press at once; the final edit follows when the
     /// prompt ends.
     fn on_callback(&mut self, input: CallbackInput) {
+        if let Some(chat) = input.chat {
+            self.reopen(chat);
+        }
+        let input = self.press_as_primary(input);
         let answer = self.press(&input);
         self.hand_off(
             Work::Callback,
@@ -5918,6 +6565,87 @@ impl Slots {
                 text: answer.map(str::to_owned),
             },
         );
+    }
+
+    /// A press on a twin (TASK-063) is a press on its primary message.
+    fn press_as_primary(&self, mut input: CallbackInput) -> CallbackInput {
+        let Some(primary) = input
+            .message()
+            .and_then(|message| self.mirror.primary_of(message))
+        else {
+            return input;
+        };
+        let thread = input
+            .topic()
+            .and_then(|topic| self.mirror_primary(topic))
+            .filter(|place| place.chat == primary.chat)
+            .and_then(|place| place.thread);
+        input.chat = Some(primary.chat);
+        input.message_id = Some(primary.id);
+        input.thread_id = thread;
+        input
+    }
+
+    /// The primary topic of mirror topic `place` (TASK-063).
+    fn mirror_primary(&self, place: Place) -> Option<Place> {
+        let slot = self.registry.slot_by_topic(place)?;
+        self.registry
+            .place(slot)
+            .filter(|primary| *primary != place)
+    }
+
+    /// `place` and `reply_to` of a user's message as the questions, prompts
+    /// and blocks of the slot see them (TASK-063): in a mirror topic, the
+    /// primary topic and the primary message of the twin replied to. A reply
+    /// to a message that is no twin (a user's) stays as it was.
+    fn as_primary(&self, place: Place, reply_to: Option<i64>) -> (Place, Option<i64>) {
+        let Some(primary) = self.mirror_primary(place) else {
+            return (place, reply_to);
+        };
+        match reply_to {
+            None => (primary, None),
+            Some(reply_to) => match self
+                .mirror
+                .primary_of(MessageKey::new(place.chat, reply_to))
+            {
+                Some(twin_of) if twin_of.chat == primary.chat => (primary, Some(twin_of.id)),
+                _ => (place, Some(reply_to)),
+            },
+        }
+    }
+
+    /// A user's message written in topic `from` of `slot` shows in its
+    /// other views as `echo` (TASK-063), without a sound and without twins
+    /// (each view gets its own echo).
+    fn echo(&mut self, slot: SlotId, from: Place, echo: String) {
+        if !self.registry.private {
+            return;
+        }
+        let mut views = self.registry.mirrors(slot);
+        views.extend(self.registry.place(slot));
+        let ops: Vec<Op> = views
+            .into_iter()
+            .filter(|view| *view != from)
+            .map(|view| message_op(view, echo.clone()))
+            .collect();
+        if !ops.is_empty() {
+            self.send_as(true, ops);
+        }
+    }
+
+    /// A private topic that is no slot's (the user made it, TASK-063), or
+    /// the private chat's General, gets a short answer `notice`, at most
+    /// once per `Options::notice_every`.
+    fn tell_foreign(&mut self, place: Place, notice: &'static str) {
+        let now = Instant::now();
+        let every = self.options.notice_every;
+        self.foreign_told.retain(|_, at| now < *at + every);
+        if self.foreign_told.contains_key(&place) {
+            return;
+        }
+        if self.send_messages(vec![message_op(place, notice.to_owned())]) {
+            self.foreign_told.insert(place, now);
+        }
     }
 
     /// The first press on an open prompt fixes the answer for good; later
@@ -5949,11 +6677,21 @@ impl Slots {
         // A press that beats Telegram's answer to the send (the message id
         // is not known yet) counts for the one prompt of that topic with its
         // id still in flight (TASK-060).
-        let Some(key) = input
+        let found = input
             .message()
             .and_then(|message| self.prompts.by_message(message))
             .or_else(|| self.prompts.in_flight(request_id, input.topic()))
-        else {
+            // A twin pressed before Telegram's answer linked it (TASK-063).
+            .or_else(|| {
+                let primary = self.mirror_primary(input.topic()?)?;
+                self.prompts.active_in(request_id, primary)
+            });
+        // The kept twin of a prompt lost in a private chat (TASK-063).
+        let found = found.or_else(|| match self.adopt_pressed(input) {
+            Some(Asked::Prompt(key)) => Some(key),
+            _ => None,
+        });
+        let Some(key) = found else {
             debug!("button of a prompt this hub does not know");
             return expired;
         };
@@ -6474,7 +7212,23 @@ impl Slots {
                 continue;
             };
             let mut meta = BTreeMap::new();
-            if let Some(view) = self.registry.slot(slot).and_then(Slot::primary) {
+            // A private place only to an agent that tells it apart (TASK-063).
+            let private_place = self
+                .conns
+                .get(&conn)
+                .is_some_and(|bound| bound.private_place);
+            let view = self
+                .registry
+                .primary_view(slot)
+                .filter(|view| private_place || !view.chat.is_private())
+                .or_else(|| {
+                    self.registry
+                        .slot(slot)?
+                        .views
+                        .iter()
+                        .find(|view| view.chat == Chat::Group)
+                });
+            if let Some(view) = view {
                 meta.insert("place".to_owned(), view.chat.label().to_owned());
                 if let Some(thread_id) = view.topic_id {
                     meta.insert("thread_id".to_owned(), thread_id.to_string());
@@ -6931,8 +7685,10 @@ impl Slots {
         for index in 0..self.registry.slots.len() {
             let slot = SlotId(index);
             let entry = &self.registry.slots[index];
-            let (Some(view), Some(session)) = (entry.primary(), entry.current_session.clone())
-            else {
+            let (Some(view), Some(session)) = (
+                self.registry.primary_view(slot),
+                entry.current_session.clone(),
+            ) else {
                 continue;
             };
             let Some(place) = view.place() else {
@@ -6946,15 +7702,17 @@ impl Slots {
                 .get(&slot)
                 .map_or((0, false), |shown| (shown.in_flight, shown.urgent));
             // A status message or edit still on its way shows the newest
-            // status when it goes (TASK-062).
+            // status when it goes (TASK-062), in the mirror topics too.
             let live_texts: Vec<LiveText> = self
                 .shown
-                .get(&slot)
+                .get_mut(&slot)
                 .map(|shown| {
+                    shown.twins.retain(|twin| !twin.went() && !twin.cancelled());
                     shown
                         .sending
                         .iter()
                         .chain(&shown.editing)
+                        .chain(&shown.twins)
                         .cloned()
                         .collect()
                 })
@@ -7111,8 +7869,8 @@ impl Slots {
         let topic = self.registry.place(slot);
         let message = self
             .registry
-            .slot(slot)
-            .and_then(|slot| slot.primary()?.status);
+            .primary_view(slot)
+            .and_then(|view| view.status);
         let shown = self.shown.entry(slot).or_default();
         shown.in_flight = shown.in_flight.saturating_sub(1);
         if let StatusJob::Edit { content, .. } = &job
@@ -7165,6 +7923,9 @@ impl Slots {
                 if applied {
                     let (text, keyboard) = content.shown();
                     shown.shows(text, keyboard, now);
+                    if let Chat::Private(private) = message.chat {
+                        self.proven.insert(private);
+                    }
                 } else if gone {
                     // Deleted in Telegram: a new one is sent.
                     shown.content = None;
@@ -7209,6 +7970,17 @@ impl Slots {
                 // and so does the one it was to replace.
                 let expected = old.map(|(old, _)| old.id);
                 if topic != Some(place) || expected != message.map(|status| status.message_id) {
+                    // Its session is answered in another view of the slot
+                    // now, or the slot left that topic's chat (TASK-063): no
+                    // status message stays behind there.
+                    let behind = topic != Some(place)
+                        && self.registry.slot(slot).is_some_and(|entry| {
+                            entry.views.iter().all(|view| view.chat != place.chat)
+                                || entry.views.iter().any(|view| view.place() == Some(place))
+                        });
+                    if behind {
+                        self.retire(MessageKey::new(place.chat, sent.message_id), false);
+                    }
                     return;
                 }
                 let (text, keyboard) = content.shown();
@@ -7274,7 +8046,7 @@ impl Slots {
     /// never is: the next content goes below it, and it moves.
     fn absorbable(&self, slot: SlotId, place: Place) -> Option<MessageKey> {
         self.options.status_every?;
-        let view = self.registry.slot(slot)?.primary()?;
+        let view = self.registry.primary_view(slot)?;
         let status = view.status?;
         let bottom = self.bottoms.get(&place);
         let blocked = view.place() != Some(place)
@@ -7516,9 +8288,51 @@ impl Slots {
         }
     }
 
+    /// Messages of `ids` whose ✍ the agent of `conn` can tell (TASK-063): a
+    /// private chat's only when it announced `private_place`. An older agent
+    /// gets them all the same (v0.1.13 and later read the place right, but
+    /// only a newer one says so), without the ✍: one before v0.1.13 reports
+    /// a private chat's message as the group's.
+    fn receipts_of(&self, conn: u64, ids: &[MessageKey]) -> Vec<MessageKey> {
+        let private_place = self
+            .conns
+            .get(&conn)
+            .is_some_and(|bound| bound.private_place);
+        ids.iter()
+            .copied()
+            .filter(|id| private_place || !id.chat.is_private())
+            .collect()
+    }
+
+    /// [`Self::notify`] about a user's own message: it stays in the view
+    /// the user wrote in, no twin in the others (TASK-063).
+    fn notify_author(&mut self, slot: SlotId, place: Place, notice: &'static str) {
+        let now = Instant::now();
+        if self
+            .notices
+            .get(&(slot, notice))
+            .is_some_and(|&last| now < last + self.options.notice_every)
+        {
+            debug!(
+                ordinal = self.ordinal(slot),
+                "notice sent to this slot recently; not repeated"
+            );
+            return;
+        }
+        if self.send_as(true, vec![message_op(place, notice.to_owned())]) {
+            self.notices.insert((slot, notice), now);
+        }
+    }
+
     /// Hands all `ops` to the dispatch task in order, or none of them when
     /// that would pass [`MAX_QUEUED_MESSAGES`].
     fn send_messages(&mut self, ops: Vec<Op>) -> bool {
+        self.send_as(false, ops)
+    }
+
+    /// [`Self::send_messages`]; `answer`: they answer a user's own message
+    /// ([`Work::Answer`]).
+    fn send_as(&mut self, answer: bool, ops: Vec<Op>) -> bool {
         if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
@@ -7530,7 +8344,14 @@ impl Slots {
         }
         self.queued_messages += ops.len();
         for op in ops {
-            self.hand_off(Work::Message, op);
+            let work = if answer { Work::Answer } else { Work::Message };
+            // A text for a private topic is sent again if it is lost there
+            // (TASK-063).
+            let text = (matches!(op, Op::Send { .. }) && op.chat().is_some_and(|c| c.is_private()))
+                .then(|| op.clone());
+            if let (Some(seq), Some(text)) = (self.hand_off(work, op), text) {
+                self.unlanded.insert(seq, (text, answer));
+            }
         }
         true
     }
@@ -7538,19 +8359,829 @@ impl Slots {
     /// Never waits: the dispatch task does.
     /// A new message counts as on its way into its topic until Telegram
     /// answered (TASK-062); one that is not the stream's or a status message
-    /// closes the turn message there.
-    fn hand_off(&mut self, work: Work, op: Op) {
+    /// closes the turn message there. What goes into a primary topic, or is
+    /// about a message there, goes to its mirrors too (TASK-063). Its
+    /// dispatch number, when the dispatch task took it.
+    fn hand_off(&mut self, work: Work, op: Op) -> Option<u64> {
+        self.hand_off_again(work, op, None)
+    }
+
+    /// [`Self::hand_off`] of a prompt or question that goes again after it
+    /// was lost as dispatch number `again` (TASK-063): the twins kept of
+    /// that send take this one, and no new twin goes to their chats.
+    fn hand_off_again(&mut self, work: Work, op: Op, again: Option<u64>) -> Option<u64> {
         let posts = op.posts();
         if let Some(place) = posts {
             self.bottoms.entry(place).or_default().posting += 1;
             if !matches!(work, Work::Stream { .. } | Work::Status { .. }) {
                 self.close_turn_message(place);
             }
+            self.below_mirror_status(place);
+        }
+        let mut twins = self.twin_calls(&work, &op);
+        if let Some(old) = again {
+            let kept = self.mirror.kept_chats(old);
+            twins.retain(|twin| twin.op.chat().is_none_or(|chat| !kept.contains(&chat)));
         }
         if self.dispatch.send((work, op)).is_err() {
             debug!("dispatch task stopped; job dropped");
             if let Some(bottom) = posts.and_then(|place| self.bottoms.get_mut(&place)) {
                 bottom.posting = bottom.posting.saturating_sub(1);
+            }
+            return None;
+        }
+        self.handed += 1;
+        let seq = self.handed;
+        if let Some(old) = again {
+            self.mirror.carry(old, seq);
+        }
+        for twin in twins {
+            self.hand_twin(seq, twin);
+        }
+        Some(seq)
+    }
+
+    /// Something of the hub or a user came into mirror topic `place`, below
+    /// the twin of the status message (TASK-063): the status moves in every
+    /// view, and nothing more goes into the turn message.
+    fn below_mirror_status(&mut self, place: Place) {
+        let Some(slot) = self.registry.slot_by_topic(place) else {
+            return;
+        };
+        let Some(primary) = self
+            .registry
+            .place(slot)
+            .filter(|primary| *primary != place)
+        else {
+            return;
+        };
+        self.bottoms.entry(primary).or_default().foreign = true;
+        self.close_turn_message(place);
+    }
+
+    /// The calls for the mirror topics that go with `op` (TASK-063): a new
+    /// message of a primary topic gets a twin in each mirror topic (none
+    /// when it answers a message the mirror has no twin of: a user's), and
+    /// an edit, a delete or stream content written into a message goes to
+    /// its twins. Separators, service message deletes and reactions stay in
+    /// their topic.
+    fn twin_calls(&mut self, work: &Work, op: &Op) -> Vec<TwinCall> {
+        if !self.registry.private
+            || matches!(
+                work,
+                Work::Topic(_) | Work::Delete | Work::Reaction | Work::Answer | Work::Twin { .. }
+            )
+        {
+            return Vec::new();
+        }
+        if let Some(place) = op.posts() {
+            let mirrors = self.primary_mirrors(place);
+            let status = match work {
+                Work::Status { slot, .. } => Some(*slot),
+                _ => None,
+            };
+            // Made again or ended when the primary send makes no message.
+            let ghost = matches!(
+                work,
+                Work::Stream { .. }
+                    | Work::Status { .. }
+                    | Work::Permission(_)
+                    | Work::Question { .. }
+            );
+            // Edited long after, maybe after a restart.
+            let lasting = matches!(work, Work::Block(_) | Work::Resume { .. });
+            return mirrors
+                .into_iter()
+                .filter_map(|to| {
+                    let op = self.as_new_twin(op, to)?;
+                    Some(TwinCall {
+                        op,
+                        link: Link::Seq { ghost, lasting },
+                        status,
+                    })
+                })
+                .collect();
+        }
+        let (primary, place) = match op {
+            Op::Edit {
+                chat, message_id, ..
+            }
+            | Op::Delete { chat, message_id } => (MessageKey::new(*chat, *message_id), None),
+            Op::Stream {
+                chat,
+                thread_id,
+                into: Some(into),
+                ..
+            } => (
+                MessageKey::new(*chat, *into),
+                Some(Place::topic(*chat, *thread_id)),
+            ),
+            _ => return Vec::new(),
+        };
+        let writes = self.mirror.write(primary, op);
+        // A status message taken away before its twin went: the twin never
+        // goes (no send and delete in the mirror's budget for nothing).
+        if matches!(op, Op::Delete { .. }) {
+            for write in &writes {
+                if let Write::Queued(id) = write
+                    && let Some(text) = self.status_twins.get(id)
+                {
+                    text.cancel();
+                }
+            }
+        }
+        // Stream content the mirror has no twin to write into goes there as
+        // a new message, which takes the next writes.
+        let lost: Vec<Chat> = if writes.is_empty() {
+            place
+                .map(|place| self.primary_mirrors(place))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|to| to.chat)
+                .collect()
+        } else {
+            writes
+                .iter()
+                .filter_map(|write| match write {
+                    Write::Lost(chat) => Some(*chat),
+                    _ => None,
+                })
+                .collect()
+        };
+        let status = match work {
+            Work::Status { slot, .. } if matches!(op, Op::Edit { .. }) => Some(*slot),
+            _ => None,
+        };
+        let mut calls = Vec::new();
+        for write in writes {
+            if let Write::Now(twin) = write
+                && let Some(op) = self.as_twin(op, twin)
+            {
+                calls.push(TwinCall {
+                    op,
+                    link: Link::None,
+                    status,
+                });
+            }
+        }
+        if let Some(place) = place {
+            for chat in lost {
+                calls.extend(self.lost_content(primary, place, chat, op));
+            }
+        }
+        calls
+    }
+
+    /// The mirror topics of `place` when it is a slot's primary topic.
+    fn primary_mirrors(&self, place: Place) -> Vec<Place> {
+        let Some(slot) = self.registry.slot_by_topic(place) else {
+            return Vec::new();
+        };
+        if self.registry.place(slot) != Some(place) {
+            return Vec::new();
+        }
+        self.registry.mirrors(slot)
+    }
+
+    /// Stream content written into primary message `primary` of `place`,
+    /// whose twin in `chat` is lost or unknown: a new twin message there.
+    fn lost_content(
+        &self,
+        primary: MessageKey,
+        place: Place,
+        chat: Chat,
+        op: &Op,
+    ) -> Option<TwinCall> {
+        let to = self
+            .primary_mirrors(place)
+            .into_iter()
+            .find(|to| to.chat == chat)?;
+        let Op::Stream {
+            text, html, notify, ..
+        } = op
+        else {
+            return None;
+        };
+        Some(TwinCall {
+            op: Op::Stream {
+                chat: to.chat,
+                thread_id: to.thread?,
+                text: text.clone(),
+                html: html.clone(),
+                merge: false,
+                restart: true,
+                notify: *notify,
+                into: None,
+            },
+            link: Link::Of(primary),
+            status: None,
+        })
+    }
+
+    /// `op`, a new message of a primary topic, for mirror topic `to`; `None`
+    /// when it answers a message `to` has no twin of.
+    fn as_new_twin(&self, op: &Op, to: Place) -> Option<Op> {
+        let mut op = op.clone();
+        match &mut op {
+            Op::Send {
+                chat,
+                thread_id,
+                reply_to,
+                ..
+            } => {
+                if let Some(reply_to) = reply_to {
+                    *reply_to = self
+                        .mirror
+                        .twin(MessageKey::new(*chat, *reply_to), to.chat)?
+                        .id;
+                }
+                *chat = to.chat;
+                *thread_id = to.thread;
+            }
+            Op::SendDocument {
+                chat, thread_id, ..
+            }
+            | Op::SendPhoto {
+                chat, thread_id, ..
+            }
+            | Op::SendAlbum {
+                chat, thread_id, ..
+            } => {
+                *chat = to.chat;
+                *thread_id = to.thread;
+            }
+            Op::Stream {
+                chat,
+                thread_id,
+                restart,
+                into: None,
+                ..
+            } => {
+                *chat = to.chat;
+                *thread_id = to.thread?;
+                // The mirror's stream never waits for a line of the primary
+                // one to be sent again.
+                *restart = true;
+            }
+            _ => return None,
+        }
+        Some(op)
+    }
+
+    /// `op`, a call about a primary message, for its twin `twin`.
+    fn as_twin(&self, op: &Op, twin: MessageKey) -> Option<Op> {
+        let mut op = op.clone();
+        match &mut op {
+            Op::Edit {
+                chat, message_id, ..
+            }
+            | Op::Delete { chat, message_id } => {
+                *chat = twin.chat;
+                *message_id = twin.id;
+            }
+            Op::Stream {
+                chat,
+                thread_id,
+                restart,
+                into: Some(into),
+                ..
+            } => {
+                let to = self
+                    .primary_mirrors(Place::topic(*chat, *thread_id))
+                    .into_iter()
+                    .find(|to| to.chat == twin.chat)?;
+                *chat = twin.chat;
+                *thread_id = to.thread?;
+                *into = twin.id;
+                *restart = true;
+            }
+            _ => return None,
+        }
+        Some(op)
+    }
+
+    /// Hands a call for a mirror topic to the dispatch task. A new twin
+    /// message waits only while fewer than [`MAX_TWIN_POSTS`] do (a prompt
+    /// or question always goes); a dropped one is told in its topic later.
+    fn hand_twin(&mut self, seq: u64, call: TwinCall) {
+        let posts = call.op.posts();
+        let asks = matches!(
+            call.op,
+            Op::Send {
+                permission: true,
+                ..
+            }
+        );
+        if let Some(place) = posts
+            && self.twin_posts >= MAX_TWIN_POSTS
+            && !asks
+        {
+            if self.gaps.insert(place) {
+                warn!("a mirror topic falls behind; its twins are dropped until it caught up");
+            }
+            return;
+        }
+        let chat = call.op.chat().unwrap_or(Chat::Group);
+        let id = match call.link {
+            Link::Seq { ghost, lasting } => self.mirror.send(seq, chat, ghost, lasting),
+            Link::Of(primary) => self.mirror.send_for(primary, chat),
+            Link::None => None,
+        };
+        if !matches!(call.link, Link::None) && id.is_none() {
+            if let Some(place) = posts {
+                self.gaps.insert(place);
+            }
+            return;
+        }
+        // The pump keeps its text the slot's status until it goes.
+        let status = call.status.and_then(|slot| {
+            let content = match &call.op {
+                Op::Send {
+                    text, reply_markup, ..
+                }
+                | Op::Edit {
+                    text, reply_markup, ..
+                } => LiveText::new(
+                    text.clone(),
+                    reply_markup
+                        .clone()
+                        .unwrap_or_else(permissions::no_keyboard),
+                ),
+                _ => return None,
+            };
+            self.shown
+                .entry(slot)
+                .or_default()
+                .twins
+                .push(content.clone());
+            Some(content)
+        });
+        if let (Some(id), Some(text)) = (id, &status)
+            && posts.is_some()
+        {
+            self.status_twins.insert(id, text.clone());
+        }
+        let work = Work::Twin {
+            id,
+            place: posts,
+            status,
+        };
+        if self.dispatch.send((work, call.op)).is_err() {
+            debug!("dispatch task stopped; twin dropped");
+            return;
+        }
+        self.handed += 1;
+        if posts.is_some() {
+            self.twin_posts += 1;
+        }
+    }
+
+    /// What the twin book asks after an answer.
+    fn follow(&mut self, follows: Vec<Follow>) {
+        for follow in follows {
+            let call = match follow {
+                Follow::Write { twin, op } => self.as_twin(&op, twin).map(|op| TwinCall {
+                    op,
+                    link: Link::None,
+                    status: None,
+                }),
+                Follow::Lost { primary, chat, op } => match &op {
+                    Op::Stream {
+                        chat: from,
+                        thread_id,
+                        into: Some(_),
+                        ..
+                    } => self.lost_content(primary, Place::topic(*from, *thread_id), chat, &op),
+                    _ => None,
+                },
+                Follow::Delete(twin) => Some(TwinCall {
+                    op: Op::Delete {
+                        chat: twin.chat,
+                        message_id: twin.id,
+                    },
+                    link: Link::None,
+                    status: None,
+                }),
+            };
+            if let Some(call) = call {
+                self.hand_twin(0, call);
+            }
+        }
+    }
+
+    /// Telegram answered a call in a mirror topic.
+    fn on_twin_done(&mut self, id: Option<u64>, place: Option<Place>, delivery: Option<Delivery>) {
+        if place.is_some() {
+            self.twin_posts = self.twin_posts.saturating_sub(1);
+        }
+        if let Some(id) = id {
+            self.status_twins.remove(&id);
+            let made = match &delivery {
+                Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                    Some(message.message_id)
+                }
+                _ => None,
+            };
+            let follows = self.mirror.twin_answered(id, made);
+            self.follow(follows);
+        }
+        match (&delivery, place) {
+            (Some(delivery), Some(place)) if topic_gone(delivery) => self.topic_gone_at(place),
+            (Some(delivery), Some(place)) if forbidden(delivery) => self.close_chat(place.chat),
+            (Some(Err(error)), _) => debug!(%error, "call in a mirror topic failed"),
+            _ => {}
+        }
+        if self.twin_posts == 0 && !self.gaps.is_empty() {
+            for place in std::mem::take(&mut self.gaps) {
+                if self.registry.slot_by_topic(place).is_some() {
+                    self.send_messages(vec![message_op(place, MIRROR_GAP_NOTICE.to_owned())]);
+                }
+            }
+        }
+    }
+
+    /// The topic `place` is gone in Telegram (a user deleted a private
+    /// topic, TASK-063): its slot gets a new one.
+    fn topic_gone_at(&mut self, place: Place) {
+        let (Some(slot), Some(thread_id)) = (self.registry.slot_by_topic(place), place.thread)
+        else {
+            return;
+        };
+        warn!(
+            ordinal = self.ordinal(slot),
+            "forum topic is gone; creating a replacement"
+        );
+        self.registry.topic_invalid(slot, place.chat, thread_id);
+    }
+
+    /// The bot may not write to private chat `chat` (403): its views wait
+    /// until its user writes to the bot, and the group is told once.
+    fn close_chat(&mut self, chat: Chat) {
+        let Chat::Private(private) = chat else {
+            return;
+        };
+        self.proven.remove(&private);
+        if !self.registry.closed.insert(private) {
+            return;
+        }
+        warn!("the bot may not write to a private chat; its views wait until its user writes");
+        if self.closed_told.insert(private) {
+            self.send_messages(vec![message_op(
+                Place::new(Chat::Group, None),
+                PRIVATE_CLOSED_NOTICE.to_owned(),
+            )]);
+        }
+    }
+
+    /// Its user wrote in private chat `chat`: the bot may write there again,
+    /// and its topics are made at once.
+    fn reopen(&mut self, chat: Chat) {
+        if let Chat::Private(private) = chat {
+            self.proven.insert(private);
+        }
+        if let Chat::Private(private) = chat
+            && self.registry.closed.remove(&private)
+        {
+            for view in self
+                .registry
+                .slots
+                .iter_mut()
+                .flat_map(|slot| &mut slot.views)
+                .filter(|view| view.chat == chat)
+            {
+                view.failed = None;
+            }
+            info!("a closed private chat is open again");
+        }
+        // Before the user's message is echoed there.
+        self.drop_fallback_views();
+    }
+
+    /// The owner a SessionStart names (TASK-063): the first allowlisted
+    /// user, or in a team the recorded owner of the device the hook came
+    /// from, else the first user.
+    fn owner_of_post(&self, post: &HookPost) -> Option<PrivateChat> {
+        let owners = self.options.owners.as_ref()?;
+        Some(match &owners.devices {
+            None => owners.first,
+            Some(devices) => post
+                .enrolled
+                .as_deref()
+                .and_then(|id| devices.owner(id))
+                .unwrap_or(owners.first),
+        })
+    }
+
+    /// A SessionStart made slot `made` (the first index past the slots
+    /// before it): with its owner's private chat usable the slot shows
+    /// there alone (TASK-063, decision 2026-09-28), else in the group as
+    /// before.
+    fn home_new_slot(&mut self, post: &HookPost, made: usize) {
+        let Some(owner) = self.owner_of_post(post) else {
+            return;
+        };
+        self.hook_owners.insert(post.session_id.clone(), owner);
+        let share = self.options.owners.as_ref().is_some_and(|o| o.share_new);
+        let slot = SlotId(made);
+        if share || self.registry.slots.len() <= made {
+            return;
+        }
+        if !self.registry.usable(Chat::Private(owner)) {
+            // In the group until the private chat opens (TASK-063).
+            self.mark_fallback(slot);
+            return;
+        }
+        if self.registry.make_private(slot, Chat::Private(owner)) {
+            info!(
+                ordinal = self.ordinal(slot),
+                "new slot shows in its owner's private chat only"
+            );
+        }
+    }
+
+    /// Every slot with a live session shows in its owner's private chat
+    /// too, once private chats are on (TASK-063); a slot with no usable
+    /// view (its private chat closed, or private chats off) shows in the
+    /// group.
+    fn ensure_private_views(&mut self) {
+        let sessions = &self.registry.sessions;
+        self.hook_owners
+            .retain(|session, _| sessions.contains_key(session));
+        self.add_private_views();
+        for index in 0..self.registry.slots.len() {
+            let slot = SlotId(index);
+            let live = self.registry.slots[index]
+                .current_session
+                .as_deref()
+                .is_some_and(|session| self.registry.is_live_top_level(session));
+            let usable = self.registry.slots[index]
+                .views
+                .iter()
+                .any(|view| self.registry.usable(view.chat));
+            if live && !usable && self.registry.add_view(slot, Chat::Group) {
+                self.mark_fallback(slot);
+                info!(
+                    ordinal = self.ordinal(slot),
+                    "slot shows in the group: its private chat is not usable"
+                );
+            }
+        }
+        self.drop_fallback_views();
+    }
+
+    /// The group view of `slot` is there only while its private chat is
+    /// not usable (TASK-063).
+    fn mark_fallback(&mut self, slot: SlotId) {
+        if let Some(view) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(Chat::Group))
+        {
+            view.fallback = true;
+            self.registry.dirty = true;
+        }
+    }
+
+    /// A slot that shows in the group only because its private chat was
+    /// closed (403) or private chats were off goes back to the private
+    /// chat alone once that chat takes the session again (TASK-063; the
+    /// user wants new sessions out of the group, sharing is TASK-064): the
+    /// private view is primary and the bot or the user wrote there since.
+    /// Its group topic is told so, gets the dead icon and loses its status
+    /// message.
+    fn drop_fallback_views(&mut self) {
+        for index in 0..self.registry.slots.len() {
+            let slot = SlotId(index);
+            let Some(Chat::Private(private)) = self
+                .registry
+                .primary_view(slot)
+                .map(|view| view.chat)
+                .filter(|chat| chat.is_private())
+            else {
+                continue;
+            };
+            if !self.proven.contains(&private) {
+                continue;
+            }
+            let fallback = self.registry.slots[index]
+                .views
+                .iter()
+                .find(|view| view.chat == Chat::Group && view.fallback);
+            // A topic being made goes once it is known.
+            if fallback.is_none_or(|view| view.topic_id.is_none() && view.busy) {
+                continue;
+            }
+            // It mirrored the private view (after a restart): twins may be
+            // on their way there still.
+            let mirrored = self
+                .primaries
+                .get(&slot)
+                .is_some_and(|place| place.chat == Chat::Private(private));
+            let Some(view) = self.registry.remove_view(slot, Chat::Group) else {
+                continue;
+            };
+            info!(
+                ordinal = self.ordinal(slot),
+                "slot leaves the group: its private chat takes the session again"
+            );
+            if let Some(status) = view.status {
+                self.retire(
+                    MessageKey::new(Chat::Group, status.message_id),
+                    status.pinned,
+                );
+            }
+            if let Some(thread_id) = view.topic_id {
+                self.send_messages(vec![message_op(
+                    Place::topic(Chat::Group, thread_id),
+                    FALLBACK_END_NOTICE.to_owned(),
+                )]);
+                let icon = self
+                    .options
+                    .icons
+                    .for_state(SlotState::Dead)
+                    .map(str::to_owned);
+                if icon.is_some() {
+                    self.hand_off(
+                        Work::Callback,
+                        Op::EditTopic {
+                            chat: Chat::Group,
+                            thread_id,
+                            name: None,
+                            icon_custom_emoji_id: icon,
+                        },
+                    );
+                }
+            }
+            if mirrored {
+                // The status moves: its old message takes its twin along,
+                // and a twin not sent yet never goes.
+                if let Some(shown) = self.shown.get(&slot) {
+                    for twin in &shown.twins {
+                        twin.cancel();
+                    }
+                }
+                if let Some(place) = self.registry.place(slot) {
+                    self.bottoms.entry(place).or_default().foreign = true;
+                }
+            }
+        }
+    }
+
+    fn add_private_views(&mut self) {
+        let Some(owners) = self.options.owners.clone() else {
+            return;
+        };
+        for index in 0..self.registry.slots.len() {
+            let slot = SlotId(index);
+            let Some(session) = self.registry.slots[index].current_session.clone() else {
+                continue;
+            };
+            if !self.registry.is_live_top_level(&session) {
+                continue;
+            }
+            // Only a session known to run: its SessionStart came in this run
+            // of the hub, or its agent is bound. One the registry still
+            // holds live after a restart may have died while the hub was
+            // down; it must not get an empty private topic.
+            let running = self.hook_owners.contains_key(&session)
+                || self
+                    .registry
+                    .sessions
+                    .get(&session)
+                    .is_some_and(|entry| entry.agent.is_some());
+            if !running {
+                continue;
+            }
+            // In a team the owner is known once the session's agent is
+            // bound: before, the slot would go to the wrong private chat.
+            let owner = match &owners.devices {
+                None => Some(owners.first),
+                Some(devices) => self.hook_owners.get(&session).copied().or_else(|| {
+                    self.registry
+                        .sessions
+                        .get(&session)
+                        .and_then(|entry| entry.agent)
+                        .and_then(|conn| self.conns.get(&conn))
+                        .map(|bound| {
+                            bound
+                                .enrolled
+                                .as_deref()
+                                .and_then(|id| devices.owner(id))
+                                .unwrap_or(owners.first)
+                        })
+                }),
+            };
+            let Some(owner) = owner.filter(|owner| !self.registry.closed.contains(owner)) else {
+                continue;
+            };
+            if self.registry.add_view(slot, Chat::Private(owner)) {
+                info!(
+                    ordinal = self.ordinal(slot),
+                    "slot shows in its owner's private chat too"
+                );
+            }
+        }
+    }
+
+    /// Follows each slot's primary topic: when the session is answered in
+    /// another view now (its private topic came, or its private chat
+    /// closed), the old view's status message goes and the turn message is
+    /// closed; the mirror views keep the twin of the status message.
+    fn follow_primaries(&mut self) {
+        for index in 0..self.registry.slots.len() {
+            let slot = SlotId(index);
+            let now = self.registry.place(slot);
+            let before = match now {
+                Some(place) => self.primaries.insert(slot, place),
+                None => self.primaries.remove(&slot),
+            };
+            if let (Some(old), Some(new)) = (before, now)
+                && old.chat != new.chat
+            {
+                self.primary_moved(slot, old);
+            }
+            self.sync_mirror_status(slot);
+        }
+    }
+
+    fn primary_moved(&mut self, slot: SlotId, old: Place) {
+        info!(
+            ordinal = self.ordinal(slot),
+            "slot's session is answered in another view now"
+        );
+        if let Some(session) = self
+            .registry
+            .slot(slot)
+            .and_then(|entry| entry.current_session.clone())
+            && let Some(live) = self.streams.get_mut(&session)
+        {
+            live.close_open();
+        }
+        // A closed private chat takes no call: its status message stays in
+        // its view, stale, until the chat opens and it is the status there
+        // again (edited, or moved below what came meanwhile).
+        let usable = self.registry.usable(old.chat);
+        let status = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(old.chat))
+            .filter(|view| usable && view.place() == Some(old))
+            .and_then(|view| view.status.take());
+        if let Some(status) = status {
+            self.registry.dirty = true;
+            self.retire(MessageKey::new(old.chat, status.message_id), status.pinned);
+        }
+        if let Some(shown) = self.shown.get_mut(&slot) {
+            shown.content = None;
+        }
+    }
+
+    /// The mirror views of `slot` keep the twin of its status message
+    /// (`registry.json` keeps it across a restart). A mirror topic that has
+    /// no twin of it at all (made after it, or its twin was dropped) gets
+    /// one: the status message moves in every view.
+    fn sync_mirror_status(&mut self, slot: SlotId) {
+        let Some(primary) = self.registry.primary_view(slot) else {
+            return;
+        };
+        let (primary_chat, status) = (primary.chat, primary.status_message());
+        let place = primary.place();
+        let untwinned = status.is_some_and(|status| {
+            self.registry
+                .mirrors(slot)
+                .iter()
+                .any(|mirror| !self.mirror.knows(status, mirror.chat))
+        });
+        if untwinned
+            && self.twin_posts < MAX_TWIN_POSTS
+            && let Some(place) = place
+        {
+            self.bottoms.entry(place).or_default().foreign = true;
+        }
+        // A closed private chat's view keeps its own (stale) status message.
+        let twins: Vec<(Chat, Option<StatusMessage>)> = self.registry.slots[slot.0]
+            .views
+            .iter()
+            .filter(|view| view.chat != primary_chat && self.registry.usable(view.chat))
+            .map(|view| {
+                let twin = status
+                    .and_then(|status| self.mirror.twin(status, view.chat))
+                    .map(|twin| StatusMessage {
+                        message_id: twin.id,
+                        pinned: false,
+                    });
+                (view.chat, twin)
+            })
+            .collect();
+        for (chat, twin) in twins {
+            if let Some(view) = self
+                .registry
+                .slot_mut(slot)
+                .and_then(|entry| entry.view_mut(chat))
+                && view.status != twin
+            {
+                view.status = twin;
+                self.registry.dirty = true;
             }
         }
     }
@@ -7604,6 +9235,54 @@ impl Slots {
                     bottom.last = bottom.last.max(message_id);
                 }
             }
+            Done::Landed {
+                place,
+                seq,
+                landed,
+                gone,
+                closed,
+            } => {
+                let text = self.unlanded.remove(&seq);
+                let twinned = self.mirror.twinned(seq);
+                let slot = self.registry.slot_by_topic(place);
+                let follows = self.mirror.primary_answered(seq, place.chat, landed);
+                self.follow(follows);
+                if let (Chat::Private(private), Landed::Message(_)) = (place.chat, landed) {
+                    self.proven.insert(private);
+                }
+                // A reply, notice or echo lost in a private chat goes again
+                // (TASK-063): into the topic made again; after a 403 into
+                // the slot's primary topic, unless its twin shows it there
+                // already (an echo or a notice about the user's own message
+                // was for the private chat alone).
+                if let (Some((op, answer)), Some(slot)) = (text, slot)
+                    && place.chat.is_private()
+                    && (gone || (closed && !answer && !twinned))
+                {
+                    info!(
+                        ordinal = self.ordinal(slot),
+                        "message lost in a private chat; it goes again"
+                    );
+                    self.keep_lost(LostMessage {
+                        slot,
+                        chat: place.chat,
+                        gone,
+                        op,
+                    });
+                }
+                // Users delete topics of their private chat (TASK-063).
+                if gone && place.chat.is_private() {
+                    self.topic_gone_at(place);
+                }
+                if closed {
+                    self.close_chat(place.chat);
+                }
+            }
+            Done::Twin {
+                id,
+                place,
+                delivery,
+            } => self.on_twin_done(id, place, delivery),
             Done::Retire { retire, delivery } => self.on_retire_done(retire, delivery),
             Done::Topic { job, delivery } => self.on_topic_done(job, delivery),
             Done::Delete(delivery) => match delivery {
@@ -7625,7 +9304,39 @@ impl Slots {
                     None => warn!("message to a topic got no answer"),
                 }
             }
-            Done::Permission { key, delivery } => {
+            Done::Permission { key, seq, delivery } => {
+                // Lost in a private chat (TASK-063): it stays open and goes
+                // again once the slot has a primary topic (the one made
+                // again, or the group's); the twins of this send are kept.
+                let lost_in = self
+                    .prompts
+                    .get(key)
+                    .and_then(|prompt| prompt.place)
+                    .map(|place| place.chat)
+                    .filter(|chat| lost_in_private(*chat, delivery.as_ref()));
+                if let Some(chat) = lost_in {
+                    self.again.insert(
+                        seq,
+                        Lost {
+                            asked: Asked::Prompt(key),
+                            chat,
+                            version: 0,
+                        },
+                    );
+                    if let Some(prompt) = self
+                        .prompts
+                        .get_mut(key)
+                        .filter(|prompt| prompt.state.is_active())
+                    {
+                        prompt.sent = false;
+                        prompt.place = None;
+                        info!(
+                            session = short(&prompt.session),
+                            "permission prompt lost in a private chat; it goes again"
+                        );
+                        return;
+                    }
+                }
                 match delivery {
                     Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
                         self.prompts.delivered(key, message.message_id);
@@ -7649,9 +9360,10 @@ impl Slots {
             Done::Question {
                 key,
                 version,
+                seq,
                 delivery,
             } => {
-                self.on_question_done(key, version, delivery);
+                self.on_question_done(key, version, seq, delivery);
                 self.release_held();
             }
             Done::QuestionEdit {
@@ -7799,6 +9511,10 @@ impl Slots {
     }
 
     fn on_topic_done(&mut self, job: TopicJob, delivery: Option<Delivery>) {
+        if delivery.as_ref().is_some_and(forbidden) {
+            // A private chat whose user never pressed Start (TASK-063).
+            self.close_chat(job.view().1);
+        }
         let icons = &self.options.icons;
         let Some(delivery) = delivery else {
             // The scheduler stopped: handing the job out again would come
@@ -7820,6 +9536,9 @@ impl Slots {
             } => match delivery {
                 Ok(Outcome::Topic(topic)) if topic.message_thread_id != 0 => {
                     info!(ordinal = self.ordinal(slot), "forum topic created");
+                    if let Chat::Private(private) = chat {
+                        self.proven.insert(private);
+                    }
                     self.registry.topic_created(
                         slot,
                         chat,
@@ -7906,6 +9625,7 @@ impl Slots {
         self.flush_all();
         self.offer_resume();
         let edits = Instant::now() >= self.grace_until;
+        self.ensure_private_views();
         self.pump_drains();
         let draining = self.draining_slots(Instant::now());
         for job in self
@@ -7950,6 +9670,9 @@ impl Slots {
             };
             self.hand_off(Work::Topic(job), op);
         }
+        self.follow_primaries();
+        self.send_lost_messages();
+        self.release_kept();
         self.send_after_separator(false);
         let room = MAX_BLOCK_JOBS.saturating_sub(self.block_jobs);
         for job in self.registry.block_work(room) {
@@ -7974,6 +9697,15 @@ impl Slots {
         self.warn_outdated();
         self.pump_updates();
         self.pump_status();
+        if self.mirror.take_changed() {
+            self.registry.twins = self
+                .mirror
+                .lasting()
+                .into_iter()
+                .map(|(primary, twin)| TwinLink { primary, twin })
+                .collect();
+            self.registry.dirty = true;
+        }
         if self.registry.dirty {
             self.registry.dirty = false;
             self.saver
@@ -8175,6 +9907,83 @@ struct Compaction {
     done: Option<(Duration, Instant)>,
 }
 
+/// What Telegram made of a new message of a primary topic, for its twins
+/// (TASK-063). A stream line refused for good (a 4xx but a lost topic, as
+/// [`Slots`] skips it: a 403 of a closed private chat, a bad request) is
+/// never sent again, so its twin stays; a prompt or question lost in a
+/// private chat goes again and keeps its twins ([`Landed::Again`]); any
+/// other failure is sent again (or ends) and takes its ghost twin away.
+fn landed_of(
+    work: &Work,
+    chat: Chat,
+    delivery: Option<&Delivery>,
+    message_id: Option<i64>,
+) -> Landed {
+    match (delivery, message_id) {
+        (_, Some(id)) => Landed::Message(id),
+        (Some(Ok(Outcome::Merged)), None) => Landed::Merged,
+        (delivery, None)
+            if matches!(work, Work::Permission(_) | Work::Question { .. })
+                && lost_in_private(chat, delivery) =>
+        {
+            Landed::Again
+        }
+        (Some(result @ Err(ApiError::Telegram { code, .. })), None)
+            if matches!(work, Work::Stream { .. })
+                && (400..500).contains(code)
+                && !topic_gone(result) =>
+        {
+            Landed::Merged
+        }
+        _ => Landed::Nothing,
+    }
+}
+
+/// A send to `chat` that a private chat lost for now (TASK-063): its topic
+/// was deleted (a new one is made) or the bot may not write there (the
+/// slot goes on in the group). The group never counts: a 403 there closes
+/// nothing, and a lost group topic is not made again from here.
+fn lost_in_private(chat: Chat, delivery: Option<&Delivery>) -> bool {
+    chat.is_private()
+        && delivery.is_some_and(|delivery| topic_gone(delivery) || forbidden(delivery))
+}
+
+/// `/start` (optionally `@bot`, a payload after it): what Telegram sends
+/// when a user presses Start in the bot's private chat.
+fn is_start(text: Option<&str>) -> bool {
+    text.and_then(|text| text.split_whitespace().next())
+        .and_then(|word| word.strip_prefix("/start"))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('@'))
+}
+
+/// The echo of a user's message (TASK-063): `✉ <author>: <text>`, a file as
+/// `📎 <name>` before its caption, a forward marked `↪`; cut to Telegram's
+/// limit.
+fn echo_text(
+    author: Option<&str>,
+    forwarded: bool,
+    text: &str,
+    file: Option<&Attachment>,
+) -> String {
+    let mut body = String::new();
+    if forwarded {
+        body.push_str("↪ ");
+    }
+    if let Some(file) = file {
+        body.push_str("📎 ");
+        body.push_str(file.name.as_deref().unwrap_or(file.kind.as_str()));
+        if !text.is_empty() {
+            body.push('\n');
+        }
+    }
+    body.push_str(text);
+    let author = author.unwrap_or(ECHO_NO_NAME);
+    cut(
+        &format!("{ECHO_MARK} {author}: {body}"),
+        transcript::TELEGRAM_TEXT_LIMIT,
+    )
+}
+
 /// A plain message without a sound.
 fn message_op(place: Place, text: String) -> Op {
     Op::Send {
@@ -8196,14 +10005,24 @@ async fn dispatch_loop(
     mut work: mpsc::UnboundedReceiver<(Work, Op)>,
     done: mpsc::UnboundedSender<Done>,
 ) {
+    // The dispatch number of each job, as the actor counts them.
+    let mut seq = 0;
     while let Some((work, op)) = work.recv().await {
-        let posts = op.posts();
+        seq += 1;
+        let posts = op.posts().filter(|_| !matches!(work, Work::Twin { .. }));
         let answer = match &work {
             Work::Status {
                 job:
                     StatusJob::Create { content, .. }
                     | StatusJob::Replace { content, .. }
                     | StatusJob::Edit { content, .. },
+                ..
+            } => outbox.submit_status(op, content.clone()).await,
+            // A status message in a mirror topic goes like the primary one:
+            // with the status of when it goes, and a prompt of its topic
+            // drops a new one while it waits (TASK-063).
+            Work::Twin {
+                status: Some(content),
                 ..
             } => outbox.submit_status(op, content.clone()).await,
             _ => outbox.submit(op).await,
@@ -8219,16 +10038,30 @@ async fn dispatch_loop(
                     _ => None,
                 };
                 let _ = done.send(Done::Posted { place, message_id });
+                let landed = landed_of(&work, place.chat, delivery.as_ref(), message_id);
+                let _ = done.send(Done::Landed {
+                    place,
+                    seq,
+                    landed,
+                    gone: delivery.as_ref().is_some_and(topic_gone),
+                    closed: delivery.as_ref().is_some_and(forbidden),
+                });
             }
             let _ = done.send(match work {
+                Work::Twin { id, place, .. } => Done::Twin {
+                    id,
+                    place,
+                    delivery,
+                },
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
-                Work::Message => Done::Message(delivery),
-                Work::Permission(key) => Done::Permission { key, delivery },
+                Work::Message | Work::Answer => Done::Message(delivery),
+                Work::Permission(key) => Done::Permission { key, seq, delivery },
                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
                 Work::Question { key, version } => Done::Question {
                     key,
                     version,
+                    seq,
                     delivery,
                 },
                 Work::QuestionEdit { key, version } => Done::QuestionEdit {
@@ -8594,6 +10427,8 @@ mod tests {
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             };
             self.agents
@@ -8634,6 +10469,7 @@ mod tests {
     fn say(thread_id: Option<i64>, message_id: i64, text: Option<&str>) -> Control {
         Control::Message(Inbound {
             chat: Chat::Group,
+            sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id,
             text: text.map(str::to_owned),
@@ -8642,6 +10478,7 @@ mod tests {
             forwarded: false,
             media: None,
             from_name: None,
+            author: None,
         })
     }
 
@@ -8711,6 +10548,7 @@ mod tests {
         rig.control
             .send(Control::Message(Inbound {
                 chat: Chat::Group,
+                sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 43,
                 thread_id: Some(101),
                 text: Some("again".into()),
@@ -8719,11 +10557,13 @@ mod tests {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             }))
             .unwrap();
         rig.control
             .send(Control::Message(Inbound {
                 chat: Chat::Group,
+                sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 46,
                 thread_id: Some(101),
                 text: Some("чужие слова".into()),
@@ -8732,6 +10572,7 @@ mod tests {
                 forwarded: true,
                 media: None,
                 from_name: None,
+                author: None,
             }))
             .unwrap();
         // General and a topic that is no slot reach nobody and say nothing.
@@ -9537,6 +11378,7 @@ again"
         rig.control
             .send(Control::Message(Inbound {
                 chat: Chat::Group,
+                sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 51,
                 thread_id: Some(100),
                 text: Some("Green".into()),
@@ -9545,6 +11387,7 @@ again"
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             }))
             .unwrap();
         settled(&rig, |ops| {
@@ -10662,6 +12505,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -10716,6 +12561,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: true,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -11537,6 +13384,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -11633,6 +13482,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -12690,6 +14541,8 @@ again"
             files: false,
             session_reads: true,
             status_lines: false,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
         }
     }
@@ -13072,6 +14925,7 @@ again"
             rig.control
                 .send(Control::Message(Inbound {
                     chat: Chat::Group,
+                    sender: crate::hub::chat::PrivateChat::of_user(1001),
                     message_id,
                     thread_id: Some(100),
                     text: Some("hi".into()),
@@ -13080,6 +14934,7 @@ again"
                     forwarded: false,
                     media: None,
                     from_name: None,
+                    author: None,
                 }))
                 .unwrap();
         }
@@ -14773,6 +16628,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             };
             self.agents
@@ -15168,6 +17025,8 @@ again"
                     files: false,
                     session_reads: false,
                     status_lines: false,
+                    private_place: false,
+                    enrolled: None,
                     heartbeat: false,
                 },
                 to_agent,
@@ -15222,6 +17081,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -15269,6 +17130,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -15328,6 +17191,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -16740,6 +18605,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -16951,6 +18818,8 @@ again"
             files: false,
             session_reads: false,
             status_lines: false,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
         };
         rig.agents
@@ -17988,6 +19857,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -18670,6 +20541,8 @@ again"
                 files: false,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -18680,6 +20553,7 @@ again"
     fn topic_text(message_id: i64, text: &str, forwarded: bool) -> Inbound {
         Inbound {
             chat: Chat::Group,
+            sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id: Some(100),
             text: Some(text.into()),
@@ -18688,6 +20562,7 @@ again"
             forwarded,
             media: None,
             from_name: None,
+            author: None,
         }
     }
 
@@ -18882,6 +20757,7 @@ again"
     fn photo(message_id: i64, file_id: &str, caption: Option<&str>, size: Option<u64>) -> Control {
         Control::Message(Inbound {
             chat: Chat::Group,
+            sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id: Some(100),
             text: None,
@@ -18898,6 +20774,7 @@ again"
                 caption: caption.map(str::to_owned),
             }),
             from_name: None,
+            author: None,
         })
     }
 
@@ -18926,6 +20803,8 @@ again"
                 files,
                 session_reads: false,
                 status_lines: false,
+                private_place: false,
+                enrolled: None,
                 heartbeat: false,
             },
             to_agent,
@@ -21051,5 +22930,669 @@ again"
             Some(MessageKey::new(Chat::Group, 504)),
             "below the second prompt (503), the last message of its topic"
         );
+    }
+
+    /// Private chats on with one owner; new slots shared to the group too,
+    /// for the mirror (TASK-063).
+    fn private_options() -> Options {
+        Options {
+            owners: Some(Owners {
+                first: PrivateChat::of_user(7),
+                devices: None,
+                share_new: true,
+            }),
+            ..message_options()
+        }
+    }
+
+    /// TASK-063 (decision 2026-09-28): a new slot shows in its owner's
+    /// private chat alone; with that chat closed (403) it shows in the
+    /// group, and a slot whose private view is not usable gets the group.
+    #[tokio::test]
+    async fn a_new_slot_shows_in_the_private_chat_alone_or_else_in_the_group() {
+        let dir = TempDir::new("slots-private-home");
+        let options = Options {
+            owners: Some(Owners {
+                first: PrivateChat::of_user(7),
+                devices: None,
+                share_new: false,
+            }),
+            ..message_options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        let owner = private_owner();
+        slots.on_hook(&start(A, 10));
+        assert_eq!(
+            slots.registry.slots[0].views,
+            [crate::hub::registry::View::new(owner)]
+        );
+        slots.pump();
+        assert_eq!(slots.registry.slots[0].views.len(), 1, "no group view");
+        // The owner blocked the bot: the slot shows in the group too.
+        let Chat::Private(private) = owner else {
+            unreachable!()
+        };
+        slots.registry.closed.insert(private);
+        slots.pump();
+        let chats: Vec<(Chat, bool)> = slots.registry.slots[0]
+            .views
+            .iter()
+            .map(|view| (view.chat, view.fallback))
+            .collect();
+        assert_eq!(chats, [(owner, false), (Chat::Group, true)]);
+        // A new slot while the chat is closed: the group, as before, until
+        // the chat opens.
+        slots.on_hook(&start(B, 11));
+        assert_eq!(
+            slots.registry.slots[1].views,
+            [crate::hub::registry::View {
+                fallback: true,
+                ..crate::hub::registry::View::new(Chat::Group)
+            }]
+        );
+    }
+
+    fn private_owner() -> Chat {
+        Chat::Private(PrivateChat::of_user(7))
+    }
+
+    /// Private chats on as the hub runs: new slots in the private chat alone.
+    fn private_only_options() -> Options {
+        Options {
+            owners: Some(Owners {
+                first: PrivateChat::of_user(7),
+                devices: None,
+                share_new: false,
+            }),
+            ..message_options()
+        }
+    }
+
+    /// TASK-063 (code review 6): a slot that got a group view only because
+    /// its private chat was closed leaves the group once that chat opens and
+    /// has the session again: its group topic is told and gets the dead
+    /// icon. A slot shared from the start keeps its group view.
+    #[tokio::test]
+    async fn a_slot_in_the_group_for_a_closed_chat_leaves_it_once_the_chat_opens() {
+        let dir = TempDir::new("slots-private-fallback");
+        let mut slots = stalled_slots(&dir, private_only_options());
+        let owner = private_owner();
+        let Chat::Private(private) = owner else {
+            unreachable!()
+        };
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        slots.close_chat(owner);
+        slots.pump();
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        // A slot shared from before: its group view is no fallback.
+        slots.on_hook(&start(B, 11));
+        slots.registry.slots[1].views = vec![
+            crate::hub::registry::View::new(Chat::Group),
+            crate::hub::registry::View::new(owner),
+        ];
+        slots
+            .registry
+            .topic_created(SlotId(1), Chat::Group, 101, "t", None);
+        slots
+            .registry
+            .topic_created(SlotId(1), owner, 701, "t", None);
+        slots.pump();
+        assert_eq!(
+            slots.registry.place(SlotId(0)),
+            Some(Place::topic(Chat::Group, 100))
+        );
+        let mut work = capture_dispatch(&mut slots);
+        // Still closed: nothing changes.
+        slots.pump();
+        assert_eq!(slots.registry.slots[0].views.len(), 2);
+        // The owner writes to the bot.
+        slots.reopen(owner);
+        assert!(slots.proven.contains(&private));
+        slots.pump();
+        let chats: Vec<Chat> = slots.registry.slots[0]
+            .views
+            .iter()
+            .map(|view| view.chat)
+            .collect();
+        assert_eq!(chats, [owner], "the private chat alone again");
+        assert_eq!(
+            slots.registry.place(SlotId(0)),
+            Some(Place::topic(owner, 700))
+        );
+        assert_eq!(
+            slots.registry.slots[1].views.len(),
+            2,
+            "a shared slot stays"
+        );
+        let group: Vec<Op> = all_work(&mut work)
+            .into_iter()
+            .map(|(_, op)| op)
+            .filter(|op| op.chat() == Some(Chat::Group))
+            .collect();
+        assert!(
+            group.iter().any(
+                |op| matches!(op, Op::Send { thread_id: Some(100), text, .. }
+                if text == FALLBACK_END_NOTICE)
+            ),
+            "{group:#?}"
+        );
+        assert!(
+            group.iter().any(|op| matches!(op, Op::EditTopic { thread_id: 100, icon_custom_emoji_id: Some(icon), .. }
+                if Some(icon.as_str()) == slots.options.icons.for_state(SlotState::Dead))),
+            "{group:#?}"
+        );
+        assert!(
+            group
+                .iter()
+                .all(|op| op.place().is_none_or(|place| place.thread != Some(101))),
+            "nothing for the shared slot's group topic: {group:#?}"
+        );
+    }
+
+    /// TASK-063 (code review 2): after a restart the registry still holds
+    /// sessions that may have died while the hub was down. Their slots get
+    /// no private view until the session shows it runs: its agent binds (or
+    /// its SessionStart comes).
+    #[tokio::test]
+    async fn a_session_held_over_a_restart_gets_a_private_view_once_its_agent_binds() {
+        let dir = TempDir::new("slots-private-zombie");
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, 10));
+        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.after_restart();
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(registry, store, outbox, private_only_options());
+        slots.pump();
+        assert_eq!(
+            slots.registry.slots[0].views.len(),
+            1,
+            "no private topic for a session that may be dead"
+        );
+        connect(&mut slots, 1, A, Some(10));
+        slots.pump();
+        let chats: Vec<Chat> = slots.registry.slots[0]
+            .views
+            .iter()
+            .map(|view| view.chat)
+            .collect();
+        assert_eq!(chats, [Chat::Group, private_owner()]);
+    }
+
+    /// TASK-063 (code review 5): when the private chat closes (403), its
+    /// status message stays in its view and is not cleared away (the chat
+    /// takes no call); the group's view goes on as the primary one.
+    #[tokio::test]
+    async fn a_closed_private_chat_keeps_its_status_message() {
+        let dir = TempDir::new("slots-private-closed-status");
+        let owner = private_owner();
+        let mut slots = stalled_slots(&dir, private_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        slots.registry.add_view(SlotId(0), owner);
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        slots.registry.slots[0].views[1].status = Some(StatusMessage {
+            message_id: 5900,
+            pinned: false,
+        });
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 900,
+            pinned: false,
+        });
+        slots.mirror.link(
+            MessageKey::new(owner, 5900),
+            MessageKey::new(Chat::Group, 900),
+        );
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        slots.close_chat(owner);
+        slots.pump();
+        assert_eq!(
+            slots.registry.place(SlotId(0)),
+            Some(Place::topic(Chat::Group, 100))
+        );
+        assert_eq!(
+            slots.registry.slots[0].views[1].status,
+            Some(StatusMessage {
+                message_id: 5900,
+                pinned: false
+            }),
+            "kept in its view"
+        );
+        let calls: Vec<Op> = all_work(&mut work).into_iter().map(|(_, op)| op).collect();
+        assert!(
+            calls.iter().all(|op| op.chat() != Some(owner)),
+            "no call into the closed chat: {calls:#?}"
+        );
+    }
+
+    /// TASK-063 (code review 1): a question whose message finds its private
+    /// topic deleted is not sent to the terminal: it waits for the topic
+    /// made again and goes there.
+    #[tokio::test]
+    async fn a_question_lost_in_a_deleted_private_topic_goes_again() {
+        let dir = TempDir::new("slots-private-question-again");
+        let owner = private_owner();
+        let mut slots = stalled_slots(&dir, private_only_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        let mut work = capture_dispatch(&mut slots);
+        let (answer, _answered) = oneshot::channel();
+        slots.on_question_ask(QuestionAsk {
+            post: question_post(A),
+            answer,
+        });
+        let before = slots.handed;
+        slots.pump();
+        let (seq, key, version) = all_work(&mut work)
+            .into_iter()
+            .enumerate()
+            .find_map(|(n, (job, op))| match job {
+                Work::Question { key, version } => {
+                    assert_eq!(op.place(), Some(Place::topic(owner, 700)));
+                    Some((before + 1 + n as u64, key, version))
+                }
+                _ => None,
+            })
+            .expect("the question is sent");
+        let gone = || {
+            Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message thread not found".into(),
+            }))
+        };
+        slots.on_done(Done::Landed {
+            place: Place::topic(owner, 700),
+            seq,
+            landed: Landed::Again,
+            gone: true,
+            closed: false,
+        });
+        slots.on_done(Done::Question {
+            key,
+            version,
+            seq,
+            delivery: gone(),
+        });
+        slots.pump();
+        assert!(
+            slots
+                .questions
+                .get(key)
+                .is_some_and(questions::Ask::is_open),
+            "not sent to the terminal"
+        );
+        assert_eq!(
+            slots.registry.place(SlotId(0)),
+            None,
+            "its topic is made again"
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 701, "t", None);
+        slots.pump();
+        let again: Vec<Option<Place>> = all_work(&mut work)
+            .into_iter()
+            .filter(|(job, _)| matches!(job, Work::Question { .. }))
+            .map(|(_, op)| op.place())
+            .collect();
+        assert_eq!(again, [Some(Place::topic(owner, 701))]);
+        assert!(slots.again.is_empty());
+    }
+
+    /// TASK-063 (code review 1): the twin of a prompt lost in a deleted
+    /// private topic is kept in the group; pressed before the prompt went
+    /// again, it is the prompt: the press decides it, and it does not go
+    /// again.
+    #[tokio::test]
+    async fn a_press_on_the_kept_twin_of_a_lost_prompt_decides_it() {
+        let dir = TempDir::new("slots-private-kept-press");
+        let owner = private_owner();
+        let mut slots = stalled_slots(&dir, private_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        slots.registry.add_view(SlotId(0), owner);
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_agent(permission(1, "abcde", "ls"));
+        let before = slots.handed;
+        slots.pump();
+        let handed = all_work(&mut work);
+        let mut seq = None;
+        let mut twin = None;
+        for (n, (job, op)) in handed.into_iter().enumerate() {
+            match job {
+                Work::Permission(_) => {
+                    assert_eq!(op.place(), Some(Place::topic(owner, 700)));
+                    seq = Some(before + 1 + n as u64);
+                }
+                Work::Twin { id, place, .. } => {
+                    assert_eq!(place, Some(Place::topic(Chat::Group, 100)));
+                    twin = Some((id, place));
+                }
+                _ => {}
+            }
+        }
+        let (seq, (id, place)) = (seq.unwrap(), twin.unwrap());
+        let key = slots.prompts.active()[0];
+        slots.on_done(Done::Twin {
+            id,
+            place,
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 950,
+                ..Message::default()
+            }))),
+        });
+        slots.on_done(Done::Landed {
+            place: Place::topic(owner, 700),
+            seq,
+            landed: Landed::Again,
+            gone: true,
+            closed: false,
+        });
+        slots.on_done(Done::Permission {
+            key,
+            seq,
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message thread not found".into(),
+            })),
+        });
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().all(|(_, op)| !matches!(
+                op,
+                Op::Delete {
+                    chat: Chat::Group,
+                    message_id: 950
+                }
+            )),
+            "the twin is kept: {handed:#?}"
+        );
+        assert!(
+            !handed
+                .iter()
+                .any(|(job, _)| matches!(job, Work::Permission(_))),
+            "it waits for its private topic"
+        );
+        slots.on_control(press("q", Some(950), "allow:abcde"));
+        assert_eq!(
+            slots.prompts.by_message(MessageKey::new(Chat::Group, 950)),
+            Some(key)
+        );
+        assert!(matches!(
+            slots.prompts.get(key).map(|prompt| prompt.state),
+            Some(State::Selected {
+                behavior: Behavior::Allow,
+                ..
+            })
+        ));
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 701, "t", None);
+        slots.pump();
+        assert!(
+            !all_work(&mut work)
+                .iter()
+                .any(|(job, _)| matches!(job, Work::Permission(_))),
+            "decided: it does not go again"
+        );
+        assert!(slots.again.is_empty());
+    }
+
+    /// Everything handed to the dispatch task so far.
+    fn all_work(work: &mut mpsc::UnboundedReceiver<(Work, Op)>) -> Vec<(Work, Op)> {
+        let mut all = Vec::new();
+        while let Ok(item) = work.try_recv() {
+            all.push(item);
+        }
+        all
+    }
+
+    /// TASK-063: the twin of the status message is kept in registry.json;
+    /// after a restart an edit of the status message reaches it too.
+    #[tokio::test]
+    async fn a_restart_keeps_the_twin_of_the_status_message() {
+        let dir = TempDir::new("slots-twin-restart");
+        let owner = private_owner();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, 10));
+        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.add_view(SlotId(0), owner);
+        registry.topic_created(SlotId(0), owner, 700, "t", None);
+        registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 900,
+            pinned: false,
+        });
+        registry.slots[0].views[1].status = Some(StatusMessage {
+            message_id: 5900,
+            pinned: false,
+        });
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(registry, store, outbox, private_options());
+        let mut work = capture_dispatch(&mut slots);
+        let primary = MessageKey::new(owner, 5900);
+        assert_eq!(
+            slots.registry.place(SlotId(0)),
+            Some(Place::topic(owner, 700))
+        );
+        assert_eq!(
+            slots.mirror.primary_of(MessageKey::new(Chat::Group, 900)),
+            Some(primary)
+        );
+        slots.hand_off(
+            Work::Callback,
+            Op::Edit {
+                chat: owner,
+                message_id: 5900,
+                text: "x".into(),
+                reply_markup: None,
+                background: false,
+            },
+        );
+        let edited: Vec<MessageKey> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(_, op)| match op {
+                Op::Edit {
+                    chat, message_id, ..
+                } => Some(MessageKey::new(chat, message_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edited, [primary, MessageKey::new(Chat::Group, 900)]);
+    }
+
+    /// TASK-063: the twin of a lasting message (a subagent block) is kept
+    /// in registry.json: after a restart the block's final edit reaches
+    /// the group too, and a press or reply on it counts for the primary.
+    #[tokio::test]
+    async fn a_restart_keeps_the_twin_of_a_block() {
+        let dir = TempDir::new("slots-twin-block");
+        let owner = private_owner();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, 10));
+        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.add_view(SlotId(0), owner);
+        registry.topic_created(SlotId(0), owner, 700, "t", None);
+        let (primary, twin) = (
+            MessageKey::new(owner, 5100),
+            MessageKey::new(Chat::Group, 910),
+        );
+        registry.twins = vec![TwinLink { primary, twin }];
+        let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
+        assert_eq!(saved.twins, registry.twins, "kept in registry.json");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(saved, store, outbox, private_options());
+        let mut work = capture_dispatch(&mut slots);
+        assert_eq!(slots.mirror.primary_of(twin), Some(primary));
+        slots.hand_off(
+            Work::Callback,
+            Op::Edit {
+                chat: owner,
+                message_id: 5100,
+                text: "↳ Explore: итог".into(),
+                reply_markup: None,
+                background: false,
+            },
+        );
+        let edited: Vec<MessageKey> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(_, op)| match op {
+                Op::Edit {
+                    chat, message_id, ..
+                } => Some(MessageKey::new(chat, message_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(edited, [primary, twin]);
+    }
+
+    /// TASK-063: a stream line the private chat refused for good (403 of
+    /// a blocked bot, a bad request) is skipped, not sent again: its twin
+    /// in the group stays. A lost topic sends it again: the twin goes.
+    #[test]
+    fn a_stream_line_skipped_for_good_keeps_its_twin() {
+        let stream = Work::Stream {
+            session: A.to_owned(),
+            number: 1,
+        };
+        let refused = |code: i64, description: &str| -> Delivery {
+            Err(ApiError::Telegram {
+                code,
+                description: description.to_owned(),
+            })
+        };
+        let forbidden = refused(403, "Forbidden: bot was blocked by the user");
+        let gone = refused(400, "Bad Request: message thread not found");
+        let owner = private_owner();
+        assert_eq!(
+            landed_of(&stream, owner, Some(&forbidden), None),
+            Landed::Merged
+        );
+        assert_eq!(
+            landed_of(&stream, owner, Some(&gone), None),
+            Landed::Nothing
+        );
+        assert_eq!(
+            landed_of(&Work::Message, owner, Some(&forbidden), None),
+            Landed::Nothing
+        );
+        assert_eq!(landed_of(&stream, owner, None, None), Landed::Nothing);
+        assert_eq!(
+            landed_of(&stream, owner, Some(&forbidden), Some(7)),
+            Landed::Message(7)
+        );
+        // A prompt or question lost in a private chat goes again and keeps
+        // its twins; in the group it does not.
+        let prompt = Work::Permission(1);
+        let question = Work::Question { key: 1, version: 1 };
+        for lost in [&gone, &forbidden] {
+            assert_eq!(landed_of(&prompt, owner, Some(lost), None), Landed::Again);
+            assert_eq!(landed_of(&question, owner, Some(lost), None), Landed::Again);
+            assert_eq!(
+                landed_of(&prompt, Chat::Group, Some(lost), None),
+                Landed::Nothing
+            );
+        }
+        let bad = refused(400, "Bad Request: can't parse entities");
+        assert_eq!(landed_of(&prompt, owner, Some(&bad), None), Landed::Nothing);
+    }
+
+    /// TASK-063: at most `MAX_TWIN_POSTS` twins wait for Telegram; the
+    /// primary topic gets every message, the mirror is told once it caught
+    /// up.
+    #[tokio::test]
+    async fn a_mirror_that_falls_behind_drops_twins_and_is_told_once() {
+        let dir = TempDir::new("slots-twin-gap");
+        let owner = private_owner();
+        let mut slots = stalled_slots(&dir, private_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        slots.registry.add_view(SlotId(0), owner);
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        let mut work = capture_dispatch(&mut slots);
+        let (primary, mirror) = (Place::topic(owner, 700), Place::topic(Chat::Group, 100));
+        for n in 0..MAX_TWIN_POSTS + 3 {
+            assert!(slots.send_messages(vec![message_op(primary, format!("m{n}"))]));
+        }
+        let handed = all_work(&mut work);
+        let primaries = handed
+            .iter()
+            .filter(|(_, op)| op.place() == Some(primary))
+            .count();
+        let twins: Vec<(Option<u64>, Option<Place>)> = handed
+            .iter()
+            .filter_map(|(work, _)| match work {
+                Work::Twin { id, place, .. } => Some((*id, *place)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(primaries, MAX_TWIN_POSTS + 3, "the primary topic gets all");
+        assert_eq!(twins.len(), MAX_TWIN_POSTS);
+        assert!(twins.iter().all(|(_, place)| *place == Some(mirror)));
+        assert!(slots.gaps.contains(&mirror));
+        for (n, (id, place)) in twins.into_iter().enumerate() {
+            slots.on_done(Done::Twin {
+                id,
+                place,
+                delivery: Some(Ok(Outcome::Sent(Message {
+                    message_id: 2000 + n as i64,
+                    ..Message::default()
+                }))),
+            });
+        }
+        let told: Vec<String> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(_, op)| match op {
+                Op::Send {
+                    chat,
+                    thread_id,
+                    text,
+                    ..
+                } if Place::new(chat, thread_id) == mirror => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told, [MIRROR_GAP_NOTICE]);
+        assert!(slots.gaps.is_empty());
     }
 }

@@ -548,6 +548,8 @@ impl Agent {
             files: false,
             session_reads: false,
             status_lines,
+            private_place: false,
+            enrolled: None,
             heartbeat: false,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
@@ -1157,6 +1159,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
         hub.control
             .send(Control::Message(Inbound {
                 chat: Chat::Group,
+                sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
                 thread_id: Some(100),
                 text: Some(text.into()),
@@ -1165,6 +1168,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                author: None,
             }))
             .unwrap();
     };
