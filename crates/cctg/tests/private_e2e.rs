@@ -6,7 +6,8 @@
 //! message of the group and its twin in the private chat have different
 //! ids. Private chats are on (`Options::owners`) with one owner. Sharing a
 //! slot to the group and taking it out (TASK-064), then the menu in the
-//! private chat's General (TASK-073), at the end.
+//! private chat's General (TASK-073) and its compact turn view (TASK-076),
+//! at the end.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -31,6 +32,7 @@ use cctg::hub::updates::{CallbackInput, Inbound};
 use cctg::hub::{permissions, updates};
 use cctg::wire::{
     self, AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionRequest, Register, Secret,
+    StreamItem, StreamLine,
 };
 use serde_json::Value;
 use tokio::io::BufReader;
@@ -67,6 +69,8 @@ fn owner() -> Chat {
 struct Shown {
     id: i64,
     text: String,
+    /// The HTML it was last sent or written with (TASK-076).
+    html: Option<String>,
     /// The texts of its buttons.
     buttons: Vec<String>,
     loud: bool,
@@ -93,6 +97,9 @@ struct Fake {
     forbid_private: AtomicBool,
     /// `deleteForumTopic` is refused: the bot may not delete messages.
     refuse_topic_delete: AtomicBool,
+    /// HTML with a quote is refused as markup Telegram cannot parse
+    /// (TASK-076).
+    refuse_quote: AtomicBool,
 }
 
 fn buttons(markup: Option<&Value>) -> Vec<String> {
@@ -145,6 +152,20 @@ impl Transport for Fake {
                 description: "Forbidden: bot can't initiate conversation with a user".into(),
             });
         }
+        if self.refuse_quote.load(Ordering::SeqCst)
+            && let Op::Send {
+                html: Some(html), ..
+            }
+            | Op::Stream {
+                html: Some(html), ..
+            } = op
+            && html.contains("<blockquote")
+        {
+            return Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: can't parse entities: unsupported start tag".into(),
+            });
+        }
         // Ids of the group and of the private chat never meet.
         let base = if chat.is_private() { 5000 } else { 1000 };
         let mut chats = self.chats.lock().unwrap();
@@ -174,6 +195,7 @@ impl Transport for Fake {
             Op::Send {
                 thread_id,
                 text,
+                html,
                 reply_markup,
                 permission,
                 notify,
@@ -182,6 +204,7 @@ impl Transport for Fake {
                 let shown = Shown {
                     id: 0,
                     text: text.clone(),
+                    html: html.clone(),
                     buttons: buttons(reply_markup.as_ref()),
                     loud: *notify,
                     status: reply_markup.is_some() && !permission,
@@ -191,6 +214,7 @@ impl Transport for Fake {
             Op::Stream {
                 thread_id,
                 text,
+                html,
                 notify,
                 into: None,
                 ..
@@ -198,6 +222,7 @@ impl Transport for Fake {
                 let shown = Shown {
                     id: 0,
                     text: text.clone(),
+                    html: html.clone(),
                     buttons: Vec::new(),
                     loud: *notify,
                     status: false,
@@ -206,11 +231,13 @@ impl Transport for Fake {
             }
             Op::Stream {
                 text,
+                html,
                 into: Some(id),
                 ..
             } => match model.message(*id) {
                 Some(shown) => {
                     shown.text.clone_from(text);
+                    shown.html.clone_from(html);
                     shown.buttons.clear();
                     shown.status = false;
                     sent(*id)
@@ -225,6 +252,7 @@ impl Transport for Fake {
             } => match model.message(*message_id) {
                 Some(shown) => {
                     shown.text.clone_from(text);
+                    shown.html = None;
                     if reply_markup.is_some() {
                         shown.buttons = buttons(reply_markup.as_ref());
                     }
@@ -338,6 +366,7 @@ impl Fake {
         let shown = Shown {
             id: 0,
             text: text.into(),
+            html: None,
             buttons: Vec::new(),
             loud: false,
             status: false,
@@ -528,6 +557,24 @@ impl Hub {
         .await;
     }
 
+    /// [`Hub::start`] with a transcript path (TASK-076): the session is
+    /// streamed through its agent, the hub never reads the file itself.
+    async fn start_streamed(&self) {
+        let path = self._state.0.join("never-written.jsonl");
+        let post = HookPost::new(
+            HOST.into(),
+            SESSION.into(),
+            CWD.into(),
+            path.display().to_string(),
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(4242),
+                parent_claude_pid: None,
+            },
+        );
+        self.hooks.send(post).await.unwrap();
+    }
+
     /// Waits until `ready` holds.
     async fn until(&self, what: &str, ready: impl Fn(&Fake) -> bool) {
         let reached = async {
@@ -702,6 +749,32 @@ impl Agent {
     /// actor bound the agent waits in the buffer with a notice, as it would
     /// for a real session whose agent is not up yet.
     async fn connect_as(hub: &Hub, private_place: bool, console_keys: bool) -> Self {
+        Self::connect_with(hub, private_place, console_keys, false).await
+    }
+
+    /// An agent in the private chat that reads transcripts (TASK-076): a
+    /// task of its own answers every read from `transcript`.
+    async fn serve(hub: &Hub, transcript: Transcript) -> JoinHandle<()> {
+        let mut agent = Self::connect_with(hub, true, false, true).await;
+        tokio::spawn(async move {
+            while let Some(msg) = agent.next_within(Duration::from_secs(3600)).await {
+                if let HubMsg::TranscriptRead {
+                    session_id, from, ..
+                } = msg
+                {
+                    let chunk = transcript.chunk(session_id, from);
+                    agent.send(chunk).await;
+                }
+            }
+        })
+    }
+
+    async fn connect_with(
+        hub: &Hub,
+        private_place: bool,
+        console_keys: bool,
+        transcript_reads: bool,
+    ) -> Self {
         let from = hub.fake.ops().len();
         let stream = TcpStream::connect(hub.agent_addr).await.unwrap();
         let (read, mut write) = stream.into_split();
@@ -715,7 +788,7 @@ impl Agent {
             cwd: CWD.into(),
             claude_pid: Some(4242),
             verdict_ack: true,
-            transcript_reads: false,
+            transcript_reads,
             console_keys,
             console_commands: false,
             client: None,
@@ -2117,7 +2190,7 @@ async fn e2e_menu_sections_change_settings_and_they_survive_a_restart() {
     );
     assert!(shown.buttons.contains(&"🕒 Пояс: UTC+3".to_owned()));
     let want = serde_json::json!({
-        "detail": "brief", "thinking": false, "sound": "off",
+        "detail": "brief", "thinking": false, "turn": "full", "sound": "off",
         "quiet": {"from": 23, "to": 8}, "tz": 180,
     });
     let file = state.join("registry.json");
@@ -2286,4 +2359,219 @@ async fn e2e_only_the_person_changes_their_settings() {
     );
     assert_eq!(hub.fake.edits_of(owner(), menu), 0);
     assert_eq!(hub.saved()["people"], before);
+}
+
+// ---------------------------------------------------------------- TASK-076
+
+/// The session's transcript as its agent serves it: the lines a test
+/// adds, 10 bytes each.
+#[derive(Clone, Default)]
+struct Transcript(Arc<Mutex<Vec<StreamLine>>>);
+
+impl Transcript {
+    fn push(&self, items: Vec<StreamItem>) {
+        let mut lines = self.0.lock().unwrap();
+        let end = lines.last().map_or(0, |line| line.end) + 10;
+        lines.push(StreamLine { end, items });
+    }
+
+    /// The answer to a read from byte `from` (`None`: the end).
+    fn chunk(&self, session_id: String, from: Option<u64>) -> AgentMsg {
+        let lines = self.0.lock().unwrap();
+        let from = from.unwrap_or_else(|| lines.last().map_or(0, |line| line.end));
+        let lines: Vec<StreamLine> = lines
+            .iter()
+            .filter(|line| line.end > from)
+            .cloned()
+            .collect();
+        AgentMsg::TranscriptChunk {
+            session_id,
+            from,
+            to: lines.last().map_or(from, |line| line.end),
+            lines,
+            missing: false,
+            more: false,
+            reset: false,
+        }
+    }
+}
+
+/// The turn message of the last turn: the last message that starts with
+/// its text.
+fn turn_message(fake: &Fake) -> Option<Shown> {
+    fake.shown(owner())
+        .into_iter()
+        .rev()
+        .find(|shown| shown.text.starts_with("Смотрю."))
+}
+
+const TOOL_LINES: &str = "• Bash: c1 ✓\n• Bash: c2 ✓\n• Bash: c3 ✓\n• Bash: c4 ✓\n• Bash: c5 ✓";
+
+/// One turn `n` through the transcript, one line at a time, each shown
+/// before the next goes (so each line is one read and one write): a
+/// prompt, text, five calls, 💭, then the answer and the turn's end. The
+/// turn message, and the writes that grew it.
+async fn stream_turn(hub: &Hub, transcript: &Transcript, n: u32) -> (Shown, usize) {
+    let from = hub.fake.ops().len();
+    let prompt = format!("> go {n}");
+    transcript.push(vec![StreamItem::Prompt {
+        text: format!("go {n}"),
+    }]);
+    hub.until("the prompt", |fake| fake.layout(owner()).contains(&prompt))
+        .await;
+    transcript.push(vec![StreamItem::Note {
+        text: "Смотрю.".into(),
+    }]);
+    hub.until("the turn message", |fake| {
+        turn_message(fake).is_some_and(|shown| shown.text == "Смотрю.")
+    })
+    .await;
+    for call in 1..=5 {
+        let id = format!("c{call}");
+        transcript.push(vec![
+            StreamItem::Call {
+                id: id.clone(),
+                line: format!("• Bash: {id}"),
+            },
+            StreamItem::Result { id, error: None },
+        ]);
+        let line = format!("• Bash: c{call} ✓");
+        hub.until(&line, |fake| {
+            turn_message(fake).is_some_and(|shown| shown.text.ends_with(&line))
+        })
+        .await;
+    }
+    transcript.push(vec![StreamItem::Thinking {
+        text: "Готовлю ответ.".into(),
+    }]);
+    hub.until("the thinking", |fake| {
+        turn_message(fake).is_some_and(|shown| shown.text.ends_with("💭 Готовлю ответ."))
+    })
+    .await;
+    let answer = format!("готово {n}");
+    hub.hook(HookEvent::Stop {
+        prompt_id: None,
+        last_assistant_message: Some(answer.clone()),
+    })
+    .await;
+    transcript.push(vec![StreamItem::TurnEnd]);
+    hub.until("the answer, then the status", |fake| {
+        let layout = fake.layout(owner());
+        layout.ends_with(&[answer.clone(), "STATUS".to_owned()])
+    })
+    .await;
+    let turn = turn_message(&hub.fake).expect("the turn message");
+    assert_eq!(
+        turn.text,
+        format!("Смотрю.\n{TOOL_LINES}\n💭 Готовлю ответ.")
+    );
+    let writes = hub.fake.ops()[from..]
+        .iter()
+        .filter(|op| {
+            matches!(op, Op::Stream { chat, into: Some(id), merge: true, .. }
+                if *chat == owner() && *id == turn.id)
+        })
+        .count();
+    (turn, writes)
+}
+
+/// The compact turn view (TASK-076): the turn message carries its tool
+/// lines and 💭 in one collapsed quote, the text outside it, no buttons,
+/// and it grows by as many writes as in the full view; the answer is a
+/// message of its own. After «Ход: полный» the next turn has no quote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_compact_turn_quotes_tool_lines() {
+    let hub = start_hub("compact-turn", MENU, Fake::default()).await;
+    hub.start_streamed().await;
+    let transcript = Transcript::default();
+    let _agent = Agent::serve(&hub, transcript.clone()).await;
+    hub.until("the status and the pinned menu", |fake| {
+        fake.layout(owner()).contains(&"STATUS".to_owned()) && fake.menu(owner()).is_some()
+    })
+    .await;
+    hub.menu_press("menu:tv:c").await;
+    let menu = hub.fake.menu(owner()).unwrap();
+    assert!(
+        menu.buttons.contains(&"✅ Ход: сжатый".to_owned()),
+        "{menu:?}"
+    );
+    let (compact, compact_writes) = stream_turn(&hub, &transcript, 1).await;
+    assert_eq!(
+        compact.html.as_deref(),
+        Some(
+            format!("Смотрю.\n<blockquote expandable>{TOOL_LINES}\n💭 Готовлю ответ.</blockquote>")
+                .as_str()
+        )
+    );
+    assert!(compact.buttons.is_empty(), "{compact:?}");
+    let answer = hub
+        .fake
+        .shown(owner())
+        .into_iter()
+        .find(|shown| shown.text == "готово 1")
+        .expect("the answer");
+    assert!(answer.id > compact.id, "below the turn message");
+    assert!(
+        !answer
+            .html
+            .as_deref()
+            .is_some_and(|html| html.contains("blockquote")),
+        "{answer:?}"
+    );
+
+    hub.menu_press("menu:tv:f").await;
+    let (full, full_writes) = stream_turn(&hub, &transcript, 2).await;
+    assert_ne!(full.id, compact.id);
+    assert_eq!(
+        full.html.as_deref(),
+        Some(format!("Смотрю.\n{TOOL_LINES}\n💭 Готовлю ответ.").as_str())
+    );
+    assert!(full.buttons.is_empty());
+    // One write per line in both views: the quote adds no edit.
+    assert_eq!(compact_writes, 6);
+    assert_eq!(full_writes, compact_writes);
+    // The first turn's message was left as it was.
+    assert_eq!(turn_message_by_id(&hub.fake, compact.id), Some(compact));
+    assert!(
+        hub.fake
+            .answers()
+            .iter()
+            .all(|answer| answer.as_deref() == Some(menu::ANSWER_SAVED))
+    );
+}
+
+fn turn_message_by_id(fake: &Fake, id: i64) -> Option<Shown> {
+    fake.shown(owner()).into_iter().find(|shown| shown.id == id)
+}
+
+/// Telegram refusing the quote: the turn message falls back to its plain
+/// text with every line, and the topic goes on (the answer, the status).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_refused_quote_falls_back_to_plain_text() {
+    let fake = Fake::default();
+    fake.refuse_quote.store(true, Ordering::SeqCst);
+    let hub = start_hub("compact-refused", MENU, fake).await;
+    hub.start_streamed().await;
+    let transcript = Transcript::default();
+    let _agent = Agent::serve(&hub, transcript.clone()).await;
+    hub.until("the status and the pinned menu", |fake| {
+        fake.layout(owner()).contains(&"STATUS".to_owned()) && fake.menu(owner()).is_some()
+    })
+    .await;
+    hub.menu_press("menu:tv:c").await;
+    let (turn, _) = stream_turn(&hub, &transcript, 1).await;
+    assert_eq!(turn.html, None, "{turn:?}");
+    let refused = hub
+        .fake
+        .ops()
+        .iter()
+        .filter(|op| {
+            matches!(op, Op::Stream { html: Some(html), .. } if html.contains("<blockquote expandable>"))
+        })
+        .count();
+    assert!(refused > 0, "the quote was tried");
+    assert_eq!(
+        hub.fake.layout(owner()).last().map(String::as_str),
+        Some("STATUS")
+    );
 }
