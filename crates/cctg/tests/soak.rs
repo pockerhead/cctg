@@ -54,6 +54,17 @@
 //! private topic of A, and a 429 of the group holds back no call into the
 //! private chat.
 //!
+//! `CCTG_SOAK_PRIVATE=brief` (TASK-078) is the private mode with the owner's
+//! private topics on «Кратко» (a `registry.json` with that person is written
+//! before the first hub starts) and the group on its default «Всё»: every
+//! check expects no tool line in the private topics and every line in the
+//! group's. Both private modes also check that the group, which has its own
+//! turn stream, never falls behind (no `MIRROR_GAP_NOTICE`, the burst there
+//! within the same 120 s), shows every line once and in order with its
+//! status message last, and grows its turn messages by at most one write
+//! per line; the report counts the requests into the group by kind:
+//! `CCTG_SOAK_PRIVATE=brief cargo test -j 1 -p cctg --test soak -- --ignored`.
+//!
 //! Slow (about a minute), so it runs only when asked:
 //! `cargo test -p cctg --test soak -- --ignored`.
 
@@ -77,7 +88,7 @@ use cctg::hub::registry::{
 use cctg::hub::scheduler::{
     BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Scheduler, Transport,
 };
-use cctg::hub::slots::{Control, Options, Owners, STATUS_EVERY, Slots};
+use cctg::hub::slots::{Control, MIRROR_GAP_NOTICE, Options, Owners, STATUS_EVERY, Slots};
 use cctg::hub::updates::{self, Inbound, Routed, ServiceKind, UpdateSource};
 use cctg::wire::Secret;
 use serde_json::{Value, json};
@@ -135,7 +146,10 @@ fn main() {
         return;
     }
     let live = std::env::var("CCTG_SOAK_LIVE").is_ok_and(|value| value == "1");
-    let private = std::env::var("CCTG_SOAK_PRIVATE").is_ok_and(|value| value == "1");
+    // `brief` (TASK-078): the private mode with the owner's topics on «Кратко».
+    let private_mode = std::env::var("CCTG_SOAK_PRIVATE").unwrap_or_default();
+    let brief = private_mode == "brief";
+    let private = private_mode == "1" || brief;
     // The private mode is the status mode with private chats on.
     let status = private || std::env::var("CCTG_SOAK_STATUS").is_ok_and(|value| value == "1");
     assert!(
@@ -148,7 +162,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("runtime");
-    let report = runtime.block_on(soak(live, status, private));
+    let report = runtime.block_on(soak(live, status, private, brief));
     println!("{report}");
     if let Ok(path) = std::env::var("CCTG_SOAK_REPORT") {
         std::fs::write(path, &report).expect("write the report");
@@ -1058,6 +1072,9 @@ struct Soak {
     status: bool,
     /// `CCTG_SOAK_PRIVATE`: private chats on (TASK-063).
     private: bool,
+    /// `CCTG_SOAK_PRIVATE=brief`: the owner's private topics on «Кратко»
+    /// (TASK-078).
+    brief: bool,
     /// Live only: for deleting this run's topics at the end.
     /// Live only, with the group's id.
     token: Option<(BotToken, i64)>,
@@ -1341,6 +1358,16 @@ fn topic_of(tg: &Tg, name: &str) -> Option<i64> {
         .and_then(|call| call.message_id)
 }
 
+/// The ones of `lines` a private topic shows (TASK-078): with the owner's
+/// «Кратко» no tool lines.
+fn private_lines(brief: bool, lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| !(brief && line.starts_with("• ")))
+        .cloned()
+        .collect()
+}
+
 /// Lines of the turn content, prompts, answers and notices the fake's topic
 /// shows, top to bottom (the status message left out).
 fn shown_lines(tg: &Tg, thread: i64) -> Vec<String> {
@@ -1458,7 +1485,7 @@ fn last_icon(tg: &Tg, thread: i64, run: usize) -> Option<String> {
 
 // ------------------------------------------------------------ scenario
 
-async fn soak(live: bool, status: bool, private: bool) -> String {
+async fn soak(live: bool, status: bool, private: bool, brief: bool) -> String {
     let started = Instant::now();
     let root = std::env::temp_dir().join(format!("cctg-soak-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -1487,6 +1514,17 @@ async fn soak(live: bool, status: bool, private: bool) -> String {
         "claude"
     });
     std::fs::copy(std::env::current_exe().unwrap(), &bin).expect("copy the stand-in");
+    // TASK-078: the owner chose «Кратко» for their private topics before the
+    // hub starts; the group stays on its default.
+    if brief {
+        std::fs::write(
+            state.join("registry.json"),
+            format!(
+                r#"{{"version":2,"people":[{{"chat":{FAKE_USER},"settings":{{"detail":"brief"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
     let (agent_port, hook_port) = {
         let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let h = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1621,6 +1659,7 @@ async fn soak(live: bool, status: bool, private: bool) -> String {
         live,
         status,
         private,
+        brief,
         token,
         root: root.clone(),
         home,
@@ -1881,7 +1920,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         )
         .await;
     }
-    for topics in &views {
+    for (index, topics) in views.iter().enumerate() {
         for (sim, thread) in [(&a1, topics[0]), (&a2, topics[1]), (&b1, topics[2])] {
             let s = short(sim.id);
             let want = [
@@ -1890,6 +1929,8 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
                 format!("• Bash: step {s} ✓"),
                 format!("answer {s}"),
             ];
+            // The private view (the second) by the owner's settings.
+            let want = private_lines(soak.brief && index == 1, &want);
             wait_for(&format!("topic lines of {s}"), 30, || {
                 let got = tg.texts(thread);
                 want.iter().all(|line| got.contains(line))
@@ -2088,11 +2129,12 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         .map(|n| format!("> burst {} {n:02}", short(A2)))
         .chain((0..burst_a2).map(|n| format!("• Bash: merge {} {n:02} ✓", short(A2))))
         .collect();
-    for topics in &views {
+    for (index, topics) in views.iter().enumerate() {
         let thread = topics[1];
+        let want = private_lines(soak.brief && index == 1, &want_a2);
         wait_for("the burst drained", 120, || {
             let got = tg.texts(thread);
-            want_a2.iter().all(|line| got.contains(line))
+            want.iter().all(|line| got.contains(line))
         })
         .await;
     }
@@ -2117,8 +2159,9 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     );
     // Rolling (TASK-062): a write into a turn message above can go after a
     // newer message, so the order is the one the topic shows.
-    for topics in &views {
+    for (index, topics) in views.iter().enumerate() {
         let thread = topics[1];
+        let want = private_lines(soak.brief && index == 1, &want_a2);
         let got_a2: Vec<String> = if soak.status {
             shown_lines(&tg, thread)
         } else {
@@ -2133,10 +2176,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
                 firsts.push(line);
             }
         }
-        assert_eq!(
-            firsts, want_a2,
-            "FIFO within the topic {thread}, nothing lost"
-        );
+        assert_eq!(firsts, want, "FIFO within the topic {thread}, nothing lost");
     }
     notes.push(format!(
         "burst: {} lines in topic A #2, {} in B; {} of A #2 sent before the prompts were asked",
@@ -2450,6 +2490,10 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         );
         notes.push(format!("registry.json: {} lasting twins", twins.len()));
     }
+    // TASK-078: the owner's settings, written before the first hub.
+    if soak.brief {
+        durable.insert(0, "people");
+    }
     assert_eq!(keys(&registry), durable, "no other durable state");
     assert_eq!(registry["version"], 2);
     assert!(registry["seq"].as_u64().is_some_and(|seq| seq > 0));
@@ -2735,7 +2779,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
                     &tg,
                     private_thread,
                     private_status,
-                    &lines,
+                    &private_lines(soak.brief, &lines),
                     &answers,
                 ));
             }
@@ -2771,6 +2815,57 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         layout_notes.push(format!(
             "requests into the group (all but callback answers): peak {peak} in any 60 s (the group's budget allows {allowed:.0}, the fake answers 429 above 20)"
         ));
+        // TASK-078: the group has a turn stream of its own.
+        if soak.private {
+            for thread in [t_a, t_a2, t_b] {
+                assert!(
+                    !tg.texts(thread)
+                        .iter()
+                        .any(|line| line == MIRROR_GAP_NOTICE),
+                    "topic {thread}: the group fell behind"
+                );
+                let lines = shown_lines(&tg, thread)
+                    .iter()
+                    .filter(|line| line.starts_with("> ") || line.starts_with("• "))
+                    .count();
+                let writes = calls
+                    .iter()
+                    .filter(|call| {
+                        call.kind == "write" && call.outcome == "ok" && call.thread == Some(thread)
+                    })
+                    .count();
+                assert!(
+                    writes <= lines,
+                    "topic {thread}: {writes} writes for {lines} lines"
+                );
+                layout_notes.push(format!(
+                    "group topic {thread}: {writes} writes for {lines} prompt and tool lines"
+                ));
+            }
+            if soak.brief {
+                for (thread, _) in &private_statuses {
+                    let tool = shown_lines(&tg, *thread)
+                        .into_iter()
+                        .find(|line| line.starts_with("• "));
+                    assert_eq!(tool, None, "private topic {thread} is brief");
+                }
+            }
+            let by_kind = |kind: &str| {
+                calls
+                    .iter()
+                    .filter(|call| call.kind == kind && call.outcome == "ok")
+                    .count()
+            };
+            layout_notes.push(format!(
+                "requests into the group by kind: send {}, stream {}, write {}, delete {}, edit {} (private topics {})",
+                by_kind("send"),
+                by_kind("stream"),
+                by_kind("write"),
+                by_kind("delete"),
+                by_kind("edit"),
+                if soak.brief { "brief" } else { "full" }
+            ));
+        }
     }
 
     // ---- report
@@ -2788,6 +2883,8 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let mut report = String::new();
     let mode = if soak.live {
         "live (real bot)"
+    } else if soak.brief {
+        "fake Telegram, private chats on, private topics brief"
     } else if soak.private {
         "fake Telegram, private chats on"
     } else {

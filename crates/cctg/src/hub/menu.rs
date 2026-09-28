@@ -6,13 +6,14 @@
 //! how loud they are. Settings belong to the person and live in
 //! `registry.json` ([`Person`], by private chat). Only the person sees and
 //! changes them: a private chat is its user's, and a press counts only in
-//! the private chat it came from. The detail level filters the stream of a
-//! slot that shows in the owner's private chat alone; while the slot shows
-//! anywhere else too, every view gets the full layout. The turn view
-//! (TASK-076) acts on the same slots: compact puts the tool lines and 💭 of
-//! the turn message into a collapsed quote that Telegram opens on a tap.
-//! The sound setting changes new messages into the private chat only; the
-//! group sounds as before. The menu does not refresh itself: ↻ does.
+//! the private chat it came from. The detail level, 💭 and the turn view
+//! (TASK-076: compact puts the tool lines and 💭 of the turn message into a
+//! collapsed quote that Telegram opens on a tap) apply per view (TASK-078):
+//! the owner's private settings in their private chat, the owner's
+//! [`Settings::group`] in the group topic of their sessions (default:
+//! everything, 💭 on, full turn). The sound setting changes the private chat
+//! only; the group sounds as before. The menu does not refresh itself: ↻
+//! does.
 //!
 //! This module is pure: data, rendering and the press codes. The slot actor
 //! sends, pins and edits.
@@ -100,6 +101,47 @@ pub struct Settings {
     /// Minutes from UTC, [`ZONE_MIN`]..=[`ZONE_MAX`]; no daylight saving.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tz: Option<i16>,
+    /// What the group topics of the person's sessions show (TASK-078);
+    /// written only when it is not the default.
+    #[serde(skip_serializing_if = "Display::is_default")]
+    pub group: Display,
+}
+
+impl Settings {
+    /// What the person's private topics show.
+    pub fn display(&self) -> Display {
+        Display {
+            detail: self.detail,
+            thinking: self.thinking,
+            turn: self.turn,
+        }
+    }
+}
+
+/// What the topics of one view show (TASK-078): the stream's detail level,
+/// 💭 and the turn view. A missing field reads as its default: everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Display {
+    pub detail: Detail,
+    pub thinking: bool,
+    pub turn: TurnView,
+}
+
+impl Default for Display {
+    fn default() -> Self {
+        Self {
+            detail: Detail::Full,
+            thinking: true,
+            turn: TurnView::Full,
+        }
+    }
+}
+
+impl Display {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for Settings {
@@ -111,6 +153,7 @@ impl Default for Settings {
             sound: Sound::Replies,
             quiet: None,
             tz: None,
+            group: Display::default(),
         }
     }
 }
@@ -191,15 +234,15 @@ pub enum Piece {
     Interrupt,
 }
 
-/// `piece` shows in the topics of a person with `settings`. Turn answers,
+/// `piece` shows in the topics of a view with `display`. Turn answers,
 /// subagent blocks, prompts, questions and notices are no pieces: they
 /// always show.
-pub fn shows(settings: &Settings, piece: Piece) -> bool {
+pub fn shows(display: &Display, piece: Piece) -> bool {
     match piece {
         Piece::Prompt | Piece::Interrupt => true,
-        Piece::Thinking => settings.thinking,
-        Piece::Text => settings.detail != Detail::Answers,
-        Piece::Tool => settings.detail == Detail::Full,
+        Piece::Thinking => display.thinking,
+        Piece::Text => display.detail != Detail::Answers,
+        Piece::Tool => display.detail == Detail::Full,
     }
 }
 
@@ -258,6 +301,18 @@ pub fn change(
             new.turn = turn;
             Page::Display
         }
+        MenuPress::GroupDetail(detail) => {
+            new.group.detail = detail;
+            Page::GroupDisplay
+        }
+        MenuPress::GroupThinking(on) => {
+            new.group.thinking = on;
+            Page::GroupDisplay
+        }
+        MenuPress::GroupTurn(turn) => {
+            new.group.turn = turn;
+            Page::GroupDisplay
+        }
         MenuPress::SoundMode(sound) => {
             new.sound = sound;
             Page::Sound
@@ -292,6 +347,7 @@ pub fn change(
         MenuPress::SetZone(_) => return Err((Page::Sound, ANSWER_UNCHANGED)),
         MenuPress::Sessions { .. }
         | MenuPress::Display
+        | MenuPress::GroupDisplay
         | MenuPress::Sound
         | MenuPress::Zone { .. }
         | MenuPress::Slot { .. }
@@ -342,6 +398,8 @@ pub enum MenuPress {
         page: u32,
     },
     Display,
+    /// The display tab's page of the group (TASK-078).
+    GroupDisplay,
     Sound,
     Zone {
         fractions: bool,
@@ -359,6 +417,11 @@ pub enum MenuPress {
     /// twice instead of undoing itself.
     Thinking(bool),
     TurnView(TurnView),
+    /// The group's detail level, 💭 and turn view (TASK-078), as the
+    /// private ones.
+    GroupDetail(Detail),
+    GroupThinking(bool),
+    GroupTurn(TurnView),
     SoundMode(Sound),
     /// Quiet hours on or off, as [`MenuPress::Thinking`].
     Quiet(bool),
@@ -372,7 +435,11 @@ impl MenuPress {
     pub fn navigates(self) -> bool {
         matches!(
             self,
-            Self::Sessions { .. } | Self::Display | Self::Sound | Self::Zone { .. }
+            Self::Sessions { .. }
+                | Self::Display
+                | Self::GroupDisplay
+                | Self::Sound
+                | Self::Zone { .. }
         )
     }
 }
@@ -405,6 +472,7 @@ pub fn data(press: &MenuPress) -> String {
     let rest = match *press {
         MenuPress::Sessions { page } => format!("s:{page}"),
         MenuPress::Display => "d".to_owned(),
+        MenuPress::GroupDisplay => "dg".to_owned(),
         MenuPress::Sound => "n".to_owned(),
         MenuPress::Zone { fractions } => format!("z:{}", u8::from(fractions)),
         MenuPress::Slot { action, page, slot } => format!("{}:{page}:{slot}", action.code()),
@@ -412,6 +480,9 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::Detail(detail) => format!("dl:{}", detail_code(detail)),
         MenuPress::Thinking(on) => format!("th:{}", u8::from(on)),
         MenuPress::TurnView(turn) => format!("tv:{}", turn_code(turn)),
+        MenuPress::GroupDetail(detail) => format!("gdl:{}", detail_code(detail)),
+        MenuPress::GroupThinking(on) => format!("gth:{}", u8::from(on)),
+        MenuPress::GroupTurn(turn) => format!("gtv:{}", turn_code(turn)),
         MenuPress::SoundMode(sound) => format!("sn:{}", sound_code(sound)),
         MenuPress::Quiet(on) => format!("q:{}", u8::from(on)),
         MenuPress::QuietFrom(hour) => format!("qf:{hour}"),
@@ -431,6 +502,7 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
             page: number(page)?,
         },
         ["d"] => MenuPress::Display,
+        ["dg"] => MenuPress::GroupDisplay,
         ["n"] => MenuPress::Sound,
         ["z", "0"] => MenuPress::Zone { fractions: false },
         ["z", "1"] => MenuPress::Zone { fractions: true },
@@ -452,6 +524,18 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ["th", "0"] => MenuPress::Thinking(false),
         ["th", "1"] => MenuPress::Thinking(true),
         ["tv", code] => MenuPress::TurnView(
+            [TurnView::Full, TurnView::Compact]
+                .into_iter()
+                .find(|turn| turn_code(*turn) == *code)?,
+        ),
+        ["gdl", code] => MenuPress::GroupDetail(
+            [Detail::Full, Detail::Brief, Detail::Answers]
+                .into_iter()
+                .find(|detail| detail_code(*detail) == *code)?,
+        ),
+        ["gth", "0"] => MenuPress::GroupThinking(false),
+        ["gth", "1"] => MenuPress::GroupThinking(true),
+        ["gtv", code] => MenuPress::GroupTurn(
             [TurnView::Full, TurnView::Compact]
                 .into_iter()
                 .find(|turn| turn_code(*turn) == *code)?,
@@ -524,8 +608,12 @@ pub struct SessionsView {
 pub enum Page {
     Sessions(usize),
     Display,
+    /// The display tab for the group (TASK-078).
+    GroupDisplay,
     Sound,
-    Zone { fractions: bool },
+    Zone {
+        fractions: bool,
+    },
 }
 
 fn button(text: impl Into<String>, press: MenuPress) -> Value {
@@ -589,7 +677,11 @@ pub fn render(
             matches!(page, Page::Sessions(_)),
             MenuPress::Sessions { page: 0 },
         ),
-        tab("👁 Показ", *page == Page::Display, MenuPress::Display),
+        tab(
+            "👁 Показ",
+            matches!(page, Page::Display | Page::GroupDisplay),
+            MenuPress::Display,
+        ),
         tab(
             "🔔 Звук",
             matches!(page, Page::Sound | Page::Zone { .. }),
@@ -599,6 +691,7 @@ pub fn render(
     let text = match page {
         Page::Sessions(_) => render_sessions(sessions, &mut rows),
         Page::Display => render_display(settings, &mut rows),
+        Page::GroupDisplay => render_group_display(settings, &mut rows),
         Page::Sound => render_sound(settings, &mut rows),
         Page::Zone { fractions } => render_zone(*fractions, unix_secs, &mut rows),
     };
@@ -691,46 +784,86 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
     text
 }
 
-fn render_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
+/// The presses of one view's display rows: detail, 💭, turn view.
+type DisplayPresses = (
+    fn(Detail) -> MenuPress,
+    fn(bool) -> MenuPress,
+    fn(TurnView) -> MenuPress,
+);
+
+/// The rows of the display tab for one view (TASK-078): the switch between
+/// the private chat and the group, then its detail level, 💭 and turn view.
+fn display_rows(
+    display: &Display,
+    group: bool,
+    (detail_press, thinking_press, turn_press): DisplayPresses,
+    rows: &mut Vec<Vec<Value>>,
+) {
+    rows.push(vec![
+        button(radio("👤 Личка", !group), MenuPress::Display),
+        button(radio("👥 Группа", group), MenuPress::GroupDisplay),
+    ]);
     let detail = |label: &str, detail: Detail| {
-        button(
-            radio(label, settings.detail == detail),
-            MenuPress::Detail(detail),
-        )
+        button(radio(label, display.detail == detail), detail_press(detail))
     };
     rows.push(vec![
         detail("Всё", Detail::Full),
         detail("Кратко", Detail::Brief),
         detail("Только ответы", Detail::Answers),
     ]);
-    let thinking = if settings.thinking {
+    let thinking = if display.thinking {
         "вкл"
     } else {
         "выкл"
     };
     rows.push(vec![button(
         format!("💭 Размышления: {thinking}"),
-        MenuPress::Thinking(!settings.thinking),
+        thinking_press(!display.thinking),
     )]);
-    let turn = |label: &str, turn: TurnView| {
-        button(
-            radio(label, settings.turn == turn),
-            MenuPress::TurnView(turn),
-        )
-    };
+    let turn =
+        |label: &str, turn: TurnView| button(radio(label, display.turn == turn), turn_press(turn));
     rows.push(vec![
         turn("Ход: полный", TurnView::Full),
         turn("Ход: сжатый", TurnView::Compact),
     ]);
-    "Что показывать в темах лички\n\n\
-Всё: промпты из терминала, текст Claude и строка на каждый вызов инструмента.\n\
+}
+
+/// What the levels mean, the same for both views.
+const DISPLAY_HELP: &str = "Всё: промпты из терминала, текст Claude и строка на каждый вызов инструмента.\n\
 Кратко: без строк инструментов.\n\
 Только ответы: промпты из терминала и ответ хода.\n\
 💭 размышления включаются отдельно, при любой подробности.\n\
 Ход сжатый: строки инструментов и 💭 свёрнуты в цитату, нажмите на неё, чтобы раскрыть.\n\
-Ответы хода, запросы разрешений, вопросы и субагенты видны всегда.\n\n\
-Пока сессия показана и в группе, показ полный и в личке, и в группе."
-        .to_owned()
+Ответы хода, запросы разрешений, вопросы и субагенты видны всегда.";
+
+fn render_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
+    display_rows(
+        &settings.display(),
+        false,
+        (MenuPress::Detail, MenuPress::Thinking, MenuPress::TurnView),
+        rows,
+    );
+    format!(
+        "Что показывать в темах лички\n\n{DISPLAY_HELP}\n\n\
+В группе ваши сессии показываются по настройкам группы: кнопка «👥 Группа»."
+    )
+}
+
+fn render_group_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
+    display_rows(
+        &settings.group,
+        true,
+        (
+            MenuPress::GroupDetail,
+            MenuPress::GroupThinking,
+            MenuPress::GroupTurn,
+        ),
+        rows,
+    );
+    format!(
+        "Что показывать в темах группы (ваши сессии, добавленные в группу)\n\n{DISPLAY_HELP}\n\n\
+По умолчанию всё. Звук в группе не меняется."
+    )
 }
 
 fn render_sound(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
@@ -849,6 +982,7 @@ mod tests {
         [
             Page::Sessions(view.page),
             Page::Display,
+            Page::GroupDisplay,
             Page::Sound,
             Page::Zone { fractions: false },
             Page::Zone { fractions: true },
@@ -911,6 +1045,11 @@ mod tests {
             "menu:tv",
             "menu:tv:x",
             "menu:tv:c:1",
+            "menu:gdl",
+            "menu:gdl:x",
+            "menu:gth:2",
+            "menu:gtv:",
+            "menu:dg:1",
         ] {
             assert_eq!(parse_callback(junk), None, "{junk}");
         }
@@ -1001,11 +1140,12 @@ mod tests {
                     thinking,
                     ..Settings::default()
                 };
-                assert!(shows(&settings, Piece::Prompt));
-                assert!(shows(&settings, Piece::Interrupt));
-                assert_eq!(shows(&settings, Piece::Thinking), thinking);
-                assert_eq!(shows(&settings, Piece::Text), detail != Detail::Answers);
-                assert_eq!(shows(&settings, Piece::Tool), detail == Detail::Full);
+                let display = settings.display();
+                assert!(shows(&display, Piece::Prompt));
+                assert!(shows(&display, Piece::Interrupt));
+                assert_eq!(shows(&display, Piece::Thinking), thinking);
+                assert_eq!(shows(&display, Piece::Text), detail != Detail::Answers);
+                assert_eq!(shows(&display, Piece::Tool), detail == Detail::Full);
             }
         }
     }
@@ -1019,6 +1159,8 @@ mod tests {
         assert_eq!(settings.sound, Sound::Replies);
         assert_eq!(settings.quiet, None);
         assert_eq!(settings.tz, None);
+        assert_eq!(settings.group, Display::default());
+        assert_eq!(settings.display(), Display::default());
         for piece in [
             Piece::Prompt,
             Piece::Text,
@@ -1026,7 +1168,8 @@ mod tests {
             Piece::Tool,
             Piece::Interrupt,
         ] {
-            assert!(shows(&settings, piece));
+            assert!(shows(&settings.display(), piece));
+            assert!(shows(&settings.group, piece));
         }
         for ringing in [false, true] {
             for asks in [false, true] {
@@ -1055,6 +1198,7 @@ mod tests {
             tz: Some(180),
             thinking: false,
             turn: TurnView::Compact,
+            group: Display::default(),
         })
         .unwrap();
         assert_eq!(
@@ -1296,5 +1440,147 @@ mod tests {
                 "{keyboard}"
             );
         }
+    }
+
+    /// TASK-078: the group's settings are pressed on their own page and
+    /// change nothing else; the press codes round-trip.
+    #[test]
+    fn the_group_display_has_its_own_presses_and_page() {
+        let presses = [
+            MenuPress::GroupDisplay,
+            MenuPress::GroupDetail(Detail::Full),
+            MenuPress::GroupDetail(Detail::Brief),
+            MenuPress::GroupDetail(Detail::Answers),
+            MenuPress::GroupThinking(false),
+            MenuPress::GroupThinking(true),
+            MenuPress::GroupTurn(TurnView::Full),
+            MenuPress::GroupTurn(TurnView::Compact),
+        ];
+        for press in presses {
+            let data = data(&press);
+            assert_eq!(parse_callback(&data), Some(press), "{data}");
+        }
+        assert_eq!(data(&MenuPress::GroupDisplay), "menu:dg");
+        assert_eq!(data(&MenuPress::GroupDetail(Detail::Brief)), "menu:gdl:b");
+        assert!(MenuPress::GroupDisplay.navigates());
+        assert!(!MenuPress::GroupDetail(Detail::Brief).navigates());
+        let before = Settings {
+            detail: Detail::Answers,
+            tz: Some(60),
+            ..Settings::default()
+        };
+        for (press, want) in [
+            (
+                MenuPress::GroupDetail(Detail::Brief),
+                Display {
+                    detail: Detail::Brief,
+                    ..Display::default()
+                },
+            ),
+            (
+                MenuPress::GroupThinking(false),
+                Display {
+                    thinking: false,
+                    ..Display::default()
+                },
+            ),
+            (
+                MenuPress::GroupTurn(TurnView::Compact),
+                Display {
+                    turn: TurnView::Compact,
+                    ..Display::default()
+                },
+            ),
+        ] {
+            let (after, page) = change(&before, press).unwrap();
+            assert_eq!(page, Page::GroupDisplay, "{press:?}");
+            assert_eq!(after.group, want, "{press:?}");
+            assert_eq!(
+                Settings {
+                    group: before.group,
+                    ..after
+                },
+                before,
+                "only the group changes: {press:?}"
+            );
+        }
+    }
+
+    /// TASK-078: `group` is written only when it is not the default, and a
+    /// file without it reads as the default.
+    #[test]
+    fn the_group_display_is_saved_only_when_chosen() {
+        let settings: Settings = serde_json::from_str(r#"{"detail":"brief"}"#).unwrap();
+        assert_eq!(settings.group, Display::default());
+        let written = serde_json::to_value(Settings::default()).unwrap();
+        assert!(written.get("group").is_none(), "{written}");
+        let chosen = Settings {
+            group: Display {
+                detail: Detail::Brief,
+                ..Display::default()
+            },
+            ..Settings::default()
+        };
+        let written = serde_json::to_value(&chosen).unwrap();
+        assert_eq!(written["group"]["detail"], "brief", "{written}");
+        let back: Settings = serde_json::from_value(written).unwrap();
+        assert_eq!(back, chosen);
+        let partial: Settings = serde_json::from_str(r#"{"group":{"thinking":false}}"#).unwrap();
+        assert_eq!(
+            partial.group,
+            Display {
+                thinking: false,
+                ..Display::default()
+            }
+        );
+    }
+
+    /// TASK-078: the display tab switches between the private chat and the
+    /// group; each page shows its own choice.
+    #[test]
+    fn the_display_tab_switches_between_the_views() {
+        let settings = Settings {
+            detail: Detail::Answers,
+            group: Display {
+                detail: Detail::Brief,
+                thinking: false,
+                turn: TurnView::Compact,
+            },
+            ..Settings::default()
+        };
+        let (text, keyboard) = render(&Page::Display, &settings, None, 0);
+        assert!(text.starts_with("Что показывать в темах лички"), "{text}");
+        assert!(text.contains("«👥 Группа»"), "{text}");
+        let private = labels(&keyboard);
+        for want in [
+            "· 👁 Показ",
+            "✅ 👤 Личка",
+            "👥 Группа",
+            "✅ Только ответы",
+            "💭 Размышления: вкл",
+            "✅ Ход: полный",
+        ] {
+            assert!(private.contains(&want.to_owned()), "{want}: {private:?}");
+        }
+        assert!(datas(&keyboard).contains(&"menu:dg".to_owned()));
+        let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, 0);
+        assert!(text.starts_with("Что показывать в темах группы"), "{text}");
+        assert!(text.ends_with("По умолчанию всё. Звук в группе не меняется."));
+        let group = labels(&keyboard);
+        for want in [
+            "· 👁 Показ",
+            "👤 Личка",
+            "✅ 👥 Группа",
+            "✅ Кратко",
+            "💭 Размышления: выкл",
+            "✅ Ход: сжатый",
+        ] {
+            assert!(group.contains(&want.to_owned()), "{want}: {group:?}");
+        }
+        let datas = datas(&keyboard);
+        for want in ["menu:d", "menu:gdl:f", "menu:gth:1", "menu:gtv:f"] {
+            assert!(datas.contains(&want.to_owned()), "{want}: {datas:?}");
+        }
+        assert!(!datas.iter().any(|data| data.starts_with("menu:dl:")));
     }
 }

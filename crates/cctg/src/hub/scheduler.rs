@@ -4138,4 +4138,42 @@ mod tests {
             "the gaps only shrink: {slow:?}"
         );
     }
+
+    /// TASK-078 review finding 1: two new messages of a mirror topic's own
+    /// turn stream queued back to back (as `hand_mirror_op` makes them)
+    /// would go as one, the second answered `Merged` without an id; the
+    /// mirror turn marks the second one not `merge` while the first waits,
+    /// and then each is a message of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_mirror_turn_message_not_merge_is_never_joined() {
+        let mirror = |text: &str, merge: bool| Op::Stream {
+            chat: Chat::Group,
+            thread_id: 1,
+            text: text.to_owned(),
+            html: None,
+            merge,
+            restart: true,
+            notify: false,
+            into: None,
+        };
+        let long = "y".repeat(2000);
+        for (merge, messages) in [(true, 1), (false, 2)] {
+            let fake = Fake::new(&[]);
+            let answers = run_timed(
+                &fake,
+                vec![(0, mirror("Looking.", true)), (600, mirror(&long, merge))],
+            )
+            .await;
+            let sent = stream_times(&fake);
+            assert_eq!(sent.len(), messages, "merge {merge}: {sent:?}");
+            assert!(matches!(answers[0], Some(Ok(Outcome::Sent(_)))));
+            if merge {
+                assert_eq!(sent[0].0, format!("Looking.\n{long}"));
+                assert!(matches!(answers[1], Some(Ok(Outcome::Merged))));
+            } else {
+                assert_eq!(sent[1].0, long);
+                assert!(matches!(answers[1], Some(Ok(Outcome::Sent(_)))));
+            }
+        }
+    }
 }
