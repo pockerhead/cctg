@@ -32,6 +32,7 @@ fn main() {
 
 #[cfg(unix)]
 mod unix {
+    use crate::common;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd};
