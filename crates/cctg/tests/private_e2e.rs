@@ -2191,7 +2191,7 @@ async fn e2e_menu_sections_change_settings_and_they_survive_a_restart() {
     assert!(shown.buttons.contains(&"🕒 Пояс: UTC+3".to_owned()));
     let want = serde_json::json!({
         "detail": "brief", "thinking": false, "turn": "full", "sound": "off",
-        "quiet": {"from": 23, "to": 8}, "tz": 180,
+        "quiet": {"from": 23, "to": 8}, "tz": 180, "rich": true,
     });
     let file = state.join("registry.json");
     let saved = || -> Value {

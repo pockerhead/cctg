@@ -5,6 +5,10 @@ use unicode_segmentation::GraphemeCursor;
 /// Bot API `sendMessage` text limit: "1-4096 characters after entities parsing".
 pub const TELEGRAM_TEXT_LIMIT: usize = 4096;
 
+/// Bot API rich message limit (TASK-075): 32768 characters; measured with
+/// `telegram_len` (UTF-16), which the probe showed to be conservative.
+pub const TELEGRAM_RICH_LIMIT: usize = 32768;
+
 /// Length in UTF-16 code units, the project's measure for `TELEGRAM_TEXT_LIMIT`.
 /// The Bot API does not name the unit of that limit. UTF-16 length is never below the code-point count,
 /// so a text within the limit by this measure fits either reading; emoji-heavy chunks get smaller.

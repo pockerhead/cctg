@@ -24,6 +24,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STALLED_BATCH_BACKOFF: Duration = Duration::from_secs(1);
 /// UTF-16 units kept of a replied message quoted for the session.
 pub const QUOTE_LIMIT: usize = 500;
+/// Nesting of a rich message's blocks read for a quote, at most (TASK-075).
+const RICH_DEPTH: usize = 32;
 /// Waits before the second and third attempt to save the offset (a file held
 /// open by a scanner or indexer on Windows makes the rename fail for a moment).
 const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
@@ -302,6 +304,8 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
             words(message.quote.map(|quote| quote.text))
                 .or_else(|| words(replied.text))
                 .or_else(|| words(replied.caption))
+                // A rich message has no `text` (TASK-075).
+                .or_else(|| words(replied.rich_message.as_deref().map(rich_words)))
                 .map(|text| cut(&text, QUOTE_LIMIT))
         });
         return Routed::Input(Inbound {
@@ -578,6 +582,75 @@ pub async fn poll_until<S: UpdateSource>(
                 () = tokio::time::sleep(wait) => {}
             }
         }
+    }
+}
+
+/// The words of a rich message (TASK-075) for a reply quote: the text of
+/// its blocks in order, one line each (a table row as its cells joined by
+/// ` | `), blank ones left out. Its `text` is a string, or inline parts
+/// (strings and objects with a `text` of their own) in an array.
+fn rich_words(rich: &Value) -> String {
+    let mut lines = Vec::new();
+    rich_lines(rich, 0, &mut lines);
+    lines.join("\n")
+}
+
+fn rich_lines(value: &Value, depth: usize, lines: &mut Vec<String>) {
+    if depth > RICH_DEPTH {
+        return;
+    }
+    match value {
+        Value::Array(blocks) => {
+            for block in blocks {
+                rich_lines(block, depth + 1, lines);
+            }
+        }
+        Value::Object(block) => {
+            let mut push = |line: String| {
+                if !line.trim().is_empty() {
+                    lines.push(line);
+                }
+            };
+            push(inline_words(value, depth));
+            if let Some(Value::Array(rows)) = block.get("cells") {
+                for row in rows {
+                    let cells: Vec<String> = row
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|cell| inline_words(cell, depth + 1))
+                        .collect();
+                    push(cells.join(" | "));
+                }
+            }
+            for key in ["blocks", "items"] {
+                if let Some(nested) = block.get(key) {
+                    rich_lines(nested, depth + 1, lines);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The inline text of a block or part: its `text` (a formula's
+/// `expression`), recursively.
+fn inline_words(value: &Value, depth: usize) -> String {
+    if depth > RICH_DEPTH {
+        return String::new();
+    }
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|part| inline_words(part, depth + 1))
+            .collect(),
+        Value::Object(part) => match (part.get("text"), part.get("expression")) {
+            (Some(text), _) => inline_words(text, depth + 1),
+            (None, Some(Value::String(expression))) => expression.clone(),
+            _ => String::new(),
+        },
+        _ => String::new(),
     }
 }
 
@@ -881,6 +954,56 @@ mod tests {
             "text": "?", "reply_to_message": replied(45, json!({ "sticker": {} })),
         }));
         assert_eq!((bare.reply_to, bare.quote), (Some(45), None));
+    }
+
+    /// TASK-075: a rich message has no `text`; its quote comes from its
+    /// blocks (the shape of probe R1), a selected fragment still first.
+    #[test]
+    fn a_reply_to_a_rich_message_quotes_its_blocks() {
+        let rich = json!({ "blocks": [
+            { "type": "heading", "text": "Итог", "size": 1 },
+            { "type": "paragraph", "text": ["Абзац с ", { "type": "bold", "text": "жирным" },
+                " и ", { "type": "url", "text": "ссылкой", "url": "https://example.com" }, "."] },
+            { "type": "table", "cells": [
+                [{ "text": "Файл", "is_header": true }, { "text": "Строк", "is_header": true }],
+                [{ "text": { "type": "code", "text": "api.rs" } }, { "text": "1109" }],
+            ] },
+            { "type": "list", "items": [{ "label": "1.", "blocks": [
+                { "type": "paragraph", "text": "Первый" },
+                { "type": "list", "items": [{ "label": "•", "blocks": [
+                    { "type": "paragraph", "text": "вложенный" },
+                ] }] },
+            ] }] },
+            { "type": "mathematical_expression", "expression": "x^2" },
+            { "type": "divider" },
+        ] });
+        let quoted = input(json!({
+            "text": "да",
+            "reply_to_message": replied(46, json!({ "rich_message": rich })),
+        }));
+        assert_eq!(quoted.reply_to, Some(46));
+        assert_eq!(
+            quoted.quote.as_deref(),
+            Some(
+                "Итог\nАбзац с жирным и ссылкой.\nФайл | Строк\napi.rs | 1109\nПервый\nвложенный\nx^2"
+            )
+        );
+
+        let long =
+            json!({ "blocks": [{ "type": "paragraph", "text": "я".repeat(QUOTE_LIMIT + 100) }] });
+        let cut = input(json!({
+            "text": "да", "reply_to_message": replied(47, json!({ "rich_message": long })),
+        }))
+        .quote
+        .unwrap_or_default();
+        assert_eq!(cut.chars().count(), QUOTE_LIMIT);
+
+        let selected = input(json!({
+            "text": "да",
+            "reply_to_message": replied(48, json!({ "rich_message": rich })),
+            "quote": { "text": "жирным", "position": 8, "is_manual": true },
+        }));
+        assert_eq!(selected.quote.as_deref(), Some("жирным"));
     }
 
     #[test]

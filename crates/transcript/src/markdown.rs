@@ -578,3 +578,240 @@ fn closing(s: &str, from: usize, c: u8, n: usize, budget: &mut usize) -> Option<
     }
     None
 }
+
+/// Tags Telegram rich markdown takes (Bot API 10.3), each with the only attributes it may carry
+/// here.
+const RICH_TAGS: &[(&str, &[&str])] = &[
+    ("a", &["href", "name"]),
+    ("b", &[]),
+    ("blockquote", &["expandable"]),
+    ("br", &[]),
+    ("code", &["class"]),
+    ("del", &[]),
+    ("details", &["open"]),
+    ("em", &[]),
+    ("h1", &[]),
+    ("h2", &[]),
+    ("h3", &[]),
+    ("h4", &[]),
+    ("h5", &[]),
+    ("h6", &[]),
+    ("hr", &[]),
+    ("i", &[]),
+    ("ins", &[]),
+    ("li", &[]),
+    ("mark", &[]),
+    ("ol", &["start", "type", "reversed"]),
+    ("p", &[]),
+    ("pre", &[]),
+    ("s", &[]),
+    ("strike", &[]),
+    ("strong", &[]),
+    ("sub", &[]),
+    ("summary", &[]),
+    ("sup", &[]),
+    ("table", &[]),
+    ("td", &["align", "valign", "colspan", "rowspan"]),
+    ("tg-spoiler", &[]),
+    ("th", &["align", "valign", "colspan", "rowspan"]),
+    ("tr", &[]),
+    ("u", &[]),
+    ("ul", &[]),
+];
+
+/// Markdown as it goes into a Telegram rich message (`rich_message.markdown`, TASK-075): the text
+/// as it is, but for `<`. Telegram rich markdown reads HTML tags, drops a tag it does not know
+/// with no error (`Vec<String>` shows as `Vec`), and a backslash does not help there, while
+/// `&lt;` does (probe TASK-075 R4, R9). So every `<` outside code that does not start a complete
+/// tag of [`RICH_TAGS`] on its line (attributes from that list only) becomes `&lt;`, and `\<`
+/// becomes `&lt;` too. Code is left alone: fenced blocks by GFM rules (an unclosed one is code to
+/// the end of the text, as Telegram reads it, and is closed at the end so that text added below
+/// is not swallowed) and code spans within a line. Indented code (four spaces) is not known here:
+/// a `<` in it shows as `&lt;`.
+pub fn rich_markdown(text: &str) -> String {
+    if !text.contains(['<', '`', '~']) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut fence: Option<(u8, usize)> = None;
+    for line in text.split_inclusive('\n') {
+        if let Some((marker, len)) = fence {
+            out.push_str(line);
+            if closes_rich_fence(line, marker, len) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = rich_fence(line) {
+            fence = Some(open);
+            out.push_str(line);
+            continue;
+        }
+        rich_line(line, &mut out);
+    }
+    if let Some((marker, len)) = fence {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.extend(std::iter::repeat_n(char::from(marker), len));
+    }
+    out
+}
+
+/// A fence line without its indentation (at most three spaces).
+fn fence_body(line: &str) -> Option<&str> {
+    let body = line.trim_start_matches(' ');
+    (line.len() - body.len() <= 3).then_some(body)
+}
+
+/// The marker and length of the fence `line` opens (GFM): three or more backticks (with no
+/// backtick after them on the line) or tildes.
+fn rich_fence(line: &str) -> Option<(u8, usize)> {
+    let body = fence_body(line)?;
+    let marker = *body.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let len = run(body.as_bytes(), 0);
+    if len < 3 || (marker == b'`' && body[len..].contains('`')) {
+        return None;
+    }
+    Some((marker, len))
+}
+
+/// `line` closes a fence of `len` `marker`s: the same marker, at least as many, only blanks
+/// after them.
+fn closes_rich_fence(line: &str, marker: u8, len: usize) -> bool {
+    let Some(body) = fence_body(line) else {
+        return false;
+    };
+    let n = run(body.as_bytes(), 0);
+    body.as_bytes().first() == Some(&marker)
+        && n >= len
+        && body[n..].trim_matches([' ', '\t', '\r', '\n']).is_empty()
+}
+
+/// One line outside a fenced block, into `out`.
+fn rich_line(line: &str, out: &mut String) {
+    let bytes = line.as_bytes();
+    let (mut i, mut plain) = (0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if bytes.get(i + 1).is_some_and(u8::is_ascii_punctuation) => {
+                if bytes[i + 1] == b'<' {
+                    out.push_str(&line[plain..i]);
+                    out.push_str("&lt;");
+                    plain = i + 2;
+                }
+                i += 2;
+            }
+            b'`' => {
+                let n = run(bytes, i);
+                i = span_end(bytes, i + n, n).map_or(i + n, |close| close + n);
+            }
+            b'<' => match rich_tag(line, i) {
+                Some(end) => i = end,
+                None => {
+                    out.push_str(&line[plain..i]);
+                    out.push_str("&lt;");
+                    i += 1;
+                    plain = i;
+                }
+            },
+            _ => i += 1,
+        }
+    }
+    out.push_str(&line[plain..]);
+}
+
+/// Start of the next run of exactly `n` backticks at or after `from`.
+fn span_end(bytes: &[u8], from: usize, n: usize) -> Option<usize> {
+    let mut j = from;
+    while j < bytes.len() {
+        if bytes[j] == b'`' {
+            let r = run(bytes, j);
+            if r == n {
+                return Some(j);
+            }
+            j += r;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+/// Spaces and tabs from `i` on.
+fn skip_blanks(bytes: &[u8], i: usize) -> usize {
+    i + bytes[i..]
+        .iter()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count()
+}
+
+/// End of the complete tag of [`RICH_TAGS`] that starts at `at` on `line`: `</name>` or
+/// `<name attr="value" ...>` (`/>` too) with attributes of that tag only.
+fn rich_tag(line: &str, at: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = at + 1;
+    let closing = bytes.get(i) == Some(&b'/');
+    if closing {
+        i += 1;
+    }
+    let name_end = i + bytes[i..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-')
+        .count();
+    let name = line[i..name_end].to_ascii_lowercase();
+    let attributes = RICH_TAGS.iter().find(|(tag, _)| *tag == name)?.1;
+    i = name_end;
+    if closing {
+        i = skip_blanks(bytes, i);
+        return (bytes.get(i) == Some(&b'>')).then_some(i + 1);
+    }
+    loop {
+        let next = skip_blanks(bytes, i);
+        match *bytes.get(next)? {
+            b'>' => return Some(next + 1),
+            b'/' => return (bytes.get(next + 1) == Some(&b'>')).then_some(next + 2),
+            // An attribute only after a blank.
+            _ if next == i => return None,
+            _ => {}
+        }
+        i = next;
+        let attribute_end = i + bytes[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphabetic() || **b == b'-')
+            .count();
+        let attribute = line[i..attribute_end].to_ascii_lowercase();
+        if attribute.is_empty() || !attributes.contains(&attribute.as_str()) {
+            return None;
+        }
+        i = attribute_end;
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        match *bytes.get(i)? {
+            quote @ (b'"' | b'\'') => {
+                let length = bytes[i + 1..]
+                    .iter()
+                    .position(|&b| b == quote || b == b'<' || b == b'\n')?;
+                if bytes[i + 1 + length] != quote {
+                    return None;
+                }
+                i += length + 2;
+            }
+            _ => {
+                let length = bytes[i..]
+                    .iter()
+                    .take_while(|b| !b.is_ascii_whitespace() && !b"\"'<>=`".contains(b))
+                    .count();
+                if length == 0 {
+                    return None;
+                }
+                i += length;
+            }
+        }
+    }
+}

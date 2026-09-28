@@ -54,6 +54,15 @@
 //! refuses as HTML falls back to all its lines. The quote tags count
 //! against the message limit like any HTML.
 //!
+//! Rich turn message (TASK-075): in a view with rich messages on, the turn
+//! message also has a third form, rich markdown ([`Open::rich`]), which the
+//! scheduler sends while Telegram takes it: assistant text and 💭 as
+//! markdown blocks as they are ([`transcript::rich_markdown`]), each run of
+//! tool lines as one HTML `<p>` block with `<br>` between them, and the
+//! quote of a compact message as `<blockquote expandable>` with `<br>`
+//! (raw line breaks there join lines). All three forms stay within one
+//! message (4096), so a refused rich write falls back to one HTML write.
+//!
 //! Mirror topics (TASK-078): the group topic of a slot answered in its
 //! owner's private chat has a turn stream of its own ([`MirrorTurn`]), fed
 //! the same steps of the same reads, shown by that view's settings with its
@@ -151,11 +160,31 @@ pub struct Open {
     /// Its HTML ends with an open run of quoted pieces: the next quoted one
     /// goes into that quote.
     pub quote: bool,
+    /// Its whole text as rich markdown (TASK-075); `None` in a view without
+    /// rich messages or when its first piece did not fit so.
+    pub rich: Option<String>,
+    /// The view's rich setting when it was made: it goes on only in that
+    /// view, as with `compact`.
+    pub rich_view: bool,
+    /// What `rich` ends with.
+    pub rich_run: RichRun,
+}
+
+/// The last block of a turn message's rich form (TASK-075).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RichRun {
+    /// Markdown: assistant text, 💭, the interrupt note.
+    Block,
+    /// A `<p>` of tool lines.
+    Lines,
+    /// The `<blockquote expandable>` of a compact message.
+    Quote,
 }
 
 impl Open {
     /// The turn message of one piece; `quoted`: in the quote of a compact
-    /// message, when that fits one message with its tags.
+    /// message, when that fits one message with its tags; `rich`: the view
+    /// shows rich messages (TASK-075).
     pub fn new(
         key: Option<MessageKey>,
         number: u64,
@@ -163,6 +192,7 @@ impl Open {
         html: Option<String>,
         compact: bool,
         quoted: bool,
+        rich: bool,
     ) -> Self {
         let wrapped = quoted
             .then(|| {
@@ -173,6 +203,10 @@ impl Open {
             })
             .filter(|wrapped| fits(wrapped));
         let quote = wrapped.is_some();
+        let rich_form = rich
+            .then(|| rich_piece(None, RichRun::Block, &text, html.as_deref(), quote))
+            .filter(|(form, _)| fits(form));
+        let rich_run = rich_form.as_ref().map_or(RichRun::Block, |(_, run)| *run);
         Self {
             key,
             number,
@@ -180,27 +214,42 @@ impl Open {
             html: wrapped.or(html),
             compact,
             quote,
+            rich: rich_form.map(|(form, _)| form),
+            rich_view: rich,
+            rich_run,
         }
     }
 
     /// `text` (as `html`, when formatted) below the message's text,
     /// `quoted` in the quote of its run; false, and nothing changes, when
-    /// that would not fit one message.
+    /// that would not fit one message (in its rich form too).
     pub fn push(&mut self, text: &str, html: Option<&str>, quoted: bool) -> bool {
         let joined = if quoted {
             self.quoted(text, html)
         } else {
             join(&self.text, self.html.as_deref(), text, html)
         };
-        match joined {
-            Some((joined, joined_html)) => {
-                self.text = joined;
-                self.html = joined_html;
-                self.quote = quoted;
-                true
+        let Some((joined, joined_html)) = joined else {
+            return false;
+        };
+        let rich = match self.rich.as_deref() {
+            Some(own) => {
+                let (form, run) = rich_piece(Some(own), self.rich_run, text, html, quoted);
+                if !fits(&form) {
+                    return false;
+                }
+                Some((form, run))
             }
-            None => false,
+            None => None,
+        };
+        self.text = joined;
+        self.html = joined_html;
+        self.quote = quoted;
+        if let Some((form, run)) = rich {
+            self.rich = Some(form);
+            self.rich_run = run;
         }
+        true
     }
 
     /// The message with `text` below it in the quote of the open run, or
@@ -215,6 +264,58 @@ impl Open {
         let joined = format!("{}\n{text}", self.text);
         (fits(&joined) && fits(&joined_html)).then_some((joined, Some(joined_html)))
     }
+}
+
+/// `own` (a turn message's rich form ending with `run`) with the piece
+/// `text`/`html` below it (TASK-075): quoted into the quote of the compact
+/// message, a formatted piece (markdown: assistant text, 💭, the interrupt
+/// note) as its markdown, a plain one (a tool line) into the `<p>` of its
+/// run.
+fn rich_piece(
+    own: Option<&str>,
+    run: RichRun,
+    text: &str,
+    html: Option<&str>,
+    quoted: bool,
+) -> (String, RichRun) {
+    let own = own.unwrap_or_default();
+    let separator = if own.is_empty() { "" } else { "\n\n" };
+    let (next, open, close) = if quoted {
+        (RichRun::Quote, QUOTE_OPEN, QUOTE_CLOSE)
+    } else if html.is_some() {
+        let block = transcript::rich_markdown(text);
+        return (format!("{own}{separator}{block}"), RichRun::Block);
+    } else {
+        (RichRun::Lines, "<p>", "</p>")
+    };
+    let content = match next {
+        RichRun::Quote => html_lines(&html_of(text, html)),
+        _ => html_lines(&transcript::escape_html(text)),
+    };
+    if run == next
+        && let Some(body) = own.strip_suffix(close)
+    {
+        return (format!("{body}<br>{content}{close}"), next);
+    }
+    (format!("{own}{separator}{open}{content}{close}"), next)
+}
+
+/// `html` with its line breaks as `<br>` (TASK-075): in an HTML block of rich
+/// markdown a raw line break joins the lines; inside `<pre>` it stays.
+fn html_lines(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find("<pre") {
+        let (before, pre) = rest.split_at(at);
+        out.push_str(&before.replace('\n', "<br>"));
+        let end = pre
+            .find("</pre>")
+            .map_or(pre.len(), |end| end + "</pre>".len());
+        out.push_str(&pre[..end]);
+        rest = &pre[end..];
+    }
+    out.push_str(&rest.replace('\n', "<br>"));
+    out
 }
 
 /// A piece with this HTML may go into the quote of a compact turn message
@@ -256,9 +357,11 @@ pub type Joined = Result<(Open, Vec<(String, Option<String>, bool)>), (String, O
 /// Pieces of one line (text, HTML, whether it is quiet turn content (a
 /// terminal prompt is not), whether it goes into the quote of a compact turn
 /// message) joined where they fit: a result line may end several calls.
+/// `rich`: the view shows rich messages (TASK-075).
 pub fn join_pieces(
     pieces: Vec<(String, Option<String>, bool, bool)>,
     compact: bool,
+    rich: bool,
 ) -> Vec<Joined> {
     let mut joined: Vec<Joined> = Vec::new();
     for (text, html, quiet, quoted) in pieces {
@@ -272,7 +375,7 @@ pub fn join_pieces(
             parts.push((text, html, quoted));
             continue;
         }
-        let together = Open::new(None, 0, text.clone(), html.clone(), compact, quoted);
+        let together = Open::new(None, 0, text.clone(), html.clone(), compact, quoted, rich);
         joined.push(Ok((together, vec![(text, html, quoted)])));
     }
     joined
@@ -332,11 +435,13 @@ struct MirrorMessage {
 /// A call of a mirror's turn stream, by its number there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirrorOp {
-    /// A new message; `into`: made of this status twin instead (an edit).
+    /// A new message; `into`: made of this status twin instead (an edit);
+    /// `rich`: its rich form (TASK-075).
     New {
         number: u64,
         text: String,
         html: Option<String>,
+        rich: Option<String>,
         merge: bool,
         into: Option<MessageKey>,
     },
@@ -346,6 +451,7 @@ pub enum MirrorOp {
         into: MessageKey,
         text: String,
         html: Option<String>,
+        rich: Option<String>,
     },
 }
 
@@ -435,14 +541,16 @@ impl MirrorTurn {
     }
 
     /// The calls for `joined` (see [`join_pieces`]) in the view's `compact`
-    /// turn view. Quiet pieces grow the turn message while they fit, else
-    /// start the next one. The first new message of a read (`posted == 0`)
-    /// is made of status twin `twin` when there is one (taken then); every
-    /// other new one counts in `posted`. Call numbers come from `calls`.
+    /// turn view and `rich` setting (TASK-075). Quiet pieces grow the turn
+    /// message while they fit, else start the next one. The first new
+    /// message of a read (`posted == 0`) is made of status twin `twin` when
+    /// there is one (taken then); every other new one counts in `posted`.
+    /// Call numbers come from `calls`.
     pub fn roll(
         &mut self,
         joined: Vec<Joined>,
         compact: bool,
+        rich: bool,
         twin: &mut Option<MessageKey>,
         posted: &mut usize,
         calls: &mut u64,
@@ -452,6 +560,7 @@ impl MirrorTurn {
             if let Ok((_, parts)) = &piece
                 && let Some(current) = self.current.as_mut()
                 && current.open.compact == compact
+                && current.open.rich_view == rich
                 && let Some(grown) = grown(&current.open, parts)
             {
                 current.open = grown;
@@ -464,6 +573,7 @@ impl MirrorTurn {
                             into,
                             text: current.open.text.clone(),
                             html: current.open.html.clone(),
+                            rich: current.open.rich.clone(),
                         });
                     }
                     _ => current.dirty = true,
@@ -477,6 +587,7 @@ impl MirrorTurn {
                 Ok((open, _)) => (open.text.clone(), open.html.clone(), Some(open)),
                 Err((text, html)) => (text, html, None),
             };
+            let rich_form = open.as_ref().and_then(|open| open.rich.clone());
             // The status twin becoming content goes at once; a message that
             // joined one still on its way would be lost (answered `Merged`,
             // then erased by that one's last write).
@@ -488,6 +599,7 @@ impl MirrorTurn {
                 number,
                 text: text.clone(),
                 html: html.clone(),
+                rich: rich_form,
                 merge,
                 into: absorb,
             });
@@ -507,7 +619,7 @@ impl MirrorTurn {
                 // A prompt made of the twin: nothing goes into it, its
                 // answer is still awaited.
                 (Some(twin), None) => {
-                    let open = Open::new(Some(twin), number, text, html, compact, false);
+                    let open = Open::new(Some(twin), number, text, html, compact, false, false);
                     self.park(message(open, Some(twin)));
                 }
                 (None, Some(open)) => {
@@ -533,6 +645,7 @@ impl MirrorTurn {
             number: next_call(calls),
             text,
             html,
+            rich: None,
             merge,
             into: None,
         }
@@ -598,6 +711,7 @@ impl MirrorTurn {
                 into,
                 text: message.open.text.clone(),
                 html: message.open.html.clone(),
+                rich: message.open.rich.clone(),
             });
             false
         } else {
@@ -795,6 +909,9 @@ pub struct Held {
     /// When it went unpaired and left a debt ([`Live::answered_early`]):
     /// held again by a rewind, it takes that debt back.
     pub gone: Option<Instant>,
+    /// The answer goes as a rich message (TASK-075): its topic's view shows
+    /// them.
+    pub rich: bool,
 }
 
 #[derive(Debug)]
@@ -1397,6 +1514,7 @@ mod tests {
             thread_id: 100,
             text: text.into(),
             html: None,
+            rich: None,
             merge: false,
             restart: false,
             notify: false,
@@ -1748,6 +1866,7 @@ mod tests {
             until: now,
             end: None,
             gone: None,
+            rich: false,
         };
         let mut live = Live::new(Some(0), Vec::new());
         let line = live.sent(&any_op());
@@ -1799,6 +1918,7 @@ mod tests {
             until: now,
             end: Some(40),
             gone: None,
+            rich: false,
         };
         let mut live = Live::new(Some(0), Vec::new());
         let mut early = held("early");
@@ -1841,6 +1961,7 @@ mod tests {
             until: now,
             end: None,
             gone: None,
+            rich: false,
         });
         let doc = live.turn_end(40).expect("its answer");
         live.answered_outside(&doc);
@@ -1856,6 +1977,7 @@ mod tests {
             until: now,
             end: None,
             gone: None,
+            rich: false,
         });
         assert!(live.turn_end(40).is_none(), "answered already");
         assert!(live.ends_unclaimed.is_empty(), "nothing to claim");
@@ -1879,6 +2001,7 @@ mod tests {
             until: now,
             end: None,
             gone: None,
+            rich: false,
         });
         let first = live.turn_end(40).expect("its answer");
         let number = live.sent_answer(first, &any_op());
@@ -1964,6 +2087,7 @@ mod tests {
             until: now,
             end: None,
             gone: None,
+            rich: false,
         }
     }
 
@@ -2185,6 +2309,9 @@ mod tests {
             html: None,
             compact: false,
             quote: false,
+            rich: None,
+            rich_view: false,
+            rich_run: RichRun::Block,
         }
     }
 
@@ -2242,6 +2369,7 @@ mod tests {
             html.map(str::to_owned),
             compact,
             compact && tool,
+            false,
         );
         for (text, html, tool) in &pieces[1..] {
             assert!(turn.push(text, *html, compact && *tool), "{text}");
@@ -2318,10 +2446,10 @@ mod tests {
         assert!(turn.push(&long, None, false), "unquoted it fits");
         // A first piece whose quote does not fit starts unquoted.
         let long = "я".repeat(limit - tags + 1);
-        let turn = Open::new(None, 1, long.clone(), None, true, true);
+        let turn = Open::new(None, 1, long.clone(), None, true, true, false);
         assert_eq!((turn.html, turn.quote), (None, false));
         let short = "я".repeat(limit - tags);
-        let turn = Open::new(None, 1, short.clone(), None, true, true);
+        let turn = Open::new(None, 1, short.clone(), None, true, true, false);
         assert_eq!(turn.html, Some(format!("{QUOTE_OPEN}{short}{QUOTE_CLOSE}")));
         assert!(turn.quote);
     }
@@ -2506,7 +2634,8 @@ mod tests {
     fn roll_quiet(turn: &mut MirrorTurn, calls: &mut u64, texts: &[&str]) -> Vec<MirrorOp> {
         let mut posted = 0;
         turn.roll(
-            join_pieces(quiet(texts), false),
+            join_pieces(quiet(texts), false, false),
+            false,
             false,
             &mut None,
             &mut posted,
@@ -2577,7 +2706,8 @@ mod tests {
         let mut calls = 0;
         let (mut twin, mut posted) = (Some(group_key(40)), 0);
         let ops = turn.roll(
-            join_pieces(quiet(&["a"]), false),
+            join_pieces(quiet(&["a"]), false, false),
+            false,
             false,
             &mut twin,
             &mut posted,
@@ -2606,7 +2736,8 @@ mod tests {
         // A later read with a twin to absorb makes nothing of it: not first.
         let (mut twin, mut posted) = (Some(group_key(41)), 1);
         let ops = turn.roll(
-            join_pieces(quiet(&["x".repeat(4095).as_str()]), false),
+            join_pieces(quiet(&["x".repeat(4095).as_str()]), false, false),
+            false,
             false,
             &mut twin,
             &mut posted,
@@ -2623,7 +2754,8 @@ mod tests {
         let (mut twin, mut posted) = (Some(group_key(40)), 0);
         let prompt = vec![("> go".to_owned(), None, false, false)];
         let ops = turn.roll(
-            join_pieces(prompt, false),
+            join_pieces(prompt, false, false),
+            false,
             false,
             &mut twin,
             &mut posted,
@@ -2719,7 +2851,8 @@ mod tests {
             let mut calls = 0;
             let (mut twin, mut posted) = (Some(group_key(40)), 0);
             let ops = turn.roll(
-                join_pieces(quiet(&["a"]), false),
+                join_pieces(quiet(&["a"]), false, false),
+                false,
                 false,
                 &mut twin,
                 &mut posted,
@@ -2898,6 +3031,175 @@ mod tests {
         assert!(
             matches!(b.as_slice(), [MirrorOp::New { merge: true, .. }]),
             "{b:?}"
+        );
+    }
+
+    // ------------------------------------------------------------ TASK-075
+
+    /// [`built`] in a view with rich messages.
+    fn built_rich(compact: bool, pieces: &[(&str, Option<&str>, bool)]) -> Open {
+        let (text, html, tool) = pieces[0];
+        let mut turn = Open::new(
+            None,
+            1,
+            text.into(),
+            html.map(str::to_owned),
+            compact,
+            compact && tool,
+            true,
+        );
+        for (text, html, tool) in &pieces[1..] {
+            assert!(turn.push(text, *html, compact && *tool), "{text}");
+        }
+        turn
+    }
+
+    #[test]
+    fn a_rich_full_turn_message_puts_tool_lines_into_one_paragraph() {
+        let turn = built_rich(
+            false,
+            &[
+                ("Смотрю.", Some("Смотрю."), false),
+                ("• Bash: a<b ✓", None, true),
+                ("• Read: c ✓", None, true),
+                ("Дальше.", Some("Дальше."), false),
+            ],
+        );
+        assert_eq!(
+            turn.rich.as_deref(),
+            Some("Смотрю.\n\n<p>• Bash: a&lt;b ✓<br>• Read: c ✓</p>\n\nДальше.")
+        );
+        assert_eq!(turn.rich_run, RichRun::Block);
+        assert!(turn.rich_view);
+        // The other forms are as without rich.
+        let plain = built(
+            false,
+            &[
+                ("Смотрю.", Some("Смотрю."), false),
+                ("• Bash: a<b ✓", None, true),
+                ("• Read: c ✓", None, true),
+                ("Дальше.", Some("Дальше."), false),
+            ],
+        );
+        assert_eq!((&turn.text, &turn.html), (&plain.text, &plain.html));
+        assert_eq!(plain.rich, None);
+        assert!(!plain.rich_view);
+    }
+
+    #[test]
+    fn a_rich_compact_turn_message_quotes_with_line_breaks() {
+        let mut turn = built_rich(true, &TURN);
+        assert_eq!(
+            turn.rich.as_deref(),
+            Some(
+                "Смотрю.\n\n<blockquote expandable>• Bash: a ✓<br>• Bash: b ✓<br>💭 …</blockquote>\n\nДальше.\n\n<blockquote expandable>• Edit: x ✓</blockquote>"
+            )
+        );
+        assert_eq!(turn.rich_run, RichRun::Quote);
+        // A `<pre>` in 💭 keeps its line breaks.
+        assert!(turn.push("💭 x", Some("💭 <pre>a\nb</pre>\nc"), true));
+        assert!(
+            turn.rich.as_deref().unwrap().ends_with(
+                "<blockquote expandable>• Edit: x ✓<br>💭 <pre>a\nb</pre><br>c</blockquote>"
+            ),
+            "{:?}",
+            turn.rich
+        );
+    }
+
+    #[test]
+    fn a_rich_markdown_piece_goes_through_rich_markdown() {
+        let turn = Open::new(
+            None,
+            1,
+            "Vec<T> ok".into(),
+            Some("Vec&lt;T&gt; ok".into()),
+            false,
+            false,
+            true,
+        );
+        assert_eq!(turn.rich.as_deref(), Some("Vec&lt;T> ok"));
+        // A fence left open is closed: the tool line after it is no code.
+        let mut turn = Open::new(
+            None,
+            1,
+            "```rust\nlet a: Vec<u8>;".into(),
+            Some("<pre>let a</pre>".into()),
+            false,
+            false,
+            true,
+        );
+        assert!(turn.push("• Bash: a ✓", None, false));
+        assert_eq!(
+            turn.rich.as_deref(),
+            Some("```rust\nlet a: Vec<u8>;\n```\n\n<p>• Bash: a ✓</p>")
+        );
+    }
+
+    #[test]
+    fn a_piece_whose_rich_form_does_not_fit_starts_the_next_message() {
+        let mut turn = built_rich(false, &[("• x ✓", None, true)]);
+        loop {
+            let before = turn.clone();
+            if !turn.push("• x ✓", None, false) {
+                assert_eq!(turn, before, "nothing changes");
+                // The rich form was the one over the limit.
+                assert!(fits(&format!("{}\n• x ✓", turn.text)));
+                assert!(turn.html.is_none());
+                assert!(!fits(&format!(
+                    "{}<br>• x ✓</p>",
+                    turn.rich.as_deref().unwrap().strip_suffix("</p>").unwrap()
+                )));
+                break;
+            }
+        }
+        // A first piece whose rich form does not fit: the message has none.
+        let long = "<".repeat(transcript::TELEGRAM_TEXT_LIMIT / 4 + 1);
+        let turn = Open::new(None, 1, long.clone(), Some(long), false, false, true);
+        assert_eq!(turn.rich, None);
+        assert!(turn.rich_view);
+    }
+
+    #[test]
+    fn a_mirror_turn_goes_on_only_in_its_rich_setting() {
+        let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
+        let mut roll = |turn: &mut MirrorTurn, text: &str, rich: bool| {
+            let mut posted = 0;
+            turn.roll(
+                join_pieces(quiet(&[text]), false, rich),
+                false,
+                rich,
+                &mut None,
+                &mut posted,
+                &mut calls,
+            )
+        };
+        let ops = roll(&mut turn, "a", true);
+        let [MirrorOp::New { number, rich, .. }] = ops.as_slice() else {
+            panic!("{ops:?}");
+        };
+        assert_eq!(rich.as_deref(), Some("<p>a</p>"));
+        let number = *number;
+        let mut answer_calls = 100;
+        turn.answered(number, Some(group_key(50)), true, false, &mut answer_calls);
+        let ops = roll(&mut turn, "b", true);
+        assert!(
+            matches!(ops.as_slice(), [MirrorOp::Write { into, rich: Some(rich), .. }]
+                if *into == group_key(50) && rich == "<p>a<br>b</p>"),
+            "{ops:?}"
+        );
+        let ops = roll(&mut turn, "c", false);
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [MirrorOp::New {
+                    rich: None,
+                    into: None,
+                    ..
+                }]
+            ),
+            "another setting, a new message: {ops:?}"
         );
     }
 }

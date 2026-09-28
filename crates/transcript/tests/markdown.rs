@@ -1,8 +1,8 @@
 //! Markdown to Telegram HTML (TASK-027).
 
 use transcript::{
-    SplitOptions, TELEGRAM_TEXT_LIMIT, escape_html, markdown_to_html, split_markdown_for_telegram,
-    telegram_len,
+    SplitOptions, TELEGRAM_TEXT_LIMIT, escape_html, markdown_to_html, rich_markdown,
+    split_markdown_for_telegram, telegram_len,
 };
 
 /// A real model answer (TASK-004 implementer summary, from this repository).
@@ -293,4 +293,108 @@ fn pathological_input_converts_in_bounded_work() {
     // Ordinary markup after a few unclosed openers still converts.
     let line = format!("{}**done**", "*open ".repeat(20));
     assert!(markdown_to_html(&line).ends_with("<b>done</b>"));
+}
+
+// rich_markdown (TASK-075)
+
+#[test]
+fn rich_markdown_escapes_every_lt_that_is_no_allowed_tag() {
+    assert_eq!(rich_markdown("a Vec<String> b"), "a Vec&lt;String> b");
+    assert_eq!(
+        rich_markdown(r#"<channel source="cctg" message_id=5> and </div>"#),
+        r#"&lt;channel source="cctg" message_id=5> and &lt;/div>"#
+    );
+    assert_eq!(rich_markdown("a < b"), "a &lt; b");
+    // A valid tag by HTML syntax (`p` with attributes `and`, `j`) that Telegram would drop.
+    assert_eq!(rich_markdown("if i<p and j>0"), "if i&lt;p and j>0");
+    assert_eq!(
+        rich_markdown(r#"<b onclick="x">y</b>"#),
+        r#"&lt;b onclick="x">y</b>"#
+    );
+    assert_eq!(rich_markdown("<!-- c -->"), "&lt;!-- c -->");
+    assert_eq!(rich_markdown("see <https://x.y>"), "see &lt;https://x.y>");
+    assert_eq!(
+        rich_markdown("<!DOCTYPE html> <?xml?>"),
+        "&lt;!DOCTYPE html> &lt;?xml?>"
+    );
+    // A tag not closed on its line.
+    assert_eq!(rich_markdown("<b\n>x"), "&lt;b\n>x");
+}
+
+#[test]
+fn rich_markdown_keeps_complete_allowed_tags() {
+    for text in [
+        "a<br>b",
+        "a<br/>b<br />c",
+        "x<sup>2</sup>",
+        "<details open><summary>s</summary>t</details>",
+        "</b>",
+        r#"<a href="https://x">y</a>"#,
+        "<a href='https://x'>y</a>",
+        "<blockquote expandable>q</blockquote>",
+        r#"<code class="language-rust">x</code>"#,
+        r#"<ol start=3 reversed><li>a</li></ol>"#,
+        r#"<td align="right" colspan=2>c</td>"#,
+        "<tg-spoiler>s</tg-spoiler> <H1>t</H1>",
+    ] {
+        assert_eq!(rich_markdown(text), text);
+    }
+}
+
+#[test]
+fn rich_markdown_leaves_code_alone() {
+    for text in [
+        "use `Vec<T>` here",
+        "``a ` <b> `` and `x`",
+        "```rust\nlet v: Vec<u8> = a < b;\n```\nafter",
+        "~~~\n<div>\n~~~",
+        "   ```\n<x>\n   ```",
+        "````\n```\n<x>\n````",
+    ] {
+        assert_eq!(rich_markdown(text), text, "{text:?}");
+    }
+    // Four spaces: no fence here, so the `<` outside code is escaped.
+    assert_eq!(rich_markdown("    ```\n<x>"), "    ```\n&lt;x>");
+    // A closing run needs the same marker, at least as long, nothing after it.
+    assert_eq!(
+        rich_markdown("```\n~~~\n``` x\n<y>\n```\n<z>"),
+        "```\n~~~\n``` x\n<y>\n```\n&lt;z>"
+    );
+    // A backtick after a backtick fence opener: a code span, not a fence.
+    assert_eq!(rich_markdown("```a`b\n<x>"), "```a`b\n&lt;x>");
+    // An unmatched backtick run is text: the `<` after it is escaped.
+    assert_eq!(rich_markdown("a ` b <c"), "a ` b &lt;c");
+}
+
+#[test]
+fn rich_markdown_closes_a_fence_left_open_at_the_end() {
+    assert_eq!(
+        rich_markdown("text\n```rust\nlet a = b<c>;"),
+        "text\n```rust\nlet a = b<c>;\n```"
+    );
+    assert_eq!(rich_markdown("~~~~\n<x>\n"), "~~~~\n<x>\n~~~~");
+}
+
+#[test]
+fn rich_markdown_backslash_lt_becomes_an_entity_other_escapes_stay() {
+    assert_eq!(rich_markdown(r"\<String>"), "&lt;String>");
+    assert_eq!(
+        rich_markdown(r"\* not a list \_x\_ \$5"),
+        r"\* not a list \_x\_ \$5"
+    );
+    assert_eq!(rich_markdown(r"\`<b>` x"), r"\`<b>` x");
+}
+
+#[test]
+fn rich_markdown_without_lt_or_fence_is_the_input() {
+    for text in [
+        "",
+        "plain text",
+        "# Title\n\n| a | b |\n|---|:-:|\n| 1 | 2 |\n\n- one\n  - two\n    - three",
+        "a > b & c &amp; **bold** $x$",
+        "кириллица 🙂 ~~strike~~",
+    ] {
+        assert_eq!(rich_markdown(text), text);
+    }
+    assert_eq!(rich_markdown(ANSWER).replace("&lt;", "<"), ANSWER);
 }

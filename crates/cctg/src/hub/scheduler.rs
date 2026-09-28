@@ -67,6 +67,14 @@
 //! it (`400 can't parse entities`), the same job goes again once, at the head
 //! of its lane, as its plain `text` without the markup.
 //!
+//! A message with `rich` goes as `sendRichMessage` (a write `into` as
+//! `editMessageText` with `rich_message`, TASK-075). When Telegram refuses it
+//! (see [`is_rich_refusal`]), its markdown is dropped and the same job goes
+//! again at the head of its lane as today's messages: `before` as jobs of
+//! their own, then its own text/html, each as HTML with the plain-text
+//! fallback above. A message whose rich edit was refused is written without
+//! rich from then on.
+//!
 //! A ready ordinary message is served after a bounded run of unmetered jobs,
 //! while a ready permission prompt always remains first.
 //!
@@ -112,6 +120,9 @@ use super::api::{ApiError, BotApi, Document, ForumTopic, Message};
 use super::chat::{Chat, MessageKey, Place};
 
 const QUEUE_CAPACITY: usize = 1024;
+/// Messages whose rich edit Telegram refused (TASK-075); when full it is
+/// cleared: a forgotten one costs one more refused request.
+const MAX_RICH_REFUSED: usize = 1024;
 const MAX_CONSECUTIVE_UNMETERED: usize = 4;
 const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// The group's rate after 429s is at least this share of `Limits::group`.
@@ -131,6 +142,9 @@ pub enum Op {
         text: String,
         /// `text` as Telegram HTML (`parse_mode: HTML`), sent instead of it.
         html: Option<String>,
+        /// TASK-075: sent as a rich message while `markdown` is set; see
+        /// [`Rich`].
+        rich: Option<Box<Rich>>,
         reply_markup: Option<Value>,
         /// Permission prompts jump ahead of ordinary messages of other topics,
         /// never ahead of older messages of their own topic but a status
@@ -226,6 +240,8 @@ pub enum Op {
         text: String,
         /// As in `Send`.
         html: Option<String>,
+        /// As in `Send`.
+        rich: Option<Box<Rich>>,
         merge: bool,
         restart: bool,
         /// As in `Send`; only lines of equal `notify` share a message.
@@ -246,6 +262,22 @@ pub enum Op {
         message_id: i64,
         emoji: String,
     },
+}
+
+/// TASK-075: agent markdown as one rich message.
+#[derive(Debug, Clone)]
+pub struct Rich {
+    /// `transcript::rich_markdown` of the text; `None` once Telegram refused
+    /// it or in a view without rich messages: the op then goes as today's
+    /// messages, `before` first.
+    pub markdown: Option<String>,
+    /// Today's messages (text, HTML) before this op's own `text`/`html`,
+    /// which are today's last one.
+    pub before: Vec<(String, String)>,
+    /// Today's form of the text is this document (more than four
+    /// messages): what a view without rich messages gets instead (the
+    /// slots actor decides; the scheduler never sends it).
+    pub file: Option<Document>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +442,9 @@ pub trait Transport: Send + Sync + 'static {
 
 impl Transport for BotApi {
     async fn execute(&self, op: &Op) -> Delivery {
+        if let Some(delivery) = execute_rich(self, op).await {
+            return delivery;
+        }
         match op {
             Op::Send {
                 chat,
@@ -590,6 +625,76 @@ impl Transport for BotApi {
     }
 }
 
+/// A message op that still has its rich markdown (TASK-075) as a rich
+/// message; `None` for every other op.
+async fn execute_rich(api: &BotApi, op: &Op) -> Option<Delivery> {
+    let delivery = match op {
+        Op::Send {
+            chat,
+            thread_id,
+            rich: Some(rich),
+            reply_markup,
+            reply_to,
+            notify,
+            ..
+        } => {
+            let markdown = rich.markdown.as_deref()?;
+            api.send_rich_message(
+                Place::new(*chat, *thread_id),
+                markdown,
+                reply_markup.as_ref(),
+                *reply_to,
+                *notify,
+            )
+            .await
+            .map(Outcome::Sent)
+        }
+        Op::Stream {
+            chat,
+            rich: Some(rich),
+            into: Some(message_id),
+            ..
+        } => {
+            let markdown = rich.markdown.as_deref()?;
+            // An explicit empty keyboard, as for the HTML write.
+            api.edit_message_rich(
+                *chat,
+                *message_id,
+                markdown,
+                Some(&super::permissions::no_keyboard()),
+            )
+            .await
+            .map(|()| {
+                Outcome::Sent(Message {
+                    message_id: *message_id,
+                    ..Message::default()
+                })
+            })
+        }
+        Op::Stream {
+            chat,
+            thread_id,
+            rich: Some(rich),
+            notify,
+            into: None,
+            ..
+        } => {
+            let markdown = rich.markdown.as_deref()?;
+            api.send_rich_message(
+                Place::topic(*chat, *thread_id),
+                markdown,
+                None,
+                None,
+                *notify,
+            )
+            .await
+            .map(Outcome::Sent)
+        }
+        _ => return None,
+    };
+    Some(delivery)
+}
+
 /// The text to send and its `parse_mode`: the HTML when there is one.
 fn formatted<'a>(text: &'a str, html: Option<&'a str>) -> (&'a str, Option<&'static str>) {
     match html {
@@ -606,6 +711,55 @@ fn is_bad_markup(error: &ApiError) -> bool {
         ApiError::Telegram { code: 400, description }
             if description.to_ascii_lowercase().contains("can't parse entities")
     )
+}
+
+/// Telegram did not take a rich message (TASK-075): a 404 (a Bot API server
+/// without the method) or a 400. The list of `RICH_MESSAGE_*` refusals is not
+/// closed, so any 400 falls back but an error of the target itself: HTML
+/// would get the same one, and the slots read those as they are.
+fn is_rich_refusal(error: &ApiError) -> bool {
+    const TARGET: [&str; 8] = [
+        "message is not modified",
+        "message to edit not found",
+        "message can't be edited",
+        "message thread not found",
+        "topic_id_invalid",
+        "topic_deleted",
+        "message to be replied not found",
+        "chat not found",
+    ];
+    match error {
+        ApiError::Telegram { code: 404, .. } => true,
+        ApiError::Telegram {
+            code: 400,
+            description,
+        } => {
+            let description = description.to_ascii_lowercase();
+            !TARGET.iter().any(|target| description.contains(target))
+        }
+        _ => false,
+    }
+}
+
+/// Drops the rich markdown of a message op; true when it had some.
+fn drop_rich(op: &mut Op) -> bool {
+    match op {
+        Op::Send {
+            rich: Some(rich), ..
+        }
+        | Op::Stream {
+            rich: Some(rich), ..
+        } => rich.markdown.take().is_some(),
+        _ => false,
+    }
+}
+
+/// The rich markdown of a one-message op: `None` without one or with
+/// earlier messages (`Rich::before`).
+fn single_markdown(rich: Option<&Rich>) -> Option<&str> {
+    rich.filter(|rich| rich.before.is_empty())?
+        .markdown
+        .as_deref()
 }
 
 fn html_or_escaped(text: &str, html: Option<&str>) -> String {
@@ -931,6 +1085,11 @@ struct Job {
     /// permission prompt of its topic answers a new one `Superseded` while it
     /// waits.
     status: Option<LiveText>,
+    /// A message of a laid-out job (TASK-075): nobody waits for its answer.
+    part: bool,
+    /// Its rich form was refused (TASK-075): the message it makes is
+    /// remembered in `Scheduler::rich_refused`.
+    rich_refused: bool,
 }
 
 /// Cloneable handle that enqueues outbound operations.
@@ -1043,6 +1202,8 @@ impl Outbox {
                 merged: Vec::new(),
                 plain_retry: false,
                 status,
+                part: false,
+                rich_refused: false,
             })
             .await;
         receiver
@@ -1069,6 +1230,9 @@ pub struct Scheduler<T> {
     topic_turn: bool,
     /// Topics whose stream broke: their lines wait for a `restart` line.
     broken: HashSet<Place>,
+    /// Messages Telegram refused a rich write of (TASK-075): they are
+    /// written as HTML; at most [`MAX_RICH_REFUSED`], kept in memory only.
+    rich_refused: HashSet<MessageKey>,
     edit: VecDeque<Job>,
     topic: VecDeque<Job>,
     message: VecDeque<Job>,
@@ -1101,6 +1265,7 @@ impl<T: Transport> Scheduler<T> {
             since_refresh: 0,
             topic_turn: true,
             broken: HashSet::new(),
+            rich_refused: HashSet::new(),
             edit: VecDeque::new(),
             topic: VecDeque::new(),
             message: VecDeque::new(),
@@ -1548,15 +1713,29 @@ impl<T: Transport> Scheduler<T> {
                 .position(|job| matches!(job.op, Op::CreateTopic { .. }))
                 .unwrap_or(0),
         };
-        let Some(mut job) = self.lane_mut(lane).remove(index) else {
+        let Some(job) = self.lane_mut(lane).remove(index) else {
             return;
         };
         if job.status.as_ref().is_some_and(LiveText::cancelled) {
             let _ = job.reply.send(Ok(Outcome::Superseded));
             return;
         }
+        let Some(mut job) = self.lay_out(lane, job) else {
+            return;
+        };
         if matches!(lane, Lane::Message(_)) {
             self.merge_lines(&mut job, Instant::now());
+        }
+        if let Op::Stream {
+            chat,
+            rich: Some(rich),
+            into: Some(id),
+            ..
+        } = &mut job.op
+            && self.rich_refused.contains(&MessageKey::new(*chat, *id))
+        {
+            // Telegram refused a rich write of this message: HTML at once.
+            rich.markdown = None;
         }
         if let Some(status) = &job.status {
             status.fill(&mut job.op);
@@ -1593,6 +1772,22 @@ impl<T: Transport> Scheduler<T> {
             }
         }
         let result = self.transport.execute(&job.op).await;
+        if matches!(&result, Err(error) if is_rich_refusal(error)) && drop_rich(&mut job.op) {
+            // Once: the next pass lays it out as today's messages.
+            warn!("telegram did not take a rich message; sending it as today's messages");
+            match &job.op {
+                Op::Stream {
+                    chat,
+                    into: Some(id),
+                    ..
+                } => self.refused_rich(MessageKey::new(*chat, *id)),
+                Op::Stream { into: None, .. } => job.rich_refused = true,
+                _ => {}
+            }
+            job.plain_retry = true;
+            self.lane_mut(lane).push_front(job);
+            return;
+        }
         if matches!(&result, Err(error) if is_bad_markup(error)) && drop_html(&mut job.op) {
             // Once: the op has no HTML left to refuse.
             warn!("telegram could not parse a formatted message; sending it as plain text");
@@ -1636,6 +1831,15 @@ impl<T: Transport> Scheduler<T> {
             }
             result => {
                 let accepted = result.is_ok();
+                if let (Op::Stream { chat, .. }, Ok(Outcome::Sent(message))) = (&job.op, &result)
+                    && job.rich_refused
+                {
+                    // Its later writes go as HTML at once.
+                    self.refused_rich(MessageKey::new(*chat, message.message_id));
+                }
+                if job.part && result.is_err() {
+                    warn!("telegram did not take a part of a message sent as today's messages");
+                }
                 if let (Op::Stream { .. }, Some(place), Err(error)) =
                     (&job.op, job.op.place(), &result)
                     && !matches!(error, ApiError::Telegram { code, .. } if (400..500).contains(code))
@@ -1652,6 +1856,89 @@ impl<T: Transport> Scheduler<T> {
                 }
             }
         }
+    }
+
+    /// A job whose rich form is gone (refused, or a view without rich
+    /// messages, TASK-075) goes as today's messages: the earlier ones
+    /// (`Rich::before`) as jobs of their own at the head of `lane`, then the
+    /// job itself with the last one, which answers its sender; `None` when
+    /// it was put back so. Anything else comes back as it is.
+    fn lay_out(&mut self, lane: Lane, mut job: Job) -> Option<Job> {
+        let (Op::Send { rich, .. } | Op::Stream { rich, .. }) = &mut job.op else {
+            return Some(job);
+        };
+        if rich.as_ref().is_none_or(|rich| rich.markdown.is_some()) {
+            return Some(job);
+        }
+        let before = rich.take().map(|rich| rich.before).unwrap_or_default();
+        if before.is_empty() {
+            return Some(job);
+        }
+        job.plain_retry = true;
+        // The first message of a stream (again) is the first part now.
+        let restart = match &mut job.op {
+            Op::Stream { restart, .. } => std::mem::take(restart),
+            _ => false,
+        };
+        let parts: Vec<Job> = before
+            .into_iter()
+            .enumerate()
+            .map(|(index, (part_text, part_html))| {
+                let mut op = job.op.clone();
+                match &mut op {
+                    Op::Send {
+                        text,
+                        html,
+                        reply_markup,
+                        reply_to,
+                        ..
+                    } => {
+                        *text = part_text;
+                        *html = Some(part_html);
+                        *reply_markup = None;
+                        *reply_to = None;
+                    }
+                    Op::Stream {
+                        text,
+                        html,
+                        merge,
+                        restart: part_restart,
+                        ..
+                    } => {
+                        *text = part_text;
+                        *html = Some(part_html);
+                        *merge = false;
+                        *part_restart = restart && index == 0;
+                    }
+                    _ => {}
+                }
+                Job {
+                    op,
+                    queued_at: job.queued_at,
+                    reply: oneshot::channel().0,
+                    merged: Vec::new(),
+                    plain_retry: true,
+                    status: None,
+                    part: true,
+                    rich_refused: false,
+                }
+            })
+            .collect();
+        let queue = self.lane_mut(lane);
+        queue.push_front(job);
+        for part in parts.into_iter().rev() {
+            queue.push_front(part);
+        }
+        None
+    }
+
+    /// Telegram refused a rich write of `message` (TASK-075): it is written
+    /// as HTML from now on.
+    fn refused_rich(&mut self, message: MessageKey) {
+        if self.rich_refused.len() >= MAX_RICH_REFUSED {
+            self.rich_refused.clear();
+        }
+        self.rich_refused.insert(message);
     }
 
     /// Drops the queued lines of `place`'s stream up to its next
@@ -1682,6 +1969,7 @@ impl<T: Transport> Scheduler<T> {
         let Op::Stream {
             text,
             html,
+            rich,
             merge: true,
             notify,
             into,
@@ -1703,6 +1991,7 @@ impl<T: Transport> Scheduler<T> {
                 let Op::Stream {
                     text: next,
                     html: next_html,
+                    rich: next_rich,
                     merge: true,
                     notify: next_notify,
                     into: next_into,
@@ -1716,6 +2005,8 @@ impl<T: Transport> Scheduler<T> {
                 }
                 text.clone_from(next);
                 html.clone_from(next_html);
+                // Its rich form too: the old one would drop the new lines.
+                rich.clone_from(next_rich);
                 let Some(next) = self.message.remove(index) else {
                     break;
                 };
@@ -1738,6 +2029,7 @@ impl<T: Transport> Scheduler<T> {
             let Op::Stream {
                 text: next,
                 html: next_html,
+                rich: next_rich,
                 merge: true,
                 notify: next_notify,
                 into: None,
@@ -1747,6 +2039,20 @@ impl<T: Transport> Scheduler<T> {
                 break;
             };
             if next_notify != notify {
+                break;
+            }
+            // Rich only when both are (TASK-075); else the message goes as
+            // HTML.
+            let joined_rich = match (
+                single_markdown(rich.as_deref()),
+                single_markdown(next_rich.as_deref()),
+            ) {
+                (Some(own), Some(next)) => Some(format!("{own}\n\n{next}")),
+                _ => None,
+            };
+            if joined_rich.as_deref().is_some_and(|joined| {
+                transcript::telegram_len(joined) > transcript::TELEGRAM_TEXT_LIMIT
+            }) {
                 break;
             }
             // One formatted line makes the whole message HTML.
@@ -1768,6 +2074,13 @@ impl<T: Transport> Scheduler<T> {
             text.push('\n');
             text.push_str(next);
             *html = joined_html;
+            *rich = joined_rich.map(|markdown| {
+                Box::new(Rich {
+                    markdown: Some(markdown),
+                    before: Vec::new(),
+                    file: None,
+                })
+            });
             let Some(next) = self.message.remove(index) else {
                 break;
             };
@@ -1919,6 +2232,7 @@ mod tests {
             thread_id: Some(7),
             text: text.to_owned(),
             html: None,
+            rich: None,
             reply_markup: None,
             permission: false,
             reply_to: None,
@@ -2071,6 +2385,7 @@ mod tests {
             thread_id: Some(thread),
             text: text.to_owned(),
             html: None,
+            rich: None,
             reply_markup: None,
             permission: false,
             reply_to: None,
@@ -2183,6 +2498,7 @@ mod tests {
             thread_id: Some(2),
             text: "permission".to_owned(),
             html: None,
+            rich: None,
             reply_markup: None,
             permission: true,
             reply_to: None,
@@ -2337,6 +2653,7 @@ mod tests {
             thread_id: Some(thread),
             text: text.to_owned(),
             html: None,
+            rich: None,
             reply_markup: None,
             permission: true,
             reply_to: None,
@@ -2581,6 +2898,7 @@ mod tests {
             thread_id: thread,
             text: text.to_owned(),
             html: None,
+            rich: None,
             merge: true,
             restart: false,
             notify: false,
@@ -2743,6 +3061,7 @@ mod tests {
             thread_id: thread,
             text: text.to_owned(),
             html: None,
+            rich: None,
             merge: false,
             restart,
             notify: false,
@@ -2846,6 +3165,7 @@ mod tests {
                 thread_id: 1,
                 text: format!("s{i}"),
                 html: None,
+                rich: None,
                 merge: false,
                 restart: false,
                 notify: false,
@@ -2923,6 +3243,7 @@ mod tests {
             thread_id: Some(1),
             text: text.to_owned(),
             html: Some(html.to_owned()),
+            rich: None,
             reply_markup: None,
             permission: false,
             reply_to: None,
@@ -2954,6 +3275,7 @@ mod tests {
                 thread_id: 1,
                 text: "_b_".to_owned(),
                 html: Some("<i>b</i>".to_owned()),
+                rich: None,
                 merge: false,
                 restart: true,
                 notify: false,
@@ -3008,6 +3330,7 @@ mod tests {
             thread_id: 1,
             text: "\u{1F4AD} **x**".to_owned(),
             html: Some("\u{1F4AD} <b>x</b>".to_owned()),
+            rich: None,
             merge: true,
             restart: false,
             notify: false,
@@ -3048,6 +3371,7 @@ mod tests {
                 thread_id: 1,
                 text: format!("**l{i}**"),
                 html: Some(format!("<b>l{i}</b>")),
+                rich: None,
                 merge: true,
                 restart: false,
                 notify: false,
@@ -3812,6 +4136,7 @@ mod tests {
                 thread_id,
                 text,
                 html,
+                rich: None,
                 merge,
                 restart,
                 notify,
@@ -4151,6 +4476,7 @@ mod tests {
             thread_id: 1,
             text: text.to_owned(),
             html: None,
+            rich: None,
             merge,
             restart: true,
             notify: false,
@@ -4175,5 +4501,436 @@ mod tests {
                 assert!(matches!(answers[1], Some(Ok(Outcome::Sent(_)))));
             }
         }
+    }
+
+    // ------------------------------------------------------------ TASK-075
+
+    /// Records every op; refuses a rich one with a `RICH_MESSAGE_*` 400 when
+    /// `refuse_rich`, HTML with `can't parse entities` when `bad_markup`,
+    /// and answers the call of an index in `errors` with that error (429:
+    /// `retry_after` 1 s). New messages get ids 1, 2, ... in order; a write
+    /// into a message answers with that message.
+    #[derive(Default)]
+    struct RichFake {
+        calls: Mutex<Vec<Op>>,
+        refuse_rich: bool,
+        bad_markup: bool,
+        errors: Mutex<HashMap<usize, (i64, &'static str)>>,
+        made: Mutex<i64>,
+    }
+
+    impl RichFake {
+        fn refusing() -> Arc<Self> {
+            Arc::new(Self {
+                refuse_rich: true,
+                ..Self::default()
+            })
+        }
+
+        fn failing(errors: &[(usize, i64, &'static str)]) -> Arc<Self> {
+            Arc::new(Self {
+                errors: Mutex::new(
+                    errors
+                        .iter()
+                        .map(|&(index, code, description)| (index, (code, description)))
+                        .collect(),
+                ),
+                ..Self::default()
+            })
+        }
+
+        fn calls(&self) -> Vec<Op> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+    }
+
+    impl Transport for RichFake {
+        async fn execute(&self, op: &Op) -> Delivery {
+            let index = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(op.clone());
+                calls.len() - 1
+            };
+            if let Some((code, description)) = self.errors.lock().unwrap().remove(&index) {
+                return Err(match code {
+                    429 => ApiError::RetryAfter(Duration::from_secs(1)),
+                    code => ApiError::Telegram {
+                        code,
+                        description: description.to_owned(),
+                    },
+                });
+            }
+            let rich = rich_md(op).is_some();
+            if rich && self.refuse_rich {
+                return Err(ApiError::Telegram {
+                    code: 400,
+                    description: "Bad Request: RICH_MESSAGE_BLOCKS_TOO_MANY".to_owned(),
+                });
+            }
+            let html = matches!(
+                op,
+                Op::Send { html: Some(_), .. } | Op::Stream { html: Some(_), .. }
+            );
+            if !rich && html && self.bad_markup {
+                return Err(ApiError::Telegram {
+                    code: 400,
+                    description: "Bad Request: can't parse entities: x".to_owned(),
+                });
+            }
+            let message_id = match op {
+                Op::Stream { into: Some(id), .. } => *id,
+                _ => {
+                    let mut made = self.made.lock().unwrap();
+                    *made += 1;
+                    *made
+                }
+            };
+            Ok(Outcome::Sent(Message {
+                message_id,
+                ..Message::default()
+            }))
+        }
+    }
+
+    /// The markdown an op goes with, when it goes rich.
+    fn rich_md(op: &Op) -> Option<&str> {
+        match op {
+            Op::Send {
+                rich: Some(rich), ..
+            }
+            | Op::Stream {
+                rich: Some(rich), ..
+            } => rich.markdown.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Each call as (rich markdown, text, html).
+    fn rich_calls(fake: &RichFake) -> Vec<(Option<String>, String, Option<String>)> {
+        fake.calls()
+            .iter()
+            .filter_map(|op| match op {
+                Op::Send { text, html, .. } | Op::Stream { text, html, .. } => {
+                    Some((rich_md(op).map(str::to_owned), text.clone(), html.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rich(markdown: Option<&str>, before: &[&str]) -> Option<Box<Rich>> {
+        Some(Box::new(Rich {
+            markdown: markdown.map(str::to_owned),
+            before: before
+                .iter()
+                .map(|text| ((*text).to_owned(), format!("<b>{text}</b>")))
+                .collect(),
+            file: None,
+        }))
+    }
+
+    fn rich_send(markdown: Option<&str>, before: &[&str], text: &str) -> Op {
+        Op::Send {
+            chat: Chat::Group,
+            thread_id: Some(1),
+            text: text.to_owned(),
+            html: Some(format!("<b>{text}</b>")),
+            rich: rich(markdown, before),
+            reply_markup: Some(serde_json::json!({ "inline_keyboard": [] })),
+            permission: false,
+            reply_to: Some(9),
+            notify: true,
+        }
+    }
+
+    fn rich_stream(into: Option<i64>, markdown: Option<&str>, text: &str, merge: bool) -> Op {
+        Op::Stream {
+            chat: Chat::Group,
+            thread_id: 1,
+            text: text.to_owned(),
+            html: Some(format!("<b>{text}</b>")),
+            rich: rich(markdown, &[]),
+            merge,
+            restart: false,
+            notify: false,
+            into,
+        }
+    }
+
+    fn sent_id(delivery: Result<Delivery, oneshot::error::RecvError>) -> i64 {
+        match delivery {
+            Ok(Ok(Outcome::Sent(message))) => message.message_id,
+            other => panic!("not sent: {other:?}"),
+        }
+    }
+
+    /// (a) A refused rich answer goes as today's messages, in order; its
+    /// sender gets the last one; only that one keeps the buttons and reply.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_rich_message_goes_as_its_html_messages_in_order() {
+        let fake = RichFake::refusing();
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let answer = outbox
+            .submit(rich_send(Some("# md"), &["a", "b"], "c"))
+            .await;
+        drop(outbox);
+        scheduler.run().await;
+        assert_eq!(sent_id(answer.await), 3);
+        let calls = rich_calls(&fake);
+        assert_eq!(
+            calls,
+            [
+                (
+                    Some("# md".to_owned()),
+                    "c".to_owned(),
+                    Some("<b>c</b>".to_owned())
+                ),
+                (None, "a".to_owned(), Some("<b>a</b>".to_owned())),
+                (None, "b".to_owned(), Some("<b>b</b>".to_owned())),
+                (None, "c".to_owned(), Some("<b>c</b>".to_owned())),
+            ]
+        );
+        let ops = fake.calls();
+        for part in &ops[1..3] {
+            assert!(matches!(
+                part,
+                Op::Send {
+                    reply_markup: None,
+                    reply_to: None,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            &ops[3],
+            Op::Send {
+                reply_markup: Some(_),
+                reply_to: Some(9),
+                ..
+            }
+        ));
+    }
+
+    /// (b) A refused rich write goes as one HTML write, and later rich
+    /// writes of that message go as HTML at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_message_whose_rich_write_was_refused_is_written_as_html() {
+        let fake = RichFake::refusing();
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let running = tokio::spawn(scheduler.run());
+        let first = outbox
+            .submit(rich_stream(Some(5), Some("md 1"), "one", true))
+            .await;
+        assert_eq!(sent_id(first.await), 5);
+        let second = outbox
+            .submit(rich_stream(Some(5), Some("md 2"), "two", true))
+            .await;
+        assert_eq!(sent_id(second.await), 5);
+        drop(outbox);
+        running.await.unwrap();
+        let calls = rich_calls(&fake);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[0].0.as_deref(), Some("md 1"));
+        assert_eq!((calls[1].0.as_deref(), calls[1].1.as_str()), (None, "one"));
+        assert_eq!((calls[2].0.as_deref(), calls[2].1.as_str()), (None, "two"));
+    }
+
+    /// (c) A new message whose rich send was refused went as HTML: its
+    /// later writes go as HTML at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_message_sent_as_html_after_a_refusal_is_written_as_html() {
+        let fake = RichFake::refusing();
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let running = tokio::spawn(scheduler.run());
+        let made = outbox
+            .submit(rich_stream(None, Some("md 1"), "one", false))
+            .await;
+        let id = sent_id(made.await);
+        let write = outbox
+            .submit(rich_stream(Some(id), Some("md 2"), "two", true))
+            .await;
+        assert_eq!(sent_id(write.await), id);
+        drop(outbox);
+        running.await.unwrap();
+        let calls = rich_calls(&fake);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[0].0.is_some());
+        assert!(calls[1].0.is_none() && calls[2].0.is_none(), "{calls:?}");
+        assert!(matches!(fake.calls()[2], Op::Stream { into: Some(i), .. } if i == id));
+    }
+
+    /// (d) An error of the target is no refusal of the rich form: no
+    /// fallback, the sender gets it.
+    #[tokio::test(start_paused = true)]
+    async fn a_target_error_of_a_rich_write_is_answered_as_it_is() {
+        for description in [
+            "Bad Request: message is not modified",
+            "Bad Request: message to edit not found",
+        ] {
+            let fake = RichFake::failing(&[(0, 400, description)]);
+            let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+            let write = outbox
+                .submit(rich_stream(Some(5), Some("md"), "one", true))
+                .await;
+            drop(outbox);
+            scheduler.run().await;
+            assert!(
+                matches!(write.await, Ok(Err(ApiError::Telegram { code: 400, .. }))),
+                "{description}"
+            );
+            assert_eq!(fake.calls().len(), 1, "{description}");
+        }
+    }
+
+    /// (e) After a refused rich form, HTML Telegram cannot parse still goes
+    /// as plain text.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_rich_message_still_falls_back_to_plain_text() {
+        let fake = Arc::new(RichFake {
+            refuse_rich: true,
+            bad_markup: true,
+            ..RichFake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let answer = outbox.submit(rich_send(Some("md"), &[], "c")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert_eq!(sent_id(answer.await), 1);
+        let calls = rich_calls(&fake);
+        assert_eq!(
+            calls,
+            [
+                (
+                    Some("md".to_owned()),
+                    "c".to_owned(),
+                    Some("<b>c</b>".to_owned())
+                ),
+                (None, "c".to_owned(), Some("<b>c</b>".to_owned())),
+                (None, "c".to_owned(), None),
+            ]
+        );
+    }
+
+    /// (f) A 429 on a part puts it back at the head: the order holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_wait_on_a_part_keeps_the_order() {
+        let fake = Arc::new(RichFake {
+            refuse_rich: true,
+            errors: Mutex::new([(2, (429, ""))].into_iter().collect()),
+            ..RichFake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let answer = outbox.submit(rich_send(Some("md"), &["a", "b"], "c")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert_eq!(sent_id(answer.await), 3);
+        let texts: Vec<String> = rich_calls(&fake)
+            .into_iter()
+            .skip(1)
+            .map(|(_, text, _)| text)
+            .collect();
+        assert_eq!(texts, ["a", "b", "b", "c"]);
+    }
+
+    /// (g) A job without markdown but with earlier messages (a view without
+    /// rich messages) goes as today's messages without a rich attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_without_markdown_goes_as_its_messages_at_once() {
+        let fake = RichFake::refusing();
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let answer = outbox.submit(rich_send(None, &["a", "b"], "c")).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert_eq!(sent_id(answer.await), 3);
+        let calls = rich_calls(&fake);
+        assert!(
+            calls
+                .iter()
+                .all(|(rich, _, html)| rich.is_none() && html.is_some())
+        );
+        let texts: Vec<&str> = calls.iter().map(|(_, text, _)| text.as_str()).collect();
+        assert_eq!(texts, ["a", "b", "c"]);
+    }
+
+    /// (h) Writes into one message joined: the newest rich form goes.
+    #[tokio::test(start_paused = true)]
+    async fn joined_writes_into_a_message_go_with_the_newest_rich_form() {
+        let fake = Arc::new(RichFake::default());
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let first = outbox
+            .submit(rich_stream(Some(5), Some("md 1"), "one", true))
+            .await;
+        let second = outbox
+            .submit(rich_stream(Some(5), Some("md 2"), "one two", true))
+            .await;
+        drop(outbox);
+        scheduler.run().await;
+        assert_eq!(sent_id(first.await), 5);
+        assert!(matches!(second.await, Ok(Ok(Outcome::Merged))));
+        let calls = rich_calls(&fake);
+        assert_eq!(
+            calls,
+            [(
+                Some("md 2".to_owned()),
+                "one two".to_owned(),
+                Some("<b>one two</b>".to_owned())
+            )]
+        );
+    }
+
+    /// (i) Two new rich lines joined: their markdown blocks one below the
+    /// other; with one of them not rich, the message goes as HTML.
+    #[tokio::test(start_paused = true)]
+    async fn joined_new_lines_are_rich_only_when_both_are() {
+        for (second, want) in [(Some("B"), Some("A\n\nB")), (None, None)] {
+            let fake = Arc::new(RichFake::default());
+            let (scheduler, outbox) = Scheduler::new(fake.clone(), Limits::default());
+            let first = outbox.submit(rich_stream(None, Some("A"), "a", true)).await;
+            let next = outbox.submit(rich_stream(None, second, "b", true)).await;
+            drop(outbox);
+            scheduler.run().await;
+            assert_eq!(sent_id(first.await), 1);
+            assert!(matches!(next.await, Ok(Ok(Outcome::Merged))));
+            let calls = rich_calls(&fake);
+            assert_eq!(
+                calls,
+                [(
+                    want.map(str::to_owned),
+                    "a\nb".to_owned(),
+                    Some("<b>a</b>\n<b>b</b>".to_owned())
+                )],
+                "{second:?}"
+            );
+        }
+    }
+
+    /// (k) A part of a stream answer Telegram did not take (not a 4xx)
+    /// breaks the stream: the rest is dropped, the sender gets no answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_part_of_a_stream_answer_breaks_its_stream() {
+        let fake = Arc::new(RichFake {
+            refuse_rich: true,
+            errors: Mutex::new([(1, (502, "Bad Gateway"))].into_iter().collect()),
+            ..RichFake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let answer = Op::Stream {
+            chat: Chat::Group,
+            thread_id: 1,
+            text: "c".to_owned(),
+            html: Some("<b>c</b>".to_owned()),
+            rich: rich(Some("md"), &["a", "b"]),
+            merge: false,
+            restart: true,
+            notify: true,
+            into: None,
+        };
+        let answer = outbox.submit(answer).await;
+        drop(outbox);
+        scheduler.run().await;
+        assert!(answer.await.is_err(), "closed without an answer");
+        let ops = fake.calls();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(matches!(&ops[1], Op::Stream { text, restart: true, .. } if text == "a"));
     }
 }
