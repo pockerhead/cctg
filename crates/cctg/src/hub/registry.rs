@@ -293,10 +293,36 @@ pub fn separator(session_id: &str, resumed: bool) -> String {
     format!("── session {} · {how} ──", short(session_id))
 }
 
+/// How a [`share_line`] starts.
+const SHARE_LINE_START: &str = "── общий доступ: ";
+
 /// The first line of a group topic made by a share (TASK-064): `name` is
 /// who shared the slot.
 pub fn share_line(name: &str) -> String {
-    format!("── общий доступ: {name} ──")
+    format!("{SHARE_LINE_START}{name} ──")
+}
+
+/// What of separator text `pending` is still to post once `sent` reached
+/// the topic: without the lines both begin with, else without `sent` at its
+/// end. A share line joined before or after a separator on its way, or a
+/// new session's separator put after a share line on its way (TASK-064),
+/// never goes twice. `None`: nothing is left.
+fn unsent(pending: &str, sent: &str) -> Option<String> {
+    let pending: Vec<&str> = pending.split('\n').collect();
+    let sent: Vec<&str> = sent.split('\n').collect();
+    let common = pending
+        .iter()
+        .zip(&sent)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let rest = if common > 0 {
+        &pending[common..]
+    } else if pending.ends_with(&sent) {
+        &pending[..pending.len() - sent.len()]
+    } else {
+        &pending[..]
+    };
+    (!rest.is_empty()).then(|| rest.join("\n"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -640,6 +666,14 @@ impl TopicJob {
             | Self::Separator { slot, chat, .. } => (*slot, *chat),
         }
     }
+
+    /// The topic it is about; `None` for a create.
+    pub fn thread(&self) -> Option<i64> {
+        match self {
+            Self::Create { .. } => None,
+            Self::Edit { thread_id, .. } | Self::Separator { thread_id, .. } => Some(*thread_id),
+        }
+    }
 }
 
 /// What a hook event or an agent registration asks of the actor.
@@ -736,6 +770,11 @@ pub enum Unshared {
 pub struct TwinLink {
     pub primary: MessageKey,
     pub twin: MessageKey,
+    /// The twin's topic (TASK-064), forgotten with it when the topic stops
+    /// being a view; a hub before that named none
+    /// ([`Registry::lasting_twin_thread`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<i64>,
 }
 
 impl Default for Registry {
@@ -807,6 +846,35 @@ impl Registry {
             .filter(ready)
             .find(|view| view.chat.is_private())
             .or_else(|| views.iter().find(ready))
+    }
+
+    /// The topic of the twin of a lasting link kept without one (by a hub
+    /// before TASK-064): the view in the twin's chat of the slot whose block
+    /// or Resume offer the primary message is.
+    pub fn lasting_twin_thread(&self, link: &TwinLink) -> Option<i64> {
+        let agents = self.subagents.values().map(|entry| &entry.block);
+        let nested = self
+            .sessions
+            .values()
+            .filter_map(|entry| entry.block.as_ref());
+        let slot = agents
+            .chain(nested)
+            .filter(|block| block.message() == Some(link.primary))
+            .find_map(|block| self.slot_by_topic(block.place?))
+            .or_else(|| {
+                self.slots
+                    .iter()
+                    .position(|slot| {
+                        slot.buffer.resume.as_ref().and_then(|note| note.message)
+                            == Some(link.primary)
+                    })
+                    .map(SlotId)
+            })?;
+        self.slots[slot.0]
+            .views
+            .iter()
+            .find(|view| view.chat == link.twin.chat)?
+            .topic_id
     }
 
     /// The topic of the slot's primary view, where its session's messages go.
@@ -900,10 +968,7 @@ impl Registry {
         view.fallback = false;
         if view.topic_id.is_some() {
             view.pending_separator = Some(match view.pending_separator.take() {
-                Some(separator) => format!(
-                    "{line}
-{separator}"
-                ),
+                Some(separator) => format!("{line}\n{separator}"),
                 None => line,
             });
         } else {
@@ -1054,7 +1119,17 @@ impl Registry {
             Some(_) => {
                 let text = separator(session, resumed);
                 for view in &mut slot.views {
-                    view.pending_separator = Some(text.clone());
+                    // A share line not posted yet stays the topic's first
+                    // (TASK-064); an older separator is replaced.
+                    let line = view
+                        .pending_separator
+                        .as_deref()
+                        .and_then(|pending| pending.split('\n').next())
+                        .filter(|line| line.starts_with(SHARE_LINE_START));
+                    view.pending_separator = Some(match line {
+                        Some(line) => format!("{line}\n{text}"),
+                        None => text.clone(),
+                    });
                 }
                 slot.current_session = Some(session.to_owned());
             }
@@ -1995,7 +2070,8 @@ impl Registry {
         self.dirty = true;
     }
 
-    /// The separator `text` reached `thread_id`. A stale result changes nothing.
+    /// The separator `text` reached `thread_id`; what was joined to it
+    /// meanwhile stays pending ([`unsent`]). A stale result changes nothing.
     pub fn topic_separated(&mut self, id: SlotId, chat: Chat, thread_id: i64, text: &str) {
         let Some(view) = self.slots[id.0]
             .view_mut(chat)
@@ -2005,21 +2081,30 @@ impl Registry {
         };
         view.busy = false;
         view.failed = None;
-        if view.pending_separator.as_deref() == Some(text) {
-            view.pending_separator = None;
-            self.dirty = true;
+        if let Some(pending) = view.pending_separator.take() {
+            let rest = unsent(&pending, text);
+            if rest.as_deref() != Some(pending.as_str()) {
+                self.dirty = true;
+            }
+            view.pending_separator = rest;
         }
     }
 
-    /// A create, edit or separator failed for another reason than a gone
-    /// topic: the slot's work is not tried again until its name or icon
-    /// changes or [`Registry::retry_failed`] runs.
-    pub fn topic_failed(&mut self, id: SlotId, chat: Chat, icons: &Icons) {
+    /// A create, edit or separator of topic `thread` (`None`: a create)
+    /// failed for another reason than a gone topic: the slot's work is not
+    /// tried again until its name or icon changes or
+    /// [`Registry::retry_failed`] runs. A result for a topic the view no
+    /// longer has (TASK-064: a view unshared and shared again) is stale and
+    /// changes nothing.
+    pub fn topic_failed(&mut self, id: SlotId, chat: Chat, thread: Option<i64>, icons: &Icons) {
         let wanted = (
             self.desired_title(id),
             icons.for_state(self.state(id)).map(str::to_owned),
         );
-        if let Some(view) = self.slots[id.0].view_mut(chat) {
+        if let Some(view) = self.slots[id.0]
+            .view_mut(chat)
+            .filter(|view| view.topic_id == thread)
+        {
             view.busy = false;
             view.failed = Some(wanted);
         }
@@ -3855,7 +3940,7 @@ mod tests {
         );
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         // Refused: kept, not repeated until the retry.
-        registry.topic_failed(id, Chat::Group, &Icons::default());
+        registry.topic_failed(id, Chat::Group, Some(100), &Icons::default());
         assert_eq!(
             registry.slots[id.0].views[0].pending_separator.as_deref(),
             Some(text)
@@ -3885,7 +3970,7 @@ mod tests {
             registry.topic_work(&Icons::default(), true).is_empty(),
             "busy"
         );
-        registry.topic_failed(slot, Chat::Group, &Icons::default());
+        registry.topic_failed(slot, Chat::Group, None, &Icons::default());
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         registry.retry_failed();
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
@@ -4316,5 +4401,160 @@ mod tests {
             loaded.slots[1].views[1].place(),
             Some(Place::topic(private, 100))
         );
+    }
+
+    /// Code review F2 (repro R1): a new session in a shared slot keeps a
+    /// share line that has not reached the new group topic yet before its
+    /// separator, and a line on its way when the session came is posted
+    /// once.
+    #[test]
+    fn an_unsent_share_line_survives_a_new_session() {
+        let line = share_line("Анна");
+        let separator_b = separator(B, false);
+        // Its first try failed: it waits for the retry tick.
+        let (mut registry, slot, _) = private_slot();
+        registry.share(slot, Chat::Group, line.clone());
+        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        assert!(registry.separator_job(slot, Chat::Group).is_some());
+        registry.topic_failed(slot, Chat::Group, Some(100), &Icons::default());
+        registry.apply_hook(&end(A));
+        registry.apply_hook(&start(B, CWD, Some(2), None));
+        assert_eq!(slot_of(&registry, B), Some(slot));
+        let joined = format!("{line}\n{separator_b}");
+        assert_eq!(
+            registry.slots[slot.0].views[1].pending_separator.as_deref(),
+            Some(joined.as_str())
+        );
+        assert_eq!(
+            registry.slots[slot.0].views[0].pending_separator.as_deref(),
+            Some(separator_b.as_str()),
+            "the private topic gets the separator alone"
+        );
+        registry.retry_failed();
+        let jobs = registry.topic_work(&Icons::default(), true);
+        assert!(
+            jobs.iter().any(|job| matches!(job,
+                TopicJob::Separator { chat: Chat::Group, text, .. } if *text == joined)),
+            "{jobs:?}"
+        );
+        registry.topic_separated(slot, Chat::Group, 100, &joined);
+        assert_eq!(registry.slots[slot.0].views[1].pending_separator, None);
+
+        // On its way when the session came: only the separator is left.
+        for sent in [line.clone(), format!("{line}\n{}", separator(C, false))] {
+            let (mut registry, slot, _) = private_slot();
+            registry.share(slot, Chat::Group, line.clone());
+            registry.topic_created(slot, Chat::Group, 100, "t", None);
+            registry.slots[slot.0].views[1].pending_separator = Some(sent.clone());
+            assert!(registry.separator_job(slot, Chat::Group).is_some());
+            registry.apply_hook(&end(A));
+            registry.apply_hook(&start(B, CWD, Some(2), None));
+            assert_eq!(
+                registry.slots[slot.0].views[1].pending_separator.as_deref(),
+                Some(joined.as_str())
+            );
+            registry.topic_separated(slot, Chat::Group, 100, &sent);
+            assert_eq!(
+                registry.slots[slot.0].views[1].pending_separator.as_deref(),
+                Some(separator_b.as_str()),
+                "sent {sent:?}"
+            );
+        }
+    }
+
+    /// Code review F3 (repro R2): a share that adopts a fallback group view
+    /// while its session separator is on its way posts that separator once;
+    /// only the share line is left.
+    #[test]
+    fn an_adopted_separator_on_its_way_is_posted_once() {
+        let (mut registry, slot, _) = private_slot();
+        assert!(registry.add_view(slot, Chat::Group));
+        registry.slots[slot.0].views[1].fallback = true;
+        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        let separator = separator(B, false);
+        registry.slots[slot.0].views[1].pending_separator = Some(separator.clone());
+        let jobs = registry.topic_work(&Icons::default(), true);
+        assert!(
+            jobs.iter().any(|job| matches!(job,
+                TopicJob::Separator { chat: Chat::Group, text, .. } if *text == separator)),
+            "{jobs:?}"
+        );
+        let line = share_line("Анна");
+        assert_eq!(
+            registry.share(slot, Chat::Group, line.clone()),
+            Some(Shared::Adopted)
+        );
+        registry.topic_separated(slot, Chat::Group, 100, &separator);
+        assert_eq!(
+            registry.slots[slot.0].views[1].pending_separator,
+            Some(line)
+        );
+    }
+
+    #[test]
+    fn only_what_was_not_sent_of_a_separator_stays() {
+        assert_eq!(unsent("a", "a"), None);
+        assert_eq!(unsent("a\nb", "a\nb"), None);
+        assert_eq!(unsent("a\nb", "a").as_deref(), Some("b"));
+        assert_eq!(unsent("a\nb", "b").as_deref(), Some("a"));
+        assert_eq!(unsent("a\nb", "a\nc").as_deref(), Some("b"));
+        assert_eq!(unsent("a", "b").as_deref(), Some("a"), "stale: kept");
+    }
+
+    /// Code review F4 (repro R4): the failure of a topic call of a group
+    /// view that was unshared lands on nothing when the slot is shared
+    /// again meanwhile: the new view's create in flight stays the only one.
+    #[test]
+    fn a_stale_failure_of_an_unshared_view_leaves_the_new_create_alone() {
+        let (mut registry, slot, _) = private_slot();
+        registry.share(slot, Chat::Group, share_line("Анна"));
+        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        registry.slots[slot.0].views[1].pending_separator = None;
+        // A rename of the group topic goes out.
+        registry.slots[slot.0].views[1].applied_title = Some("old".into());
+        let jobs = registry.topic_work(&Icons::default(), true);
+        assert!(
+            jobs.iter().any(|job| matches!(
+                job,
+                TopicJob::Edit {
+                    chat: Chat::Group,
+                    ..
+                }
+            )),
+            "{jobs:?}"
+        );
+        // Unshared and shared again while it is on its way.
+        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Removed);
+        assert_eq!(
+            registry.share(slot, Chat::Group, share_line("Анна")),
+            Some(Shared::Added)
+        );
+        let creates = |jobs: &[TopicJob]| {
+            jobs.iter()
+                .filter(|job| {
+                    matches!(
+                        job,
+                        TopicJob::Create {
+                            chat: Chat::Group,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
+        // The old rename fails (not "topic gone").
+        registry.topic_failed(slot, Chat::Group, Some(100), &Icons::default());
+        registry.retry_failed();
+        assert_eq!(
+            creates(&registry.topic_work(&Icons::default(), true)),
+            0,
+            "a second createForumTopic while the first is on its way"
+        );
+        // The new create's own failure still counts.
+        registry.topic_failed(slot, Chat::Group, None, &Icons::default());
+        assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 0);
+        registry.retry_failed();
+        assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
     }
 }

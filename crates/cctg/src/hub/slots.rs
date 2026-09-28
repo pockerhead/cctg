@@ -1515,7 +1515,8 @@ impl Slots {
         // and of the status messages below.
         let mut mirror = Mirror::default();
         for link in &registry.twins {
-            mirror.link_lasting(link.primary, link.twin);
+            let thread = link.thread.or_else(|| registry.lasting_twin_thread(link));
+            mirror.link_lasting(TwinLink { thread, ..*link });
         }
         let mut primaries = HashMap::new();
         for index in 0..registry.slots.len() {
@@ -1534,7 +1535,7 @@ impl Slots {
                     .status_message()
                     .filter(|twin| twin.chat != status.chat)
                 {
-                    mirror.link(status, twin);
+                    mirror.link(status, twin, view.topic_id);
                 }
             }
         }
@@ -7841,6 +7842,9 @@ impl Slots {
                 for content in own {
                     content.set(text.clone(), keyboard.clone());
                 }
+                // After `own`: a call `primary_moved` handed to the twins is
+                // in both lists, and it goes into the group, so the mirror
+                // keyboard has to be the one it keeps.
                 for content in twins {
                     content.set(text.clone(), mirrored.clone());
                 }
@@ -8818,10 +8822,10 @@ impl Slots {
             }
             return;
         }
-        let chat = call.op.chat().unwrap_or(Chat::Group);
+        let to = posts.unwrap_or_else(|| Place::new(call.op.chat().unwrap_or(Chat::Group), None));
         let id = match call.link {
-            Link::Seq { ghost, lasting } => self.mirror.send(seq, chat, ghost, lasting),
-            Link::Of(primary) => self.mirror.send_for(primary, chat),
+            Link::Seq { ghost, lasting } => self.mirror.send(seq, to, ghost, lasting),
+            Link::Of(primary) => self.mirror.send_for(primary, to),
             Link::None => None,
         };
         if !matches!(call.link, Link::None) && id.is_none() {
@@ -9131,9 +9135,10 @@ impl Slots {
     /// view ended (TASK-063) or the owner unshared it (TASK-064). An ended
     /// fallback's topic is told, gets the dead icon and loses its status
     /// message (an unshared topic is deleted instead, [`Self::delete_unshared`]).
-    /// When the group mirrored the private view, the status moves there.
+    /// Either way no twin there is written again. When the group mirrored the
+    /// private view, the status moves there.
     fn leave_group(&mut self, slot: SlotId, end: GroupEnd) {
-        let mirrored = match end {
+        let (mirrored, topic) = match end {
             GroupEnd::Fallback { view, mirrored } => {
                 info!(
                     ordinal = self.ordinal(slot),
@@ -9148,10 +9153,15 @@ impl Slots {
                 if let Some(place) = view.place() {
                     self.end_group_topic(place, FALLBACK_END_NOTICE);
                 }
-                mirrored
+                (mirrored, view.place())
             }
-            GroupEnd::Unshare => true,
+            GroupEnd::Unshare { topic } => (true, topic),
         };
+        // The topic said it is no longer updated: edits of the session's
+        // blocks, prompts and Resume offers stay out of it (TASK-064).
+        if let Some(topic) = topic {
+            self.mirror.forget_topic(topic);
+        }
         if mirrored {
             // The status moves: its old message takes its twin along,
             // and a twin not sent yet never goes.
@@ -9230,7 +9240,7 @@ impl Slots {
         }
         // Before `reopen`, which would drop a fallback group view.
         let adopted = match command {
-            ShareCommand::Share => self.adopt_fallback(slot, input.author.as_deref()),
+            ShareCommand::Share => self.adopt_fallback(slot, input.display_name.as_deref()),
             ShareCommand::Unshare => None,
         };
         self.reopen(input.chat);
@@ -9239,7 +9249,7 @@ impl Slots {
         self.close_turn_message(place);
         let outcome = match (adopted, command) {
             (Some(outcome), _) => outcome,
-            (None, ShareCommand::Share) => self.share_slot(slot, input.author.as_deref()),
+            (None, ShareCommand::Share) => self.share_slot(slot, input.display_name.as_deref()),
             (None, ShareCommand::Unshare) => self.unshare_slot(slot),
         };
         self.send_as(true, vec![message_op(place, outcome.notice().to_owned())]);
@@ -9269,10 +9279,10 @@ impl Slots {
         };
         if press == Press::Share {
             // Before `reopen`, which would drop a fallback group view.
-            let adopted = self.adopt_fallback(slot, input.author.as_deref());
+            let adopted = self.adopt_fallback(slot, input.display_name.as_deref());
             self.reopen(chat);
             return adopted
-                .unwrap_or_else(|| self.share_slot(slot, input.author.as_deref()))
+                .unwrap_or_else(|| self.share_slot(slot, input.display_name.as_deref()))
                 .answer();
         }
         self.reopen(chat);
@@ -9362,12 +9372,17 @@ impl Slots {
         else {
             return ShareOutcome::Later;
         };
+        let topic = self
+            .registry
+            .slot(slot)
+            .and_then(|entry| entry.views.iter().find(|view| view.chat == Chat::Group))
+            .and_then(View::place);
         match self.registry.unshare(slot, Chat::Group) {
             Unshared::NotShared => ShareOutcome::NotShared,
             Unshared::Creating => ShareOutcome::Later,
             Unshared::Removed => {
                 info!(ordinal = self.ordinal(slot), "slot unshared from the group");
-                self.leave_group(slot, GroupEnd::Unshare);
+                self.leave_group(slot, GroupEnd::Unshare { topic });
                 self.close_turn_message(place);
                 let shown = self.shown.entry(slot).or_default();
                 shown.unshare_confirm = None;
@@ -9963,6 +9978,9 @@ impl Slots {
             self.close_chat(job.view().1);
         }
         let icons = &self.options.icons;
+        // A failure is about this topic only: the view may have another by
+        // now (TASK-064: unshared and shared again).
+        let thread = job.thread();
         let Some(delivery) = delivery else {
             // The scheduler stopped: handing the job out again would come
             // back at once, so it waits for the retry tick like a failure.
@@ -9971,7 +9989,7 @@ impl Slots {
                 ordinal = self.ordinal(slot),
                 "topic call got no answer; retrying later"
             );
-            self.registry.topic_failed(slot, chat, icons);
+            self.registry.topic_failed(slot, chat, thread, icons);
             return;
         };
         match job {
@@ -10002,7 +10020,7 @@ impl Slots {
                 }
                 Ok(_) => {
                     warn!("createForumTopic answered without a topic id");
-                    self.registry.topic_failed(slot, chat, icons);
+                    self.registry.topic_failed(slot, chat, thread, icons);
                 }
                 Err(error) => {
                     // Known limitation (TASK-011 review I3): createForumTopic
@@ -10010,7 +10028,7 @@ impl Slots {
                     // the answer was lost (or the hub died before saving it),
                     // the retry makes a second one and the first is orphaned.
                     warn!(%error, ordinal = self.ordinal(slot), "cannot create a forum topic; retrying later");
-                    self.registry.topic_failed(slot, chat, icons);
+                    self.registry.topic_failed(slot, chat, thread, icons);
                 }
             },
             TopicJob::Edit {
@@ -10038,7 +10056,7 @@ impl Slots {
                     if let Err(error) = &delivery {
                         warn!(%error, ordinal = self.ordinal(slot), "cannot edit a forum topic; retrying later");
                     }
-                    self.registry.topic_failed(slot, chat, icons);
+                    self.registry.topic_failed(slot, chat, thread, icons);
                 }
             }
             TopicJob::Separator {
@@ -10062,7 +10080,7 @@ impl Slots {
                     if let Err(error) = &delivery {
                         warn!(%error, ordinal = self.ordinal(slot), "session separator not delivered; retrying later");
                     }
-                    self.registry.topic_failed(slot, chat, icons);
+                    self.registry.topic_failed(slot, chat, thread, icons);
                 }
             }
         }
@@ -10117,12 +10135,7 @@ impl Slots {
         self.pump_updates();
         self.pump_status();
         if self.mirror.take_changed() {
-            self.registry.twins = self
-                .mirror
-                .lasting()
-                .into_iter()
-                .map(|(primary, twin)| TwinLink { primary, twin })
-                .collect();
+            self.registry.twins = self.mirror.lasting();
             self.registry.dirty = true;
         }
         if self.registry.dirty {
@@ -10412,8 +10425,8 @@ enum GroupEnd {
     /// Its fallback view ended (TASK-063); `mirrored`: the group mirrored
     /// the private view.
     Fallback { view: Box<View>, mirrored: bool },
-    /// The owner unshared it (TASK-064).
-    Unshare,
+    /// The owner unshared it (TASK-064); `topic`: its group topic, if made.
+    Unshare { topic: Option<Place> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10992,6 +11005,7 @@ mod tests {
 
     fn say(thread_id: Option<i64>, message_id: i64, text: Option<&str>) -> Control {
         Control::Message(Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
@@ -11071,6 +11085,7 @@ mod tests {
         rig.control.send(say(Some(101), 42, Some("hi B"))).unwrap();
         rig.control
             .send(Control::Message(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 43,
@@ -11086,6 +11101,7 @@ mod tests {
             .unwrap();
         rig.control
             .send(Control::Message(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 46,
@@ -11668,7 +11684,7 @@ again"
             message_id,
             thread_id: None,
             from_name: None,
-            author: None,
+            display_name: None,
         })
     }
 
@@ -11902,6 +11918,7 @@ again"
         let id = question_id(&ops, 0);
         rig.control
             .send(Control::Message(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 51,
@@ -12533,7 +12550,7 @@ again"
             message_id: Some(message_id),
             thread_id: Some(thread),
             from_name: None,
-            author: None,
+            display_name: None,
         });
         rig.control.send(elsewhere).unwrap();
         let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
@@ -15450,6 +15467,7 @@ again"
         for (message_id, reply_to) in [(50, block), (51, nested), (52, 999)] {
             rig.control
                 .send(Control::Message(Inbound {
+                    display_name: None,
                     chat: Chat::Group,
                     sender: crate::hub::chat::PrivateChat::of_user(1001),
                     message_id,
@@ -21078,6 +21096,7 @@ again"
 
     fn topic_text(message_id: i64, text: &str, forwarded: bool) -> Inbound {
         Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
@@ -21282,6 +21301,7 @@ again"
 
     fn photo(message_id: i64, file_id: &str, caption: Option<&str>, size: Option<u64>) -> Control {
         Control::Message(Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
@@ -23682,6 +23702,7 @@ again"
         slots.mirror.link(
             MessageKey::new(owner, 5900),
             MessageKey::new(Chat::Group, 900),
+            Some(100),
         );
         slots.pump();
         let mut work = capture_dispatch(&mut slots);
@@ -23973,7 +23994,11 @@ again"
             MessageKey::new(owner, 5100),
             MessageKey::new(Chat::Group, 910),
         );
-        registry.twins = vec![TwinLink { primary, twin }];
+        registry.twins = vec![TwinLink {
+            primary,
+            twin,
+            thread: Some(100),
+        }];
         let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
         assert_eq!(saved.twins, registry.twins, "kept in registry.json");
         let store = RegistryStore::open(dir.path()).unwrap();
@@ -24142,6 +24167,7 @@ again"
             media: None,
             from_name: None,
             author: Some(SHARER.into()),
+            display_name: Some(SHARER.into()),
         })
     }
 
@@ -24154,7 +24180,7 @@ again"
             message_id: Some(message_id),
             thread_id: Some(thread),
             from_name: None,
-            author: Some(SHARER.into()),
+            display_name: Some(SHARER.into()),
         })
     }
 
@@ -24516,7 +24542,9 @@ again"
         slots.mirror.link(
             MessageKey::new(private_owner(), 5900),
             MessageKey::new(Chat::Group, 900),
+            Some(100),
         );
+
         slots.pump();
         let _ = all_work(&mut work);
         (slots, work)
@@ -24906,5 +24934,148 @@ again"
                 ..
             })
         ));
+    }
+
+    /// An edit of the primary message whose twin is 950 in group topic 100.
+    fn edit_prompt(slots: &mut Slots, text: &str) {
+        slots
+            .hand_off(
+                Work::Callback,
+                Op::Edit {
+                    chat: private_owner(),
+                    message_id: 5950,
+                    text: text.into(),
+                    reply_markup: Some(permissions::no_keyboard()),
+                    background: false,
+                },
+            )
+            .expect("handed out");
+    }
+
+    fn into_group(handed: &[(Work, Op)]) -> Vec<&Op> {
+        handed
+            .iter()
+            .map(|(_, op)| op)
+            .filter(|op| op.chat() == Some(Chat::Group))
+            .collect()
+    }
+
+    /// Code review F1 (repro R3): once unshared, the group topic gets no
+    /// more edits of twins, whether it stays (no right to delete it: it says
+    /// "no longer updated") or its delete is still on its way. Before the
+    /// unshare the same edit reaches the twin.
+    #[tokio::test]
+    async fn an_unshared_topic_gets_no_more_twin_edits() {
+        for can_delete in [false, true] {
+            let dir = TempDir::new("slots-unshare-twin-edits");
+            let options = Options {
+                can_delete,
+                ..private_options()
+            };
+            let (mut slots, mut work, _key) = prompt_with_twin(&dir, options);
+            let _ = all_work(&mut work);
+            edit_prompt(&mut slots, "before the unshare");
+            let handed = all_work(&mut work);
+            assert!(
+                matches!(
+                    into_group(&handed)[..],
+                    [Op::Edit {
+                        message_id: 950,
+                        ..
+                    }]
+                ),
+                "{handed:#?}"
+            );
+            slots.on_control(owner_says(Some(700), 5001, "/unshare"));
+            slots.pump();
+            let handed = all_work(&mut work);
+            let group = Place::topic(Chat::Group, 100);
+            if can_delete {
+                assert_eq!(topic_deletes(&handed), [group]);
+            } else {
+                assert!(
+                    sends_into(&handed, group).contains(&UNSHARED_KEPT_NOTICE.to_owned()),
+                    "{handed:#?}"
+                );
+            }
+            assert_eq!(
+                slots.mirror.primary_of(MessageKey::new(Chat::Group, 950)),
+                None
+            );
+            edit_prompt(&mut slots, "new content after the unshare");
+            slots.pump();
+            let handed = all_work(&mut work);
+            assert!(
+                into_group(&handed).is_empty(),
+                "can_delete {can_delete}: {handed:#?}"
+            );
+        }
+    }
+
+    /// Code review F1: a lasting twin link kept by a hub before TASK-064
+    /// names no topic; after a restart it is found from the slot whose
+    /// Resume offer the primary message is, so an unshare forgets it too
+    /// (and the next save keeps its topic).
+    #[tokio::test]
+    async fn a_twin_link_of_an_older_hub_goes_with_its_unshared_topic() {
+        let dir = TempDir::new("slots-twin-legacy");
+        let owner = private_owner();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, 10));
+        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.add_view(SlotId(0), owner);
+        registry.topic_created(SlotId(0), owner, 700, "t", None);
+        let (primary, twin) = (
+            MessageKey::new(owner, 5100),
+            MessageKey::new(Chat::Group, 910),
+        );
+        registry.slots[0].buffer.resume = Some(ResumeNote {
+            session: A.into(),
+            number: 1,
+            message: Some(primary),
+        });
+        let legacy = TwinLink {
+            primary,
+            twin,
+            thread: None,
+        };
+        registry.twins = vec![legacy];
+        let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
+        assert_eq!(saved.twins, [legacy]);
+        assert_eq!(saved.lasting_twin_thread(&legacy), Some(100));
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(saved, store, outbox, private_options());
+        let mut work = capture_dispatch(&mut slots);
+        assert_eq!(
+            slots.mirror.lasting(),
+            [TwinLink {
+                thread: Some(100),
+                ..legacy
+            }]
+        );
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(owner_says(Some(700), 5001, "/unshare"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(slots.registry.twins.is_empty(), "the save forgets it too");
+        slots.hand_off(
+            Work::Callback,
+            Op::Edit {
+                chat: owner,
+                message_id: 5100,
+                text: "Resume: не нужно".into(),
+                reply_markup: Some(permissions::no_keyboard()),
+                background: false,
+            },
+        );
+        let handed = all_work(&mut work);
+        assert!(into_group(&handed).is_empty(), "{handed:#?}");
     }
 }

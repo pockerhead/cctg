@@ -348,7 +348,7 @@ fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
             message_id: Some(message_id),
             thread_id: Some(100),
             from_name: None,
-            author: None,
+            display_name: None,
         }))
         .unwrap();
 }
@@ -356,6 +356,7 @@ fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
 fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
     hub.control
         .send(Control::Message(Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id,

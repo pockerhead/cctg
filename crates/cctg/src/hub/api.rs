@@ -69,6 +69,8 @@ pub struct User {
     pub is_bot: bool,
     pub username: Option<String>,
     pub first_name: Option<String>,
+    /// With the first name, signs a share line (TASK-064).
+    pub last_name: Option<String>,
     /// The bot has topics in private chats (Threaded Mode in @BotFather);
     /// only `getMe` says it (Bot API 9.3, TASK-063).
     pub has_topics_enabled: bool,

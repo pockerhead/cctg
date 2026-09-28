@@ -617,6 +617,7 @@ mod tests {
         let (roster_tx, mut roster_rx) = mpsc::unbounded_channel();
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let input = |text: &str| Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 5,
@@ -650,7 +651,7 @@ mod tests {
             message_id: Some(8),
             thread_id: None,
             from_name: None,
-            author: None,
+            display_name: None,
         }));
         route(Routed::Input(Inbound {
             text: None,
@@ -663,7 +664,7 @@ mod tests {
             message_id: Some(9),
             thread_id: None,
             from_name: None,
-            author: None,
+            display_name: None,
         };
         route(Routed::Callback(press.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {

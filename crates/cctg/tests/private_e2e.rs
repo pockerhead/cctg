@@ -510,6 +510,7 @@ impl Hub {
                 media: None,
                 from_name: None,
                 author: Some(NAME.into()),
+                display_name: Some(NAME.into()),
             }))
             .unwrap();
         message_id
@@ -536,6 +537,7 @@ impl Hub {
                 media: None,
                 from_name: None,
                 author: Some(NAME.into()),
+                display_name: Some(NAME.into()),
             }))
             .unwrap();
     }
@@ -544,6 +546,7 @@ impl Hub {
     fn say_general(&self, chat: Chat, text: &str) {
         self.control
             .send(Control::Message(Inbound {
+                display_name: None,
                 chat,
                 sender: PrivateChat::of_user(OWNER),
                 message_id: 1,
@@ -569,7 +572,7 @@ impl Hub {
                 message_id: Some(message_id),
                 thread_id: self.fake.topic(chat),
                 from_name: None,
-                author: Some(NAME.into()),
+                display_name: Some(NAME.into()),
             }))
             .unwrap();
     }

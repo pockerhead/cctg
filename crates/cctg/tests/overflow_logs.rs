@@ -139,6 +139,7 @@ async fn one_overflow_warning_per_episode() {
     let say = |message_id: i64| {
         control
             .send(Control::Message(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,

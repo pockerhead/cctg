@@ -31,10 +31,15 @@
 //! - The links of lasting messages (subagent blocks, Resume offers) are
 //!   also kept apart, at most [`MAX_LASTING`], for `registry.json`: after a
 //!   restart of the hub their edits still reach the twins.
+//! - The book knows the topic of every twin: when a topic stops being a
+//!   view of its slot (an unshare, the end of a fallback view, TASK-064),
+//!   its twins are forgotten ([`Mirror::forget_topic`]) and nothing more is
+//!   written there.
 
 use std::collections::{HashMap, VecDeque};
 
-use super::chat::{Chat, MessageKey};
+use super::chat::{Chat, MessageKey, Place};
+use super::registry::TwinLink;
 use super::scheduler::Op;
 
 /// Primary messages remembered with their twins.
@@ -75,7 +80,8 @@ enum Primary {
 
 #[derive(Debug)]
 struct Send {
-    chat: Chat,
+    /// The twin's topic.
+    to: Place,
     primary: Primary,
     /// The twin's own answer: `Some(None)` when it made no message.
     answer: Option<Option<i64>>,
@@ -128,12 +134,13 @@ pub struct Mirror {
     sends: HashMap<u64, Send>,
     /// Twin sends by the dispatch number of their primary send.
     by_seq: HashMap<u64, Vec<u64>>,
-    twins: HashMap<MessageKey, Vec<(Chat, Twin)>>,
+    /// The twins of a primary message, one per chat, with their topic.
+    twins: HashMap<MessageKey, Vec<(Place, Twin)>>,
     /// The primary message of each twin shown.
     back: HashMap<MessageKey, MessageKey>,
     order: VecDeque<MessageKey>,
     /// Links of lasting messages, newest last.
-    lasting: VecDeque<(MessageKey, MessageKey)>,
+    lasting: VecDeque<TwinLink>,
     /// `lasting` changed since [`Self::take_changed`].
     changed: bool,
     /// Twin sends kept for a primary send that goes again, by the dispatch
@@ -142,12 +149,12 @@ pub struct Mirror {
 }
 
 impl Mirror {
-    /// A twin in `chat` of the send handed out as dispatch number `seq`;
+    /// A twin in topic `to` of the send handed out as dispatch number `seq`;
     /// its id for [`Self::twin_answered`]. `None` when too many wait.
     /// `ghost`: it goes when that send makes no message; `lasting`: its
     /// link is kept for a restart ([`Self::lasting`]).
-    pub fn send(&mut self, seq: u64, chat: Chat, ghost: bool, lasting: bool) -> Option<u64> {
-        let id = self.open(chat, Primary::Waiting(seq))?;
+    pub fn send(&mut self, seq: u64, to: Place, ghost: bool, lasting: bool) -> Option<u64> {
+        let id = self.open(to, Primary::Waiting(seq))?;
         if let Some(send) = self.sends.get_mut(&id) {
             send.ghost = ghost;
             send.lasting = lasting;
@@ -156,15 +163,15 @@ impl Mirror {
         Some(id)
     }
 
-    /// A new twin in `chat` of `primary`, a message Telegram shows already
-    /// (stream content whose twin was lost, [`Follow::Lost`]).
-    pub fn send_for(&mut self, primary: MessageKey, chat: Chat) -> Option<u64> {
-        let id = self.open(chat, Primary::Key(primary))?;
-        self.set(primary, chat, Twin::Sending(id));
+    /// A new twin in topic `to` of `primary`, a message Telegram shows
+    /// already (stream content whose twin was lost, [`Follow::Lost`]).
+    pub fn send_for(&mut self, primary: MessageKey, to: Place) -> Option<u64> {
+        let id = self.open(to, Primary::Key(primary))?;
+        self.set(primary, to, Twin::Sending(id));
         Some(id)
     }
 
-    fn open(&mut self, chat: Chat, primary: Primary) -> Option<u64> {
+    fn open(&mut self, to: Place, primary: Primary) -> Option<u64> {
         if self.sends.len() >= MAX_SENDS {
             return None;
         }
@@ -172,7 +179,7 @@ impl Mirror {
         self.sends.insert(
             self.next,
             Send {
-                chat,
+                to,
                 primary,
                 answer: None,
                 queued: None,
@@ -208,9 +215,9 @@ impl Mirror {
                 continue;
             };
             send.primary = primary;
-            let twin_chat = send.chat;
+            let to = send.to;
             if let Primary::Key(key) = primary {
-                self.set(key, twin_chat, Twin::Sending(id));
+                self.set(key, to, Twin::Sending(id));
             }
             follows.extend(self.settle(id));
         }
@@ -237,43 +244,47 @@ impl Mirror {
         let send = self.sends.remove(&id)?;
         match (send.primary, answer) {
             (Primary::Key(primary), Some(twin_id)) => {
-                let twin = MessageKey::new(send.chat, twin_id);
-                self.set(primary, send.chat, Twin::Shown(twin_id));
+                let twin = MessageKey::new(send.to.chat, twin_id);
+                self.set(primary, send.to, Twin::Shown(twin_id));
                 self.back.insert(twin, primary);
                 if send.lasting {
-                    self.keep(primary, twin);
+                    self.keep(TwinLink {
+                        primary,
+                        twin,
+                        thread: send.to.thread,
+                    });
                     self.changed = true;
                 }
                 send.queued.map(|op| Follow::Write { twin, op })
             }
             (Primary::Key(primary), None) => {
-                self.set(primary, send.chat, Twin::Lost);
+                self.set(primary, send.to, Twin::Lost);
                 send.queued.map(|op| Follow::Lost {
                     primary,
-                    chat: send.chat,
+                    chat: send.to.chat,
                     op,
                 })
             }
             (Primary::Nothing, Some(twin_id)) if send.ghost => {
-                Some(Follow::Delete(MessageKey::new(send.chat, twin_id)))
+                Some(Follow::Delete(MessageKey::new(send.to.chat, twin_id)))
             }
             _ => None,
         }
     }
 
-    /// The twin of `primary` in `chat` is now `twin`.
-    fn set(&mut self, primary: MessageKey, chat: Chat, twin: Twin) {
+    /// The twin of `primary` in `to`'s chat is now `twin`, in topic `to`.
+    fn set(&mut self, primary: MessageKey, to: Place, twin: Twin) {
         let known = self.twins.contains_key(&primary);
         let twins = self.twins.entry(primary).or_default();
-        let before = match twins.iter_mut().find(|(of, _)| *of == chat) {
-            Some((_, state)) => Some(std::mem::replace(state, twin)),
+        let before = match twins.iter_mut().find(|(of, _)| of.chat == to.chat) {
+            Some(entry) => Some(std::mem::replace(entry, (to, twin)).1),
             None => {
-                twins.push((chat, twin));
+                twins.push((to, twin));
                 None
             }
         };
         if let Some(Twin::Shown(old)) = before.filter(|before| *before != twin) {
-            self.back.remove(&MessageKey::new(chat, old));
+            self.back.remove(&MessageKey::new(to.chat, old));
         }
         if !known {
             self.order.push_back(primary);
@@ -286,10 +297,49 @@ impl Mirror {
     }
 
     fn forget(&mut self, primary: MessageKey) {
-        for (chat, twin) in self.twins.remove(&primary).unwrap_or_default() {
+        for (to, twin) in self.twins.remove(&primary).unwrap_or_default() {
             if let Twin::Shown(id) = twin {
-                self.back.remove(&MessageKey::new(chat, id));
+                self.back.remove(&MessageKey::new(to.chat, id));
             }
+        }
+    }
+
+    /// Topic `place` is no view of its slot any more (TASK-064): every twin
+    /// there, shown or on its way, is forgotten, lasting links included, so
+    /// no later call about a primary message goes there and a press on one
+    /// of them maps to nothing.
+    pub fn forget_topic(&mut self, place: Place) {
+        let gone: Vec<u64> = self
+            .sends
+            .iter()
+            .filter(|(_, send)| send.to == place)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &gone {
+            self.sends.remove(id);
+        }
+        for ids in self.by_seq.values_mut().chain(self.kept.values_mut()) {
+            ids.retain(|id| !gone.contains(id));
+        }
+        self.by_seq.retain(|_, ids| !ids.is_empty());
+        self.kept.retain(|_, ids| !ids.is_empty());
+        let back = &mut self.back;
+        for twins in self.twins.values_mut() {
+            twins.retain(|(to, twin)| {
+                if *to != place {
+                    return true;
+                }
+                if let Twin::Shown(id) = twin {
+                    back.remove(&MessageKey::new(to.chat, *id));
+                }
+                false
+            });
+        }
+        let before = self.lasting.len();
+        self.lasting
+            .retain(|link| Place::new(link.twin.chat, link.thread) != place);
+        if self.lasting.len() != before {
+            self.changed = true;
         }
     }
 
@@ -302,10 +352,10 @@ impl Mirror {
             return Vec::new();
         };
         let mut writes = Vec::new();
-        for &(chat, twin) in twins {
+        for &(to, twin) in twins {
             match twin {
-                Twin::Shown(id) => writes.push(Write::Now(MessageKey::new(chat, id))),
-                Twin::Lost => writes.push(Write::Lost(chat)),
+                Twin::Shown(id) => writes.push(Write::Now(MessageKey::new(to.chat, id))),
+                Twin::Lost => writes.push(Write::Lost(to.chat)),
                 Twin::Sending(id) => {
                     if let Some(send) = self.sends.get_mut(&id)
                         && !matches!(send.queued, Some(Op::Delete { .. }))
@@ -332,7 +382,7 @@ impl Mirror {
             .into_iter()
             .flatten()
             .filter_map(|id| self.sends.get(id))
-            .map(|send| (send.chat, send.answer))
+            .map(|send| (send.to.chat, send.answer))
             .collect()
     }
 
@@ -341,7 +391,7 @@ impl Mirror {
         self.kept.iter().find_map(|(seq, ids)| {
             ids.iter()
                 .filter_map(|id| self.sends.get(id))
-                .any(|send| send.chat == twin.chat && send.answer == Some(Some(twin.id)))
+                .any(|send| send.to.chat == twin.chat && send.answer == Some(Some(twin.id)))
                 .then_some(*seq)
         })
     }
@@ -365,7 +415,7 @@ impl Mirror {
                 continue;
             }
             send.primary = Primary::Waiting(new);
-            chats.push(send.chat);
+            chats.push(send.to.chat);
             self.by_seq.entry(new).or_default().push(id);
         }
         chats
@@ -392,7 +442,7 @@ impl Mirror {
             };
             match send.answer {
                 Some(answer) => {
-                    let chat = send.chat;
+                    let chat = send.to.chat;
                     self.sends.remove(&id);
                     shown.extend(answer.map(|twin| MessageKey::new(chat, twin)));
                 }
@@ -411,7 +461,7 @@ impl Mirror {
             .get(&primary)?
             .iter()
             .find_map(|(of, twin)| match twin {
-                Twin::Shown(id) if *of == chat => Some(MessageKey::new(chat, *id)),
+                Twin::Shown(id) if of.chat == chat => Some(MessageKey::new(chat, *id)),
                 _ => None,
             })
     }
@@ -420,7 +470,7 @@ impl Mirror {
     pub fn knows(&self, primary: MessageKey, chat: Chat) -> bool {
         self.twins
             .get(&primary)
-            .is_some_and(|twins| twins.iter().any(|(of, _)| *of == chat))
+            .is_some_and(|twins| twins.iter().any(|(of, _)| of.chat == chat))
     }
 
     /// The primary message of `twin`.
@@ -428,10 +478,10 @@ impl Mirror {
         self.back.get(&twin).copied()
     }
 
-    /// `twin` shows `primary` (a status message kept in `registry.json`
-    /// across a restart).
-    pub fn link(&mut self, primary: MessageKey, twin: MessageKey) {
-        self.set(primary, twin.chat, Twin::Shown(twin.id));
+    /// `twin`, in topic `thread` of its chat, shows `primary` (a status
+    /// message kept in `registry.json` across a restart).
+    pub fn link(&mut self, primary: MessageKey, twin: MessageKey, thread: Option<i64>) {
+        self.set(primary, Place::new(twin.chat, thread), Twin::Shown(twin.id));
         self.back.insert(twin, primary);
     }
 
@@ -441,22 +491,22 @@ impl Mirror {
     }
 
     /// [`Self::link`] of a lasting message, as `registry.json` kept it.
-    pub fn link_lasting(&mut self, primary: MessageKey, twin: MessageKey) {
-        self.link(primary, twin);
-        self.keep(primary, twin);
+    pub fn link_lasting(&mut self, link: TwinLink) {
+        self.link(link.primary, link.twin, link.thread);
+        self.keep(link);
     }
 
-    fn keep(&mut self, primary: MessageKey, twin: MessageKey) {
+    fn keep(&mut self, link: TwinLink) {
         self.lasting
-            .retain(|&(of, to)| !(of == primary && to.chat == twin.chat));
-        self.lasting.push_back((primary, twin));
+            .retain(|kept| !(kept.primary == link.primary && kept.twin.chat == link.twin.chat));
+        self.lasting.push_back(link);
         while self.lasting.len() > MAX_LASTING {
             self.lasting.pop_front();
         }
     }
 
     /// The links of lasting messages, oldest first.
-    pub fn lasting(&self) -> Vec<(MessageKey, MessageKey)> {
+    pub fn lasting(&self) -> Vec<TwinLink> {
         self.lasting.iter().copied().collect()
     }
 
@@ -475,6 +525,19 @@ mod tests {
         Chat::Private(PrivateChat::of_user(7))
     }
 
+    /// The group topic the twins go to.
+    fn group() -> Place {
+        Place::topic(Chat::Group, 100)
+    }
+
+    fn lasting(primary: i64, twin: i64) -> TwinLink {
+        TwinLink {
+            primary: MessageKey::new(owner(), primary),
+            twin: MessageKey::new(Chat::Group, twin),
+            thread: Some(100),
+        }
+    }
+
     fn edit(chat: Chat, message_id: i64, text: &str) -> Op {
         Op::Edit {
             chat,
@@ -488,8 +551,8 @@ mod tests {
     #[test]
     fn a_twin_is_linked_whichever_answer_comes_first() {
         let mut mirror = Mirror::default();
-        let first = mirror.send(1, Chat::Group, false, false).unwrap();
-        let second = mirror.send(2, Chat::Group, false, false).unwrap();
+        let first = mirror.send(1, group(), false, false).unwrap();
+        let second = mirror.send(2, group(), false, false).unwrap();
         assert!(mirror.twin_answered(first, Some(50)).is_empty());
         assert!(
             mirror
@@ -517,7 +580,7 @@ mod tests {
     #[test]
     fn a_call_waits_for_its_twin_and_the_newest_one_goes() {
         let mut mirror = Mirror::default();
-        let id = mirror.send(1, Chat::Group, false, false).unwrap();
+        let id = mirror.send(1, group(), false, false).unwrap();
         mirror.primary_answered(1, owner(), Landed::Message(5));
         let primary = MessageKey::new(owner(), 5);
         assert_eq!(
@@ -540,7 +603,7 @@ mod tests {
     #[test]
     fn a_delete_waiting_for_its_twin_is_not_replaced() {
         let mut mirror = Mirror::default();
-        let id = mirror.send(1, Chat::Group, false, false).unwrap();
+        let id = mirror.send(1, group(), false, false).unwrap();
         mirror.primary_answered(1, owner(), Landed::Message(5));
         let primary = MessageKey::new(owner(), 5);
         let delete = Op::Delete {
@@ -562,9 +625,9 @@ mod tests {
     #[test]
     fn a_primary_without_a_message_takes_its_ghost_twin_away() {
         let mut mirror = Mirror::default();
-        let refused = mirror.send(1, Chat::Group, true, false).unwrap();
-        let merged = mirror.send(2, Chat::Group, true, false).unwrap();
-        let kept = mirror.send(3, Chat::Group, false, false).unwrap();
+        let refused = mirror.send(1, group(), true, false).unwrap();
+        let merged = mirror.send(2, group(), true, false).unwrap();
+        let kept = mirror.send(3, group(), false, false).unwrap();
         mirror.twin_answered(refused, Some(50));
         let follows = mirror.primary_answered(1, owner(), Landed::Nothing);
         assert!(matches!(
@@ -589,14 +652,14 @@ mod tests {
     fn a_prompt_that_goes_again_keeps_its_twin_for_the_next_send() {
         let mut mirror = Mirror::default();
         // The twin comes before the primary is lost, and one after.
-        let early = mirror.send(1, Chat::Group, true, false).unwrap();
+        let early = mirror.send(1, group(), true, false).unwrap();
         mirror.twin_answered(early, Some(50));
         assert!(
             mirror
                 .primary_answered(1, owner(), Landed::Again)
                 .is_empty()
         );
-        let late = mirror.send(2, Chat::Group, true, false).unwrap();
+        let late = mirror.send(2, group(), true, false).unwrap();
         mirror.primary_answered(2, owner(), Landed::Again);
         assert_eq!(mirror.kept(2), [(Chat::Group, None)]);
         assert!(mirror.twin_answered(late, Some(51)).is_empty(), "no delete");
@@ -623,7 +686,7 @@ mod tests {
         assert!(mirror.lost().is_empty());
         assert_eq!(mirror.waiting(), 0);
         // One still on its way when let go is deleted once it comes.
-        let unanswered = mirror.send(3, Chat::Group, true, false).unwrap();
+        let unanswered = mirror.send(3, group(), true, false).unwrap();
         mirror.primary_answered(3, owner(), Landed::Again);
         assert!(mirror.release(3).is_empty());
         assert!(matches!(
@@ -635,7 +698,7 @@ mod tests {
     #[test]
     fn content_for_a_lost_twin_goes_back_to_the_actor() {
         let mut mirror = Mirror::default();
-        let id = mirror.send(1, Chat::Group, true, false).unwrap();
+        let id = mirror.send(1, group(), true, false).unwrap();
         mirror.primary_answered(1, owner(), Landed::Message(5));
         let primary = MessageKey::new(owner(), 5);
         let write = Op::Stream {
@@ -659,7 +722,7 @@ mod tests {
             [Write::Lost(Chat::Group)]
         );
         // The actor sends it as a new twin, which then takes the calls.
-        let again = mirror.send_for(primary, Chat::Group).unwrap();
+        let again = mirror.send_for(primary, group()).unwrap();
         mirror.twin_answered(again, Some(60));
         assert_eq!(
             mirror.write(primary, &edit(owner(), 5, "y")),
@@ -674,8 +737,8 @@ mod tests {
     #[test]
     fn lasting_links_are_kept_apart_and_bounded() {
         let mut mirror = Mirror::default();
-        let block = mirror.send(1, Chat::Group, false, true).unwrap();
-        let line = mirror.send(2, Chat::Group, true, false).unwrap();
+        let block = mirror.send(1, group(), false, true).unwrap();
+        let line = mirror.send(2, group(), true, false).unwrap();
         mirror.primary_answered(1, owner(), Landed::Message(5));
         mirror.primary_answered(2, owner(), Landed::Message(6));
         mirror.twin_answered(line, Some(51));
@@ -684,17 +747,11 @@ mod tests {
         assert!(mirror.take_changed());
         assert!(!mirror.take_changed());
         let kept = mirror.lasting();
-        assert_eq!(
-            kept,
-            [(
-                MessageKey::new(owner(), 5),
-                MessageKey::new(Chat::Group, 50)
-            )]
-        );
+        assert_eq!(kept, [lasting(5, 50)], "with the twin's topic");
         // After a restart: linked again, and still kept.
         let mut again = Mirror::default();
-        for (primary, twin) in kept {
-            again.link_lasting(primary, twin);
+        for link in kept {
+            again.link_lasting(link);
         }
         assert_eq!(
             again.write(MessageKey::new(owner(), 5), &edit(owner(), 5, "done")),
@@ -703,18 +760,88 @@ mod tests {
         assert_eq!(again.lasting().len(), 1);
         assert!(!again.take_changed(), "loading changes nothing to save");
         for n in 0..(MAX_LASTING as i64 + 1) {
-            again.link_lasting(
-                MessageKey::new(owner(), 100 + n),
-                MessageKey::new(Chat::Group, 1000 + n),
-            );
+            again.link_lasting(lasting(100 + n, 1000 + n));
         }
         assert_eq!(again.lasting().len(), MAX_LASTING);
         assert_eq!(
             again.lasting().last(),
-            Some(&(
-                MessageKey::new(owner(), 100 + MAX_LASTING as i64),
-                MessageKey::new(Chat::Group, 1000 + MAX_LASTING as i64)
+            Some(&lasting(
+                100 + MAX_LASTING as i64,
+                1000 + MAX_LASTING as i64
             ))
+        );
+    }
+
+    /// TASK-064: a topic that is no view any more is forgotten with every
+    /// twin in it, whatever its state; another topic of the same chat keeps
+    /// its twins.
+    #[test]
+    fn a_topic_that_is_no_view_any_more_gets_no_write() {
+        let mut mirror = Mirror::default();
+        let other = Place::topic(Chat::Group, 200);
+        // Shown in the forgotten topic, a lasting one too.
+        let shown = mirror.send(1, group(), false, false).unwrap();
+        mirror.primary_answered(1, owner(), Landed::Message(5));
+        mirror.twin_answered(shown, Some(50));
+        mirror.link_lasting(lasting(6, 60));
+        // Lost there, and one still on its way with a call waiting for it.
+        let lost = mirror.send(2, group(), false, false).unwrap();
+        mirror.primary_answered(2, owner(), Landed::Message(7));
+        mirror.twin_answered(lost, None);
+        let sending = mirror.send(3, group(), false, true).unwrap();
+        mirror.primary_answered(3, owner(), Landed::Message(8));
+        mirror.write(MessageKey::new(owner(), 8), &edit(owner(), 8, "queued"));
+        // Not answered yet at all, and one kept for a prompt that goes again.
+        let early = mirror.send(4, group(), true, false).unwrap();
+        let kept = mirror.send(5, group(), true, false).unwrap();
+        mirror.primary_answered(5, owner(), Landed::Again);
+        // Another topic of the group.
+        let elsewhere = mirror.send(9, other, false, true).unwrap();
+        mirror.primary_answered(9, owner(), Landed::Message(9));
+        mirror.twin_answered(elsewhere, Some(90));
+        mirror.take_changed();
+
+        mirror.forget_topic(group());
+        assert!(mirror.take_changed(), "the lasting link goes from the save");
+        assert_eq!(
+            mirror.lasting(),
+            [TwinLink {
+                primary: MessageKey::new(owner(), 9),
+                twin: MessageKey::new(Chat::Group, 90),
+                thread: Some(200),
+            }]
+        );
+        for primary in [5, 6, 7, 8] {
+            assert!(
+                mirror
+                    .write(
+                        MessageKey::new(owner(), primary),
+                        &edit(owner(), primary, "x")
+                    )
+                    .is_empty(),
+                "{primary}"
+            );
+        }
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 50)), None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 60)), None);
+        assert_eq!(mirror.twin(MessageKey::new(owner(), 5), Chat::Group), None);
+        // Late answers there link nothing and write nothing.
+        assert!(mirror.twin_answered(sending, Some(80)).is_empty());
+        assert!(!mirror.twinned(4));
+        assert!(
+            mirror
+                .primary_answered(4, owner(), Landed::Nothing)
+                .is_empty()
+        );
+        assert!(mirror.twin_answered(early, Some(81)).is_empty());
+        assert!(mirror.kept(5).is_empty());
+        assert!(mirror.twin_answered(kept, Some(82)).is_empty());
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 80)), None);
+        assert_eq!(mirror.waiting(), 0);
+        // The other topic is untouched.
+        assert_eq!(
+            mirror.write(MessageKey::new(owner(), 9), &edit(owner(), 9, "y")),
+            [Write::Now(MessageKey::new(Chat::Group, 90))]
         );
     }
 
@@ -725,6 +852,7 @@ mod tests {
             mirror.link(
                 MessageKey::new(owner(), n),
                 MessageKey::new(Chat::Group, 10_000 + n),
+                Some(100),
             );
         }
         assert_eq!(
@@ -742,8 +870,8 @@ mod tests {
         );
         let mut mirror = Mirror::default();
         for seq in 0..MAX_SENDS as u64 {
-            assert!(mirror.send(seq, Chat::Group, false, false).is_some());
+            assert!(mirror.send(seq, group(), false, false).is_some());
         }
-        assert!(mirror.send(9999, Chat::Group, false, false).is_none());
+        assert!(mirror.send(9999, group(), false, false).is_none());
     }
 }

@@ -1189,6 +1189,7 @@ impl Soak {
         if self.live {
             let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
             let _ = hub.control.send(Control::Message(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
@@ -1225,7 +1226,7 @@ impl Soak {
                 message_id: Some(message_id),
                 thread_id: None,
                 from_name: None,
-                author: None,
+                display_name: None,
             }));
             return;
         }

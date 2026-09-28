@@ -444,6 +444,7 @@ async fn e2e_the_status_message_rolls_below_the_turn() {
     let user = hub.fake.user("ещё");
     hub.control
         .send(Control::Message(Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id: user,

@@ -600,6 +600,7 @@ mod tests {
 
     fn command(text: &str, thread_id: Option<i64>) -> Inbound {
         Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
@@ -622,7 +623,7 @@ mod tests {
             message_id: Some(77),
             thread_id: None,
             from_name: Some("Иван".into()),
-            author: None,
+            display_name: None,
         }
     }
 

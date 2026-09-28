@@ -545,6 +545,7 @@ mod tests {
     #[test]
     fn only_our_commands_are_commands() {
         let input = |text: &str| crate::hub::updates::Inbound {
+            display_name: None,
             chat: Chat::Group,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
@@ -677,6 +678,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         for text in texts {
             tx.send(Inbound {
+                display_name: None,
                 chat: Chat::Group,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 1,
