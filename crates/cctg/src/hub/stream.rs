@@ -61,13 +61,17 @@
 //! follows the primary view alone. The turn answer goes there as a twin. The
 //! turn message of a mirror grows by one write in flight at a time: what
 //! comes meanwhile waits and goes in one write of the whole text, and a
-//! message closed while it still owes one gets that last write.
+//! message closed while it still owes one gets that last write. A new turn
+//! message never joins another one still on its way (the scheduler would
+//! answer it `Merged` and the other one's last write would erase it), and
+//! the call numbers come from one counter of the actor, so a late answer of
+//! a mirror turn made before never lands on a new one.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::warn;
 
 use super::chat::{MessageKey, Place};
 use super::menu::Piece;
@@ -304,7 +308,9 @@ pub struct MirrorTurn {
     current: Option<MirrorMessage>,
     /// Messages closed while an answer or a last write was due.
     closing: VecDeque<MirrorMessage>,
-    next: u64,
+    /// New messages the scheduler may join later ones into (`merge`) whose
+    /// answer has not come: until it came, a new message does not join.
+    joining: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -365,7 +371,7 @@ impl MirrorTurn {
             read_to,
             current: None,
             closing: VecDeque::new(),
-            next: 0,
+            joining: Vec::new(),
         }
     }
 
@@ -387,9 +393,17 @@ impl MirrorTurn {
         }
     }
 
-    fn next(&mut self) -> u64 {
-        self.next += 1;
-        self.next
+    /// No stream feeds it any more (its topic is no mirror now): the turn
+    /// message is closed; it only waits for the answers to its calls, and a
+    /// stream that feeds it again starts it over ([`Self::reset`]).
+    pub fn leave(&mut self) {
+        self.close();
+        self.session.clear();
+    }
+
+    /// Nothing it sent waits for an answer, nothing is owed.
+    pub fn idle(&self) -> bool {
+        self.current.is_none() && self.closing.is_empty() && self.joining.is_empty()
     }
 
     /// Something came below the turn message: nothing more goes into it; a
@@ -406,7 +420,7 @@ impl MirrorTurn {
         self.closing.push_back(message);
         if self.closing.len() > MAX_CLOSING {
             self.closing.pop_front();
-            debug!("a closed mirror turn message goes without its last write");
+            warn!("a closed mirror turn message goes without its last write");
         }
     }
 
@@ -414,13 +428,14 @@ impl MirrorTurn {
     /// turn view. Quiet pieces grow the turn message while they fit, else
     /// start the next one. The first new message of a read (`posted == 0`)
     /// is made of status twin `twin` when there is one (taken then); every
-    /// other new one counts in `posted`.
+    /// other new one counts in `posted`. Call numbers come from `calls`.
     pub fn roll(
         &mut self,
         joined: Vec<Joined>,
         compact: bool,
         twin: &mut Option<MessageKey>,
         posted: &mut usize,
+        calls: &mut u64,
     ) -> Vec<MirrorOp> {
         let mut ops = Vec::new();
         for piece in joined {
@@ -432,10 +447,10 @@ impl MirrorTurn {
                 current.open = grown;
                 match current.open.key {
                     Some(into) if current.writing.is_none() => {
-                        self.next += 1;
-                        current.writing = Some(self.next);
+                        let number = next_call(calls);
+                        current.writing = Some(number);
                         ops.push(MirrorOp::Write {
-                            number: self.next,
+                            number,
                             into,
                             text: current.open.text.clone(),
                             html: current.open.html.clone(),
@@ -446,18 +461,24 @@ impl MirrorTurn {
                 continue;
             }
             self.close();
-            let number = self.next();
+            let number = next_call(calls);
             let absorb = if *posted == 0 { twin.take() } else { None };
             let (text, html, open) = match piece {
                 Ok((open, _)) => (open.text.clone(), open.html.clone(), Some(open)),
                 Err((text, html)) => (text, html, None),
             };
+            // The status twin becoming content goes at once; a message that
+            // joined one still on its way would be lost (answered `Merged`,
+            // then erased by that one's last write).
+            let merge = open.is_some() && absorb.is_none() && self.joining.is_empty();
+            if merge {
+                self.joining.push(number);
+            }
             ops.push(MirrorOp::New {
                 number,
                 text: text.clone(),
                 html: html.clone(),
-                // The status twin becoming content goes at once.
-                merge: open.is_some() && absorb.is_none(),
+                merge,
                 into: absorb,
             });
             let message = |open: Open, key: Option<MessageKey>| MirrorMessage {
@@ -491,9 +512,15 @@ impl MirrorTurn {
 
     /// A message of its own for one stream chunk (no turn message: status
     /// messages off).
-    pub fn line(&mut self, text: String, html: Option<String>, merge: bool) -> MirrorOp {
+    pub fn line(
+        &mut self,
+        text: String,
+        html: Option<String>,
+        merge: bool,
+        calls: &mut u64,
+    ) -> MirrorOp {
         MirrorOp::New {
-            number: self.next(),
+            number: next_call(calls),
             text,
             html,
             merge,
@@ -503,14 +530,16 @@ impl MirrorTurn {
 
     /// Telegram answered call `number`: `made` the message a new one made,
     /// `accepted` it is in the topic, `gone` the message written into is
-    /// gone.
+    /// gone. A write owed now takes its number from `calls`.
     pub fn answered(
         &mut self,
         number: u64,
         made: Option<MessageKey>,
         accepted: bool,
         gone: bool,
+        calls: &mut u64,
     ) -> Answered {
+        self.joining.retain(|joining| *joining != number);
         let mut answered = Answered::default();
         let of = |message: &MirrorMessage| {
             (message.open.key.is_none() && message.number == number)
@@ -551,11 +580,11 @@ impl MirrorTurn {
         let settled = if !keep {
             true
         } else if let (true, Some(into)) = (message.dirty, message.open.key) {
-            self.next += 1;
-            message.writing = Some(self.next);
+            let number = next_call(calls);
+            message.writing = Some(number);
             message.dirty = false;
             answered.write = Some(MirrorOp::Write {
-                number: self.next,
+                number,
                 into,
                 text: message.open.text.clone(),
                 html: message.open.html.clone(),
@@ -574,6 +603,12 @@ impl MirrorTurn {
         }
         answered
     }
+}
+
+/// The next number of `calls`, the one call counter of all mirror turns.
+fn next_call(calls: &mut u64) -> u64 {
+    *calls += 1;
+    *calls
 }
 
 /// Applies the items of one line to the calls still open and the receipts.
@@ -2458,13 +2493,14 @@ mod tests {
     }
 
     /// `turn` rolls `texts` of one line, with nothing to absorb.
-    fn roll_quiet(turn: &mut MirrorTurn, texts: &[&str]) -> Vec<MirrorOp> {
+    fn roll_quiet(turn: &mut MirrorTurn, calls: &mut u64, texts: &[&str]) -> Vec<MirrorOp> {
         let mut posted = 0;
         turn.roll(
             join_pieces(quiet(texts), false),
             false,
             &mut None,
             &mut posted,
+            calls,
         )
     }
 
@@ -2488,7 +2524,8 @@ mod tests {
     #[test]
     fn a_mirror_turn_grows_while_its_send_waits_and_writes_once() {
         let mut turn = MirrorTurn::new("s", 0);
-        let ops = roll_quiet(&mut turn, &["a"]);
+        let mut calls = 0;
+        let ops = roll_quiet(&mut turn, &mut calls, &["a"]);
         let [
             MirrorOp::New {
                 number: new,
@@ -2501,9 +2538,9 @@ mod tests {
             panic!("{ops:?}");
         };
         // Its send waits: the next lines wait in it.
-        assert!(roll_quiet(&mut turn, &["b"]).is_empty());
-        assert!(roll_quiet(&mut turn, &["c"]).is_empty());
-        let answered = turn.answered(*new, Some(group_key(50)), true, false);
+        assert!(roll_quiet(&mut turn, &mut calls, &["b"]).is_empty());
+        assert!(roll_quiet(&mut turn, &mut calls, &["c"]).is_empty());
+        let answered = turn.answered(*new, Some(group_key(50)), true, false, &mut calls);
         let Some(MirrorOp::Write {
             number: write,
             into,
@@ -2515,8 +2552,8 @@ mod tests {
         };
         assert_eq!((into, text.as_str()), (group_key(50), "a\nb\nc"));
         // While that write waits: one more, once it is answered.
-        assert!(roll_quiet(&mut turn, &["d"]).is_empty());
-        let answered = turn.answered(write, Some(group_key(50)), true, false);
+        assert!(roll_quiet(&mut turn, &mut calls, &["d"]).is_empty());
+        let answered = turn.answered(write, Some(group_key(50)), true, false, &mut calls);
         assert!(matches!(
             answered.write,
             Some(MirrorOp::Write { ref text, .. }) if text == "a\nb\nc\nd"
@@ -2527,12 +2564,14 @@ mod tests {
     #[test]
     fn a_mirror_turn_absorbs_the_twin_first() {
         let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
         let (mut twin, mut posted) = (Some(group_key(40)), 0);
         let ops = turn.roll(
             join_pieces(quiet(&["a"]), false),
             false,
             &mut twin,
             &mut posted,
+            &mut calls,
         );
         let [
             MirrorOp::New {
@@ -2548,8 +2587,8 @@ mod tests {
         assert_eq!(*into, group_key(40));
         assert_eq!((twin, posted), (None, 0), "no new message");
         // The next piece grows it once the edit is answered.
-        assert!(roll_quiet(&mut turn, &["b"]).is_empty());
-        let answered = turn.answered(*number, None, true, false);
+        assert!(roll_quiet(&mut turn, &mut calls, &["b"]).is_empty());
+        let answered = turn.answered(*number, None, true, false, &mut calls);
         assert!(matches!(
             answered.write,
             Some(MirrorOp::Write { into, ref text, .. }) if into == group_key(40) && text == "a\nb"
@@ -2561,6 +2600,7 @@ mod tests {
             false,
             &mut twin,
             &mut posted,
+            &mut calls,
         );
         assert!(matches!(ops.as_slice(), [MirrorOp::New { into: None, .. }]));
         assert_eq!((twin, posted), (Some(group_key(41)), 2));
@@ -2569,9 +2609,16 @@ mod tests {
     #[test]
     fn a_prompt_absorbs_the_twin_and_closes() {
         let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
         let (mut twin, mut posted) = (Some(group_key(40)), 0);
         let prompt = vec![("> go".to_owned(), None, false, false)];
-        let ops = turn.roll(join_pieces(prompt, false), false, &mut twin, &mut posted);
+        let ops = turn.roll(
+            join_pieces(prompt, false),
+            false,
+            &mut twin,
+            &mut posted,
+            &mut calls,
+        );
         let [
             MirrorOp::New {
                 number,
@@ -2583,32 +2630,33 @@ mod tests {
         else {
             panic!("{ops:?}");
         };
-        let ops = roll_quiet(&mut turn, &["a"]);
+        let ops = roll_quiet(&mut turn, &mut calls, &["a"]);
         assert!(
             matches!(ops.as_slice(), [MirrorOp::New { into: None, .. }]),
             "below the prompt: {ops:?}"
         );
         // Refused, the twin may still show the old status.
-        let answered = turn.answered(*number, None, false, false);
+        let answered = turn.answered(*number, None, false, false, &mut calls);
         assert_eq!(answered.retire, Some(group_key(40)));
     }
 
     #[test]
     fn a_closed_mirror_message_gets_its_last_write() {
         let mut turn = MirrorTurn::new("s", 0);
-        let ops = roll_quiet(&mut turn, &["a"]);
+        let mut calls = 0;
+        let ops = roll_quiet(&mut turn, &mut calls, &["a"]);
         let new = ops[0].number();
         let write = turn
-            .answered(new, Some(group_key(50)), true, false)
+            .answered(new, Some(group_key(50)), true, false, &mut calls)
             .write
             .map_or(0, |op| op.number());
         assert_eq!(write, 0, "nothing owed yet");
-        let ops = roll_quiet(&mut turn, &["b"]);
+        let ops = roll_quiet(&mut turn, &mut calls, &["b"]);
         let write = ops[0].number();
         // The last lines of the turn while that write waits, then the answer.
-        assert!(roll_quiet(&mut turn, &["c"]).is_empty());
+        assert!(roll_quiet(&mut turn, &mut calls, &["c"]).is_empty());
         turn.close();
-        let answered = turn.answered(write, Some(group_key(50)), true, false);
+        let answered = turn.answered(write, Some(group_key(50)), true, false, &mut calls);
         let Some(MirrorOp::Write {
             number: last,
             into,
@@ -2620,32 +2668,36 @@ mod tests {
         };
         assert_eq!((into, text.as_str()), (group_key(50), "a\nb\nc"));
         // The next turn: a new message; the closed one grows no more.
-        let ops = roll_quiet(&mut turn, &["d"]);
+        let ops = roll_quiet(&mut turn, &mut calls, &["d"]);
         assert!(matches!(ops.as_slice(), [MirrorOp::New { .. }]), "{ops:?}");
-        assert_eq!(turn.answered(last, None, true, false), Answered::default());
+        assert_eq!(
+            turn.answered(last, None, true, false, &mut calls),
+            Answered::default()
+        );
         assert!(turn.closing.is_empty());
     }
 
     #[test]
     fn a_refused_mirror_write_closes_the_message() {
         let mut turn = MirrorTurn::new("s", 0);
-        let new = roll_quiet(&mut turn, &["a"])[0].number();
-        turn.answered(new, Some(group_key(50)), true, false);
-        let write = roll_quiet(&mut turn, &["b"])[0].number();
+        let mut calls = 0;
+        let new = roll_quiet(&mut turn, &mut calls, &["a"])[0].number();
+        turn.answered(new, Some(group_key(50)), true, false, &mut calls);
+        let write = roll_quiet(&mut turn, &mut calls, &["b"])[0].number();
         assert_eq!(
-            turn.answered(write, None, false, false),
+            turn.answered(write, None, false, false, &mut calls),
             Answered::default()
         );
-        let ops = roll_quiet(&mut turn, &["c"]);
+        let ops = roll_quiet(&mut turn, &mut calls, &["c"]);
         assert!(
             matches!(ops.as_slice(), [MirrorOp::New { text, .. }] if text == "c"),
             "{ops:?}"
         );
         // A refused new message: the next piece is a new one too.
         let refused = ops[0].number();
-        turn.answered(refused, None, false, false);
+        turn.answered(refused, None, false, false, &mut calls);
         assert!(matches!(
-            roll_quiet(&mut turn, &["d"]).as_slice(),
+            roll_quiet(&mut turn, &mut calls, &["d"]).as_slice(),
             [MirrorOp::New { .. }]
         ));
     }
@@ -2654,19 +2706,171 @@ mod tests {
     fn a_refused_absorption_retires_the_twin() {
         for (gone, retire) in [(false, Some(group_key(40))), (true, None)] {
             let mut turn = MirrorTurn::new("s", 0);
+            let mut calls = 0;
             let (mut twin, mut posted) = (Some(group_key(40)), 0);
             let ops = turn.roll(
                 join_pieces(quiet(&["a"]), false),
                 false,
                 &mut twin,
                 &mut posted,
+                &mut calls,
             );
-            let answered = turn.answered(ops[0].number(), None, false, gone);
+            let answered = turn.answered(ops[0].number(), None, false, gone, &mut calls);
             assert_eq!(answered.retire, retire, "gone={gone}");
             assert!(matches!(
-                roll_quiet(&mut turn, &["b"]).as_slice(),
+                roll_quiet(&mut turn, &mut calls, &["b"]).as_slice(),
                 [MirrorOp::New { into: None, .. }]
             ));
         }
+    }
+
+    /// TASK-078 review finding 1: a mirror turn message whose send still
+    /// waits grew locally; the next piece does not fit it and starts message
+    /// B. B must not be one the scheduler joins into A (answered `Merged`,
+    /// dropped with what grew it, then erased by A's last write): it goes
+    /// unjoinable, and every line ends up in one of the two messages.
+    #[test]
+    fn a_new_mirror_message_never_joins_one_on_its_way() {
+        let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
+        let a = roll_quiet(&mut turn, &mut calls, &["Looking."]);
+        let [
+            MirrorOp::New {
+                number: a,
+                merge: true,
+                into: None,
+                ..
+            },
+        ] = a.as_slice()
+        else {
+            panic!("{a:?}");
+        };
+        let t1 = "x".repeat(2500);
+        assert!(
+            roll_quiet(&mut turn, &mut calls, &[t1.as_str()]).is_empty(),
+            "A grows locally"
+        );
+        let t2 = "y".repeat(2000);
+        let b = roll_quiet(&mut turn, &mut calls, &[t2.as_str()]);
+        let [
+            MirrorOp::New {
+                number: b,
+                merge: false,
+                into: None,
+                text,
+                ..
+            },
+        ] = b.as_slice()
+        else {
+            panic!("B may not join A: {b:?}");
+        };
+        assert_eq!(text, &t2);
+        assert!(
+            roll_quiet(&mut turn, &mut calls, &["z tail"]).is_empty(),
+            "B grows locally"
+        );
+        let after_a = turn.answered(*a, Some(group_key(50)), true, false, &mut calls);
+        let after_b = turn.answered(*b, Some(group_key(51)), true, false, &mut calls);
+        let written: Vec<(MessageKey, String)> = [after_a.write, after_b.write]
+            .into_iter()
+            .flatten()
+            .map(|op| match op {
+                MirrorOp::Write { into, text, .. } => (into, text),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            written,
+            [
+                (group_key(50), format!("Looking.\n{t1}")),
+                (group_key(51), format!("{t2}\nz tail")),
+            ]
+        );
+        // Both answered: the next new message may be joined into again.
+        let next = roll_quiet(&mut turn, &mut calls, &["w".repeat(4000).as_str()]);
+        assert!(
+            matches!(next.as_slice(), [MirrorOp::New { merge: true, .. }]),
+            "{next:?}"
+        );
+    }
+
+    /// Also a new message the turn no longer keeps (closed before it grew,
+    /// e.g. by a user's message) may take no later one while it waits.
+    #[test]
+    fn a_closed_message_on_its_way_takes_no_new_one() {
+        let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
+        let a = roll_quiet(&mut turn, &mut calls, &["a"])[0].number();
+        turn.close();
+        let b = roll_quiet(&mut turn, &mut calls, &["b"]);
+        assert!(
+            matches!(b.as_slice(), [MirrorOp::New { merge: false, .. }]),
+            "{b:?}"
+        );
+        assert!(!turn.idle());
+        turn.answered(a, Some(group_key(50)), true, false, &mut calls);
+        turn.close();
+        let c = roll_quiet(&mut turn, &mut calls, &["c"]);
+        assert!(
+            matches!(c.as_slice(), [MirrorOp::New { merge: true, .. }]),
+            "{c:?}"
+        );
+    }
+
+    /// TASK-078 review finding 2: the call numbers come from one counter of
+    /// the actor, so a mirror turn made again for the same topic never
+    /// takes a late answer of the one before as its own.
+    #[test]
+    fn mirror_turns_share_one_call_counter() {
+        let mut calls = 0;
+        let mut old = MirrorTurn::new("s", 0);
+        let old_new = roll_quiet(&mut old, &mut calls, &["old"])[0].number();
+        drop(old);
+        let mut turn = MirrorTurn::new("s", 100);
+        let new = roll_quiet(&mut turn, &mut calls, &["new"])[0].number();
+        assert_ne!(old_new, new);
+        // The old call's answer comes now: it is no call of this turn.
+        let answered = turn.answered(old_new, Some(group_key(7)), true, false, &mut calls);
+        assert_eq!(answered, Answered::default());
+        assert!(
+            roll_quiet(&mut turn, &mut calls, &["more"]).is_empty(),
+            "still waits for its own"
+        );
+        let answered = turn.answered(new, Some(group_key(8)), true, false, &mut calls);
+        assert!(matches!(
+            answered.write,
+            Some(MirrorOp::Write { into, ref text, .. }) if into == group_key(8) && text == "new\nmore"
+        ));
+    }
+
+    /// TASK-078 review finding 3: a mirror turn no stream feeds any more
+    /// still owes the last write of its turn message; it is idle once that
+    /// went, and a stream that feeds it again starts over.
+    #[test]
+    fn a_left_mirror_turn_writes_what_it_owes() {
+        let mut turn = MirrorTurn::new("s", 0);
+        let mut calls = 0;
+        let new = roll_quiet(&mut turn, &mut calls, &["a"])[0].number();
+        assert!(roll_quiet(&mut turn, &mut calls, &["b"]).is_empty());
+        turn.leave();
+        assert_eq!(turn.session, "");
+        assert!(!turn.idle(), "its last write is owed");
+        let answered = turn.answered(new, Some(group_key(50)), true, false, &mut calls);
+        let Some(MirrorOp::Write {
+            number: last,
+            into,
+            text,
+            ..
+        }) = answered.write
+        else {
+            panic!("{answered:?}");
+        };
+        assert_eq!((into, text.as_str()), (group_key(50), "a\nb"));
+        assert!(!turn.idle());
+        turn.answered(last, None, true, false, &mut calls);
+        assert!(turn.idle());
+        turn.reset("s", 30);
+        assert!(!turn.takes(30));
+        assert!(turn.takes(40));
     }
 }
