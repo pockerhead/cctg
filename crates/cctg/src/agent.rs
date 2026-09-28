@@ -79,6 +79,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::channel::{self, FileCall, Hub, NoHub};
 use crate::client;
+use crate::compress::{self, COMPRESS_TIMEOUT, Compressor};
 use crate::device::{self, DeviceConfig};
 use crate::download;
 use crate::files;
@@ -93,8 +94,8 @@ use crate::tls::{HubAddr, ReadTask, Stream};
 use crate::update::{self, Plan, Worker};
 use crate::wire::{
     self, AgentMsg, Beat, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind, FileOutcome,
-    FilePart, Heartbeat, HookEvent, HubMsg, Liveness, Register, Rejection, Secret, SessionAsk,
-    UpdateOutcome, WireError,
+    FilePart, Heartbeat, HookEvent, HubMsg, Liveness, Register, Rejection, Secret, SessionAnswer,
+    SessionAsk, UpdateOutcome, WireError,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -614,6 +615,10 @@ pub struct Dirs {
     /// The session's working folder: files from the topic are kept under
     /// it ([`files::save`]) and a relative `send_file` path starts there.
     pub work: Option<PathBuf>,
+    /// The claude program of the helper run that compresses a group
+    /// history (TASK-077, [`compress::program`]); `None`: no compression,
+    /// every such ask is answered `unreadable`.
+    pub claude: Option<PathBuf>,
 }
 
 /// Runs the worker agent (`cctg agent-worker`, started by the shim) until
@@ -745,6 +750,9 @@ pub async fn run_stdio() -> i32 {
     let dirs = Dirs {
         project,
         work: std::env::current_dir().ok(),
+        claude: Some(compress::program(&|name| std::env::var_os(name), &|path| {
+            path.is_file()
+        })),
     };
     let worker = Some(Arc::new(worker));
     let ended = serve_channel(
@@ -913,7 +921,44 @@ fn skip_line(reader: &mut impl BufRead) -> bool {
 /// claude closes stdin. Without `worker` an `update` is ignored. A resumed
 /// worker first tells Claude Code to list the tools again: it may offer
 /// more than the worker Claude Code met.
+///
+/// A helper claude of a group history compression still running when the
+/// loop returns is killed before this returns: the worker ends with
+/// `std::process::exit`, which drops nothing (TASK-077).
 pub async fn serve_channel<W: AsyncWrite + Unpin>(
+    frames: mpsc::Receiver<Frame>,
+    output: W,
+    hub: Hub,
+    events: Option<mpsc::Receiver<LinkEvent>>,
+    dirs: Dirs,
+    console: Option<Console>,
+    worker: Option<Arc<Worker>>,
+) -> std::io::Result<Ended> {
+    let compressions = match &hub {
+        Hub::Link(outbox) => {
+            let compressor = dirs.claude.clone().map(|program| Compressor {
+                program,
+                work: dirs.work.clone(),
+                timeout: COMPRESS_TIMEOUT,
+            });
+            Some(spawn_compressor(outbox.clone(), compressor))
+        }
+        Hub::Off(_) => None,
+    };
+    let requests = compressions
+        .as_ref()
+        .map(|compressions| compressions.requests.clone());
+    let ended = serve_loop(frames, output, hub, events, dirs, console, worker, requests).await;
+    if let Some(compressions) = compressions {
+        compressions.stop().await;
+    }
+    ended
+}
+
+/// The loop of [`serve_channel`]; group histories to compress go to
+/// `compressions`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_loop<W: AsyncWrite + Unpin>(
     mut frames: mpsc::Receiver<Frame>,
     mut output: W,
     hub: Hub,
@@ -921,6 +966,7 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
     dirs: Dirs,
     console: Option<Console>,
     worker: Option<Arc<Worker>>,
+    compressions: Option<mpsc::Sender<Compression>>,
 ) -> std::io::Result<Ended> {
     let (reads, session_reads, console_jobs, outbox) = match &hub {
         Hub::Link(outbox) => (
@@ -1129,6 +1175,20 @@ pub async fn serve_channel<W: AsyncWrite + Unpin>(
                         && reads.try_send((session_id, from)).is_err()
                     {
                         debug!("transcript read busy; request dropped");
+                    }
+                    Vec::new()
+                }
+                Some(LinkEvent::Message(HubMsg::SessionRead {
+                    read_id,
+                    ask: SessionAsk::Compress { text, limit },
+                    ..
+                })) => {
+                    // Off the loop, one at a time (TASK-077); one beyond the
+                    // queue is dropped: the hub's wait runs out and it cuts.
+                    if let Some(compressions) = &compressions
+                        && compressions.try_send((read_id, text, limit)).is_err()
+                    {
+                        debug!("compressions busy; request dropped");
                     }
                     Vec::new()
                 }
@@ -1961,6 +2021,61 @@ fn spawn_session_reader(
     requests
 }
 
+/// A group history to compress: read id, text, limit (TASK-077).
+type Compression = (u64, String, u32);
+/// Compressions waiting: the hub has at most one out per slot, and this
+/// agent's session has one slot.
+const COMPRESSIONS: usize = 2;
+
+/// The compressor worker of [`spawn_compressor`].
+pub struct Compressions {
+    /// Where the histories to compress go.
+    pub requests: mpsc::Sender<Compression>,
+    task: JoinHandle<()>,
+}
+
+impl Compressions {
+    /// Ends the worker; a helper claude still running is killed (its child
+    /// handle is dropped with `kill_on_drop`) before this returns.
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+/// The one worker that runs the helper claude of [`crate::compress`], one
+/// run at a time, off the loop: its answer is the summary as `text` pieces,
+/// or `unreadable` when there is no compressor or the run failed.
+pub fn spawn_compressor(
+    outbox: mpsc::Sender<AgentMsg>,
+    compressor: Option<Compressor>,
+) -> Compressions {
+    let (requests, mut pending) = mpsc::channel::<Compression>(COMPRESSIONS);
+    let task = tokio::spawn(async move {
+        while let Some((read_id, text, limit)) = pending.recv().await {
+            let summary = match &compressor {
+                Some(compressor) => compressor.run(&text, limit).await,
+                None => None,
+            };
+            let answers = match summary {
+                Some(summary) => reads::pieces(&summary),
+                None => vec![SessionAnswer::Unreadable],
+            };
+            for answer in answers {
+                if outbox
+                    .send(AgentMsg::SessionAnswer { read_id, answer })
+                    .await
+                    .is_err()
+                {
+                    debug!("hub link gone; compression answer dropped");
+                    return;
+                }
+            }
+        }
+    });
+    Compressions { requests, task }
+}
+
 /// A key to press or a line to type, with the hub's id for the answer.
 enum ConsoleJob {
     Key(u64, ConsoleKey),
@@ -2777,6 +2892,7 @@ mod tests {
         let dirs = Dirs {
             project: project.map(|folder| Arc::new(tail::OwnProject::at(folder))),
             work: None,
+            claude: None,
         };
         tokio::spawn(serve_channel(
             frames_rx, ours, hub, events, dirs, None, None,
@@ -3216,6 +3332,75 @@ mod tests {
         assert_eq!(claude.recv().await["id"], 5);
     }
 
+    /// TASK-077: a compression ask goes to the compressor, not to the
+    /// session reader; without a claude program it is `unreadable` at once
+    /// (nothing is started), and a read asked after it is answered too.
+    #[tokio::test]
+    async fn a_compression_without_a_claude_is_unreadable_and_reads_go_on() {
+        let dir = crate::hub::testdir::TempDir::new("agent-compress");
+        let session = "5e551077-0000-4000-8000-000000000001";
+        let project = dir.path().join("projects").join("C--w");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{session}.jsonl")),
+            "{\"type\":\"ai-title\",\"aiTitle\":\"T\"}\n",
+        )
+        .unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (outbox, events) = spawn(config(addr, Backoff::default()));
+        let mut claude = claude_reading(Hub::Link(outbox), Some(events), Some(project));
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 0);
+        claude
+            .send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await;
+        let (mut reader, mut write) = raw_hub(&listener).await;
+        let compress = HubMsg::SessionRead {
+            read_id: 1,
+            session_id: session.into(),
+            ask: SessionAsk::Compress {
+                text: "Анна: да".into(),
+                limit: 5,
+            },
+        };
+        wire::write_msg(&mut write, &compress).await.unwrap();
+        let title = HubMsg::SessionRead {
+            read_id: 2,
+            session_id: session.into(),
+            ask: SessionAsk::Title { from: 0 },
+        };
+        wire::write_msg(&mut write, &title).await.unwrap();
+        let mut answered = Vec::new();
+        for _ in 0..2 {
+            match agent_line(&mut reader).await {
+                AgentMsg::SessionAnswer {
+                    read_id: 1,
+                    answer: SessionAnswer::Unreadable,
+                } => answered.push(1),
+                AgentMsg::SessionAnswer {
+                    read_id: 2,
+                    answer: SessionAnswer::Title { title, .. },
+                } => {
+                    assert_eq!(title.as_deref(), Some("T"));
+                    answered.push(2);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        answered.sort_unstable();
+        assert_eq!(answered, [1, 2]);
+        // Claude Code saw nothing of it.
+        claude
+            .send(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#)
+            .await;
+        assert_eq!(claude.recv().await["id"], 5);
+    }
+
     #[tokio::test]
     async fn console_keys_and_commands_are_answered_and_never_reach_claude() {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -3404,6 +3589,7 @@ mod tests {
         let dirs = Dirs {
             project: None,
             work: Some(work.to_owned()),
+            claude: None,
         };
         tokio::spawn(serve_channel(
             frames_rx,

@@ -90,7 +90,9 @@ pub fn answer(
             };
             subagent(project, session_id, &input)
         }
-        SessionAsk::Other => vec![SessionAnswer::Unsupported],
+        // The agent's compressor takes it (TASK-077); it comes here only
+        // past that.
+        SessionAsk::Compress { .. } | SessionAsk::Other => vec![SessionAnswer::Unsupported],
     }
 }
 
@@ -493,11 +495,17 @@ mod tests {
             ask(&dir, OTHER, render_ask(TranscriptView::Brief, 3)),
             [SessionAnswer::Missing]
         );
-        // An ask of a newer hub.
+        // An ask of a newer hub, and a compression that missed the
+        // compressor (TASK-077).
         assert_eq!(
             ask(&dir, SESSION, SessionAsk::Other),
             [SessionAnswer::Unsupported]
         );
+        let compress = SessionAsk::Compress {
+            text: "t".into(),
+            limit: 5,
+        };
+        assert_eq!(ask(&dir, SESSION, compress), [SessionAnswer::Unsupported]);
     }
 
     #[test]

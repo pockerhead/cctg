@@ -11,11 +11,16 @@
 //! collapsed quote that Telegram opens on a tap) apply per view (TASK-078):
 //! the owner's private settings in their private chat, the owner's
 //! [`Settings::group`] in the group topic of their sessions (default:
-//! everything, 💭 on, full turn, rich messages off). Rich messages
+//! everything, 💭 on, full turn, rich messages on). Rich messages
 //! (TASK-075: answers and turn text as Telegram rich markdown) are a setting
-//! of each view too: on by default in the private chat, off in the group.
-//! The sound setting changes the private chat only; the group sounds as
-//! before. The menu does not refresh itself: ↻ does.
+//! of each view too, on by default in both (the group since TASK-077; a
+//! saved choice stays). The sound setting changes the private chat only;
+//! the group sounds as before. The menu does not refresh itself: ↻ does.
+//!
+//! TASK-077: in the group topic of a shared session the agent answers only
+//! mentions ([`crate::hub::mention`]); the session row switches a slot
+//! between that and every message, and [`Settings::history`] is how much of
+//! the group's history a mention takes along.
 //!
 //! This module is pure: data, rendering and the press codes. The slot actor
 //! sends, pins and edits.
@@ -110,6 +115,11 @@ pub struct Settings {
     /// Rich messages in the person's private topics (TASK-075); on by
     /// default.
     pub rich: bool,
+    /// How much of the group topic's history a mention takes along to the
+    /// person's shared sessions (TASK-077); written only when not the
+    /// default.
+    #[serde(skip_serializing_if = "HistoryLimit::is_default")]
+    pub history: HistoryLimit,
 }
 
 impl Settings {
@@ -132,8 +142,8 @@ pub struct Display {
     pub detail: Detail,
     pub thinking: bool,
     pub turn: TurnView,
-    /// Agent text as rich messages (TASK-075); off by default: the group
-    /// view.
+    /// Agent text as rich messages (TASK-075); on by default (the group
+    /// view since TASK-077).
     pub rich: bool,
 }
 
@@ -143,7 +153,7 @@ impl Default for Display {
             detail: Detail::Full,
             thinking: true,
             turn: TurnView::Full,
-            rich: false,
+            rich: true,
         }
     }
 }
@@ -165,6 +175,44 @@ impl Default for Settings {
             tz: None,
             group: Display::default(),
             rich: true,
+            history: HistoryLimit::default(),
+        }
+    }
+}
+
+/// Characters of the group history a mention takes along (TASK-077); a
+/// longer one is compressed on the session's device, or cut. Default last,
+/// as [`Detail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryLimit {
+    Short,
+    Long,
+    #[default]
+    #[serde(other)]
+    Medium,
+}
+
+impl HistoryLimit {
+    pub const ALL: [Self; 3] = [Self::Short, Self::Medium, Self::Long];
+
+    pub fn chars(self) -> u32 {
+        match self {
+            Self::Short => 2000,
+            Self::Medium => 4000,
+            Self::Long => 8000,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Short => "s",
+            Self::Medium => "m",
+            Self::Long => "l",
         }
     }
 }
@@ -332,6 +380,10 @@ pub fn change(
             new.group.rich = on;
             Page::GroupDisplay
         }
+        MenuPress::GroupHistory(limit) => {
+            new.history = limit;
+            Page::GroupDisplay
+        }
         MenuPress::SoundMode(sound) => {
             new.sound = sound;
             Page::Sound
@@ -385,16 +437,23 @@ pub enum SlotAction {
     UnshareConfirm,
     Stop,
     StopConfirm,
+    /// 💬: the group topic of the shared slot takes mentions only
+    /// (TASK-077).
+    Mentions,
+    /// 📣: it takes every message.
+    EveryMessage,
 }
 
 impl SlotAction {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Open,
         Self::Share,
         Self::Unshare,
         Self::UnshareConfirm,
         Self::Stop,
         Self::StopConfirm,
+        Self::Mentions,
+        Self::EveryMessage,
     ];
 
     fn code(self) -> &'static str {
@@ -405,6 +464,8 @@ impl SlotAction {
             Self::UnshareConfirm => "uc",
             Self::Stop => "st",
             Self::StopConfirm => "sc",
+            Self::Mentions => "mn",
+            Self::EveryMessage => "ma",
         }
     }
 }
@@ -444,6 +505,8 @@ pub enum MenuPress {
     GroupThinking(bool),
     GroupTurn(TurnView),
     GroupRich(bool),
+    /// The group history a mention takes along (TASK-077).
+    GroupHistory(HistoryLimit),
     SoundMode(Sound),
     /// Quiet hours on or off, as [`MenuPress::Thinking`].
     Quiet(bool),
@@ -507,6 +570,7 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::GroupThinking(on) => format!("gth:{}", u8::from(on)),
         MenuPress::GroupTurn(turn) => format!("gtv:{}", turn_code(turn)),
         MenuPress::GroupRich(on) => format!("grc:{}", u8::from(on)),
+        MenuPress::GroupHistory(limit) => format!("ghl:{}", limit.code()),
         MenuPress::SoundMode(sound) => format!("sn:{}", sound_code(sound)),
         MenuPress::Quiet(on) => format!("q:{}", u8::from(on)),
         MenuPress::QuietFrom(hour) => format!("qf:{hour}"),
@@ -563,6 +627,11 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ["gth", "1"] => MenuPress::GroupThinking(true),
         ["grc", "0"] => MenuPress::GroupRich(false),
         ["grc", "1"] => MenuPress::GroupRich(true),
+        ["ghl", code] => MenuPress::GroupHistory(
+            HistoryLimit::ALL
+                .into_iter()
+                .find(|limit| limit.code() == *code)?,
+        ),
         ["gtv", code] => MenuPress::GroupTurn(
             [TurnView::Full, TurnView::Compact]
                 .into_iter()
@@ -617,6 +686,9 @@ pub struct SessionRow {
     pub share_confirm: bool,
     /// ⏹, asking for its second press when `true`; `None`: nothing to stop.
     pub stop: Option<bool>,
+    /// The group topic takes mentions only (`true`) or every message; `None`
+    /// unless `shared` is `Some(true)` (TASK-077).
+    pub mentions: Option<bool>,
 }
 
 /// One page of the sessions tab.
@@ -749,10 +821,11 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
     for (index, row) in view.rows.iter().enumerate() {
         let n = index + 1;
         let (icon, state) = row.state.icon_and_text();
-        let group = if row.shared == Some(true) {
-            ", в группе"
-        } else {
-            ""
+        let group = match (row.shared, row.mentions) {
+            (Some(true), Some(true)) => ", в группе, по упоминанию",
+            (Some(true), Some(false)) => ", в группе, все сообщения",
+            (Some(true), None) => ", в группе",
+            _ => "",
         };
         text.push_str(&format!(
             "\n{n}. {icon} {} — {state}{group}",
@@ -774,6 +847,11 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
                 press(SlotAction::UnshareConfirm),
             )),
             (None, _) => {}
+        }
+        match row.mentions.filter(|_| row.shared == Some(true)) {
+            Some(true) => buttons.push(button(format!("📣 {n}"), press(SlotAction::EveryMessage))),
+            Some(false) => buttons.push(button(format!("💬 {n}"), press(SlotAction::Mentions))),
+            None => {}
         }
         match row.stop {
             Some(false) => buttons.push(button(format!("⏹ {n}"), press(SlotAction::Stop))),
@@ -903,9 +981,17 @@ fn render_group_display(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> Stri
         ),
         rows,
     );
+    let history = |limit: HistoryLimit| {
+        button(
+            radio(&format!("📜 {}", limit.chars()), settings.history == limit),
+            MenuPress::GroupHistory(limit),
+        )
+    };
+    rows.push(HistoryLimit::ALL.into_iter().map(history).collect());
     format!(
-        "Что показывать в темах группы (ваши сессии, добавленные в группу)\n\n{DISPLAY_HELP}\n\n\
-По умолчанию всё, rich-разметка выключена. Звук в группе не меняется."
+        "Что показывать в темах группы (ваши сессии, добавленные в группу)\n\n{DISPLAY_HELP}\n\
+📜 История до обращения: сколько символов истории темы группы агент получает с обращением; длиннее — сжимает haiku на вашем устройстве, при сбое обрезает.\n\n\
+По умолчанию всё, rich-разметка включена. Звук в группе не меняется."
     )
 }
 
@@ -1018,6 +1104,10 @@ mod tests {
             shared,
             share_confirm,
             stop,
+            // Even slots take mentions only, odd ones every message.
+            mentions: shared
+                .filter(|shared| *shared)
+                .map(|_| slot.is_multiple_of(2)),
         }
     }
 
@@ -1203,15 +1293,13 @@ mod tests {
         assert_eq!(settings.quiet, None);
         assert_eq!(settings.tz, None);
         assert_eq!(settings.group, Display::default());
-        // TASK-075: rich messages on in the private chat, off in the group.
-        assert_eq!(
-            settings.display(),
-            Display {
-                rich: true,
-                ..Display::default()
-            }
-        );
-        assert!(!settings.group.rich);
+        // TASK-075: rich messages on in the private chat; in the group too
+        // since TASK-077.
+        assert_eq!(settings.display(), Display::default());
+        assert!(settings.display().rich);
+        assert!(settings.group.rich);
+        assert_eq!(settings.history, HistoryLimit::Medium);
+        assert_eq!(settings.history.chars(), 4000);
         for piece in [
             Piece::Prompt,
             Piece::Text,
@@ -1251,16 +1339,20 @@ mod tests {
             turn: TurnView::Compact,
             group: Display::default(),
             rich: true,
+            history: HistoryLimit::Long,
         })
         .unwrap();
         assert_eq!(
             written,
             json!({"detail": "answers", "thinking": false, "turn": "compact", "sound": "off",
-                   "quiet": {"from": 22, "to": 7}, "tz": 180, "rich": true})
+                   "quiet": {"from": 22, "to": 7}, "tz": 180, "rich": true, "history": "long"})
         );
         let back: Settings = serde_json::from_value(written).unwrap();
         assert_eq!(back.detail, Detail::Answers);
         assert_eq!(back.turn, TurnView::Compact);
+        assert_eq!(back.history, HistoryLimit::Long);
+        let later: Settings = serde_json::from_str(r#"{"history":"later"}"#).unwrap();
+        assert_eq!(later.history, HistoryLimit::Medium);
         assert_eq!(
             serde_json::to_value(Settings::default()).unwrap(),
             json!({"detail": "full", "thinking": true, "turn": "full", "sound": "replies",
@@ -1547,9 +1639,9 @@ mod tests {
                 },
             ),
             (
-                MenuPress::GroupRich(true),
+                MenuPress::GroupRich(false),
                 Display {
-                    rich: true,
+                    rich: false,
                     ..Display::default()
                 },
             ),
@@ -1631,7 +1723,7 @@ mod tests {
         let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, 0);
         assert!(text.starts_with("Что показывать в темах группы"), "{text}");
         assert!(
-            text.ends_with("По умолчанию всё, rich-разметка выключена. Звук в группе не меняется.")
+            text.ends_with("По умолчанию всё, rich-разметка включена. Звук в группе не меняется.")
         );
         let group = labels(&keyboard);
         for want in [
@@ -1658,9 +1750,9 @@ mod tests {
         assert!(!datas.iter().any(|data| data.starts_with("menu:dl:")));
     }
 
-    /// TASK-075: rich messages are a setting of each view: on in the
-    /// private chat and off in the group by default, also for a file written
-    /// before; each press changes its own view only.
+    /// TASK-075: rich messages are a setting of each view: on by default in
+    /// the private chat and (TASK-077) in the group; a group choice written
+    /// before stays; each press changes its own view only.
     #[test]
     fn rich_messages_are_a_setting_of_each_view() {
         for press in [
@@ -1679,7 +1771,13 @@ mod tests {
             serde_json::from_str(r#"{"detail":"brief","group":{"detail":"brief"}}"#).unwrap();
         assert!(old.rich);
         assert!(old.display().rich);
-        assert!(!old.group.rich);
+        assert!(old.group.rich);
+        let chosen: Settings = serde_json::from_str(
+            r#"{"group":{"detail":"full","thinking":true,"turn":"full","rich":false}}"#,
+        )
+        .unwrap();
+        assert!(!chosen.group.rich, "a saved choice stays");
+        assert!(serde_json::to_value(&chosen).unwrap()["group"]["rich"] == false);
         let (off, page) = change(&Settings::default(), MenuPress::Rich(false)).unwrap();
         assert_eq!(page, Page::Display);
         assert_eq!(
@@ -1689,17 +1787,140 @@ mod tests {
                 ..Settings::default()
             }
         );
-        let (on, page) = change(&Settings::default(), MenuPress::GroupRich(true)).unwrap();
+        let (off, page) = change(&Settings::default(), MenuPress::GroupRich(false)).unwrap();
         assert_eq!(page, Page::GroupDisplay);
         assert_eq!(
-            on,
+            off,
             Settings {
                 group: Display {
-                    rich: true,
+                    rich: false,
                     ..Display::default()
                 },
                 ..Settings::default()
             }
         );
+        assert_eq!(
+            change(&off, MenuPress::GroupRich(true)).unwrap().0,
+            Settings::default()
+        );
+    }
+
+    /// TASK-077: the history limit is a radio row of the group page; a press
+    /// sets it and stays there; it is written only when not the default.
+    #[test]
+    fn the_history_limit_is_chosen_on_the_group_page() {
+        for limit in HistoryLimit::ALL {
+            let press = MenuPress::GroupHistory(limit);
+            let data = data(&press);
+            assert_eq!(parse_callback(&data), Some(press), "{data}");
+            assert!(!press.navigates());
+        }
+        assert_eq!(
+            data(&MenuPress::GroupHistory(HistoryLimit::Short)),
+            "menu:ghl:s"
+        );
+        for junk in ["menu:ghl", "menu:ghl:x", "menu:ghl:m:1"] {
+            assert_eq!(parse_callback(junk), None, "{junk}");
+        }
+        assert_eq!(
+            HistoryLimit::ALL.map(HistoryLimit::chars),
+            [2000, 4000, 8000]
+        );
+        let (text, keyboard) = render(&Page::GroupDisplay, &Settings::default(), None, 0);
+        assert!(text.contains("📜 История до обращения: "), "{text}");
+        let labels = labels(&keyboard);
+        for want in ["📜 2000", "✅ 📜 4000", "📜 8000"] {
+            assert!(labels.contains(&want.to_owned()), "{want}: {labels:?}");
+        }
+        let (short, page) = change(
+            &Settings::default(),
+            MenuPress::GroupHistory(HistoryLimit::Short),
+        )
+        .unwrap();
+        assert_eq!(page, Page::GroupDisplay);
+        assert_eq!(
+            short,
+            Settings {
+                history: HistoryLimit::Short,
+                ..Settings::default()
+            }
+        );
+        assert_eq!(serde_json::to_value(&short).unwrap()["history"], "short");
+        let (_, keyboard) = render(&Page::GroupDisplay, &short, None, 0);
+        assert!(super::tests::labels(&keyboard).contains(&"✅ 📜 2000".to_owned()));
+        // The private page has no such row.
+        let (_, keyboard) = render(&Page::Display, &short, None, 0);
+        assert!(
+            !datas(&keyboard)
+                .iter()
+                .any(|data| data.starts_with("menu:ghl"))
+        );
+    }
+
+    /// TASK-077: a shared row says how its group topic takes messages and
+    /// offers the other mode; an unshared row has neither.
+    #[test]
+    fn a_shared_row_switches_between_mentions_and_every_message() {
+        let view = SessionsView {
+            rows: vec![
+                row(2, Some(true), false, None),
+                row(3, Some(true), false, None),
+                row(4, Some(false), false, None),
+                SessionRow {
+                    mentions: Some(true),
+                    ..row(5, None, false, None)
+                },
+            ],
+            page: 0,
+            pages: 1,
+            outdated: 0,
+        };
+        let (text, keyboard) = render(&Page::Sessions(0), &Settings::default(), Some(&view), 0);
+        assert!(
+            text.contains("\n1. ⚡ [box] project · 2 — работает, в группе, по упоминанию"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n2. ⚡ [box] project · 3 — работает, в группе, все сообщения"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n3. ⚡ [box] project · 4 — работает\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n4. ⚡ [box] project · 5 — работает"),
+            "{text}"
+        );
+        let labels = labels(&keyboard);
+        let datas = datas(&keyboard);
+        let at = |label: &str| {
+            labels
+                .iter()
+                .position(|l| l == label)
+                .unwrap_or_else(|| panic!("{label}: {labels:?}"))
+        };
+        assert_eq!(datas[at("📣 1")], "menu:ma:0:2");
+        assert_eq!(datas[at("💬 2")], "menu:mn:0:3");
+        for absent in ["📣 3", "💬 3", "📣 4", "💬 4"] {
+            assert!(!labels.contains(&absent.to_owned()), "{absent}");
+        }
+        for (code, action) in [
+            ("mn", SlotAction::Mentions),
+            ("ma", SlotAction::EveryMessage),
+        ] {
+            assert_eq!(
+                parse_callback(&format!("menu:{code}:1:9")),
+                Some(MenuPress::Slot {
+                    action,
+                    page: 1,
+                    slot: 9
+                })
+            );
+        }
+        // Every code of a row button is its own.
+        let codes: Vec<&str> = SlotAction::ALL.iter().map(|action| action.code()).collect();
+        let unique: std::collections::BTreeSet<&str> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len(), "{codes:?}");
     }
 }

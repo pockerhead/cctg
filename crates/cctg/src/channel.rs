@@ -66,6 +66,9 @@ only for compatibility, and a message sent through it repeats what the user alre
 The topic may be shared by a team whose members are all equal users: then each message, and each \
 `---`-separated part of a message made of several, starts with its author's name and a colon, and \
 the tag has a `from_name` attribute when one person wrote all of it. \
+In a topic shared with a group, a message may start with a block from `(история темы группы` to \
+`(конец истории)`: the group's earlier messages, for context only; only the message after the \
+block is addressed to you, and `from_name` names its author. \
 If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
 never ask for permissions through `reply`. A tag with a `file_path` attribute brings a file the user sent \

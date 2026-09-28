@@ -75,6 +75,7 @@ fn input(text: &str) -> Inbound {
         media: None,
         from_name: None,
         author: None,
+        reply_from: None,
     }
 }
 

@@ -37,6 +37,7 @@ use transcript::telegram_len;
 
 use super::buffer::Buffer;
 use super::chat::{Chat, MessageKey, Place, PrivateChat};
+use super::mention::Backlog;
 use super::menu::Person;
 use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
@@ -387,6 +388,17 @@ pub struct View {
     /// line, TASK-064).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opening: Option<String>,
+    /// The group view of a shared slot: messages kept for the agent's next
+    /// mention (TASK-077).
+    #[serde(default, skip_serializing_if = "Backlog::is_empty")]
+    pub backlog: Backlog,
+    /// The group view of a shared slot hands every message to the session,
+    /// not only mentions of the agent (TASK-077).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub every_message: bool,
+    /// The topic was told once that the agent answers only mentions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mention_told: bool,
     /// A topic call for this view is in flight.
     #[serde(skip)]
     pub busy: bool,
@@ -407,6 +419,9 @@ impl View {
             status: None,
             fallback: false,
             opening: None,
+            backlog: Backlog::default(),
+            every_message: false,
+            mention_told: false,
             busy: false,
             failed: None,
         }
@@ -2147,10 +2162,13 @@ impl Registry {
             .view_mut(chat)
             .filter(|view| view.topic_id == Some(thread_id))
         {
-            // Its status message went with the topic.
+            // Its status message went with the topic, and so did the
+            // messages its backlog kept (the new topic gets the mention
+            // hint again); the owner's mode choice stays (TASK-077).
             *view = View {
                 fallback: view.fallback,
                 opening: view.opening.take(),
+                every_message: view.every_message,
                 ..View::new(chat)
             };
             self.dirty = true;
@@ -2809,6 +2827,7 @@ mod tests {
             tz: Some(-570),
             group: Default::default(),
             rich: true,
+            history: Default::default(),
         };
         assert!(registry.dirty, "a change of a known person too");
         registry.person_mut(boris);
@@ -4221,6 +4240,7 @@ mod tests {
                 forwarded: false,
                 file: None,
                 from_name: None,
+                history: None,
             },
             false,
         );
@@ -4470,6 +4490,36 @@ mod tests {
             loaded.slots[1].views[1].place(),
             Some(Place::topic(private, 100))
         );
+    }
+
+    /// TASK-077: the mention mode fields of a group view are saved only when
+    /// set and load back; a view without them loads as before; a replaced
+    /// group topic keeps the owner's mode but not the old topic's backlog.
+    #[test]
+    fn a_group_views_mention_fields_round_trip_and_survive_a_new_topic_by_mode_only() {
+        let dir = TempDir::new("registry-mentions");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        let plain = serde_json::to_string(&registry.slots[0].views[0]).unwrap();
+        for key in ["backlog", "every_message", "mention_told"] {
+            assert!(!plain.contains(key), "{plain}");
+        }
+        let view = registry.slots[0].view_mut(Chat::Group).unwrap();
+        view.backlog.push("Анна: a".into());
+        view.every_message = true;
+        view.mention_told = true;
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let loaded = store.load().unwrap();
+        let view = &loaded.slots[0].views[0];
+        assert_eq!(view.backlog.parts, ["Анна: a"]);
+        assert!(view.every_message && view.mention_told);
+        registry.topic_invalid(SlotId(0), Chat::Group, 100);
+        let view = &registry.slots[0].views[0];
+        assert_eq!(view.topic_id, None);
+        assert!(view.every_message, "the mode stays");
+        assert!(view.backlog.is_empty() && !view.mention_told);
     }
 
     /// Code review F2 (repro R1): a new session in a shared slot keeps a

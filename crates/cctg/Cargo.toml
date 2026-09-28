@@ -74,6 +74,12 @@ harness = false
 name = "run_e2e"
 harness = false
 
+# The TASK-077 compressor test runs its own main: the test binary is also the
+# helper claude stand-in (started with `--safe-mode`).
+[[test]]
+name = "compress_e2e"
+harness = false
+
 # The TASK-044 test of `cctg run` in a terminal (Linux, macOS): it is also
 # the claude stand-in in the pseudo-terminal.
 [[test]]

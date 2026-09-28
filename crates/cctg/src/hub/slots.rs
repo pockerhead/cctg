@@ -276,8 +276,9 @@
 //! nothing is kept. A turn message goes on only in the view it was made
 //! in: a change of the view (the menu, a share) starts the next one.
 //!
-//! Rich (TASK-075): in a view whose rich setting is on (the private chat by
-//! default, the group not), turn answers and agent replies go as one rich
+//! Rich (TASK-075): in a view whose rich setting is on (by default every
+//! view, the group since TASK-077, but the group of a slot without an
+//! owner), turn answers and agent replies go as one rich
 //! message of their markdown while it fits one (32768), and the turn
 //! message carries a rich form of itself ([`stream::Open`]); everything
 //! else stays HTML. Each op carries today's messages too: the scheduler
@@ -288,6 +289,22 @@
 //! markdown when it shows none ([`Slots::in_view`]), or takes today's
 //! document when the text is more than four messages (a streamed answer
 //! then goes outside the stream, as today).
+//!
+//! Mentions (TASK-077, see [`mention`]): with [`Options::mentions`], the
+//! group topic of a slot shared from its owner's private chat (the private
+//! view is the primary one) hands the session only the messages that
+//! address the agent: `@<bot username>` in the words, or an explicit reply
+//! to one of the bot's messages. Any other message there (not a console
+//! command, not an answer to a question) is kept, rendered, in the group
+//! view's backlog: no 👀, no echo, the private status stays where it is,
+//! and the topic is told once how to address the agent. The next message of
+//! that topic that goes to the buffer takes the backlog along as its
+//! [`buffer::History`]; one longer than the owner's
+//! [`menu::Settings::history`] waits at the front of the buffer while the
+//! session's agent compresses it ([`SessionAsk::Compress`], at most one per
+//! slot, [`Options::compress_wait`]), and is cut to its newest part when
+//! that fails. The owner switches a slot to every message and back in the
+//! menu's session row.
 //!
 //! Logs carry short session ids, slot ordinals and fixed text; never a path,
 //! a folder, a title, message text, a file name or a caption.
@@ -313,6 +330,7 @@ use super::console;
 use super::devices::Devices;
 use super::fetch::{self, Fetch, Fetched};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
+use super::mention;
 use super::menu::{self, MenuPress, Page, RowState, SlotAction};
 use super::mirror::{Detached, Follow, Landed, Mirror, Write};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
@@ -617,7 +635,25 @@ pub struct Options {
     /// The menu in the General of each private chat (TASK-073); `false`:
     /// `/start` there answers [`PRIVATE_START_TEXT`], as before.
     pub menu: bool,
+    /// The bot as a mention names it: shared slots answer mentions only in
+    /// their group topic (TASK-077); `None`: every message goes.
+    pub mentions: Option<MentionBot>,
+    /// A compression of a group history the agent has not answered by then
+    /// has failed and the history is cut ([`COMPRESS_WAIT`] in the hub);
+    /// each piece of the summary starts the wait again.
+    pub compress_wait: Duration,
 }
+
+/// Who the agent is in a group topic (TASK-077): `getMe`'s id and username.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionBot {
+    pub id: i64,
+    pub username: String,
+}
+
+/// [`Options::compress_wait`] in the hub: longer than the agent's own limit
+/// of a helper run ([`crate::compress::COMPRESS_TIMEOUT`]).
+pub const COMPRESS_WAIT: Duration = Duration::from_secs(60);
 
 /// A burst of topic messages of a slot being gathered into one inbound
 /// (TASK-048); its messages wait in the slot's buffer.
@@ -630,6 +666,20 @@ struct Gather {
     /// The burst goes then, or at once when that passed (a file or a
     /// command ended it, or the link queue had no room).
     due: Instant,
+}
+
+/// The album of the latest group file of a slot (TASK-077): Telegram sends
+/// each file of an album as a message of its own, the caption on one of
+/// them. Its files address the agent when one of them does.
+#[derive(Debug)]
+struct MentionAlbum {
+    /// Telegram's `media_group_id`.
+    id: String,
+    /// A file of it addressed the agent: the later ones are not kept.
+    mentioned: bool,
+    /// Its files kept for the next mention before one of them addressed
+    /// the agent, oldest first, each with its part in the group backlog.
+    kept: Vec<(Inbound, String)>,
 }
 
 /// The kept file of a slot on its way to an agent.
@@ -719,6 +769,8 @@ impl Default for Options {
             channel_wait: Duration::ZERO,
             owners: None,
             menu: false,
+            mentions: None,
+            compress_wait: COMPRESS_WAIT,
         }
     }
 }
@@ -1086,6 +1138,13 @@ enum Purpose {
     },
     /// A finished subagent's block; `text` gathers the pieces.
     Body { input: BodyInput, text: String },
+    /// The group history of kept message `message` of `slot`, compressed
+    /// (TASK-077); `text` gathers the pieces.
+    Compress {
+        slot: SlotId,
+        message: MessageKey,
+        text: String,
+    },
 }
 
 /// The messages of an album offer on their way to Telegram (TASK-059).
@@ -1525,6 +1584,11 @@ pub struct Slots {
     transcript_asks: Option<mpsc::Receiver<TranscriptAsk>>,
     /// Session reads out to agents, by read id.
     reads: HashMap<u64, Pending>,
+    /// Slots whose front message waits for its history's compression
+    /// (TASK-077): at most one per slot.
+    compressing: HashSet<SlotId>,
+    /// The album of each slot's latest group file (TASK-077).
+    mention_albums: HashMap<SlotId, MentionAlbum>,
     /// Hooks waiting for their channel twin, oldest first.
     hook_asks: Vec<HookAsk>,
     /// Hooks waiting for a press, by the key of their prompt.
@@ -1756,6 +1820,8 @@ impl Slots {
             asks: None,
             transcript_asks: None,
             reads: HashMap::new(),
+            compressing: HashSet::new(),
+            mention_albums: HashMap::new(),
             hook_asks: Vec::new(),
             hook_waiters: HashMap::new(),
             relayed: VecDeque::new(),
@@ -3191,7 +3257,7 @@ impl Slots {
             self.read_failed(purpose, Unavailable::LinkLost);
             return;
         }
-        let until = Instant::now() + self.options.read_wait;
+        let until = Instant::now() + self.wait_for(&purpose);
         self.reads.insert(
             read_id,
             Pending {
@@ -3202,14 +3268,32 @@ impl Slots {
         );
     }
 
+    /// How long a read for `purpose` waits for its (next) answer.
+    fn wait_for(&self, purpose: &Purpose) -> Duration {
+        match purpose {
+            Purpose::Compress { .. } => self.options.compress_wait,
+            _ => self.options.read_wait,
+        }
+    }
+
     /// One answer to session read `read_id`. Only the agent asked counts.
     fn on_session_answer(&mut self, conn: u64, read_id: u64, answer: SessionAnswer) {
-        let Some(pending) = self.reads.get_mut(&read_id).filter(|p| p.conn == conn) else {
+        let Some(wait) = self
+            .reads
+            .get(&read_id)
+            .filter(|p| p.conn == conn)
+            .map(|pending| self.wait_for(&pending.purpose))
+        else {
             debug!(conn, "session answer nobody waits for");
             return;
         };
+        let Some(pending) = self.reads.get_mut(&read_id) else {
+            return;
+        };
         if let (
-            Purpose::Command { text, .. } | Purpose::Body { text, .. },
+            Purpose::Command { text, .. }
+            | Purpose::Body { text, .. }
+            | Purpose::Compress { text, .. },
             SessionAnswer::Text { text: piece, more },
         ) = (&mut pending.purpose, &answer)
         {
@@ -3222,7 +3306,7 @@ impl Slots {
             }
             text.push_str(piece);
             if *more {
-                pending.until = Instant::now() + self.options.read_wait;
+                pending.until = Instant::now() + wait;
                 return;
             }
         }
@@ -3238,6 +3322,14 @@ impl Slots {
             (Purpose::Body { input, text }, SessionAnswer::Text { .. }) => {
                 self.body_done(input.agent_id, text);
             }
+            (
+                Purpose::Compress {
+                    slot,
+                    message,
+                    text,
+                },
+                SessionAnswer::Text { .. },
+            ) => self.history_ready(slot, message, Some(text)),
             (Purpose::Title { session, path, .. }, SessionAnswer::Title { title, scanned }) => {
                 self.on_title(session, path, title, scanned);
             }
@@ -3332,6 +3424,14 @@ impl Slots {
                 }
                 let text = subagents::body_text(&input, None, None);
                 self.body_done(agent_id, text);
+            }
+            Purpose::Compress { slot, message, .. } => {
+                info!(
+                    ordinal = self.ordinal(slot),
+                    ?why,
+                    "group history not compressed; cut"
+                );
+                self.history_ready(slot, message, None);
             }
         }
     }
@@ -3564,14 +3664,22 @@ impl Slots {
             }
             return;
         };
-        let (place, key) = (input.place(), input.key());
+        let place = input.place();
+        // Kept for the next mention, it reaches no view but its own
+        // (TASK-077).
+        let holds = self
+            .registry
+            .slot_by_topic(place)
+            .is_some_and(|slot| self.holds(slot, place, &input));
         match self.registry.slot_by_topic(place) {
             Some(slot) => {
                 match self.registry.place(slot) {
                     // In a mirror topic: the status moves in every view
                     // (TASK-063).
                     Some(primary) if primary != place => {
-                        self.bottoms.entry(primary).or_default().foreign = true;
+                        if !holds {
+                            self.bottoms.entry(primary).or_default().foreign = true;
+                        }
                         // Below the status twin there (TASK-078).
                         let bottom = self.bottoms.entry(place).or_default();
                         bottom.last = bottom.last.max(input.message_id);
@@ -3613,6 +3721,22 @@ impl Slots {
             debug!("message in a topic without a slot; not forwarded");
             return;
         };
+        if holds {
+            self.keep_for_mention(slot, place, input);
+            return;
+        }
+        // The files of its album kept before it go first, as files.
+        for earlier in self.album_mention(slot, place, &input) {
+            self.take_in(slot, place, thread_id, earlier);
+        }
+        self.take_in(slot, place, thread_id, input);
+    }
+
+    /// Message `input` of topic `place` (thread `thread_id`) of `slot`, not
+    /// kept for a mention: a console command, or a message parked for the
+    /// slot's session.
+    fn take_in(&mut self, slot: SlotId, place: Place, thread_id: i64, input: Inbound) {
+        let key = input.key();
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
             (None, Some(media)) => {
@@ -3660,6 +3784,7 @@ impl Slots {
         } else {
             self.gather(slot, key);
         }
+        let history = self.take_history(slot, place);
         self.park(
             slot,
             Parked {
@@ -3672,9 +3797,253 @@ impl Slots {
                 forwarded: input.forwarded,
                 file,
                 from_name: input.from_name,
+                history,
             },
         );
         self.flush(slot);
+    }
+
+    /// Message `input` in topic `place` of `slot` is kept for the agent's
+    /// next mention (TASK-077): the group topic of a slot shared from its
+    /// owner's private chat, in mention mode, and it neither addresses the
+    /// agent (itself or as a file of an album that did) nor is a console
+    /// command.
+    fn holds(&self, slot: SlotId, place: Place, input: &Inbound) -> bool {
+        let Some(bot) = &self.options.mentions else {
+            return false;
+        };
+        let group_view = self
+            .registry
+            .slot(slot)
+            .and_then(|entry| entry.views.iter().find(|view| view.chat == Chat::Group));
+        let console = !input.forwarded
+            && input
+                .text
+                .as_deref()
+                .is_some_and(|text| console::classify(text).is_some());
+        place.chat == Chat::Group
+            && self
+                .registry
+                .place(slot)
+                .is_some_and(|primary| primary.chat.is_private())
+            && self.registry.shared(slot, Chat::Group)
+            && group_view.is_some_and(|view| !view.every_message)
+            && !mentioned(bot, input)
+            && !self.album_mentioned(slot, input)
+            && !console
+    }
+
+    /// `input` is a file of the album of `slot` that addressed the agent.
+    fn album_mentioned(&self, slot: SlotId, input: &Inbound) -> bool {
+        album_of(input).is_some_and(|id| {
+            self.mention_albums
+                .get(&slot)
+                .is_some_and(|album| album.mentioned && album.id == id)
+        })
+    }
+
+    /// Group message `input` of `slot` addresses the agent: when it is a
+    /// file of an album, the album's files kept for the next mention before
+    /// it leave the group backlog and come back to go as files, oldest
+    /// first, and the album's later files address the agent too.
+    fn album_mention(&mut self, slot: SlotId, place: Place, input: &Inbound) -> Vec<Inbound> {
+        let Some(id) = album_of(input) else {
+            return Vec::new();
+        };
+        let addressed = self
+            .options
+            .mentions
+            .as_ref()
+            .is_some_and(|bot| mentioned(bot, input));
+        if place.chat != Chat::Group || !addressed {
+            return Vec::new();
+        }
+        let album = MentionAlbum {
+            id: id.to_owned(),
+            mentioned: true,
+            kept: Vec::new(),
+        };
+        let kept = match self.mention_albums.insert(slot, album) {
+            Some(album) if album.id == id => album.kept,
+            _ => return Vec::new(),
+        };
+        if kept.is_empty() {
+            return Vec::new();
+        }
+        if let Some(view) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(Chat::Group))
+        {
+            // Newest first: each is the latest part equal to it.
+            for (_, part) in kept.iter().rev() {
+                if let Some(at) = view.backlog.parts.iter().rposition(|kept| kept == part) {
+                    view.backlog.parts.remove(at);
+                }
+            }
+            self.registry.dirty = true;
+        }
+        info!(
+            ordinal = self.ordinal(slot),
+            files = kept.len(),
+            "kept files of an album go with its mention"
+        );
+        kept.into_iter().map(|(input, _)| input).collect()
+    }
+
+    /// Keeps group message `input` of `slot` in its group view's backlog,
+    /// rendered, a file as a placeholder (never downloaded); a message with
+    /// neither words nor a file is dropped without a word. The topic is
+    /// told once how to address the agent.
+    fn keep_for_mention(&mut self, slot: SlotId, place: Place, input: Inbound) {
+        // A file of an album is remembered: a later file of the album may
+        // address the agent.
+        let album = album_of(&input)
+            .map(str::to_owned)
+            .map(|id| (id, input.clone()));
+        let (text, file) = match (input.text, input.media) {
+            (Some(text), _) => (text, None),
+            (None, Some(media)) => (media.caption.unwrap_or_default(), Some(media.file)),
+            (None, None) => return,
+        };
+        let part = mention::part(
+            &text,
+            input.quote.as_deref(),
+            input.from_name.as_deref(),
+            input.forwarded,
+            file.as_ref(),
+        );
+        let ordinal = self.ordinal(slot);
+        let Some(view) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(Chat::Group))
+        else {
+            return;
+        };
+        view.backlog.push(part.clone());
+        let (kept, told) = (view.backlog.parts.len(), view.mention_told);
+        self.registry.dirty = true;
+        info!(ordinal, kept, "group message kept for the next mention");
+        if let Some((id, input)) = album {
+            match self.mention_albums.get_mut(&slot) {
+                Some(album) if album.id == id => {
+                    if album.kept.len() < MAX_ALBUM {
+                        album.kept.push((input, part));
+                    }
+                }
+                _ => {
+                    let album = MentionAlbum {
+                        id,
+                        mentioned: false,
+                        kept: vec![(input, part)],
+                    };
+                    self.mention_albums.insert(slot, album);
+                }
+            }
+        }
+        let Some(hint) = self
+            .options
+            .mentions
+            .as_ref()
+            .filter(|_| !told)
+            .map(|bot| mention::mention_hint(&bot.username))
+        else {
+            return;
+        };
+        if self.send_messages(vec![message_op(place, hint)])
+            && let Some(view) = self
+                .registry
+                .slot_mut(slot)
+                .and_then(|entry| entry.view_mut(Chat::Group))
+        {
+            view.mention_told = true;
+        }
+    }
+
+    /// The backlog of the group view of `slot` for a message of topic
+    /// `place` that goes to the buffer (TASK-077): taken, as one history to
+    /// compress first when it is longer than the owner's limit. `None` for
+    /// another topic or an empty backlog.
+    fn take_history(&mut self, slot: SlotId, place: Place) -> Option<buffer::History> {
+        if place.chat != Chat::Group {
+            return None;
+        }
+        let limit = self.history_limit(slot);
+        let view = self.registry.slot_mut(slot)?.view_mut(Chat::Group)?;
+        if view.backlog.parts.is_empty() {
+            return None;
+        }
+        let taken = std::mem::take(&mut view.backlog);
+        self.registry.dirty = true;
+        let text = mention::render(&taken);
+        let state = if text.chars().count() <= limit as usize {
+            buffer::HistoryState::Full
+        } else {
+            buffer::HistoryState::Pending
+        };
+        Some(buffer::History {
+            text,
+            count: u32::try_from(taken.parts.len()).unwrap_or(u32::MAX),
+            dropped: taken.dropped,
+            limit,
+            state,
+        })
+    }
+
+    /// Characters of group history a mention of `slot` takes along: its
+    /// owner's setting, else the default.
+    fn history_limit(&self, slot: SlotId) -> u32 {
+        self.owner_of(slot)
+            .and_then(|owner| self.registry.person(owner))
+            .map_or_else(
+                || menu::HistoryLimit::default().chars(),
+                |person| person.settings.history.chars(),
+            )
+    }
+
+    /// The compression of the history of kept message `message` of `slot`
+    /// ended (TASK-077): its `summary`, cut when still over the limit, or,
+    /// without one, the history's newest part. The next flush sends it.
+    fn history_ready(&mut self, slot: SlotId, message: MessageKey, summary: Option<String>) {
+        self.compressing.remove(&slot);
+        let ordinal = self.ordinal(slot);
+        let Some(history) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| {
+                entry
+                    .buffer
+                    .messages
+                    .iter_mut()
+                    .find(|parked| parked.key() == message)
+            })
+            .and_then(|parked| parked.history.as_mut())
+            .filter(|history| history.state == buffer::HistoryState::Pending)
+        else {
+            return;
+        };
+        let limit = history.limit as usize;
+        let chars_in = history.text.chars().count();
+        let outcome = match summary.filter(|summary| !summary.trim().is_empty()) {
+            Some(summary) => {
+                history.text = if summary.chars().count() <= limit {
+                    summary
+                } else {
+                    mention::cut_history(&summary, limit)
+                };
+                history.state = buffer::HistoryState::Compressed;
+                "compressed"
+            }
+            None => {
+                history.text = mention::cut_history(&history.text, limit);
+                history.state = buffer::HistoryState::Cut;
+                "cut"
+            }
+        };
+        let chars_out = history.text.chars().count();
+        self.registry.dirty = true;
+        info!(ordinal, outcome, chars_in, chars_out, "group history ready");
     }
 
     /// Text message `message_id` for the live session of `slot` joins the
@@ -3773,6 +4142,32 @@ impl Slots {
             .and_then(|entry| entry.buffer.messages.front())
             .cloned()
         {
+            // A history to compress first (TASK-077): asked once; a read
+            // that fails at once has cut it already, and it goes on.
+            if parked.pending() {
+                if !self.compressing.insert(slot) {
+                    break;
+                }
+                let (text, limit) = parked
+                    .history
+                    .as_ref()
+                    .map(|history| (history.text.clone(), history.limit))
+                    .unwrap_or_default();
+                match self.reader(&session) {
+                    Some(reader) => self.ask_read(
+                        reader,
+                        &session,
+                        SessionAsk::Compress { text, limit },
+                        Purpose::Compress {
+                            slot,
+                            message: parked.key(),
+                            text: String::new(),
+                        },
+                    ),
+                    None => self.history_ready(slot, parked.key(), None),
+                }
+                continue;
+            }
             // The messages that leave the slot now; `delivered`: they
             // reached the agent.
             let (taken, delivered) = match parked.file.clone() {
@@ -3899,8 +4294,10 @@ impl Slots {
         };
         let ordinal = self.ordinal(slot);
         let kind = file.kind.as_str();
+        // A caption, or a history (TASK-077), goes without the file.
+        let words = !parked.text.is_empty() || parked.history.is_some();
         if !bound.files {
-            if !parked.text.is_empty()
+            if words
                 && bound
                     .to_agent
                     .try_send(self.inbound(session, parked))
@@ -3910,20 +4307,28 @@ impl Slots {
             }
             info!(ordinal, kind, "agent takes no files; the file is dropped");
             self.notify_author(slot, parked.place(), buffer::OLD_AGENT_NOTICE);
-            return FileStep::Gone {
-                delivered: !parked.text.is_empty(),
-            };
+            return FileStep::Gone { delivered: words };
         }
         if bound.to_agent.is_closed() {
             return FileStep::Wait;
         }
         let Some(fetcher) = &self.fetcher else {
+            // A mention's history (TASK-077) goes without the file.
+            let history = parked.history.is_some();
+            if history
+                && bound
+                    .to_agent
+                    .try_send(self.inbound(session, parked))
+                    .is_err()
+            {
+                return FileStep::Wait;
+            }
             warn!(
                 ordinal,
                 kind, "no download task; a file from the topic is dropped"
             );
             self.notify_author(slot, parked.place(), buffer::FETCH_FAILED_NOTICE);
-            return FileStep::Gone { delivered: false };
+            return FileStep::Gone { delivered: history };
         };
         let transfer_id = self.transfers + 1;
         let job = fetch::Job {
@@ -3957,7 +4362,8 @@ impl Slots {
     }
 
     /// The download task is done with the kept file of `slot`: it leaves
-    /// the slot, and the topic hears of a file that did not go. It stays
+    /// the slot, and the topic hears of a file that did not go (a message
+    /// with a group history stays, without the file: TASK-077). It stays
     /// for the next agent when its link closed first (up to
     /// [`MAX_LINK_LOSSES`] times in a row) or when it went to a link that
     /// is no longer the slot's live agent (its session ended meanwhile:
@@ -4020,7 +4426,18 @@ impl Slots {
             return;
         };
         if let Some(entry) = self.registry.slot_mut(slot) {
-            entry.buffer.messages.pop_front();
+            match entry.buffer.messages.front_mut() {
+                // A mention's history (TASK-077) does not go with a file
+                // that did not come: the message stays, as words only.
+                Some(parked)
+                    if parked.history.is_some() && !matches!(outcome, Fetched::Handed { .. }) =>
+                {
+                    parked.file = None;
+                }
+                _ => {
+                    entry.buffer.messages.pop_front();
+                }
+            }
         }
         self.registry.dirty = true;
         match outcome {
@@ -4491,7 +4908,8 @@ impl Slots {
         {
             if parts.first().is_some_and(|first| {
                 (first.place(), first.reply_to) != (parked.place(), parked.reply_to)
-            }) {
+            }) || (!parts.is_empty() && parked.pending())
+            {
                 break;
             }
             size += parked.content().len() + buffer::PART_SEPARATOR.len();
@@ -10359,6 +10777,15 @@ impl Slots {
         let share_confirm = shown
             .and_then(|shown| shown.unshare_confirm)
             .is_some_and(|until| now < until);
+        // TASK-077: how its group topic takes messages, once shared.
+        let mentions = shared.filter(|shared| *shared).map(|_| {
+            self.registry.slot(slot).is_some_and(|entry| {
+                entry
+                    .views
+                    .iter()
+                    .any(|view| view.chat == Chat::Group && !view.every_message)
+            })
+        });
         let stop = self
             .live_agent(slot)
             .filter(|(session, conn)| {
@@ -10376,6 +10803,7 @@ impl Slots {
             shared,
             share_confirm,
             stop,
+            mentions,
         }
     }
 
@@ -10507,7 +10935,44 @@ impl Slots {
                 };
                 self.press_status_of(slot, press).to_owned()
             }
+            SlotAction::Mentions => self.set_every_message(slot, private, false).to_owned(),
+            SlotAction::EveryMessage => self.set_every_message(slot, private, true).to_owned(),
         }
+    }
+
+    /// 💬 or 📣 of the menu of `private` (TASK-077): the group topic of
+    /// shared `slot` takes every message, or mentions only; the owner only
+    /// (its private view is the primary one), and the group topic is told.
+    fn set_every_message(&mut self, slot: SlotId, private: Chat, every: bool) -> &'static str {
+        let owner = self
+            .registry
+            .place(slot)
+            .is_some_and(|place| place.chat == private);
+        if !owner || !self.registry.shared(slot, Chat::Group) {
+            return menu::ANSWER_UNCHANGED;
+        }
+        let ordinal = self.ordinal(slot);
+        let Some(view) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(Chat::Group))
+            .filter(|view| view.every_message != every)
+        else {
+            return menu::ANSWER_UNCHANGED;
+        };
+        view.every_message = every;
+        let place = view.place();
+        self.registry.dirty = true;
+        info!(ordinal, every, "group topic mode changed from the menu");
+        let text = match (&self.options.mentions, every) {
+            (_, true) => Some(mention::MODE_ALL_TEXT.to_owned()),
+            (Some(bot), false) => Some(mention::mode_mention_text(&bot.username)),
+            (None, false) => None,
+        };
+        if let (Some(place), Some(text)) = (place, text) {
+            self.send_messages(vec![message_op(place, text)]);
+        }
+        menu::ANSWER_SAVED
     }
 
     /// «Обновить все клиенты» of `chat` (TASK-073): every live session of
@@ -10618,19 +11083,13 @@ impl Slots {
     /// settings (TASK-078; the TASK-073 rule "a shared slot is full
     /// everywhere" is gone). A private chat by its person's settings; the
     /// group by the group settings of the slot's owner, the person of its
-    /// first private view (a closed one too); the default without one.
+    /// first private view (a closed one too); the default without one, but
+    /// no rich messages in the group of a slot without an owner (TASK-077:
+    /// without a private chat there is no menu to switch them off).
     fn display_in(&self, slot: SlotId, chat: Chat) -> menu::Display {
         let (owner, group) = match chat {
             Chat::Private(private) => (Some(private), false),
-            Chat::Group => (
-                self.registry.slot(slot).and_then(|entry| {
-                    entry.views.iter().find_map(|view| match view.chat {
-                        Chat::Private(private) => Some(private),
-                        Chat::Group => None,
-                    })
-                }),
-                true,
-            ),
+            Chat::Group => (self.owner_of(slot), true),
         };
         owner
             .and_then(|owner| self.registry.person(owner))
@@ -10645,11 +11104,25 @@ impl Slots {
             // default (TASK-075: rich on), not the group's.
             .unwrap_or_else(|| {
                 if group {
-                    menu::Display::default()
+                    menu::Display {
+                        rich: owner.is_some(),
+                        ..menu::Display::default()
+                    }
                 } else {
                     menu::Settings::default().display()
                 }
             })
+    }
+
+    /// The owner of `slot`: the person of its first private view (a closed
+    /// one too).
+    fn owner_of(&self, slot: SlotId) -> Option<PrivateChat> {
+        self.registry.slot(slot).and_then(|entry| {
+            entry.views.iter().find_map(|view| match view.chat {
+                Chat::Private(private) => Some(private),
+                Chat::Group => None,
+            })
+        })
     }
 
     /// `op` with the sound its person chose (TASK-073), when it is a new
@@ -12030,6 +12503,32 @@ fn echo_text(
     )
 }
 
+/// The album of a file message (Telegram's `media_group_id`).
+fn album_of(input: &Inbound) -> Option<&str> {
+    input
+        .media
+        .as_ref()
+        .and_then(|media| media.album.as_deref())
+}
+
+/// `input` addresses the agent (TASK-077): `@<username>` in its own words
+/// (a forward's are someone else's), or an explicit reply to one of the
+/// bot's messages (by the bot's id: other bots and anonymous admins do not
+/// count).
+fn mentioned(bot: &MentionBot, input: &Inbound) -> bool {
+    if input.forwarded {
+        return false;
+    }
+    let words = input.text.as_deref().or_else(|| {
+        input
+            .media
+            .as_ref()
+            .and_then(|media| media.caption.as_deref())
+    });
+    words.is_some_and(|words| mention::mentions(words, &bot.username))
+        || input.reply_from == Some(bot.id)
+}
+
 /// A plain message without a sound.
 fn message_op(place: Place, text: String) -> Op {
     Op::Send {
@@ -12532,6 +13031,7 @@ mod tests {
             media: None,
             from_name: None,
             author: None,
+            reply_from: None,
         })
     }
 
@@ -12612,6 +13112,7 @@ mod tests {
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             }))
             .unwrap();
         rig.control
@@ -12628,6 +13129,7 @@ mod tests {
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             }))
             .unwrap();
         // General and a topic that is no slot reach nobody and say nothing.
@@ -13445,6 +13947,7 @@ again"
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             }))
             .unwrap();
         settled(&rig, |ops| {
@@ -16994,6 +17497,7 @@ again"
                     media: None,
                     from_name: None,
                     author: None,
+                    reply_from: None,
                 }))
                 .unwrap();
         }
@@ -22636,6 +23140,7 @@ again"
             media: None,
             from_name: None,
             author: None,
+            reply_from: None,
         }
     }
 
@@ -22846,9 +23351,11 @@ again"
                     size,
                 },
                 caption: caption.map(str::to_owned),
+                album: None,
             }),
             from_name: None,
             author: None,
+            reply_from: None,
         })
     }
 
@@ -24257,6 +24764,7 @@ again"
             forwarded: false,
             file: None,
             from_name: None,
+            history: None,
         };
         for (chat, label) in [(Chat::Group, "group"), (private, "private")] {
             let meta = slots.burst_meta(A, &[parked(chat, 5), parked(chat, 6)]);
@@ -25728,6 +26236,7 @@ again"
             from_name: None,
             author: Some(SHARER.into()),
             display_name: Some(SHARER.into()),
+            reply_from: None,
         })
     }
 
@@ -29107,6 +29616,7 @@ again"
             from_name: None,
             author: Some(SHARER.into()),
             display_name: Some(SHARER.into()),
+            reply_from: None,
         })
     }
 
@@ -29597,6 +30107,7 @@ again"
         assert!(today_chunks(&long).len() > 4);
         let dir = TempDir::new("slots-rich-twin-long");
         let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        slots.registry.person_mut(owner_chat()).settings.group.rich = false;
         slots.on_hook(&stop(A, Some(&long)));
         slots.pump();
         let (primary, twins) = rich_contents(&all_work(&mut work));
@@ -29967,5 +30478,771 @@ again"
         assert_eq!(second.len(), 1, "{second:#?}");
         assert_ne!(second[0].into, Some(first[0].id), "a new message");
         assert!(handed.iter().all(|(_, op)| rich_form(op).is_none()));
+    }
+
+    // TASK-077: mention mode of a shared slot's group topic.
+
+    const BOT_ID: i64 = 555;
+
+    fn mention_options() -> Options {
+        Options {
+            mentions: Some(MentionBot {
+                id: BOT_ID,
+                username: "cctg_bot".into(),
+            }),
+            compress_wait: Duration::from_secs(5),
+            ..private_only_options()
+        }
+    }
+
+    /// Agent `conn` of session A that reads session files, with room for
+    /// `room` messages; what it gets.
+    fn mention_agent(
+        slots: &mut Slots,
+        conn: u64,
+        room: usize,
+        files: bool,
+    ) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(room);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                private_place: true,
+                files,
+                ..reads_register(A, Some(10))
+            },
+            to_agent,
+        });
+        from_hub
+    }
+
+    /// Text `text` by team member `name` in group topic 100; an explicit
+    /// reply to message 42 of `reply_from` when given.
+    fn group_by(message_id: i64, text: &str, name: &str, reply_from: Option<i64>) -> Control {
+        Control::Message(Inbound {
+            chat: Chat::Group,
+            sender: PrivateChat::of_user(7),
+            message_id,
+            thread_id: Some(100),
+            text: Some(text.into()),
+            reply_to: reply_from.map(|_| 42),
+            quote: None,
+            forwarded: false,
+            media: None,
+            from_name: Some(name.into()),
+            author: Some(name.into()),
+            display_name: Some(name.into()),
+            reply_from,
+        })
+    }
+
+    /// What reached a mention agent since the last call.
+    #[derive(Default)]
+    struct Got {
+        inbounds: Vec<(String, BTreeMap<String, String>)>,
+        compress: Vec<(u64, String, u32)>,
+        files: Vec<String>,
+    }
+
+    fn got(from_hub: &mut mpsc::Receiver<HubMsg>) -> Got {
+        let mut got = Got::default();
+        while let Ok(msg) = from_hub.try_recv() {
+            match msg {
+                HubMsg::Inbound { content, meta } => got.inbounds.push((content, meta)),
+                HubMsg::SessionRead {
+                    read_id,
+                    ask: SessionAsk::Compress { text, limit },
+                    ..
+                } => got.compress.push((read_id, text, limit)),
+                HubMsg::FileStart { content, .. } => got.files.push(content),
+                _ => {}
+            }
+        }
+        got
+    }
+
+    fn mention_contents(got: &Got) -> Vec<&str> {
+        got.inbounds
+            .iter()
+            .map(|(content, _)| content.as_str())
+            .collect()
+    }
+
+    fn reactions_on(handed: &[(Work, Op)]) -> Vec<i64> {
+        handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::React { message_id, .. } => Some(*message_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn backlog_of(slots: &Slots) -> Vec<String> {
+        slots.registry.slots[0]
+            .views
+            .iter()
+            .find(|view| view.chat == Chat::Group)
+            .map(|view| view.backlog.parts.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn answer_read(slots: &mut Slots, read_id: u64, answer: SessionAnswer) {
+        slots.on_agent(AgentEvent::Message {
+            conn: 1,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::SessionAnswer { read_id, answer },
+        });
+        slots.pump();
+    }
+
+    /// A shared slot in mention mode with a reading agent; nothing handed
+    /// out yet.
+    fn mention_slot(
+        dir: &TempDir,
+        room: usize,
+    ) -> (
+        Slots,
+        mpsc::UnboundedReceiver<(Work, Op)>,
+        mpsc::Receiver<HubMsg>,
+    ) {
+        let (mut slots, mut work) = shared_slot(dir, mention_options());
+        let mut agent = mention_agent(&mut slots, 1, room, false);
+        slots.pump();
+        let _ = all_work(&mut work);
+        let _ = got(&mut agent);
+        (slots, work, agent)
+    }
+
+    fn private_700() -> Place {
+        Place::topic(private_owner(), 700)
+    }
+
+    fn group_100() -> Place {
+        Place::topic(Chat::Group, 100)
+    }
+
+    fn long_text(id: i64) -> String {
+        format!("{id}{}", "ж".repeat(1500))
+    }
+
+    /// Three long messages from `first` and a mention: the id of the
+    /// compression the agent is asked for.
+    fn ask_compress(slots: &mut Slots, agent: &mut mpsc::Receiver<HubMsg>, first: i64) -> u64 {
+        for id in first..first + 3 {
+            slots.on_control(group_by(id, &long_text(id), "Анна", None));
+        }
+        slots.on_control(group_by(first + 3, "@cctg_bot ?", "Иван", None));
+        slots.pump();
+        let asked = got(agent);
+        assert!(asked.inbounds.is_empty());
+        assert_eq!(asked.compress.len(), 1);
+        asked.compress[0].0
+    }
+
+    /// The history of `content` is at most 4000 characters: the newest
+    /// messages of the three from `first`, whole.
+    fn cut_to_newest(content: &str, first: i64) {
+        let history = content
+            .split_once(")\n")
+            .and_then(|(_, rest)| rest.split_once("\n(конец истории)"))
+            .map(|(history, _)| history.to_owned())
+            .unwrap();
+        assert!(history.chars().count() <= 4000, "{}", history.len());
+        assert!(history.ends_with(&long_text(first + 2)), "the newest whole");
+        assert!(!history.contains(&long_text(first)), "the oldest gone");
+    }
+
+    /// (б) (в): unaddressed group messages reach nobody but their own topic
+    /// (one hint), a mention takes them along with their authors; a reply
+    /// to another bot is none, a reply to this bot is one.
+    #[tokio::test]
+    async fn unaddressed_group_messages_wait_for_a_mention_and_go_with_it() {
+        let dir = TempDir::new("slots-mention-keep");
+        let (mut slots, mut work, mut agent) = mention_slot(&dir, 64);
+        slots.on_control(group_by(10, "где логи?", "Анна", None));
+        // The hint into the group moved the private status like any
+        // message of the hub there; a kept message does not.
+        slots.bottoms.entry(private_700()).or_default().foreign = false;
+        slots.on_control(group_by(11, "в /var/log", "Иван", None));
+        assert!(
+            !slots.bottoms[&private_700()].foreign,
+            "the private status stays"
+        );
+        slots.pump();
+        assert!(got(&mut agent).inbounds.is_empty());
+        let handed = all_work(&mut work);
+        assert!(sends_into(&handed, private_700()).is_empty(), "no echo");
+        assert_eq!(
+            sends_into(&handed, group_100()),
+            [mention::mention_hint("cctg_bot")],
+            "one hint for two"
+        );
+        assert!(reactions_on(&handed).is_empty(), "no 👀");
+        assert_eq!(backlog_of(&slots), ["Анна: где логи?", "Иван: в /var/log"]);
+        assert!(slots.registry.slots[0].views[1].mention_told);
+        assert!(slots.registry.slots[0].buffer.is_idle());
+        // A reply to another bot's message is no mention.
+        slots.on_control(group_by(12, "ок", "Анна", Some(BOT_ID + 1)));
+        slots.pump();
+        assert!(got(&mut agent).inbounds.is_empty());
+        assert!(sends_into(&all_work(&mut work), group_100()).is_empty());
+        // A mention in another case takes the three along.
+        slots.on_control(group_by(13, "@CCTG_Bot глянь", "Иван", None));
+        slots.pump();
+        let got13 = got(&mut agent);
+        assert_eq!(
+            mention_contents(&got13),
+            [
+                "(история темы группы с прошлого обращения к вам: 3 сообщения)\n\
+              Анна: где логи?\n\n---\n\nИван: в /var/log\n\n---\n\nАнна: ок\n(конец истории)\n\n\
+              Иван: @CCTG_Bot глянь"
+            ]
+        );
+        let meta = &got13.inbounds[0].1;
+        assert_eq!(meta["message_id"], "13");
+        assert!(!meta.contains_key("history"), "{meta:?}");
+        assert!(backlog_of(&slots).is_empty());
+        let handed = all_work(&mut work);
+        let echo = sends_into(&handed, private_700());
+        assert_eq!(echo.len(), 1, "{echo:?}");
+        assert!(echo[0].ends_with("Иван: @CCTG_Bot глянь"), "{echo:?}");
+        assert_eq!(reactions_on(&handed), [13]);
+        // A reply to this bot's message is a mention.
+        slots.on_control(group_by(14, "ещё", "Анна", None));
+        slots.on_control(group_by(15, "и это", "Иван", Some(BOT_ID)));
+        slots.pump();
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+              Анна: ещё\n(конец истории)\n\nИван: и это"
+            ]
+        );
+        // The next mention has no history.
+        slots.on_control(group_by(16, "@cctg_bot и всё", "Анна", None));
+        slots.pump();
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            ["Анна: @cctg_bot и всё"]
+        );
+        // The owner's private messages go as before.
+        slots.on_control(owner_says(Some(700), 5002, "привет"));
+        slots.pump();
+        assert_eq!(mention_contents(&got(&mut agent)), ["привет"]);
+    }
+
+    /// (г) (д): a history over the limit waits at the front of the buffer
+    /// (a private message after it too) while the agent compresses it; a
+    /// summary goes as «сжато».
+    #[tokio::test]
+    async fn a_long_history_is_compressed_first_and_later_messages_wait_for_it() {
+        let dir = TempDir::new("slots-mention-compress");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        for id in 10..13 {
+            slots.on_control(group_by(id, &long_text(id), "Анна", None));
+        }
+        slots.on_control(group_by(13, "@cctg_bot итог?", "Иван", None));
+        slots.on_control(owner_says(Some(700), 5002, "после"));
+        slots.pump();
+        let asked = got(&mut agent);
+        assert!(asked.inbounds.is_empty(), "the mention waits");
+        let [(read_id, text, 4000)] = asked.compress.as_slice() else {
+            panic!("one compression: {:?}", asked.compress);
+        };
+        assert!(text.starts_with("Анна: 10ж") && text.contains("Анна: 12ж"));
+        assert_eq!(buffered(&slots, 0), [13, 5002]);
+        // Asked once.
+        slots.pump();
+        assert!(got(&mut agent).compress.is_empty());
+        answer_read(
+            &mut slots,
+            *read_id,
+            SessionAnswer::Text {
+                text: "Анна трижды ".into(),
+                more: true,
+            },
+        );
+        assert!(
+            got(&mut agent).inbounds.is_empty(),
+            "the summary is in pieces"
+        );
+        answer_read(
+            &mut slots,
+            *read_id,
+            SessionAnswer::Text {
+                text: "написала длинно".into(),
+                more: false,
+            },
+        );
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 3 сообщения, сжато)\n\
+                 Анна трижды написала длинно\n(конец истории)\n\nИван: @cctg_bot итог?",
+                "после",
+            ]
+        );
+        assert!(slots.compressing.is_empty());
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// (г): an agent that cannot compress, one that stays silent past
+    /// `compress_wait` and a summary over the limit: the history is cut to
+    /// its newest part.
+    #[tokio::test(start_paused = true)]
+    async fn a_history_the_agent_does_not_compress_is_cut() {
+        let dir = TempDir::new("slots-mention-cut");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        // Too old to compress.
+        let read_id = ask_compress(&mut slots, &mut agent, 10);
+        answer_read(&mut slots, read_id, SessionAnswer::Unsupported);
+        let content = got(&mut agent).inbounds.remove(0).0;
+        assert!(
+            content.starts_with(
+                "(история темы группы с прошлого обращения к вам: 3 сообщения, начало обрезано)\n"
+            ),
+            "{content}"
+        );
+        cut_to_newest(&content, 10);
+        // Silent.
+        let _ = ask_compress(&mut slots, &mut agent, 20);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        slots.on_tick();
+        slots.pump();
+        assert!(got(&mut agent).inbounds.is_empty(), "within the wait");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        slots.on_tick();
+        slots.pump();
+        let content = got(&mut agent).inbounds.remove(0).0;
+        assert!(content.contains(", начало обрезано)"), "{content}");
+        cut_to_newest(&content, 20);
+        // A summary longer than the limit is cut too, and still «сжато».
+        let read_id = ask_compress(&mut slots, &mut agent, 30);
+        answer_read(
+            &mut slots,
+            read_id,
+            SessionAnswer::Text {
+                text: "ы".repeat(5000),
+                more: false,
+            },
+        );
+        let content = got(&mut agent).inbounds.remove(0).0;
+        assert!(
+            content.starts_with(&format!(
+                "(история темы группы с прошлого обращения к вам: 3 сообщения, сжато)\n…{}\n",
+                "ы".repeat(3999)
+            )),
+            "{}",
+            content.chars().take(100).collect::<String>()
+        );
+        assert!(slots.compressing.is_empty());
+    }
+
+    /// (г): a link queue with no room for the ask cuts the history at once
+    /// (no recursion, no hang); it goes as soon as the queue has room.
+    #[tokio::test]
+    async fn a_full_link_queue_cuts_the_history_at_once() {
+        let dir = TempDir::new("slots-mention-full");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 4);
+        for id in 10..13 {
+            slots.on_control(group_by(id, &long_text(id), "Анна", None));
+        }
+        let to_agent = slots.conns[&1].to_agent.clone();
+        while to_agent.try_send(HubMsg::Ping).is_ok() {}
+        slots.on_control(group_by(13, "@cctg_bot итог?", "Иван", None));
+        slots.pump();
+        assert!(slots.compressing.is_empty());
+        let front = slots.registry.slots[0].buffer.messages.front().unwrap();
+        let history = front.history.as_ref().unwrap();
+        assert_eq!(history.state, buffer::HistoryState::Cut);
+        assert!(history.text.chars().count() <= 4000);
+        let full = got(&mut agent);
+        assert!(full.inbounds.is_empty() && full.compress.is_empty());
+        slots.pump();
+        let content = got(&mut agent).inbounds.remove(0).0;
+        assert!(content.contains(", начало обрезано)"), "{content}");
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// (е): a history waiting for compression is in `registry.json`; after
+    /// a restart the agent is asked again.
+    #[tokio::test]
+    async fn a_waiting_compression_is_asked_again_after_a_restart() {
+        let dir = TempDir::new("slots-mention-restart");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        for id in 10..13 {
+            slots.on_control(group_by(id, &long_text(id), "Анна", None));
+        }
+        slots.on_control(group_by(13, "@cctg_bot итог?", "Иван", None));
+        slots.pump();
+        assert_eq!(got(&mut agent).compress.len(), 1);
+        let store = RegistryStore::open(dir.path()).unwrap();
+        store.save(&RegistryStore::encode(&slots.registry)).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.slots[0].buffer.messages[0].pending());
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut again = Slots::new(loaded, store, outbox, mention_options());
+        let mut agent = mention_agent(&mut again, 2, 64, false);
+        again.pump();
+        let asked = got(&mut agent);
+        assert!(asked.inbounds.is_empty());
+        assert_eq!(asked.compress.len(), 1);
+    }
+
+    /// (ж): without private topics, and with the owner's private chat
+    /// closed (the group is the primary view), nothing is kept; the first
+    /// message then takes what was kept before.
+    #[tokio::test]
+    async fn only_a_group_mirror_of_a_private_slot_keeps_messages() {
+        let dir = TempDir::new("slots-mention-group-only");
+        let mut slots = stalled_slots(
+            &dir,
+            Options {
+                mentions: mention_options().mentions,
+                ..message_options()
+            },
+        );
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        let mut agent = mention_agent(&mut slots, 1, 64, false);
+        slots.pump();
+        let _ = got(&mut agent);
+        slots.on_control(group_by(10, "без обращения", "Анна", None));
+        slots.pump();
+        assert_eq!(mention_contents(&got(&mut agent)), ["Анна: без обращения"]);
+        // A shared slot whose private chat is closed.
+        let dir = TempDir::new("slots-mention-closed");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        slots.on_control(group_by(10, "раньше", "Анна", None));
+        slots.pump();
+        assert!(got(&mut agent).inbounds.is_empty());
+        slots.registry.closed.insert(owner_chat());
+        assert_eq!(slots.registry.place(SlotId(0)), Some(group_100()));
+        slots.on_control(group_by(11, "теперь", "Иван", None));
+        slots.pump();
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+              Анна: раньше\n(конец истории)\n\nИван: теперь"
+            ]
+        );
+    }
+
+    /// (з): the owner switches the group topic to every message and back in
+    /// the menu; the first message after the switch takes the history.
+    #[tokio::test]
+    async fn every_message_mode_hands_each_message_and_the_history_once() {
+        let dir = TempDir::new("slots-mention-every");
+        let (mut slots, mut work, mut agent) = mention_slot(&dir, 64);
+        let now = Instant::now();
+        assert_eq!(
+            slots.session_row(SlotId(0), owner_chat(), now).mentions,
+            Some(true)
+        );
+        slots.on_control(group_by(10, "раньше", "Анна", None));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert_eq!(
+            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None),
+            menu::ANSWER_SAVED
+        );
+        assert_eq!(
+            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None),
+            menu::ANSWER_UNCHANGED
+        );
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [mention::MODE_ALL_TEXT]
+        );
+        assert_eq!(
+            slots.session_row(SlotId(0), owner_chat(), now).mentions,
+            Some(false)
+        );
+        slots.on_control(group_by(11, "первое", "Иван", None));
+        slots.on_control(group_by(12, "второе", "Иван", None));
+        slots.pump();
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Анна: раньше\n(конец истории)\n\nИван: первое",
+                "Иван: второе",
+            ]
+        );
+        assert_eq!(
+            slots.press_menu_slot(owner_chat(), SlotAction::Mentions, 0, None),
+            menu::ANSWER_SAVED
+        );
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [mention::mode_mention_text("cctg_bot")]
+        );
+        slots.on_control(group_by(13, "снова ждёт", "Анна", None));
+        slots.pump();
+        assert!(got(&mut agent).inbounds.is_empty());
+        assert_eq!(backlog_of(&slots), ["Анна: снова ждёт"]);
+        // A person whose slot it is not changes nothing.
+        let stranger = PrivateChat::of_user(99);
+        assert_eq!(
+            slots.press_menu_slot(stranger, SlotAction::EveryMessage, 0, None),
+            menu::ANSWER_NOT_YOURS
+        );
+    }
+
+    /// TASK-077: the group view of an owned slot shows rich messages by
+    /// default, saved settings or not; a slot without an owner (no private
+    /// chat, so no menu to switch them off) does not.
+    #[tokio::test]
+    async fn the_group_is_rich_by_default_only_for_an_owned_slot() {
+        let dir = TempDir::new("slots-rich-group-default");
+        let (mut slots, _work) = shared_slot(&dir, private_only_options());
+        assert!(slots.registry.person(owner_chat()).is_none());
+        assert!(slots.display_in(SlotId(0), Chat::Group).rich);
+        slots.registry.person_mut(owner_chat());
+        assert!(slots.display_in(SlotId(0), Chat::Group).rich);
+        let dir = TempDir::new("slots-rich-group-alone");
+        let mut slots = stalled_slots(&dir, message_options());
+        slots.on_hook(&start(A, 10));
+        assert!(!slots.display_in(SlotId(0), Chat::Group).rich);
+    }
+
+    /// (к): a console command in the group topic works as before and leaves
+    /// the history alone.
+    #[tokio::test]
+    async fn a_console_command_in_the_group_is_not_kept_and_takes_no_history() {
+        let dir = TempDir::new("slots-mention-console");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        slots.on_control(group_by(10, "раньше", "Анна", None));
+        slots.on_control(group_by(11, "!ls", "Анна", None));
+        slots.pump();
+        assert_eq!(backlog_of(&slots), ["Анна: раньше"]);
+        assert!(got(&mut agent).inbounds.is_empty());
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// (л): a file that mentions the agent in its caption carries the
+    /// history in the content of its transfer; a kept file is a placeholder.
+    #[tokio::test]
+    async fn a_file_mention_carries_the_history_and_a_kept_file_is_a_placeholder() {
+        let dir = TempDir::new("slots-mention-file");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        slots.fetch_files(Arc::new(TelegramFiles(
+            [("p".to_owned(), b"x".to_vec())].into(),
+        )));
+        let mut done = slots.done_rx.take().unwrap();
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        let photo_by = |message_id: i64, caption: &str| {
+            Control::Message(Inbound {
+                media: Some(crate::hub::updates::Media {
+                    file: Attachment {
+                        kind: crate::wire::FileKind::Photo,
+                        file_id: "p".into(),
+                        name: None,
+                        size: Some(1),
+                    },
+                    caption: Some(caption.into()),
+                    album: None,
+                }),
+                text: None,
+                ..match group_by(message_id, "", "Анна", None) {
+                    Control::Message(input) => input,
+                    _ => unreachable!(),
+                }
+            })
+        };
+        slots.on_control(photo_by(10, "схема"));
+        slots.pump();
+        assert!(slots.fetching.is_empty(), "a kept file is not downloaded");
+        assert_eq!(backlog_of(&slots), ["Анна: [фото] схема"]);
+        slots.on_control(photo_by(11, "@cctg_bot смотри"));
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        let got = got(&mut agent);
+        assert_eq!(
+            got.files,
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+              Анна: [фото] схема\n(конец истории)\n\nАнна: @cctg_bot смотри"
+            ]
+        );
+    }
+
+    /// Photo `file_id` of album `album` by Анна in group topic 100, with
+    /// `caption` (TASK-077 review F1).
+    fn album_photo(message_id: i64, file_id: &str, album: &str, caption: Option<&str>) -> Control {
+        Control::Message(Inbound {
+            media: Some(crate::hub::updates::Media {
+                file: Attachment {
+                    kind: crate::wire::FileKind::Photo,
+                    file_id: file_id.into(),
+                    name: None,
+                    size: Some(1),
+                },
+                caption: caption.map(str::to_owned),
+                album: Some(album.into()),
+            }),
+            text: None,
+            ..match group_by(message_id, "", "Анна", None) {
+                Control::Message(input) => input,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    /// Review F1: Telegram sends an album as one message per file, the
+    /// caption on one of them. When the caption addresses the agent, every
+    /// file of the album goes to the session, the ones before it too, and
+    /// none stays in the history as a placeholder; an album nobody
+    /// addressed stays kept.
+    #[tokio::test]
+    async fn the_files_of_an_album_whose_caption_addresses_the_agent_all_go() {
+        let dir = TempDir::new("slots-mention-album");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        let files: HashMap<String, Vec<u8>> = ["p", "q", "r", "s", "t", "u", "v"]
+            .into_iter()
+            .map(|id| (id.to_owned(), b"x".to_vec()))
+            .collect();
+        slots.fetch_files(Arc::new(TelegramFiles(files)));
+        let mut done = slots.done_rx.take().unwrap();
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        // An album nobody addressed: kept.
+        slots.on_control(album_photo(5, "v", "c", None));
+        slots.on_control(group_by(6, "решили: релиз в пятницу", "Иван", None));
+        slots.pump();
+        // The caption on the first file.
+        slots.on_control(album_photo(10, "p", "a", Some("@cctg_bot смотри все")));
+        slots.on_control(album_photo(11, "q", "a", None));
+        slots.on_control(album_photo(12, "r", "a", None));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [10, 11, 12], "none of it kept");
+        // One by one: the agent takes each before the next comes.
+        let mut files = Vec::new();
+        for _ in 0..3 {
+            fetched(&mut slots, &mut done).await;
+            files.extend(got(&mut agent).files);
+        }
+        assert_eq!(
+            files,
+            [
+                "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
+                 Анна: [фото]\n\n---\n\nИван: решили: релиз в пятницу\n(конец истории)\n\n\
+                 Анна: @cctg_bot смотри все",
+                "Анна:",
+                "Анна:",
+            ]
+        );
+        assert!(backlog_of(&slots).is_empty());
+        // The caption on the last file, as for an album of documents.
+        slots.on_control(group_by(19, "а вот ещё", "Иван", None));
+        slots.on_control(album_photo(20, "s", "b", None));
+        slots.on_control(album_photo(21, "t", "b", None));
+        slots.pump();
+        assert_eq!(
+            backlog_of(&slots),
+            ["Иван: а вот ещё", "Анна: [фото]", "Анна: [фото]"]
+        );
+        assert!(slots.fetching.is_empty(), "kept files are not downloaded");
+        slots.on_control(album_photo(22, "u", "b", Some("@cctg_bot и эти")));
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [20, 21, 22], "the album in order");
+        let (mut files, mut inbounds) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            fetched(&mut slots, &mut done).await;
+            let got = got(&mut agent);
+            files.extend(got.files);
+            inbounds.extend(got.inbounds);
+        }
+        assert_eq!(
+            files,
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Иван: а вот ещё\n(конец истории)\n\nАнна:",
+                "Анна:",
+                "Анна: @cctg_bot и эти",
+            ]
+        );
+        assert!(inbounds.is_empty());
+        assert!(backlog_of(&slots).is_empty());
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+    }
+
+    /// Review F2: a file that addresses the agent but cannot be downloaded
+    /// still brings the group history, as words, with the notice.
+    #[tokio::test]
+    async fn a_file_mention_whose_file_fails_still_brings_the_history() {
+        let dir = TempDir::new("slots-mention-lost");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        slots.fetch_files(Arc::new(TelegramFiles(HashMap::new())));
+        let mut done = slots.done_rx.take().unwrap();
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(group_by(9, "решили: релиз в пятницу", "Иван", None));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(album_photo(10, "gone", "a", Some("@cctg_bot смотри")));
+        slots.pump();
+        assert!(backlog_of(&slots).is_empty(), "taken by the mention");
+        fetched(&mut slots, &mut done).await;
+        let got = got(&mut agent);
+        assert!(got.files.is_empty());
+        assert_eq!(
+            mention_contents(&got),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Иван: решили: релиз в пятницу\n(конец истории)\n\nАнна: @cctg_bot смотри"
+            ]
+        );
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+        let handed = all_work(&mut work);
+        let notices: Vec<&str> = handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::Send {
+                    chat: Chat::Group,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, [buffer::FETCH_FAILED_NOTICE]);
+        assert_eq!(reactions_on(&handed), [10]);
+    }
+
+    /// Review F2, without a download task: the history goes as words too.
+    #[tokio::test]
+    async fn a_file_mention_without_a_download_task_still_brings_the_history() {
+        let dir = TempDir::new("slots-mention-nofetch");
+        let (mut slots, mut work) = shared_slot(&dir, mention_options());
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        slots.on_control(group_by(9, "решили", "Иван", None));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(album_photo(10, "p", "a", Some("@cctg_bot смотри")));
+        slots.pump();
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Иван: решили\n(конец истории)\n\nАнна: @cctg_bot смотри"
+            ]
+        );
+        assert!(slots.registry.slots[0].buffer.messages.is_empty());
+        assert_eq!(reactions_on(&all_work(&mut work)), [10]);
     }
 }

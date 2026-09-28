@@ -8,6 +8,7 @@
 //! slot to the group and taking it out (TASK-064), then the menu in the
 //! private chat's General (TASK-073), its compact turn view (TASK-076) and
 //! the display of each view by its own settings (TASK-078), at the end.
+//! Last, a shared slot's group topic that answers mentions only (TASK-077).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -19,11 +20,12 @@ use std::time::Duration;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
 use cctg::hub::chat::{Chat, Place, PrivateChat};
 use cctg::hub::ingress::{bind, serve_agents};
+use cctg::hub::mention;
 use cctg::hub::menu;
 use cctg::hub::registry::{ICON_ALIVE, ICON_DEAD, RegistryStore, share_line};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Transport};
 use cctg::hub::slots::{
-    Control, ECHO_MARK, FALLBACK_END_NOTICE, FOREIGN_TOPIC_NOTICE, Options, Owners,
+    Control, ECHO_MARK, FALLBACK_END_NOTICE, FOREIGN_TOPIC_NOTICE, MentionBot, Options, Owners,
     PRIVATE_CLOSED_NOTICE, PRIVATE_GENERAL_NOTICE, PRIVATE_START_TEXT, SHARE_OWNER_ONLY_NOTICE,
     SHARED_NOTICE, Slots, UNSHARED_KEPT_NOTICE, UNSHARED_NOTICE,
 };
@@ -32,7 +34,7 @@ use cctg::hub::updates::{CallbackInput, Inbound};
 use cctg::hub::{permissions, updates};
 use cctg::wire::{
     self, AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionRequest, Register, Secret,
-    StreamItem, StreamLine,
+    SessionAnswer, SessionAsk, StreamItem, StreamLine,
 };
 use serde_json::Value;
 use tokio::io::BufReader;
@@ -438,18 +440,31 @@ impl Drop for Hub {
 const SHARED: Mode = Mode::Private {
     share_new: true,
     menu: false,
+    mentions: false,
 };
 /// Private chats on as the hub runs: a new slot shows in the private chat
 /// alone (decision 2026-09-28).
 const PRIVATE: Mode = Mode::Private {
     share_new: false,
     menu: false,
+    mentions: false,
 };
 /// [`PRIVATE`] with the menu (TASK-073), as the hub runs.
 const MENU: Mode = Mode::Private {
     share_new: false,
     menu: true,
+    mentions: false,
 };
+/// [`MENU`] with the bot known by its name: a shared slot's group topic
+/// answers mentions only (TASK-077), as the hub runs.
+const MENTIONS: Mode = Mode::Private {
+    share_new: false,
+    menu: true,
+    mentions: true,
+};
+/// The bot of [`MENTIONS`].
+const BOT_ID: i64 = 8_100_200_300;
+const BOT: &str = "cctg_test_bot";
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -458,6 +473,7 @@ enum Mode {
     Private {
         share_new: bool,
         menu: bool,
+        mentions: bool,
     },
 }
 
@@ -498,6 +514,10 @@ async fn start_hub_on(state: &std::path::Path, mode: Mode, fake: Arc<Fake>, own:
             }),
         },
         menu: matches!(mode, Mode::Private { menu: true, .. }),
+        mentions: matches!(mode, Mode::Private { mentions: true, .. }).then(|| MentionBot {
+            id: BOT_ID,
+            username: BOT.into(),
+        }),
         ..Options::default()
     };
     let slots = Slots::new(registry, store, outbox, options);
@@ -616,6 +636,7 @@ impl Hub {
                 from_name: None,
                 author: Some(NAME.into()),
                 display_name: Some(NAME.into()),
+                reply_from: None,
             }))
             .unwrap();
         message_id
@@ -643,8 +664,33 @@ impl Hub {
                 from_name: None,
                 author: Some(NAME.into()),
                 display_name: Some(NAME.into()),
+                reply_from: None,
             }))
             .unwrap();
+    }
+
+    /// Team member `name`'s message in the group topic, an explicit reply to
+    /// a message of sender `reply_from` when given (TASK-077); its id.
+    fn say_group(&self, name: &str, text: &str, reply_from: Option<i64>) -> i64 {
+        let message_id = self.fake.user(Chat::Group, text);
+        self.control
+            .send(Control::Message(Inbound {
+                chat: Chat::Group,
+                sender: PrivateChat::of_user(OWNER),
+                message_id,
+                thread_id: self.fake.topic(Chat::Group),
+                text: Some(text.into()),
+                reply_to: reply_from.map(|_| message_id - 1),
+                quote: None,
+                forwarded: false,
+                media: None,
+                from_name: Some(name.into()),
+                author: Some(name.into()),
+                display_name: Some(name.into()),
+                reply_from,
+            }))
+            .unwrap();
+        message_id
     }
 
     /// A user's message in the General of `chat`.
@@ -663,6 +709,7 @@ impl Hub {
                 media: None,
                 from_name: None,
                 author: None,
+                reply_from: None,
             }))
             .unwrap();
     }
@@ -749,13 +796,13 @@ impl Agent {
     /// actor bound the agent waits in the buffer with a notice, as it would
     /// for a real session whose agent is not up yet.
     async fn connect_as(hub: &Hub, private_place: bool, console_keys: bool) -> Self {
-        Self::connect_with(hub, private_place, console_keys, false).await
+        Self::connect_with(hub, private_place, console_keys, false, false).await
     }
 
     /// An agent in the private chat that reads transcripts (TASK-076): a
     /// task of its own answers every read from `transcript`.
     async fn serve(hub: &Hub, transcript: Transcript) -> JoinHandle<()> {
-        let mut agent = Self::connect_with(hub, true, false, true).await;
+        let mut agent = Self::connect_with(hub, true, false, true, false).await;
         tokio::spawn(async move {
             while let Some(msg) = agent.next_within(Duration::from_secs(3600)).await {
                 if let HubMsg::TranscriptRead {
@@ -769,11 +816,14 @@ impl Agent {
         })
     }
 
+    /// `session_reads`: it is asked for session reads (TASK-077: the
+    /// compression of a group history).
     async fn connect_with(
         hub: &Hub,
         private_place: bool,
         console_keys: bool,
         transcript_reads: bool,
+        session_reads: bool,
     ) -> Self {
         let from = hub.fake.ops().len();
         let stream = TcpStream::connect(hub.agent_addr).await.unwrap();
@@ -793,7 +843,7 @@ impl Agent {
             console_commands: false,
             client: None,
             files: false,
-            session_reads: false,
+            session_reads,
             status_lines: false,
             private_place,
             enrolled: None,
@@ -2243,6 +2293,7 @@ async fn e2e_the_owners_sound_setting_quiets_the_private_topic_only() {
     let mode = Mode::Private {
         share_new: true,
         menu: true,
+        mentions: false,
     };
     let (hub, _agent) = menu_hub("menu-sound", mode, false).await;
     hub.menu_press("menu:n").await;
@@ -2589,7 +2640,7 @@ async fn serve_with_verdicts(
     mpsc::UnboundedReceiver<(String, Behavior)>,
     JoinHandle<()>,
 ) {
-    let Agent { mut reader, write } = Agent::connect_with(hub, true, false, true).await;
+    let Agent { mut reader, write } = Agent::connect_with(hub, true, false, true, false).await;
     let write = Arc::new(tokio::sync::Mutex::new(write));
     let (verdicts, verdicts_rx) = mpsc::unbounded_channel();
     let writer = write.clone();
@@ -2687,6 +2738,7 @@ async fn e2e_a_shared_slot_shows_brief_in_private_and_everything_in_the_group() 
         Mode::Private {
             share_new: true,
             menu: true,
+            mentions: false,
         },
         Fake::default(),
     )
@@ -2795,4 +2847,155 @@ async fn e2e_a_shared_slot_shows_brief_in_private_and_everything_in_the_group() 
         .await
         .expect("the group's setting saved");
     assert_eq!(hub.saved()["people"][0]["settings"]["detail"], "full");
+}
+
+/// The next compression the agent is asked for; an inbound before it is a
+/// failure.
+async fn next_compress(agent: &mut Agent) -> (u64, String, u32) {
+    loop {
+        match agent.next().await {
+            Some(HubMsg::SessionRead {
+                read_id,
+                ask: SessionAsk::Compress { text, limit },
+                ..
+            }) => return (read_id, text, limit),
+            Some(HubMsg::Inbound { content, .. }) => panic!("inbound first: {content}"),
+            Some(_) => {}
+            None => panic!("no compression asked"),
+        }
+    }
+}
+
+/// TASK-077: the group topic of a shared slot hands the session only what
+/// addresses the agent (`@name` in any case, a reply to the bot), with the
+/// group's messages since the last one and their authors; the group gets
+/// one hint and the private chat no echo of what was kept. A history over
+/// the owner's limit (2000 from the menu) is compressed by the agent, or
+/// cut when it cannot; 📣 in the menu hands every message at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_shared_group_topic_answers_mentions_with_the_history() {
+    let hub = start_hub("mentions", MENTIONS, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect_with(&hub, true, false, false, true).await;
+    hub.until("the status and the pinned menu", |fake| {
+        fake.layout(owner()).contains(&"STATUS".to_owned()) && fake.menu(owner()).is_some()
+    })
+    .await;
+    hub.menu_press("menu:sh:0:0").await;
+    let line = share_line(NAME);
+    hub.until("the group topic with the share line", |fake| {
+        fake.layout(Chat::Group).first() == Some(&line)
+    })
+    .await;
+    assert!(
+        hub.fake
+            .menu(owner())
+            .unwrap()
+            .buttons
+            .contains(&"📣 1".to_owned())
+    );
+    let hint = mention::mention_hint(BOT);
+    hub.say_group("Анна", "где логи?", None);
+    hub.say_group("Иван", "в /var/log", None);
+    hub.say_group("Анна", "ок", Some(BOT_ID + 1));
+    hub.until("the hint", |fake| fake.layout(Chat::Group).contains(&hint))
+        .await;
+    let mention = hub.say_group("Иван", "@CCTG_test_bot сделай", None);
+    let (content, meta) = agent.inbound().await;
+    assert_eq!(
+        content,
+        "(история темы группы с прошлого обращения к вам: 3 сообщения)\n\
+         Анна: где логи?\n\n---\n\nИван: в /var/log\n\n---\n\nАнна: ок\n(конец истории)\n\n\
+         Иван: @CCTG_test_bot сделай"
+    );
+    assert_eq!(meta["message_id"], mention.to_string());
+    assert!(!meta.contains_key("history"), "{meta:?}");
+    hub.until("the mention echoed in private and 👀", |fake| {
+        fake.layout(owner())
+            .iter()
+            .any(|text| text.ends_with("Иван: @CCTG_test_bot сделай"))
+            && fake.ops().iter().any(|op| {
+                matches!(op, Op::React { chat: Chat::Group, message_id, .. } if *message_id == mention)
+            })
+    })
+    .await;
+    let group = hub.fake.layout(Chat::Group);
+    assert_eq!(group.iter().filter(|text| **text == hint).count(), 1);
+    assert!(
+        !hub.fake
+            .layout(owner())
+            .iter()
+            .any(|text| text.contains("где логи") || text.contains("/var/log")),
+        "no echo of a kept message"
+    );
+    // A reply to the bot's message is a mention.
+    hub.say_group("Анна", "ещё", None);
+    hub.say_group("Иван", "и это", Some(BOT_ID));
+    let (content, _) = agent.inbound().await;
+    assert_eq!(
+        content,
+        "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+         Анна: ещё\n(конец истории)\n\nИван: и это"
+    );
+    // The owner's limit 2000: a longer history is compressed by the agent.
+    hub.menu_press("menu:ghl:s").await;
+    let (older, newer) = ("я".repeat(1200), "ю".repeat(1200));
+    hub.say_group("Анна", &older, None);
+    hub.say_group("Иван", &newer, None);
+    hub.say_group("Анна", "@cctg_test_bot итог", None);
+    let (read_id, text, limit) = next_compress(&mut agent).await;
+    assert_eq!(limit, 2000);
+    assert_eq!(text, format!("Анна: {older}\n\n---\n\nИван: {newer}"));
+    agent
+        .send(AgentMsg::SessionAnswer {
+            read_id,
+            answer: SessionAnswer::Text {
+                text: "Анна и Иван прислали по букве".into(),
+                more: false,
+            },
+        })
+        .await;
+    let (content, _) = agent.inbound().await;
+    assert_eq!(
+        content,
+        "(история темы группы с прошлого обращения к вам: 2 сообщения, сжато)\n\
+         Анна и Иван прислали по букве\n(конец истории)\n\nАнна: @cctg_test_bot итог"
+    );
+    // An agent that cannot compress: the newest part only.
+    hub.say_group("Анна", &older, None);
+    hub.say_group("Иван", &newer, None);
+    hub.say_group("Анна", "@cctg_test_bot ещё итог", None);
+    let (read_id, _, _) = next_compress(&mut agent).await;
+    agent
+        .send(AgentMsg::SessionAnswer {
+            read_id,
+            answer: SessionAnswer::Unsupported,
+        })
+        .await;
+    let (content, _) = agent.inbound().await;
+    assert_eq!(
+        content,
+        format!(
+            "(история темы группы с прошлого обращения к вам: 2 сообщения, начало обрезано)\n\
+             Иван: {newer}\n(конец истории)\n\nАнна: @cctg_test_bot ещё итог"
+        )
+    );
+    // 📣: every message goes at once.
+    hub.menu_press("menu:ma:0:0").await;
+    hub.until("the mode line in the group", |fake| {
+        fake.layout(Chat::Group)
+            .contains(&mention::MODE_ALL_TEXT.to_owned())
+    })
+    .await;
+    hub.say_group("Анна", "без обращения", None);
+    let (content, _) = agent.inbound().await;
+    assert_eq!(content, "Анна: без обращения");
+    assert!(
+        hub.fake
+            .menu(owner())
+            .unwrap()
+            .buttons
+            .contains(&"💬 1".to_owned())
+    );
+    assert!(!texts(&hub.fake.ops()).contains(&OWNER.to_string()));
 }
