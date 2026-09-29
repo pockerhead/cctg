@@ -1127,6 +1127,21 @@ impl Registry {
         true
     }
 
+    /// `view`, taken out by [`Self::remove_view`], is the slot's again
+    /// (TASK-069: a fallback view held while its owner picks a group).
+    /// `false`: no such slot, or it has a view in that chat already.
+    pub fn put_back_view(&mut self, id: SlotId, view: View) -> bool {
+        let Some(slot) = self.slots.get_mut(id.0) else {
+            return false;
+        };
+        if slot.views.iter().any(|kept| kept.chat == view.chat) {
+            return false;
+        }
+        slot.views.push(view);
+        self.dirty = true;
+        true
+    }
+
     /// The slot no longer shows in `chat` (TASK-063: a fallback group view
     /// once the private chat took the session again): the view removed.
     /// `None` when it is not there or the slot's only view.

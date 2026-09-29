@@ -924,10 +924,11 @@ enum Done {
         job: BlockJob,
         delivery: Option<Delivery>,
     },
-    /// A stream message of `session`, by its number in [`Live`].
+    /// A stream message of `session`, by its number in [`Live`], into `chat`.
     Stream {
         session: String,
         number: u64,
+        chat: Option<Chat>,
         delivery: Option<Delivery>,
     },
     Reaction(Option<Delivery>),
@@ -943,19 +944,21 @@ enum Done {
         transfer_id: u64,
         outcome: Fetched,
     },
-    /// A file of an agent's `send_file`.
+    /// A file of an agent's `send_file`, into `chat`.
     File {
         conn: u64,
         transfer_id: u64,
         size: u64,
+        chat: Option<Chat>,
         delivery: Option<Delivery>,
     },
-    /// A message of an album offer.
+    /// A message of an album offer, into `chat`.
     Album {
         conn: u64,
         transfer_id: u64,
         size: u64,
         parts: Vec<usize>,
+        chat: Option<Chat>,
         delivery: Option<Delivery>,
     },
     /// The delete of the group topic `place` of an unshared slot (TASK-064).
@@ -1398,8 +1401,20 @@ struct AfterSeparator {
     text: String,
     kind: &'static str,
     notify: bool,
-    /// Messages it takes; they count in `queued_messages` while it waits.
+    /// Messages it takes; they count as messages into `chat` while it waits
+    /// (TASK-069, [`Slots::queued_for`]).
     parts: usize,
+    chat: Chat,
+}
+
+/// A slot whose owner picks a group to share to (TASK-069): until `until`
+/// its fallback view in the default group, once the private chat took the
+/// session again, is `held` here instead of in the registry, with whether
+/// it mirrored the private view. Picking the default group puts it back
+/// as the shared view; anything else ends it as a fallback ends.
+struct Choosing {
+    until: Instant,
+    held: Option<(Box<View>, bool)>,
 }
 
 /// The messages of [`Slots::send_text`]: with `rich` (TASK-075) one rich
@@ -1844,9 +1859,10 @@ pub struct Slots {
     /// A first unshare press in a group picker waits for its second until
     /// then, by slot (TASK-069).
     picks: HashMap<SlotId, (GroupChat, Instant)>,
-    /// Slots whose group picker went out while they showed in the default
-    /// group as a fallback: that view stays until then (TASK-069).
-    choosing: HashMap<SlotId, Instant>,
+    /// Slots whose owner picks a group to share to while they show in the
+    /// default group as a fallback (TASK-069): that view is held out of the
+    /// registry, so nothing goes there, until a pick or the hold's end.
+    choosing: HashMap<SlotId, Choosing>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -4656,7 +4672,13 @@ impl Slots {
         } else if size == 0 || size > files::MAX_UPLOAD || !album_fits(&parts, size) {
             FileOutcome::Failed
         } else if self.file_bytes + size > MAX_FILE_BYTES
-            || self.queued_messages + offer_messages(&parts) > MAX_QUEUED_MESSAGES
+            || self.queued_for(
+                target
+                    .as_ref()
+                    .and_then(|(_, slot)| self.registry.place(*slot))
+                    .map(|place| place.chat),
+            ) + offer_messages(&parts)
+                > MAX_QUEUED_MESSAGES
         {
             FileOutcome::Busy
         } else {
@@ -4719,7 +4741,9 @@ impl Slots {
             .and_then(|(_, slot)| Some((slot, self.registry.place(slot)?)));
         let refused = match target {
             None => Some(FileOutcome::NoTopic),
-            Some(_) if self.queued_messages >= MAX_QUEUED_MESSAGES => Some(FileOutcome::Busy),
+            Some((_, place)) if self.queued_for(Some(place.chat)) >= MAX_QUEUED_MESSAGES => {
+                Some(FileOutcome::Busy)
+            }
             Some(_) => None,
         };
         let (Some((slot, place)), None) = (target, refused) else {
@@ -4755,7 +4779,7 @@ impl Slots {
                 notify: false,
             }
         };
-        self.queued_messages += 1;
+        self.count_queued(Some(place.chat), 1);
         info!(
             ordinal = self.ordinal(slot),
             size, photo, "file from the session queued for its topic"
@@ -4771,11 +4795,15 @@ impl Slots {
     }
 
     /// Telegram answered a file of `conn`: the agent hears whether it went.
-    fn on_file_done(&mut self, conn: u64, transfer_id: u64, size: u64, delivery: Option<Delivery>) {
-        self.queued_messages = self.queued_messages.saturating_sub(1);
-        if self.queued_messages == 0 {
-            self.overflow_warned = false;
-        }
+    fn on_file_done(
+        &mut self,
+        conn: u64,
+        transfer_id: u64,
+        size: u64,
+        chat: Option<Chat>,
+        delivery: Option<Delivery>,
+    ) {
+        self.uncount_queued(chat, 1);
         self.file_bytes = self.file_bytes.saturating_sub(size);
         let outcome = match delivery {
             Some(Ok(_)) => {
@@ -4871,7 +4899,7 @@ impl Slots {
         }
         // `album_fits` checked that the sizes add up to the bytes.
         debug_assert_eq!(offset as u64, size);
-        if self.queued_messages + ops.len() > MAX_QUEUED_MESSAGES {
+        if self.queued_for(Some(place.chat)) + ops.len() > MAX_QUEUED_MESSAGES {
             self.file_bytes = self.file_bytes.saturating_sub(size);
             info!(
                 conn,
@@ -4882,7 +4910,7 @@ impl Slots {
             self.answer_file(conn, upload.transfer_id, FileOutcome::Busy);
             return;
         }
-        self.queued_messages += ops.len();
+        self.count_queued(Some(place.chat), ops.len());
         info!(
             ordinal = self.ordinal(slot),
             size,
@@ -4918,12 +4946,10 @@ impl Slots {
         transfer_id: u64,
         size: u64,
         parts: &[usize],
+        chat: Option<Chat>,
         delivery: Option<Delivery>,
     ) {
-        self.queued_messages = self.queued_messages.saturating_sub(1);
-        if self.queued_messages == 0 {
-            self.overflow_warned = false;
-        }
+        self.uncount_queued(chat, 1);
         self.file_bytes = self.file_bytes.saturating_sub(size);
         let went = matches!(delivery, Some(Ok(_)));
         match delivery {
@@ -5136,8 +5162,8 @@ impl Slots {
             else {
                 continue;
             };
-            if self.queued_messages >= MAX_QUEUED_MESSAGES {
-                return;
+            if self.queued_for(Some(place.chat)) >= MAX_QUEUED_MESSAGES {
+                continue;
             }
             let reply_markup = buffer::callback_data(&session).map(buffer::keyboard);
             if reply_markup.is_none() {
@@ -5154,7 +5180,7 @@ impl Slots {
                 message: None,
             });
             self.registry.dirty = true;
-            self.queued_messages += 1;
+            self.count_queued(Some(place.chat), 1);
             info!(
                 ordinal = self.ordinal(slot),
                 session = short(&session),
@@ -5206,10 +5232,7 @@ impl Slots {
         chat: Chat,
         delivery: Option<Delivery>,
     ) {
-        self.queued_messages = self.queued_messages.saturating_sub(1);
-        if self.queued_messages == 0 {
-            self.overflow_warned = false;
-        }
+        self.uncount_queued(Some(chat), 1);
         let message = match &delivery {
             Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
                 Some(MessageKey::new(chat, message.message_id))
@@ -5409,7 +5432,7 @@ impl Slots {
     fn release(&mut self, session: &str, held: Held) {
         let streamed =
             self.stream_target(session).is_some() || self.current_slot(session).is_none();
-        let room = MAX_QUEUED_MESSAGES.saturating_sub(self.queued_messages);
+        let room = MAX_QUEUED_MESSAGES.saturating_sub(self.queued_for(self.stream_chat(session)));
         let held = match self.streams.get_mut(session).filter(|_| streamed) {
             Some(live) => match answer_ops(live, held, room, session) {
                 Ok(ops) => {
@@ -5435,7 +5458,7 @@ impl Slots {
         }
         let parts = ops.len();
         for (number, op) in ops {
-            self.queued_messages += 1;
+            self.count_queued(op.chat(), 1);
             self.hand_off(
                 Work::Stream {
                     session: session.to_owned(),
@@ -5549,6 +5572,9 @@ impl Slots {
             let Some((conn, path)) = target else {
                 continue;
             };
+            // Messages waiting for its chat (TASK-069: a group other than
+            // the default one by its own count).
+            let queued = self.queued_for(self.stream_chat(&session));
             let Some(live) = self.streams.get_mut(&session) else {
                 continue;
             };
@@ -5558,7 +5584,7 @@ impl Slots {
             if live.reading.is_some()
                 || !due
                 || live.unanswered() >= stream::MAX_WAITING
-                || self.queued_messages >= STREAM_QUEUE
+                || queued >= STREAM_QUEUE
                 || live.open_pending()
             {
                 continue;
@@ -5648,7 +5674,7 @@ impl Slots {
             "stream messages of a session that left its topic sent again"
         );
         for (number, op) in again {
-            self.queued_messages += usize::from(op.posts().is_some());
+            self.count_queued(op.chat(), usize::from(op.posts().is_some()));
             self.hand_off(
                 Work::Stream {
                     session: session.to_owned(),
@@ -5734,7 +5760,7 @@ impl Slots {
             self.rich_anywhere(place),
         )
         .len();
-        if self.queued_messages + parts > MAX_QUEUED_MESSAGES {
+        if self.queued_for(Some(place.chat)) + parts > MAX_QUEUED_MESSAGES {
             if !self.overflow_warned {
                 self.overflow_warned = true;
                 warn!(
@@ -5747,7 +5773,7 @@ impl Slots {
             session = short(session),
             kind, "waits behind the separator of its slot"
         );
-        self.queued_messages += parts;
+        self.count_queued(Some(place.chat), parts);
         self.after_separator.push(AfterSeparator {
             slot,
             session: session.to_owned(),
@@ -5755,6 +5781,7 @@ impl Slots {
             kind,
             notify,
             parts,
+            chat: place.chat,
         });
     }
 
@@ -5774,7 +5801,7 @@ impl Slots {
                 self.after_separator.push(held);
                 continue;
             }
-            self.queued_messages = self.queued_messages.saturating_sub(held.parts);
+            self.uncount_queued(Some(held.chat), held.parts);
             if !current {
                 debug!(
                     session = short(&held.session),
@@ -5891,6 +5918,9 @@ impl Slots {
                 })
             })
             .collect();
+        // Messages waiting for the stream's chat (TASK-069: a group other
+        // than the default one by its own count).
+        let queued_start = self.queued_for(place.map(|place| place.chat));
         let Some(live) = self.streams.get_mut(session) else {
             return;
         };
@@ -6008,7 +6038,7 @@ impl Slots {
             self.registry.dirty = true;
         }
         let mut actions = Vec::new();
-        let mut queued = self.queued_messages;
+        let mut queued = queued_start;
         // Answers held again whose turn end this read starts after go first.
         for held in live.overdue(from) {
             let answered = match answer_ops(
@@ -6280,7 +6310,7 @@ impl Slots {
                 Action::Stream(number, op) => {
                     // Only new messages count: a write into a message above
                     // is bounded per session (`stream::MAX_WAITING`).
-                    self.queued_messages += usize::from(op.posts().is_some());
+                    self.count_queued(op.chat(), usize::from(op.posts().is_some()));
                     self.hand_off(
                         Work::Stream {
                             session: session.to_owned(),
@@ -6339,8 +6369,26 @@ impl Slots {
         self.stream_answered(session);
     }
 
-    /// Telegram answered stream message `number` of `session`.
+    /// [`Self::on_stream_sent`] of a message into the chat of its op.
+    #[cfg(test)]
     fn on_stream_done(&mut self, session: &str, number: u64, delivery: Option<Delivery>) {
+        let sent = self
+            .streams
+            .get(session)
+            .and_then(|live| live.op_of(number))
+            .and_then(Op::chat);
+        self.on_stream_sent(session, number, sent, delivery);
+    }
+
+    /// Telegram answered stream message `number` of `session`, sent into
+    /// `sent`.
+    fn on_stream_sent(
+        &mut self,
+        session: &str,
+        number: u64,
+        sent: Option<Chat>,
+        delivery: Option<Delivery>,
+    ) {
         // TASK-062: the message it was written into, if any. Its text read
         // again after a rewind is no change; a message that is gone is not
         // written into again.
@@ -6353,10 +6401,7 @@ impl Slots {
             _ => (None, None),
         };
         if into.is_none() {
-            self.queued_messages = self.queued_messages.saturating_sub(1);
-            if self.queued_messages == 0 {
-                self.overflow_warned = false;
-            }
+            self.uncount_queued(sent, 1);
         }
         let unchanged = into.is_some()
             && delivery
@@ -9619,6 +9664,54 @@ impl Slots {
         chat.filter(|chat| matches!(chat, Chat::Group(_)) && *chat != self.registry.default_chat())
     }
 
+    /// New messages into `chat` waiting for Telegram as the caps count
+    /// them (TASK-069): that group's own count for a group other than the
+    /// default one, else the shared `queued_messages`.
+    fn queued_for(&self, chat: Option<Chat>) -> usize {
+        match self.counted_apart(chat) {
+            Some(group) => self.queued_apart.get(&group).copied().unwrap_or(0),
+            None => self.queued_messages,
+        }
+    }
+
+    /// `count` more new messages into `chat` wait for Telegram.
+    fn count_queued(&mut self, chat: Option<Chat>, count: usize) {
+        match self.counted_apart(chat) {
+            Some(group) => *self.queued_apart.entry(group).or_default() += count,
+            None => self.queued_messages += count,
+        }
+    }
+
+    /// Telegram answered `count` new messages into `chat`.
+    fn uncount_queued(&mut self, chat: Option<Chat>, count: usize) {
+        let left = match self.counted_apart(chat) {
+            Some(group) => {
+                let queued = self.queued_apart.entry(group).or_default();
+                *queued = queued.saturating_sub(count);
+                let left = *queued;
+                if left == 0 {
+                    self.queued_apart.remove(&group);
+                }
+                left
+            }
+            None => {
+                self.queued_messages = self.queued_messages.saturating_sub(count);
+                self.queued_messages
+            }
+        };
+        if left == 0 {
+            self.overflow_warned = false;
+        }
+    }
+
+    /// The chat the stream of `session` writes to: its slot's primary
+    /// topic's (TASK-069: for the caps of [`Self::queued_for`]).
+    fn stream_chat(&self, session: &str) -> Option<Chat> {
+        self.current_slot(session)
+            .and_then(|slot| self.registry.place(slot))
+            .map(|place| place.chat)
+    }
+
     /// Never waits: the dispatch task does.
     /// A new message counts as on its way into its topic until Telegram
     /// answered (TASK-062); one that is not the stream's or a status message
@@ -10440,7 +10533,17 @@ impl Slots {
                 .iter()
                 .any(|view| self.registry.usable(view.chat));
             let default = self.registry.default_chat();
-            if live && !usable && self.registry.add_view(slot, default) {
+            // A fallback view held for the group picker comes back as it was
+            // (TASK-069).
+            let held = if live && !usable {
+                self.choosing
+                    .get_mut(&slot)
+                    .and_then(|choosing| choosing.held.take())
+            } else {
+                None
+            };
+            let back = held.is_some_and(|(view, _)| self.registry.put_back_view(slot, *view));
+            if live && !usable && (back || self.registry.add_view(slot, default)) {
                 self.mark_fallback(slot);
                 info!(
                     ordinal = self.ordinal(slot),
@@ -10471,15 +10574,22 @@ impl Slots {
     /// user wants new sessions out of the group, sharing is TASK-064): the
     /// private view is primary and the bot or the user wrote there since.
     /// Its group topic is told so, gets the dead icon and loses its status
-    /// message. Not while its owner chooses a group for it (TASK-069).
+    /// message. While its owner picks a group for it (TASK-069) it is held
+    /// out of the registry instead, silently, and ends so once the hold is
+    /// over.
     fn drop_fallback_views(&mut self) {
         let now = Instant::now();
-        self.choosing.retain(|_, until| now < *until);
+        let over: Vec<SlotId> = self
+            .choosing
+            .iter()
+            .filter(|(_, choosing)| now >= choosing.until)
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in over {
+            self.end_choosing(slot);
+        }
         for index in 0..self.registry.slots.len() {
             let slot = SlotId(index);
-            if self.choosing.contains_key(&slot) {
-                continue;
-            }
             let Some(Chat::Private(private)) = self
                 .registry
                 .primary_view(slot)
@@ -10509,6 +10619,10 @@ impl Slots {
             let Some(view) = self.registry.remove_view(slot, default) else {
                 continue;
             };
+            if self.choosing.contains_key(&slot) {
+                self.hold_fallback(slot, view, mirrored);
+                continue;
+            }
             self.leave_group(
                 slot,
                 GroupEnd::Fallback {
@@ -10516,6 +10630,36 @@ impl Slots {
                     mirrored,
                 },
             );
+        }
+    }
+
+    /// The fallback view of `slot`, out of the registry, waits for its
+    /// owner's pick (TASK-069): nothing new goes to its topic (no echo, no
+    /// twin, no edit of a twin there), its status message goes as when a
+    /// fallback ends, and its topic is told nothing yet.
+    fn hold_fallback(&mut self, slot: SlotId, mut view: View, mirrored: bool) {
+        info!(
+            ordinal = self.ordinal(slot),
+            "fallback group view held while its owner picks a group"
+        );
+        if let Some(status) = view.status.take() {
+            self.retire(MessageKey::new(view.chat, status.message_id), status.pinned);
+        }
+        self.stop_mirroring(slot, view.place(), mirrored);
+        if let Some(choosing) = self.choosing.get_mut(&slot) {
+            choosing.held = Some((Box::new(view), mirrored));
+        }
+    }
+
+    /// The owner of `slot` picked, or the hold ran out (TASK-069): a held
+    /// fallback view ends as a fallback ends.
+    fn end_choosing(&mut self, slot: SlotId) {
+        if let Some((view, mirrored)) = self
+            .choosing
+            .remove(&slot)
+            .and_then(|choosing| choosing.held)
+        {
+            self.leave_group(slot, GroupEnd::Fallback { view, mirrored });
         }
     }
 
@@ -10542,6 +10686,12 @@ impl Slots {
             }
             GroupEnd::Unshare { topic } => (true, topic),
         };
+        self.stop_mirroring(slot, topic, mirrored);
+    }
+
+    /// No twin goes to `topic` of `slot` again; when it `mirrored` the
+    /// primary view, the status moves.
+    fn stop_mirroring(&mut self, slot: SlotId, topic: Option<Place>, mirrored: bool) {
         // The topic said it is no longer updated: edits of the session's
         // blocks, prompts and Resume offers stay out of it (TASK-064).
         if let Some(topic) = topic {
@@ -10625,12 +10775,16 @@ impl Slots {
         }
         // Several groups to choose from: the picker (TASK-069).
         if self.registry.share_targets(slot).len() > 1 {
-            self.keep_fallback_for_pick(slot);
+            if matches!(command, ShareCommand::Share) {
+                self.hold_for_pick(slot);
+            }
             self.reopen(input.chat);
             let bottom = self.bottoms.entry(place).or_default();
             bottom.last = bottom.last.max(input.message_id);
             self.close_turn_message(place);
-            self.send_picker(slot, place);
+            if !self.send_picker(slot, place) {
+                self.end_choosing(slot);
+            }
             return;
         }
         // Before `reopen`, which would drop a fallback group view.
@@ -10676,11 +10830,12 @@ impl Slots {
             return status::ANSWER_STALE;
         };
         if press == Press::Groups || self.registry.share_targets(slot).len() > 1 {
-            self.keep_fallback_for_pick(slot);
-            self.reopen(chat);
-            return match input.topic() {
-                Some(place) if self.send_picker(slot, place) => ANSWER_PICKER,
-                _ => status::ANSWER_SHARE_LATER,
+            let share = matches!(press, Press::Share | Press::Groups);
+            let topic = input.topic();
+            return if self.open_picker(slot, chat, share, |_| topic) {
+                ANSWER_PICKER
+            } else {
+                status::ANSWER_SHARE_LATER
             };
         }
         self.press_share_of(slot, chat, press, input.display_name.as_deref())
@@ -10699,12 +10854,17 @@ impl Slots {
         author: Option<&str>,
     ) -> &'static str {
         if press == Press::Groups || self.registry.share_targets(slot).len() > 1 {
-            self.keep_fallback_for_pick(slot);
-            self.reopen(chat);
-            let place = self.registry.place(slot).filter(|place| place.chat == chat);
-            return match place {
-                Some(place) if self.send_picker(slot, place) => ANSWER_PICKER_TOPIC,
-                _ => status::ANSWER_SHARE_LATER,
+            let share = matches!(press, Press::Share | Press::Groups);
+            let place = |slots: &Self| {
+                slots
+                    .registry
+                    .place(slot)
+                    .filter(|place| place.chat == chat)
+            };
+            return if self.open_picker(slot, chat, share, place) {
+                ANSWER_PICKER_TOPIC
+            } else {
+                status::ANSWER_SHARE_LATER
             };
         }
         let group = self.registry.default_group;
@@ -10745,6 +10905,14 @@ impl Slots {
     /// Only the default group has fallback views (TASK-069).
     fn adopt_fallback(&mut self, slot: SlotId, author: Option<&str>) -> Option<ShareOutcome> {
         let default = self.registry.default_chat();
+        // One held for the group picker is the slot's again (TASK-069).
+        if let Some((view, _)) = self
+            .choosing
+            .remove(&slot)
+            .and_then(|choosing| choosing.held)
+        {
+            self.registry.put_back_view(slot, *view);
+        }
         let fallback = self
             .registry
             .slot(slot)?
@@ -10760,10 +10928,38 @@ impl Slots {
         Some(ShareOutcome::Shared)
     }
 
-    /// The group picker of `slot` opens (TASK-069): a fallback view of it in
-    /// the default group stays while its owner chooses, so picking the
-    /// default group takes that topic over ([`Self::adopt_fallback`]).
-    fn keep_fallback_for_pick(&mut self, slot: SlotId) {
+    /// Opens the group picker of `slot` from its owner's private chat
+    /// `chat`, into the topic `place` names once the chat is open again
+    /// (TASK-069). For a share (`share`) a fallback view of the slot in the
+    /// default group is held while the owner picks, so picking the default
+    /// group takes that topic over ([`Self::adopt_fallback`]); when the
+    /// picker did not go, it ends at once as before. `true`: it went.
+    fn open_picker(
+        &mut self,
+        slot: SlotId,
+        chat: Chat,
+        share: bool,
+        place: impl FnOnce(&Self) -> Option<Place>,
+    ) -> bool {
+        if share {
+            self.hold_for_pick(slot);
+        }
+        self.reopen(chat);
+        let sent = place(self).is_some_and(|place| self.send_picker(slot, place));
+        if !sent {
+            self.end_choosing(slot);
+        }
+        sent
+    }
+
+    /// `slot` starts (or goes on) waiting for its owner's pick with its
+    /// fallback view held, when it has one ([`Self::drop_fallback_views`]).
+    fn hold_for_pick(&mut self, slot: SlotId) {
+        let until = Instant::now() + PICK_KEEPS_FALLBACK;
+        if let Some(choosing) = self.choosing.get_mut(&slot) {
+            choosing.until = until;
+            return;
+        }
         let default = self.registry.default_chat();
         let fallback = self.registry.slot(slot).is_some_and(|entry| {
             entry
@@ -10772,8 +10968,7 @@ impl Slots {
                 .any(|view| view.chat == default && view.fallback)
         });
         if fallback {
-            self.choosing
-                .insert(slot, Instant::now() + PICK_KEEPS_FALLBACK);
+            self.choosing.insert(slot, Choosing { until, held: None });
         }
     }
 
@@ -10982,8 +11177,8 @@ impl Slots {
                 let adopted = (group == self.registry.default_group)
                     .then(|| self.adopt_fallback(slot, input.display_name.as_deref()))
                     .flatten();
-                // Chosen: a fallback view kept for the choice goes now.
-                self.choosing.remove(&slot);
+                // Chosen: a fallback view held for the choice ends now.
+                self.end_choosing(slot);
                 self.reopen(chat);
                 adopted
                     .unwrap_or_else(|| self.share_slot(slot, group, input.display_name.as_deref()))
@@ -12167,24 +12362,7 @@ impl Slots {
                 Some(Err(error)) => debug!(%error, "forum service message not deleted"),
             },
             Done::Message { chat, delivery } => {
-                let left = match self.counted_apart(chat) {
-                    Some(chat) => {
-                        let count = self.queued_apart.entry(chat).or_default();
-                        *count = count.saturating_sub(1);
-                        let left = *count;
-                        if left == 0 {
-                            self.queued_apart.remove(&chat);
-                        }
-                        left
-                    }
-                    None => {
-                        self.queued_messages = self.queued_messages.saturating_sub(1);
-                        self.queued_messages
-                    }
-                };
-                if left == 0 {
-                    self.overflow_warned = false;
-                }
+                self.uncount_queued(chat, 1);
                 match delivery {
                     Some(Ok(_)) => {}
                     Some(Err(error)) => warn!(%error, "message to a topic not delivered"),
@@ -12273,8 +12451,9 @@ impl Slots {
             Done::Stream {
                 session,
                 number,
+                chat,
                 delivery,
-            } => self.on_stream_done(&session, number, delivery),
+            } => self.on_stream_sent(&session, number, chat, delivery),
             Done::Reaction(delivery) => {
                 self.reactions = self.reactions.saturating_sub(1);
                 self.on_reaction_done(delivery);
@@ -12293,15 +12472,17 @@ impl Slots {
                 conn,
                 transfer_id,
                 size,
+                chat,
                 delivery,
-            } => self.on_file_done(conn, transfer_id, size, delivery),
+            } => self.on_file_done(conn, transfer_id, size, chat, delivery),
             Done::Album {
                 conn,
                 transfer_id,
                 size,
                 parts,
+                chat,
                 delivery,
-            } => self.on_album_done(conn, transfer_id, size, &parts, delivery),
+            } => self.on_album_done(conn, transfer_id, size, &parts, chat, delivery),
             Done::TopicDeleted { place, delivery } => self.on_topic_deleted(place, delivery),
             Done::Menu { job, delivery } => self.on_menu_done(job, delivery),
             Done::Picker(delivery) => {
@@ -13296,6 +13477,7 @@ async fn dispatch_loop(
                 Work::Stream { session, number } => Done::Stream {
                     session,
                     number,
+                    chat,
                     delivery,
                 },
                 Work::Reaction => Done::Reaction(delivery),
@@ -13313,6 +13495,7 @@ async fn dispatch_loop(
                     conn,
                     transfer_id,
                     size,
+                    chat,
                     delivery,
                 },
                 Work::Album {
@@ -13325,6 +13508,7 @@ async fn dispatch_loop(
                     transfer_id,
                     size,
                     parts,
+                    chat,
                     delivery,
                 },
                 Work::DeleteTopic(place) => Done::TopicDeleted { place, delivery },
@@ -24495,6 +24679,7 @@ again"
             conn: 1,
             transfer_id: 1,
             size,
+            chat: None,
             delivery: Some(Ok(Outcome::Sent(Message::default()))),
         });
         assert_eq!(file_answers(&mut agent), [(1, FileOutcome::Sent)]);
@@ -24510,6 +24695,7 @@ again"
             conn: 1,
             transfer_id: 2,
             size: 5,
+            chat: None,
             delivery: Some(Err(ApiError::Telegram {
                 code: 400,
                 description: "Bad Request: file is empty".into(),
@@ -24685,6 +24871,7 @@ again"
             transfer_id: 1,
             size: (png.len() + jpeg.len()) as u64,
             parts: vec![0, 2],
+            chat: None,
             delivery: Some(Ok(Outcome::Sent(Message::default()))),
         });
         assert!(
@@ -24696,6 +24883,7 @@ again"
             transfer_id: 1,
             size: 8,
             parts: vec![1, 3],
+            chat: None,
             delivery: Some(Err(ApiError::Telegram {
                 code: 400,
                 description: "Bad Request: file is empty".into(),
@@ -24730,6 +24918,7 @@ again"
                 transfer_id: 2,
                 size,
                 parts,
+                chat: None,
                 delivery: None,
             });
         }
@@ -32683,14 +32872,31 @@ again"
         slots.pump();
         let handed = all_work(&mut work);
         assert!(sends_into(&handed, Place::topic(def, 100)).is_empty());
-        assert_eq!(
-            fallback(&slots),
-            Some((true, Some(100))),
-            "kept while picking"
+        // Held out of the registry while the owner picks (review round 2):
+        // no mirror, so what the owner writes stays in the private chat.
+        assert_eq!(fallback(&slots), None, "held, not a view");
+        let held = |slots: &Slots| {
+            slots
+                .choosing
+                .get(&SlotId(0))
+                .and_then(|choosing| choosing.held.as_ref())
+                .map(|(view, _)| (view.fallback, view.topic_id))
+        };
+        assert_eq!(held(&slots), Some((true, Some(100))));
+        assert!(
+            !slots
+                .registry
+                .mirrors(SlotId(0))
+                .contains(&Place::topic(def, 100))
         );
-        // The next pumps keep it too.
+        slots.on_control(owner_says(Some(700), 5002, "private secret"));
         slots.pump();
-        assert_eq!(fallback(&slots), Some((true, Some(100))));
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().all(|(_, op)| op.chat() != Some(def)),
+            "nothing goes to the held topic: {handed:#?}"
+        );
+        assert_eq!(held(&slots), Some((true, Some(100))));
         slots.on_control(press_in(owner, 700, 6000, &format!("grp:0:{DEF}:s")));
         slots.pump();
         let handed = all_work(&mut work);
@@ -32854,5 +33060,163 @@ again"
         });
         assert!(slots.send_as(true, vec![message_op(b_200(), "again".into())]));
         assert_eq!(slots.queued_messages, base + 1);
+    }
+
+    /// Slot 0 of `private_slot` with agent 1 bound, its private chat closed
+    /// and opened again: a fallback view in the default group (topic 100),
+    /// and a second group B the owner may pick.
+    fn fallback_and_b(dir: &TempDir) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = private_slot(dir, private_only_options());
+        connect(&mut slots, 1, A, Some(10));
+        slots.close_chat(private_owner());
+        slots.pump();
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        slots
+            .registry
+            .join_group(GroupChat::of(B_ID), Some("Бета".into()), true, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(slots.registry.slots[0].views[1].fallback);
+        (slots, work)
+    }
+
+    /// (TASK-069 review round 2, 1) A fallback held for the picker gets
+    /// nothing, and ends as a fallback ends once the hold runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_fallback_ends_once_the_pick_times_out() {
+        let dir = TempDir::new("slots-groups-held-expiry");
+        let (mut slots, mut work) = fallback_and_b(&dir);
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        assert!(sends_into(&all_work(&mut work), group_100()).is_empty());
+        assert!(slots.choosing[&SlotId(0)].held.is_some());
+        tokio::time::advance(PICK_KEEPS_FALLBACK - Duration::from_secs(1)).await;
+        slots.pump();
+        assert!(
+            all_work(&mut work)
+                .iter()
+                .all(|(_, op)| op.chat() != Some(Chat::GROUP))
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(sends_into(&handed, group_100()), [FALLBACK_END_NOTICE]);
+        assert!(slots.choosing.is_empty());
+        assert!(
+            !slots.registry.slots[0]
+                .views
+                .iter()
+                .any(|view| view.chat == Chat::GROUP)
+        );
+    }
+
+    /// (TASK-069 review round 2, 1) Only a share holds the fallback, and
+    /// only when the picker went: `/unshare` and a picker the full queue
+    /// dropped end it at once, as before.
+    #[tokio::test]
+    async fn only_a_picker_for_a_share_that_went_holds_the_fallback() {
+        let dir = TempDir::new("slots-groups-held-unshare");
+        let (mut slots, mut work) = fallback_and_b(&dir);
+        slots.on_control(owner_says(Some(700), 5001, "/unshare"));
+        slots.pump();
+        assert!(slots.choosing.is_empty());
+        assert!(
+            sends_into(&all_work(&mut work), group_100())
+                .iter()
+                .any(|text| text == FALLBACK_END_NOTICE)
+        );
+        let dir = TempDir::new("slots-groups-held-full");
+        let (mut slots, _work) = fallback_and_b(&dir);
+        slots.queued_messages = MAX_QUEUED_MESSAGES;
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        assert!(slots.choosing.is_empty(), "the picker did not go");
+        assert!(
+            !slots.registry.slots[0]
+                .views
+                .iter()
+                .any(|view| view.chat == Chat::GROUP)
+        );
+    }
+
+    /// (TASK-069 review round 2, 2) A hub restart while the owner picks:
+    /// the held view is not in `registry.json`, so the new run knows no
+    /// view there and writes nothing to that topic; picking the default
+    /// group then makes a new topic (the known limit).
+    #[tokio::test]
+    async fn a_restart_while_picking_forgets_the_held_fallback_safely() {
+        let dir = TempDir::new("slots-groups-held-restart");
+        let (mut slots, mut work) = fallback_and_b(&dir);
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        let mut registry = slots.registry.clone();
+        registry.after_restart();
+        drop(slots);
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(registry, store, outbox, private_only_options());
+        let mut work = capture_dispatch(&mut slots);
+        connect(&mut slots, 1, A, Some(10));
+        slots.pump();
+        assert!(
+            !slots.registry.slots[0]
+                .views
+                .iter()
+                .any(|view| view.chat == Chat::GROUP)
+        );
+        assert!(
+            all_work(&mut work)
+                .iter()
+                .all(|(_, op)| op.place() != Some(group_100()))
+        );
+        assert!(slots.choosing.is_empty());
+        // No fallback to take over: a pick of the default group shares
+        // into a new topic.
+        assert!(slots.adopt_fallback(SlotId(0), None).is_none());
+    }
+
+    /// (TASK-069 review round 2, 3) A slot whose primary view is in group
+    /// B (its private chat closed, shown only in B): its stream messages
+    /// count by B, so a paused B holds back no other chat's stream.
+    #[tokio::test]
+    async fn a_stream_into_another_group_counts_by_that_group() {
+        let dir = TempDir::new("slots-groups-stream-apart");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        connect(&mut slots, 1, A, Some(10));
+        slots
+            .registry
+            .join_group(GroupChat::of(B_ID), Some("Бета".into()), true, true);
+        slots.registry.share(
+            SlotId(0),
+            group_b(),
+            crate::hub::registry::share_line(SHARER),
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), group_b(), 200, "t", None);
+        slots.close_chat(private_owner());
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert_eq!(slots.registry.place(SlotId(0)), Some(b_200()));
+        assert_eq!(slots.stream_chat(A), Some(group_b()));
+        let base = slots.queued_messages;
+        let ops: Vec<(u64, Op)> = (0..STREAM_QUEUE as u64)
+            .map(|number| (number, message_op(b_200(), format!("line {number}"))))
+            .collect();
+        slots.stream_answer(A, ops);
+        assert_eq!(slots.queued_messages, base, "B counts apart");
+        assert_eq!(slots.queued_for(Some(group_b())), STREAM_QUEUE);
+        assert!(slots.queued_for(Some(private_owner())) < STREAM_QUEUE);
+        slots.on_stream_sent(A, 0, Some(group_b()), None);
+        assert_eq!(slots.queued_for(Some(group_b())), STREAM_QUEUE - 1);
+        assert_eq!(slots.queued_messages, base);
     }
 }
