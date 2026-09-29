@@ -132,6 +132,23 @@ impl Backlog {
     /// newest always stays).
     pub fn push(&mut self, part: String) {
         self.parts.push_back(part);
+        self.keep_caps();
+    }
+
+    /// The oldest part equal to `old` becomes `new` (a voice message
+    /// recognized after it was kept, TASK-085), within the same caps as
+    /// [`Backlog::push`]; `false` when no part equals `old` (a mention took
+    /// the backlog meanwhile).
+    pub fn replace(&mut self, old: &str, new: String) -> bool {
+        let Some(part) = self.parts.iter_mut().find(|part| *part == old) else {
+            return false;
+        };
+        *part = new;
+        self.keep_caps();
+        true
+    }
+
+    fn keep_caps(&mut self) {
         while self.parts.len() > 1
             && (self.parts.len() > MAX_BACKLOG
                 || self.parts.iter().map(String::len).sum::<usize>() > MAX_BACKLOG_BYTES)
@@ -186,8 +203,26 @@ pub fn part(
         from_name: from_name.map(str::to_owned),
         history: None,
         mention: false,
+        voice: None,
     }
     .content()
+}
+
+/// [`part`] of a voice message recognized as `heard` (TASK-085): its words
+/// instead of the placeholder, then its caption on a line of its own.
+pub fn heard_part(
+    text: &str,
+    quote: Option<&str>,
+    from_name: Option<&str>,
+    forwarded: bool,
+    heard: &str,
+) -> String {
+    let words = if text.is_empty() {
+        format!("[голосовое, распознано] {heard}")
+    } else {
+        format!("[голосовое, распознано] {heard}\n{text}")
+    };
+    part(&words, quote, from_name, forwarded, None)
 }
 
 /// The kept messages as one text, [`PART_SEPARATOR`] between them.
@@ -405,6 +440,54 @@ mod tests {
             ),
             "Иван: [фото] схема"
         );
+    }
+
+    /// TASK-085: a recognized voice message reads like its part, with its
+    /// words instead of the placeholder.
+    #[test]
+    fn a_heard_part_is_the_part_with_the_words() {
+        let voice = Attachment {
+            kind: FileKind::Voice,
+            file_id: "v".into(),
+            name: None,
+            size: None,
+        };
+        assert_eq!(
+            part("", Some("вопрос"), Some("Анна"), false, Some(&voice)),
+            "> вопрос\n\nАнна: [голосовое]"
+        );
+        assert_eq!(
+            heard_part("", Some("вопрос"), Some("Анна"), false, "да"),
+            "> вопрос\n\nАнна: [голосовое, распознано] да"
+        );
+        assert_eq!(
+            heard_part("подпись", None, None, true, "да"),
+            "(переслано)\n[голосовое, распознано] да\nподпись"
+        );
+    }
+
+    #[test]
+    fn a_replaced_part_is_the_oldest_equal_one_within_the_caps() {
+        let mut backlog = Backlog::default();
+        for part in ["a", "[голосовое]", "b", "[голосовое]"] {
+            backlog.push(part.into());
+        }
+        assert!(backlog.replace("[голосовое]", "слова".into()));
+        assert_eq!(backlog.parts, ["a", "слова", "b", "[голосовое]"]);
+        assert!(!backlog.replace("нет такой", "x".into()));
+        assert_eq!(backlog.dropped, 0);
+        // A longer part pushes the oldest out of the byte cap.
+        let mut backlog = Backlog::default();
+        for n in 0..15 {
+            backlog.push(format!("{n:04}{}", "x".repeat(4092)));
+        }
+        backlog.push("[голосовое]".into());
+        assert_eq!((backlog.parts.len(), backlog.dropped), (16, 0));
+        assert!(backlog.replace("[голосовое]", "y".repeat(8192)));
+        assert_eq!(backlog.parts.len(), 15);
+        assert_eq!(backlog.dropped, 1);
+        assert!(backlog.parts[0].starts_with("0001"));
+        assert_eq!(backlog.parts.back().map(String::len), Some(8192));
     }
 
     #[test]

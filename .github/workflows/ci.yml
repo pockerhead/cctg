@@ -53,6 +53,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked --no-fail-fast
+      # The voice recognition helper of the hub image (TASK-085): its own
+      # workspace, linked with the static sherpa-onnx libraries (Linux only),
+      # the archive checked like in the Dockerfile.
+      - name: voice helper
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa
+        run: |
+          archive=sherpa-onnx-v1.13.8-linux-x64-static-lib.tar.bz2
+          mkdir -p "$SHERPA_ONNX_ARCHIVE_DIR"
+          curl -fsSL -o "$SHERPA_ONNX_ARCHIVE_DIR/$archive" \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/$archive"
+          echo "e1fdc5b67530e15741ef897fa5ffff297056f3bf0c6d829a27af9225a4c4b5a6  $SHERPA_ONNX_ARCHIVE_DIR/$archive" | sha256sum -c -
+          cargo fmt --manifest-path crates/voice/Cargo.toml -- --check
+          cargo clippy --manifest-path crates/voice/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path crates/voice/Cargo.toml --locked
 
   image:
     runs-on: ubuntu-latest

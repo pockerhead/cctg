@@ -115,7 +115,7 @@ async fn hand<F: Fetch>(fetch: &F, job: &Job) -> Fetched {
         return Fetched::LinkClosed;
     }
     let kind = job.file.kind;
-    let download = match download(fetch, &job.file.file_id).await {
+    let download = match download(fetch, &job.file.file_id, files::MAX_DOWNLOAD).await {
         Ok(download) => download,
         Err(error) if error.is_too_big() => {
             info!(
@@ -153,11 +153,15 @@ async fn hand<F: Fetch>(fetch: &F, job: &Job) -> Fetched {
     Fetched::Handed { size }
 }
 
-/// [`Fetch::fetch`] with the tries of [`TRIES`].
-async fn download<F: Fetch>(fetch: &F, file_id: &str) -> Result<Download, ApiError> {
+/// [`Fetch::fetch`] of at most `limit` bytes with the tries of [`TRIES`].
+pub(super) async fn download<F: Fetch>(
+    fetch: &F,
+    file_id: &str,
+    limit: u64,
+) -> Result<Download, ApiError> {
     let mut tried = 1;
     loop {
-        let error = match fetch.fetch(file_id, files::MAX_DOWNLOAD).await {
+        let error = match fetch.fetch(file_id, limit).await {
             Ok(download) => return Ok(download),
             Err(error) => error,
         };

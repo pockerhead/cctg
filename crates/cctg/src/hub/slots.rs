@@ -116,6 +116,19 @@
 //! within [`COMPACT_GRACE`] after that still gives the done line (the hooks
 //! are separate POSTs and can arrive in either order).
 //!
+//! Voice messages (TASK-085, see [`voice`]): with [`Slots::recognize_voices`]
+//! a voice message kept for the session waits in its slot, ahead of what
+//! came after it, until it is recognized; its words are posted in its topic
+//! as a reply to it ([`buffer::VOICE_HEARD_PREFIX`]) and it goes on once
+//! Telegram answered that post, as its file with the words in its content.
+//! Without recognition, a voice too long, a failure or no result within
+//! `Options::hear_wait`, it goes as a file marked unheard and its author is
+//! told why; a post Telegram does not answer within `Options::show_wait`
+//! holds it no longer. The echo of a voice message in the slot's other
+//! views waits for its words. A voice message kept for a mention
+//! (TASK-077) is recognized too: its words replace its placeholder in the
+//! group backlog.
+//!
 //! Client updates (TASK-040): an agent registers with its cctg build. A
 //! live current session whose agent runs another build than the hub (or is
 //! too old to say) is outdated: its topic gets one warning per hub build with
@@ -355,7 +368,7 @@ use transcript::{
 };
 
 use super::api::{ApiError, ChatInfo, ChatMember, Document, FLOOD_WINDOW, Floods};
-use super::buffer::{self, Attachment, Parked, ResumeNote};
+use super::buffer::{self, Attachment, Parked, ResumeNote, Voice, VoiceState};
 use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
 use super::config::Allowlist;
@@ -384,12 +397,14 @@ use super::subagents::{
 use super::updates::{
     self, CallbackInput, ConnectInput, ForwardInput, Inbound, InviteInput, MemberUpdate, Origin,
 };
+use super::voice::{self, Hear, Heard};
 use crate::channel::is_request_id;
 use crate::files;
 use crate::wire::{
-    AgentMsg, Answered, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileOutcome,
-    FilePart, HookEvent, HookPost, HubMsg, MAX_ALBUM, PermissionPost, PermissionRequest,
-    QUESTION_TOOL, SessionAnswer, SessionAsk, StreamItem, StreamLine, UpdateOutcome,
+    AgentMsg, Answered, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind,
+    FileOutcome, FilePart, HookEvent, HookPost, HubMsg, MAX_ALBUM, PermissionPost,
+    PermissionRequest, QUESTION_TOOL, SessionAnswer, SessionAsk, StreamItem, StreamLine,
+    UpdateOutcome,
 };
 
 /// The longest text one session read may bring, as the agent sends at most
@@ -508,6 +523,12 @@ pub const GATHER_QUIET: Duration = Duration::from_millis(2500);
 /// A burst goes at most this long after its first message, however steady
 /// the stream.
 pub const GATHER_MAX: Duration = Duration::from_secs(6);
+/// A voice message waits at most this long for its recognition, the queue
+/// and the download included (TASK-085); then it goes unheard.
+pub const HEAR_WAIT: Duration = Duration::from_secs(180);
+/// A recognized voice message waits at most this long for Telegram to
+/// answer the post with its words (TASK-085).
+pub const SHOW_WAIT: Duration = Duration::from_secs(30);
 /// Content of one burst inbound at most (the first message always goes);
 /// the rest of the burst follows in the next one. A link line holds
 /// [`crate::wire::MAX_LINE`], and a JSON escape takes up to 6 bytes per byte.
@@ -739,6 +760,10 @@ pub struct Options {
     /// A cleanup takes a slot dead at least this long, whatever its age:
     /// a `/clear` or a client restart leaves a slot dead for seconds.
     pub dead_grace: Duration,
+    /// [`HEAR_WAIT`] in the hub.
+    pub hear_wait: Duration,
+    /// [`SHOW_WAIT`] in the hub.
+    pub show_wait: Duration,
 }
 
 /// Who the agent is in a group topic (TASK-077): `getMe`'s id and username.
@@ -777,6 +802,47 @@ struct MentionAlbum {
     /// Its files kept for the next mention before one of them addressed
     /// the agent, oldest first, each with its part in the group backlog.
     kept: Vec<(Inbound, String)>,
+}
+
+/// A voice message being recognized (TASK-085).
+#[derive(Debug)]
+struct Hearing {
+    slot: SlotId,
+    /// The topic it was sent in: the post with its words goes there, also
+    /// when the message left the slot meanwhile.
+    place: Place,
+    target: HearTarget,
+    /// It goes unheard then.
+    until: Instant,
+    /// `Some(author)`: its echo in the slot's other views waits for its
+    /// words. `None` after a restart and for a message kept for a mention.
+    echo: Option<Option<String>>,
+}
+
+/// Where the words of a voice message go.
+#[derive(Debug)]
+enum HearTarget {
+    /// The message kept in the slot's buffer.
+    Parked,
+    /// Group backlog part `part` (TASK-077), from the rest of the fields.
+    Backlog {
+        part: String,
+        text: String,
+        quote: Option<String>,
+        from_name: Option<String>,
+        forwarded: bool,
+    },
+}
+
+/// The post with the words of a kept voice message on its way to Telegram
+/// (TASK-085): the message waits for it.
+#[derive(Debug, Clone, Copy)]
+struct Showing {
+    slot: SlotId,
+    /// Messages of the post not answered yet.
+    parts: usize,
+    /// It waits no longer then.
+    until: Instant,
 }
 
 /// The kept file of a slot on its way to an agent.
@@ -877,6 +943,8 @@ impl Default for Options {
             cleanup_gap_group: Duration::from_secs(15),
             cleanup_gap_private: Duration::from_secs(2),
             dead_grace: Duration::from_secs(60),
+            hear_wait: HEAR_WAIT,
+            show_wait: SHOW_WAIT,
         }
     }
 }
@@ -1021,6 +1089,18 @@ enum Done {
         slot: SlotId,
         transfer_id: u64,
         outcome: Fetched,
+    },
+    /// The recognition task is done with a voice message (TASK-085).
+    Voice {
+        job: voice::Job,
+        heard: Heard,
+    },
+    /// A message of the post with the words of voice message `message`,
+    /// into `chat`, was answered.
+    Heard {
+        message: MessageKey,
+        chat: Option<Chat>,
+        delivery: Option<Delivery>,
     },
     /// A file of an agent's `send_file`, into `chat`.
     File {
@@ -1366,6 +1446,11 @@ enum Work {
     /// What the session says: a turn answer or a reply. Like `Message`, but
     /// «Всё» rings it; notices stay quiet (TASK-073).
     Content,
+    /// The words of voice message `message` (TASK-085): like `Answer`; the
+    /// message waits for the answer.
+    Heard {
+        message: MessageKey,
+    },
     Permission(u64),
     PromptEdit(u64),
     Question {
@@ -1899,6 +1984,13 @@ pub struct Slots {
     link_losses: HashMap<SlotId, (MessageKey, u32)>,
     /// Bursts of topic messages being gathered, by slot.
     gathers: HashMap<SlotId, Gather>,
+    /// The recognition task, once [`Slots::recognize_voices`] started it
+    /// (TASK-085).
+    voices: Option<mpsc::Sender<voice::Job>>,
+    /// Voice messages being recognized.
+    hearing: HashMap<MessageKey, Hearing>,
+    /// Recognized voice messages waiting for the post with their words.
+    showing: HashMap<MessageKey, Showing>,
     /// When topic texts last went to a session, within
     /// `Options::inbound_settle`.
     handed_at: HashMap<String, Instant>,
@@ -2141,6 +2233,9 @@ impl Slots {
             fetching: HashMap::new(),
             link_losses: HashMap::new(),
             gathers: HashMap::new(),
+            voices: None,
+            hearing: HashMap::new(),
+            showing: HashMap::new(),
             handed_at: HashMap::new(),
             unseen: HashMap::new(),
             channel_off_told: HashSet::new(),
@@ -2251,6 +2346,54 @@ impl Slots {
             },
         ));
         self.fetcher = Some(jobs);
+    }
+
+    /// Starts the task that downloads voice messages of topics with `fetch`
+    /// and turns them into words with `hear` (TASK-085); call before
+    /// [`Self::run`]. Without it a voice message goes as a file, unheard,
+    /// with [`buffer::VOICE_OFF_NOTICE`]. Voice messages a restart left
+    /// being recognized are asked again.
+    pub fn recognize_voices<F: Fetch, H: Hear>(&mut self, fetch: Arc<F>, hear: Arc<H>) {
+        let (jobs, jobs_rx) = mpsc::channel(voice::VOICE_QUEUE);
+        let done = self.done_tx.clone();
+        tokio::spawn(voice::serve(fetch, hear, jobs_rx, move |job, heard| {
+            let _ = done.send(Done::Voice { job, heard });
+        }));
+        self.voices = Some(jobs);
+        let pending: Vec<(SlotId, Parked)> = self
+            .registry
+            .slots
+            .iter()
+            .enumerate()
+            .flat_map(|(index, entry)| {
+                entry
+                    .buffer
+                    .messages
+                    .iter()
+                    .filter(|parked| parked.voice_pending())
+                    .map(move |parked| (SlotId(index), parked.clone()))
+            })
+            .collect();
+        for (slot, parked) in pending {
+            let file_id = parked
+                .file
+                .as_ref()
+                .map(|file| file.file_id.clone())
+                .unwrap_or_default();
+            let asked = !file_id.is_empty()
+                && self.ask_voice(
+                    slot,
+                    parked.place(),
+                    parked.key(),
+                    file_id,
+                    HearTarget::Parked,
+                    None,
+                );
+            if !asked {
+                self.set_voice(slot, parked.key(), VoiceState::Unheard, String::new());
+                self.notify_author(slot, parked.place(), buffer::VOICE_FAILED_NOTICE);
+            }
+        }
     }
 
     /// The channel for `PermissionRequest` hooks
@@ -2460,6 +2603,13 @@ impl Slots {
                 .filter(|at| *at > now)
                 .fold(deadline, Instant::min)
         };
+        // A voice message's waits end on the tick, past ones at once.
+        let deadline = self
+            .hearing
+            .values()
+            .map(|hearing| hearing.until)
+            .chain(self.showing.values().map(|showing| showing.until))
+            .fold(deadline, Instant::min);
         // A refused stream reads (or, once its session left the slot, sends)
         // again at its retry, and a drain holds the next separator for a
         // bounded time; a past read time the pump did not act on waits for
@@ -4175,6 +4325,7 @@ impl Slots {
     /// slot's session.
     fn take_in(&mut self, slot: SlotId, place: Place, thread_id: i64, input: Inbound) {
         let key = input.key();
+        let duration = input.media.as_ref().and_then(|media| media.duration);
         // A message that addresses the agent (TASK-080) in a group the slot
         // is shared to from its owner's private chat (TASK-077's mentions,
         // in either mode; never the slot's own group topic, a fallback view
@@ -4224,15 +4375,39 @@ impl Slots {
             self.on_console_command(slot, place, input.message_id, command);
             return;
         }
+        // A voice message is recognized first (TASK-085).
+        let voice = file
+            .as_ref()
+            .filter(|file| file.kind == FileKind::Voice)
+            .map(|file| {
+                let state = self.start_voice(
+                    slot,
+                    Place::topic(input.chat, thread_id),
+                    key,
+                    file,
+                    duration,
+                    input.author.clone(),
+                );
+                Voice {
+                    state,
+                    text: String::new(),
+                }
+            });
         // Whoever reads another view of the slot sees what the session is
-        // told, signed (TASK-063); the session gets it once, from here.
-        let echo = echo_text(
-            input.author.as_deref(),
-            input.forwarded,
-            &text,
-            file.as_ref(),
-        );
-        self.echo(slot, place, echo);
+        // told, signed (TASK-063); the session gets it once, from here. A
+        // voice message's echo waits for its words.
+        if voice
+            .as_ref()
+            .is_none_or(|voice| voice.state != VoiceState::Pending)
+        {
+            let echo = echo_text(
+                input.author.as_deref(),
+                input.forwarded,
+                &text,
+                file.as_ref(),
+            );
+            self.echo(slot, place, echo);
+        }
         if file.is_some() {
             self.end_gather(slot);
         } else {
@@ -4257,9 +4432,315 @@ impl Slots {
                 from_name: input.from_name,
                 history,
                 mention: mention_of.is_some(),
+                voice,
             },
         );
         self.flush(slot);
+    }
+
+    /// Voice message `message` of `slot`, sent in topic `place`, is to be
+    /// recognized for the session (TASK-085): its state until then. Its
+    /// author hears why it will not be.
+    fn start_voice(
+        &mut self,
+        slot: SlotId,
+        place: Place,
+        message: MessageKey,
+        file: &Attachment,
+        duration: Option<u64>,
+        author: Option<String>,
+    ) -> VoiceState {
+        let ordinal = self.ordinal(slot);
+        let notice = if self.voices.is_none() {
+            buffer::VOICE_OFF_NOTICE
+        } else if !voice_fits(duration, file.size) {
+            info!(ordinal, "voice message too long to recognize");
+            buffer::VOICE_TOO_LONG_NOTICE
+        } else if self.ask_voice(
+            slot,
+            place,
+            message,
+            file.file_id.clone(),
+            HearTarget::Parked,
+            Some(author),
+        ) {
+            return VoiceState::Pending;
+        } else {
+            buffer::VOICE_FAILED_NOTICE
+        };
+        self.notify_author(slot, place, notice);
+        VoiceState::Unheard
+    }
+
+    /// Hands voice message `message` to the recognition task. `false`: no
+    /// task, or its queue is full.
+    fn ask_voice(
+        &mut self,
+        slot: SlotId,
+        place: Place,
+        message: MessageKey,
+        file_id: String,
+        target: HearTarget,
+        echo: Option<Option<String>>,
+    ) -> bool {
+        let ordinal = self.ordinal(slot);
+        let Some(voices) = &self.voices else {
+            return false;
+        };
+        let until = Instant::now() + self.options.hear_wait;
+        let job = voice::Job {
+            slot,
+            message,
+            file_id,
+            until,
+        };
+        if voices.try_send(job).is_err() {
+            info!(
+                ordinal,
+                "voice recognition queue full; the voice message is not recognized"
+            );
+            return false;
+        }
+        debug!(ordinal, "voice message being recognized");
+        self.hearing.insert(
+            message,
+            Hearing {
+                slot,
+                place,
+                target,
+                until,
+                echo,
+            },
+        );
+        true
+    }
+
+    /// Voice message `message` kept in `slot`, still being recognized,
+    /// becomes `state` (with its words `text` when heard): the message as
+    /// it is now, `None` when it is not kept or not pending any more.
+    fn set_voice(
+        &mut self,
+        slot: SlotId,
+        message: MessageKey,
+        state: VoiceState,
+        text: String,
+    ) -> Option<Parked> {
+        let parked = self
+            .registry
+            .slot_mut(slot)?
+            .buffer
+            .messages
+            .iter_mut()
+            .find(|parked| parked.key() == message && parked.voice_pending())?;
+        parked.voice = Some(Voice { state, text });
+        let parked = parked.clone();
+        self.registry.dirty = true;
+        Some(parked)
+    }
+
+    /// The recognition task is done with voice message `job` (TASK-085). A
+    /// result after its `Options::hear_wait` is dropped: the message went
+    /// on unheard.
+    fn on_voice(&mut self, job: voice::Job, heard: Heard) {
+        let message = job.message;
+        let Some(hearing) = self.hearing.remove(&message) else {
+            debug!("late voice recognition result dropped");
+            return;
+        };
+        let Hearing {
+            slot,
+            place,
+            target,
+            echo,
+            ..
+        } = hearing;
+        let ordinal = self.ordinal(slot);
+        let outcome = match &heard {
+            Heard::Text(_) => "heard",
+            Heard::Silent => "silent",
+            Heard::TooLong => "too_long",
+            Heard::Failed => "failed",
+        };
+        info!(ordinal, outcome, "voice message recognition done");
+        if !self.voice_topic(slot, place) {
+            // Its words are shown nowhere, so none reach the session: a kept
+            // message goes on unheard, a backlog keeps its placeholder.
+            info!(
+                ordinal,
+                "topic of a voice message gone or archived; its words are not shown"
+            );
+            if matches!(target, HearTarget::Parked)
+                && self
+                    .set_voice(slot, message, VoiceState::Unheard, String::new())
+                    .is_some()
+            {
+                self.flush(slot);
+            }
+            return;
+        }
+        match target {
+            HearTarget::Parked => {
+                let parked = match heard {
+                    Heard::Text(words) => {
+                        if let Some(parts) = self.post_heard(place, message, &words) {
+                            let until = Instant::now() + self.options.show_wait;
+                            self.showing.insert(message, Showing { slot, parts, until });
+                        }
+                        self.set_voice(slot, message, VoiceState::Heard, words)
+                    }
+                    other => {
+                        let notice = if other == Heard::TooLong {
+                            buffer::VOICE_TOO_LONG_NOTICE
+                        } else {
+                            buffer::VOICE_FAILED_NOTICE
+                        };
+                        let parked =
+                            self.set_voice(slot, message, VoiceState::Unheard, String::new());
+                        if parked.is_some() {
+                            self.notify_author(slot, place, notice);
+                        }
+                        parked
+                    }
+                };
+                if let (Some(parked), Some(author)) = (parked, echo) {
+                    self.echo_voice(slot, place, author.as_deref(), &parked);
+                }
+                self.flush(slot);
+            }
+            HearTarget::Backlog {
+                part,
+                text,
+                quote,
+                from_name,
+                forwarded,
+            } => {
+                let Heard::Text(words) = heard else {
+                    return;
+                };
+                self.post_heard(place, message, &words);
+                let heard_part = mention::heard_part(
+                    &text,
+                    quote.as_deref(),
+                    from_name.as_deref(),
+                    forwarded,
+                    &words,
+                );
+                if let Some(view) = self
+                    .registry
+                    .slot_mut(slot)
+                    .and_then(|entry| entry.view_mut(place.chat))
+                    && view.backlog.replace(&part, heard_part)
+                {
+                    self.registry.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Topic `place` of a voice message of `slot` still shows that slot: the
+    /// slot is not archived (TASK-074) and the topic is one of its views.
+    fn voice_topic(&self, slot: SlotId, place: Place) -> bool {
+        self.registry
+            .slot(slot)
+            .is_some_and(|entry| !entry.archived)
+            && self.registry.slot_by_topic(place) == Some(slot)
+    }
+
+    /// Posts the words of voice message `message` into `place` as a reply
+    /// to it: the number of messages handed out, `None` when the queue had
+    /// no room.
+    fn post_heard(&mut self, place: Place, message: MessageKey, words: &str) -> Option<usize> {
+        let text = format!("{}{words}", buffer::VOICE_HEARD_PREFIX);
+        let ops: Vec<Op> = split_for_telegram(&text, SplitOptions::default())
+            .chunks
+            .into_iter()
+            .map(|chunk| {
+                let mut op = message_op(place, chunk);
+                if let Op::Send { reply_to, .. } = &mut op {
+                    *reply_to = Some(message.id);
+                }
+                op
+            })
+            .collect();
+        let parts = ops.len();
+        self.queue_messages(move || Work::Heard { message }, true, ops)
+            .then_some(parts)
+    }
+
+    /// The echo of voice message `parked` in the slot's other views, once
+    /// its recognition ended (TASK-063, TASK-085): its words when heard,
+    /// else its caption.
+    fn echo_voice(&mut self, slot: SlotId, place: Place, author: Option<&str>, parked: &Parked) {
+        let words = if parked.voice_heard() {
+            parked.words()
+        } else {
+            parked.text.clone()
+        };
+        let echo = echo_text(author, parked.forwarded, &words, parked.file.as_ref());
+        self.echo(slot, place, echo);
+    }
+
+    /// Telegram answered a message of the post with the words of voice
+    /// message `message`: after the last one the message goes on.
+    fn on_heard(&mut self, message: MessageKey) {
+        let Some(showing) = self.showing.get_mut(&message) else {
+            return;
+        };
+        showing.parts = showing.parts.saturating_sub(1);
+        if showing.parts == 0 {
+            let slot = showing.slot;
+            self.showing.remove(&message);
+            self.flush(slot);
+        }
+    }
+
+    /// Voice messages whose waits ran out (TASK-085): one not recognized
+    /// by then goes unheard, one whose post Telegram did not answer goes.
+    fn expire_voices(&mut self, now: Instant) {
+        let late: Vec<MessageKey> = self
+            .hearing
+            .iter()
+            .filter(|(_, hearing)| hearing.until <= now)
+            .map(|(message, _)| *message)
+            .collect();
+        for message in late {
+            let Some(hearing) = self.hearing.remove(&message) else {
+                continue;
+            };
+            if !matches!(hearing.target, HearTarget::Parked) {
+                continue;
+            }
+            let (slot, place) = (hearing.slot, hearing.place);
+            info!(
+                ordinal = self.ordinal(slot),
+                "voice message not recognized in time; it goes unheard"
+            );
+            let Some(parked) = self.set_voice(slot, message, VoiceState::Unheard, String::new())
+            else {
+                continue;
+            };
+            if self.voice_topic(slot, place) {
+                self.notify_author(slot, place, buffer::VOICE_FAILED_NOTICE);
+                if let Some(author) = hearing.echo {
+                    self.echo_voice(slot, place, author.as_deref(), &parked);
+                }
+            }
+            self.flush(slot);
+        }
+        let shown: Vec<(MessageKey, SlotId)> = self
+            .showing
+            .iter()
+            .filter(|(_, showing)| showing.until <= now)
+            .map(|(message, showing)| (*message, showing.slot))
+            .collect();
+        for (message, slot) in shown {
+            self.showing.remove(&message);
+            info!(
+                ordinal = self.ordinal(slot),
+                "voice text not confirmed by Telegram in time; the voice goes on"
+            );
+            self.flush(slot);
+        }
     }
 
     /// Message `input` in topic `place` of `slot` is kept for the agent's
@@ -4362,6 +4843,8 @@ impl Slots {
         let album = album_of(&input)
             .map(str::to_owned)
             .map(|id| (id, input.clone()));
+        let key = input.key();
+        let duration = input.media.as_ref().and_then(|media| media.duration);
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
             (None, Some(media)) => (media.caption.unwrap_or_default(), Some(media.file)),
@@ -4386,6 +4869,21 @@ impl Slots {
         let (kept, told) = (view.backlog.parts.len(), view.mention_told);
         self.registry.dirty = true;
         info!(ordinal, kept, "group message kept for the next mention");
+        // A voice message's words replace its placeholder once recognized
+        // (TASK-085); without recognition it stays a placeholder.
+        if let Some(file) = file
+            .as_ref()
+            .filter(|file| file.kind == FileKind::Voice && voice_fits(duration, file.size))
+        {
+            let target = HearTarget::Backlog {
+                part: part.clone(),
+                text: text.clone(),
+                quote: input.quote.clone(),
+                from_name: input.from_name.clone(),
+                forwarded: input.forwarded,
+            };
+            self.ask_voice(slot, place, key, file.file_id.clone(), target, None);
+        }
         if let Some((id, input)) = album {
             match self.mention_albums.get_mut(&(slot, place.chat)) {
                 Some(album) if album.id == id => {
@@ -4634,6 +5132,21 @@ impl Slots {
                 }
                 continue;
             }
+            // A voice message waits for its words (TASK-085).
+            if parked.voice_pending() {
+                if self.hearing.contains_key(&parked.key()) {
+                    break;
+                }
+                // Its recognition was lost (a restart without the helper):
+                // it goes unheard.
+                self.set_voice(slot, parked.key(), VoiceState::Unheard, String::new());
+                self.notify_author(slot, parked.place(), buffer::VOICE_FAILED_NOTICE);
+                continue;
+            }
+            // And for the post of its words.
+            if self.showing.contains_key(&parked.key()) {
+                break;
+            }
             // The messages that leave the slot now; `delivered`: they
             // reached the agent.
             let (taken, delivered) = match parked.file.clone() {
@@ -4760,8 +5273,9 @@ impl Slots {
         };
         let ordinal = self.ordinal(slot);
         let kind = file.kind.as_str();
-        // A caption, or a history (TASK-077), goes without the file.
-        let words = !parked.text.is_empty() || parked.history.is_some();
+        // A caption, a history (TASK-077) or recognized words (TASK-085)
+        // go without the file.
+        let words = parked.has_words();
         if !bound.files {
             if words
                 && bound
@@ -4779,9 +5293,11 @@ impl Slots {
             return FileStep::Wait;
         }
         let Some(fetcher) = &self.fetcher else {
-            // A mention's history (TASK-077) goes without the file.
+            // A mention's history (TASK-077) or recognized words (TASK-085)
+            // go without the file.
             let history = parked.history.is_some();
-            if history
+            let words = history || parked.voice_heard();
+            if words
                 && bound
                     .to_agent
                     .try_send(self.inbound(session, parked))
@@ -4795,13 +5311,15 @@ impl Slots {
             );
             // Its caption went with the history: only the file is asked for
             // again (TASK-072).
-            let notice = if history && !parked.text.is_empty() {
+            let notice = if parked.voice_heard() {
+                buffer::VOICE_FILE_FAILED_NOTICE
+            } else if history && !parked.text.is_empty() {
                 buffer::FETCH_FAILED_WORDS_NOTICE
             } else {
                 buffer::FETCH_FAILED_NOTICE
             };
             self.notify_author(slot, parked.place(), notice);
-            return FileStep::Gone { delivered: history };
+            return FileStep::Gone { delivered: words };
         };
         let transfer_id = self.transfers + 1;
         let job = fetch::Job {
@@ -4901,15 +5419,19 @@ impl Slots {
         // Its caption goes on without the file: only the file is asked for
         // again (TASK-072).
         let mut words = false;
+        let mut voice_words = false;
         if let Some(entry) = self.registry.slot_mut(slot) {
             match entry.buffer.messages.front_mut() {
-                // A mention's history (TASK-077) does not go with a file
-                // that did not come: the message stays, as words only.
+                // A mention's history (TASK-077) or recognized words
+                // (TASK-085) do not go with a file that did not come: the
+                // message stays, as words only.
                 Some(parked)
-                    if parked.history.is_some() && !matches!(outcome, Fetched::Handed { .. }) =>
+                    if (parked.history.is_some() || parked.voice_heard())
+                        && !matches!(outcome, Fetched::Handed { .. }) =>
                 {
                     parked.file = None;
-                    words = !parked.text.is_empty();
+                    voice_words = parked.voice_heard();
+                    words = !parked.text.is_empty() || voice_words;
                 }
                 _ => {
                     entry.buffer.messages.pop_front();
@@ -4934,6 +5456,9 @@ impl Slots {
                     stream::receipt(stream, message);
                 }
                 self.react(message, stream::ACCEPTED);
+            }
+            _ if voice_words => {
+                self.notify_author(slot, place, buffer::VOICE_FILE_FAILED_NOTICE);
             }
             Fetched::TooBig => self.notify_author(slot, place, buffer::TOO_BIG_NOTICE),
             Fetched::Failed if words => {
@@ -10013,7 +10538,7 @@ impl Slots {
     }
 
     /// [`Self::send_as`] with each op's job made by `work`.
-    fn queue_messages(&mut self, work: fn() -> Work, answer: bool, ops: Vec<Op>) -> bool {
+    fn queue_messages(&mut self, work: impl Fn() -> Work, answer: bool, ops: Vec<Op>) -> bool {
         // Nothing goes to a group the bot left (TASK-069).
         let ops: Vec<Op> = ops
             .into_iter()
@@ -10200,6 +10725,7 @@ impl Slots {
                     | Work::Delete
                     | Work::Reaction
                     | Work::Answer
+                    | Work::Heard { .. }
                     | Work::Twin { .. }
                     | Work::Menu(_)
                     | Work::Picker
@@ -13732,6 +14258,7 @@ impl Slots {
         self.check_candidates();
         self.retry_bodies();
         self.check_compactions(now);
+        self.expire_voices(now);
         let untold: Vec<u64> = self
             .conns
             .iter()
@@ -13936,6 +14463,20 @@ impl Slots {
                 transfer_id,
                 outcome,
             } => self.on_fetched(slot, transfer_id, outcome),
+            Done::Voice { job, heard } => self.on_voice(job, heard),
+            Done::Heard {
+                message,
+                chat,
+                delivery,
+            } => {
+                self.uncount_queued(chat, 1);
+                match delivery {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => warn!(%error, "voice text to a topic not delivered"),
+                    None => warn!("voice text to a topic got no answer"),
+                }
+                self.on_heard(message);
+            }
             Done::File {
                 conn,
                 transfer_id,
@@ -14876,6 +15417,13 @@ fn mentioned(bot: &MentionBot, input: &Inbound) -> bool {
         || input.reply_from == Some(bot.id)
 }
 
+/// A voice message of `duration` seconds and `size` bytes, as Telegram
+/// told them, is one to recognize (TASK-085).
+fn voice_fits(duration: Option<u64>, size: Option<u64>) -> bool {
+    duration.is_none_or(|seconds| seconds <= voice::MAX_VOICE_SECONDS)
+        && size.is_none_or(|bytes| bytes <= voice::MAX_VOICE_BYTES)
+}
+
 /// A plain message without a sound.
 fn message_op(place: Place, text: String) -> Op {
     Op::Send {
@@ -14956,6 +15504,11 @@ async fn dispatch_loop(
                 Work::Topic(job) => Done::Topic { job, delivery },
                 Work::Delete => Done::Delete(delivery),
                 Work::Message | Work::Answer | Work::Content => Done::Message { chat, delivery },
+                Work::Heard { message } => Done::Heard {
+                    message,
+                    chat,
+                    delivery,
+                },
                 Work::Permission(key) => Done::Permission { key, seq, delivery },
                 Work::PromptEdit(key) => Done::PromptEdit { key, delivery },
                 Work::Question { key, version } => Done::Question {
@@ -25777,6 +26330,7 @@ again"
                 },
                 caption: caption.map(str::to_owned),
                 album: None,
+                duration: None,
             }),
             from_name: None,
             author: None,
@@ -27197,6 +27751,7 @@ again"
             from_name: None,
             history: None,
             mention: false,
+            voice: None,
         };
         for (chat, label) in [(Chat::GROUP, "group"), (private, "private")] {
             let meta = slots.burst_meta(A, &[parked(chat, 5), parked(chat, 6)]);
@@ -34190,6 +34745,7 @@ again"
                     },
                     caption: Some(caption.into()),
                     album: None,
+                    duration: None,
                 }),
                 text: None,
                 ..match group_by(message_id, "", "Анна", None) {
@@ -34229,6 +34785,7 @@ again"
                 },
                 caption: caption.map(str::to_owned),
                 album: Some(album.into()),
+                duration: None,
             }),
             text: None,
             ..match group_by(message_id, "", "Анна", None) {
@@ -35167,6 +35724,7 @@ again"
                     },
                     caption: None,
                     album: Some("album".into()),
+                    duration: None,
                 }),
                 ..input
             }),
@@ -37807,6 +38365,626 @@ again"
             topic_deletes(&all_work(&mut work)),
             [place],
             "deleted once the chat is open again"
+        );
+    }
+
+    // TASK-085: voice messages recognized on the hub.
+
+    /// Hears what the test says: each call shows on `calls`, and its answer
+    /// is the next one sent through [`Mouth`] (none left: failed).
+    struct Ears {
+        calls: mpsc::UnboundedSender<Vec<u8>>,
+        answers: tokio::sync::Mutex<mpsc::UnboundedReceiver<Heard>>,
+    }
+
+    impl Hear for Ears {
+        async fn hear(&self, ogg: Vec<u8>) -> Heard {
+            let _ = self.calls.send(ogg);
+            self.answers
+                .lock()
+                .await
+                .recv()
+                .await
+                .unwrap_or(Heard::Failed)
+        }
+    }
+
+    /// The test's side of [`Ears`].
+    struct Mouth {
+        calls: mpsc::UnboundedReceiver<Vec<u8>>,
+        answers: mpsc::UnboundedSender<Heard>,
+    }
+
+    impl Mouth {
+        /// The bytes of the next voice the recognizer got.
+        async fn called(&mut self) -> Vec<u8> {
+            tokio::time::timeout(WAIT, self.calls.recv())
+                .await
+                .expect("a recognition in time")
+                .expect("ears alive")
+        }
+
+        fn answer(&self, heard: Heard) {
+            self.answers.send(heard).unwrap();
+        }
+    }
+
+    fn ears_and_mouth() -> (Arc<Ears>, Mouth) {
+        let (calls, calls_rx) = mpsc::unbounded_channel();
+        let (answers, answers_rx) = mpsc::unbounded_channel();
+        let ears = Ears {
+            calls,
+            answers: tokio::sync::Mutex::new(answers_rx),
+        };
+        (
+            Arc::new(ears),
+            Mouth {
+                calls: calls_rx,
+                answers,
+            },
+        )
+    }
+
+    const OGG: &[u8] = b"OggS voice";
+    const WORDS: &str = "привет запусти тесты";
+
+    fn heard_post(words: &str) -> String {
+        format!("{}{words}", buffer::VOICE_HEARD_PREFIX)
+    }
+
+    fn voice_files() -> TelegramFiles {
+        TelegramFiles([("v".to_owned(), OGG.to_vec())].into())
+    }
+
+    /// Voice message `message_id` of `duration` seconds in topic `thread`
+    /// of `chat`, by team member `from_name` (the owner without one).
+    fn voice_in(
+        chat: Chat,
+        thread: i64,
+        message_id: i64,
+        from_name: Option<&str>,
+        duration: Option<u64>,
+    ) -> Control {
+        Control::Message(Inbound {
+            display_name: None,
+            chat,
+            sender: PrivateChat::of_user(7),
+            message_id,
+            thread_id: Some(thread),
+            text: None,
+            reply_to: None,
+            quote: None,
+            forwarded: false,
+            media: Some(crate::hub::updates::Media {
+                file: Attachment {
+                    kind: FileKind::Voice,
+                    file_id: "v".into(),
+                    name: None,
+                    size: Some(OGG.len() as u64),
+                },
+                caption: None,
+                album: None,
+                duration,
+            }),
+            from_name: from_name.map(str::to_owned),
+            author: Some(from_name.unwrap_or(SHARER).to_owned()),
+            reply_from: None,
+        })
+    }
+
+    /// A voice message by Анна of a team in group topic 100.
+    fn group_voice(message_id: i64, duration: Option<u64>) -> Control {
+        voice_in(Chat::GROUP, 100, message_id, Some("Анна"), duration)
+    }
+
+    /// The actor, what it hands to the scheduler, the tasks' answers and the
+    /// agent's link.
+    type VoiceRig = (
+        Slots,
+        mpsc::UnboundedReceiver<(Work, Op)>,
+        mpsc::UnboundedReceiver<Done>,
+        mpsc::Receiver<HubMsg>,
+    );
+
+    /// A live session in slot 0 with topic 100 whose agent takes files, the
+    /// download task, and recognition by `ears` when given.
+    fn voice_slots(dir: &TempDir, options: Options, ears: Option<Arc<Ears>>) -> VoiceRig {
+        let options = Options {
+            notice_every: Duration::ZERO,
+            ..options
+        };
+        let mut slots = stalled_slots(dir, options);
+        let work = capture_dispatch(&mut slots);
+        slots.fetch_files(Arc::new(voice_files()));
+        if let Some(ears) = ears {
+            slots.recognize_voices(Arc::new(voice_files()), ears);
+        }
+        let done = slots.done_rx.take().unwrap();
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
+        let agent = connect_files(&mut slots, 1, A, Some(10), true);
+        (slots, work, done, agent)
+    }
+
+    /// The posts of recognized words among `handed`: the message each
+    /// answers and its text.
+    fn heard_posts(handed: &[(Work, Op)]) -> Vec<(Option<i64>, String)> {
+        handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (Work::Heard { .. }, Op::Send { reply_to, text, .. }) => {
+                    Some((*reply_to, text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Telegram answered the post of the words of voice `message_id`.
+    fn heard_answered(slots: &mut Slots, chat: Chat, message_id: i64, delivery: Option<Delivery>) {
+        slots.on_done(Done::Heard {
+            message: MessageKey::new(chat, message_id),
+            chat: Some(chat),
+            delivery,
+        });
+        slots.pump();
+    }
+
+    fn voice_state(slots: &Slots, message_id: i64) -> Option<VoiceState> {
+        slots.registry.slots[0]
+            .buffer
+            .messages
+            .iter()
+            .find(|parked| parked.message_id == message_id)
+            .and_then(|parked| parked.voice.as_ref())
+            .map(|voice| voice.state)
+    }
+
+    /// Scenarios 1 and 2: the words are posted as a reply to the voice, and
+    /// the voice (with the words) and the text after it reach the session
+    /// only once Telegram answered the post.
+    #[tokio::test]
+    async fn a_voice_message_is_shown_as_words_before_it_reaches_the_session() {
+        let dir = TempDir::new("slots-voice-heard");
+        let (ears, mut mouth) = ears_and_mouth();
+        let (mut slots, mut work, mut done, mut agent) =
+            voice_slots(&dir, message_options(), Some(ears));
+        slots.on_control(group_voice(5, Some(4)));
+        slots.on_control(say(Some(100), 6, Some("после")));
+        slots.pump();
+        assert_eq!(mouth.called().await, OGG);
+        // Nothing goes while it is being recognized; the text waits behind.
+        assert_eq!(buffered(&slots, 0), [5, 6]);
+        assert_eq!(voice_state(&slots, 5), Some(VoiceState::Pending));
+        assert!(arrived(&mut agent, &mut Vec::new()).is_empty());
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut slots, &mut done).await;
+        let handed = all_work(&mut work);
+        assert_eq!(heard_posts(&handed), [(Some(5), heard_post(WORDS))]);
+        assert_eq!(sends_into(&handed, group_100()), [heard_post(WORDS)]);
+        assert_eq!(voice_state(&slots, 5), Some(VoiceState::Heard));
+        // Still nothing until Telegram answered the post.
+        assert!(arrived(&mut agent, &mut Vec::new()).is_empty());
+        assert_eq!(buffered(&slots, 0), [5, 6]);
+        assert_eq!(slots.queued_messages, 1);
+        heard_answered(&mut slots, Chat::GROUP, 5, Some(Ok(Outcome::Done)));
+        assert_eq!(slots.queued_messages, 0);
+        fetched(&mut slots, &mut done).await;
+        let mut bytes = Vec::new();
+        assert_eq!(
+            arrived(&mut agent, &mut bytes),
+            [
+                format!("file voice.jpg Анна: (голосовое, распознано) {WORDS}"),
+                "text после".to_owned(),
+            ]
+        );
+        assert_eq!(bytes, [OGG]);
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// Scenario 3: a post Telegram refuses lets the voice go, and frees its
+    /// place in the message queue.
+    #[tokio::test]
+    async fn a_refused_post_lets_the_voice_go() {
+        let dir = TempDir::new("slots-voice-refused");
+        let (ears, mut mouth) = ears_and_mouth();
+        let (mut slots, mut work, mut done, mut agent) =
+            voice_slots(&dir, message_options(), Some(ears));
+        slots.on_control(group_voice(5, Some(4)));
+        slots.pump();
+        mouth.called().await;
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(heard_posts(&all_work(&mut work)).len(), 1);
+        assert_eq!(slots.queued_messages, 1);
+        let refused = ApiError::Telegram {
+            code: 400,
+            description: "Bad Request: message to be replied not found".into(),
+        };
+        heard_answered(&mut slots, Chat::GROUP, 5, Some(Err(refused)));
+        assert_eq!(slots.queued_messages, 0);
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            [format!(
+                "file voice.jpg Анна: (голосовое, распознано) {WORDS}"
+            )]
+        );
+    }
+
+    /// Scenario 4: a post Telegram does not answer holds the voice only
+    /// for `show_wait`.
+    #[tokio::test]
+    async fn an_unanswered_post_holds_the_voice_only_for_a_while() {
+        let dir = TempDir::new("slots-voice-show-wait");
+        let (ears, mut mouth) = ears_and_mouth();
+        let options = Options {
+            show_wait: Duration::from_millis(200),
+            ..message_options()
+        };
+        let (mut slots, mut work, mut done, mut agent) = voice_slots(&dir, options, Some(ears));
+        slots.on_control(group_voice(5, Some(4)));
+        slots.pump();
+        mouth.called().await;
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(heard_posts(&all_work(&mut work)).len(), 1);
+        slots.on_tick();
+        slots.pump();
+        assert_eq!(buffered(&slots, 0), [5], "within the wait it stays");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        slots.on_tick();
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            [format!(
+                "file voice.jpg Анна: (голосовое, распознано) {WORDS}"
+            )]
+        );
+        // A late answer changes nothing.
+        heard_answered(&mut slots, Chat::GROUP, 5, Some(Ok(Outcome::Done)));
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// Scenario 5: a failure, no words or a voice too long go as a file
+    /// marked unheard, and the author is told why; one longer than 5
+    /// minutes by Telegram's word is not even asked for.
+    #[tokio::test]
+    async fn a_voice_not_recognized_goes_as_a_file_marked_unheard() {
+        let dir = TempDir::new("slots-voice-unheard");
+        let (ears, mut mouth) = ears_and_mouth();
+        let (mut slots, mut work, mut done, mut agent) =
+            voice_slots(&dir, message_options(), Some(ears));
+        for (id, heard, notice) in [
+            (5, Heard::Failed, buffer::VOICE_FAILED_NOTICE),
+            (6, Heard::Silent, buffer::VOICE_FAILED_NOTICE),
+            (7, Heard::TooLong, buffer::VOICE_TOO_LONG_NOTICE),
+        ] {
+            slots.on_control(group_voice(id, Some(4)));
+            slots.pump();
+            mouth.called().await;
+            mouth.answer(heard);
+            fetched(&mut slots, &mut done).await;
+            let handed = all_work(&mut work);
+            assert!(heard_posts(&handed).is_empty(), "{handed:#?}");
+            assert_eq!(sends_into(&handed, group_100()), [notice], "{id}");
+            fetched(&mut slots, &mut done).await;
+            assert_eq!(
+                arrived(&mut agent, &mut Vec::new()),
+                ["file voice.jpg Анна: (голосовое, не распознано)"],
+                "{id}"
+            );
+        }
+        slots.on_control(group_voice(8, Some(301)));
+        slots.pump();
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [buffer::VOICE_TOO_LONG_NOTICE]
+        );
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["file voice.jpg Анна: (голосовое, не распознано)"]
+        );
+        assert!(mouth.calls.try_recv().is_err(), "not recognized");
+    }
+
+    /// Scenario 5: a hub without recognition sends the voice as a file and
+    /// says so.
+    #[tokio::test]
+    async fn without_recognition_a_voice_goes_as_a_file_with_a_notice() {
+        let dir = TempDir::new("slots-voice-off");
+        let (mut slots, mut work, mut done, mut agent) = voice_slots(&dir, message_options(), None);
+        slots.on_control(group_voice(5, Some(4)));
+        slots.pump();
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [buffer::VOICE_OFF_NOTICE]
+        );
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["file voice.jpg Анна: (голосовое, не распознано)"]
+        );
+    }
+
+    /// Scenario 6: no result within `hear_wait`: the voice goes unheard, and
+    /// a late result posts nothing.
+    #[tokio::test]
+    async fn a_recognition_that_takes_too_long_lets_the_voice_go_unheard() {
+        let dir = TempDir::new("slots-voice-hear-wait");
+        let (ears, mut mouth) = ears_and_mouth();
+        let options = Options {
+            hear_wait: Duration::from_millis(200),
+            ..message_options()
+        };
+        let (mut slots, mut work, mut done, mut agent) = voice_slots(&dir, options, Some(ears));
+        slots.on_control(group_voice(5, Some(4)));
+        slots.pump();
+        mouth.called().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        slots.on_tick();
+        slots.pump();
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [buffer::VOICE_FAILED_NOTICE]
+        );
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["file voice.jpg Анна: (голосовое, не распознано)"]
+        );
+        let _ = all_work(&mut work);
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut slots, &mut done).await;
+        assert!(
+            all_work(&mut work).is_empty(),
+            "a late result posts nothing"
+        );
+    }
+
+    /// Scenario 7: a voice for a dead session is shown at once and waits,
+    /// with its words, for the next session of the slot.
+    #[tokio::test]
+    async fn a_voice_for_a_dead_session_is_shown_and_kept() {
+        let dir = TempDir::new("slots-voice-dead");
+        let (ears, mut mouth) = ears_and_mouth();
+        let (mut slots, mut work, mut done, _old) =
+            voice_slots(&dir, message_options(), Some(ears));
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(group_voice(5, Some(4)));
+        slots.pump();
+        mouth.called().await;
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            heard_posts(&all_work(&mut work)),
+            [(Some(5), heard_post(WORDS))]
+        );
+        heard_answered(&mut slots, Chat::GROUP, 5, Some(Ok(Outcome::Done)));
+        assert_eq!(buffered(&slots, 0), [5]);
+        assert_eq!(voice_state(&slots, 5), Some(VoiceState::Heard));
+        slots.on_hook(&start(B, 11));
+        let mut agent = connect_files(&mut slots, 2, B, Some(11), true);
+        slots.pump();
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            [format!(
+                "file voice.jpg Анна: (голосовое, распознано) {WORDS}"
+            )]
+        );
+    }
+
+    /// The actor of a hub restarted with `registry`, its dispatch captured.
+    fn restarted(
+        dir: &TempDir,
+        registry: &Registry,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let saved: Registry = serde_json::from_slice(&RegistryStore::encode(registry)).unwrap();
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let options = Options {
+            notice_every: Duration::ZERO,
+            ..message_options()
+        };
+        let mut slots = Slots::new(saved, store, outbox, options);
+        let work = capture_dispatch(&mut slots);
+        slots.fetch_files(Arc::new(voice_files()));
+        (slots, work)
+    }
+
+    /// Scenario 8: a voice being recognized when the hub stopped is asked
+    /// again after the restart; without recognition then it goes unheard
+    /// instead of holding the slot.
+    #[tokio::test]
+    async fn a_restart_asks_again_or_lets_the_voice_go() {
+        let dir = TempDir::new("slots-voice-restart");
+        let (ears, mut mouth) = ears_and_mouth();
+        let (mut slots, _work, _done, _agent) = voice_slots(&dir, message_options(), Some(ears));
+        slots.on_control(group_voice(5, Some(4)));
+        slots.pump();
+        mouth.called().await;
+        assert_eq!(voice_state(&slots, 5), Some(VoiceState::Pending));
+        let registry = slots.registry.clone();
+
+        let dir = TempDir::new("slots-voice-restart-again");
+        let (mut again, mut work) = restarted(&dir, &registry);
+        let (ears, mut mouth) = ears_and_mouth();
+        again.recognize_voices(Arc::new(voice_files()), ears);
+        let mut done = again.done_rx.take().unwrap();
+        let mut agent = connect_files(&mut again, 1, A, Some(10), true);
+        again.pump();
+        assert_eq!(mouth.called().await, OGG);
+        assert!(arrived(&mut agent, &mut Vec::new()).is_empty());
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut again, &mut done).await;
+        assert_eq!(heard_posts(&all_work(&mut work)).len(), 1);
+        heard_answered(&mut again, Chat::GROUP, 5, Some(Ok(Outcome::Done)));
+        fetched(&mut again, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            [format!(
+                "file voice.jpg Анна: (голосовое, распознано) {WORDS}"
+            )]
+        );
+
+        let dir = TempDir::new("slots-voice-restart-off");
+        let (mut off, mut work) = restarted(&dir, &registry);
+        let mut done = off.done_rx.take().unwrap();
+        let mut agent = connect_files(&mut off, 1, A, Some(10), true);
+        off.pump();
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [buffer::VOICE_FAILED_NOTICE]
+        );
+        fetched(&mut off, &mut done).await;
+        assert_eq!(
+            arrived(&mut agent, &mut Vec::new()),
+            ["file voice.jpg Анна: (голосовое, не распознано)"]
+        );
+    }
+
+    /// Scenario 9: in mention mode a kept voice's placeholder becomes its
+    /// words; a mention before they came takes the placeholder along.
+    #[tokio::test]
+    async fn a_voice_kept_for_a_mention_is_kept_as_its_words() {
+        let dir = TempDir::new("slots-voice-mention");
+        let (mut slots, mut work, mut agent) = mention_slot(&dir, 64);
+        let (ears, mut mouth) = ears_and_mouth();
+        slots.recognize_voices(Arc::new(voice_files()), ears);
+        let mut done = slots.done_rx.take().unwrap();
+        slots.on_control(group_voice(10, Some(3)));
+        slots.pump();
+        assert_eq!(backlog_of(&slots), ["Анна: [голосовое]"]);
+        mouth.called().await;
+        mouth.answer(Heard::Text("привет".into()));
+        fetched(&mut slots, &mut done).await;
+        let handed = all_work(&mut work);
+        assert_eq!(heard_posts(&handed), [(Some(10), heard_post("привет"))]);
+        assert!(sends_into(&handed, group_100()).contains(&heard_post("привет")));
+        assert_eq!(backlog_of(&slots), ["Анна: [голосовое, распознано] привет"]);
+        assert!(got(&mut agent).inbounds.is_empty());
+        // A mention before the words came takes the placeholder.
+        slots.on_control(group_voice(11, Some(3)));
+        slots.pump();
+        mouth.called().await;
+        slots.on_control(group_by(12, "@cctg_bot глянь", "Иван", None));
+        slots.pump();
+        let got12 = got(&mut agent);
+        assert_eq!(
+            mention_contents(&got12),
+            [
+                "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
+                 Анна: [голосовое, распознано] привет\n\n---\n\nАнна: [голосовое]\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nИван: глянь"
+            ]
+        );
+        mouth.answer(Heard::Text("второе".into()));
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            heard_posts(&all_work(&mut work)),
+            [(Some(11), heard_post("второе"))]
+        );
+        assert!(backlog_of(&slots).is_empty());
+    }
+
+    /// TASK-074 × TASK-085: the words of a voice whose slot was archived
+    /// (its topics cleaned up) meanwhile are posted nowhere.
+    #[tokio::test]
+    async fn an_archived_slot_gets_no_voice_words() {
+        let dir = TempDir::new("slots-voice-archived");
+        let (mut slots, mut work, _agent) = mention_slot(&dir, 64);
+        let (ears, mut mouth) = ears_and_mouth();
+        slots.recognize_voices(Arc::new(voice_files()), ears);
+        let mut done = slots.done_rx.take().unwrap();
+        slots.on_control(group_voice(10, Some(3)));
+        slots.pump();
+        mouth.called().await;
+        let _ = all_work(&mut work);
+        slots.registry.archive_slot(SlotId(0), &HashSet::new());
+        mouth.answer(Heard::Text("привет".into()));
+        fetched(&mut slots, &mut done).await;
+        let handed = all_work(&mut work);
+        assert!(heard_posts(&handed).is_empty(), "{handed:#?}");
+        assert!(sends_into(&handed, group_100()).is_empty(), "{handed:#?}");
+        assert!(backlog_of(&slots).is_empty());
+    }
+
+    /// Scenario 10: one voice being recognized and a full queue behind it:
+    /// the next one is not recognized.
+    #[tokio::test]
+    async fn a_voice_beyond_a_full_queue_goes_unheard() {
+        let dir = TempDir::new("slots-voice-queue");
+        let (ears, mut mouth) = ears_and_mouth();
+        let (mut slots, mut work, _done, _agent) = voice_slots(&dir, message_options(), Some(ears));
+        slots.on_control(group_voice(1, Some(3)));
+        slots.pump();
+        mouth.called().await;
+        for id in 2..=1 + voice::VOICE_QUEUE as i64 {
+            slots.on_control(group_voice(id, Some(3)));
+        }
+        slots.pump();
+        assert!(sends_into(&all_work(&mut work), group_100()).is_empty());
+        let next = 2 + voice::VOICE_QUEUE as i64;
+        slots.on_control(group_voice(next, Some(3)));
+        slots.pump();
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [buffer::VOICE_FAILED_NOTICE]
+        );
+        let states: Vec<Option<VoiceState>> =
+            (1..=next).map(|id| voice_state(&slots, id)).collect();
+        let mut want = vec![Some(VoiceState::Pending); 1 + voice::VOICE_QUEUE];
+        want.push(Some(VoiceState::Unheard));
+        assert_eq!(states, want);
+    }
+
+    /// Scenario 11: a private hub's mirror gets one echo, with the words,
+    /// once they came, and no twin of the post.
+    #[tokio::test]
+    async fn a_mirror_gets_one_echo_with_the_words_and_no_twin_of_the_post() {
+        let dir = TempDir::new("slots-voice-mirror");
+        let (mut slots, mut work) = shared_slot(&dir, private_only_options());
+        slots.fetch_files(Arc::new(voice_files()));
+        let (ears, mut mouth) = ears_and_mouth();
+        slots.recognize_voices(Arc::new(voice_files()), ears);
+        let mut done = slots.done_rx.take().unwrap();
+        let mut agent = mention_agent(&mut slots, 1, 64, true);
+        slots.pump();
+        let _ = all_work(&mut work);
+        slots.on_control(voice_in(private_owner(), 700, 5010, None, Some(3)));
+        slots.pump();
+        mouth.called().await;
+        assert!(
+            sends_into(&all_work(&mut work), group_100()).is_empty(),
+            "the echo waits for the words"
+        );
+        mouth.answer(Heard::Text(WORDS.into()));
+        fetched(&mut slots, &mut done).await;
+        let handed = all_work(&mut work);
+        assert_eq!(heard_posts(&handed), [(Some(5010), heard_post(WORDS))]);
+        assert_eq!(
+            sends_into(&handed, group_100()),
+            [format!(
+                "✉ {SHARER}: 📎 voice\n(голосовое, распознано) {WORDS}"
+            )]
+        );
+        heard_answered(&mut slots, private_owner(), 5010, Some(Ok(Outcome::Done)));
+        fetched(&mut slots, &mut done).await;
+        assert_eq!(
+            got(&mut agent).files,
+            [format!("(голосовое, распознано) {WORDS}")]
         );
     }
 }

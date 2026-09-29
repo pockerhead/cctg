@@ -1,0 +1,24 @@
+[package]
+name = "cctg-voice"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace (TASK-085): the root workspace, its lock file and the
+# client binaries never build sherpa-onnx. Built only on Linux in the hub
+# image; the sherpa-onnx version must match SHERPA_ONNX_VERSION in the
+# Dockerfile.
+[workspace]
+
+[dependencies]
+opus-pure = "0.2.2"
+serde_json = "1"
+
+# The recognizer only on Linux: elsewhere the helper decodes and answers
+# "model not loaded", so its decoder and output are tested on any machine.
+[target.'cfg(target_os = "linux")'.dependencies]
+sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["static"] }
+libc = "0.2"
+
+[profile.release]
+strip = true

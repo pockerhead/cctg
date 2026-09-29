@@ -166,6 +166,8 @@ pub struct FileInfo {
     pub file_id: String,
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
+    /// Seconds, as the sender set it (read for voice messages, TASK-085).
+    pub duration: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

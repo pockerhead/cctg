@@ -4783,6 +4783,7 @@ mod tests {
                 from_name: None,
                 history: None,
                 mention: false,
+                voice: None,
             },
             false,
         );
@@ -5587,6 +5588,7 @@ mod tests {
                 from_name: None,
                 history: None,
                 mention: false,
+                voice: None,
             });
         assert_eq!(registry.cleanup_candidates(1000), [], "a kept message");
         registry.slots[slot.0].buffer = Buffer::default();
