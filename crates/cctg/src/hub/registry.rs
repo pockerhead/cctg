@@ -1130,13 +1130,17 @@ impl Registry {
     /// `view`, taken out by [`Self::remove_view`], is the slot's again
     /// (TASK-069: a fallback view held while its owner picks a group).
     /// `false`: no such slot, or it has a view in that chat already.
-    pub fn put_back_view(&mut self, id: SlotId, view: View) -> bool {
+    /// A topic call in flight when it was taken out was answered while it
+    /// was away: it is not busy, as after a restart (TASK-069 review 3).
+    pub fn put_back_view(&mut self, id: SlotId, mut view: View) -> bool {
         let Some(slot) = self.slots.get_mut(id.0) else {
             return false;
         };
         if slot.views.iter().any(|kept| kept.chat == view.chat) {
             return false;
         }
+        view.busy = false;
+        view.failed = None;
         slot.views.push(view);
         self.dirty = true;
         true

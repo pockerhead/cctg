@@ -1409,12 +1409,12 @@ struct AfterSeparator {
 
 /// A slot whose owner picks a group to share to (TASK-069): until `until`
 /// its fallback view in the default group, once the private chat took the
-/// session again, is `held` here instead of in the registry, with whether
-/// it mirrored the private view. Picking the default group puts it back
-/// as the shared view; anything else ends it as a fallback ends.
+/// session again, is `held` here instead of in the registry. Picking the
+/// default group puts it back as the shared view; anything else ends it as
+/// a fallback ends.
 struct Choosing {
     until: Instant,
-    held: Option<(Box<View>, bool)>,
+    held: Option<Box<View>>,
 }
 
 /// The messages of [`Slots::send_text`]: with `rich` (TASK-075) one rich
@@ -10542,7 +10542,7 @@ impl Slots {
             } else {
                 None
             };
-            let back = held.is_some_and(|(view, _)| self.registry.put_back_view(slot, *view));
+            let back = held.is_some_and(|view| self.registry.put_back_view(slot, *view));
             if live && !usable && (back || self.registry.add_view(slot, default)) {
                 self.mark_fallback(slot);
                 info!(
@@ -10647,18 +10647,20 @@ impl Slots {
         }
         self.stop_mirroring(slot, view.place(), mirrored);
         if let Some(choosing) = self.choosing.get_mut(&slot) {
-            choosing.held = Some((Box::new(view), mirrored));
+            choosing.held = Some(Box::new(view));
         }
     }
 
     /// The owner of `slot` picked, or the hold ran out (TASK-069): a held
-    /// fallback view ends as a fallback ends.
+    /// fallback view ends as a fallback ends. Its twins stopped when it was
+    /// held, so the status does not move again (review 3).
     fn end_choosing(&mut self, slot: SlotId) {
-        if let Some((view, mirrored)) = self
+        if let Some(view) = self
             .choosing
             .remove(&slot)
             .and_then(|choosing| choosing.held)
         {
+            let mirrored = false;
             self.leave_group(slot, GroupEnd::Fallback { view, mirrored });
         }
     }
@@ -10906,7 +10908,7 @@ impl Slots {
     fn adopt_fallback(&mut self, slot: SlotId, author: Option<&str>) -> Option<ShareOutcome> {
         let default = self.registry.default_chat();
         // One held for the group picker is the slot's again (TASK-069).
-        if let Some((view, _)) = self
+        if let Some(view) = self
             .choosing
             .remove(&slot)
             .and_then(|choosing| choosing.held)
@@ -32880,7 +32882,7 @@ again"
                 .choosing
                 .get(&SlotId(0))
                 .and_then(|choosing| choosing.held.as_ref())
-                .map(|(view, _)| (view.fallback, view.topic_id))
+                .map(|view| (view.fallback, view.topic_id))
         };
         assert_eq!(held(&slots), Some((true, Some(100))));
         assert!(
@@ -33217,6 +33219,161 @@ again"
         assert!(slots.queued_for(Some(private_owner())) < STREAM_QUEUE);
         slots.on_stream_sent(A, 0, Some(group_b()), None);
         assert_eq!(slots.queued_for(Some(group_b())), STREAM_QUEUE - 1);
+        assert_eq!(slots.queued_messages, base);
+    }
+
+    /// Answers every topic call handed out, as Telegram would, until none
+    /// is left (at most four rounds).
+    fn answer_topics(slots: &mut Slots, work: &mut mpsc::UnboundedReceiver<(Work, Op)>) {
+        for _ in 0..4 {
+            let jobs: Vec<TopicJob> = all_work(work)
+                .into_iter()
+                .filter_map(|(job, _)| match job {
+                    Work::Topic(job) => Some(job),
+                    _ => None,
+                })
+                .collect();
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                slots.on_done(Done::Topic {
+                    job,
+                    delivery: Some(Ok(Outcome::Sent(Message::default()))),
+                });
+            }
+            slots.pump();
+        }
+    }
+
+    /// (TASK-069 review round 3, 1; repro `repro_r3_call_in_flight_while_
+    /// held_leaves_the_adopted_view_busy`) A topic call of the fallback view
+    /// in flight when it is held is answered while it is away; put back by
+    /// the pick it is not busy, and its share line goes once.
+    #[tokio::test]
+    async fn a_topic_call_answered_while_held_leaves_the_view_free() {
+        let dir = TempDir::new("slots-groups-held-busy");
+        // `fallback_and_b` with every topic call answered: none in flight.
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        connect(&mut slots, 1, A, Some(10));
+        slots.close_chat(private_owner());
+        slots.pump();
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        slots
+            .registry
+            .join_group(GroupChat::of(B_ID), Some("Бета".into()), true, true);
+        slots.pump();
+        answer_topics(&mut slots, &mut work);
+        let _ = all_work(&mut work);
+        slots.registry.set_title(A, "Renamed");
+        slots.pump();
+        let edit = all_work(&mut work)
+            .into_iter()
+            .find_map(|(job, _)| match job {
+                Work::Topic(
+                    job @ TopicJob::Edit {
+                        chat: Chat::GROUP, ..
+                    },
+                ) => Some(job),
+                _ => None,
+            })
+            .expect("a rename of the fallback topic in flight");
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(slots.choosing[&SlotId(0)].held.is_some());
+        slots.on_done(Done::Topic {
+            job: edit,
+            delivery: Some(Ok(Outcome::Sent(Message::default()))),
+        });
+        assert!(slots.adopt_fallback(SlotId(0), Some(SHARER)).is_some());
+        slots.pump();
+        slots.pump();
+        let separators = all_work(&mut work)
+            .iter()
+            .filter(|(job, _)| {
+                matches!(
+                    job,
+                    Work::Topic(TopicJob::Separator {
+                        chat: Chat::GROUP,
+                        thread_id: 100,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(separators, 1, "the share line goes once");
+    }
+
+    /// (TASK-069 review round 3, 2) The end of a hold moves the private
+    /// status no second time: the held view's twins stopped when it was
+    /// held.
+    #[tokio::test]
+    async fn the_end_of_a_hold_moves_the_status_no_second_time() {
+        let dir = TempDir::new("slots-groups-held-end");
+        let (mut slots, mut work) = fallback_and_b(&dir);
+        slots.primaries.insert(SlotId(0), private_700());
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(slots.choosing[&SlotId(0)].held.is_some());
+        slots.bottoms.entry(private_700()).or_default().foreign = false;
+        slots.end_choosing(SlotId(0));
+        assert!(!slots.bottoms[&private_700()].foreign);
+        assert!(
+            sends_into(&all_work(&mut work), group_100()).contains(&FALLBACK_END_NOTICE.to_owned())
+        );
+    }
+
+    /// (TASK-069 review round 3, coverage) A held fallback comes back, the
+    /// same topic, when the private chat closes again while the owner picks.
+    #[tokio::test]
+    async fn a_held_fallback_comes_back_when_the_private_chat_closes_again() {
+        let dir = TempDir::new("slots-groups-held-back");
+        let (mut slots, mut work) = fallback_and_b(&dir);
+        slots.on_control(owner_says(Some(700), 5001, "/share"));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(slots.choosing[&SlotId(0)].held.is_some());
+        slots.close_chat(private_owner());
+        slots.pump();
+        let view = slots.registry.slots[0]
+            .views
+            .iter()
+            .find(|view| view.chat == Chat::GROUP)
+            .map(|view| (view.fallback, view.topic_id));
+        assert_eq!(view, Some((true, Some(100))));
+        assert!(
+            slots
+                .choosing
+                .get(&SlotId(0))
+                .is_none_or(|choosing| choosing.held.is_none())
+        );
+        assert!(
+            !all_work(&mut work)
+                .iter()
+                .any(|(_, op)| matches!(op, Op::CreateTopic { .. }))
+        );
+    }
+
+    /// (TASK-069 review round 3, coverage) A file answered from group B
+    /// frees a place in B's count, not in the shared one.
+    #[tokio::test]
+    async fn a_file_into_another_group_is_uncounted_there() {
+        let dir = TempDir::new("slots-groups-file-apart");
+        let (mut slots, _work) = shared_in_b(&dir, private_only_options());
+        slots.queued_apart.insert(group_b(), 2);
+        let base = slots.queued_messages;
+        slots.on_done(Done::File {
+            conn: 1,
+            transfer_id: 9,
+            size: 0,
+            chat: Some(group_b()),
+            delivery: None,
+        });
+        assert_eq!(slots.queued_for(Some(group_b())), 1);
         assert_eq!(slots.queued_messages, base);
     }
 }
