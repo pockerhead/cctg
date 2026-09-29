@@ -3063,6 +3063,7 @@ impl Hub {
                     ..ChatMember::default()
                 },
                 by_allowed,
+                by: by_allowed.then(|| PrivateChat::of_user(OWNER)),
             }))
             .unwrap();
     }
@@ -3362,6 +3363,7 @@ async fn e2e_groups_connect_tells_what_is_missing() {
             is_forum: false,
             thread_id: None,
             target: Some(BOT.to_uppercase()),
+            sender: PrivateChat::of_user(OWNER),
         }))
         .unwrap();
     hub.until("the answer in the group", |fake| {

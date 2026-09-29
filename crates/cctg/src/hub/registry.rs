@@ -774,6 +774,10 @@ pub struct Registry {
     /// in the order they were added.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
+    /// The last member key given (TASK-081 review): keys are never given
+    /// twice, so a 🗑 drawn before a removal never hits the next person.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_keys: u32,
     /// The groups the hub knows (TASK-069), the default one among them
     /// once a hub loaded the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -782,6 +786,10 @@ pub struct Registry {
     /// registry no hub loaded (unit tests) has [`unset_group`].
     #[serde(skip, default = "unset_group")]
     pub default_group: GroupChat,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The default group of a registry no hub loaded: 0 is no Telegram chat id.
@@ -863,6 +871,7 @@ impl Default for Registry {
             unshared: Vec::new(),
             people: Vec::new(),
             members: Vec::new(),
+            member_keys: 0,
             groups: Vec::new(),
             default_group: unset_group(),
         }
@@ -908,15 +917,17 @@ impl Registry {
         self.members.iter().find(|member| member.chat == chat)
     }
 
-    /// Adds a member; its key is one past the highest key (1 for the
-    /// first). The caller checks that `chat` is no member yet.
+    /// Adds a member; its key is one past every key given before (1 for
+    /// the first), a removed member's too. The caller checks that `chat` is
+    /// no member yet.
     pub fn add_member(&mut self, chat: PrivateChat, name: String, username: Option<String>) -> u32 {
         let key = self
             .members
             .iter()
             .map(|member| member.key)
-            .max()
-            .map_or(1, |key| key.saturating_add(1));
+            .fold(self.member_keys, u32::max)
+            .saturating_add(1);
+        self.member_keys = key;
         self.members.push(Member {
             chat,
             name,
@@ -3172,8 +3183,8 @@ mod tests {
         assert!(registry.remove_member(2).is_none());
         assert_eq!(
             registry.add_member(boris, "Борис".into(), None),
-            2,
-            "max + 1"
+            3,
+            "a removed member's key is never given again"
         );
         registry.dirty = false;
         registry.retain_members(|_| true);
@@ -3192,6 +3203,9 @@ mod tests {
         let mut loaded = loaded;
         loaded.retain_members(|member| member.chat != anna);
         assert!(loaded.dirty && loaded.member(anna).is_none());
+        // The counter is saved: with nobody left the next key is still new.
+        loaded.retain_members(|_| false);
+        assert_eq!(loaded.add_member(anna, "Анна".into(), None), 4);
     }
 
     #[test]

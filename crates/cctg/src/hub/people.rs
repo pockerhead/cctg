@@ -94,10 +94,10 @@ pub fn invite_link(bot_username: &str, code: &str) -> String {
 /// Why the [`Book`] took nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The same owner already waits to confirm the same person.
-    Waiting,
     /// Too many wait already.
     Full,
+    /// The system's random generator failed: no invite code.
+    NoRandom,
 }
 
 /// A person an owner may add with «Добавить».
@@ -107,7 +107,16 @@ pub struct Pending {
     pub user: PrivateChat,
     pub name: String,
     pub username: Option<String>,
+    /// The messages that ask it, as Telegram took them.
+    messages: Vec<i64>,
     until: Instant,
+}
+
+impl Pending {
+    /// The messages that ask it: each loses its buttons once it is decided.
+    pub fn messages(&self) -> &[i64] {
+        &self.messages
+    }
 }
 
 struct Invite {
@@ -126,14 +135,21 @@ pub struct Book {
 
 impl Default for Book {
     /// Tokens start at a random number: a «Добавить» button of an earlier
-    /// run of the hub never confirms a new proposal with its number.
+    /// run of the hub never confirms a new proposal with its number. Without
+    /// the random generator the clock's nanoseconds stand in: the start only
+    /// has to differ from the last run's.
     fn default() -> Self {
         let mut seed = [0u8; 4];
-        aws_lc_rs::rand::fill(&mut seed).expect("the system random generator works");
+        let start = match aws_lc_rs::rand::fill(&mut seed) {
+            Ok(()) => u32::from_le_bytes(seed),
+            Err(_) => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.subsec_nanos()),
+        };
         Self {
             pending: Vec::new(),
             invites: Vec::new(),
-            next_token: u32::from_le_bytes(seed),
+            next_token: start,
         }
     }
 }
@@ -144,7 +160,10 @@ impl Book {
         self.invites.retain(|invite| now < invite.until);
     }
 
-    /// `owner` may add `user` with the returned token.
+    /// `owner` may add `user` with the returned token. A proposal of the
+    /// same owner for the same person that still waits keeps its token and
+    /// waits anew: its message may never have reached Telegram, so it is
+    /// asked again.
     pub fn propose(
         &mut self,
         owner: PrivateChat,
@@ -154,12 +173,13 @@ impl Book {
         now: Instant,
     ) -> Result<u32, Refusal> {
         self.prune(now);
-        if self
+        if let Some(waiting) = self
             .pending
-            .iter()
-            .any(|pending| pending.owner == owner && pending.user == user)
+            .iter_mut()
+            .find(|pending| pending.owner == owner && pending.user == user)
         {
-            return Err(Refusal::Waiting);
+            waiting.until = now + PENDING_TTL;
+            return Ok(waiting.token);
         }
         if self.pending.len() >= MAX_PENDING {
             return Err(Refusal::Full);
@@ -172,20 +192,50 @@ impl Book {
             user,
             name,
             username,
+            messages: Vec::new(),
             until: now + PENDING_TTL,
         });
         Ok(token)
     }
 
-    /// The proposal `token` of `owner`, gone from the book; `None` when it
-    /// is someone else's, expired or taken.
-    pub fn take(&mut self, owner: PrivateChat, token: u32, now: Instant) -> Option<Pending> {
-        self.prune(now);
-        let at = self
+    /// Telegram took message `message` asking proposal `token` of `owner`.
+    pub fn placed(&mut self, owner: PrivateChat, token: u32, message: i64) {
+        if let Some(pending) = self
             .pending
-            .iter()
-            .position(|pending| pending.owner == owner && pending.token == token)?;
+            .iter_mut()
+            .find(|pending| pending.owner == owner && pending.token == token)
+        {
+            pending.messages.push(message);
+        }
+    }
+
+    /// The proposal `token` of `owner` pressed on `message`, gone from the
+    /// book; `None` when it is someone else's, expired, taken, or `message`
+    /// is not one that asks it (none is known before Telegram answered).
+    pub fn take(
+        &mut self,
+        owner: PrivateChat,
+        token: u32,
+        message: i64,
+        now: Instant,
+    ) -> Option<Pending> {
+        self.prune(now);
+        let at = self.pending.iter().position(|pending| {
+            pending.owner == owner
+                && pending.token == token
+                && (pending.messages.is_empty() || pending.messages.contains(&message))
+        })?;
         Some(self.pending.remove(at))
+    }
+
+    /// Every proposal for `user`, gone from the book: they were added or
+    /// removed meanwhile.
+    pub fn drop_user(&mut self, user: PrivateChat) -> Vec<Pending> {
+        let (dropped, kept) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|pending| pending.user == user);
+        self.pending = kept;
+        dropped
     }
 
     /// A new one-time invite code of `owner`.
@@ -195,7 +245,7 @@ impl Book {
             return Err(Refusal::Full);
         }
         let mut bytes = [0u8; 16];
-        aws_lc_rs::rand::fill(&mut bytes).expect("the system random generator works");
+        aws_lc_rs::rand::fill(&mut bytes).map_err(|_| Refusal::NoRandom)?;
         let code = URL_SAFE_NO_PAD.encode(bytes);
         self.invites.push(Invite {
             owner,
@@ -205,10 +255,7 @@ impl Book {
         Ok(code)
     }
 
-    /// The owner of invite `code`, which is spent now; `None` for an
-    /// unknown, used or expired code.
-    pub fn redeem(&mut self, code: &str, now: Instant) -> Option<PrivateChat> {
-        self.prune(now);
+    fn invite_at(&self, code: &str) -> Option<usize> {
         let mut found = None;
         // Every code is compared, in constant time each.
         for (at, invite) in self.invites.iter().enumerate() {
@@ -218,7 +265,21 @@ impl Book {
                 found = Some(at);
             }
         }
-        found.map(|at| self.invites.remove(at).owner)
+        found
+    }
+
+    /// The owner of invite `code`; `None` for an unknown, used or expired
+    /// code. The code stays until [`Self::spend_invite`].
+    pub fn invite_owner(&mut self, code: &str, now: Instant) -> Option<PrivateChat> {
+        self.prune(now);
+        self.invite_at(code).map(|at| self.invites[at].owner)
+    }
+
+    /// Invite `code` did its work: it is gone.
+    pub fn spend_invite(&mut self, code: &str) {
+        if let Some(at) = self.invite_at(code) {
+            self.invites.remove(at);
+        }
     }
 }
 
@@ -227,12 +288,14 @@ impl Book {
 pub const ONLY_OWNER_ADDS: &str = "Добавлять людей может только владелец.";
 pub const NO_BOTS: &str = "Бота добавить нельзя.";
 pub const ALREADY: &str = "Он(а) уже в списке.";
-pub const WAITING: &str = "Это подтверждение уже ждёт выше.";
 pub const TOO_MANY_PENDING: &str =
     "Слишком много неподтверждённых добавлений; подтвердите или отмените их.";
 pub const HIDDEN: &str = "Telegram скрывает аккаунт этого человека в пересылках. Дайте ему одноразовую ссылку-приглашение.";
 pub const OTHER: &str = "Это сообщение от имени чата или канала: по нему человека не добавить. Перешлите его личное сообщение или дайте ссылку-приглашение.";
 pub const INVITE_RECEIVED: &str = "Приглашение получено: владелец подтвердит доступ.";
+/// The owner is not asked now (too many wait, the list is full): the code
+/// stays for a later try.
+pub const INVITE_NOT_NOW: &str = "Сейчас добавить вас не получается. Откройте эту же ссылку позже (она живёт 10 минут) или попросите у владельца новую.";
 pub const STALE: &str = "Подтверждение устарело.";
 pub const CANCELLED: &str = "Отменено.";
 pub const FAREWELL: &str =
@@ -241,6 +304,7 @@ pub const FAREWELL: &str =
 pub const ANSWER_OWNER_ONLY: &str = "Список людей меняет владелец";
 pub const ANSWER_GONE: &str = "Его уже нет в списке";
 pub const ANSWER_NO_USERNAME: &str = "У бота нет username: ссылку не сделать";
+pub const ANSWER_NO_RANDOM: &str = "Ссылку сделать не вышло, попробуйте ещё раз";
 /// The button that makes an invite link.
 pub const INVITE_BUTTON: &str = "🔗 Ссылка-приглашение";
 
@@ -332,12 +396,18 @@ mod tests {
             is_invite_payload(&format!("{INVITE_PREFIX}{code}")),
             "{code}"
         );
-        assert_eq!(book.redeem("AAAAAAAAAAAAAAAAAAAAAA", now), None);
-        assert_eq!(book.redeem(&code, now), Some(chat(1)));
-        assert_eq!(book.redeem(&code, now), None, "one time");
+        assert_eq!(book.invite_owner("AAAAAAAAAAAAAAAAAAAAAA", now), None);
+        assert_eq!(book.invite_owner(&code, now), Some(chat(1)));
+        assert_eq!(
+            book.invite_owner(&code, now),
+            Some(chat(1)),
+            "not spent yet"
+        );
+        book.spend_invite(&code);
+        assert_eq!(book.invite_owner(&code, now), None, "one time");
 
         let late = book.mint_invite(chat(1), now).unwrap();
-        assert_eq!(book.redeem(&late, now + INVITE_TTL), None, "expired");
+        assert_eq!(book.invite_owner(&late, now + INVITE_TTL), None, "expired");
 
         for _ in 0..MAX_INVITES {
             book.mint_invite(chat(2), now).unwrap();
@@ -353,21 +423,54 @@ mod tests {
         let token = book
             .propose(chat(1), chat(9), "Анна".into(), None, now)
             .unwrap();
+        // Asked again (its message may be lost): the same token, waiting anew.
+        let later = now + PENDING_TTL / 2;
         assert_eq!(
-            book.propose(chat(1), chat(9), "Анна".into(), None, now)
-                .unwrap_err(),
-            Refusal::Waiting
+            book.propose(chat(1), chat(9), "Анна".into(), None, later),
+            Ok(token)
         );
-        assert!(book.take(chat(2), token, now).is_none(), "another owner's");
-        assert!(book.take(chat(1), token.wrapping_add(1), now).is_none());
-        let taken = book.take(chat(1), token, now).unwrap();
+        book.placed(chat(1), token, 500);
+        book.placed(chat(1), token, 501);
+        assert!(
+            book.take(chat(2), token, 500, now).is_none(),
+            "another owner's"
+        );
+        assert!(
+            book.take(chat(1), token.wrapping_add(1), 500, now)
+                .is_none()
+        );
+        assert!(
+            book.take(chat(1), token, 777, now).is_none(),
+            "not its message"
+        );
+        let taken = book.take(chat(1), token, 501, now + PENDING_TTL).unwrap();
         assert_eq!((taken.owner, taken.user), (chat(1), chat(9)));
-        assert!(book.take(chat(1), token, now).is_none(), "taken once");
+        assert_eq!(taken.messages(), [500, 501]);
+        assert!(book.take(chat(1), token, 500, now).is_none(), "taken once");
 
         let token = book
             .propose(chat(1), chat(9), "Анна".into(), None, now)
             .unwrap();
-        assert!(book.take(chat(1), token, now + PENDING_TTL).is_none());
+        assert!(
+            book.take(chat(1), token, 1, now).is_some(),
+            "no message known yet: any"
+        );
+        let token = book
+            .propose(chat(1), chat(9), "Анна".into(), None, now)
+            .unwrap();
+        assert!(book.take(chat(1), token, 1, now + PENDING_TTL).is_none());
+
+        book.propose(chat(1), chat(9), "Анна".into(), None, now)
+            .unwrap();
+        book.propose(chat(2), chat(9), "Анна".into(), None, now)
+            .unwrap();
+        book.propose(chat(2), chat(8), "Борис".into(), None, now)
+            .unwrap();
+        let dropped = book.drop_user(chat(9));
+        assert_eq!(dropped.len(), 2);
+        assert!(dropped.iter().all(|pending| pending.user == chat(9)));
+        assert_eq!(book.pending.len(), 1);
+        book.drop_user(chat(8));
 
         for user in 0..MAX_PENDING as i64 {
             book.propose(chat(1), chat(100 + user), "x".into(), None, now)

@@ -113,7 +113,7 @@ impl std::fmt::Debug for InviteCode {
 }
 
 /// The bot's new membership in a group (TASK-069). Who changed it is only
-/// `by_allowed`; the id never leaves here.
+/// `by_allowed` and `by`; neither is ever logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberUpdate {
     pub chat: GroupChat,
@@ -125,6 +125,9 @@ pub struct MemberUpdate {
     pub member: ChatMember,
     /// An allowlisted user made the change.
     pub by_allowed: bool,
+    /// That allowlisted user (TASK-081: one removed meanwhile does not
+    /// count). Never logged.
+    pub by: Option<PrivateChat>,
 }
 
 /// `/connect` in a group (TASK-069).
@@ -138,6 +141,9 @@ pub struct ConnectInput {
     pub thread_id: Option<i64>,
     /// The bot `/connect@<name>` names; `None` for a bare `/connect`.
     pub target: Option<String>,
+    /// Who sent it (TASK-081: one removed meanwhile is dropped). Never
+    /// logged.
+    pub sender: PrivateChat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,13 +419,11 @@ fn connect_of(message: &Message, allowlist: &Allowlist) -> Option<ConnectInput> 
         return None;
     }
     let target = connect_target(message.text.as_deref()?)?;
-    if !message
+    let sender = message
         .from
         .as_ref()
-        .is_some_and(|from| allowlist.contains(from.id))
-    {
-        return None;
-    }
+        .filter(|from| allowlist.contains(from.id))?
+        .id;
     Some(ConnectInput {
         chat: GroupChat::of(message.chat.id),
         supergroup: message.chat.kind == "supergroup",
@@ -429,6 +433,7 @@ fn connect_of(message: &Message, allowlist: &Allowlist) -> Option<ConnectInput> 
             .message_thread_id
             .filter(|_| message.is_topic_message),
         target,
+        sender: PrivateChat::of_user(sender),
     })
 }
 
@@ -603,16 +608,19 @@ pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> 
         if !is_group(chat) {
             return Routed::Ignored(Ignored::OtherChat);
         }
+        let by = changed
+            .from
+            .as_ref()
+            .filter(|from| allowlist.contains(from.id))
+            .map(|from| PrivateChat::of_user(from.id));
         return Routed::Member(MemberUpdate {
             chat: GroupChat::of(chat.id),
             supergroup: chat.kind == "supergroup",
             title: chat.title.as_deref().and_then(group_title),
             is_forum: chat.is_forum,
             member: changed.new_chat_member,
-            by_allowed: changed
-                .from
-                .as_ref()
-                .is_some_and(|from| allowlist.contains(from.id)),
+            by_allowed: by.is_some(),
+            by,
         });
     }
 
@@ -2149,6 +2157,7 @@ mod tests {
                 is_forum: false,
                 thread_id: Some(7),
                 target: None,
+                sender: PrivateChat::of_user(ALLOWED),
             })
         );
         match route_one(connect(ALLOWED, unknown, "/CONNECT@Other_Bot please")) {

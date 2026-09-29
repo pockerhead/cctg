@@ -1061,10 +1061,17 @@ enum MenuJob {
     },
     /// The delete of a `/start` or `/menu` message.
     Clean,
-    /// A message about the people (TASK-081): a proposal, its answer, an
+    /// A message about the people (TASK-081): an answer to an owner, an
     /// invite link, a greeting or a farewell. Quiet: a 403 (a person who
     /// never pressed Start) closes no chat and tells no group.
     People,
+    /// The question to `owner` whether to add the person of proposal
+    /// `token` (TASK-081): quiet as [`MenuJob::People`]; the message
+    /// Telegram took is the one its buttons act on.
+    Proposal {
+        owner: PrivateChat,
+        token: u32,
+    },
 }
 
 /// A call about a slot's status message; at most one per slot in flight,
@@ -1578,6 +1585,18 @@ fn topic_gone(delivery: &Delivery) -> bool {
             "message thread not found",
         ],
     )
+}
+
+/// A people message (TASK-081) Telegram did not take: its error code only,
+/// Telegram's text is not ours to log.
+fn people_undelivered(delivery: Option<&Delivery>) {
+    if let Some(Err(error)) = delivery {
+        let code = match error {
+            ApiError::Telegram { code, .. } => Some(*code),
+            _ => None,
+        };
+        debug!(?code, "people message not delivered");
+    }
 }
 
 /// The bot may not write to the chat: a user who never pressed Start or
@@ -3793,7 +3812,18 @@ impl Slots {
                 }
                 return;
             }
-            Control::Member(update) => return self.on_member(update),
+            Control::Member(mut update) => {
+                // TASK-081: made by a person removed after the poll let it
+                // through.
+                if update.by.is_some_and(|by| self.removed.contains(&by)) {
+                    update.by_allowed = false;
+                }
+                return self.on_member(update);
+            }
+            Control::Connect(input) if self.removed.contains(&input.sender) => {
+                debug!("input of a removed person dropped");
+                return;
+            }
             Control::Connect(input) => return self.on_connect(input),
             Control::Forward(input) => return self.on_forward(input),
             Control::Invite(input) => return self.on_invite(input),
@@ -11534,72 +11564,70 @@ impl Slots {
         }
         let owner = input.chat;
         self.reopen(Chat::Private(owner));
-        let reply = Some(input.message_id);
         if !self.options.allowlist.is_owner(owner.expose()) {
-            self.tell_person(
-                owner,
-                people::ONLY_OWNER_ADDS.to_owned(),
-                None,
-                reply,
-                false,
-            );
+            self.tell_person(owner, people::ONLY_OWNER_ADDS.to_owned(), None, false);
             return;
         }
         match input.origin {
             Origin::User { is_bot: true, .. } => {
-                self.tell_person(owner, people::NO_BOTS.to_owned(), None, reply, false);
+                self.tell_person(owner, people::NO_BOTS.to_owned(), None, false);
             }
             Origin::User {
                 user,
                 name,
                 username,
                 ..
-            } => self.propose_member(owner, user, name, username, reply, false),
+            } => {
+                self.propose_member(owner, user, name, username, false);
+            }
             Origin::Hidden => {
                 // The link needs the bot's username.
                 let keyboard = self.options.mentions.is_some().then(menu::invite_keyboard);
-                self.tell_person(owner, people::HIDDEN.to_owned(), keyboard, reply, false);
+                self.tell_person(owner, people::HIDDEN.to_owned(), keyboard, false);
             }
             Origin::Other => {
-                self.tell_person(owner, people::OTHER.to_owned(), None, reply, false);
+                self.tell_person(owner, people::OTHER.to_owned(), None, false);
             }
         }
     }
 
     /// `/start inv_<code>` (TASK-081): a valid code asks its owner to
-    /// confirm the person; any other gets no answer.
+    /// confirm the person and is spent; when the owner cannot be asked now,
+    /// the person is told so and the code stays. Any other code gets no
+    /// answer.
     fn on_invite(&mut self, input: InviteInput) {
         if !self.options.menu || !self.registry.private {
             return;
         }
-        let Some(owner) = self.people.redeem(input.code.as_str(), StdInstant::now()) else {
+        let code = input.code.as_str();
+        let Some(owner) = self.people.invite_owner(code, StdInstant::now()) else {
             debug!("invite code not valid");
             return;
         };
         if self.options.allowlist.allows(input.user) {
             return;
         }
-        self.tell_person(
-            input.user,
-            people::INVITE_RECEIVED.to_owned(),
-            None,
-            None,
-            false,
-        );
-        self.propose_member(owner, input.user, input.name, input.username, None, true);
+        let text = if self.propose_member(owner, input.user, input.name, input.username, true) {
+            self.people.spend_invite(code);
+            people::INVITE_RECEIVED
+        } else {
+            people::INVITE_NOT_NOW
+        };
+        self.tell_person(input.user, text.to_owned(), None, false);
     }
 
-    /// Asks `owner` to confirm `user` as a member, or tells why not.
+    /// Asks `owner` to confirm `user` as a member (again, when that
+    /// question waits already: its message may be lost), or tells why not.
+    /// `true`: asked.
     fn propose_member(
         &mut self,
         owner: PrivateChat,
         user: PrivateChat,
         name: Option<String>,
         username: Option<String>,
-        reply_to: Option<i64>,
         notify: bool,
-    ) {
-        let text = if self.options.allowlist.allows(user) {
+    ) -> bool {
+        let refusal = if self.options.allowlist.allows(user) {
             people::ALREADY.to_owned()
         } else if self.options.allowlist.members_len() >= people::MAX_MEMBERS {
             people::full_list()
@@ -11613,26 +11641,37 @@ impl Slots {
                 .propose(owner, user, name, username, StdInstant::now())
             {
                 Ok(token) => {
-                    let text = people::confirm_text(&label);
-                    let keyboard = Some(menu::add_keyboard(token));
-                    self.tell_person(owner, text, keyboard, reply_to, notify);
-                    return;
+                    self.hand_off(
+                        Work::Menu(MenuJob::Proposal { owner, token }),
+                        Op::Send {
+                            chat: Chat::Private(owner),
+                            thread_id: None,
+                            text: people::confirm_text(&label),
+                            html: None,
+                            rich: None,
+                            reply_markup: Some(menu::add_keyboard(token)),
+                            permission: false,
+                            reply_to: None,
+                            notify,
+                        },
+                    );
+                    return true;
                 }
-                Err(Refusal::Waiting) => people::WAITING.to_owned(),
-                Err(Refusal::Full) => people::TOO_MANY_PENDING.to_owned(),
+                Err(Refusal::Full | Refusal::NoRandom) => people::TOO_MANY_PENDING.to_owned(),
             }
         };
-        self.tell_person(owner, text, None, reply_to, false);
+        self.tell_person(owner, refusal, None, false);
+        false
     }
 
     /// A message about the people into the General of `chat` (TASK-081):
-    /// quiet, a 403 closes nothing.
+    /// quiet, a 403 closes nothing. No reply to the forward: a deleted
+    /// forward would make Telegram refuse it.
     fn tell_person(
         &mut self,
         chat: PrivateChat,
         text: String,
         keyboard: Option<serde_json::Value>,
-        reply_to: Option<i64>,
         notify: bool,
     ) {
         self.hand_off(
@@ -11645,10 +11684,35 @@ impl Slots {
                 rich: None,
                 reply_markup: keyboard,
                 permission: false,
-                reply_to,
+                reply_to: None,
                 notify,
             },
         );
+    }
+
+    /// Proposal message `message` of `owner` says `text` and loses its
+    /// buttons (TASK-081).
+    fn edit_proposal(&mut self, owner: PrivateChat, message: i64, text: String) {
+        self.hand_off(
+            Work::Menu(MenuJob::People),
+            Op::Edit {
+                chat: Chat::Private(owner),
+                message_id: message,
+                text,
+                reply_markup: Some(permissions::no_keyboard()),
+                background: false,
+            },
+        );
+    }
+
+    /// Every proposal of any owner for `user`, gone: `user` was added or
+    /// removed meanwhile; their messages say `text`.
+    fn drop_proposals(&mut self, user: PrivateChat, text: &str) {
+        for pending in self.people.drop_user(user) {
+            for message in pending.messages().to_vec() {
+                self.edit_proposal(pending.owner, message, text.to_owned());
+            }
+        }
     }
 
     /// The people tab of owner `owner` now (TASK-081).
@@ -11677,13 +11741,14 @@ impl Slots {
     }
 
     /// A people press of owner `owner` (TASK-081); `on_menu`: it was on
-    /// their current menu. The page to show and the answer.
+    /// their current menu; `general`: the pressed message when it is in
+    /// the General. The page to show and the answer.
     fn press_people(
         &mut self,
         owner: PrivateChat,
         press: MenuPress,
         on_menu: bool,
-        message: Option<i64>,
+        general: Option<i64>,
     ) -> (Page, String) {
         let answer = match press {
             MenuPress::Remove { .. } | MenuPress::RemoveConfirm { .. } if !on_menu => {
@@ -11712,8 +11777,19 @@ impl Slots {
                 }
             }
             MenuPress::Invite => self.press_invite(owner),
-            MenuPress::AddYes { token } => self.press_add(owner, message, token, true),
-            MenuPress::AddNo { token } => self.press_add(owner, message, token, false),
+            // A proposal's buttons act only on a proposal message: never on
+            // the menu or on a message of a topic.
+            MenuPress::AddYes { token } | MenuPress::AddNo { token } => {
+                match general.filter(|_| !on_menu) {
+                    Some(message) => self.press_add(
+                        owner,
+                        message,
+                        token,
+                        matches!(press, MenuPress::AddYes { .. }),
+                    ),
+                    None => people::STALE.to_owned(),
+                }
+            }
             _ => String::new(),
         };
         (Page::People, answer)
@@ -11734,46 +11810,41 @@ impl Slots {
             Ok(code) => {
                 info!("invite link minted");
                 let link = people::invite_link(&bot, &code);
-                self.tell_person(owner, people::invite_text(&link), None, None, false);
+                self.tell_person(owner, people::invite_text(&link), None, false);
                 String::new()
             }
-            Err(_) => people::invites_full(),
+            Err(Refusal::Full) => people::invites_full(),
+            Err(Refusal::NoRandom) => people::ANSWER_NO_RANDOM.to_owned(),
         }
     }
 
     /// «Добавить» (`yes`) or «Отмена» of proposal `token` of `owner` on
-    /// `message` (TASK-081): the proposal message says what came of it and
-    /// loses its buttons.
-    fn press_add(
-        &mut self,
-        owner: PrivateChat,
-        message: Option<i64>,
-        token: u32,
-        yes: bool,
-    ) -> String {
-        let text = match self.people.take(owner, token, StdInstant::now()) {
-            None => people::STALE.to_owned(),
-            Some(_) if !yes => people::CANCELLED.to_owned(),
-            Some(pending) => self.add_member(pending),
+    /// General message `message` (TASK-081): every message of the proposal
+    /// says what came of it and loses its buttons. A press no live proposal
+    /// of `owner` asks on that message edits nothing: its answer says it is
+    /// stale.
+    fn press_add(&mut self, owner: PrivateChat, message: i64, token: u32, yes: bool) -> String {
+        let Some(pending) = self.people.take(owner, token, message, StdInstant::now()) else {
+            return people::STALE.to_owned();
         };
-        let Some(message) = message else {
-            return cut(&text, 190);
+        let mut messages = pending.messages().to_vec();
+        if !messages.contains(&message) {
+            messages.push(message);
+        }
+        let text = if yes {
+            self.add_member(pending)
+        } else {
+            people::CANCELLED.to_owned()
         };
-        self.hand_off(
-            Work::Menu(MenuJob::People),
-            Op::Edit {
-                chat: Chat::Private(owner),
-                message_id: message,
-                text,
-                reply_markup: Some(permissions::no_keyboard()),
-                background: false,
-            },
-        );
+        for message in messages {
+            self.edit_proposal(owner, message, text.clone());
+        }
         String::new()
     }
 
     /// Adds the person of `pending` (TASK-081): they write from the next
-    /// update on and are greeted. What the proposal message says then.
+    /// update on and are greeted; other owners' questions about them go.
+    /// What the proposal message says then.
     fn add_member(&mut self, pending: people::Pending) -> String {
         if self.options.allowlist.allows(pending.user) {
             return people::ALREADY.to_owned();
@@ -11787,6 +11858,7 @@ impl Slots {
             .add_member(user, pending.name, pending.username);
         self.removed.remove(&user);
         self.publish_members();
+        self.drop_proposals(user, people::ALREADY);
         info!(
             members = self.registry.members.len(),
             "person added from the menu"
@@ -11796,19 +11868,22 @@ impl Slots {
             .mentions
             .as_ref()
             .map(|bot| bot.username.clone());
-        self.tell_person(user, people::welcome_text(bot.as_deref()), None, None, true);
+        self.tell_person(user, people::welcome_text(bot.as_deref()), None, true);
         people::added_text(&label, bot.as_deref())
     }
 
     /// Removes member `key` at the second press of `owner` (TASK-081):
     /// their access ends at once, their menu goes (their settings stay),
-    /// their devices are revoked and they are told. The answer to show.
+    /// their devices are revoked and they are told; every armed 🗑 of the
+    /// key and every waiting question about them go. The answer to show.
     fn remove_member(&mut self, owner: PrivateChat, key: u32) -> Option<String> {
         let member = self.registry.remove_member(key)?;
         let gone = member.chat;
         self.removed.insert(gone);
         self.publish_members();
         self.remove_confirm.remove(&owner);
+        self.remove_confirm.retain(|_, (armed, _)| *armed != key);
+        self.drop_proposals(gone, people::STALE);
         if let Some(menu) = self.registry.person(gone).and_then(|person| person.menu) {
             self.retire(MessageKey::new(Chat::Private(gone), menu), true);
         }
@@ -11837,7 +11912,7 @@ impl Slots {
             }
             None => 0,
         };
-        self.tell_person(gone, people::FAREWELL.to_owned(), None, None, true);
+        self.tell_person(gone, people::FAREWELL.to_owned(), None, true);
         info!(
             members = self.registry.members.len(),
             devices, "person removed from the menu"
@@ -12097,7 +12172,8 @@ impl Slots {
             | MenuPress::Invite
             | MenuPress::AddYes { .. }
             | MenuPress::AddNo { .. }) => {
-                self.press_people(chat, people_press, on_menu, input.message_id)
+                let general = input.message_id.filter(|_| input.thread_id.is_none());
+                self.press_people(chat, people_press, on_menu, general)
             }
             setting => {
                 let old = self
@@ -12288,6 +12364,19 @@ impl Slots {
     /// Telegram answered a call about a menu (TASK-073).
     fn on_menu_done(&mut self, job: MenuJob, delivery: Option<Delivery>) {
         match job {
+            // TASK-081: the menu of a person removed while it was on its
+            // way goes at once.
+            MenuJob::Show { chat } if self.removed.contains(&chat) => {
+                self.pending_menus.remove(&chat);
+                if let Some(Ok(Outcome::Sent(message))) = &delivery
+                    && message.message_id != 0
+                {
+                    self.retire(
+                        MessageKey::new(Chat::Private(chat), message.message_id),
+                        false,
+                    );
+                }
+            }
             MenuJob::Show { chat } => {
                 let content = self.pending_menus.remove(&chat);
                 let message = match &delivery {
@@ -12354,15 +12443,14 @@ impl Slots {
             }
             // TASK-081: a person who never pressed Start is no chat to
             // close. The code only: Telegram's text is not ours to log.
-            MenuJob::People => {
-                if let Some(Err(error)) = delivery {
-                    let code = match error {
-                        ApiError::Telegram { code, .. } => Some(code),
-                        _ => None,
-                    };
-                    debug!(?code, "people message not delivered");
+            MenuJob::People => people_undelivered(delivery.as_ref()),
+            MenuJob::Proposal { owner, token } => match &delivery {
+                Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
+                    self.people.placed(owner, token, message.message_id);
                 }
-            }
+                // Lost: the owner's next forward or invite asks again.
+                _ => people_undelivered(delivery.as_ref()),
+            },
         }
     }
 
@@ -13885,7 +13973,7 @@ async fn dispatch_loop(
                     // A people message (TASK-081) closes no chat: its
                     // person may never have pressed Start.
                     closed: delivery.as_ref().is_some_and(forbidden)
-                        && !matches!(work, Work::Menu(MenuJob::People)),
+                        && !matches!(work, Work::Menu(MenuJob::People | MenuJob::Proposal { .. })),
                 });
             }
             let _ = done.send(match work {
@@ -32687,6 +32775,7 @@ again"
             is_forum: forum,
             member,
             by_allowed,
+            by: by_allowed.then(|| PrivateChat::of_user(7)),
         })
     }
 
@@ -32855,6 +32944,7 @@ again"
             is_forum: true,
             thread_id: Some(5),
             target: target.map(str::to_owned),
+            sender: PrivateChat::of_user(7),
         };
         let there = Place::topic(group_b(), 5);
         // With the bot's name (review: privacy mode shows it only that).
@@ -34012,7 +34102,7 @@ again"
             .iter()
             .filter_map(|(work, op)| match (work, op) {
                 (
-                    Work::Menu(MenuJob::People),
+                    Work::Menu(MenuJob::People | MenuJob::Proposal { .. }),
                     Op::Send {
                         chat: Chat::Private(to),
                         thread_id: None,
@@ -34099,18 +34189,23 @@ again"
         let sends = people_sends(&handed);
         assert_eq!(sends.len(), 1, "{handed:#?}");
         let (to, text, _, reply) = &sends[0];
-        assert_eq!((*to, *reply), (owner_chat(), Some(50)));
+        assert_eq!(
+            (*to, *reply),
+            (owner_chat(), None),
+            "no reply: a deleted forward would refuse it"
+        );
         assert!(
             text.starts_with("Добавить «Анна (@anna)» в cctg?"),
             "{text}"
         );
         let token = proposal_token(&handed);
 
-        // The same forward again: the question waits above.
+        // The same forward again: the question comes again (the first may
+        // be lost), with the same buttons.
         slots.on_control(forward_of_member());
-        let again = people_sends(&all_work(&mut work));
-        assert_eq!(again.len(), 1);
-        assert_eq!(again[0].1, people::WAITING);
+        let handed_again = all_work(&mut work);
+        assert_eq!(people_sends(&handed_again).len(), 1);
+        assert_eq!(proposal_token(&handed_again), token);
 
         slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
         let handed = all_work(&mut work);
@@ -34141,10 +34236,12 @@ again"
             "the menu is not the proposal"
         );
 
-        // A second press of the same button: stale.
+        // A second press of the same button: stale, the message is not
+        // touched (it was edited already).
         slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
         let handed = all_work(&mut work);
-        assert_eq!(people_edits(&handed), [(1200, people::STALE.to_owned())]);
+        assert!(people_edits(&handed).is_empty(), "{handed:#?}");
+        assert_eq!(callback_answers(&handed), [Some(people::STALE.to_owned())]);
         assert_eq!(slots.registry.members.len(), 1);
 
         // Forwarded again, they are in the list already.
@@ -34481,7 +34578,11 @@ again"
         slots.on_control(press_by(owner_chat(), 1202, &format!("menu:pa:{token}")));
         let _ = all_work(&mut work);
         assert!(slots.options.allowlist.contains(MEMBER));
-        assert_eq!(slots.registry.members[0].key, key, "max + 1 of none");
+        assert_eq!(
+            slots.registry.members[0].key,
+            key + 1,
+            "keys are never given twice"
+        );
         slots.on_control(said());
         slots.on_control(pressed());
         slots.pump();
@@ -34541,15 +34642,15 @@ again"
         let handed = all_work(&mut work);
         let sends = people_sends(&handed);
         assert_eq!(sends.len(), 2, "{handed:#?}");
-        assert_eq!(
-            (sends[0].0, sends[0].1.as_str()),
-            (PrivateChat::of_user(GUEST), people::INVITE_RECEIVED)
-        );
-        assert_eq!(sends[1].0, owner_chat());
+        assert_eq!(sends[0].0, owner_chat());
         assert!(
-            sends[1].1.starts_with("Добавить «Гость» в cctg?"),
+            sends[0].1.starts_with("Добавить «Гость» в cctg?"),
             "{}",
-            sends[1].1
+            sends[0].1
+        );
+        assert_eq!(
+            (sends[1].0, sends[1].1.as_str()),
+            (PrivateChat::of_user(GUEST), people::INVITE_RECEIVED)
         );
         let token = proposal_token(&handed);
 
@@ -34582,5 +34683,391 @@ again"
         assert_eq!(members, [member_chat()]);
         assert!(allowlist.contains(MEMBER) && allowlist.is_owner(7));
         assert_eq!(allowlist.members_len(), 1);
+    }
+
+    // ------------------------------------------ TASK-081 code review fixes
+
+    /// Telegram took the question of proposal `token` of `owner` as
+    /// `message`.
+    fn proposal_placed(slots: &mut Slots, owner: PrivateChat, token: u32, message: i64) {
+        slots.on_done(Done::Menu {
+            job: MenuJob::Proposal { owner, token },
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: message,
+                ..Message::default()
+            }))),
+        });
+    }
+
+    /// The edits of people messages among `handed`, by message.
+    fn edited(handed: &[(Work, Op)], message: i64) -> Vec<String> {
+        people_edits(handed)
+            .into_iter()
+            .filter(|(id, _)| *id == message)
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// Review finding 1: a question Telegram refused (or that never arrived)
+    /// does not block the person: the next forward asks again with buttons
+    /// of the same proposal, and «Добавить» there adds them.
+    #[tokio::test]
+    async fn a_lost_question_is_asked_again_on_the_next_forward() {
+        let dir = TempDir::new("slots-people-lost");
+        let (mut slots, mut work) = menu_slot(&dir, people_options());
+        slots.on_control(forward_of_member());
+        let handed = all_work(&mut work);
+        let token = proposal_token(&handed);
+        assert!(
+            handed.iter().any(|(work, op)| matches!(
+                (work, op),
+                (
+                    Work::Menu(MenuJob::Proposal { token: t, .. }),
+                    Op::Send { reply_to: None, .. }
+                ) if *t == token
+            )),
+            "a proposal job, no reply: {handed:#?}"
+        );
+        slots.on_done(Done::Menu {
+            job: MenuJob::Proposal {
+                owner: owner_chat(),
+                token,
+            },
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message to be replied not found".into(),
+            })),
+        });
+        slots.on_control(forward_of_member());
+        let handed = all_work(&mut work);
+        let sends = people_sends(&handed);
+        assert_eq!(sends.len(), 1, "{sends:?}");
+        assert!(
+            sends[0].1.starts_with("Добавить «Анна (@anna)»"),
+            "{}",
+            sends[0].1
+        );
+        assert!(sends[0].2.is_some(), "with buttons");
+        assert_eq!(proposal_token(&handed), token);
+        proposal_placed(&mut slots, owner_chat(), token, 1400);
+        slots.on_control(press_by(owner_chat(), 1400, &format!("menu:pa:{token}")));
+        let handed = all_work(&mut work);
+        assert!(slots.options.allowlist.contains(MEMBER));
+        assert_eq!(edited(&handed, 1400).len(), 1);
+    }
+
+    /// Review finding 2: a member's key is never given again, so a 🗑 another
+    /// owner armed for a removed member never removes the next one.
+    #[tokio::test]
+    async fn an_armed_key_of_a_removed_member_removes_nobody_else() {
+        const BORIS: i64 = 7_319_402_778;
+        const CLARA: i64 = 7_319_402_779;
+        let dir = TempDir::new("slots-people-keys");
+        let options = Options {
+            allowlist: [7, 8].into_iter().collect(),
+            ..people_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        let second = PrivateChat::of_user(8);
+        slots.registry.person_mut(second).menu = Some(8800);
+        slots
+            .registry
+            .add_member(member_chat(), "Анна".into(), None);
+        let boris = slots
+            .registry
+            .add_member(PrivateChat::of_user(BORIS), "Борис".into(), None);
+        slots.publish_members();
+        let _ = all_work(&mut work);
+        slots.on_control(press_by(second, 8800, &format!("menu:pr:{boris}")));
+        slots.on_control(menu_press(MENU, &format!("menu:pr:{boris}")));
+        slots.on_control(menu_press(MENU, &format!("menu:prc:{boris}")));
+        assert!(!slots.options.allowlist.contains(BORIS));
+        let _ = all_work(&mut work);
+        slots.on_control(forward_in(
+            owner_chat(),
+            Origin::User {
+                user: PrivateChat::of_user(CLARA),
+                is_bot: false,
+                name: Some("Клара".into()),
+                username: None,
+            },
+        ));
+        let token = proposal_token(&all_work(&mut work));
+        slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
+        let _ = all_work(&mut work);
+        let clara = slots
+            .registry
+            .member(PrivateChat::of_user(CLARA))
+            .unwrap()
+            .key;
+        assert_ne!(clara, boris, "a new key");
+        slots.on_control(press_by(second, 8800, &format!("menu:prc:{boris}")));
+        slots.on_control(press_by(second, 8800, &format!("menu:prc:{clara}")));
+        let handed = all_work(&mut work);
+        assert!(slots.options.allowlist.contains(CLARA), "Clara stays");
+        assert!(
+            !callback_answers(&handed).iter().any(|answer| answer
+                .as_deref()
+                .is_some_and(|t| t.starts_with("Удалён(а)"))),
+            "{handed:#?}"
+        );
+    }
+
+    /// Review finding 3: «Добавить» and «Отмена» act only on their question:
+    /// on a topic message, on the menu or on another message of the General
+    /// they edit nothing and the proposal waits.
+    #[tokio::test]
+    async fn proposal_buttons_act_only_on_their_question() {
+        let dir = TempDir::new("slots-people-forged");
+        let (mut slots, mut work) = menu_slot(&dir, people_options());
+        slots.on_control(press_in(private_owner(), 700, 900, "menu:pn:1"));
+        let handed = all_work(&mut work);
+        assert!(
+            !handed.iter().any(|(_, op)| matches!(op, Op::Edit { .. })),
+            "{handed:#?}"
+        );
+        assert_eq!(callback_answers(&handed), [Some(people::STALE.to_owned())]);
+
+        slots.on_control(forward_of_member());
+        let token = proposal_token(&all_work(&mut work));
+        proposal_placed(&mut slots, owner_chat(), token, 1500);
+        for (thread, message) in [(Some(700), 1500), (None, MENU), (None, 1501)] {
+            let press = match thread {
+                Some(thread) => press_in(
+                    private_owner(),
+                    thread,
+                    message,
+                    &format!("menu:pa:{token}"),
+                ),
+                None => press_by(owner_chat(), message, &format!("menu:pa:{token}")),
+            };
+            slots.on_control(press);
+            let handed = all_work(&mut work);
+            assert!(
+                !handed.iter().any(
+                    |(_, op)| matches!(op, Op::Edit { message_id, .. } if *message_id != MENU)
+                ),
+                "{message}: {handed:#?}"
+            );
+            assert!(!slots.options.allowlist.contains(MEMBER), "{message}");
+        }
+        slots.on_control(press_by(owner_chat(), 1500, &format!("menu:pn:{token}")));
+        let handed = all_work(&mut work);
+        assert_eq!(edited(&handed, 1500), [people::CANCELLED]);
+    }
+
+    /// Review finding 4: an invite the owner cannot be asked about now tells
+    /// the guest so and keeps the code; once there is room the same code
+    /// asks the owner.
+    #[tokio::test]
+    async fn an_invite_the_owner_is_not_asked_about_keeps_its_code() {
+        const GUEST: i64 = 7_319_402_888;
+        let dir = TempDir::new("slots-people-invite-full");
+        let (mut slots, mut work) = menu_slot(&dir, people_options());
+        let mut tokens = Vec::new();
+        for user in 0..people::MAX_PENDING as i64 {
+            slots.on_control(forward_in(
+                owner_chat(),
+                Origin::User {
+                    user: PrivateChat::of_user(7_319_500_000 + user),
+                    is_bot: false,
+                    name: Some("x".into()),
+                    username: None,
+                },
+            ));
+            tokens.push(proposal_token(&all_work(&mut work)));
+        }
+        slots.on_control(menu_press(MENU, "menu:pi"));
+        let sends = people_sends(&all_work(&mut work));
+        let code = sends[0]
+            .1
+            .split("start=inv_")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap()
+            .to_owned();
+        for _ in 0..2 {
+            slots.on_control(invite_from(GUEST, &code));
+            let sends = people_sends(&all_work(&mut work));
+            assert_eq!(sends.len(), 2, "{sends:?}");
+            assert_eq!(
+                (sends[0].0, sends[0].1.as_str()),
+                (owner_chat(), people::TOO_MANY_PENDING)
+            );
+            assert_eq!(
+                (sends[1].0, sends[1].1.as_str()),
+                (PrivateChat::of_user(GUEST), people::INVITE_NOT_NOW)
+            );
+        }
+        slots.on_control(press_by(
+            owner_chat(),
+            1600,
+            &format!("menu:pn:{}", tokens[0]),
+        ));
+        let _ = all_work(&mut work);
+        slots.on_control(invite_from(GUEST, &code));
+        let sends = people_sends(&all_work(&mut work));
+        assert_eq!(sends.len(), 2, "{sends:?}");
+        assert!(
+            sends[0].1.starts_with("Добавить «Гость» в cctg?"),
+            "{}",
+            sends[0].1
+        );
+        assert_eq!(sends[1].1, people::INVITE_RECEIVED);
+        slots.on_control(invite_from(GUEST, &code));
+        assert!(all_work(&mut work).is_empty(), "spent now");
+    }
+
+    /// Review finding 5: `/connect` and a membership change of a person
+    /// removed after the poll let them through do not count.
+    #[tokio::test]
+    async fn a_removed_persons_connect_and_group_changes_do_not_count() {
+        const GROUP_C: i64 = -1_009_000_000_777;
+        let dir = TempDir::new("slots-people-connect");
+        let (mut slots, mut work) = with_member(&dir);
+        let key = slots.registry.members[0].key;
+        slots.on_control(menu_press(MENU, &format!("menu:pr:{key}")));
+        slots.on_control(menu_press(MENU, &format!("menu:prc:{key}")));
+        assert!(!slots.options.allowlist.contains(MEMBER));
+        let _ = all_work(&mut work);
+        let connect = |sender: PrivateChat| {
+            Control::Connect(ConnectInput {
+                chat: GroupChat::of(GROUP_C),
+                supergroup: true,
+                title: Some("Группа".into()),
+                is_forum: true,
+                thread_id: None,
+                target: None,
+                sender,
+            })
+        };
+        slots.on_control(connect(member_chat()));
+        assert!(all_work(&mut work).is_empty(), "dropped");
+        slots.on_control(connect(owner_chat()));
+        assert!(!all_work(&mut work).is_empty(), "the owner's is answered");
+
+        let added_by = |by: PrivateChat| {
+            Control::Member(MemberUpdate {
+                chat: GroupChat::of(GROUP_C - 1),
+                supergroup: true,
+                title: Some("Группа".into()),
+                is_forum: true,
+                member: ChatMember {
+                    status: "administrator".into(),
+                    can_manage_topics: true,
+                    can_delete_messages: true,
+                    ..ChatMember::default()
+                },
+                by_allowed: true,
+                by: Some(by),
+            })
+        };
+        slots.on_control(added_by(member_chat()));
+        assert!(
+            slots.registry.group(GroupChat::of(GROUP_C - 1)).is_none(),
+            "not an allowlisted person's group"
+        );
+        slots.on_control(added_by(owner_chat()));
+        assert!(slots.registry.group(GroupChat::of(GROUP_C - 1)).is_some());
+    }
+
+    /// Review nits: a menu of a removed person that lands later goes at
+    /// once; other owners' questions about a person go when the person is
+    /// added or removed.
+    #[tokio::test]
+    async fn a_removal_or_an_addition_clears_what_waits_for_the_person() {
+        let dir = TempDir::new("slots-people-nits");
+        let options = Options {
+            allowlist: [7, 8].into_iter().collect(),
+            ..people_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        let second = PrivateChat::of_user(8);
+        // The second owner asks about Anna too; the first adds her.
+        slots.on_control(forward_in(
+            second,
+            Origin::User {
+                user: member_chat(),
+                is_bot: false,
+                name: Some("Анна".into()),
+                username: None,
+            },
+        ));
+        let theirs = proposal_token(&all_work(&mut work));
+        proposal_placed(&mut slots, second, theirs, 8801);
+        slots.on_control(forward_of_member());
+        let token = proposal_token(&all_work(&mut work));
+        slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
+        let handed = all_work(&mut work);
+        assert_eq!(edited(&handed, 8801), [people::ALREADY]);
+        slots.on_control(press_by(second, 8801, &format!("menu:pa:{theirs}")));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(people::STALE.to_owned())]
+        );
+
+        // Her menu is on its way when the first owner removes her.
+        slots.registry.person_mut(member_chat());
+        slots
+            .pending_menus
+            .insert(member_chat(), (String::new(), serde_json::Value::Null));
+        let key = slots.registry.members[0].key;
+        slots.on_control(menu_press(MENU, &format!("menu:pr:{key}")));
+        slots.on_control(menu_press(MENU, &format!("menu:prc:{key}")));
+        assert!(!slots.options.allowlist.contains(MEMBER));
+        let _ = all_work(&mut work);
+        // Her menu, sent before the removal, lands now.
+        slots.on_done(Done::Menu {
+            job: MenuJob::Show {
+                chat: member_chat(),
+            },
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 7800,
+                ..Message::default()
+            }))),
+        });
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(|(_, op)| matches!(
+                op,
+                Op::Delete { chat: Chat::Private(to), message_id: 7800 } if *to == member_chat()
+            )),
+            "{handed:#?}"
+        );
+        assert!(!handed.iter().any(|(_, op)| matches!(op, Op::Pin { .. })));
+        assert!(slots.registry.person(member_chat()).unwrap().menu.is_none());
+
+        // A question about her from before the removal goes stale.
+        let dir = TempDir::new("slots-people-nits-remove");
+        let options = Options {
+            allowlist: [7, 8].into_iter().collect(),
+            ..people_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        slots
+            .registry
+            .add_member(member_chat(), "Анна".into(), None);
+        slots.publish_members();
+        // A question of the second owner about her that still waits (one
+        // from before she was added): put in the book directly.
+        let theirs = slots
+            .people
+            .propose(
+                second,
+                member_chat(),
+                "Анна".into(),
+                None,
+                StdInstant::now(),
+            )
+            .unwrap();
+        proposal_placed(&mut slots, second, theirs, 8802);
+        let key = slots.registry.members[0].key;
+        slots.on_control(menu_press(MENU, &format!("menu:pr:{key}")));
+        slots.on_control(menu_press(MENU, &format!("menu:prc:{key}")));
+        let handed = all_work(&mut work);
+        assert_eq!(edited(&handed, 8802), [people::STALE]);
+        slots.on_control(press_by(second, 8802, &format!("menu:pa:{theirs}")));
+        let _ = all_work(&mut work);
+        assert!(!slots.options.allowlist.contains(MEMBER), "not back");
     }
 }

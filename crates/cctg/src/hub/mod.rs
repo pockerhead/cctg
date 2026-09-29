@@ -874,6 +874,7 @@ mod tests {
             is_forum: true,
             member: ChatMember::default(),
             by_allowed: true,
+            by: Some(PrivateChat::of_user(ALLOWED)),
         };
         let connect = updates::ConnectInput {
             chat: GroupChat::of(CHAT - 1),
@@ -882,6 +883,7 @@ mod tests {
             is_forum: true,
             thread_id: None,
             target: None,
+            sender: PrivateChat::of_user(ALLOWED),
         };
         let mut route = route_inbound(
             &commands_tx,

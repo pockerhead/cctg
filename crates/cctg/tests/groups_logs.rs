@@ -141,6 +141,7 @@ fn member(id: i64, status: &str, supergroup: bool, by_allowed: bool) -> Control 
             ..admin()
         },
         by_allowed,
+        by: by_allowed.then(|| PrivateChat::of_user(OWNER)),
     })
 }
 
@@ -152,6 +153,7 @@ fn connect(id: i64) -> Control {
         is_forum: true,
         thread_id: Some(5),
         target: Some("cctg_bot".into()),
+        sender: PrivateChat::of_user(OWNER),
     })
 }
 
