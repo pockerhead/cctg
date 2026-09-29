@@ -632,6 +632,16 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
         status_sends(&hub.fake.ops()),
         [(100, "💤 Ждёт вас".to_owned())]
     );
+    // The fake records a send before the hub has its answer: only an edit
+    // of the message proves the hub knows it as the status message
+    // (TASK-082; a notice before that is about no message of the hub).
+    hub.numbers(A).await;
+    hub.shows(
+        "numbers shown",
+        100,
+        shown(&format!("💤 Ждёт вас\n{NUMBERS}"), &[]),
+    )
+    .await;
 
     // The bot's pin notice about the status message goes (a hub before
     // TASK-062 pinned it); one about another message stays.
@@ -670,7 +680,6 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
         }
     )));
 
-    hub.numbers(A).await;
     hub.hook(A, HookEvent::UserPromptSubmit { prompt_id: None })
         .await;
     hub.hook(A, tool("t1", "• Bash: sleep 30")).await;
