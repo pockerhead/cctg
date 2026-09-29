@@ -94,13 +94,18 @@ RUN apt-get update \
 COPY --from=build /cctg /usr/local/bin/cctg
 COPY --from=voice /cctg-voice /usr/local/bin/cctg-voice
 COPY --from=model /model /usr/local/share/cctg/voice-ru
-# The helper recognizes the fixture: the real engine and model, at build time.
-# Its answer line (took_ms, peak_rss_kb) goes to the build log; the build
-# fails when the words are not in it.
+# The helper recognizes the fixture: the real engine and model, at build time,
+# twice in one process (TASK-086: it answers requests, each the byte count on
+# a line and then the bytes, until stdin closes). Its answer lines (took_ms,
+# peak_rss_kb) go to the build log; the build fails unless both have the
+# words.
 RUN --mount=type=bind,source=crates/voice/tests/fixtures/voice-ru.ogg,target=/tmp/voice-ru.ogg \
-    heard="$(cctg-voice /usr/local/share/cctg/voice-ru < /tmp/voice-ru.ogg)" \
-    && echo "cctg-voice on the fixture: ${heard}" \
-    && echo "${heard}" | grep -q 'запусти тесты'
+    size="$(stat -c %s /tmp/voice-ru.ogg)" \
+    && heard="$( { printf '%s\n' "${size}"; cat /tmp/voice-ru.ogg; \
+                   printf '%s\n' "${size}"; cat /tmp/voice-ru.ogg; } \
+                 | cctg-voice /usr/local/share/cctg/voice-ru )" \
+    && echo "cctg-voice on the fixture, twice: ${heard}" \
+    && test "$(echo "${heard}" | grep -c 'запусти тесты')" -eq 2     && test "$(echo "${heard}" | wc -l)" -eq 2
 USER 10001
 WORKDIR /data
 # Both listeners on every interface of the container; TLS comes from

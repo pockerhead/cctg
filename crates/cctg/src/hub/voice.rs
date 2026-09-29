@@ -1,12 +1,14 @@
 //! Voice messages to text on the hub (TASK-085).
 //!
 //! The slots actor sends a [`Job`] per voice message of a topic; one task
-//! downloads the file (at most [`MAX_VOICE_BYTES`]) and runs the helper
-//! `cctg-voice` on it, one voice at a time, and gets back one [`Heard`] per
-//! job. The helper is a process of its own per voice: it decodes the
-//! OGG/Opus and recognizes it with the model baked into the hub image, then
-//! exits, so its memory goes back to the system. It gets the bytes on stdin
-//! and answers one JSON line; it never inherits the bot token, the hub
+//! downloads the file (at most [`MAX_VOICE_BYTES`]) and hands it to the
+//! helper `cctg-voice`, one voice at a time, and gets back one [`Heard`] per
+//! job. The helper is one process that stays (TASK-086): it loads the model
+//! baked into the hub image once, when the hub starts, and answers each
+//! voice (its byte count on a line, then the OGG/Opus bytes on stdin) with
+//! one JSON line. A helper that exits, answers out of the protocol or takes
+//! longer than [`VOICE_TIMEOUT`] is killed; that voice goes unheard and the
+//! next one starts a new helper. It never inherits the bot token, the hub
 //! secret or a proxy (see [`scrubbed`]).
 //!
 //! Logs carry lengths, times and outcomes, never the words, the caption,
@@ -20,8 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -34,12 +37,13 @@ use super::registry::SlotId;
 pub const MAX_VOICE_SECONDS: u64 = 300;
 /// A voice file larger than this is not downloaded for recognition.
 pub const MAX_VOICE_BYTES: u64 = 4 << 20;
-/// One helper run at most; then it is killed.
+/// One voice in the helper at most (the helper's start and model load
+/// included when the voice starts it); then the helper is killed.
 pub const VOICE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Voice messages waiting for the recognition task; one more is not
 /// recognized.
 pub const VOICE_QUEUE: usize = 8;
-/// Bytes of helper stdout read at most.
+/// Bytes of one helper answer line read at most.
 const MAX_HELPER_OUTPUT: u64 = 64 << 10;
 
 /// What recognition made of a voice message.
@@ -59,14 +63,29 @@ pub enum Heard {
 /// the hub, a fake in tests.
 pub trait Hear: Send + Sync + 'static {
     fn hear(&self, ogg: Vec<u8>) -> impl Future<Output = Heard> + Send;
+
+    /// Gets ready for the first voice; [`serve`] calls it once, first.
+    fn warm(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
-/// The `cctg-voice` helper: `program <model>` with the voice on stdin.
-#[derive(Debug, Clone)]
+/// The `cctg-voice` helper: `program <model>`, one process kept running
+/// while it answers.
+#[derive(Debug)]
 pub struct Helper {
-    pub program: PathBuf,
-    pub model: PathBuf,
-    pub timeout: Duration,
+    program: PathBuf,
+    model: PathBuf,
+    timeout: Duration,
+    running: Mutex<Option<Running>>,
+}
+
+/// A started helper and its pipes.
+#[derive(Debug)]
+struct Running {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
 }
 
 /// The helper's answer line.
@@ -74,6 +93,7 @@ pub struct Helper {
 #[serde(default)]
 struct Output {
     text: String,
+    error: Option<String>,
     audio_ms: u64,
     took_ms: u64,
     peak_rss_kb: Option<u64>,
@@ -91,39 +111,56 @@ pub fn scrubbed(name: &OsStr) -> bool {
             .any(|proxy| name.eq_ignore_ascii_case(proxy))
 }
 
-/// The outcome of a finished helper run from its exit code and stdout.
-fn heard_of(code: Option<i32>, stdout: &[u8]) -> (&'static str, Heard, Option<Output>) {
-    match code {
-        Some(0) => {
-            let line = stdout
-                .split(|byte| *byte == b'\n')
-                .next()
-                .unwrap_or_default();
-            match serde_json::from_slice::<Output>(line) {
-                Ok(output) => {
-                    let text = output.text.trim();
-                    let heard = if text.is_empty() {
-                        Heard::Silent
-                    } else {
-                        Heard::Text(text.to_owned())
-                    };
-                    let outcome = if heard == Heard::Silent {
-                        "silent"
-                    } else {
-                        "ok"
-                    };
-                    (outcome, heard, Some(output))
-                }
-                Err(_) => ("failed", Heard::Failed, None),
-            }
-        }
-        Some(3) => ("too_long", Heard::TooLong, None),
-        _ => ("failed", Heard::Failed, None),
+/// The outcome of one answer line of the helper; `None` when the line is
+/// no answer of its protocol.
+fn heard_of(line: &[u8]) -> Option<(&'static str, Heard, Output)> {
+    let output = serde_json::from_slice::<Output>(line).ok()?;
+    let (outcome, heard) = match output.error.as_deref() {
+        Some("too_long" | "too_big") => ("too_long", Heard::TooLong),
+        Some(_) => ("failed", Heard::Failed),
+        None => match output.text.trim() {
+            "" => ("silent", Heard::Silent),
+            text => ("ok", Heard::Text(text.to_owned())),
+        },
+    };
+    Some((outcome, heard, output))
+}
+
+/// Writes one voice to `running` and reads its answer line; `Err` when the
+/// helper is gone or its answer has no end.
+async fn ask(running: &mut Running, ogg: &[u8]) -> Result<Vec<u8>, ()> {
+    let header = format!("{}\n", ogg.len());
+    running
+        .stdin
+        .write_all(header.as_bytes())
+        .await
+        .map_err(|_| ())?;
+    running.stdin.write_all(ogg).await.map_err(|_| ())?;
+    running.stdin.flush().await.map_err(|_| ())?;
+    let mut line = Vec::new();
+    (&mut running.stdout)
+        .take(MAX_HELPER_OUTPUT)
+        .read_until(b'\n', &mut line)
+        .await
+        .map_err(|_| ())?;
+    if line.pop() != Some(b'\n') {
+        return Err(());
     }
+    Ok(line)
 }
 
 impl Helper {
-    async fn run(&self, ogg: Vec<u8>) -> (&'static str, Heard, Option<Output>) {
+    pub fn new(program: PathBuf, model: PathBuf, timeout: Duration) -> Self {
+        Self {
+            program,
+            model,
+            timeout,
+            running: Mutex::new(None),
+        }
+    }
+
+    /// A new helper process; it loads the model before it reads a voice.
+    fn spawn(&self) -> Option<Running> {
         let mut command = tokio::process::Command::new(&self.program);
         command
             .arg(&self.model)
@@ -142,40 +179,53 @@ impl Helper {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(_) => return ("spawn", Heard::Failed, None),
+        let Ok(mut child) = command.spawn() else {
+            warn!("voice helper did not start");
+            return None;
         };
-        let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            warn!("voice helper did not start");
+            return None;
+        };
+        info!("voice helper started");
+        Some(Running {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    /// The running helper, a new one when there is none or it exited.
+    fn ready<'a>(&self, running: &'a mut Option<Running>) -> Option<&'a mut Running> {
+        if let Some(current) = running.as_mut()
+            && !matches!(current.child.try_wait(), Ok(None))
+        {
+            *running = None;
+        }
+        if running.is_none() {
+            *running = self.spawn();
+        }
+        running.as_mut()
+    }
+
+    async fn run(&self, ogg: Vec<u8>) -> (&'static str, Heard, Option<Output>) {
+        let mut running = self.running.lock().await;
+        let Some(current) = self.ready(&mut running) else {
             return ("spawn", Heard::Failed, None);
         };
-        let work = async {
-            // Written and read at once: a pipe holds a few KiB only.
-            let feed = async move {
-                let _ = stdin.write_all(&ogg).await;
-                drop(stdin);
-            };
-            let read = async move {
-                let mut output = Vec::new();
-                let _ = (&mut stdout)
-                    .take(MAX_HELPER_OUTPUT)
-                    .read_to_end(&mut output)
-                    .await;
-                let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-                output
-            };
-            let ((), output) = tokio::join!(feed, read);
-            let status = child.wait().await;
-            (output, status)
+        let outcome = match tokio::time::timeout(self.timeout, ask(current, &ogg)).await {
+            Ok(Ok(line)) => match heard_of(&line) {
+                Some((outcome, heard, output)) => return (outcome, heard, Some(output)),
+                None => "failed",
+            },
+            Ok(Err(())) => "crashed",
+            Err(_) => "timeout",
         };
-        match tokio::time::timeout(self.timeout, work).await {
-            Ok((output, Ok(status))) => heard_of(status.code(), &output),
-            Ok((_, Err(_))) => ("failed", Heard::Failed, None),
-            Err(_) => {
-                let _ = child.kill().await;
-                ("timeout", Heard::Failed, None)
-            }
+        // Gone, hung or out of step: the next voice starts a new helper.
+        if let Some(mut stopped) = running.take() {
+            let _ = stopped.child.kill().await;
         }
+        (outcome, Heard::Failed, None)
     }
 }
 
@@ -191,6 +241,12 @@ impl Hear for Helper {
             "voice recognition"
         );
         heard
+    }
+
+    /// Starts the helper, so the model is in memory before the first voice.
+    async fn warm(&self) {
+        let mut running = self.running.lock().await;
+        let _ = self.ready(&mut running);
     }
 }
 
@@ -212,6 +268,7 @@ pub async fn serve<F: Fetch, H: Hear>(
     mut jobs: mpsc::Receiver<Job>,
     done: impl Fn(Job, Heard) + Send + 'static,
 ) {
+    hear.warm().await;
     while let Some(job) = jobs.recv().await {
         let heard = if job.until <= Instant::now() {
             Heard::Failed
@@ -258,41 +315,45 @@ mod tests {
     }
 
     #[test]
-    fn the_answer_line_gives_the_words_or_silence() {
+    fn the_answer_line_gives_the_words_silence_or_the_refusal() {
         let (outcome, heard, output) = heard_of(
-            Some(0),
-            r#"{"text":" привет \"мир\" ","audio_ms":4590,"took_ms":700,"peak_rss_kb":9}
-"#
-            .as_bytes(),
-        );
+            r#"{"text":" привет \"мир\" ","audio_ms":4590,"took_ms":700,"peak_rss_kb":9}"#
+                .as_bytes(),
+        )
+        .unwrap();
         assert_eq!(outcome, "ok");
         assert_eq!(heard, Heard::Text("привет \"мир\"".into()));
-        let output = output.unwrap();
         assert_eq!(
             (output.audio_ms, output.took_ms, output.peak_rss_kb),
             (4590, 700, Some(9))
         );
-        let (outcome, heard, _) = heard_of(Some(0), br#"{"text":"  ","audio_ms":1}"#);
+        let (outcome, heard, _) = heard_of(br#"{"text":"  ","audio_ms":1}"#).unwrap();
         assert_eq!((outcome, heard), ("silent", Heard::Silent));
-        assert_eq!(heard_of(Some(0), b"not json").1, Heard::Failed);
-        assert_eq!(heard_of(Some(0), b"").1, Heard::Failed);
-        assert_eq!(heard_of(Some(3), b"").1, Heard::TooLong);
-        for code in [Some(1), Some(2), Some(4), Some(101), None] {
-            assert_eq!(
-                heard_of(code, br#"{"text":"x"}"#).1,
-                Heard::Failed,
-                "{code:?}"
-            );
+        for (error, outcome, heard) in [
+            ("too_long", "too_long", Heard::TooLong),
+            ("too_big", "too_long", Heard::TooLong),
+            ("not_opus", "failed", Heard::Failed),
+            ("failed", "failed", Heard::Failed),
+            ("new", "failed", Heard::Failed),
+        ] {
+            let line = format!(r#"{{"error":"{error}","took_ms":3}}"#);
+            let (got, what, output) = heard_of(line.as_bytes()).unwrap();
+            assert_eq!((got, what), (outcome, heard), "{error}");
+            assert_eq!(output.took_ms, 3);
         }
+        assert!(heard_of(b"not json").is_none());
+        assert!(heard_of(b"").is_none());
     }
 
     #[tokio::test]
     async fn a_helper_that_does_not_start_fails() {
-        let helper = Helper {
-            program: PathBuf::from("cctg-voice-that-does-not-exist-085"),
-            model: PathBuf::from("model"),
-            timeout: Duration::from_secs(5),
-        };
+        let helper = Helper::new(
+            PathBuf::from("cctg-voice-that-does-not-exist-085"),
+            PathBuf::from("model"),
+            Duration::from_secs(5),
+        );
+        helper.warm().await;
+        assert_eq!(helper.hear(b"OggS".to_vec()).await, Heard::Failed);
         assert_eq!(helper.hear(b"OggS".to_vec()).await, Heard::Failed);
     }
 
