@@ -2331,45 +2331,27 @@ impl Registry {
         places
     }
 
-    /// Topic `place`, waiting for its cleanup, is its slot's again (TASK-074
-    /// review: a message was written there): an archived slot gets back
-    /// every topic of its own still queued, a slot a session took since
-    /// gets this one when it shows in no view of that chat. `None`: not
-    /// queued, or its slot has a view in that chat already.
+    /// Private topic `place`, waiting for its cleanup, is its slot's again
+    /// (TASK-074 review: a message was written there), only while that slot
+    /// is still archived: it becomes the slot's one view and the slot is no
+    /// longer archived. Other queued topics of the slot stay queued; a group
+    /// topic never comes back (the cleanup ended the share). `None`: not
+    /// queued, a group topic, or its slot was taken by a session since.
     pub fn revive_topic(&mut self, place: Place) -> Option<SlotId> {
-        let id = self.cleanup.iter().find(|t| t.place == place)?.slot;
-        let slot = self.slots.get_mut(id.0)?;
-        let back: Vec<Place> = if slot.archived {
-            self.cleanup
-                .iter()
-                .filter(|t| t.slot == id)
-                .map(|t| t.place)
-                .collect()
-        } else if slot.views.iter().any(|view| view.chat == place.chat) {
+        if !place.chat.is_private() {
             return None;
-        } else {
-            vec![place]
-        };
-        let mut views = Vec::new();
-        self.cleanup.retain(|t| {
-            if back.contains(&t.place) {
-                views.push(t.view.clone());
-                false
-            } else {
-                true
-            }
-        });
-        for view in &mut views {
-            view.busy = false;
-            view.failed = None;
         }
+        let at = self.cleanup.iter().position(|t| t.place == place)?;
+        let id = self.cleanup[at].slot;
+        if !self.slots.get(id.0)?.archived {
+            return None;
+        }
+        let mut view = self.cleanup.remove(at).view;
+        view.busy = false;
+        view.failed = None;
         let slot = &mut self.slots[id.0];
-        if slot.archived {
-            slot.views = views;
-            slot.archived = false;
-        } else {
-            slot.views.extend(views);
-        }
+        slot.views = vec![view];
+        slot.archived = false;
         self.dirty = true;
         self.settle_version();
         Some(id)
@@ -5675,47 +5657,51 @@ mod tests {
         assert_eq!(saved["version"], 3);
     }
 
-    /// TASK-074 review (finding 1): a message in a topic waiting for its
-    /// cleanup brings it back: an archived slot gets its queued topics back
-    /// and is no longer archived; a slot a session took since gets the
-    /// topic as another view, unless it shows in that chat already.
+    /// TASK-074 review: only a private topic of a slot still archived comes
+    /// back, as the slot's one view; its other queued topics and a group
+    /// topic stay queued; nothing comes back to a slot a session took.
     #[test]
-    fn a_queued_topic_comes_back_to_its_slot() {
+    fn only_a_private_topic_of_an_archived_slot_comes_back() {
         let (mut registry, slot, owner) = private_slot();
+        registry.share(slot, Chat::GROUP, share_line("Анна"));
+        registry.topic_created(slot, Chat::GROUP, 900, "t", None);
         registry.apply_hook(&end(A));
         let private_topic = Place::topic(owner, 700);
+        let group_topic = Place::topic(Chat::GROUP, 900);
         let kept = registry.clone();
-        registry.archive_slot(slot, &HashSet::from([owner]));
+        registry.archive_slot(slot, &HashSet::from([owner, Chat::GROUP]));
+        // A second private topic of the slot, from an earlier cleanup.
+        let mut older = registry.cleanup[0].clone();
+        older.place = Place::topic(owner, 690);
+        older.view.topic_id = Some(690);
+        registry.cleanup.push(older);
         assert_eq!(registry.revive_topic(Place::topic(owner, 701)), None);
+        assert_eq!(registry.revive_topic(group_topic), None, "never the group");
+        assert!(registry.slots[slot.0].archived);
         assert_eq!(registry.revive_topic(private_topic), Some(slot));
         assert!(!registry.slots[slot.0].archived);
-        assert!(registry.cleanup.is_empty());
-        assert_eq!(registry.slot_by_topic(private_topic), Some(slot));
-        assert_eq!(registry.slots[slot.0].views, kept.slots[slot.0].views);
-        assert_eq!(registry.version, VERSION, "nothing archived or queued");
+        assert_eq!(
+            registry.slots[slot.0].views,
+            kept.slots[slot.0].views[..1],
+            "the private view alone"
+        );
+        let left: Vec<Place> = registry.cleanup.iter().map(|t| t.place).collect();
+        assert_eq!(left, [group_topic, Place::topic(owner, 690)]);
+        assert_eq!(
+            registry.revive_topic(Place::topic(owner, 690)),
+            None,
+            "not archived any more"
+        );
+        assert_eq!(registry.version, ARCHIVE_VERSION, "topics still queued");
 
-        // Taken by the next session, which shows in the group: the old
-        // private topic joins it.
-        registry.archive_slot(slot, &HashSet::from([owner]));
-        assert_eq!(registry.version, ARCHIVE_VERSION);
-        registry.apply_hook(&start(B, CWD, Some(2), None));
-        let chats: Vec<(Chat, Option<i64>)> = registry.slots[slot.0]
-            .views
-            .iter()
-            .map(|view| (view.chat, view.topic_id))
-            .collect();
-        assert_eq!(chats, [(Chat::GROUP, None)]);
-        assert_eq!(registry.revive_topic(private_topic), Some(slot));
-        assert_eq!(registry.slot_by_topic(private_topic), Some(slot));
-        assert_eq!(registry.slots[slot.0].views.len(), 2);
-
-        // Taken by a session in that private chat: it stays queued.
+        // Taken by the next session: nothing comes back.
         let mut taken = kept;
         taken.archive_slot(slot, &HashSet::from([owner]));
         taken.apply_hook(&start(B, CWD, Some(2), None));
-        assert!(taken.make_private(slot, owner));
         assert_eq!(taken.revive_topic(private_topic), None);
         assert_eq!(taken.cleanup.len(), 1);
+        let chats: Vec<Chat> = taken.slots[slot.0].views.iter().map(|v| v.chat).collect();
+        assert_eq!(chats, [Chat::GROUP]);
     }
 
     /// TASK-074: a file without the new fields writes none and stays

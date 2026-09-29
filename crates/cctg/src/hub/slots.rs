@@ -602,6 +602,12 @@ pub const DEVICE_GONE: &str = "Этого устройства уже нет";
 pub const CLEANUP_CHANGED: &str = "Список изменился, посмотрите ещё раз";
 /// A member's name as a device's owner in the devices tab, at most.
 const DEVICE_OWNER_LIMIT: usize = 40;
+/// Told in a topic a cleanup is deleting, to a message that goes nowhere
+/// (TASK-074 review).
+pub const CLEANED_TOPIC_NOTICE: &str =
+    "Эту тему убрала уборка: сообщение не передано, тема скоро будет удалена.";
+/// A session title in [`CLEANED_TOPIC_NOTICE`], at most (UTF-16 units).
+const CLEANED_TITLE_LIMIT: usize = 100;
 
 /// Whose private chat shows a slot (TASK-063): the first allowlisted user,
 /// the only one when there is one. In a team (`devices` set) it is the
@@ -4065,10 +4071,9 @@ impl Slots {
             return;
         };
         let place = input.place();
-        // A topic waiting for its cleanup (TASK-074 review 1): a message
-        // there brings it back to its slot, as if it was never cleaned; a
-        // slot a session took since, with a topic of its own in that chat,
-        // takes the message as it is.
+        // A topic waiting for its cleanup (TASK-074 review): a message in a
+        // private one of a slot still archived brings that topic back; any
+        // other goes nowhere, its author is told and the delete goes on.
         if self.registry.slot_by_topic(place).is_none()
             && let Some(slot) = self
                 .registry
@@ -4083,7 +4088,12 @@ impl Slots {
                     "a message came into a topic waiting for its cleanup; it stays"
                 );
             } else {
-                self.take_in(slot, place, thread_id, input);
+                debug!(
+                    ordinal = self.ordinal(slot),
+                    "message in a cleaned topic; not forwarded"
+                );
+                let notice = self.cleaned_topic_notice(slot, place.chat);
+                self.tell_foreign(place, &notice);
                 return;
             }
         }
@@ -8158,7 +8168,30 @@ impl Slots {
     /// A private topic that is no slot's (the user made it, TASK-063), or
     /// the private chat's General, gets a short answer `notice`, at most
     /// once per `Options::notice_every`.
-    fn tell_foreign(&mut self, place: Place, notice: &'static str) {
+    /// What a topic a cleanup is deleting says to a message there (TASK-074
+    /// review); in a private chat, where the slot's session is now, when
+    /// it has a topic there.
+    fn cleaned_topic_notice(&self, slot: SlotId, chat: Chat) -> String {
+        let current = self
+            .registry
+            .slot(slot)
+            .filter(|entry| chat.is_private() && !entry.archived)
+            .and_then(|entry| {
+                entry
+                    .views
+                    .iter()
+                    .find(|view| view.chat == chat && view.topic_id.is_some())
+            });
+        match current {
+            Some(_) => format!(
+                "{CLEANED_TOPIC_NOTICE} Сессия этой папки сейчас в теме «{}».",
+                cut(&self.registry.desired_title(slot), CLEANED_TITLE_LIMIT)
+            ),
+            None => CLEANED_TOPIC_NOTICE.to_owned(),
+        }
+    }
+
+    fn tell_foreign(&mut self, place: Place, notice: &str) {
         let now = Instant::now();
         let every = self.options.notice_every;
         self.foreign_told.retain(|_, at| now < *at + every);
@@ -12734,8 +12767,10 @@ impl Slots {
             .iter()
             .any(|queued| queued.place == place)
         {
-            // Brought back by a message while its delete was on its way
-            // (review 1): deleted all the same, its slot gets a new topic.
+            // A private topic of an archived slot a message brought back
+            // while its delete was on its way (the only way a queued topic
+            // becomes a view again): deleted all the same, its slot gets a
+            // new topic.
             let gone = matches!(delivery, Some(Ok(_))) || delivery.as_ref().is_some_and(topic_gone);
             if gone
                 && let (Some(slot), Some(thread_id)) =
@@ -37485,11 +37520,11 @@ again"
         );
     }
 
-    /// Review finding 1: the slot was taken by a new session with a topic
-    /// in the same private chat: a message in the old topic still reaches
-    /// the slot.
+    /// Review round 2: the slot was taken by a new session with a topic in
+    /// the same private chat: a message in the old topic reaches nobody,
+    /// its author is told where the session is now, the old topic goes.
     #[tokio::test]
-    async fn a_message_in_an_old_cleaned_topic_reaches_the_new_session() {
+    async fn a_message_in_an_old_cleaned_topic_points_to_the_new_one() {
         let dir = TempDir::new("slots-074-review-r1-taken");
         let (mut slots, mut work) = review_cleaned_slot(&dir);
         slots.on_hook(&resumed(A, 20));
@@ -37501,13 +37536,182 @@ again"
         let old = Place::topic(private_owner(), 700);
         slots.on_topic_message(private_text(902, 700, "сюда"));
         slots.pump();
-        let handed = all_work(&mut work);
+        let told = sends_into(&all_work(&mut work), old);
+        assert_eq!(told.len(), 1, "{told:?}");
         assert!(
-            !sends_into(&handed, old).contains(&FOREIGN_TOPIC_NOTICE.to_owned()),
-            "{handed:#?}"
+            told[0].starts_with(CLEANED_TOPIC_NOTICE) && told[0].contains("сейчас в теме «"),
+            "{told:?}"
         );
-        assert_eq!(parked_texts(&slots, 0), ["сюда"]);
+        assert!(parked_texts(&slots, 0).is_empty());
         assert_eq!(queued(&slots), [old], "the old topic still goes");
+        assert_eq!(slots.registry.slots[0].views.len(), 1);
+    }
+
+    /// Review round 2 (repro N1): slot 0 cleaned twice while its first
+    /// topic still waits; a message in the older topic brings back that
+    /// topic alone: one view per chat, and the file loads again.
+    #[tokio::test]
+    async fn two_cleanups_never_give_a_slot_two_views_in_one_chat() {
+        let dir = TempDir::new("slots-074-review2-n1");
+        let (mut slots, mut work) = review_cleaned_slot(&dir);
+        let owner = private_owner();
+        cleaned(
+            &mut slots,
+            Place::topic(owner, 700),
+            refused(502, "Bad Gateway"),
+        );
+        // A new session takes the slot, gets topic 710 there, ends.
+        slots.on_hook(&start(B, 21));
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 710, "t", None);
+        slots.on_hook(&end(B, 21));
+        slots.pump();
+        topics_answered(&mut slots, &mut work);
+        slots.shown.clear();
+        // Cleaned again, the first topic still queued.
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 1, &[0])));
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 1, &[0])));
+        let _ = all_work(&mut work);
+        assert_eq!(
+            queued(&slots),
+            [Place::topic(owner, 700), Place::topic(owner, 710)]
+        );
+        slots.on_topic_message(private_text(903, 700, "стоп"));
+        slots.pump();
+        let chats: Vec<Chat> = slots.registry.slots[0]
+            .views
+            .iter()
+            .map(|view| view.chat)
+            .collect();
+        assert_eq!(chats, [owner]);
+        assert_eq!(
+            slots.registry.slot_by_topic(Place::topic(owner, 700)),
+            Some(SlotId(0))
+        );
+        assert_eq!(queued(&slots), [Place::topic(owner, 710)], "still goes");
+        let store_dir = TempDir::new("slots-074-review2-n1-store");
+        let store = RegistryStore::open(store_dir.path()).unwrap();
+        store.save(&RegistryStore::encode(&slots.registry)).unwrap();
+        assert!(store.load(GroupChat::UNIT).is_ok(), "registry.json loads");
+    }
+
+    /// Slot 0 in private topic 700 and shared to the group (topic 100, the
+    /// bot may delete there), ended and cleaned with «сейчас»: both deletes
+    /// handed out.
+    fn shared_cleaned_slot(dir: &TempDir) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let options = Options {
+            can_delete: true,
+            ..cleanup_options()
+        };
+        let (mut slots, mut work) = menu_slot(dir, options);
+        slots.registry.share(
+            SlotId(0),
+            Chat::GROUP,
+            crate::hub::registry::share_line(SHARER),
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        slots.registry.slots[0].views[1].pending_separator = None;
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        topics_answered(&mut slots, &mut work);
+        slots.on_control(menu_press(MENU, "menu:hd:0"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 2, &[0])));
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 2, &[0])));
+        slots.pump();
+        let deletes = topic_deletes(&all_work(&mut work));
+        assert!(
+            deletes.contains(&Place::topic(Chat::GROUP, 100)),
+            "{deletes:?}"
+        );
+        assert!(slots.registry.slots[0].archived);
+        (slots, work)
+    }
+
+    /// Review round 2 (repro N2): the owner's next session takes the
+    /// cleaned slot, private only; a member writes into the old group
+    /// topic, still waiting for its delete: the session is not shared with
+    /// the group, the text goes nowhere, the member is told, and the delete
+    /// makes no new group topic.
+    #[tokio::test]
+    async fn a_group_message_does_not_share_the_next_session() {
+        let dir = TempDir::new("slots-074-review2-n2");
+        let (mut slots, mut work) = shared_cleaned_slot(&dir);
+        slots.on_hook(&start(B, 11));
+        assert_eq!(slots.registry.sessions[B].slot, Some(SlotId(0)));
+        assert!(
+            !slots.registry.shared(SlotId(0), Chat::GROUP),
+            "private only"
+        );
+        let old = Place::topic(Chat::GROUP, 100);
+        slots.on_topic_message(topic_text(950, "а это что?", false));
+        slots.pump();
+        let told = sends_into(&all_work(&mut work), old);
+        assert_eq!(told, [CLEANED_TOPIC_NOTICE], "no current topic named");
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
+        assert!(parked_texts(&slots, 0).is_empty());
+        cleaned(&mut slots, old, Some(Ok(Outcome::Done)));
+        let group_creates = all_work(&mut work)
+            .into_iter()
+            .filter(|(job, _)| {
+                matches!(
+                    job,
+                    Work::Topic(TopicJob::Create {
+                        chat: Chat::GROUP,
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(group_creates, 0);
+        // An archived slot does not get its group topic back either.
+        let dir = TempDir::new("slots-074-review2-n2-archived");
+        let (mut slots, mut work) = shared_cleaned_slot(&dir);
+        slots.on_topic_message(topic_text(951, "есть кто?", false));
+        slots.pump();
+        assert_eq!(
+            sends_into(&all_work(&mut work), old),
+            [CLEANED_TOPIC_NOTICE]
+        );
+        assert!(slots.registry.slots[0].archived);
+        assert!(parked_texts(&slots, 0).is_empty());
+    }
+
+    /// Review round 2 (repro N3): the next session shared again (group
+    /// topic 120) while the old group topic 100 waits for its delete: a
+    /// message there without a mention reaches no session (TASK-077 is not
+    /// bypassed); one in the new topic is kept for the next mention.
+    #[tokio::test]
+    async fn the_old_group_topic_bypasses_no_mention_mode() {
+        let dir = TempDir::new("slots-074-review2-n3");
+        let (mut slots, mut work) = shared_cleaned_slot(&dir);
+        slots.on_hook(&start(B, 11));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 710, "t", None);
+        slots.registry.share(
+            SlotId(0),
+            Chat::GROUP,
+            crate::hub::registry::share_line(SHARER),
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 120, "t", None);
+        slots.pump();
+        let _ = all_work(&mut work);
+        let mut fresh = topic_text(960, "болтаем", false);
+        fresh.thread_id = Some(120);
+        slots.on_topic_message(fresh);
+        slots.on_topic_message(topic_text(961, "тоже болтаем", false));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert!(
+            parked_texts(&slots, 0).is_empty(),
+            "handed to the session without a mention: {:?}",
+            parked_texts(&slots, 0)
+        );
     }
 
     /// Review repro R2: `claude --resume` of the archived slot's own session
