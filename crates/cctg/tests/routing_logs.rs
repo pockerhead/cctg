@@ -6,9 +6,20 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use cctg::hub::chat::GroupChat;
 use cctg::hub::config::Allowlist;
+use cctg::hub::groups::KnownGroups;
 use cctg::hub::updates::route_batch;
 use serde_json::{Value, json};
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = CHAT;
+
+/// The groups the poll lets through: the default one.
+fn known_groups() -> KnownGroups {
+    KnownGroups::of([GroupChat::of(GROUP_ID)])
+}
 
 const CHAT: i64 = -1000000000001;
 const ALLOWED: i64 = 1001;
@@ -74,7 +85,7 @@ fn routing_logs_never_contain_user_ids() {
             json!({ "update_id": 5, "message": private(json!({ "text": "x" })) }),
             json!({ "update_id": 6, "message": private(json!({ "forum_topic_edited": {} })) }),
         ];
-        route_batch(batch, None, CHAT, &allowlist);
+        route_batch(batch, None, &known_groups(), &allowlist);
     });
     let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
         .unwrap_or_default();

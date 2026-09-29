@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
 use cctg::hub::buffer::{RESUMED_TEXT, resume_text};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress::serve_agents;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -21,6 +21,11 @@ use cctg::wire::{self, AgentMsg, HookEvent, HookPost, HubMsg, Register, Secret};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 const SECRET: &str = "buffer-e2e-secret-0123456789";
 const SESSION: &str = "0b0ffe20-0000-4000-8000-000000000001";
@@ -83,7 +88,7 @@ fn post(event: HookEvent) -> HookPost {
 fn say(message_id: i64, text: &str) -> Control {
     Control::Message(Inbound {
         display_name: None,
-        chat: Chat::Group,
+        chat: GROUP,
         sender: cctg::hub::chat::PrivateChat::of_user(1001),
         message_id,
         thread_id: Some(100),
@@ -119,7 +124,12 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -290,7 +300,12 @@ async fn a_burst_reaches_a_live_session_over_tcp_as_one_inbound() {
         gather_max: GATHER_MAX,
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
     let (control, control_rx) = mpsc::unbounded_channel();

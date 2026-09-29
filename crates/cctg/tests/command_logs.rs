@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::commands::{Asks, handle};
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
@@ -19,6 +19,11 @@ use cctg::hub::slots::{Options, Slots};
 use cctg::hub::updates::Inbound;
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, Register};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 const SESSION: &str = "5e551017-0000-4000-8000-000000000001";
 const DEAD: &str = "dead0000-0000-4000-8000-000000000002";
@@ -64,7 +69,7 @@ impl Transport for Fake {
 fn input(text: &str) -> Inbound {
     Inbound {
         display_name: None,
-        chat: Chat::Group,
+        chat: GROUP,
         sender: cctg::hub::chat::PrivateChat::of_user(1001),
         message_id: 1,
         thread_id: None,
@@ -122,7 +127,12 @@ async fn command_logs_carry_no_paths() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let mut slots = Slots::new(store.load().expect("load"), store, outbox.clone(), options);
+    let mut slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox.clone(),
+        options,
+    );
     let source = Arc::new(Asks(slots.transcript_asks(), None));
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);

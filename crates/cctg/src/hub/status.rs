@@ -55,6 +55,8 @@ const UPDATE: &str = "status:update";
 const SHARE: &str = "status:share";
 const UNSHARE: &str = "status:unshare";
 const UNSHARE_CONFIRM: &str = "status:unshare_confirm";
+/// Opens the group picker (TASK-069).
+const GROUPS: &str = "status:groups";
 /// The update button of an outdated-client warning: `update:<session id>`.
 const UPDATE_PREFIX: &str = "update:";
 
@@ -83,6 +85,8 @@ pub const UPDATED_NOTICE: &str = "✅ Клиент cctg обновлён.";
 pub const SHARE_BUTTON: &str = "👥 В группу";
 pub const UNSHARE_BUTTON: &str = "🙈 Убрать из группы";
 pub const UNSHARE_CONFIRM_BUTTON: &str = "Точно убрать из группы?";
+/// The share button when there are several groups (TASK-069).
+pub const GROUPS_BUTTON: &str = "👥 Группы…";
 pub const ANSWER_SHARED: &str = "Сессия теперь видна в группе";
 pub const ANSWER_ALREADY_SHARED: &str = "Сессия уже в группе";
 pub const ANSWER_UNSHARE_CONFIRM: &str =
@@ -125,6 +129,8 @@ pub enum Press {
     Unshare,
     /// 🙈 Убрать из группы, the confirming press.
     UnshareConfirm,
+    /// 👥 Группы…: the group picker (TASK-069).
+    Groups,
 }
 
 /// The status button of `data`; anything else is not one.
@@ -136,6 +142,7 @@ pub fn parse_callback(data: &str) -> Option<Press> {
         SHARE => Some(Press::Share),
         UNSHARE => Some(Press::Unshare),
         UNSHARE_CONFIRM => Some(Press::UnshareConfirm),
+        GROUPS => Some(Press::Groups),
         _ => None,
     }
 }
@@ -370,6 +377,8 @@ pub enum ShareButton {
     Unshare,
     /// It asks for the confirming press.
     Confirm,
+    /// 👥 Группы…: several groups to choose from (TASK-069).
+    Pick,
 }
 
 /// The text and keyboard of the status message. The keyboard is always
@@ -422,6 +431,7 @@ pub fn render(phase: &Phase, metrics: Option<&Metrics>, buttons: Buttons) -> (St
             ShareButton::Share => (SHARE_BUTTON, SHARE),
             ShareButton::Unshare => (UNSHARE_BUTTON, UNSHARE),
             ShareButton::Confirm => (UNSHARE_CONFIRM_BUTTON, UNSHARE_CONFIRM),
+            ShareButton::Pick => (GROUPS_BUTTON, GROUPS),
         };
         rows.push(vec![json!({ "text": label, "callback_data": data })]);
     }
@@ -462,7 +472,7 @@ pub fn for_mirror(keyboard: &Value) -> Value {
         return keyboard.clone();
     };
     let share = |button: &Value| {
-        [SHARE, UNSHARE, UNSHARE_CONFIRM]
+        [SHARE, UNSHARE, UNSHARE_CONFIRM, GROUPS]
             .iter()
             .any(|data| button["callback_data"] == *data)
     };
@@ -718,6 +728,7 @@ mod tests {
         assert_eq!(parse_callback(SHARE), Some(Press::Share));
         assert_eq!(parse_callback(UNSHARE), Some(Press::Unshare));
         assert_eq!(parse_callback(UNSHARE_CONFIRM), Some(Press::UnshareConfirm));
+        assert_eq!(parse_callback(GROUPS), Some(Press::Groups));
         for other in [
             "allow:abcde",
             "resume:x",
@@ -729,7 +740,15 @@ mod tests {
             assert_eq!(parse_callback(other), None, "{other}");
         }
         // Telegram allows 1-64 bytes of callback data.
-        for data in [STOP, CONFIRM, UPDATE, SHARE, UNSHARE, UNSHARE_CONFIRM] {
+        for data in [
+            STOP,
+            CONFIRM,
+            UPDATE,
+            SHARE,
+            UNSHARE,
+            UNSHARE_CONFIRM,
+            GROUPS,
+        ] {
             assert!(data.len() <= 64);
         }
         let session = "5e551017-0000-4000-8000-000000000001";
@@ -775,6 +794,7 @@ mod tests {
                 UNSHARE_CONFIRM_BUTTON,
                 UNSHARE_CONFIRM,
             ),
+            (ShareButton::Pick, GROUPS_BUTTON, GROUPS),
         ] {
             let all = Buttons {
                 interrupt: true,

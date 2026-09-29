@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
 use cctg::hub::buffer::QUEUED_NOTICE;
+use cctg::hub::chat::GroupChat;
 use cctg::hub::config::Allowlist;
+use cctg::hub::groups::KnownGroups;
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -19,6 +21,15 @@ use cctg::hub::updates::{Routed, route_batch};
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, Register};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = CHAT;
+
+/// The groups the poll lets through: the default one.
+fn known_groups() -> KnownGroups {
+    KnownGroups::of([GroupChat::of(GROUP_ID)])
+}
 
 const CHAT: i64 = -1000000000001;
 /// Distinctive enough not to appear by chance (logs run `.without_time()`).
@@ -74,7 +85,7 @@ fn topic_message_with(update_id: i64, text: &str, extra: Value) -> Control {
         message.extend(extra.clone());
     }
     let allowlist: Allowlist = [USER].into_iter().collect();
-    let (_, mut routed) = route_batch(vec![update], None, CHAT, &allowlist);
+    let (_, mut routed) = route_batch(vec![update], None, &known_groups(), &allowlist);
     match routed.remove(0) {
         Routed::Input(input) => Control::Message(input),
         other => panic!("not input: {other:?}"),
@@ -120,7 +131,12 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -185,9 +201,13 @@ async fn message_logs_carry_no_text_and_no_user_id() {
         !saved.contains(&USER.to_string()),
         "no user id in the saved buffer"
     );
-    assert!(
-        !saved.contains(&CHAT.to_string()),
-        "no chat id in the saved buffer"
+    // TASK-069: the group's id is stored as the chat of stored messages
+    // and of its group record, nowhere else.
+    assert_eq!(
+        saved.matches(&CHAT.to_string()).count(),
+        saved.matches(&format!("\"group\": {CHAT}")).count()
+            + saved.matches(&format!("\"chat\": {CHAT}")).count(),
+        "the chat id only as a group"
     );
     let (to_agent, mut to_agent_rx) = mpsc::channel(4);
     agents

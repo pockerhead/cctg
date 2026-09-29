@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress::{self, AgentEvent};
 use cctg::hub::questions::{self, Press};
 use cctg::hub::registry::RegistryStore;
@@ -26,6 +26,11 @@ use cctg::hub::updates::{CallbackInput, Inbound};
 use cctg::wire::{HookEvent, HookPost, HubMsg, Register, Secret};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 mod common;
 
@@ -188,7 +193,12 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
         question_wait,
         ..Options::default()
     };
-    let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
+    let mut slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).unwrap(),
+        store,
+        outbox,
+        options,
+    );
     let asks = slots.permission_asks();
     let questions = slots.question_asks();
     let (agents, agents_rx) = mpsc::channel(16);
@@ -342,7 +352,7 @@ fn assert_clean(output: &Output) {
 fn press(hub: &Hub, message_id: i64, id: &str, question: usize, press: Press) {
     hub.control
         .send(Control::Callback(CallbackInput {
-            chat: Some(Chat::Group),
+            chat: Some(GROUP),
             query_id: "q".into(),
             data: Some(questions::callback_data(id, question, press)),
             message_id: Some(message_id),
@@ -357,7 +367,7 @@ fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
     hub.control
         .send(Control::Message(Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: GROUP,
             sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id: Some(100),

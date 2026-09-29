@@ -11,12 +11,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::GroupChat;
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Options, Slots};
 use cctg::wire::{HookEvent, HookPost, HubMsg, Register};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
 
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -97,7 +102,12 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
         stream_every: Duration::from_millis(10),
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (_control, control_rx) = mpsc::unbounded_channel();

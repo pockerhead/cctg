@@ -798,55 +798,55 @@ mod tests {
     fn the_book_finds_asks_by_message_and_text() {
         let mut book = Asks::default();
         let mut first = ask(vec![question("A?", false, &["x"])]);
-        first.place = Some(Place::topic(Chat::Group, 100));
+        first.place = Some(Place::topic(Chat::GROUP, 100));
         first.message_id = Some(5);
         let mut second = ask(vec![question("B?", false, &["y"])]);
         second.id = "bcdef".into();
-        second.place = Some(Place::topic(Chat::Group, 100));
+        second.place = Some(Place::topic(Chat::GROUP, 100));
         second.message_id = Some(6);
         let first = book.open(first).unwrap();
         let second = book.open(second).unwrap();
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 6)),
+            book.by_message(MessageKey::new(Chat::GROUP, 6)),
             Some(second)
         );
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(5)),
             Some(first)
         );
-        assert_eq!(book.text_target(Place::topic(Chat::Group, 100), None), None);
+        assert_eq!(book.text_target(Place::topic(Chat::GROUP, 100), None), None);
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(9)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(9)),
             None
         );
         book.get_mut(first).unwrap().press(0, Press::Other);
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), None),
+            book.text_target(Place::topic(Chat::GROUP, 100), None),
             Some(first)
         );
-        assert_eq!(book.text_target(Place::topic(Chat::Group, 101), None), None);
+        assert_eq!(book.text_target(Place::topic(Chat::GROUP, 101), None), None);
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(6)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(6)),
             Some(second)
         );
         assert!(book.waiting("s") && book.id_taken("s", "abcde") && !book.id_taken("t", "abcde"));
         book.get_mut(first).unwrap().end(State::Gone);
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(5)),
             None
         );
         // With ✏️ Другое armed, a reply to any other message is no answer.
         book.get_mut(second).unwrap().press(0, Press::Other);
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), None),
+            book.text_target(Place::topic(Chat::GROUP, 100), None),
             Some(second)
         );
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(6)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(6)),
             Some(second)
         );
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(777)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(777)),
             None
         );
         for _ in book.len()..MAX_ASKS {
@@ -865,46 +865,46 @@ mod tests {
         let mut book = Asks::default();
         let mut sending = ask(vec![question("A?", false, &["x"])]);
         sending.sending = true;
-        sending.place = Some(Place::topic(Chat::Group, 100));
+        sending.place = Some(Place::topic(Chat::GROUP, 100));
         let key = book.open(sending).unwrap();
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             Some(key)
         );
-        assert!(book.sending_in(Place::topic(Chat::Group, 100)));
+        assert!(book.sending_in(Place::topic(Chat::GROUP, 100)));
         assert_eq!(
-            book.in_flight("bcdef", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("bcdef", Some(Place::topic(Chat::GROUP, 100))),
             None
         );
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 101))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 101))),
             None,
             "other topic"
         );
-        assert!(!book.sending_in(Place::topic(Chat::Group, 101)));
+        assert!(!book.sending_in(Place::topic(Chat::GROUP, 101)));
         assert_eq!(book.in_flight("abcde", None), None, "topic unknown");
         let mut twin = ask(vec![question("B?", false, &["y"])]);
         twin.session = "t".into();
         twin.sending = true;
-        twin.place = Some(Place::topic(Chat::Group, 100));
+        twin.place = Some(Place::topic(Chat::GROUP, 100));
         let twin = book.open(twin).unwrap();
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             None,
             "ambiguous"
         );
         book.get_mut(twin).unwrap().message_id = Some(6);
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             Some(key)
         );
         book.get_mut(key).unwrap().sending = false;
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             None,
             "not handed to Telegram"
         );
-        assert!(!book.sending_in(Place::topic(Chat::Group, 100)));
+        assert!(!book.sending_in(Place::topic(Chat::GROUP, 100)));
     }
 
     /// TASK-061: message and topic ids are numbered per chat. An ask in the
@@ -915,7 +915,7 @@ mod tests {
         let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(7_319_402_518));
         let mut book = Asks::default();
         let mut group = ask(vec![question("A?", false, &["x"])]);
-        group.place = Some(Place::topic(Chat::Group, 100));
+        group.place = Some(Place::topic(Chat::GROUP, 100));
         group.message_id = Some(5);
         let mut own = ask(vec![question("B?", false, &["y"])]);
         own.session = "t".into();
@@ -924,7 +924,7 @@ mod tests {
         let group = book.open(group).unwrap();
         let own = book.open(own).unwrap();
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 5)),
+            book.by_message(MessageKey::new(Chat::GROUP, 5)),
             Some(group)
         );
         assert_eq!(book.by_message(MessageKey::new(private, 5)), Some(own));
@@ -933,11 +933,11 @@ mod tests {
             Some(own)
         );
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(5)),
             Some(group)
         );
         book.get_mut(own).unwrap().press(0, Press::Other);
-        assert_eq!(book.text_target(Place::topic(Chat::Group, 100), None), None);
+        assert_eq!(book.text_target(Place::topic(Chat::GROUP, 100), None), None);
         assert_eq!(
             book.text_target(Place::topic(private, 100), None),
             Some(own)
@@ -950,9 +950,9 @@ mod tests {
         sending.place = Some(Place::topic(private, 200));
         let sending = book.open(sending).unwrap();
         assert!(book.sending_in(Place::topic(private, 200)));
-        assert!(!book.sending_in(Place::topic(Chat::Group, 200)));
+        assert!(!book.sending_in(Place::topic(Chat::GROUP, 200)));
         assert_eq!(
-            book.in_flight("fghij", Some(Place::topic(Chat::Group, 200))),
+            book.in_flight("fghij", Some(Place::topic(Chat::GROUP, 200))),
             None
         );
         assert_eq!(
@@ -968,21 +968,21 @@ mod tests {
     fn a_reply_to_another_message_is_no_answer_while_typing() {
         let q = question("Q?", false, &["  Padded label  "]);
         let mut typing = ask(vec![q.clone()]);
-        typing.place = Some(Place::topic(Chat::Group, 100));
+        typing.place = Some(Place::topic(Chat::GROUP, 100));
         typing.message_id = Some(5);
         typing.press(0, Press::Other);
         let mut book = Asks::default();
         let key = book.open(typing).unwrap();
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(777)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(777)),
             None
         );
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), Some(5)),
+            book.text_target(Place::topic(Chat::GROUP, 100), Some(5)),
             Some(key)
         );
         assert_eq!(
-            book.text_target(Place::topic(Chat::Group, 100), None),
+            book.text_target(Place::topic(Chat::GROUP, 100), None),
             Some(key)
         );
         let mut plain = ask(vec![q]);

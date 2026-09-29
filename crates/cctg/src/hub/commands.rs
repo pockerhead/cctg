@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use transcript::{SplitOptions, split_for_telegram};
 
 use super::api::{ApiError, Document};
-use super::chat::Place;
+use super::chat::{Chat, Place};
 use super::registry::{Registry, SessionKind};
 use super::scheduler::{Op, Outbox, Outcome};
 use super::updates::Inbound;
@@ -35,6 +35,10 @@ const DELIVERY_FAILURE_NOTICE: &str = "Не удалось отправить т
 /// guards against a stopped actor.
 pub const ANSWER_WAIT: Duration = Duration::from_secs(120);
 const NO_ACTOR: &str = "Транскрипт сейчас недоступен: hub останавливается.";
+/// `/brief` or `/full` in a group other than the default one outside a
+/// shared session's topic, or with a session id (TASK-069).
+pub const OTHER_GROUP_NOTICE: &str =
+    "В этой группе /brief и /full показывают только сессию темы, где их написали, и без id сессии.";
 
 pub const USAGE: &str = "Использование: /brief [n] [начало id сессии] или /full [n] [начало id сессии]. \
 n: сколько последних промптов показать, от 1 до 100 (по умолчанию brief 3, full 1). \
@@ -239,7 +243,20 @@ impl TranscriptSource for Asks {
 /// else the current session of the slot topic it was sent in, else (General,
 /// a topic that is no slot) the newest running top-level session. `Err`:
 /// the notice for the user. Only sessions the hub knows are found.
+/// In a group other than the default one, where people outside the
+/// allowlist read along (TASK-069), only the session of a slot shared
+/// there, in its topic, and without a prefix.
 pub fn resolve(registry: &Registry, place: Place, prefix: Option<&str>) -> Result<String, String> {
+    if let Chat::Group(group) = place.chat
+        && group != registry.default_group
+    {
+        return registry
+            .slot_by_topic(place)
+            .filter(|slot| prefix.is_none() && registry.shared(*slot, place.chat))
+            .and_then(|slot| registry.slot(slot))
+            .and_then(|slot| slot.current_session.clone())
+            .ok_or_else(|| OTHER_GROUP_NOTICE.to_owned());
+    }
     if let Some(prefix) = prefix {
         let mut found: Vec<_> = registry
             .sessions
@@ -539,7 +556,7 @@ mod tests {
     use crate::hub::chat::{Chat, Place};
 
     const GENERAL: Place = Place {
-        chat: Chat::Group,
+        chat: Chat::GROUP,
         thread: None,
     };
 
@@ -547,7 +564,7 @@ mod tests {
     fn only_our_commands_are_commands() {
         let input = |text: &str| crate::hub::updates::Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
             thread_id: Some(2),
@@ -681,7 +698,7 @@ mod tests {
         for text in texts {
             tx.send(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 1,
                 thread_id: THREAD,
@@ -764,7 +781,7 @@ mod tests {
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::SendDocument {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id,
                 document,
                 notify: false,
@@ -883,17 +900,17 @@ mod tests {
         // A slot topic: its current session; General: the newest running
         // top-level one (the nested run is newer but not top-level).
         assert_eq!(
-            resolve(&registry, Place::topic(Chat::Group, 100), None),
+            resolve(&registry, Place::topic(Chat::GROUP, 100), None),
             Ok(A.to_owned())
         );
         assert_eq!(resolve(&registry, GENERAL, None), Ok(B.to_owned()));
         assert_eq!(
-            resolve(&registry, Place::topic(Chat::Group, 555), None),
+            resolve(&registry, Place::topic(Chat::GROUP, 555), None),
             Ok(B.to_owned())
         );
         // A prefix, anywhere, among every known session.
         assert_eq!(
-            resolve(&registry, Place::topic(Chat::Group, 100), Some("aaaab")),
+            resolve(&registry, Place::topic(Chat::GROUP, 100), Some("aaaab")),
             Ok(B.to_owned())
         );
         assert_eq!(resolve(&registry, GENERAL, Some("cc")), Ok(N.to_owned()));
@@ -914,6 +931,50 @@ mod tests {
             },
         ));
         assert_eq!(resolve(&registry, GENERAL, None), Ok(A.to_owned()));
+    }
+
+    /// TASK-069 review: in another group people outside the allowlist read
+    /// along, so a command there shows only the session of a slot shared
+    /// there, in its topic; General, other topics and prefixes get a notice
+    /// that names no session.
+    #[test]
+    fn in_another_group_a_command_shows_only_the_session_shared_there() {
+        const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+        const B: &str = "aaaabbbb-0000-4000-8000-000000000002";
+        let other = crate::hub::chat::GroupChat::of(-1_002_222);
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, 10, None));
+        registry.apply_hook(&start(B, 11, None));
+        registry.set_title(B, "Private title");
+        registry.join_group(other, Some("B".into()), true, true);
+        registry.share(
+            crate::hub::registry::SlotId(0),
+            Chat::Group(other),
+            "shared".into(),
+        );
+        registry.slots[0]
+            .view_mut(Chat::Group(other))
+            .expect("the shared view")
+            .topic_id = Some(200);
+        let refused = Err(OTHER_GROUP_NOTICE.to_owned());
+        let in_other = |thread| Place::new(Chat::Group(other), thread);
+        assert_eq!(
+            resolve(&registry, in_other(Some(200)), None),
+            Ok(A.to_owned())
+        );
+        assert_eq!(resolve(&registry, in_other(None), None), refused);
+        assert_eq!(resolve(&registry, in_other(Some(999)), None), refused);
+        assert_eq!(
+            resolve(&registry, in_other(Some(200)), Some("aaaa")),
+            refused
+        );
+        assert_eq!(resolve(&registry, in_other(None), Some("aaaab")), refused);
+        // The default group as before.
+        assert_eq!(resolve(&registry, GENERAL, None), Ok(B.to_owned()));
+        assert!(
+            resolve(&registry, GENERAL, Some("aaaa"))
+                .is_err_and(|text| text.contains("Private title"))
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use cctg::hook;
 use cctg::hub::api::{ApiError, ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress::{bind, serve_agents, serve_hooks};
 use cctg::hub::registry::{ICON_ALIVE, RegistryStore};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -35,6 +35,11 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 mod common;
 
@@ -328,7 +333,7 @@ async fn start_hub_in(state: TempRoot, every: Duration) -> Hub {
     };
     let (scheduler, outbox) = Scheduler::new(fake.clone(), bucket);
     let store = RegistryStore::open(&state.0).unwrap();
-    let registry = store.load().unwrap();
+    let registry = store.load(GroupChat::of(GROUP_ID)).unwrap();
     let options = Options {
         grace: Duration::ZERO,
         status_every: Some(every),
@@ -424,7 +429,7 @@ impl Hub {
     fn press(&self, message_id: i64, data: &str) {
         self.control
             .send(Control::Callback(CallbackInput {
-                chat: Some(Chat::Group),
+                chat: Some(GROUP),
                 query_id: format!("q-{data}"),
                 data: Some(data.into()),
                 message_id: Some(message_id),
@@ -632,14 +637,14 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     // TASK-062 pinned it); one about another message stays.
     hub.control
         .send(Control::Pinned {
-            chat: Chat::Group,
+            chat: GROUP,
             message_id: 5000,
             pinned: status,
         })
         .unwrap();
     hub.control
         .send(Control::Pinned {
-            chat: Chat::Group,
+            chat: GROUP,
             message_id: 5001,
             pinned: 777,
         })
@@ -650,7 +655,7 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
                 matches!(
                     op,
                     Op::Delete {
-                        chat: Chat::Group,
+                        chat: GROUP,
                         message_id: 5000
                     }
                 )
@@ -660,7 +665,7 @@ async fn the_status_message_follows_the_session_and_its_button_writes_esc() {
     assert!(!ops.iter().any(|op| matches!(
         op,
         Op::Delete {
-            chat: Chat::Group,
+            chat: GROUP,
             message_id: 5001
         }
     )));
@@ -1160,7 +1165,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
         hub.control
             .send(Control::Message(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: GROUP,
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
                 thread_id: Some(100),
@@ -1199,7 +1204,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
     let ops = hub
         .until("both answers handled", |ops| {
             let reacted = ops.iter().any(|op| {
-                matches!(op, Op::React { chat: Chat::Group, message_id: 41, emoji } if emoji == stream::ACCEPTED)
+                matches!(op, Op::React { chat: GROUP, message_id: 41, emoji } if emoji == stream::ACCEPTED)
             });
             let told = ops.iter().any(|op| {
                 matches!(op, Op::Send { reply_to: Some(42), text, .. } if text == console::DRAFT_NOTICE)

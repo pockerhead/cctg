@@ -9,13 +9,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cctg::hub::api::{ApiError, ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Control, Options, Slots};
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, Register, SessionAnswer, SessionAsk};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -90,7 +95,12 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -214,7 +224,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
     for message_id in 1..=3 {
         control
             .send(Control::TopicEdited {
-                chat: Chat::Group,
+                chat: GROUP,
                 thread_id: Some(100),
                 message_id,
             })

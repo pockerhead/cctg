@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 
 use cctg::device::canonical_cwd;
 use cctg::hub::api::{ApiError, BotApi, ForumTopic, Message};
-use cctg::hub::chat::{Chat, PrivateChat};
+use cctg::hub::chat::{Chat, GroupChat, PrivateChat};
 use cctg::hub::config::{Allowlist, BotToken, Config};
 use cctg::hub::ingress::{serve_agents, serve_hooks};
 use cctg::hub::offset::OffsetStore;
@@ -95,6 +95,15 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// The id of the default group (TASK-069): the fake's, or the live run's
+/// `CCTG_CHAT_ID`.
+static GROUP_ID: AtomicI64 = AtomicI64::new(FAKE_CHAT);
+
+/// The default group, as the hub names it.
+fn group() -> Chat {
+    Chat::Group(GroupChat::of(GROUP_ID.load(Ordering::SeqCst)))
+}
 
 mod common;
 
@@ -568,7 +577,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             | Op::EditTopic { chat, .. }
             | Op::DeleteTopic { chat, .. }
             | Op::Stream { chat, .. }
-            | Op::React { chat, .. } => *chat = Chat::Group,
+            | Op::React { chat, .. } => *chat = group(),
             Op::AnswerCallback { .. } => {}
         }
         let (kind, thread, text, message) = describe(&in_group);
@@ -576,7 +585,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
     }
     match op {
         Op::Send {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             text,
             permission,
@@ -588,19 +597,19 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             None,
         ),
         Op::SendDocument {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             document,
             ..
         } => ("document", *thread_id, document.file_name.clone(), None),
         Op::SendPhoto {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             document,
             ..
         } => ("photo", *thread_id, document.file_name.clone(), None),
         Op::SendAlbum {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             items,
             ..
@@ -615,7 +624,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             None,
         ),
         Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             text,
             into: None,
@@ -623,43 +632,43 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
         } => ("stream", Some(*thread_id), text.clone(), None),
         // TASK-062: turn content written into a message of the topic.
         Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             text,
             into: Some(message_id),
             ..
         } => ("write", Some(*thread_id), text.clone(), Some(*message_id)),
         Op::Edit {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             message_id,
             text,
             ..
         } => ("edit", None, text.clone(), Some(*message_id)),
         Op::React {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             message_id,
             emoji,
         } => ("react", None, emoji.clone(), Some(*message_id)),
         Op::AnswerCallback { query_id, .. } => ("callback", None, query_id.clone(), None),
         Op::Delete {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             message_id,
         } => ("delete", None, String::new(), Some(*message_id)),
         Op::Unpin {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             message_id,
         } => ("unpin", None, String::new(), Some(*message_id)),
         Op::Pin {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             message_id,
         } => ("pin", None, String::new(), Some(*message_id)),
         Op::CreateTopic {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             name,
             ..
         } => ("create_topic", None, name.clone(), None),
         Op::EditTopic {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
             name,
             icon_custom_emoji_id,
@@ -674,7 +683,7 @@ fn describe(op: &Op) -> (&'static str, Option<i64>, String, Option<i64>) {
             None,
         ),
         Op::DeleteTopic {
-            chat: Chat::Group,
+            chat: Chat::Group(_),
             thread_id,
         } => ("delete_topic", Some(*thread_id), String::new(), None),
         // TASK-061: a hub without private chats writes only to the group.
@@ -833,7 +842,7 @@ impl Tg {
     /// own limit, which this fake does not enforce).
     fn group_flood(&self, op: &Op, at: Instant) -> Option<Duration> {
         let limit = self.group_limit?;
-        if op.chat() != Some(Chat::Group) {
+        if op.chat() != Some(group()) {
             return None;
         }
         let window = Duration::from_secs(60);
@@ -883,7 +892,7 @@ impl Tg {
             } => {
                 // The planned 429s hit the group (TASK-063: its pause must
                 // not hold the private chat back).
-                if *chat == Chat::Group {
+                if *chat == group() {
                     let seen = self.streams_seen.fetch_add(1, Ordering::SeqCst) + 1;
                     let mut flood = self.flood.lock().unwrap();
                     if flood.front() == Some(&seen) {
@@ -965,7 +974,7 @@ impl Tg {
 /// chat (its id is the user's).
 fn chat_json(chat: Chat) -> Value {
     match chat {
-        Chat::Group => json!({"id": FAKE_CHAT, "type": "supergroup", "is_forum": true}),
+        Chat::Group(_) => json!({"id": FAKE_CHAT, "type": "supergroup", "is_forum": true}),
         Chat::Private(_) => json!({"id": FAKE_USER, "type": "private", "first_name": "u"}),
     }
 }
@@ -1047,10 +1056,6 @@ impl Updates {
 }
 
 impl UpdateSource for Updates {
-    fn chat_id(&self) -> i64 {
-        FAKE_CHAT
-    }
-
     async fn get_updates(&self, _: Option<i64>, _: Duration) -> Result<Vec<Value>, ApiError> {
         let mut rx = self.rx.lock().await;
         let Some(first) = rx.recv().await else {
@@ -1136,7 +1141,9 @@ impl Soak {
             outbox
         };
         let store = RegistryStore::open(&self.state).expect("registry store");
-        let registry = store.load().expect("registry loads");
+        let registry = store
+            .load(GroupChat::of(GROUP_ID.load(Ordering::SeqCst)))
+            .expect("registry loads");
         let slots = Slots::new(registry, store, outbox, self.options.clone());
         let (agents, agents_rx) = mpsc::channel(256);
         let (hooks, hooks_rx) = mpsc::channel(256);
@@ -1148,6 +1155,7 @@ impl Soak {
             tokio::spawn(serve_hooks(hooks_listener, secret, hooks)),
         ]);
         let offsets = OffsetStore::open(&self.state).expect("offset store");
+        let groups = self.options.groups.clone();
         let (allowlist, tg, router) = (self.allowlist.clone(), self.tg.clone(), control.clone());
         let live = self.live;
         let route = move |routed: Routed| match routed {
@@ -1178,7 +1186,7 @@ impl Soak {
                 let tg = self.tg.clone();
                 tokio::spawn(async move {
                     let api = tg.live.as_ref().expect("live api");
-                    updates::poll(api, &allowlist, &offsets, route).await;
+                    updates::poll(api, &groups, &allowlist, &offsets, route).await;
                 })
             }
             None => {
@@ -1187,6 +1195,7 @@ impl Soak {
                 tokio::spawn(async move {
                     updates::poll_until(
                         &source,
+                        &groups,
                         &allowlist,
                         private,
                         &offsets,
@@ -1202,7 +1211,7 @@ impl Soak {
 
     /// A user message in a topic.
     fn say(&self, hub: &Hub, thread: i64, text: &str) {
-        self.say_in(hub, Chat::Group, thread, text);
+        self.say_in(hub, group(), thread, text);
     }
 
     /// A user message in a topic of `chat` (TASK-063: the owner's private
@@ -1212,7 +1221,7 @@ impl Soak {
             let message_id = self.next_message.fetch_add(1, Ordering::SeqCst);
             let _ = hub.control.send(Control::Message(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: group(),
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
                 thread_id: Some(thread),
@@ -1243,7 +1252,7 @@ impl Soak {
         let query = format!("{SYNTHETIC_QUERY}{message_id}");
         if self.live {
             let _ = hub.control.send(Control::Callback(updates::CallbackInput {
-                chat: Some(Chat::Group),
+                chat: Some(group()),
                 query_id: query,
                 data: Some(data.to_owned()),
                 message_id: Some(message_id),
@@ -1553,12 +1562,13 @@ async fn soak(live: bool, status: bool, private: bool, brief: bool) -> String {
             .map(PathBuf::from)
             .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env"));
         let config = Config::load(Some(&env_file)).expect("live config (values not shown)");
-        let api = BotApi::new(&config.token, config.chat_id).expect("bot api");
+        let api = BotApi::new(&config.token).expect("bot api");
+        GROUP_ID.store(config.chat_id, Ordering::SeqCst);
         // The run creates topics, deletes their service messages and at the
         // end the topics themselves.
         let me = api.get_me().await.expect("getMe");
         let member = api
-            .get_chat_member(Chat::Group, me.id)
+            .get_chat_member(group(), me.id)
             .await
             .expect("getChatMember");
         assert!(
@@ -2478,10 +2488,19 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     };
     // Private mode keeps the twins of lasting messages (TASK-063: Resume
     // offers, subagent blocks) for a restart: a private primary, a group twin.
-    let mut durable = vec!["pids", "seq", "sessions", "slots", "subagents", "version"];
+    // TASK-069: the record of the default group.
+    let mut durable = vec![
+        "groups",
+        "pids",
+        "seq",
+        "sessions",
+        "slots",
+        "subagents",
+        "version",
+    ];
     if soak.private {
-        durable.insert(5, "twins");
-        let group = serde_json::to_value(Chat::Group).unwrap();
+        durable.insert(6, "twins");
+        let group = serde_json::to_value(group()).unwrap();
         let twins = registry["twins"].as_array().expect("twins");
         assert!(
             twins
@@ -2493,10 +2512,10 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     }
     // TASK-078: the owner's settings, written before the first hub.
     if soak.brief {
-        durable.insert(0, "people");
+        durable.insert(1, "people");
     }
     assert_eq!(keys(&registry), durable, "no other durable state");
-    assert_eq!(registry["version"], 2);
+    assert_eq!(registry["version"], 3);
     assert!(registry["seq"].as_u64().is_some_and(|seq| seq > 0));
     assert_eq!(registry["subagents"], json!({}), "no subagent records");
     let slots = registry["slots"].as_array().expect("slots");
@@ -2542,7 +2561,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
             private_statuses.push((private_thread, id));
         }
         let view = &slot_views[0];
-        assert_eq!(view["chat"], "group");
+        assert_eq!(view["chat"], serde_json::to_value(group()).unwrap());
         assert_eq!(view["topic_id"], thread);
         assert_eq!(view["pending_separator"], Value::Null);
         assert_eq!(
@@ -2618,9 +2637,11 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
         assert!(
             entry["stream"]["receipts"]
                 .as_array()
-                .is_some_and(|keys| keys.iter().all(|key| (key["chat"] == "group"
-                    || (soak.private && key["chat"] == json!({"private": FAKE_USER})))
-                    && key["id"].is_i64())),
+                .is_some_and(|keys| keys
+                    .iter()
+                    .all(|key| (key["chat"] == serde_json::to_value(group()).unwrap()
+                        || (soak.private && key["chat"] == json!({"private": FAKE_USER})))
+                        && key["id"].is_i64())),
             "{id}: receipts"
         );
     }
@@ -2664,7 +2685,7 @@ async fn scenario(soak: &Soak, started: Instant) -> String {
     let block_place = if soak.private {
         json!({"chat": {"private": FAKE_USER}, "thread": q_a})
     } else {
-        json!({"chat": "group", "thread": t_a})
+        json!({"chat": group(), "thread": t_a})
     };
     assert_eq!(
         block["place"], block_place,

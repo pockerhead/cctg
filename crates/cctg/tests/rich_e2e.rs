@@ -10,13 +10,18 @@
 use std::sync::{Arc, Mutex};
 
 use cctg::hub::api::BotApi;
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::config::Config;
 use cctg::hub::scheduler::{BucketConfig, Op, Outbox, Outcome, Rich, Scheduler};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use transcript::{HtmlChunk, SplitOptions, rich_markdown, split_markdown_for_telegram};
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 const REFUSED: &str =
     r#"{"ok":false,"error_code":400,"description":"Bad Request: RICH_MESSAGE_BLOCKS_TOO_MANY"}"#;
@@ -134,7 +139,7 @@ async fn scheduler(
     })
     .unwrap()
     .token;
-    let api = Arc::new(BotApi::with_api_url(&url, &token, -1001, None).unwrap());
+    let api = Arc::new(BotApi::with_api_url(&url, &token, None).unwrap());
     let fast = BucketConfig {
         capacity: 100,
         refill_every: std::time::Duration::from_millis(1),
@@ -160,7 +165,7 @@ fn rich_send(text: &str, notify: bool) -> Op {
     let mut chunks = chunks(text);
     let last = chunks.pop().unwrap();
     Op::Send {
-        chat: Chat::Group,
+        chat: GROUP,
         thread_id: Some(5),
         text: last.text,
         html: Some(last.html),
@@ -257,7 +262,7 @@ async fn a_refused_rich_answer_goes_as_its_html_messages_without_loss() {
 #[tokio::test]
 async fn a_rich_write_into_a_message_and_its_html_fallback() {
     let write = || Op::Stream {
-        chat: Chat::Group,
+        chat: GROUP,
         thread_id: 5,
         text: "Смотрю.\n• Bash: a<b ✓".to_owned(),
         html: Some("Смотрю.\n• Bash: a&lt;b ✓".to_owned()),
@@ -309,7 +314,7 @@ async fn a_rich_write_into_a_message_and_its_html_fallback() {
 #[tokio::test]
 async fn a_new_rich_stream_message_goes_as_send_rich_message() {
     let line = |notify: bool| Op::Stream {
-        chat: Chat::Group,
+        chat: GROUP,
         thread_id: 5,
         text: "Смотрю.".to_owned(),
         html: Some("Смотрю.".to_owned()),

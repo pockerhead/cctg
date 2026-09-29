@@ -442,10 +442,12 @@ pub enum SlotAction {
     Mentions,
     /// 📣: it takes every message.
     EveryMessage,
+    /// 👥 n…: the group picker in the slot's topic (TASK-069).
+    Groups,
 }
 
 impl SlotAction {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Open,
         Self::Share,
         Self::Unshare,
@@ -454,6 +456,7 @@ impl SlotAction {
         Self::StopConfirm,
         Self::Mentions,
         Self::EveryMessage,
+        Self::Groups,
     ];
 
     fn code(self) -> &'static str {
@@ -466,6 +469,7 @@ impl SlotAction {
             Self::StopConfirm => "sc",
             Self::Mentions => "mn",
             Self::EveryMessage => "ma",
+            Self::Groups => "gp",
         }
     }
 }
@@ -689,6 +693,38 @@ pub struct SessionRow {
     /// The group topic takes mentions only (`true`) or every message; `None`
     /// unless `shared` is `Some(true)` (TASK-077).
     pub mentions: Option<bool>,
+    /// The slot has two or more groups to choose from (TASK-069): one
+    /// button opens the group picker instead of 👥 and 🙈.
+    pub pick: bool,
+    /// The titles of the groups it shows in (TASK-069), when `pick`.
+    pub groups: Vec<String>,
+}
+
+/// Group titles a session row names at most (TASK-069).
+const ROW_GROUPS: usize = 3;
+
+/// Where a shared row shows: `, в группе` with one group, else the titles
+/// of its groups (at most [`ROW_GROUPS`], each cut).
+fn groups_text(row: &SessionRow) -> String {
+    if !row.pick {
+        return ", в группе".to_owned();
+    }
+    let titles: Vec<String> = row
+        .groups
+        .iter()
+        .take(ROW_GROUPS)
+        .map(|title| cut(title, super::groups::TITLE_BUTTON_LIMIT))
+        .collect();
+    match row.groups.len() {
+        0 => ", в группе".to_owned(),
+        1 => format!(", в группе «{}»", titles[0]),
+        n if n <= ROW_GROUPS => format!(", в группах: {}", titles.join(", ")),
+        n => format!(
+            ", в группах: {} и ещё {}",
+            titles.join(", "),
+            n - ROW_GROUPS
+        ),
+    }
 }
 
 /// One page of the sessions tab.
@@ -822,10 +858,10 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
         let n = index + 1;
         let (icon, state) = row.state.icon_and_text();
         let group = match (row.shared, row.mentions) {
-            (Some(true), Some(true)) => ", в группе, по упоминанию",
-            (Some(true), Some(false)) => ", в группе, все сообщения",
-            (Some(true), None) => ", в группе",
-            _ => "",
+            (Some(true), Some(true)) => format!("{}, по упоминанию", groups_text(row)),
+            (Some(true), Some(false)) => format!("{}, все сообщения", groups_text(row)),
+            (Some(true), None) => groups_text(row),
+            _ => String::new(),
         };
         text.push_str(&format!(
             "\n{n}. {icon} {} — {state}{group}",
@@ -838,6 +874,9 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
         };
         let mut buttons = vec![button(format!("↗ {n}"), press(SlotAction::Open))];
         match (row.shared, row.share_confirm) {
+            (Some(_), _) if row.pick => {
+                buttons.push(button(format!("👥 {n}…"), press(SlotAction::Groups)));
+            }
             (Some(false), _) => buttons.push(button(format!("👥 {n}"), press(SlotAction::Share))),
             (Some(true), false) => {
                 buttons.push(button(format!("🙈 {n}"), press(SlotAction::Unshare)));
@@ -1108,6 +1147,8 @@ mod tests {
             mentions: shared
                 .filter(|shared| *shared)
                 .map(|_| slot.is_multiple_of(2)),
+            pick: false,
+            groups: Vec::new(),
         }
     }
 
@@ -1922,5 +1963,71 @@ mod tests {
         let codes: Vec<&str> = SlotAction::ALL.iter().map(|action| action.code()).collect();
         let unique: std::collections::BTreeSet<&str> = codes.iter().copied().collect();
         assert_eq!(unique.len(), codes.len(), "{codes:?}");
+    }
+
+    /// TASK-069: with several groups a row has one picker button instead of
+    /// 👥 and 🙈 and names the groups it shows in, three at most.
+    #[test]
+    fn a_row_with_several_groups_opens_the_picker_and_names_its_groups() {
+        let titles =
+            |n: usize| -> Vec<String> { (1..=n).map(|i| format!("Группа {i}")).collect() };
+        let picked = |slot: u32, shared: bool, groups: usize| SessionRow {
+            pick: true,
+            groups: titles(groups),
+            ..row(slot, Some(shared), false, None)
+        };
+        let view = SessionsView {
+            rows: vec![
+                picked(2, true, 1),
+                picked(3, true, 2),
+                picked(4, true, 5),
+                picked(5, false, 0),
+            ],
+            page: 0,
+            pages: 1,
+            outdated: 0,
+        };
+        let (text, keyboard) = render(&Page::Sessions(0), &Settings::default(), Some(&view), 0);
+        assert!(
+            text.contains(
+                "\n1. ⚡ [box] project · 2 — работает, в группе «Группа 1», по упоминанию"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n2. ⚡ [box] project · 3 — работает, в группах: Группа 1, Группа 2, все сообщения"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n3. ⚡ [box] project · 4 — работает, в группах: Группа 1, Группа 2, Группа 3 и ещё 2, по упоминанию"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n4. ⚡ [box] project · 5 — работает"),
+            "{text}"
+        );
+        let labels = labels(&keyboard);
+        let datas = datas(&keyboard);
+        for n in 1..=4 {
+            let at = labels
+                .iter()
+                .position(|label| *label == format!("👥 {n}…"))
+                .unwrap_or_else(|| panic!("{n}: {labels:?}"));
+            assert!(datas[at].starts_with("menu:gp:0:"), "{}", datas[at]);
+            assert!(!labels.contains(&format!("🙈 {n}")), "{labels:?}");
+            assert!(!labels.contains(&format!("👥 {n}")), "{labels:?}");
+        }
+        assert_eq!(
+            parse_callback("menu:gp:1:9"),
+            Some(MenuPress::Slot {
+                action: SlotAction::Groups,
+                page: 1,
+                slot: 9
+            })
+        );
     }
 }

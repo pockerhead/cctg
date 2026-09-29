@@ -602,7 +602,7 @@ mod tests {
     fn command(text: &str, thread_id: Option<i64>) -> Inbound {
         Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
             thread_id,
@@ -619,7 +619,7 @@ mod tests {
 
     fn press(data: &str) -> CallbackInput {
         CallbackInput {
-            chat: Some(Chat::Group),
+            chat: Some(Chat::GROUP),
             query_id: "q".into(),
             data: Some(data.into()),
             message_id: Some(77),

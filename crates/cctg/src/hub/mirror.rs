@@ -568,13 +568,13 @@ mod tests {
 
     /// The group topic the twins go to.
     fn group() -> Place {
-        Place::topic(Chat::Group, 100)
+        Place::topic(Chat::GROUP, 100)
     }
 
     fn lasting(primary: i64, twin: i64) -> TwinLink {
         TwinLink {
             primary: MessageKey::new(owner(), primary),
-            twin: MessageKey::new(Chat::Group, twin),
+            twin: MessageKey::new(Chat::GROUP, twin),
             thread: Some(100),
         }
     }
@@ -608,11 +608,11 @@ mod tests {
         assert!(mirror.twin_answered(second, Some(51)).is_empty());
         let primary = MessageKey::new(owner(), 5);
         assert_eq!(
-            mirror.twin(primary, Chat::Group),
-            Some(MessageKey::new(Chat::Group, 50))
+            mirror.twin(primary, Chat::GROUP),
+            Some(MessageKey::new(Chat::GROUP, 50))
         );
         assert_eq!(
-            mirror.primary_of(MessageKey::new(Chat::Group, 51)),
+            mirror.primary_of(MessageKey::new(Chat::GROUP, 51)),
             Some(MessageKey::new(owner(), 6))
         );
         assert_eq!(mirror.waiting(), 0);
@@ -633,11 +633,11 @@ mod tests {
         let [Follow::Write { twin, op }] = follows.as_slice() else {
             panic!("{follows:?}");
         };
-        assert_eq!(*twin, MessageKey::new(Chat::Group, 50));
+        assert_eq!(*twin, MessageKey::new(Chat::GROUP, 50));
         assert!(matches!(op, Op::Edit { text, .. } if text == "b"));
         assert_eq!(
             mirror.write(primary, &edit(owner(), 5, "c")),
-            [Write::Now(MessageKey::new(Chat::Group, 50))]
+            [Write::Now(MessageKey::new(Chat::GROUP, 50))]
         );
     }
 
@@ -673,7 +673,7 @@ mod tests {
         let follows = mirror.primary_answered(1, owner(), Landed::Nothing);
         assert!(matches!(
             follows.as_slice(),
-            [Follow::Delete(key)] if *key == MessageKey::new(Chat::Group, 50)
+            [Follow::Delete(key)] if *key == MessageKey::new(Chat::GROUP, 50)
         ));
         // A reply that did not reach the primary topic stays in the mirror.
         mirror.twin_answered(kept, Some(52));
@@ -685,7 +685,7 @@ mod tests {
         // Merged: the twin stays, unlinked.
         mirror.primary_answered(2, owner(), Landed::Merged);
         assert!(mirror.twin_answered(merged, Some(51)).is_empty());
-        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 51)), None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::GROUP, 51)), None);
         assert_eq!(mirror.waiting(), 0);
     }
 
@@ -702,28 +702,28 @@ mod tests {
         );
         let late = mirror.send(2, group(), true, false).unwrap();
         mirror.primary_answered(2, owner(), Landed::Again);
-        assert_eq!(mirror.kept(2), [(Chat::Group, None)]);
+        assert_eq!(mirror.kept(2), [(Chat::GROUP, None)]);
         assert!(mirror.twin_answered(late, Some(51)).is_empty(), "no delete");
-        assert_eq!(mirror.kept(1), [(Chat::Group, Some(Some(50)))]);
-        assert_eq!(mirror.kept_of(MessageKey::new(Chat::Group, 51)), Some(2));
+        assert_eq!(mirror.kept(1), [(Chat::GROUP, Some(Some(50)))]);
+        assert_eq!(mirror.kept_of(MessageKey::new(Chat::GROUP, 51)), Some(2));
         let mut lost = mirror.lost();
         lost.sort_unstable();
         assert_eq!(lost, [1, 2]);
         // Sent again as number 7: the kept twin is linked to that message.
-        assert_eq!(mirror.kept_chats(1), [Chat::Group]);
-        assert_eq!(mirror.carry(1, 7), [Chat::Group]);
+        assert_eq!(mirror.kept_chats(1), [Chat::GROUP]);
+        assert_eq!(mirror.carry(1, 7), [Chat::GROUP]);
         assert!(mirror.twinned(7));
         mirror.primary_answered(7, owner(), Landed::Message(9));
         assert_eq!(
-            mirror.twin(MessageKey::new(owner(), 9), Chat::Group),
-            Some(MessageKey::new(Chat::Group, 50))
+            mirror.twin(MessageKey::new(owner(), 9), Chat::GROUP),
+            Some(MessageKey::new(Chat::GROUP, 50))
         );
         assert_eq!(
-            mirror.primary_of(MessageKey::new(Chat::Group, 50)),
+            mirror.primary_of(MessageKey::new(Chat::GROUP, 50)),
             Some(MessageKey::new(owner(), 9))
         );
         // Not sent again: the twin is handed back, not deleted.
-        assert_eq!(mirror.release(2), [MessageKey::new(Chat::Group, 51)]);
+        assert_eq!(mirror.release(2), [MessageKey::new(Chat::GROUP, 51)]);
         assert!(mirror.lost().is_empty());
         assert_eq!(mirror.waiting(), 0);
         // One still on its way when let go is deleted once it comes.
@@ -732,7 +732,7 @@ mod tests {
         assert!(mirror.release(3).is_empty());
         assert!(matches!(
             mirror.twin_answered(unanswered, Some(52)).as_slice(),
-            [Follow::Delete(key)] if *key == MessageKey::new(Chat::Group, 52)
+            [Follow::Delete(key)] if *key == MessageKey::new(Chat::GROUP, 52)
         ));
     }
 
@@ -747,17 +747,17 @@ mod tests {
         assert!(mirror.twin_answered(id, None).is_empty());
         assert_eq!(
             mirror.write(primary, &edit(owner(), 5, "x")),
-            [Write::Lost(Chat::Group)]
+            [Write::Lost(Chat::GROUP)]
         );
         // A new twin of it (the status of a mirror topic) takes the calls.
         let again = mirror.send_for(primary, group()).unwrap();
         mirror.twin_answered(again, Some(60));
         assert_eq!(
             mirror.write(primary, &edit(owner(), 5, "y")),
-            [Write::Now(MessageKey::new(Chat::Group, 60))]
+            [Write::Now(MessageKey::new(Chat::GROUP, 60))]
         );
         assert_eq!(
-            mirror.primary_of(MessageKey::new(Chat::Group, 60)),
+            mirror.primary_of(MessageKey::new(Chat::GROUP, 60)),
             Some(primary)
         );
     }
@@ -783,7 +783,7 @@ mod tests {
         }
         assert_eq!(
             again.write(MessageKey::new(owner(), 5), &edit(owner(), 5, "done")),
-            [Write::Now(MessageKey::new(Chat::Group, 50))]
+            [Write::Now(MessageKey::new(Chat::GROUP, 50))]
         );
         assert_eq!(again.lasting().len(), 1);
         assert!(!again.take_changed(), "loading changes nothing to save");
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn a_topic_that_is_no_view_any_more_gets_no_write() {
         let mut mirror = Mirror::default();
-        let other = Place::topic(Chat::Group, 200);
+        let other = Place::topic(Chat::GROUP, 200);
         // Shown in the forgotten topic, a lasting one too.
         let shown = mirror.send(1, group(), false, false).unwrap();
         mirror.primary_answered(1, owner(), Landed::Message(5));
@@ -835,7 +835,7 @@ mod tests {
             mirror.lasting(),
             [TwinLink {
                 primary: MessageKey::new(owner(), 9),
-                twin: MessageKey::new(Chat::Group, 90),
+                twin: MessageKey::new(Chat::GROUP, 90),
                 thread: Some(200),
             }]
         );
@@ -850,9 +850,9 @@ mod tests {
                 "{primary}"
             );
         }
-        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 50)), None);
-        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 60)), None);
-        assert_eq!(mirror.twin(MessageKey::new(owner(), 5), Chat::Group), None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::GROUP, 50)), None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::GROUP, 60)), None);
+        assert_eq!(mirror.twin(MessageKey::new(owner(), 5), Chat::GROUP), None);
         // Late answers there link nothing and write nothing.
         assert!(mirror.twin_answered(sending, Some(80)).is_empty());
         assert!(!mirror.twinned(4));
@@ -864,12 +864,12 @@ mod tests {
         assert!(mirror.twin_answered(early, Some(81)).is_empty());
         assert!(mirror.kept(5).is_empty());
         assert!(mirror.twin_answered(kept, Some(82)).is_empty());
-        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 80)), None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::GROUP, 80)), None);
         assert_eq!(mirror.waiting(), 0);
         // The other topic is untouched.
         assert_eq!(
             mirror.write(MessageKey::new(owner(), 9), &edit(owner(), 9, "y")),
-            [Write::Now(MessageKey::new(Chat::Group, 90))]
+            [Write::Now(MessageKey::new(Chat::GROUP, 90))]
         );
     }
 
@@ -879,12 +879,12 @@ mod tests {
         for n in 0..(MAX_TWINS as i64 + 1) {
             mirror.link(
                 MessageKey::new(owner(), n),
-                MessageKey::new(Chat::Group, 10_000 + n),
+                MessageKey::new(Chat::GROUP, 10_000 + n),
                 Some(100),
             );
         }
         assert_eq!(
-            mirror.primary_of(MessageKey::new(Chat::Group, 10_000)),
+            mirror.primary_of(MessageKey::new(Chat::GROUP, 10_000)),
             None
         );
         assert!(
@@ -893,8 +893,8 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            mirror.twin(MessageKey::new(owner(), 1), Chat::Group),
-            Some(MessageKey::new(Chat::Group, 10_001))
+            mirror.twin(MessageKey::new(owner(), 1), Chat::GROUP),
+            Some(MessageKey::new(Chat::GROUP, 10_001))
         );
         let mut mirror = Mirror::default();
         for seq in 0..MAX_SENDS as u64 {
@@ -915,41 +915,41 @@ mod tests {
         mirror.twin_answered(shown, Some(50));
         let primary = MessageKey::new(owner(), 5);
         assert_eq!(
-            mirror.detach(primary, Chat::Group),
-            Detached::Shown(MessageKey::new(Chat::Group, 50))
+            mirror.detach(primary, Chat::GROUP),
+            Detached::Shown(MessageKey::new(Chat::GROUP, 50))
         );
         assert!(mirror.write(primary, &edit(owner(), 5, "x")).is_empty());
-        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 50)), None);
-        assert!(!mirror.knows(primary, Chat::Group));
-        assert_eq!(mirror.detach(primary, Chat::Group), Detached::None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::GROUP, 50)), None);
+        assert!(!mirror.knows(primary, Chat::GROUP));
+        assert_eq!(mirror.detach(primary, Chat::GROUP), Detached::None);
         // On its way: taken away once Telegram answers.
         let sending = mirror.send(2, group(), true, false).unwrap();
         mirror.primary_answered(2, owner(), Landed::Message(6));
         let second = MessageKey::new(owner(), 6);
         assert_eq!(
-            mirror.detach(second, Chat::Group),
+            mirror.detach(second, Chat::GROUP),
             Detached::Sending(sending)
         );
-        assert!(!mirror.knows(second, Chat::Group));
+        assert!(!mirror.knows(second, Chat::GROUP));
         assert!(matches!(
             mirror.twin_answered(sending, Some(60)).as_slice(),
-            [Follow::Delete(key)] if *key == MessageKey::new(Chat::Group, 60)
+            [Follow::Delete(key)] if *key == MessageKey::new(Chat::GROUP, 60)
         ));
-        assert_eq!(mirror.primary_of(MessageKey::new(Chat::Group, 60)), None);
+        assert_eq!(mirror.primary_of(MessageKey::new(Chat::GROUP, 60)), None);
         assert_eq!(mirror.waiting(), 0);
         // A new twin of a shown message, answered: shown.
         let again = mirror.send_for(second, group()).unwrap();
         mirror.twin_answered(again, Some(61));
         assert_eq!(
-            mirror.detach(second, Chat::Group),
-            Detached::Shown(MessageKey::new(Chat::Group, 61))
+            mirror.detach(second, Chat::GROUP),
+            Detached::Shown(MessageKey::new(Chat::GROUP, 61))
         );
         // Lost: nothing to clear away.
         let lost = mirror.send(3, group(), true, false).unwrap();
         mirror.primary_answered(3, owner(), Landed::Message(7));
         mirror.twin_answered(lost, None);
         assert_eq!(
-            mirror.detach(MessageKey::new(owner(), 7), Chat::Group),
+            mirror.detach(MessageKey::new(owner(), 7), Chat::GROUP),
             Detached::None
         );
     }

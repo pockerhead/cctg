@@ -21,7 +21,9 @@ use cctg::agent::{self, Backoff, Dirs, Frame, LinkConfig};
 use cctg::channel::Hub;
 use cctg::hub::api::BotApi;
 use cctg::hub::buffer::{OLD_AGENT_NOTICE, TOO_BIG_NOTICE};
+use cctg::hub::chat::GroupChat;
 use cctg::hub::config::{Allowlist, Config};
+use cctg::hub::groups::KnownGroups;
 use cctg::hub::ingress::serve_agents;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Scheduler};
@@ -32,6 +34,15 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = CHAT;
+
+/// The groups the poll lets through: the default one.
+fn known_groups() -> KnownGroups {
+    KnownGroups::of([GroupChat::of(GROUP_ID)])
+}
 
 const SECRET: &str = "files-e2e-secret-0123456789";
 const SESSION: &str = "f11e5000-0000-4000-8000-000000000032";
@@ -193,7 +204,7 @@ fn topic_message(message_id: i64, thread_id: i64, fields: Value) -> Control {
         message.extend(fields.clone());
     }
     let allowlist: Allowlist = [USER].into_iter().collect();
-    let (_, mut routed) = route_batch(vec![update], None, CHAT, &allowlist);
+    let (_, mut routed) = route_batch(vec![update], None, &known_groups(), &allowlist);
     match routed.remove(0) {
         Routed::Input(input) => Control::Message(input),
         other => panic!("not input: {other:?}"),
@@ -410,7 +421,7 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
     })
     .unwrap()
     .token;
-    let api = Arc::new(BotApi::with_api_url(&url, &token, CHAT, None).unwrap());
+    let api = Arc::new(BotApi::with_api_url(&url, &token, None).unwrap());
     let fast = BucketConfig {
         capacity: 1000,
         refill_every: Duration::from_millis(1),
@@ -423,7 +434,12 @@ async fn files_go_both_ways_and_never_reach_the_logs() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
+    let mut slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).unwrap(),
+        store,
+        outbox,
+        options,
+    );
     slots.fetch_files(api);
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);

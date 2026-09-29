@@ -547,7 +547,7 @@ mod tests {
 
     /// Shown in Telegram as `message_id` of the group's topic 100.
     fn shown(book: &mut Prompts, key: u64, message_id: i64) {
-        shown_in(book, key, Place::topic(Chat::Group, 100), message_id);
+        shown_in(book, key, Place::topic(Chat::GROUP, 100), message_id);
     }
 
     fn shown_in(book: &mut Prompts, key: u64, place: Place, message_id: i64) {
@@ -566,10 +566,10 @@ mod tests {
         let mut book = Prompts::default();
         let group = added(book.open(prompt("A", "abcde")));
         let own = added(book.open(prompt("B", "abcde")));
-        shown_in(&mut book, group, Place::topic(Chat::Group, 100), 10);
+        shown_in(&mut book, group, Place::topic(Chat::GROUP, 100), 10);
         shown_in(&mut book, own, Place::topic(private, 100), 10);
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 10)),
+            book.by_message(MessageKey::new(Chat::GROUP, 10)),
             Some(group)
         );
         assert_eq!(book.by_message(MessageKey::new(private, 10)), Some(own));
@@ -578,7 +578,7 @@ mod tests {
         assert!(book.remove(own).is_some());
         assert_eq!(book.by_message(MessageKey::new(private, 10)), None);
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 10)),
+            book.by_message(MessageKey::new(Chat::GROUP, 10)),
             Some(group),
             "the group's prompt stays found"
         );
@@ -586,13 +586,13 @@ mod tests {
         // another prompt, never an ambiguous pair.
         let a = added(book.open(prompt("C", "fghij")));
         let b = added(book.open(prompt("D", "fghij")));
-        for (key, chat) in [(a, Chat::Group), (b, private)] {
+        for (key, chat) in [(a, Chat::GROUP), (b, private)] {
             let sending = book.get_mut(key).unwrap();
             sending.sent = true;
             sending.place = Some(Place::topic(chat, 200));
         }
         assert_eq!(
-            book.in_flight("fghij", Some(Place::topic(Chat::Group, 200))),
+            book.in_flight("fghij", Some(Place::topic(Chat::GROUP, 200))),
             Some(a)
         );
         assert_eq!(
@@ -717,11 +717,11 @@ mod tests {
         shown(&mut book, first, 10);
         shown(&mut book, other, 11);
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 10)),
+            book.by_message(MessageKey::new(Chat::GROUP, 10)),
             Some(first)
         );
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 11)),
+            book.by_message(MessageKey::new(Chat::GROUP, 11)),
             Some(other)
         );
         // Once A's prompt ended, the same id may ask again.
@@ -766,23 +766,23 @@ mod tests {
         let mut book = Prompts::default();
         let key = added(book.open(prompt("A", "abcde")));
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             None,
             "not handed out"
         );
         let sending = book.get_mut(key).unwrap();
         sending.sent = true;
-        sending.place = Some(Place::topic(Chat::Group, 100));
+        sending.place = Some(Place::topic(Chat::GROUP, 100));
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             Some(key)
         );
         assert_eq!(
-            book.in_flight("bcdef", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("bcdef", Some(Place::topic(Chat::GROUP, 100))),
             None
         );
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 101))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 101))),
             None,
             "other topic"
         );
@@ -790,20 +790,20 @@ mod tests {
         let twin = added(book.open(prompt("B", "abcde")));
         let sending = book.get_mut(twin).unwrap();
         sending.sent = true;
-        sending.place = Some(Place::topic(Chat::Group, 100));
+        sending.place = Some(Place::topic(Chat::GROUP, 100));
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             None,
             "ambiguous"
         );
         book.delivered(twin, 11);
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             Some(key)
         );
         book.delivered(key, 10);
         assert_eq!(
-            book.in_flight("abcde", Some(Place::topic(Chat::Group, 100))),
+            book.in_flight("abcde", Some(Place::topic(Chat::GROUP, 100))),
             None,
             "id known"
         );
@@ -908,7 +908,7 @@ mod tests {
         let Opened::Added { expired: None, .. } = book.open(prompt("B", "abcde")) else {
             panic!("a finished prompt makes room");
         };
-        assert_eq!(book.by_message(MessageKey::new(Chat::Group, 100)), None);
+        assert_eq!(book.by_message(MessageKey::new(Chat::GROUP, 100)), None);
         // Then the oldest open one expires; a selected one never does.
         book.get_mut(keys[1]).unwrap().state = State::Selected {
             behavior: Behavior::Deny,
@@ -922,9 +922,9 @@ mod tests {
             panic!("an open prompt makes room");
         };
         assert_eq!(gone.message_id, Some(102));
-        assert_eq!(book.by_message(MessageKey::new(Chat::Group, 102)), None);
+        assert_eq!(book.by_message(MessageKey::new(Chat::GROUP, 102)), None);
         assert_eq!(
-            book.by_message(MessageKey::new(Chat::Group, 101)),
+            book.by_message(MessageKey::new(Chat::GROUP, 101)),
             Some(keys[1])
         );
         assert_eq!(book.len(), MAX_PROMPTS);
