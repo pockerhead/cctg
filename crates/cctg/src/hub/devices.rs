@@ -438,6 +438,17 @@ impl Devices {
             .and_then(|device| device.owner)
     }
 
+    /// The ids of the devices `owner` owns (TASK-081: revoked when an
+    /// owner removes them from the people).
+    pub fn owned_by(&self, owner: PrivateChat) -> Vec<String> {
+        self.lock()
+            .devices
+            .iter()
+            .filter(|device| device.owner == Some(owner))
+            .map(|device| device.id.clone())
+            .collect()
+    }
+
     /// The name of device `id`.
     pub fn name(&self, id: &str) -> Option<String> {
         self.lock()
@@ -963,6 +974,27 @@ mod tests {
         assert_eq!(reopened.owner(&joined.id), Some(owner));
         let shown = format!("{:?}", reopened.0.inner.lock().unwrap().devices);
         assert!(!shown.contains("7319402518"), "{shown}");
+    }
+
+    /// TASK-081: the devices of one owner, none of anyone else.
+    #[test]
+    fn the_devices_of_an_owner_are_listed() {
+        let dir = TempDir::new("devices-owned");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let enroll = |name: &str| {
+            let code = devices.mint_code().unwrap();
+            devices.join(&code, name).unwrap().id
+        };
+        let (first, second, third) = (enroll("a"), enroll("b"), enroll("c"));
+        let anna = PrivateChat::of_user(7);
+        let boris = PrivateChat::of_user(8);
+        assert!(devices.owned_by(anna).is_empty());
+        devices.set_owner(&first, anna).unwrap();
+        devices.set_owner(&third, anna).unwrap();
+        devices.set_owner(&second, boris).unwrap();
+        assert_eq!(devices.owned_by(anna), [first, third]);
+        assert_eq!(devices.owned_by(boris), [second]);
+        assert!(devices.owned_by(PrivateChat::of_user(9)).is_empty());
     }
 
     #[test]

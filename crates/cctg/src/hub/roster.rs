@@ -7,7 +7,9 @@
 //! («Да, отозвать» / «Отмена») on the same message, and the confirmation
 //! revokes the device at once ([`Devices::revoke`]) and edits the message
 //! back into the list. Only allowlisted users get here (the poll drops the
-//! rest). Logs carry device ids, never names, codes or secrets.
+//! rest), and only owners (`CCTG_ALLOWED_USER_IDS`) are served: a member
+//! added from the menu (TASK-081) is told so. Logs carry device ids, never
+//! names, codes or secrets.
 //!
 //! `/join` answers with `curl .../<release>/install.sh | sh -s -- <hub
 //! address> [--pin <sha256>] --join <code>`; the address and pin say how
@@ -29,7 +31,7 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use super::chat::{Chat, MessageKey, PrivateChat};
-use super::config::PublicAddrs;
+use super::config::{Allowlist, PublicAddrs};
 use super::devices::{CODE_TTL, Devices, Listed, MAX_CODES, MintError, SharedState, code_key};
 use super::scheduler::{Op, Outbox, Outcome};
 use super::updates::{CallbackInput, Inbound};
@@ -54,6 +56,8 @@ const AGENT_PORT: u16 = 47291;
 const HOOK_PORT: u16 = 47292;
 /// What the `/join` message says once its code expired.
 pub const EXPIRED: &str = "Код из этого сообщения истёк. Новый: /join.";
+/// The answer to a member's `/join`, `/devices` or press (TASK-081).
+pub const OWNERS_ONLY: &str = "Подключать и отзывать устройства может только владелец.";
 
 /// What the `/join` message says once a device took its code.
 fn used_text(id: &str, name: &str) -> String {
@@ -255,6 +259,7 @@ pub async fn serve(
     devices: Devices,
     join: JoinInfo,
     bot_username: Option<String>,
+    allowlist: Allowlist,
 ) {
     let mut spent = devices.spent();
     // Code key -> the `/join` message, when its code expires and who asked
@@ -269,6 +274,21 @@ pub async fn serve(
                 None => inputs_open = false,
                 Some(Input::Command(input)) => {
                     if addressed_elsewhere(input.text.as_deref(), bot_username.as_deref()) {
+                        continue;
+                    }
+                    if !allowlist.is_owner(input.sender.expose()) {
+                        let refusal = Op::Send {
+                            chat: input.chat,
+                            thread_id: None,
+                            text: OWNERS_ONLY.to_owned(),
+                            html: None,
+                            rich: None,
+                            reply_markup: None,
+                            permission: false,
+                            reply_to: None,
+                            notify: false,
+                        };
+                        submit(&outbox, refusal).await;
                         continue;
                     }
                     if command_name(&input) == Some("join") {
@@ -287,6 +307,13 @@ pub async fn serve(
                         },
                     )
                     .await;
+                }
+                Some(Input::Press(press)) if !allowlist.is_owner(press.sender.expose()) => {
+                    let answer = Op::AnswerCallback {
+                        query_id: press.query_id,
+                        text: Some(OWNERS_ONLY.to_owned()),
+                    };
+                    submit(&outbox, answer).await;
                 }
                 Some(Input::Press(press)) => on_press(&outbox, &devices, press).await,
             },
@@ -626,7 +653,19 @@ mod tests {
             thread_id: None,
             from_name: Some("Иван".into()),
             display_name: None,
+            sender: PrivateChat::of_user(OWNER),
         }
+    }
+
+    /// The owner of these tests (`CCTG_ALLOWED_USER_IDS`); [`MEMBER`] was
+    /// added from the menu (TASK-081).
+    const OWNER: i64 = 1001;
+    const MEMBER: i64 = 3003;
+
+    fn allowlist() -> Allowlist {
+        let allowlist: Allowlist = [OWNER].into_iter().collect();
+        allowlist.set_members([PrivateChat::of_user(MEMBER)]);
+        allowlist
     }
 
     async fn run(devices: &Devices, inputs: Vec<Input>) -> Vec<Op> {
@@ -644,6 +683,7 @@ mod tests {
             devices.clone(),
             join_info(),
             Some("cctg_bot".into()),
+            allowlist(),
         )
         .await;
         scheduler.await.unwrap();
@@ -975,6 +1015,7 @@ mod tests {
             devices.clone(),
             join_info(),
             Some("cctg_bot".into()),
+            allowlist(),
         ));
         let ops = || fake.0.lock().unwrap().clone();
         let started = Instant::now();
@@ -1038,6 +1079,74 @@ mod tests {
             .find(|entry| entry.name == "side box")
             .unwrap();
         assert_eq!(devices.owner(&side_box.id), None);
+    }
+
+    /// TASK-081: a member's `/join` and `/devices` get one refusal and no
+    /// code; their press revokes nothing, also under an owner's list.
+    #[tokio::test(start_paused = true)]
+    async fn only_owners_join_and_revoke_devices() {
+        let dir = TempDir::new("roster-owners");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let (id, _) = enroll(&dir, &devices, "laptop");
+        let member = PrivateChat::of_user(MEMBER);
+        let by_member = |text: &str| Inbound {
+            sender: member,
+            ..command(text, None)
+        };
+        let member_press = |data: &str| CallbackInput {
+            sender: member,
+            ..press(data)
+        };
+        let codes = || {
+            std::fs::read_dir(dir.path().join("join"))
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        };
+        let before = codes();
+        let ops = run(
+            &devices,
+            vec![
+                Input::Command(by_member("/join")),
+                Input::Command(by_member("/devices")),
+                Input::Press(member_press(&format!("dev:r:{id}"))),
+                Input::Press(member_press(&format!("dev:y:{id}"))),
+            ],
+        )
+        .await;
+        assert_eq!(codes(), before, "no code minted");
+        assert!(devices.name(&id).is_some(), "not revoked");
+        let sends: Vec<&String> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Send {
+                    text,
+                    thread_id: None,
+                    reply_markup: None,
+                    ..
+                } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sends, [OWNERS_ONLY, OWNERS_ONLY], "{ops:?}");
+        let answers: Vec<Option<String>> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::AnswerCallback { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [Some(OWNERS_ONLY.to_owned()), Some(OWNERS_ONLY.to_owned())]
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::Edit { .. })),
+            "{ops:?}"
+        );
+
+        // The owner as before.
+        let ops = run(&devices, vec![Input::Press(press(&format!("dev:y:{id}")))]).await;
+        assert!(devices.name(&id).is_none(), "{ops:?}");
     }
 
     #[tokio::test(start_paused = true)]

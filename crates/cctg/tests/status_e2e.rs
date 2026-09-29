@@ -436,6 +436,7 @@ impl Hub {
                 thread_id: None,
                 from_name: None,
                 display_name: None,
+                sender: cctg::hub::chat::PrivateChat::of_user(1001),
             }))
             .unwrap();
     }

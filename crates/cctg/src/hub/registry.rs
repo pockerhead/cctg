@@ -30,7 +30,9 @@
 //! its topic in [`Registry::unshared`] until Telegram deleted it.
 //!
 //! Each person's menu in their private chat and their settings for it
-//! (TASK-073) are kept in [`Registry::people`], by private chat.
+//! (TASK-073) are kept in [`Registry::people`], by private chat. The people
+//! owners added to the allowlist from the menu (TASK-081) are
+//! [`Registry::members`].
 //!
 //! Paths, folder names and titles are private: nothing here logs them.
 
@@ -47,6 +49,7 @@ use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::groups::{DEFAULT_GROUP_TITLE, Group, fallback_title};
 use super::mention::Backlog;
 use super::menu::Person;
+use super::people::Member;
 use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
 
@@ -767,6 +770,14 @@ pub struct Registry {
     /// (TASK-073).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub people: Vec<Person>,
+    /// The people owners added to the allowlist from the menu (TASK-081),
+    /// in the order they were added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<Member>,
+    /// The last member key given (TASK-081 review): keys are never given
+    /// twice, so a 🗑 drawn before a removal never hits the next person.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_keys: u32,
     /// The groups the hub knows (TASK-069), the default one among them
     /// once a hub loaded the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -775,6 +786,10 @@ pub struct Registry {
     /// registry no hub loaded (unit tests) has [`unset_group`].
     #[serde(skip, default = "unset_group")]
     pub default_group: GroupChat,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// The default group of a registry no hub loaded: 0 is no Telegram chat id.
@@ -855,6 +870,8 @@ impl Default for Registry {
             twins: Vec::new(),
             unshared: Vec::new(),
             people: Vec::new(),
+            members: Vec::new(),
+            member_keys: 0,
             groups: Vec::new(),
             default_group: unset_group(),
         }
@@ -893,6 +910,48 @@ impl Registry {
             }
         };
         &mut self.people[at]
+    }
+
+    /// The member of private chat `chat` (TASK-081).
+    pub fn member(&self, chat: PrivateChat) -> Option<&Member> {
+        self.members.iter().find(|member| member.chat == chat)
+    }
+
+    /// Adds a member; its key is one past every key given before (1 for
+    /// the first), a removed member's too. The caller checks that `chat` is
+    /// no member yet.
+    pub fn add_member(&mut self, chat: PrivateChat, name: String, username: Option<String>) -> u32 {
+        let key = self
+            .members
+            .iter()
+            .map(|member| member.key)
+            .fold(self.member_keys, u32::max)
+            .saturating_add(1);
+        self.member_keys = key;
+        self.members.push(Member {
+            chat,
+            name,
+            username,
+            key,
+        });
+        self.dirty = true;
+        key
+    }
+
+    /// Removes the member with `key`.
+    pub fn remove_member(&mut self, key: u32) -> Option<Member> {
+        let at = self.members.iter().position(|member| member.key == key)?;
+        self.dirty = true;
+        Some(self.members.remove(at))
+    }
+
+    /// Keeps the members `keep` takes.
+    pub fn retain_members(&mut self, mut keep: impl FnMut(&Member) -> bool) {
+        let before = self.members.len();
+        self.members.retain(|member| keep(member));
+        if self.members.len() != before {
+            self.dirty = true;
+        }
     }
 
     /// The caller sets [`Registry::dirty`] when it changes a saved field.
@@ -3092,6 +3151,61 @@ mod tests {
         assert_eq!(loaded.people, registry.people);
         assert_eq!(loaded.person(anna).unwrap().menu, Some(41));
         assert_eq!(loaded.person(boris).unwrap().settings, Settings::default());
+    }
+
+    /// TASK-081: the members survive `registry.json` in version 3; a file
+    /// without them loads with none and none write nothing; keys grow.
+    #[test]
+    fn members_round_trip_and_keys_grow() {
+        let dir = TempDir::new("registry-members");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let (mut registry, _, _) = private_slot();
+        let plain = String::from_utf8(RegistryStore::encode(&registry)).unwrap();
+        assert!(!plain.contains("members"), "{plain}");
+        store.save(plain.as_bytes()).unwrap();
+        assert!(store.load(GroupChat::UNIT).unwrap().members.is_empty());
+
+        let anna = PrivateChat::of_user(7);
+        let boris = PrivateChat::of_user(8);
+        registry.dirty = false;
+        assert_eq!(
+            registry.add_member(anna, "Анна".into(), Some("anna".into())),
+            1
+        );
+        assert!(registry.dirty);
+        assert_eq!(registry.add_member(boris, "Борис".into(), None), 2);
+        registry.dirty = false;
+        assert_eq!(
+            registry.remove_member(2).map(|member| member.chat),
+            Some(boris)
+        );
+        assert!(registry.dirty);
+        assert!(registry.remove_member(2).is_none());
+        assert_eq!(
+            registry.add_member(boris, "Борис".into(), None),
+            3,
+            "a removed member's key is never given again"
+        );
+        registry.dirty = false;
+        registry.retain_members(|_| true);
+        assert!(!registry.dirty, "nothing went");
+        assert_eq!(registry.member(anna).map(|member| member.key), Some(1));
+
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
+        assert_eq!(loaded.version, VERSION);
+        assert_eq!(loaded.members, registry.members);
+        assert_eq!(
+            loaded.member(anna).unwrap().username.as_deref(),
+            Some("anna")
+        );
+
+        let mut loaded = loaded;
+        loaded.retain_members(|member| member.chat != anna);
+        assert!(loaded.dirty && loaded.member(anna).is_none());
+        // The counter is saved: with nobody left the next key is still new.
+        loaded.retain_members(|_| false);
+        assert_eq!(loaded.add_member(anna, "Анна".into(), None), 4);
     }
 
     #[test]

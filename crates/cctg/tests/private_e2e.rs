@@ -781,6 +781,7 @@ impl Hub {
                 thread_id: None,
                 from_name: None,
                 display_name: Some(NAME.into()),
+                sender: PrivateChat::of_user(OWNER),
             }))
             .unwrap();
     }
@@ -827,6 +828,7 @@ impl Hub {
                 thread_id: self.fake.topic(chat),
                 from_name: None,
                 display_name: Some(NAME.into()),
+                sender: PrivateChat::of_user(OWNER),
             }))
             .unwrap();
     }
@@ -3061,6 +3063,7 @@ impl Hub {
                     ..ChatMember::default()
                 },
                 by_allowed,
+                by: by_allowed.then(|| PrivateChat::of_user(OWNER)),
             }))
             .unwrap();
     }
@@ -3360,6 +3363,7 @@ async fn e2e_groups_connect_tells_what_is_missing() {
             is_forum: false,
             thread_id: None,
             target: Some(BOT.to_uppercase()),
+            sender: PrivateChat::of_user(OWNER),
         }))
         .unwrap();
     hub.until("the answer in the group", |fake| {

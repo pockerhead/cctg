@@ -1259,6 +1259,7 @@ impl Soak {
                 thread_id: None,
                 from_name: None,
                 display_name: None,
+                sender: cctg::hub::chat::PrivateChat::of_user(FAKE_USER),
             }));
             return;
         }
