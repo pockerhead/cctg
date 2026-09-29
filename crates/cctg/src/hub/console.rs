@@ -50,7 +50,8 @@ pub fn invalid_notice(why: keys::Untypable) -> String {
             "в ней эмодзи или другой символ, который не набрать одной клавишей".to_owned()
         }
         keys::Untypable::TooLong { chars } => format!(
-            "в ней {chars} символов, а можно не больше {}",
+            "в ней {chars} {}, а можно не больше {}",
+            symbols(chars),
             keys::MAX_LINE_CHARS
         ),
     };
@@ -61,9 +62,19 @@ pub fn invalid_notice(why: keys::Untypable) -> String {
 /// hub, [`OLD_AGENT_LINE_CHARS`]): refused before it is sent.
 pub fn old_agent_notice(chars: usize, limit: usize) -> String {
     format!(
-        "Команда для терминала не набрана: в ней {chars} символов, а клиент cctg этой сессии \
-         набирает не больше {limit}. Обновите его (⬆️ Обновить) или сократите команду."
+        "Команда для терминала не набрана: в ней {chars} {}, а клиент cctg этой сессии \
+         набирает не больше {limit}. Обновите его (⬆️ Обновить) или сократите команду.",
+        symbols(chars)
     )
+}
+
+/// Russian plural of «символ» after `n`.
+fn symbols(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, 11) | (_, 12..=14) | (5..=9 | 0, _) => "символов",
+        (1, _) => "символ",
+        _ => "символа",
+    }
 }
 
 pub const OFFLINE_NOTICE: &str = "Команда для терминала не набрана: сессия не на связи.";
@@ -130,6 +141,21 @@ fn is_bot_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_too_long_refusal_counts_characters_in_russian() {
+        for (n, word) in [
+            (751, "символ,"),
+            (752, "символа,"),
+            (755, "символов,"),
+            (811, "символов,"),
+            (1000, "символов,"),
+        ] {
+            let told = invalid_notice(keys::Untypable::TooLong { chars: n });
+            assert!(told.contains(&format!("{n} {word}")), "{told}");
+            assert!(old_agent_notice(n, 200).contains(&format!("{n} {word}")));
+        }
+    }
 
     #[test]
     fn bang_and_slash_commands_are_typed_and_the_rest_is_a_message() {
