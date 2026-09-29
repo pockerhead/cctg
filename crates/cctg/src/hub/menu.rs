@@ -26,6 +26,11 @@
 //! to the allowlist ([`super::people`]), a remove button each (asking once
 //! more) and the invite link button.
 //!
+//! TASK-074: an owner's menu also has «💻 Устройства» (the hub's devices
+//! with their owners, a revoke button each, asking once more, and the
+//! install line of `/join`) and «🛠 Hub» (version, uptime, sessions, 429s
+//! and the cleanup of the topics of long dead slots).
+//!
 //! This module is pure: data, rendering and the press codes. The slot actor
 //! sends, pins and edits.
 
@@ -33,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::chat::PrivateChat;
+use super::devices::CODE_TTL;
 use super::people;
 use super::registry::cut;
 
@@ -58,6 +64,12 @@ pub const ANSWER_NOT_YOURS: &str = "Это не ваша сессия";
 pub const ANSWER_PRIVATE_ONLY: &str = "Меню работает в личке с ботом";
 pub const ANSWER_ALL_CURRENT: &str = "Все клиенты уже обновлены";
 pub const ANSWER_STALE_MENU: &str = "Это меню устарело: /menu";
+/// The answer to a member's press of an owner's tab (TASK-074).
+pub const ANSWER_OWNER_ONLY: &str = "Это может только владелец";
+
+/// The ages a cleanup offers, in days (TASK-074); 0 is «dead now».
+pub const CLEANUP_DAYS: [u16; 5] = [0, 1, 7, 30, 90];
+pub const DEFAULT_CLEANUP_DAYS: u16 = 30;
 
 /// The answer to ↗: the topic of `title` moved to the top of the list.
 pub fn lifted(title: &str) -> String {
@@ -433,7 +445,15 @@ pub fn change(
         | MenuPress::RemoveConfirm { .. }
         | MenuPress::Invite
         | MenuPress::AddYes { .. }
-        | MenuPress::AddNo { .. } => return Err((Page::Sessions(0), ANSWER_UNCHANGED)),
+        | MenuPress::AddNo { .. }
+        | MenuPress::Devices
+        | MenuPress::DeviceRevoke { .. }
+        | MenuPress::DeviceRevokeConfirm { .. }
+        | MenuPress::DeviceAdd
+        | MenuPress::Hub
+        | MenuPress::CleanupDays(_)
+        | MenuPress::Cleanup { .. }
+        | MenuPress::CleanupConfirm { .. } => return Err((Page::Sessions(0), ANSWER_UNCHANGED)),
     };
     Ok((new, page))
 }
@@ -548,6 +568,32 @@ pub enum MenuPress {
     AddNo {
         token: u32,
     },
+    /// The devices tab (TASK-074), an owner's only.
+    Devices,
+    /// 🗑 of device `id` (its 8 hex digits as a number): asks once more.
+    DeviceRevoke {
+        id: u32,
+    },
+    /// «точно?» of device `id`: revokes it.
+    DeviceRevokeConfirm {
+        id: u32,
+    },
+    /// ➕: the install line of `/join`, as a message of its own.
+    DeviceAdd,
+    /// The hub tab (TASK-074), an owner's only.
+    Hub,
+    /// The age of a cleanup, one of [`CLEANUP_DAYS`].
+    CleanupDays(u16),
+    /// 🧹 of a cleanup of `days` that counted `topics`: asks once more.
+    Cleanup {
+        days: u16,
+        topics: u32,
+    },
+    /// «точно?» of that cleanup: it starts, when it still counts `topics`.
+    CleanupConfirm {
+        days: u16,
+        topics: u32,
+    },
 }
 
 impl MenuPress {
@@ -561,7 +607,27 @@ impl MenuPress {
                 | Self::Sound
                 | Self::Zone { .. }
                 | Self::People
+                | Self::Devices
+                | Self::Hub
+                | Self::CleanupDays(_)
         )
+    }
+
+    /// A press of an owner's tab (TASK-081 people, TASK-074 devices and
+    /// hub): an owner's only.
+    pub fn owners_only(self) -> bool {
+        self.manages_people()
+            || matches!(
+                self,
+                Self::Devices
+                    | Self::DeviceRevoke { .. }
+                    | Self::DeviceRevokeConfirm { .. }
+                    | Self::DeviceAdd
+                    | Self::Hub
+                    | Self::CleanupDays(_)
+                    | Self::Cleanup { .. }
+                    | Self::CleanupConfirm { .. }
+            )
     }
 
     /// A press about the members (TASK-081): an owner's only.
@@ -631,8 +697,31 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::Invite => "pi".to_owned(),
         MenuPress::AddYes { token } => format!("pa:{token}"),
         MenuPress::AddNo { token } => format!("pn:{token}"),
+        MenuPress::Devices => "dv".to_owned(),
+        MenuPress::DeviceRevoke { id } => format!("dr:{id:08x}"),
+        MenuPress::DeviceRevokeConfirm { id } => format!("drc:{id:08x}"),
+        MenuPress::DeviceAdd => "da".to_owned(),
+        MenuPress::Hub => "hb".to_owned(),
+        MenuPress::CleanupDays(days) => format!("hd:{days}"),
+        MenuPress::Cleanup { days, topics } => format!("hx:{days}:{topics}"),
+        MenuPress::CleanupConfirm { days, topics } => format!("hxc:{days}:{topics}"),
     };
     format!("{PREFIX}{rest}")
+}
+
+/// A device id of callback data: exactly 8 lowercase hex digits, as
+/// `devices.json` has them.
+fn device_number(text: &str) -> Option<u32> {
+    let hex = text.len() == 8
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    hex.then(|| u32::from_str_radix(text, 16).ok()).flatten()
+}
+
+/// A cleanup age of callback data: one of [`CLEANUP_DAYS`].
+fn cleanup_days(text: &str) -> Option<u16> {
+    text.parse().ok().filter(|days| CLEANUP_DAYS.contains(days))
 }
 
 /// The press of callback data `data`; `None` when it is no menu press.
@@ -649,6 +738,15 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ["n"] => MenuPress::Sound,
         ["z", "0"] => MenuPress::Zone { fractions: false },
         ["z", "1"] => MenuPress::Zone { fractions: true },
+        // Before the slot buttons: that arm refuses any other three parts.
+        ["hx", days, topics] => MenuPress::Cleanup {
+            days: cleanup_days(days)?,
+            topics: number(topics)?,
+        },
+        ["hxc", days, topics] => MenuPress::CleanupConfirm {
+            days: cleanup_days(days)?,
+            topics: number(topics)?,
+        },
         [code, page, slot] => MenuPress::Slot {
             action: SlotAction::ALL
                 .into_iter()
@@ -712,6 +810,16 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ["pn", token] => MenuPress::AddNo {
             token: number(token)?,
         },
+        ["dv"] => MenuPress::Devices,
+        ["dr", id] => MenuPress::DeviceRevoke {
+            id: device_number(id)?,
+        },
+        ["drc", id] => MenuPress::DeviceRevokeConfirm {
+            id: device_number(id)?,
+        },
+        ["da"] => MenuPress::DeviceAdd,
+        ["hb"] => MenuPress::Hub,
+        ["hd", days] => MenuPress::CleanupDays(cleanup_days(days)?),
         _ => return None,
     })
 }
@@ -813,6 +921,76 @@ pub enum Page {
     },
     /// The people tab (TASK-081).
     People,
+    /// The devices tab (TASK-074).
+    Devices,
+    /// The hub tab (TASK-074).
+    Hub,
+}
+
+/// A device in the devices tab (TASK-074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    /// Its 8 hex digits as a number.
+    pub id: u32,
+    pub name: String,
+    /// Who owns it, as words («ваше», a member's name, ...).
+    pub owner: String,
+    /// `YYYY-MM-DD` of its join.
+    pub joined: String,
+    /// When its secret was last taken, as words.
+    pub seen: String,
+    /// Its 🗑 asks for its second press.
+    pub confirm: bool,
+}
+
+/// The devices tab of an owner (TASK-074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicesView {
+    pub rows: Vec<DeviceRow>,
+    /// What `/devices` says about the shared secret.
+    pub shared: String,
+}
+
+/// The hub tab of an owner (TASK-074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubView {
+    /// The release tag, or words for a local build.
+    pub release: String,
+    /// The short build id.
+    pub build: String,
+    /// When the hub started, UTC.
+    pub started: String,
+    pub uptime: String,
+    /// Slots with a live session and dead ones not archived.
+    pub live: usize,
+    pub ended: usize,
+    /// Topics of every slot's views.
+    pub topics: usize,
+    pub devices: usize,
+    /// 429 answers of the last day, or since the start when `!floods_day`.
+    pub floods: usize,
+    pub floods_day: bool,
+    /// The chosen age of the cleanup, one of [`CLEANUP_DAYS`].
+    pub days: u16,
+    /// What that cleanup would take: slots, topics to delete, and topics
+    /// the bot cannot delete, which stay.
+    pub slots: usize,
+    pub clean: u32,
+    pub kept: usize,
+    /// Its 🧹 asks for its second press.
+    pub armed: bool,
+    /// Topics a cleanup still has to delete, and those it deleted or could
+    /// not delete since the hub started.
+    pub left: usize,
+    pub done: usize,
+    pub failed: usize,
+}
+
+/// The devices or hub tab of an owner (TASK-074).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerPage {
+    Devices(DevicesView),
+    Hub(HubView),
 }
 
 /// The people tab of an owner (TASK-081).
@@ -893,17 +1071,22 @@ fn clock(unix_secs: i64, tz: i16) -> String {
 
 /// The text and keyboard of `page` for a person with `settings`;
 /// `sessions` is the sessions tab's page (`None` shows it empty); `people`
-/// the people tab of an owner (`None`: no such tab, and its page shows the
-/// sessions tab).
+/// the people tab of an owner (`None`: no owner's tabs, and their pages
+/// show the sessions tab); `owner_page` the devices or hub tab of an owner
+/// (TASK-074; missing for its page: the sessions tab).
 pub fn render(
     page: &Page,
     settings: &Settings,
     sessions: Option<&SessionsView>,
     people: Option<&PeopleView>,
+    owner_page: Option<&OwnerPage>,
     unix_secs: i64,
 ) -> (String, Value) {
-    let page = match (page, people) {
-        (Page::People, None) => &Page::Sessions(0),
+    let owner_page = owner_page.filter(|_| people.is_some());
+    let page = match (page, people, owner_page) {
+        (Page::People, None, _)
+        | (Page::Devices, _, None | Some(OwnerPage::Hub(_)))
+        | (Page::Hub, _, None | Some(OwnerPage::Devices(_))) => &Page::Sessions(0),
         _ => page,
     };
     let tab = |label: &str, current: bool, press: MenuPress| {
@@ -931,20 +1114,29 @@ pub fn render(
             MenuPress::Sound,
         ),
     ]];
+    // The owner's tabs, a row of their own (TASK-074).
     if people.is_some() {
-        rows[0].push(tab(
-            "👥 Люди",
-            matches!(page, Page::People),
-            MenuPress::People,
-        ));
+        rows.push(vec![
+            tab("👥 Люди", matches!(page, Page::People), MenuPress::People),
+            tab(
+                "💻 Устройства",
+                matches!(page, Page::Devices),
+                MenuPress::Devices,
+            ),
+            tab("🛠 Hub", matches!(page, Page::Hub), MenuPress::Hub),
+        ]);
     }
-    let text = match (page, people) {
-        (Page::Sessions(_), _) | (Page::People, None) => render_sessions(sessions, &mut rows),
-        (Page::Display, _) => render_display(settings, &mut rows),
-        (Page::GroupDisplay, _) => render_group_display(settings, &mut rows),
-        (Page::Sound, _) => render_sound(settings, &mut rows),
-        (Page::Zone { fractions }, _) => render_zone(*fractions, unix_secs, &mut rows),
-        (Page::People, Some(view)) => render_people(view, &mut rows),
+    let text = match (page, people, owner_page) {
+        (Page::People, Some(view), _) => render_people(view, &mut rows),
+        (Page::Devices, _, Some(OwnerPage::Devices(view))) => render_devices(view, &mut rows),
+        (Page::Hub, _, Some(OwnerPage::Hub(view))) => render_hub(view, &mut rows),
+        (Page::Display, ..) => render_display(settings, &mut rows),
+        (Page::GroupDisplay, ..) => render_group_display(settings, &mut rows),
+        (Page::Sound, ..) => render_sound(settings, &mut rows),
+        (Page::Zone { fractions }, ..) => render_zone(*fractions, unix_secs, &mut rows),
+        (Page::Sessions(_) | Page::People | Page::Devices | Page::Hub, ..) => {
+            render_sessions(sessions, &mut rows)
+        }
     };
     (
         cut(&text, transcript::TELEGRAM_TEXT_LIMIT),
@@ -1229,6 +1421,135 @@ fn render_people(view: &PeopleView, rows: &mut Vec<Vec<Value>>) -> String {
     text
 }
 
+/// A device's name on a button, at most (UTF-16 units).
+const DEVICE_BUTTON_LIMIT: usize = 40;
+
+fn render_devices(view: &DevicesView, rows: &mut Vec<Vec<Value>>) -> String {
+    let mut text = if view.rows.is_empty() {
+        "Устройства\n\nСвоих секретов у устройств пока нет.".to_owned()
+    } else {
+        format!("Устройства ({}):", view.rows.len())
+    };
+    // Not `device`: the hub's file guard (tests/hub_reads_no_files.rs)
+    // forbids that name, the crate's module.
+    for (index, machine) in view.rows.iter().enumerate() {
+        text.push_str(&format!(
+            "\n{}. {} · {:08x} · с {} · {} · {}",
+            index + 1,
+            machine.name,
+            machine.id,
+            machine.joined,
+            machine.seen,
+            machine.owner,
+        ));
+        let name = cut(&machine.name, DEVICE_BUTTON_LIMIT);
+        rows.push(vec![if machine.confirm {
+            button(
+                format!("🗑 {name} — точно?"),
+                MenuPress::DeviceRevokeConfirm { id: machine.id },
+            )
+        } else {
+            button(
+                format!("🗑 {name}"),
+                MenuPress::DeviceRevoke { id: machine.id },
+            )
+        }]);
+    }
+    text.push_str(&format!(
+        "\n\n{}\n\n\
+🗑 отзывает устройство: его агенты сразу теряют связь с hub, хуки больше не принимаются; вернуть его можно только новым кодом.\n\
+➕ присылает ниже отдельным сообщением строку установки с одноразовым кодом на {} минут; устройство с этим кодом будет вашим.",
+        view.shared,
+        CODE_TTL.as_secs() / 60
+    ));
+    rows.push(vec![
+        button("➕ Добавить устройство", MenuPress::DeviceAdd),
+        button("↻", MenuPress::Devices),
+    ]);
+    text
+}
+
+fn render_hub(view: &HubView, rows: &mut Vec<Vec<Value>>) -> String {
+    let floods = if view.floods_day {
+        format!("429 за сутки: {}", view.floods)
+    } else {
+        format!("429 с запуска: {}", view.floods)
+    };
+    let mut text = format!(
+        "Hub\n\n\
+Версия: {} (сборка {})\n\
+Запущен: {}, работает {}\n\
+Сессии: живых {}, завершённых {}\n\
+Темы: {}\n\
+Устройства: {}\n\
+{floods}\n\n\
+Уборка тем\n",
+        view.release,
+        view.build,
+        view.started,
+        view.uptime,
+        view.live,
+        view.ended,
+        view.topics,
+        view.devices,
+    );
+    if view.days == 0 {
+        text.push_str("Мёртвые сейчас (дольше минуты)");
+    } else {
+        text.push_str(&format!("Завершены больше {} дн. назад", view.days));
+    }
+    text.push_str(&format!(": слотов {}, тем {}", view.slots, view.clean));
+    if view.kept > 0 {
+        text.push_str(&format!(
+            "\nещё {} тем бот удалить не может, они останутся как есть",
+            view.kept
+        ));
+    }
+    if view.left > 0 || view.done + view.failed > 0 {
+        text.push_str(&format!(
+            "\nУборка: осталось {}, удалено {}, не удалось {}",
+            view.left, view.done, view.failed
+        ));
+    }
+    text.push_str(
+        "\n\nУборка общая на весь hub: темы всех людей, в личках и в группах; делают её только владельцы. \
+Тема удаляется со всеми сообщениями. Слоты с сообщениями, ждущими Resume, и с открытым запросом разрешения или вопросом не трогаются. \
+Следующая сессия той же папки получит новую тему. \
+Возраст считается с того момента, когда hub увидел сессию завершённой; завершённые до этой версии hub считаются с обновления.",
+    );
+    rows.push(
+        CLEANUP_DAYS
+            .into_iter()
+            .map(|days| {
+                let label = match days {
+                    0 => "сейчас".to_owned(),
+                    days => format!("{days} дн"),
+                };
+                button(
+                    radio(&label, days == view.days),
+                    MenuPress::CleanupDays(days),
+                )
+            })
+            .collect(),
+    );
+    if view.clean > 0 {
+        let (days, topics) = (view.days, view.clean);
+        rows.push(vec![if view.armed {
+            button(
+                format!("🧹 Удалить {topics} тем — точно?"),
+                MenuPress::CleanupConfirm { days, topics },
+            )
+        } else {
+            button(
+                format!("🧹 Удалить темы: {topics}"),
+                MenuPress::Cleanup { days, topics },
+            )
+        }]);
+    }
+    rows.push(vec![button("↻", MenuPress::Hub)]);
+    text
+}
+
 fn render_zone(fractions: bool, unix_secs: i64, rows: &mut Vec<Vec<Value>>) -> String {
     let mut zones: Vec<i16> = (-12..=14).map(|hours: i16| hours * 60).collect();
     if fractions {
@@ -1303,26 +1624,304 @@ mod tests {
     }
 
     fn all_pages(settings: &Settings, view: &SessionsView) -> Vec<(String, Value)> {
+        let devices = OwnerPage::Devices(devices_view());
+        let hubs = [hub_view(false), hub_view(true)].map(OwnerPage::Hub);
         [
-            Page::Sessions(view.page),
-            Page::Display,
-            Page::GroupDisplay,
-            Page::Sound,
-            Page::Zone { fractions: false },
-            Page::Zone { fractions: true },
-            Page::People,
+            (Page::Sessions(view.page), None),
+            (Page::Display, None),
+            (Page::GroupDisplay, None),
+            (Page::Sound, None),
+            (Page::Zone { fractions: false }, None),
+            (Page::Zone { fractions: true }, None),
+            (Page::People, None),
+            (Page::Devices, Some(&devices)),
+            (Page::Hub, Some(&hubs[0])),
+            (Page::Hub, Some(&hubs[1])),
         ]
         .iter()
-        .map(|page| {
+        .map(|(page, owner_page)| {
             render(
                 page,
                 settings,
                 Some(view),
                 Some(&people_view()),
+                *owner_page,
                 1_700_000_000,
             )
         })
         .collect()
+    }
+
+    /// 32 devices of the longest names, the one of `u32::MAX` asking for
+    /// its second press (TASK-074).
+    fn devices_view() -> DevicesView {
+        DevicesView {
+            rows: (0..32u32)
+                .map(|index| DeviceRow {
+                    id: if index == 31 { u32::MAX } else { index },
+                    name: "Ж".repeat(crate::hub::devices::NAME_LIMIT),
+                    owner: "владелец не записан".into(),
+                    joined: "2026-09-29".into(),
+                    seen: "последний вход 2 ч назад".into(),
+                    confirm: index == 31,
+                })
+                .collect(),
+            shared: "Общий секрет hub (CCTG_HUB_SECRET) отключён.".into(),
+        }
+    }
+
+    /// A hub whose cleanup of 90 days counts `u32::MAX` topics, armed or
+    /// not (TASK-074).
+    fn hub_view(armed: bool) -> HubView {
+        HubView {
+            release: "v0.1.27".into(),
+            build: "0123abcd".into(),
+            started: "2026-09-29 10:00 UTC".into(),
+            uptime: "3 ч 5 мин".into(),
+            live: 2,
+            ended: 5,
+            topics: 9,
+            devices: 3,
+            floods: 4,
+            floods_day: true,
+            days: 90,
+            slots: 3,
+            clean: u32::MAX,
+            kept: 1,
+            armed,
+            left: 2,
+            done: 1,
+            failed: 0,
+        }
+    }
+
+    /// TASK-074: the owner's tabs are a second row, only with the people
+    /// view; the devices and hub pages need their own view, else they are
+    /// the sessions page.
+    #[test]
+    fn the_owner_tabs_are_a_second_row() {
+        let settings = Settings::default();
+        let devices = OwnerPage::Devices(devices_view());
+        let hub = OwnerPage::Hub(hub_view(false));
+        let (_, keyboard) = render(&Page::Sound, &settings, None, None, None, 0);
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows[0].as_array().unwrap().len(), 3, "{keyboard}");
+        for absent in ["👥 Люди", "💻 Устройства", "🛠 Hub"] {
+            assert!(!labels(&keyboard).contains(&absent.to_owned()), "{absent}");
+        }
+        let (_, keyboard) = render(&Page::Sound, &settings, None, Some(&people_view()), None, 0);
+        let second: Vec<&str> = keyboard["inline_keyboard"][1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|button| button["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(second, ["👥 Люди", "💻 Устройства", "🛠 Hub"]);
+        // Without the people view (a member): the sessions page.
+        for (page, owner_page) in [(Page::Hub, &hub), (Page::Devices, &devices)] {
+            let (text, keyboard) = render(&page, &settings, None, None, Some(owner_page), 0);
+            assert!(text.starts_with("Сессии"), "{text}");
+            assert!(labels(&keyboard).contains(&"· 🗂 Сессии".to_owned()));
+        }
+        // A page without its own view: the sessions page too.
+        for (page, owner_page) in [
+            (Page::Hub, None),
+            (Page::Hub, Some(&devices)),
+            (Page::Devices, Some(&hub)),
+        ] {
+            let (text, _) = render(&page, &settings, None, Some(&people_view()), owner_page, 0);
+            assert!(text.starts_with("Сессии"), "{page:?}: {text}");
+        }
+        let (text, keyboard) = render(
+            &Page::Devices,
+            &settings,
+            None,
+            Some(&people_view()),
+            Some(&devices),
+            0,
+        );
+        assert!(text.starts_with("Устройства (32):"), "{text}");
+        assert!(transcript::telegram_len(&text) <= transcript::TELEGRAM_TEXT_LIMIT);
+        let shown = labels(&keyboard);
+        let pressed = datas(&keyboard);
+        assert!(shown.contains(&"· 💻 Устройства".to_owned()), "{shown:?}");
+        let at = shown
+            .iter()
+            .position(|label| label.ends_with("— точно?"))
+            .unwrap();
+        assert_eq!(pressed[at], "menu:drc:ffffffff");
+        let at = shown
+            .iter()
+            .position(|label| label.starts_with("🗑 "))
+            .unwrap();
+        assert_eq!(pressed[at], "menu:dr:00000000");
+        assert!(pressed.contains(&"menu:da".to_owned()));
+        assert!(pressed.contains(&"menu:dv".to_owned()));
+        let empty = OwnerPage::Devices(DevicesView {
+            rows: Vec::new(),
+            shared: "Общий секрет hub (CCTG_HUB_SECRET) отключён.".into(),
+        });
+        let (text, _) = render(
+            &Page::Devices,
+            &settings,
+            None,
+            Some(&people_view()),
+            Some(&empty),
+            0,
+        );
+        assert!(
+            text.contains("Своих секретов у устройств пока нет."),
+            "{text}"
+        );
+        assert!(text.contains("отключён"), "{text}");
+    }
+
+    /// TASK-074: the hub page shows its numbers, the chosen age, what the
+    /// cleanup takes, and asks once more before it starts.
+    #[test]
+    fn the_hub_page_counts_and_asks_before_the_cleanup() {
+        let settings = Settings::default();
+        let render_hub_page = |view: HubView| {
+            render(
+                &Page::Hub,
+                &settings,
+                None,
+                Some(&people_view()),
+                Some(&OwnerPage::Hub(view)),
+                0,
+            )
+        };
+        let (text, keyboard) = render_hub_page(HubView {
+            clean: 7,
+            ..hub_view(false)
+        });
+        for want in [
+            "Версия: v0.1.27 (сборка 0123abcd)",
+            "Сессии: живых 2, завершённых 5",
+            "429 за сутки: 4",
+            "Завершены больше 90 дн. назад: слотов 3, тем 7",
+            "ещё 1 тем бот удалить не может",
+            "Уборка: осталось 2, удалено 1, не удалось 0",
+            "общая на весь hub",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        let shown = labels(&keyboard);
+        let pressed = datas(&keyboard);
+        assert!(shown.contains(&"· 🛠 Hub".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"✅ 90 дн".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"сейчас".to_owned()), "{shown:?}");
+        let at = shown
+            .iter()
+            .position(|label| label.starts_with("🧹"))
+            .unwrap();
+        assert_eq!(shown[at], "🧹 Удалить темы: 7");
+        assert_eq!(pressed[at], "menu:hx:90:7");
+        assert!(pressed.contains(&"menu:hd:0".to_owned()));
+        assert!(pressed.contains(&"menu:hb".to_owned()));
+        let (_, keyboard) = render_hub_page(HubView {
+            clean: 7,
+            ..hub_view(true)
+        });
+        assert!(datas(&keyboard).contains(&"menu:hxc:90:7".to_owned()));
+        // Nothing to clean: no button; now, since the start, nothing done.
+        let (text, keyboard) = render_hub_page(HubView {
+            days: 0,
+            clean: 0,
+            slots: 0,
+            kept: 0,
+            left: 0,
+            done: 0,
+            failed: 0,
+            floods_day: false,
+            ..hub_view(false)
+        });
+        assert!(
+            text.contains("Мёртвые сейчас (дольше минуты): слотов 0, тем 0"),
+            "{text}"
+        );
+        assert!(text.contains("429 с запуска: 4"), "{text}");
+        assert!(!text.contains("бот удалить не может") && !text.contains("Уборка: осталось"));
+        assert!(
+            !labels(&keyboard)
+                .iter()
+                .any(|label| label.starts_with("🧹"))
+        );
+        assert!(labels(&keyboard).contains(&"✅ сейчас".to_owned()));
+    }
+
+    /// TASK-074: the new presses round-trip, only valid ids and ages parse,
+    /// the cleanup codes are not taken for a slot button, and every one of
+    /// them is an owner's and no setting.
+    #[test]
+    fn the_owner_presses_parse_strictly() {
+        for press in [
+            MenuPress::Devices,
+            MenuPress::DeviceRevoke { id: 0 },
+            MenuPress::DeviceRevokeConfirm { id: u32::MAX },
+            MenuPress::DeviceAdd,
+            MenuPress::Hub,
+            MenuPress::CleanupDays(0),
+            MenuPress::CleanupDays(90),
+            MenuPress::Cleanup {
+                days: 30,
+                topics: 7,
+            },
+            MenuPress::CleanupConfirm {
+                days: 0,
+                topics: u32::MAX,
+            },
+        ] {
+            assert_eq!(parse_callback(&data(&press)), Some(press), "{press:?}");
+            assert!(press.owners_only(), "{press:?}");
+            assert!(change(&Settings::default(), press).is_err(), "{press:?}");
+        }
+        assert_eq!(
+            parse_callback("menu:dr:0123abcd"),
+            Some(MenuPress::DeviceRevoke { id: 0x0123_abcd })
+        );
+        assert_eq!(
+            parse_callback("menu:hx:30:7"),
+            Some(MenuPress::Cleanup {
+                days: 30,
+                topics: 7
+            })
+        );
+        assert_eq!(
+            parse_callback("menu:hxc:0:1"),
+            Some(MenuPress::CleanupConfirm { days: 0, topics: 1 })
+        );
+        for junk in [
+            "menu:dr:ABCDEF12",
+            "menu:dr:123",
+            "menu:dr:0123abcde",
+            "menu:drc:+123abcd",
+            "menu:hd:5",
+            "menu:hd",
+            "menu:hx:30",
+            "menu:hxc:30:x",
+            "menu:hx:2:7",
+            "menu:hx:30:-1",
+            "menu:dv:1",
+            "menu:hb:1",
+        ] {
+            assert_eq!(parse_callback(junk), None, "{junk}");
+        }
+        assert!(MenuPress::Devices.navigates());
+        assert!(MenuPress::Hub.navigates());
+        assert!(MenuPress::CleanupDays(1).navigates());
+        assert!(!MenuPress::DeviceAdd.navigates());
+        assert!(!MenuPress::Cleanup { days: 1, topics: 1 }.navigates());
+        assert!(MenuPress::People.owners_only());
+        assert!(!MenuPress::Sound.owners_only());
+        assert!(
+            !MenuPress::Slot {
+                action: SlotAction::Open,
+                page: 0,
+                slot: 0
+            }
+            .owners_only()
+        );
     }
 
     /// Two members, the second asking for its second press (TASK-081).
@@ -1351,7 +1950,7 @@ mod tests {
     /// proposal's buttons.
     #[test]
     fn the_people_tab_lists_members_with_their_buttons() {
-        let (text, keyboard) = render(&Page::People, &Settings::default(), None, None, 0);
+        let (text, keyboard) = render(&Page::People, &Settings::default(), None, None, None, 0);
         assert!(text.starts_with("Сессии"), "no tab, the sessions: {text}");
         assert!(!labels(&keyboard).iter().any(|label| label.contains("Люди")));
         assert!(!datas(&keyboard).contains(&"menu:pp".to_owned()));
@@ -1361,6 +1960,7 @@ mod tests {
             &Settings::default(),
             None,
             Some(&people_view()),
+            None,
             0,
         );
         assert!(labels(&keyboard).contains(&"👥 Люди".to_owned()));
@@ -1370,6 +1970,7 @@ mod tests {
             &Settings::default(),
             None,
             Some(&people_view()),
+            None,
             0,
         );
         assert!(text.starts_with("Люди"), "{text}");
@@ -1395,7 +1996,14 @@ mod tests {
             members: Vec::new(),
             invite: false,
         };
-        let (text, keyboard) = render(&Page::People, &Settings::default(), None, Some(&alone), 0);
+        let (text, keyboard) = render(
+            &Page::People,
+            &Settings::default(),
+            None,
+            Some(&alone),
+            None,
+            0,
+        );
         assert!(text.contains("Участники: пока никого."), "{text}");
         assert!(!datas(&keyboard).contains(&"menu:pi".to_owned()));
 
@@ -1683,6 +2291,7 @@ mod tests {
             &Settings::default(),
             Some(&first),
             None,
+            None,
             0,
         );
         assert!(text.starts_with("Сессии (стр. 1/2)"), "{text}");
@@ -1732,6 +2341,7 @@ mod tests {
             &Settings::default(),
             Some(&last),
             None,
+            None,
             0,
         );
         assert!(text.starts_with("Сессии (стр. 2/2)"), "{text}");
@@ -1741,7 +2351,14 @@ mod tests {
         assert!(labels.contains(&"🙈 1".to_owned()));
         assert!(labels.contains(&"⬆️ Обновить все клиенты".to_owned()));
         // None at all.
-        let (text, _) = render(&Page::Sessions(0), &Settings::default(), None, None, 0);
+        let (text, _) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            None,
+            None,
+            None,
+            0,
+        );
         assert!(text.ends_with("Сессий пока нет."), "{text}");
     }
 
@@ -1752,6 +2369,7 @@ mod tests {
         let (text, keyboard) = render(
             &Page::Zone { fractions: false },
             &Settings::default(),
+            None,
             None,
             None,
             now,
@@ -1772,6 +2390,7 @@ mod tests {
             &Settings::default(),
             None,
             None,
+            None,
             now,
         );
         let labels = super::tests::labels(&keyboard);
@@ -1787,7 +2406,7 @@ mod tests {
             quiet: Some(Quiet { from: 23, to: 8 }),
             ..Settings::default()
         };
-        let (_, keyboard) = render(&Page::Sound, &settings, None, None, now);
+        let (_, keyboard) = render(&Page::Sound, &settings, None, None, None, now);
         let labels = super::tests::labels(&keyboard);
         assert!(
             labels.contains(&"🕒 Пояс: UTC+5:45".to_owned()),
@@ -1808,9 +2427,9 @@ mod tests {
             tz: Some(180),
             ..Settings::default()
         };
-        let (_, keyboard) = render(&Page::Display, &before, None, None, 0);
+        let (_, keyboard) = render(&Page::Display, &before, None, None, None, 0);
         assert!(datas(&keyboard).contains(&"menu:th:0".to_owned()));
-        let (_, keyboard) = render(&Page::Sound, &before, None, None, 0);
+        let (_, keyboard) = render(&Page::Sound, &before, None, None, None, 0);
         assert!(datas(&keyboard).contains(&"menu:q:1".to_owned()));
         for press in [MenuPress::Thinking(false), MenuPress::Quiet(true)] {
             let (once, _) = change(&before, press).unwrap();
@@ -1825,7 +2444,7 @@ mod tests {
         let (off, _) = change(&on, MenuPress::Quiet(false)).unwrap();
         assert_eq!(off.quiet, None);
         assert_eq!(change(&off, MenuPress::Quiet(false)).unwrap().0, off);
-        let (_, keyboard) = render(&Page::Sound, &on, None, None, 0);
+        let (_, keyboard) = render(&Page::Sound, &on, None, None, None, 0);
         assert!(datas(&keyboard).contains(&"menu:q:0".to_owned()));
     }
 
@@ -1834,7 +2453,7 @@ mod tests {
     #[test]
     fn the_turn_view_is_chosen_on_the_display_tab() {
         let full = Settings::default();
-        let (text, keyboard) = render(&Page::Display, &full, None, None, 0);
+        let (text, keyboard) = render(&Page::Display, &full, None, None, None, 0);
         assert!(text.contains("Ход сжатый: "), "{text}");
         let labels = labels(&keyboard);
         assert!(labels.contains(&"✅ Ход: полный".to_owned()), "{labels:?}");
@@ -1856,7 +2475,7 @@ mod tests {
             "nothing else changes"
         );
         assert_eq!(change(&compact, press).unwrap().0, compact);
-        let (_, keyboard) = render(&Page::Display, &compact, None, None, 0);
+        let (_, keyboard) = render(&Page::Display, &compact, None, None, None, 0);
         assert!(super::tests::labels(&keyboard).contains(&"✅ Ход: сжатый".to_owned()));
         let (back, _) = change(&compact, MenuPress::TurnView(TurnView::Full)).unwrap();
         assert_eq!(back, full);
@@ -1882,7 +2501,7 @@ mod tests {
             tz: Some(0),
             ..Settings::default()
         };
-        let (_, keyboard) = render(&Page::Sound, &wild, None, None, 0);
+        let (_, keyboard) = render(&Page::Sound, &wild, None, None, None, 0);
         let datas = datas(&keyboard);
         for want in ["menu:qf:14", "menu:qf:16", "menu:qt:9", "menu:qt:11"] {
             assert!(datas.contains(&want.to_owned()), "{want}: {datas:?}");
@@ -2022,7 +2641,7 @@ mod tests {
             },
             ..Settings::default()
         };
-        let (text, keyboard) = render(&Page::Display, &settings, None, None, 0);
+        let (text, keyboard) = render(&Page::Display, &settings, None, None, None, 0);
         assert!(text.starts_with("Что показывать в темах лички"), "{text}");
         assert!(text.contains("«👥 Группа»"), "{text}");
         let private = labels(&keyboard);
@@ -2039,7 +2658,7 @@ mod tests {
         }
         assert!(datas(&keyboard).contains(&"menu:rc:0".to_owned()));
         assert!(datas(&keyboard).contains(&"menu:dg".to_owned()));
-        let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, None, 0);
+        let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, None, None, 0);
         assert!(text.starts_with("Что показывать в темах группы"), "{text}");
         assert!(
             text.ends_with("По умолчанию всё, rich-разметка включена. Звук в группе не меняется.")
@@ -2145,7 +2764,14 @@ mod tests {
             HistoryLimit::ALL.map(HistoryLimit::chars),
             [2000, 4000, 8000]
         );
-        let (text, keyboard) = render(&Page::GroupDisplay, &Settings::default(), None, None, 0);
+        let (text, keyboard) = render(
+            &Page::GroupDisplay,
+            &Settings::default(),
+            None,
+            None,
+            None,
+            0,
+        );
         assert!(text.contains("📜 История до обращения: "), "{text}");
         let labels = labels(&keyboard);
         for want in ["📜 2000", "✅ 📜 4000", "📜 8000"] {
@@ -2165,10 +2791,10 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_value(&short).unwrap()["history"], "short");
-        let (_, keyboard) = render(&Page::GroupDisplay, &short, None, None, 0);
+        let (_, keyboard) = render(&Page::GroupDisplay, &short, None, None, None, 0);
         assert!(super::tests::labels(&keyboard).contains(&"✅ 📜 2000".to_owned()));
         // The private page has no such row.
-        let (_, keyboard) = render(&Page::Display, &short, None, None, 0);
+        let (_, keyboard) = render(&Page::Display, &short, None, None, None, 0);
         assert!(
             !datas(&keyboard)
                 .iter()
@@ -2198,6 +2824,7 @@ mod tests {
             &Page::Sessions(0),
             &Settings::default(),
             Some(&view),
+            None,
             None,
             0,
         );
@@ -2275,6 +2902,7 @@ mod tests {
             &Page::Sessions(0),
             &Settings::default(),
             Some(&view),
+            None,
             None,
             0,
         );

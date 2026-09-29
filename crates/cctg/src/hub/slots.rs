@@ -270,6 +270,20 @@
 //! menu does not refresh itself (↻ does). Its logs carry ordinals and fixed
 //! text: no titles, chat ids, times or time zones.
 //!
+//! Owner tabs (TASK-074): «💻 Устройства» lists the hub's devices with
+//! their owners; 🗑 asks once more and revokes off the actor (the device
+//! leaves the tab at once), ➕ asks the roster worker for a `/join` line in
+//! the owner's private chat. «🛠 Hub» shows the build, uptime, sessions,
+//! topics, devices and the 429s of the last day, and cleans up: every slot
+//! dead longer than the chosen age (at least a minute, [`Options::dead_grace`];
+//! `dead_since` is when the actor first saw it dead) with a topic the bot
+//! may delete, no kept message, no open prompt or question and no work in
+//! flight is archived (no topic until its next session, which gets a new
+//! one) and its topics are deleted one per chat at a time, a pause after
+//! each answer ([`Options::cleanup_gap_group`], [`Options::cleanup_gap_private`]),
+//! from the durable queue `registry.cleanup`. A topic the bot may not delete
+//! stays as it is and gets nothing more.
+//!
 //! Compact turn (TASK-076): the turn view of the menu acts where the detail
 //! level does, in each view by that view's settings. In the compact view
 //! the tool lines and 💭 of the turn message go into Telegram's collapsed
@@ -340,18 +354,18 @@ use transcript::{
     split_markdown_for_telegram, telegram_len,
 };
 
-use super::api::{ApiError, ChatInfo, ChatMember, Document};
+use super::api::{ApiError, ChatInfo, ChatMember, Document, FLOOD_WINDOW, Floods};
 use super::buffer::{self, Attachment, Parked, ResumeNote};
 use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
 use super::config::Allowlist;
 use super::console;
-use super::devices::Devices;
+use super::devices::{Devices, Revoked};
 use super::fetch::{self, Fetch, Fetched};
 use super::groups::{self, GroupLookup, KnownGroups, Membership, Missing, PickAction, PickRow};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
 use super::mention;
-use super::menu::{self, MenuPress, Page, RowState, SlotAction};
+use super::menu::{self, MenuPress, OwnerPage, Page, RowState, SlotAction};
 use super::mirror::{Detached, Follow, Landed, Mirror, Write};
 use super::people::{self, Book, Refusal};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
@@ -360,6 +374,7 @@ use super::registry::{
     BlockJob, BlockKey, GroupChange, Icons, Registry, RegistryStore, SessionKind, Shared, SlotId,
     SlotState, StatusMessage, TopicJob, TwinLink, Unshared, UnsharedTopic, View, cut, share_line,
 };
+use super::roster;
 use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome, Rich};
 use super::status::{self, Activity, Buttons, Press, ShareButton};
 use super::stream::{self, Format, Held, Live, MirrorOp, Open, Step};
@@ -581,6 +596,12 @@ pub const UNSHARED_KEPT_NOTICE: &str = "Сессию убрали из груп�
 pub const ECHO_MARK: &str = "✉";
 /// The author of an echo when Telegram gave no usable name.
 pub const ECHO_NO_NAME: &str = "без имени";
+/// The answer to 🗑 of a device that is gone (TASK-074).
+pub const DEVICE_GONE: &str = "Этого устройства уже нет";
+/// The answer to 🧹 when the cleanup no longer takes what it showed.
+pub const CLEANUP_CHANGED: &str = "Список изменился, посмотрите ещё раз";
+/// A member's name as a device's owner in the devices tab, at most.
+const DEVICE_OWNER_LIMIT: usize = 40;
 
 /// Whose private chat shows a slot (TASK-063): the first allowlisted user,
 /// the only one when there is one. In a team (`devices` set) it is the
@@ -695,8 +716,23 @@ pub struct Options {
     /// owners manage them.
     pub allowlist: Allowlist,
     /// The device list (TASK-081): the devices of a removed member are
-    /// revoked; `None`: none are.
+    /// revoked; `None`: none are. The devices tab of the menu (TASK-074)
+    /// shows and revokes them; `None`: it is empty.
     pub devices: Option<Devices>,
+    /// The roster worker (TASK-074): «➕ Добавить устройство» asks it for a
+    /// `/join` line; `None`: the button says to use `/join`.
+    pub roster: Option<mpsc::UnboundedSender<roster::Input>>,
+    /// The 429 count of the Bot API client, for the hub tab (TASK-074);
+    /// `None`: it shows 0.
+    pub floods: Option<Floods>,
+    /// After Telegram answered the delete of a cleaned topic, the next one
+    /// of that chat waits this long: a group (TASK-074, a fifth of its
+    /// budget) and a private chat.
+    pub cleanup_gap_group: Duration,
+    pub cleanup_gap_private: Duration,
+    /// A cleanup takes a slot dead at least this long, whatever its age:
+    /// a `/clear` or a client restart leaves a slot dead for seconds.
+    pub dead_grace: Duration,
 }
 
 /// Who the agent is in a group topic (TASK-077): `getMe`'s id and username.
@@ -830,6 +866,11 @@ impl Default for Options {
             groups: KnownGroups::default(),
             allowlist: Allowlist::default(),
             devices: None,
+            roster: None,
+            floods: None,
+            cleanup_gap_group: Duration::from_secs(15),
+            cleanup_gap_private: Duration::from_secs(2),
+            dead_grace: Duration::from_secs(60),
         }
     }
 }
@@ -1006,6 +1047,18 @@ enum Done {
     Picker(Option<Delivery>),
     /// The lookup task answered (TASK-069).
     GroupChecked(GroupAnswer),
+    /// A revoke from the devices tab of `owner` ended (TASK-074): device
+    /// `id` (8 hex), what came of it; `None` also when the revoke failed.
+    DeviceRevoked {
+        owner: PrivateChat,
+        id: String,
+        revoked: Option<Revoked>,
+    },
+    /// The delete of topic `place` of an archived slot (TASK-074).
+    TopicCleaned {
+        place: Place,
+        delivery: Option<Delivery>,
+    },
 }
 
 /// What the group lookup task found (TASK-069).
@@ -1348,6 +1401,8 @@ enum Work {
     },
     /// The delete of the group topic of an unshared slot (TASK-064).
     DeleteTopic(Place),
+    /// The delete of a topic of an archived slot (TASK-074).
+    CleanTopic(Place),
     /// A call about a menu (TASK-073).
     Menu(MenuJob),
     /// An edit of a group picker (TASK-069).
@@ -1938,6 +1993,23 @@ pub struct Slots {
     /// Members removed in this run: what the poll let through before the
     /// removal is dropped (TASK-081).
     removed: HashSet<PrivateChat>,
+    /// When this actor started (TASK-074): the hub tab's uptime and start.
+    started: (Instant, std::time::SystemTime),
+    /// A first 🗑 of a device waits for its second until then: (device id,
+    /// until), by owner (TASK-074).
+    device_confirm: HashMap<PrivateChat, (u32, Instant)>,
+    /// Devices whose revoke from the menu runs: gone from the tab already.
+    revoking: HashSet<String>,
+    /// The cleanup age each owner chose on the hub tab.
+    hub_days: HashMap<PrivateChat, u16>,
+    /// A first 🧹 waits for its second until then: (days, topics, until),
+    /// by owner.
+    cleanup_confirm: HashMap<PrivateChat, (u16, u32, Instant)>,
+    /// Per chat, the cleaned topic whose delete is in flight, and the time
+    /// before which the next one of that chat does not go.
+    cleaning: HashMap<Chat, (Option<Place>, Instant)>,
+    /// Cleaned topics deleted and not deleted in this run.
+    cleaned: (usize, usize),
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -2100,6 +2172,13 @@ impl Slots {
             people: Book::default(),
             remove_confirm: HashMap::new(),
             removed: HashSet::new(),
+            started: (now, std::time::SystemTime::now()),
+            device_confirm: HashMap::new(),
+            revoking: HashSet::new(),
+            hub_days: HashMap::new(),
+            cleanup_confirm: HashMap::new(),
+            cleaning: HashMap::new(),
+            cleaned: (0, 0),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -2364,6 +2443,17 @@ impl Slots {
             .map(|gather| gather.due)
             .filter(|at| *at > now)
             .fold(deadline, Instant::min);
+        // The next delete of a cleanup waits for its chat's pause (TASK-074).
+        let deadline = if self.registry.cleanup.is_empty() {
+            deadline
+        } else {
+            self.cleaning
+                .values()
+                .filter(|(flying, _)| flying.is_none())
+                .map(|(_, next_at)| *next_at)
+                .filter(|at| *at > now)
+                .fold(deadline, Instant::min)
+        };
         // A refused stream reads (or, once its session left the slot, sends)
         // again at its retry, and a drain holds the next separator for a
         // bounded time; a past read time the pump did not act on waits for
@@ -2726,10 +2816,30 @@ impl Slots {
 
     fn on_hook(&mut self, post: &HookPost) {
         let made = self.registry.slots.len();
+        let start = matches!(post.event, HookEvent::SessionStart { .. });
+        // Slots a cleanup archived (TASK-074): one this start takes back is
+        // homed like a new one.
+        let archived: HashSet<SlotId> = if start {
+            (0..made)
+                .filter(|index| self.registry.slots[*index].archived)
+                .map(SlotId)
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let followup = self.registry.apply_hook(post);
         let session = post.session_id.as_str();
-        if matches!(post.event, HookEvent::SessionStart { .. }) {
+        if start {
             self.home_new_slot(post, made);
+            if let Some(slot) = self
+                .registry
+                .sessions
+                .get(session)
+                .and_then(|entry| entry.slot)
+                .filter(|slot| archived.contains(slot) && !self.registry.slots[slot.0].archived)
+            {
+                self.home_new_slot(post, slot.0);
+            }
         }
         if matches!(post.event, HookEvent::SessionEnd { .. }) {
             self.scanned.remove(session);
@@ -10038,6 +10148,7 @@ impl Slots {
                     | Work::Twin { .. }
                     | Work::Menu(_)
                     | Work::Picker
+                    | Work::CleanTopic(_)
             )
         {
             return Vec::new();
@@ -10737,7 +10848,8 @@ impl Slots {
     }
 
     /// A SessionStart made slot `made` (the first index past the slots
-    /// before it): with its owner's private chat usable the slot shows
+    /// before it), or took back slot `made` that a cleanup archived
+    /// (TASK-074): with its owner's private chat usable the slot shows
     /// there alone (TASK-063, decision 2026-09-28; the owner may share it,
     /// TASK-064), else in the group as before.
     fn home_new_slot(&mut self, post: &HookPost, made: usize) {
@@ -12154,6 +12266,458 @@ impl Slots {
         Some(people::removed_answer(&member.label(), devices))
     }
 
+    /// The devices tab of owner `owner` now (TASK-074): the devices but
+    /// those being revoked, oldest first.
+    fn devices_view(&self, owner: PrivateChat) -> menu::DevicesView {
+        let Some(devices) = &self.options.devices else {
+            return menu::DevicesView {
+                rows: Vec::new(),
+                shared: String::new(),
+            };
+        };
+        let (listed, shared) = devices.list();
+        let now = std::time::SystemTime::now();
+        let instant = Instant::now();
+        let armed = self
+            .device_confirm
+            .get(&owner)
+            .filter(|(_, until)| instant < *until)
+            .map(|(id, _)| *id);
+        let rows = listed
+            .into_iter()
+            .filter(|entry| !self.revoking.contains(&entry.id))
+            .filter_map(|entry| {
+                let id = u32::from_str_radix(&entry.id, 16).ok()?;
+                let whose = match entry.owner {
+                    Some(chat) if chat == owner => "ваше".to_owned(),
+                    Some(chat) => match self.registry.member(chat) {
+                        Some(member) => cut(&member.label(), DEVICE_OWNER_LIMIT),
+                        None if self.options.allowlist.is_owner(chat.expose()) => {
+                            "другой владелец".to_owned()
+                        }
+                        None => "владелец не записан".to_owned(),
+                    },
+                    None => "владелец не записан".to_owned(),
+                };
+                let seen = match entry.seen {
+                    Some(at) => format!("последний вход {}", roster::ago(now, at)),
+                    None => "с запуска hub не входило".to_owned(),
+                };
+                Some(menu::DeviceRow {
+                    id,
+                    name: entry.name,
+                    owner: whose,
+                    joined: files::date(entry.joined),
+                    seen,
+                    confirm: armed == Some(id),
+                })
+            })
+            .collect();
+        menu::DevicesView {
+            rows,
+            shared: roster::shared_line(shared, now),
+        }
+    }
+
+    /// A devices press of owner `owner` (TASK-074); `on_menu`: it was on
+    /// their current menu. The page to show and the answer.
+    fn press_devices(
+        &mut self,
+        owner: PrivateChat,
+        press: MenuPress,
+        on_menu: bool,
+    ) -> (Page, String) {
+        let Some(devices) = self.options.devices.clone() else {
+            return (Page::Sessions(0), menu::ANSWER_UNCHANGED.to_owned());
+        };
+        let answer = match press {
+            MenuPress::DeviceRevoke { .. } | MenuPress::DeviceRevokeConfirm { .. } if !on_menu => {
+                menu::ANSWER_STALE_MENU.to_owned()
+            }
+            MenuPress::DeviceRevoke { id } => {
+                let hex = format!("{id:08x}");
+                if devices.name(&hex).is_some() && !self.revoking.contains(&hex) {
+                    let until = Instant::now() + status::CONFIRM_FOR;
+                    self.device_confirm.insert(owner, (id, until));
+                    String::new()
+                } else {
+                    DEVICE_GONE.to_owned()
+                }
+            }
+            MenuPress::DeviceRevokeConfirm { id } => {
+                let hex = format!("{id:08x}");
+                let now = Instant::now();
+                let armed = self
+                    .device_confirm
+                    .get(&owner)
+                    .is_some_and(|(armed, until)| *armed == id && now < *until);
+                if !armed {
+                    menu::ANSWER_UNCHANGED.to_owned()
+                } else if devices.name(&hex).is_none() || self.revoking.contains(&hex) {
+                    self.device_confirm.remove(&owner);
+                    DEVICE_GONE.to_owned()
+                } else {
+                    self.device_confirm.remove(&owner);
+                    self.revoking.insert(hex.clone());
+                    let done = self.done_tx.clone();
+                    // Revoking writes `devices.json`: off the actor. The
+                    // answer comes back whatever happens, so the device never
+                    // stays hidden.
+                    tokio::spawn(async move {
+                        let target = hex.clone();
+                        let revoked = tokio::task::spawn_blocking(move || devices.revoke(&target))
+                            .await
+                            .ok()
+                            .flatten();
+                        let _ = done.send(Done::DeviceRevoked {
+                            owner,
+                            id: hex,
+                            revoked,
+                        });
+                    });
+                    "Отозвано".to_owned()
+                }
+            }
+            MenuPress::DeviceAdd => {
+                let asked = self
+                    .options
+                    .roster
+                    .as_ref()
+                    .is_some_and(|roster| roster.send(roster::Input::Join(owner)).is_ok());
+                if asked {
+                    info!("join line asked from the menu");
+                    "Строка установки придёт ниже".to_owned()
+                } else {
+                    "Код сделать не вышло, попробуйте /join".to_owned()
+                }
+            }
+            _ => String::new(),
+        };
+        (Page::Devices, answer)
+    }
+
+    /// A revoke from the devices tab of `owner` ended (TASK-074).
+    fn on_device_revoked(&mut self, owner: PrivateChat, id: String, revoked: Option<Revoked>) {
+        self.revoking.remove(&id);
+        match revoked {
+            Some(revoked) => {
+                info!(
+                    device_id = %id,
+                    saved = revoked.saved,
+                    "device revoked from the menu"
+                );
+                if !revoked.saved {
+                    self.tell_person(
+                        owner,
+                        format!(
+                            "«{}» отозвано, но записать это на диск не вышло: после перезапуска hub устройство вернётся, отзовите его ещё раз.",
+                            revoked.name
+                        ),
+                        None,
+                        false,
+                    );
+                }
+            }
+            None => debug!(device_id = %id, "device from the menu was gone already"),
+        }
+    }
+
+    /// The hub tab of owner `owner` now (TASK-074).
+    fn hub_view(&self, owner: PrivateChat) -> menu::HubView {
+        let uptime = Instant::now().saturating_duration_since(self.started.0);
+        let mut live = 0;
+        let mut ended = 0;
+        let mut topics = 0;
+        for (index, slot) in self.registry.slots.iter().enumerate() {
+            topics += slot
+                .views
+                .iter()
+                .filter(|view| view.topic_id.is_some())
+                .count();
+            if self.registry.state(SlotId(index)) != SlotState::Dead {
+                live += 1;
+            } else if !slot.archived {
+                ended += 1;
+            }
+        }
+        let days = self
+            .hub_days
+            .get(&owner)
+            .copied()
+            .unwrap_or(menu::DEFAULT_CLEANUP_DAYS);
+        let (plan, clean, kept) = self.cleanup_plan(days);
+        let now = Instant::now();
+        let armed = self
+            .cleanup_confirm
+            .get(&owner)
+            .is_some_and(|(armed, topics, until)| {
+                *armed == days && *topics == clean && now < *until
+            });
+        menu::HubView {
+            release: self
+                .options
+                .release
+                .clone()
+                .unwrap_or_else(|| "локальная сборка".to_owned()),
+            build: self
+                .options
+                .build
+                .as_deref()
+                .map_or_else(|| "?".to_owned(), crate::client::short),
+            started: utc_minute(self.started.1),
+            uptime: span_words(uptime),
+            live,
+            ended,
+            topics,
+            devices: self
+                .options
+                .devices
+                .as_ref()
+                .map_or(0, |devices| devices.list().0.len()),
+            floods: self
+                .options
+                .floods
+                .as_ref()
+                .map_or(0, |floods| floods.count(StdInstant::now())),
+            floods_day: uptime >= FLOOD_WINDOW,
+            days,
+            slots: plan.len(),
+            clean,
+            kept,
+            armed,
+            left: self.registry.cleanup.len(),
+            done: self.cleaned.0,
+            failed: self.cleaned.1,
+        }
+    }
+
+    /// The bot may delete a topic of `chat` for a cleanup (TASK-074): it
+    /// writes there, and in a group it may delete messages; a private chat
+    /// with topics lets it (Bot API 9.3).
+    fn cleanup_deletable(&self, chat: Chat) -> bool {
+        self.registry.usable(chat)
+            && match chat {
+                Chat::Private(_) => true,
+                Chat::Group(_) => self.can_delete(chat),
+            }
+    }
+
+    /// What a cleanup of slots dead `days` or longer (at least
+    /// [`Options::dead_grace`]) takes now (TASK-074): the slots, their topics
+    /// the bot may delete, and those it may not, which stay. A slot with
+    /// work under way, an open prompt or question, or no topic the bot may
+    /// delete is not taken.
+    fn cleanup_plan(&self, days: u16) -> (Vec<SlotId>, u32, usize) {
+        let age = (u64::from(days) * 86_400).max(self.options.dead_grace.as_secs());
+        let now = u64::try_from(unix_now()).unwrap_or(0);
+        let mut plan = Vec::new();
+        let mut clean: u32 = 0;
+        let mut kept = 0;
+        for slot in self.registry.cleanup_candidates(now.saturating_sub(age)) {
+            let places: Vec<Place> = self.registry.slots[slot.0]
+                .views
+                .iter()
+                .filter_map(View::place)
+                .collect();
+            if self.slot_at_work(slot, &places) {
+                continue;
+            }
+            let deletable = places
+                .iter()
+                .filter(|place| self.cleanup_deletable(place.chat))
+                .count();
+            if deletable == 0 {
+                continue;
+            }
+            clean = clean.saturating_add(u32::try_from(deletable).unwrap_or(u32::MAX));
+            kept += places.len() - deletable;
+            plan.push(slot);
+        }
+        (plan, clean, kept)
+    }
+
+    /// `slot`, with topics `places`, still has something under way that a
+    /// cleanup must not cut (TASK-074): a status call, a group pick, a burst,
+    /// a file, a compression, a lost message or a text behind a separator,
+    /// the stream of its session, an open prompt or question.
+    fn slot_at_work(&self, slot: SlotId, places: &[Place]) -> bool {
+        let session = self.registry.slots[slot.0].current_session.as_deref();
+        let ours = |asked: Option<Place>, of: &str| {
+            asked.is_some_and(|place| places.contains(&place)) || session == Some(of)
+        };
+        self.shown
+            .get(&slot)
+            .is_some_and(|shown| shown.in_flight > 0)
+            || self.choosing.contains_key(&slot)
+            || self.picks.contains_key(&slot)
+            || self.gathers.contains_key(&slot)
+            || self.fetching.contains_key(&slot)
+            || self.compressing.contains(&slot)
+            || self.link_losses.contains_key(&slot)
+            || self.lost_messages.iter().any(|lost| lost.slot == slot)
+            || self.after_separator.iter().any(|after| after.slot == slot)
+            || session.is_some_and(|session| self.streams.contains_key(session))
+            || self.prompts.active().into_iter().any(|key| {
+                self.prompts.get(key).is_some_and(|prompt| {
+                    (prompt.waits || matches!(prompt.state, State::Selected { .. }))
+                        && ours(prompt.place, &prompt.session)
+                })
+            })
+            || self.questions.keys().into_iter().any(|key| {
+                self.questions
+                    .get(key)
+                    .is_some_and(|ask| ask.is_open() && ours(ask.place, &ask.session))
+            })
+    }
+
+    /// A hub press of owner `owner` (TASK-074); `on_menu`: it was on their
+    /// current menu. The page to show and the answer.
+    fn press_hub(&mut self, owner: PrivateChat, press: MenuPress, on_menu: bool) -> (Page, String) {
+        let answer = match press {
+            MenuPress::CleanupDays(days) => {
+                self.hub_days.insert(owner, days);
+                self.cleanup_confirm.remove(&owner);
+                String::new()
+            }
+            MenuPress::Cleanup { .. } | MenuPress::CleanupConfirm { .. } if !on_menu => {
+                menu::ANSWER_STALE_MENU.to_owned()
+            }
+            MenuPress::Cleanup { days, topics } => {
+                if topics == 0 || self.cleanup_plan(days).1 != topics {
+                    CLEANUP_CHANGED.to_owned()
+                } else {
+                    let until = Instant::now() + status::CONFIRM_FOR;
+                    self.cleanup_confirm.insert(owner, (days, topics, until));
+                    String::new()
+                }
+            }
+            MenuPress::CleanupConfirm { days, topics } => {
+                let now = Instant::now();
+                let armed =
+                    self.cleanup_confirm
+                        .get(&owner)
+                        .is_some_and(|(armed, counted, until)| {
+                            *armed == days && *counted == topics && now < *until
+                        });
+                let (plan, clean, _) = self.cleanup_plan(days);
+                if armed && clean == topics {
+                    self.cleanup_confirm.remove(&owner);
+                    for slot in &plan {
+                        self.archive_cleaned(*slot);
+                    }
+                    info!(
+                        slots = plan.len(),
+                        topics, days, "cleanup started from the menu"
+                    );
+                    format!("Уборка началась: тем {topics}")
+                } else {
+                    CLEANUP_CHANGED.to_owned()
+                }
+            }
+            _ => String::new(),
+        };
+        (Page::Hub, answer)
+    }
+
+    /// `slot` is archived by a cleanup (TASK-074): its topics the bot may
+    /// delete go into the queue, and what the actor knew of them goes.
+    /// Not cleaned here, the plan left the slot out while they held it:
+    /// `compressing`, `fetching`, `gathers`, `picks`, `choosing`,
+    /// `lost_messages`, `after_separator` (keyed by slot); `deleting`,
+    /// `delete_later`, `fallback_ended` hold topics that are no views.
+    fn archive_cleaned(&mut self, slot: SlotId) {
+        let deletable: HashSet<Chat> = self.registry.slots[slot.0]
+            .views
+            .iter()
+            .map(|view| view.chat)
+            .filter(|chat| self.cleanup_deletable(*chat))
+            .collect();
+        for place in self.registry.archive_slot(slot, &deletable) {
+            self.mirror.forget_topic(place);
+            self.bottoms.remove(&place);
+            self.mirror_turns.remove(&place);
+            self.foreign_told.remove(&place);
+            self.gaps.remove(&place);
+            self.mention_albums.remove(&(slot, place.chat));
+        }
+        self.shown.remove(&slot);
+        self.notices.retain(|(noticed, _), _| *noticed != slot);
+        self.link_losses.remove(&slot);
+        self.primaries.remove(&slot);
+        info!(ordinal = self.ordinal(slot), "slot archived by a cleanup");
+    }
+
+    /// Hands the deletes of cleaned topics out, one per chat at a time and
+    /// a pause after each answer (TASK-074); first notes which slots are
+    /// dead since when. A topic whose chat the bot can no longer delete in
+    /// leaves the queue and stays as it is.
+    fn delete_cleaned(&mut self) {
+        self.registry
+            .note_dead(u64::try_from(unix_now()).unwrap_or(0));
+        let now = Instant::now();
+        for place in self.registry.cleanup.clone() {
+            let chat = place.chat;
+            let Some(thread_id) = place.thread.filter(|_| self.cleanup_deletable(chat)) else {
+                debug!("a cleaned topic cannot be deleted any more; it stays as it is");
+                self.registry.cleanup.retain(|queued| *queued != place);
+                self.registry.dirty = true;
+                continue;
+            };
+            if self
+                .cleaning
+                .get(&chat)
+                .is_some_and(|(flying, next_at)| flying.is_some() || now < *next_at)
+            {
+                continue;
+            }
+            self.cleaning.insert(chat, (Some(place), now));
+            self.hand_off(Work::CleanTopic(place), Op::DeleteTopic { chat, thread_id });
+        }
+    }
+
+    /// Telegram answered the delete of cleaned topic `place` (TASK-074).
+    fn on_topic_cleaned(&mut self, place: Place, delivery: Option<Delivery>) {
+        let gap = if place.chat.is_private() {
+            self.options.cleanup_gap_private
+        } else {
+            self.options.cleanup_gap_group
+        };
+        self.cleaning
+            .insert(place.chat, (None, Instant::now() + gap));
+        if !self.registry.cleanup.contains(&place) {
+            return;
+        }
+        let deleted = match &delivery {
+            Some(Ok(_)) => Some(true),
+            Some(delivery) if topic_gone(delivery) => Some(true),
+            None | Some(Err(ApiError::Http(_) | ApiError::RetryAfter(_))) => None,
+            Some(Err(ApiError::Telegram { code, .. })) if *code >= 500 || *code == 429 => None,
+            Some(Err(ApiError::Telegram { code, .. })) => {
+                warn!(code, "cannot delete a topic of a cleaned slot");
+                Some(false)
+            }
+            Some(Err(ApiError::Decode(_))) => None,
+        };
+        let Some(deleted) = deleted else {
+            debug!("topic of a cleaned slot not deleted yet; trying again");
+            return;
+        };
+        self.registry.cleanup.retain(|queued| *queued != place);
+        self.registry.dirty = true;
+        if deleted {
+            self.cleaned.0 += 1;
+        } else {
+            self.cleaned.1 += 1;
+        }
+        if self.registry.cleanup.is_empty() {
+            info!(
+                done = self.cleaned.0,
+                failed = self.cleaned.1,
+                "cleanup finished"
+            );
+        }
+    }
+
     /// Sends the menu into the General of private chat `chat` (TASK-073);
     /// once Telegram took it, it is pinned and the old one goes.
     fn show_menu(&mut self, chat: PrivateChat, page: Page) {
@@ -12224,14 +12788,23 @@ impl Slots {
             Page::Sessions(page) => Some(self.sessions_view(chat, page)),
             _ => None,
         };
-        // The people tab is an owner's (TASK-081).
-        let people = (self.registry.private && self.options.allowlist.is_owner(chat.expose()))
-            .then(|| self.people_view(chat));
+        // The people tab is an owner's (TASK-081), and so are the devices
+        // and hub tabs (TASK-074).
+        let owner = self.registry.private && self.options.allowlist.is_owner(chat.expose());
+        let people = owner.then(|| self.people_view(chat));
+        let owner_page = match page {
+            Page::Devices if owner && self.options.devices.is_some() => {
+                Some(OwnerPage::Devices(self.devices_view(chat)))
+            }
+            Page::Hub if owner => Some(OwnerPage::Hub(self.hub_view(chat))),
+            _ => None,
+        };
         menu::render(
             &page,
             &settings,
             sessions.as_ref(),
             people.as_ref(),
+            owner_page.as_ref(),
             unix_now(),
         )
     }
@@ -12245,6 +12818,10 @@ impl Slots {
         let mut ended = Vec::new();
         for (index, entry) in self.registry.slots.iter().enumerate() {
             let slot = SlotId(index);
+            // Its topics were cleaned away (TASK-074).
+            if entry.archived {
+                continue;
+            }
             let Some(session) = entry.current_session.as_deref() else {
                 continue;
             };
@@ -12382,9 +12959,15 @@ impl Slots {
         ) {
             self.reopen(Chat::Private(chat));
         }
-        // Only owners manage the people (TASK-081).
-        if press.manages_people() && !self.options.allowlist.is_owner(chat.expose()) {
-            return people::ANSWER_OWNER_ONLY.to_owned();
+        // Only owners manage the people (TASK-081), the devices and the hub
+        // (TASK-074).
+        if press.owners_only() && !self.options.allowlist.is_owner(chat.expose()) {
+            return if press.manages_people() {
+                people::ANSWER_OWNER_ONLY
+            } else {
+                menu::ANSWER_OWNER_ONLY
+            }
+            .to_owned();
         }
         let on_menu = input.thread_id.is_none()
             && input.message_id.is_some()
@@ -12409,6 +12992,14 @@ impl Slots {
                 let general = input.message_id.filter(|_| input.thread_id.is_none());
                 self.press_people(chat, people_press, on_menu, general)
             }
+            MenuPress::Devices => (Page::Devices, String::new()),
+            MenuPress::Hub => (Page::Hub, String::new()),
+            MenuPress::DeviceRevoke { .. }
+            | MenuPress::DeviceRevokeConfirm { .. }
+            | MenuPress::DeviceAdd => self.press_devices(chat, press, on_menu),
+            MenuPress::CleanupDays(_)
+            | MenuPress::Cleanup { .. }
+            | MenuPress::CleanupConfirm { .. } => self.press_hub(chat, press, on_menu),
             setting => {
                 let old = self
                     .registry
@@ -13271,6 +13862,10 @@ impl Slots {
                 }
             }
             Done::GroupChecked(answer) => self.on_group_checked(answer),
+            Done::DeviceRevoked { owner, id, revoked } => {
+                self.on_device_revoked(owner, id, revoked);
+            }
+            Done::TopicCleaned { place, delivery } => self.on_topic_cleaned(place, delivery),
         }
     }
 
@@ -13494,6 +14089,7 @@ impl Slots {
         self.ensure_private_views();
         self.offer_menus();
         self.delete_unshared();
+        self.delete_cleaned();
         self.pump_drains();
         let draining = self.draining_slots(Instant::now());
         for job in self
@@ -14102,6 +14698,31 @@ fn unix_now() -> i64 {
         })
 }
 
+/// `YYYY-MM-DD HH:MM UTC` of `time` (TASK-074: when the hub started).
+fn utc_minute(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let minute = secs % 86_400 / 60;
+    format!(
+        "{} {:02}:{:02} UTC",
+        files::date(time),
+        minute / 60,
+        minute % 60
+    )
+}
+
+/// `2 дн 3 ч`, `3 ч 5 мин`, `5 мин` (TASK-074: the hub's uptime).
+fn span_words(span: Duration) -> String {
+    let minutes = span.as_secs() / 60;
+    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    match (days, hours) {
+        (0, 0) => format!("{minutes} мин"),
+        (0, _) => format!("{hours} ч {minutes} мин"),
+        _ => format!("{days} дн {hours} ч"),
+    }
+}
+
 /// The echo of a user's message (TASK-063): `✉ <author>: <text>`, a file as
 /// `📎 <name>` before its caption, a forward marked `↪`; cut to Telegram's
 /// limit.
@@ -14295,6 +14916,7 @@ async fn dispatch_loop(
                     delivery,
                 },
                 Work::DeleteTopic(place) => Done::TopicDeleted { place, delivery },
+                Work::CleanTopic(place) => Done::TopicCleaned { place, delivery },
                 Work::Menu(job) => Done::Menu { job, delivery },
                 Work::Picker => Done::Picker(delivery),
             });
@@ -36152,5 +36774,507 @@ again"
         slots.on_control(press_by(second, 8802, &format!("menu:pa:{theirs}")));
         let _ = all_work(&mut work);
         assert!(!slots.options.allowlist.contains(MEMBER), "not back");
+    }
+
+    // ------------------------------------------------------------ TASK-074
+
+    /// Sessions of the third and fourth slot of the cleanup tests.
+    const C: &str = "cccccccc-0000-4000-8000-000000000003";
+    const D: &str = "dddddddd-0000-4000-8000-000000000004";
+
+    /// The text and keyboard of the last menu edit among `handed`.
+    fn last_menu_edit(handed: &[(Work, Op)]) -> (String, serde_json::Value) {
+        let (_, text, keyboard) = menu_edits(handed)
+            .pop()
+            .unwrap_or_else(|| panic!("no menu edit: {handed:#?}"));
+        (text, keyboard)
+    }
+
+    /// A device book in `dir` with «laptop», owned by the owner of these
+    /// tests, and «mac», with no owner; their ids.
+    fn two_devices(dir: &TempDir) -> (Devices, String, String) {
+        let devices = Devices::open(&dir.path().join("devices"), None).unwrap();
+        let enroll = |name: &str| {
+            let code = devices.mint_code().unwrap();
+            devices.join(&code, name).unwrap().id
+        };
+        let (laptop, mac) = (enroll("laptop"), enroll("mac"));
+        devices.set_owner(&laptop, owner_chat()).unwrap();
+        (devices, laptop, mac)
+    }
+
+    /// TASK-074: the devices tab lists the devices with their owners; 🗑
+    /// asks once more and the second press revokes off the actor, the device
+    /// leaving the tab at once; a press on an old menu revokes nothing; ➕
+    /// asks the roster worker for the owner's `/join` line.
+    #[tokio::test]
+    async fn the_devices_tab_revokes_and_adds_devices() {
+        let dir = TempDir::new("slots-074-devices");
+        let (devices, laptop, mac) = two_devices(&dir);
+        let (roster_tx, mut roster_rx) = mpsc::unbounded_channel();
+        let options = Options {
+            devices: Some(devices.clone()),
+            roster: Some(roster_tx),
+            ..people_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        slots.on_control(menu_press(MENU, "menu:dv"));
+        let handed = all_work(&mut work);
+        let (text, keyboard) = last_menu_edit(&handed);
+        assert!(text.starts_with("Устройства (2):"), "{text}");
+        assert!(
+            text.contains(&format!("1. laptop · {laptop} · с ")) && text.contains(" · ваше"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("2. mac · {mac} · с ")) && text.contains("владелец не записан"),
+            "{text}"
+        );
+        assert!(text.contains("с запуска hub не входило"), "{text}");
+        let datas = button_datas(&keyboard);
+        assert!(datas.contains(&format!("menu:dr:{laptop}")), "{datas:?}");
+
+        // A press on an old menu message: nothing armed, nothing revoked.
+        slots.on_control(menu_press(MENU - 1, &format!("menu:dr:{laptop}")));
+        slots.on_control(menu_press(MENU - 1, &format!("menu:drc:{laptop}")));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(menu::ANSWER_STALE_MENU.to_owned()),
+                Some(menu::ANSWER_STALE_MENU.to_owned())
+            ]
+        );
+        assert!(slots.device_confirm.is_empty());
+        // A confirmation without the first press changes nothing.
+        slots.on_control(menu_press(MENU, &format!("menu:drc:{laptop}")));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(menu::ANSWER_UNCHANGED.to_owned())]
+        );
+
+        slots.on_control(menu_press(MENU, &format!("menu:dr:{laptop}")));
+        let handed = all_work(&mut work);
+        assert_eq!(callback_answers(&handed), [None]);
+        let (_, keyboard) = last_menu_edit(&handed);
+        let texts = button_texts(&keyboard);
+        assert!(texts.contains(&"🗑 laptop — точно?".to_owned()), "{texts:?}");
+        assert!(button_datas(&keyboard).contains(&format!("menu:drc:{laptop}")));
+
+        slots.on_control(menu_press(MENU, &format!("menu:drc:{laptop}")));
+        let handed = all_work(&mut work);
+        assert_eq!(callback_answers(&handed), [Some("Отозвано".to_owned())]);
+        let (text, _) = last_menu_edit(&handed);
+        assert!(text.starts_with("Устройства (1):"), "gone at once: {text}");
+        assert!(!text.contains("laptop"), "{text}");
+        assert!(slots.revoking.contains(&laptop));
+        // The revoke's answer comes back to the actor whatever happened.
+        let done = slots.done_rx.as_mut().unwrap();
+        let revoked = loop {
+            if let done @ Done::DeviceRevoked { .. } =
+                done.recv().await.expect("the revoke answers")
+            {
+                break done;
+            }
+        };
+        slots.on_done(revoked);
+        assert!(slots.revoking.is_empty());
+        let (listed, _) = devices.list();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            [mac.as_str()]
+        );
+        // Saved: nobody is told to revoke it again.
+        assert!(people_sends(&all_work(&mut work)).is_empty());
+
+        // 🗑 of a device that is gone.
+        slots.on_control(menu_press(MENU, &format!("menu:dr:{laptop}")));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(DEVICE_GONE.to_owned())]
+        );
+
+        slots.on_control(menu_press(MENU, "menu:da"));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some("Строка установки придёт ниже".to_owned())]
+        );
+        assert!(matches!(
+            roster_rx.try_recv(),
+            Ok(roster::Input::Join(owner)) if owner == owner_chat()
+        ));
+        // Without a roster worker the button says so.
+        slots.options.roster = None;
+        slots.on_control(menu_press(MENU, "menu:da"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some("Код сделать не вышло, попробуйте /join".to_owned())]
+        );
+    }
+
+    /// TASK-074: a member sees no devices or hub tab, and every press of
+    /// them is refused.
+    #[tokio::test]
+    async fn only_owners_get_the_devices_and_hub_tabs() {
+        let dir = TempDir::new("slots-074-owners");
+        let (mut slots, mut work) = with_member(&dir);
+        slots.registry.person_mut(member_chat()).menu = Some(7700);
+        for page in [Page::Devices, Page::Hub] {
+            let (text, keyboard) = slots.menu_content(member_chat(), page);
+            assert!(text.starts_with("Сессии"), "{text}");
+            let datas = button_datas(&keyboard);
+            assert!(
+                !datas.contains(&"menu:dv".to_owned()) && !datas.contains(&"menu:hb".to_owned())
+            );
+        }
+        let (_, keyboard) = slots.menu_content(owner_chat(), Page::Sessions(0));
+        let datas = button_datas(&keyboard);
+        assert!(datas.contains(&"menu:dv".to_owned()) && datas.contains(&"menu:hb".to_owned()));
+        for data in [
+            "menu:dv",
+            "menu:dr:00000001",
+            "menu:drc:00000001",
+            "menu:da",
+            "menu:hb",
+            "menu:hd:0",
+            "menu:hx:0:1",
+            "menu:hxc:0:1",
+        ] {
+            slots.on_control(press_by(member_chat(), 7700, data));
+            let handed = all_work(&mut work);
+            assert_eq!(
+                callback_answers(&handed),
+                [Some(menu::ANSWER_OWNER_ONLY.to_owned())],
+                "{data}"
+            );
+            assert!(menu_edits(&handed).is_empty(), "{data}");
+        }
+        assert!(slots.hub_days.is_empty() && slots.cleanup_confirm.is_empty());
+    }
+
+    /// Cleanup options: every age at once, a group without the right to
+    /// delete, the gaps of the hub.
+    fn cleanup_options() -> Options {
+        Options {
+            dead_grace: Duration::ZERO,
+            can_delete: false,
+            ..people_options()
+        }
+    }
+
+    /// Slot 0 (session A) in the private topic 700 and shared to the group
+    /// (100), slot 1 (B) in the private topic 701, slot 2 (C) in the group
+    /// topic 102 alone; all three ended.
+    fn three_dead_slots(dir: &TempDir) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = menu_slot(dir, cleanup_options());
+        let owner = private_owner();
+        slots.registry.share(
+            SlotId(0),
+            Chat::GROUP,
+            crate::hub::registry::share_line(SHARER),
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        // Its share line went: no topic call in flight.
+        slots.registry.slots[0].views[1].pending_separator = None;
+        slots.on_hook(&start(B, 11));
+        slots
+            .registry
+            .topic_created(SlotId(1), owner, 701, "t", None);
+        slots.on_hook(&start(C, 12));
+        slots.registry.slots[2].views = vec![View::new(Chat::GROUP)];
+        slots
+            .registry
+            .topic_created(SlotId(2), Chat::GROUP, 102, "t", None);
+        for (session, pid) in [(A, 10), (B, 11), (C, 12)] {
+            slots.on_hook(&end(session, pid));
+        }
+        slots.pump();
+        topics_answered(&mut slots, &mut work);
+        assert!(
+            slots
+                .registry
+                .slots
+                .iter()
+                .all(|slot| slot.dead_since.is_some())
+        );
+        (slots, work)
+    }
+
+    /// Telegram took every topic call handed out (the dead icons), also
+    /// those the stalled dispatch of the setup holds: no view is busy; the
+    /// rest of the work is dropped.
+    fn topics_answered(slots: &mut Slots, work: &mut mpsc::UnboundedReceiver<(Work, Op)>) {
+        for view in slots
+            .registry
+            .slots
+            .iter_mut()
+            .flat_map(|slot| &mut slot.views)
+        {
+            view.busy = false;
+        }
+        slots.pump();
+        for _ in 0..8 {
+            let jobs: Vec<TopicJob> = all_work(work)
+                .into_iter()
+                .filter_map(|(job, _)| match job {
+                    Work::Topic(job) => Some(job),
+                    _ => None,
+                })
+                .collect();
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                slots.on_done(Done::Topic {
+                    job,
+                    delivery: Some(Ok(Outcome::Done)),
+                });
+            }
+            slots.pump();
+        }
+        panic!("topic calls never end");
+    }
+
+    fn cleaned(slots: &mut Slots, place: Place, delivery: Option<Delivery>) {
+        slots.on_done(Done::TopicCleaned { place, delivery });
+        slots.pump();
+    }
+
+    /// The pause after the last delete in `chat` is over.
+    fn pause_over(slots: &mut Slots, chat: Chat) {
+        slots.cleaning.insert(chat, (None, Instant::now()));
+    }
+
+    /// TASK-074: the hub tab counts what a cleanup takes (a topic the bot
+    /// may not delete is shown apart, a slot with no other is not taken);
+    /// 🧹 asks once more; the cleanup archives the slots, deletes their
+    /// topics one per chat after a pause each, and survives a restart; the
+    /// next session of the folder gets a new topic in its private chat.
+    #[tokio::test]
+    async fn a_cleanup_archives_dead_slots_and_deletes_their_topics() {
+        let dir = TempDir::new("slots-074-cleanup");
+        let (mut slots, mut work) = three_dead_slots(&dir);
+        let owner = private_owner();
+        let (private_700, private_701) = (Place::topic(owner, 700), Place::topic(owner, 701));
+        slots.on_control(menu_press(MENU, "menu:hb"));
+        let (text, keyboard) = last_menu_edit(&all_work(&mut work));
+        assert!(text.contains("Сессии: живых 0, завершённых 3"), "{text}");
+        assert!(text.contains("Темы: 4"), "{text}");
+        assert!(
+            text.contains("Завершены больше 30 дн. назад: слотов 0, тем 0"),
+            "{text}"
+        );
+        assert!(
+            !button_datas(&keyboard)
+                .iter()
+                .any(|d| d.starts_with("menu:hx"))
+        );
+
+        slots.on_control(menu_press(MENU, "menu:hd:0"));
+        let (text, keyboard) = last_menu_edit(&all_work(&mut work));
+        assert!(
+            text.contains("Мёртвые сейчас (дольше минуты): слотов 2, тем 2"),
+            "{text}"
+        );
+        assert!(text.contains("ещё 1 тем бот удалить не может"), "{text}");
+        assert!(button_datas(&keyboard).contains(&"menu:hx:0:2".to_owned()));
+
+        // A count that no longer holds arms nothing.
+        slots.on_control(menu_press(MENU, "menu:hx:0:3"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(CLEANUP_CHANGED.to_owned())]
+        );
+        slots.on_control(menu_press(MENU, "menu:hxc:0:2"));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(CLEANUP_CHANGED.to_owned())],
+            "not armed"
+        );
+        assert!(!slots.registry.slots[0].archived);
+
+        slots.on_control(menu_press(MENU, "menu:hx:0:2"));
+        let (_, keyboard) = last_menu_edit(&all_work(&mut work));
+        assert!(button_datas(&keyboard).contains(&"menu:hxc:0:2".to_owned()));
+        slots.on_control(menu_press(MENU, "menu:hxc:0:2"));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some("Уборка началась: тем 2".to_owned())]
+        );
+        let (text, _) = last_menu_edit(&handed);
+        assert!(text.contains("Уборка: осталось 2, удалено 0"), "{text}");
+        assert!(slots.registry.slots[0].archived && slots.registry.slots[1].archived);
+        assert!(!slots.registry.slots[2].archived, "its only topic stays");
+        assert_eq!(slots.registry.cleanup, [private_700, private_701]);
+        assert_eq!(
+            slots.registry.version,
+            crate::hub::registry::ARCHIVE_VERSION
+        );
+        assert_eq!(
+            slots.registry.slot_by_topic(Place::topic(Chat::GROUP, 100)),
+            None
+        );
+        assert!(slots.sessions_view(owner_chat(), 0).rows.is_empty());
+
+        // One delete per chat at a time.
+        slots.pump();
+        assert_eq!(topic_deletes(&all_work(&mut work)), [private_700]);
+        slots.pump();
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+
+        // A restart in the middle: the next hub goes on, makes no topic.
+        let saved: Registry =
+            serde_json::from_slice(&RegistryStore::encode(&slots.registry)).unwrap();
+        let restart_dir = TempDir::new("slots-074-cleanup-restart");
+        let store = RegistryStore::open(restart_dir.path()).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut again = Slots::new(saved, store, outbox, cleanup_options());
+        let mut again_work = capture_dispatch(&mut again);
+        again.pump();
+        let handed = all_work(&mut again_work);
+        assert_eq!(topic_deletes(&handed), [private_700]);
+        assert!(
+            !handed
+                .iter()
+                .any(|(_, op)| matches!(op, Op::CreateTopic { .. })),
+            "{handed:#?}"
+        );
+        drop(again);
+
+        // Deleted: the next waits for the chat's pause.
+        cleaned(&mut slots, private_700, Some(Ok(Outcome::Done)));
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+        assert!(slots.next_deadline() <= Instant::now() + Duration::from_secs(2));
+        pause_over(&mut slots, owner);
+        slots.pump();
+        assert_eq!(topic_deletes(&all_work(&mut work)), [private_701]);
+        // Gone already counts as deleted.
+        cleaned(
+            &mut slots,
+            private_701,
+            refused(400, "Bad Request: TOPIC_ID_INVALID"),
+        );
+        assert!(slots.registry.cleanup.is_empty());
+        assert_eq!(slots.cleaned, (2, 0));
+
+        // The next session of the folder takes slot 0 back: its private
+        // chat, one new topic; slot 1 stays without one.
+        slots.on_hook(&start(D, 13));
+        assert_eq!(slots.registry.sessions[D].slot, Some(SlotId(0)));
+        assert!(!slots.registry.slots[0].archived);
+        assert_eq!(slots.registry.slots[0].views, [View::new(owner)]);
+        slots.pump();
+        let creates: Vec<(SlotId, Chat)> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(job, _)| match job {
+                Work::Topic(TopicJob::Create { slot, chat, .. }) => Some((slot, chat)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, [(SlotId(0), owner)]);
+        // A late answer of a delete changes nothing.
+        cleaned(&mut slots, private_700, Some(Ok(Outcome::Done)));
+        assert_eq!(slots.cleaned, (2, 0));
+        assert!(slots.registry.cleanup.is_empty());
+    }
+
+    /// TASK-074: a delete Telegram could not do now goes again after the
+    /// pause; one it refuses is given up and counted.
+    #[tokio::test]
+    async fn a_cleaned_topic_delete_retries_or_gives_up() {
+        let dir = TempDir::new("slots-074-cleanup-refused");
+        let (mut slots, mut work) = menu_slot(&dir, cleanup_options());
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        topics_answered(&mut slots, &mut work);
+        slots.on_control(menu_press(MENU, "menu:hd:0"));
+        slots.on_control(menu_press(MENU, "menu:hx:0:1"));
+        slots.on_control(menu_press(MENU, "menu:hxc:0:1"));
+        slots.pump();
+        let place = Place::topic(private_owner(), 700);
+        assert_eq!(topic_deletes(&all_work(&mut work)), [place]);
+        cleaned(&mut slots, place, refused(502, "Bad Gateway"));
+        assert_eq!(slots.registry.cleanup, [place], "kept");
+        pause_over(&mut slots, private_owner());
+        slots.pump();
+        assert_eq!(topic_deletes(&all_work(&mut work)), [place]);
+        cleaned(&mut slots, place, None);
+        pause_over(&mut slots, private_owner());
+        slots.pump();
+        assert_eq!(topic_deletes(&all_work(&mut work)), [place]);
+        cleaned(
+            &mut slots,
+            place,
+            refused(400, "Bad Request: not enough rights to delete a topic"),
+        );
+        assert!(slots.registry.cleanup.is_empty());
+        assert_eq!(slots.cleaned, (0, 1));
+        pause_over(&mut slots, private_owner());
+        slots.pump();
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+    }
+
+    /// TASK-074: a cleanup never takes a slot dead less than the grace or
+    /// the chosen age, one with an open prompt or question, or one whose
+    /// topics the bot may not delete.
+    #[tokio::test]
+    async fn a_cleanup_leaves_young_and_asking_slots() {
+        let dir = TempDir::new("slots-074-cleanup-left");
+        let options = Options {
+            dead_grace: Duration::from_secs(60),
+            ..cleanup_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        connect(&mut slots, 1, A, Some(10));
+        slots.on_agent(permission(1, "abcde", "ls"));
+        let (answer, _answered) = oneshot::channel();
+        slots.on_question_ask(QuestionAsk {
+            post: question_post(A),
+            answer,
+        });
+        slots.pump();
+        topics_answered(&mut slots, &mut work);
+        // Ended, its asks still open until the next pump closes them (a
+        // nested run's question in the topic stays open that way).
+        slots.registry.sessions.get_mut(A).unwrap().ended = true;
+        let now = u64::try_from(unix_now()).unwrap();
+        slots.registry.slots[0].dead_since = Some(now - 5);
+        assert!(slots.cleanup_plan(0).0.is_empty(), "dead 5 s < 60 s");
+        slots.options.dead_grace = Duration::ZERO;
+        assert!(
+            slots.cleanup_plan(0).0.is_empty(),
+            "prompt and question open"
+        );
+        slots.close_prompts(&[A.to_owned()]);
+        assert!(
+            slots.cleanup_plan(0).0.is_empty(),
+            "the question still open"
+        );
+        for key in slots.questions.keys() {
+            slots.end_question(key, questions::State::Expired);
+        }
+        assert_eq!(slots.cleanup_plan(0), (vec![SlotId(0)], 1, 0));
+        assert!(slots.cleanup_plan(30).0.is_empty(), "younger than 30 days");
+        slots.registry.slots[0].dead_since = Some(now - 31 * 86_400);
+        assert_eq!(slots.cleanup_plan(30).0, [SlotId(0)]);
+        // Its private chat closed: no topic the bot may delete now.
+        let Chat::Private(private) = private_owner() else {
+            unreachable!()
+        };
+        slots.registry.closed.insert(private);
+        assert!(slots.cleanup_plan(0).0.is_empty());
     }
 }

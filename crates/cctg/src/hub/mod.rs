@@ -448,6 +448,9 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         }
     };
     let groups = groups::KnownGroups::default();
+    // Before the actor: the menu's «➕ Добавить устройство» asks the roster
+    // worker too (TASK-074).
+    let (roster_tx, roster_rx) = mpsc::unbounded_channel();
     let options = slots::Options {
         icons,
         can_delete,
@@ -467,6 +470,9 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         // removed one to revoke.
         allowlist: config.allowlist.clone(),
         devices: Some(devices.clone()),
+        // TASK-074: the devices tab's join line and the hub tab's 429s.
+        roster: Some(roster_tx.clone()),
+        floods: Some(api.floods()),
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
@@ -483,7 +489,6 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         Arc::new(commands::Asks(transcript_asks, Some(control_tx.clone()))),
         me.username.clone(),
     ));
-    let (roster_tx, roster_rx) = mpsc::unbounded_channel();
     tokio::spawn(roster::serve(
         roster_rx,
         outbox,

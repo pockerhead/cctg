@@ -47,6 +47,9 @@ const NO: &str = "n";
 pub enum Input {
     Command(Inbound),
     Press(CallbackInput),
+    /// «➕ Добавить устройство» of an owner's menu (TASK-074): a `/join`
+    /// answered into their private chat.
+    Join(PrivateChat),
 }
 
 /// Where the install script of a release is: `<RAW_BASE>/<tag>/install.sh`.
@@ -308,6 +311,15 @@ pub async fn serve(
                     )
                     .await;
                 }
+                Some(Input::Join(owner)) => {
+                    // The menu refused a member already.
+                    if !allowlist.is_owner(owner.expose()) {
+                        continue;
+                    }
+                    if let Some((key, message)) = on_join(&outbox, &devices, &join, Chat::Private(owner)).await {
+                        waiting.insert(key, (message, Instant::now() + CODE_TTL, owner));
+                    }
+                }
                 Some(Input::Press(press)) if !allowlist.is_owner(press.sender.expose()) => {
                     let answer = Op::AnswerCallback {
                         query_id: press.query_id,
@@ -567,7 +579,18 @@ fn render(listed: &[Listed], shared: SharedState, notice: Option<&str>, now: Sys
         ));
     }
     text.push('\n');
-    text.push_str(&match shared {
+    text.push_str(&shared_line(shared, now));
+    text.push_str(&format!(
+        "\n\nНовое устройство: /join здесь даёт строку установки с кодом на {} минут (или «cctg hub code» на машине hub, в Docker: docker compose exec hub cctg hub code; на устройстве install.sh --join КОД или cctg join КОД).",
+        CODE_TTL.as_secs() / 60
+    ));
+    text
+}
+
+/// What `/devices` and the devices tab of the menu (TASK-074) say about the
+/// shared secret.
+pub(crate) fn shared_line(shared: SharedState, now: SystemTime) -> String {
+    match shared {
         SharedState::Off => "Общий секрет hub (CCTG_HUB_SECRET) отключён.".to_owned(),
         SharedState::On(seen) => format!(
             "Общий секрет hub (CCTG_HUB_SECRET) принимается; {}. Когда все устройства получат свои секреты, отключите его: CCTG_SHARED_SECRET=off в hub.env и перезапуск hub.",
@@ -576,16 +599,11 @@ fn render(listed: &[Listed], shared: SharedState, notice: Option<&str>, now: Sys
                 None => "с запуска hub с ним не входили".to_owned(),
             }
         ),
-    });
-    text.push_str(&format!(
-        "\n\nНовое устройство: /join здесь даёт строку установки с кодом на {} минут (или «cctg hub code» на машине hub, в Docker: docker compose exec hub cctg hub code; на устройстве install.sh --join КОД или cctg join КОД).",
-        CODE_TTL.as_secs() / 60
-    ));
-    text
+    }
 }
 
 /// «только что», «5 мин назад», «3 ч назад», «2 дн назад».
-fn ago(now: SystemTime, at: SystemTime) -> String {
+pub(crate) fn ago(now: SystemTime, at: SystemTime) -> String {
     let secs = now.duration_since(at).map_or(0, |since| since.as_secs());
     match secs {
         0..60 => "только что".to_owned(),
@@ -1081,6 +1099,74 @@ mod tests {
         assert_eq!(devices.owner(&side_box.id), None);
     }
 
+    /// TASK-074: «➕ Добавить устройство» of an owner's menu is a `/join`
+    /// into their private chat: the line, the used edit and the owner; a
+    /// member's (refused by the menu already) gets nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_menu_join_answers_in_the_owners_private_chat() {
+        let dir = TempDir::new("roster-menu-join");
+        let devices = Devices::open(dir.path(), None).unwrap();
+        let fake = Arc::new(Fake::default());
+        let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
+        let scheduler = tokio::spawn(scheduler.run());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(serve(
+            rx,
+            outbox,
+            devices.clone(),
+            join_info(),
+            Some("cctg_bot".into()),
+            allowlist(),
+        ));
+        let ops = || fake.0.lock().unwrap().clone();
+        let owner = PrivateChat::of_user(OWNER);
+        tx.send(Input::Join(PrivateChat::of_user(MEMBER))).unwrap();
+        tx.send(Input::Join(owner)).unwrap();
+        let (chat, html) = loop {
+            let sent = ops().into_iter().find_map(|op| match op {
+                Op::Send {
+                    chat,
+                    thread_id: None,
+                    html: Some(html),
+                    ..
+                } => Some((chat, html)),
+                _ => None,
+            });
+            if let Some(sent) = sent {
+                break sent;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert_eq!(chat, Chat::Private(owner));
+        let line = html
+            .split("<pre>")
+            .nth(1)
+            .and_then(|rest| rest.split("</pre>").next())
+            .unwrap()
+            .to_owned();
+        let code = line.rsplit(' ').next().unwrap();
+        let enrolled = devices.join(code, "menu box").unwrap();
+        while ops().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(tx);
+        worker.await.unwrap();
+        scheduler.await.unwrap();
+        let ops = ops();
+        let [
+            Op::Send { .. },
+            Op::Edit {
+                chat: edited, text, ..
+            },
+        ] = ops.as_slice()
+        else {
+            panic!("{ops:?}");
+        };
+        assert_eq!(*edited, Chat::Private(owner));
+        assert!(text.contains("использован"), "{text}");
+        assert_eq!(devices.owner(&enrolled.id), Some(owner));
+    }
+
     /// TASK-081: a member's `/join` and `/devices` get one refusal and no
     /// code; their press revokes nothing, also under an owner's list.
     #[tokio::test(start_paused = true)]
@@ -1176,6 +1262,7 @@ mod tests {
                 name: "Ж".repeat(NAME_LIMIT),
                 joined: now,
                 seen: Some(now - Duration::from_secs(90_000)),
+                owner: None,
             })
             .collect();
         let text = render(

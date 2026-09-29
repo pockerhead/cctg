@@ -5,8 +5,10 @@
 //! of its URL before it leaves this module, and response bodies are decoded by
 //! hand, so no error value can carry the token.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
@@ -308,6 +310,51 @@ pub struct Document {
     pub caption: Option<String>,
 }
 
+/// How far back [`Floods`] counts.
+pub const FLOOD_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// Flood answers [`Floods`] remembers at most; the oldest go first.
+const MAX_FLOODS: usize = 4096;
+
+/// The 429 answers of the last [`FLOOD_WINDOW`] (TASK-074: the Hub tab of
+/// the menu shows them). Cheap to clone: the clones share the count.
+#[derive(Clone, Default)]
+pub struct Floods(Arc<Mutex<VecDeque<Instant>>>);
+
+impl fmt::Debug for Floods {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Floods { .. }")
+    }
+}
+
+impl Floods {
+    /// One more 429 at `now`.
+    pub fn note(&self, now: Instant) {
+        let mut floods = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        forget_old(&mut floods, now);
+        if floods.len() >= MAX_FLOODS {
+            floods.pop_front();
+        }
+        floods.push_back(now);
+    }
+
+    /// The 429 answers of the [`FLOOD_WINDOW`] before `now`.
+    pub fn count(&self, now: Instant) -> usize {
+        let mut floods = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        forget_old(&mut floods, now);
+        floods.len()
+    }
+}
+
+/// Drops the marks older than [`FLOOD_WINDOW`] before `now`.
+fn forget_old(floods: &mut VecDeque<Instant>, now: Instant) {
+    while floods
+        .front()
+        .is_some_and(|at| now.saturating_duration_since(*at) > FLOOD_WINDOW)
+    {
+        floods.pop_front();
+    }
+}
+
 /// Bot API client of one bot; every call names its [`Chat`], which carries
 /// its id (TASK-061, TASK-069).
 pub struct BotApi {
@@ -316,6 +363,8 @@ pub struct BotApi {
     base: String,
     /// `<api>/file/bot<token>`, for downloads; never logged either.
     file_base: String,
+    /// The 429 answers of every call (TASK-074).
+    floods: Floods,
 }
 
 impl fmt::Debug for BotApi {
@@ -350,7 +399,25 @@ impl BotApi {
             http,
             base: format!("{api_url}/bot{}", token.expose()),
             file_base: format!("{api_url}/file/bot{}", token.expose()),
+            floods: Floods::default(),
         })
+    }
+
+    /// The count of this client's 429 answers (TASK-074).
+    pub fn floods(&self) -> Floods {
+        self.floods.clone()
+    }
+
+    /// `result` as it is, a flood answer counted: `RetryAfter`, or a 429
+    /// that came without a JSON body (a proxy's page, a file download).
+    fn noted<T>(&self, result: Result<T, ApiError>) -> Result<T, ApiError> {
+        if matches!(
+            result,
+            Err(ApiError::RetryAfter(_) | ApiError::Telegram { code: 429, .. })
+        ) {
+            self.floods.note(Instant::now());
+        }
+        result
     }
 
     /// The Bot API `chat_id` of `chat`; only request bodies carry it.
@@ -565,7 +632,7 @@ impl BotApi {
             .send()
             .await
             .map_err(ApiError::http)?;
-        let messages: Vec<Message> = decode(response).await?;
+        let messages: Vec<Message> = self.noted(decode(response).await)?;
         Ok(messages.into_iter().next().unwrap_or_default())
     }
 
@@ -600,7 +667,7 @@ impl BotApi {
             .send()
             .await
             .map_err(ApiError::http)?;
-        decode(response).await
+        self.noted(decode(response).await)
     }
 
     /// `getFile`: where a file of a message can be downloaded.
@@ -629,10 +696,10 @@ impl BotApi {
             .map_err(ApiError::http)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(ApiError::Telegram {
+            return self.noted(Err(ApiError::Telegram {
                 code: i64::from(status.as_u16()),
                 description: "file download failed".to_owned(),
-            });
+            }));
         }
         if response
             .content_length()
@@ -771,7 +838,7 @@ impl BotApi {
             request = request.timeout(timeout);
         }
         let response = request.send().await.map_err(ApiError::http)?;
-        decode(response).await
+        self.noted(decode(response).await)
     }
 }
 
@@ -1127,6 +1194,45 @@ mod tests {
             }
         });
         (url, seen)
+    }
+
+    /// TASK-074: the window forgets old marks and holds at most its cap.
+    #[test]
+    fn floods_count_the_last_day_up_to_a_cap() {
+        let floods = Floods::default();
+        let start = Instant::now();
+        assert_eq!(floods.count(start), 0);
+        floods.note(start);
+        floods.note(start + Duration::from_secs(3600));
+        assert_eq!(floods.count(start + Duration::from_secs(3600)), 2);
+        let later = start + FLOOD_WINDOW + Duration::from_secs(1);
+        assert_eq!(floods.count(later), 1, "the first is older than a day");
+        let shared = floods.clone();
+        for _ in 0..MAX_FLOODS + 10 {
+            shared.note(later);
+        }
+        assert_eq!(floods.count(later), MAX_FLOODS, "clones share the count");
+        assert_eq!(format!("{floods:?}"), "Floods { .. }");
+    }
+
+    /// TASK-074: a flood answer counts, with or without a JSON body; other
+    /// answers do not.
+    #[test]
+    fn only_flood_answers_are_counted() {
+        let api = test_api("http://127.0.0.1:9");
+        let floods = api.floods();
+        let _ = api.noted::<()>(Err(ApiError::RetryAfter(Duration::from_secs(3))));
+        let _ = api.noted::<()>(Err(ApiError::Telegram {
+            code: 429,
+            description: "non-JSON error response".into(),
+        }));
+        assert_eq!(floods.count(Instant::now()), 2);
+        let _ = api.noted::<()>(Err(ApiError::Telegram {
+            code: 400,
+            description: "Bad Request".into(),
+        }));
+        let _ = api.noted(Ok(()));
+        assert_eq!(floods.count(Instant::now()), 2);
     }
 
     fn test_api(url: &str) -> BotApi {
