@@ -33624,7 +33624,8 @@ again"
             mention_contents(&first),
             [
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-                 Анна: [фото]\n(конец истории)\n\nИван: @cctg_bot глянь"
+                 Анна: [фото]\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nИван: глянь"
             ]
         );
         // Another photo of Анна's, no album, kept: the same placeholder.
@@ -33639,17 +33640,14 @@ again"
         slots.pump();
         fetched(&mut slots, &mut done).await;
         slots.pump();
-        let later = got(&mut agent);
-        assert_eq!(later.files.len(), 1, "q alone: {:?}", later.files);
-        assert!(
-            later.files[0].ends_with("Анна: @cctg_bot вот"),
-            "{:?}",
-            later.files
-        );
-        assert!(
-            later.files[0].contains("Анна: [фото]"),
-            "the other photo stays in the history: {:?}",
-            later.files
+        // q alone, the other photo still in its history.
+        assert_eq!(
+            got(&mut agent).files,
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Анна: [фото]\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nАнна: вот"
+            ]
         );
         assert!(slots.registry.slots[0].buffer.messages.is_empty());
     }
@@ -33744,7 +33742,8 @@ again"
             mention_contents(&got1),
             [
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-              Иван: решили\n(конец истории)\n\nАнна: @cctg_bot смотри"
+                 Иван: решили\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nАнна: смотри"
             ]
         );
         assert!(slots.registry.slots[0].buffer.messages.is_empty());
