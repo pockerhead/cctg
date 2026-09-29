@@ -1891,6 +1891,10 @@ pub struct Slots {
     /// most [`MAX_FALLBACK_ENDED`] (TASK-072): a message there is answered
     /// with [`FALLBACK_END_NOTICE`].
     fallback_ended: VecDeque<Place>,
+    /// The group copies of prompts and questions moved out of an ended
+    /// fallback topic, newest last, at most [`MAX_FALLBACK_ENDED`]
+    /// (TASK-072): a press on one counts for the ask it was.
+    moved: VecDeque<(MessageKey, Asked)>,
     /// Prompts and questions lost in a private chat, by the dispatch number
     /// of the lost send, until they went again or ended (TASK-063).
     again: HashMap<u64, Lost>,
@@ -2077,6 +2081,7 @@ impl Slots {
             closed_told: HashSet::new(),
             foreign_told: HashMap::new(),
             fallback_ended: VecDeque::new(),
+            moved: VecDeque::new(),
             again: HashMap::new(),
             unlanded: HashMap::new(),
             lost_messages: VecDeque::new(),
@@ -7411,6 +7416,11 @@ impl Slots {
             Some(Asked::Question(key)) => Some(key),
             _ => None,
         });
+        // The group copy of a question moved into the private chat (TASK-072).
+        let found = found.or_else(|| match self.moved_ask(input.message()) {
+            Some(Asked::Question(key)) => Some(key),
+            _ => None,
+        });
         let Some(key) = found else {
             debug!("button of a question this hub does not know");
             return Some(questions::ANSWER_STALE);
@@ -8061,6 +8071,12 @@ impl Slots {
             });
         // The kept twin of a prompt lost in a private chat (TASK-063).
         let found = found.or_else(|| match self.adopt_pressed(input) {
+            Some(Asked::Prompt(key)) => Some(key),
+            _ => None,
+        });
+        // The group copy of a prompt moved into the private chat, pressed
+        // before its edit took the buttons (TASK-072).
+        let found = found.or_else(|| match self.moved_ask(input.message()) {
             Some(Asked::Prompt(key)) => Some(key),
             _ => None,
         });
@@ -10857,16 +10873,21 @@ impl Slots {
     }
 
     /// Group topic `place` stopped being a view of its slot (the end of a
-    /// fallback view, TASK-072): every active prompt and open question
-    /// shown there goes again into the slot's primary topic, and its copy
-    /// there loses the buttons. One whose send there is still in flight
-    /// moves once Telegram answered it ([`Self::moves_home`]).
+    /// fallback view, TASK-072): every prompt there that still waits for an
+    /// answer (one answered in the terminal stays as it is) and every open
+    /// question goes again into the slot's primary topic, and its copy there
+    /// loses the buttons; a press on the copy still counts. One whose send
+    /// there is still in flight moves once Telegram answered it
+    /// ([`Self::moves_home`]).
     fn move_asks_home(&mut self, place: Place) {
         for key in self.prompts.active() {
             let shown = self
                 .prompts
                 .get(key)
-                .filter(|prompt| prompt.place == Some(place))
+                .filter(|prompt| {
+                    prompt.place == Some(place)
+                        && (prompt.waits || matches!(prompt.state, State::Selected { .. }))
+                })
                 .and_then(|prompt| {
                     prompt
                         .message()
@@ -10874,7 +10895,7 @@ impl Slots {
                 });
             if let Some((message, text)) = shown {
                 self.prompts.unsend(key);
-                self.moved_copy(message, text);
+                self.moved_copy(message, text, Asked::Prompt(key));
                 info!("permission prompt of an ended fallback topic goes into the private chat");
             }
         }
@@ -10894,32 +10915,47 @@ impl Slots {
             ask.message_id = None;
             ask.editing = false;
             ask.retry = false;
-            self.moved_copy(message, text);
+            self.moved_copy(message, text, Asked::Question(key));
             info!("question of an ended fallback topic goes into the private chat");
         }
     }
 
-    /// A prompt or question sent into `place` whose topic is an ended
-    /// fallback view (it was on its way as the view ended, TASK-072).
+    /// Topic `place` is an ended fallback view: the asks that were on their
+    /// way into it as it ended go on in the private chat (TASK-072).
     fn moves_home(&self, place: Option<Place>) -> bool {
         place.is_some_and(|place| {
             self.fallback_ended.contains(&place) && self.registry.slot_by_topic(place).is_none()
         })
     }
 
-    /// The copy of a moved prompt or question, `message`, shows `text`
-    /// with [`MOVED_MARK`] and no buttons.
-    fn moved_copy(&mut self, message: MessageKey, text: String) {
+    /// The copy of moved prompt or question `asked`, `message`, shows `text`
+    /// with [`MOVED_MARK`] and no buttons; until then a press on it counts
+    /// for `asked` ([`Self::moved_ask`]).
+    fn moved_copy(&mut self, message: MessageKey, text: String, asked: Asked) {
+        if self.moved.len() >= MAX_FALLBACK_ENDED {
+            self.moved.pop_front();
+        }
+        self.moved.push_back((message, asked));
+        let room = transcript::TELEGRAM_TEXT_LIMIT - telegram_len(MOVED_MARK);
         self.hand_off(
             Work::Callback,
             Op::Edit {
                 chat: message.chat,
                 message_id: message.id,
-                text: format!("{text}{MOVED_MARK}"),
+                text: format!("{}{MOVED_MARK}", cut(&text, room)),
                 reply_markup: Some(permissions::no_keyboard()),
                 background: false,
             },
         );
+    }
+
+    /// The moved prompt or question whose group copy `message` is.
+    fn moved_ask(&self, message: Option<MessageKey>) -> Option<Asked> {
+        let message = message?;
+        self.moved
+            .iter()
+            .find(|(copy, _)| *copy == message)
+            .map(|(_, asked)| *asked)
     }
 
     /// The fallback view of `slot`, out of the registry, waits for its
@@ -10971,6 +11007,9 @@ impl Slots {
                     self.retire(MessageKey::new(view.chat, status.message_id), status.pinned);
                 }
                 if let Some(place) = view.place() {
+                    // Also what landed there while it was held for the
+                    // picker (TASK-072).
+                    self.move_asks_home(place);
                     self.end_group_topic(place, FALLBACK_END_NOTICE);
                     if self.fallback_ended.len() >= MAX_FALLBACK_ENDED {
                         self.fallback_ended.pop_front();
@@ -27932,6 +27971,142 @@ again"
             None,
             "the group copy is no longer the prompt"
         );
+    }
+
+    /// A private-only slot whose private chat closed: its prompt went to the
+    /// fallback group topic 100 as message 1500. The prompt's key.
+    fn fallback_prompt_shown(
+        slots: &mut Slots,
+        work: &mut mpsc::UnboundedReceiver<(Work, Op)>,
+    ) -> u64 {
+        let owner = private_owner();
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        slots.close_chat(owner);
+        slots.pump();
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        connect(slots, 1, A, Some(10));
+        slots.pump();
+        let _ = all_work(work);
+        slots.on_agent(permission(1, "abcde", "ls"));
+        let before = slots.handed;
+        slots.pump();
+        let seq = all_work(work)
+            .into_iter()
+            .enumerate()
+            .find_map(|(n, (job, _))| {
+                matches!(job, Work::Permission(_)).then(|| before + 1 + n as u64)
+            })
+            .expect("the prompt goes to the group");
+        let key = slots.prompts.active()[0];
+        slots.on_done(Done::Permission {
+            key,
+            seq,
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 1500,
+                ..Message::default()
+            }))),
+        });
+        slots.pump();
+        key
+    }
+
+    /// TASK-072 (code review round 2, finding 1): a prompt answered in the
+    /// terminal (the turn ended: it no longer waits, it stays active as
+    /// every such prompt does) does not come again into the private chat
+    /// when the fallback topic ends.
+    #[tokio::test]
+    async fn a_prompt_answered_in_the_terminal_does_not_come_again_at_start() {
+        let dir = TempDir::new("slots-072-quiet-prompt");
+        let mut slots = stalled_slots(&dir, private_only_options());
+        let mut work = capture_dispatch(&mut slots);
+        let key = fallback_prompt_shown(&mut slots, &mut work);
+        slots.on_hook(&stop(A, Some("готово")));
+        slots.pump();
+        assert!(slots.prompts.get(key).is_some_and(|prompt| !prompt.waits));
+        let _ = all_work(&mut work);
+        slots.reopen(private_owner());
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(
+            !handed
+                .iter()
+                .any(|(job, _)| matches!(job, Work::Permission(_))),
+            "{handed:#?}"
+        );
+    }
+
+    /// TASK-072 (code review round 2, finding 2): Allow pressed on the
+    /// group copy of a moved prompt before its edit took the buttons counts
+    /// for the live prompt; it goes into the private chat without buttons.
+    #[tokio::test]
+    async fn a_press_on_the_moved_group_copy_decides_the_prompt() {
+        let dir = TempDir::new("slots-072-moved-press");
+        let mut slots = stalled_slots(&dir, private_only_options());
+        let mut work = capture_dispatch(&mut slots);
+        let key = fallback_prompt_shown(&mut slots, &mut work);
+        slots.reopen(private_owner());
+        slots.on_control(press_in(Chat::GROUP, 100, 1500, "allow:abcde"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        let answers: Vec<Option<String>> = handed
+            .iter()
+            .filter_map(|(_, op)| match op {
+                Op::AnswerCallback { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        // The stalled link cannot take the verdict now: it goes once it can.
+        assert_eq!(answers, [Some(permissions::ANSWER_OFFLINE.to_owned())]);
+        assert!(matches!(
+            slots.prompts.get(key).map(|prompt| prompt.state),
+            Some(State::Selected {
+                behavior: Behavior::Allow,
+                ..
+            })
+        ));
+        let again: Vec<(Option<Place>, bool)> = handed
+            .iter()
+            .filter(|(job, _)| matches!(job, Work::Permission(_)))
+            .map(|(_, op)| match op {
+                Op::Send {
+                    chat,
+                    thread_id,
+                    reply_markup,
+                    ..
+                } => (Some(Place::new(*chat, *thread_id)), reply_markup.is_some()),
+                other => (other.place(), true),
+            })
+            .collect();
+        assert_eq!(again, [(Some(Place::topic(private_owner(), 700)), false)]);
+    }
+
+    /// TASK-072 (code review round 2, finding 1): the group copy's text is
+    /// cut so that it and [`MOVED_MARK`] fit Telegram's limit.
+    #[tokio::test]
+    async fn the_moved_copy_fits_the_limit() {
+        let dir = TempDir::new("slots-072-moved-cut");
+        let mut slots = stalled_slots(&dir, private_only_options());
+        let mut work = capture_dispatch(&mut slots);
+        slots.moved_copy(
+            MessageKey::new(Chat::GROUP, 1500),
+            "я".repeat(transcript::TELEGRAM_TEXT_LIMIT),
+            Asked::Question(0),
+        );
+        let texts: Vec<String> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(_, op)| match op {
+                Op::Edit { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].ends_with(MOVED_MARK));
+        assert!(telegram_len(&texts[0]) <= transcript::TELEGRAM_TEXT_LIMIT);
     }
 
     /// TASK-072 (review 2 of TASK-063, finding 6): after a hub restart a
