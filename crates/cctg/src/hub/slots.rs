@@ -3900,6 +3900,22 @@ impl Slots {
     /// slot's session.
     fn take_in(&mut self, slot: SlotId, place: Place, thread_id: i64, input: Inbound) {
         let key = input.key();
+        // A message that addresses the agent (TASK-080) in a group the slot
+        // is shared to from its owner's private chat (TASK-077's mentions,
+        // in either mode; never the slot's own group topic, a fallback view
+        // or a group-only hub): marked, and without the bot's name, which
+        // the session does not know as its own.
+        let mention_of = self
+            .options
+            .mentions
+            .as_ref()
+            .filter(|bot| {
+                matches!(place.chat, Chat::Group(_))
+                    && self.owner_of(slot).is_some()
+                    && self.registry.shared(slot, place.chat)
+                    && mentioned(bot, &input)
+            })
+            .map(|bot| bot.username.clone());
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
             (None, Some(media)) => {
@@ -3948,6 +3964,10 @@ impl Slots {
             self.gather(slot, key);
         }
         let history = self.take_history(slot, place);
+        let text = match &mention_of {
+            Some(username) => mention::unmention(&text, username),
+            None => text,
+        };
         self.park(
             slot,
             Parked {
@@ -3961,6 +3981,7 @@ impl Slots {
                 file,
                 from_name: input.from_name,
                 history,
+                mention: mention_of.is_some(),
             },
         );
         self.flush(slot);
@@ -5026,8 +5047,9 @@ impl Slots {
     /// id is its user's, TASK-061), `message_id`, `thread_id`,
     /// `reply_to_message_id` for
     /// an explicit reply, `target_agent` for a reply to a block of its
-    /// subagent, `forwarded` for a forward and `from_name` for a team
-    /// member's message (TASK-036).
+    /// subagent, `forwarded` for a forward, `from_name` for a team
+    /// member's message (TASK-036) and `mention` for a group message that
+    /// addresses the agent (TASK-080).
     fn inbound_meta(&self, session: &str, parked: &Parked) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::from([
             ("place".to_owned(), parked.chat.label().to_owned()),
@@ -5036,6 +5058,9 @@ impl Slots {
         ]);
         if parked.forwarded {
             meta.insert("forwarded".to_owned(), "true".to_owned());
+        }
+        if parked.mention {
+            meta.insert("mention".to_owned(), "true".to_owned());
         }
         if let Some(name) = &parked.from_name {
             meta.insert("from_name".to_owned(), name.clone());
@@ -5100,7 +5125,8 @@ impl Slots {
     /// replying to the same message, see [`Self::burst`]):
     /// [`Self::inbound_meta`] of the last one (its channel record turns them
     /// all ✍), `message_ids` of all in order when there are several,
-    /// `forwarded` only when every one is a forward and `from_name` only
+    /// `forwarded` only when every one is a forward, `mention` when any one
+    /// addresses the agent (the content marks which) and `from_name` only
     /// when one person wrote every part (the content names each part's
     /// author). One part: exactly its own meta.
     fn burst_meta(&self, session: &str, parts: &[Parked]) -> BTreeMap<String, String> {
@@ -5112,6 +5138,9 @@ impl Slots {
             meta.insert("forwarded".to_owned(), "true".to_owned());
         } else {
             meta.remove("forwarded");
+        }
+        if parts.iter().any(|parked| parked.mention) {
+            meta.insert("mention".to_owned(), "true".to_owned());
         }
         if parts
             .iter()
@@ -25630,6 +25659,7 @@ again"
             file: None,
             from_name: None,
             history: None,
+            mention: false,
         };
         for (chat, label) in [(Chat::GROUP, "group"), (private, "private")] {
             let meta = slots.burst_meta(A, &[parked(chat, 5), parked(chat, 6)]);
@@ -25643,6 +25673,20 @@ again"
                 assert!(!value.contains("1000000000001"), "{meta:?}");
             }
         }
+        // TASK-080: `mention` when a part of the burst addresses the agent.
+        let mention = |message_id| Parked {
+            mention: true,
+            ..parked(Chat::GROUP, message_id)
+        };
+        for parts in [
+            vec![mention(5)],
+            vec![mention(5), parked(Chat::GROUP, 6)],
+            vec![parked(Chat::GROUP, 5), mention(6)],
+        ] {
+            assert_eq!(slots.burst_meta(A, &parts)["mention"], "true");
+        }
+        let meta = slots.burst_meta(A, &[parked(Chat::GROUP, 5), parked(Chat::GROUP, 6)]);
+        assert!(!meta.contains_key("mention"), "{meta:?}");
     }
     // ---------------------------------------------- TASK-062 plan review
 
@@ -31561,11 +31605,12 @@ again"
             [
                 "(история темы группы с прошлого обращения к вам: 3 сообщения)\n\
               Анна: где логи?\n\n---\n\nИван: в /var/log\n\n---\n\nАнна: ок\n(конец истории)\n\n\
-              Иван: @CCTG_Bot глянь"
+              (обращение к вам из группы, где открыта эта сессия)\nИван: глянь"
             ]
         );
         let meta = &got13.inbounds[0].1;
         assert_eq!(meta["message_id"], "13");
+        assert_eq!(meta["mention"], "true", "TASK-080");
         assert!(!meta.contains_key("history"), "{meta:?}");
         assert!(backlog_of(&slots).is_empty());
         let handed = all_work(&mut work);
@@ -31577,24 +31622,43 @@ again"
         slots.on_control(group_by(14, "ещё", "Анна", None));
         slots.on_control(group_by(15, "и это", "Иван", Some(BOT_ID)));
         slots.pump();
+        let got15 = got(&mut agent);
         assert_eq!(
-            mention_contents(&got(&mut agent)),
+            mention_contents(&got15),
             [
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-              Анна: ещё\n(конец истории)\n\nИван: и это"
+              Анна: ещё\n(конец истории)\n\n\
+              (обращение к вам из группы, где открыта эта сессия)\nИван: и это"
             ]
         );
-        // The next mention has no history.
-        slots.on_control(group_by(16, "@cctg_bot и всё", "Анна", None));
+        assert_eq!(got15.inbounds[0].1["mention"], "true");
+        // The next mention has no history (TASK-080: the user's report).
+        slots.on_control(group_by(
+            16,
+            "Так ну чо дальше делаем @cctg_bot",
+            "pockerhead",
+            None,
+        ));
         slots.pump();
+        let got16 = got(&mut agent);
         assert_eq!(
-            mention_contents(&got(&mut agent)),
-            ["Анна: @cctg_bot и всё"]
+            mention_contents(&got16),
+            ["(обращение к вам из группы, где открыта эта сессия)\n\
+              pockerhead: Так ну чо дальше делаем"]
+        );
+        assert_eq!(got16.inbounds[0].1["mention"], "true");
+        let echo = sends_into(&all_work(&mut work), private_700());
+        assert!(
+            echo.iter()
+                .any(|text| text.ends_with("pockerhead: Так ну чо дальше делаем @cctg_bot")),
+            "the echo keeps the words: {echo:?}"
         );
         // The owner's private messages go as before.
         slots.on_control(owner_says(Some(700), 5002, "привет"));
         slots.pump();
-        assert_eq!(mention_contents(&got(&mut agent)), ["привет"]);
+        let got_private = got(&mut agent);
+        assert_eq!(mention_contents(&got_private), ["привет"]);
+        assert!(!got_private.inbounds[0].1.contains_key("mention"));
     }
 
     /// (г) (д): a history over the limit waits at the front of the buffer
@@ -31644,7 +31708,8 @@ again"
             mention_contents(&got(&mut agent)),
             [
                 "(история темы группы с прошлого обращения к вам: 3 сообщения, сжато)\n\
-                 Анна трижды написала длинно\n(конец истории)\n\nИван: @cctg_bot итог?",
+                 Анна трижды написала длинно\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nИван: итог?",
                 "после",
             ]
         );
@@ -31802,6 +31867,54 @@ again"
         );
     }
 
+    /// TASK-080 review: only a group the slot is shared to marks a mention.
+    /// In a group-only slot's own topic and in a fallback view, a reply to
+    /// the bot and an `@bot` text go as written, without `mention`.
+    #[tokio::test]
+    async fn a_mention_outside_a_shared_group_topic_is_not_marked() {
+        let unmarked = |got: Got, want: &[&str]| {
+            assert_eq!(mention_contents(&got), want, "{want:?}");
+            for (content, meta) in &got.inbounds {
+                assert!(!content.contains(buffer::MENTION_MARK), "{content}");
+                assert!(!meta.contains_key("mention"), "{meta:?}");
+            }
+        };
+        // A group-only slot: the group topic is its own.
+        let dir = TempDir::new("slots-mention-own-group");
+        let mut slots = stalled_slots(
+            &dir,
+            Options {
+                mentions: mention_options().mentions,
+                ..message_options()
+            },
+        );
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
+        let mut agent = mention_agent(&mut slots, 1, 64, false);
+        slots.pump();
+        let _ = got(&mut agent);
+        // Its own group view counts as shared: the owner check decides.
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
+        slots.on_control(group_by(10, "и это", "Анна", Some(BOT_ID)));
+        slots.pump();
+        unmarked(got(&mut agent), &["Анна: и это"]);
+        slots.on_control(group_by(11, "@cctg_bot глянь", "Анна", Some(BOT_ID)));
+        slots.pump();
+        unmarked(got(&mut agent), &["Анна: @cctg_bot глянь"]);
+        // A fallback view of a private slot in the group: its owner's
+        // private chat is closed (a usable one would end the fallback).
+        let dir = TempDir::new("slots-mention-fallback");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        slots.registry.closed.insert(owner_chat());
+        slots.registry.slots[0].views[1].fallback = true;
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
+        slots.on_control(group_by(10, "@cctg_bot глянь", "Анна", Some(BOT_ID)));
+        slots.pump();
+        unmarked(got(&mut agent), &["Анна: @cctg_bot глянь"]);
+    }
+
     /// (з): the owner switches the group topic to every message and back in
     /// the menu; the first message after the switch takes the history.
     #[tokio::test]
@@ -31843,6 +31956,15 @@ again"
                 "Иван: второе",
             ]
         );
+        // TASK-080: in this mode too, only a mention is marked.
+        slots.on_control(group_by(20, "@cctg_bot, а ты что скажешь?", "Иван", None));
+        slots.pump();
+        let got20 = got(&mut agent);
+        assert_eq!(
+            mention_contents(&got20),
+            ["(обращение к вам из группы, где открыта эта сессия)\nИван: а ты что скажешь?"]
+        );
+        assert_eq!(got20.inbounds[0].1["mention"], "true");
         assert_eq!(
             slots.press_menu_slot(owner_chat(), SlotAction::Mentions, 0, None),
             menu::ANSWER_SAVED
@@ -31938,7 +32060,8 @@ again"
             got.files,
             [
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-              Анна: [фото] схема\n(конец истории)\n\nАнна: @cctg_bot смотри"
+              Анна: [фото] схема\n(конец истории)\n\n\
+              (обращение к вам из группы, где открыта эта сессия)\nАнна: смотри"
             ]
         );
     }
@@ -32004,7 +32127,7 @@ again"
             [
                 "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
                  Анна: [фото]\n\n---\n\nИван: решили: релиз в пятницу\n(конец истории)\n\n\
-                 Анна: @cctg_bot смотри все",
+                 (обращение к вам из группы, где открыта эта сессия)\nАнна: смотри все",
                 "Анна:",
                 "Анна:",
             ]
@@ -32036,7 +32159,7 @@ again"
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
                  Иван: а вот ещё\n(конец истории)\n\nАнна:",
                 "Анна:",
-                "Анна: @cctg_bot и эти",
+                "(обращение к вам из группы, где открыта эта сессия)\nАнна: и эти",
             ]
         );
         assert!(inbounds.is_empty());
@@ -32068,7 +32191,8 @@ again"
             mention_contents(&got),
             [
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-                 Иван: решили: релиз в пятницу\n(конец истории)\n\nАнна: @cctg_bot смотри"
+                 Иван: решили: релиз в пятницу\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nАнна: смотри"
             ]
         );
         assert!(slots.registry.slots[0].buffer.messages.is_empty());
@@ -32104,7 +32228,8 @@ again"
             mention_contents(&got(&mut agent)),
             [
                 "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-                 Иван: решили\n(конец истории)\n\nАнна: @cctg_bot смотри"
+                 Иван: решили\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nАнна: смотри"
             ]
         );
         assert!(slots.registry.slots[0].buffer.messages.is_empty());

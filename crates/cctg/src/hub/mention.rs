@@ -47,22 +47,64 @@ fn word(c: char) -> bool {
 /// `[A-Za-z0-9_]` right before the `@` (but for a `/command` there) or right
 /// after the name (`/cmd@bot` counts; `x@bot.com` and `@botx` do not).
 pub fn mentions(text: &str, username: &str) -> bool {
+    text.match_indices('@')
+        .any(|(at, _)| mention_at(text, at, username))
+}
+
+/// The `@` at byte `at` of `text` starts a mention of `username` (see
+/// [`mentions`]).
+fn mention_at(text: &str, at: usize, username: &str) -> bool {
     if username.is_empty() {
         return false;
     }
-    text.match_indices('@').any(|(at, _)| {
-        // No word right before, or a `/command` word.
-        let word_start = text[..at].trim_end_matches(word);
-        let before_ok = word_start.len() == at
-            || word_start
-                .strip_suffix('/')
-                .is_some_and(|before| before.chars().next_back().is_none_or(char::is_whitespace));
-        let rest = &text[at + 1..];
-        let name_ok = rest
-            .get(..username.len())
-            .is_some_and(|name| name.eq_ignore_ascii_case(username));
-        before_ok && name_ok && !rest[username.len()..].chars().next().is_some_and(word)
-    })
+    // No word right before, or a `/command` word.
+    let word_start = text[..at].trim_end_matches(word);
+    let before_ok = word_start.len() == at
+        || word_start
+            .strip_suffix('/')
+            .is_some_and(|before| before.chars().next_back().is_none_or(char::is_whitespace));
+    let rest = &text[at + 1..];
+    let name_ok = rest
+        .get(..username.len())
+        .is_some_and(|name| name.eq_ignore_ascii_case(username));
+    before_ok && name_ok && !rest[username.len()..].chars().next().is_some_and(word)
+}
+
+/// `text` without its mentions of `username` (TASK-080): the session does
+/// not know the bot's name; the content marks the message as addressed to
+/// it instead ([`crate::hub::buffer::MENTION_MARK`]). A `,` or `:` right
+/// after a mention that opens a phrase goes with it, and so do the spaces
+/// the cut would leave doubled or before a line end or a `.!?`. Only the
+/// whitespace around a cut goes: a cut at the start or end of the text
+/// takes the whitespace after or before it too.
+pub fn unmention(text: &str, username: &str) -> String {
+    if !mentions(text, username) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (at, _) in text.match_indices('@') {
+        if at < from || !mention_at(text, at, username) {
+            continue;
+        }
+        out.push_str(&text[from..at]);
+        let mut after = &text[at + 1 + username.len()..];
+        if out.chars().next_back().is_none_or(char::is_whitespace) {
+            after = after.strip_prefix([',', ':']).unwrap_or(after);
+            after = after.trim_start_matches([' ', '\t']);
+        }
+        if out.is_empty() {
+            after = after.trim_start();
+        }
+        if after.is_empty() {
+            out.truncate(out.trim_end().len());
+        } else if after.starts_with(['.', '!', '?', '\n', '\r']) {
+            out.truncate(out.trim_end_matches([' ', '\t']).len());
+        }
+        from = text.len() - after.len();
+    }
+    out.push_str(&text[from..]);
+    out
 }
 
 /// The group messages kept for the next mention, each as the session will
@@ -143,6 +185,7 @@ pub fn part(
         file: None,
         from_name: from_name.map(str::to_owned),
         history: None,
+        mention: false,
     }
     .content()
 }
@@ -231,6 +274,50 @@ mod tests {
         assert!(!mentions("@cctgы", bot));
         assert!(!mentions("@cctg_boы", bot));
         assert!(!mentions("@cctg_bot", ""));
+    }
+
+    /// TASK-080: the bot's name leaves the words the session reads.
+    #[test]
+    fn unmention_drops_the_name_and_keeps_the_phrase_readable() {
+        let bot = "cctg_cursor_bot";
+        for (text, want) in [
+            (
+                "Так ну чо дальше делаем @cctg_cursor_bot",
+                "Так ну чо дальше делаем",
+            ),
+            ("@cctg_cursor_bot сделай", "сделай"),
+            ("@CCTG_Cursor_Bot, сделай", "сделай"),
+            ("@cctg_cursor_bot: сделай", "сделай"),
+            ("эй, @cctg_cursor_bot, глянь", "эй, глянь"),
+            ("сделай @cctg_cursor_bot.", "сделай."),
+            ("сделай @cctg_cursor_bot?", "сделай?"),
+            ("привет@cctg_cursor_bot", "привет"),
+            ("/brief@cctg_cursor_bot 2", "/brief 2"),
+            ("@cctg_cursor_bot\nи ещё", "и ещё"),
+            // Only the whitespace around a cut goes.
+            ("делаем @cctg_cursor_bot\nи ещё", "делаем\nи ещё"),
+            ("делаем @cctg_cursor_bot\r\nи ещё", "делаем\r\nи ещё"),
+            ("  отступ\n@cctg_cursor_bot сделай", "  отступ\nсделай"),
+            ("сделай @cctg_cursor_bot\n\n", "сделай\n\n"),
+            ("сделай\n@cctg_cursor_bot", "сделай"),
+            ("\n  @cctg_cursor_bot  сделай", "\n  сделай"),
+            ("@cctg_cursor_bot", ""),
+            ("@cctg_cursor_bot и @cctg_cursor_bot", "и"),
+            // Not a mention: left as is.
+            (
+                "x@cctg_cursor_bot.com и @cctg_cursor_botx",
+                "x@cctg_cursor_bot.com и @cctg_cursor_botx",
+            ),
+            ("  без обращения  ", "  без обращения  "),
+            ("@другой_бот сделай", "@другой_бот сделай"),
+        ] {
+            assert_eq!(unmention(text, bot), want, "{text}");
+        }
+        assert_eq!(
+            unmention("x@cctg_cursor_bot.com @cctg_cursor_bot ок", bot),
+            "x@cctg_cursor_bot.com ок"
+        );
+        assert_eq!(unmention("@cctg_bot", ""), "@cctg_bot");
     }
 
     #[test]

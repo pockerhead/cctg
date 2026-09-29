@@ -95,6 +95,10 @@ pub struct Parked {
     /// read before this one (TASK-077).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<History>,
+    /// A group message that addresses the agent (TASK-080): `@<bot>` in its
+    /// words (taken out of `text`) or a reply to the bot's message.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mention: bool,
 }
 
 /// The kept group messages a mention takes along ([`crate::hub::mention`]).
@@ -162,6 +166,8 @@ impl History {
 
 /// Heads a forwarded message in the content the session reads.
 pub const FORWARDED: &str = "(переслано)";
+/// Heads a group message that addresses the agent (TASK-080).
+pub const MENTION_MARK: &str = "(обращение к вам из группы, где открыта эта сессия)";
 
 impl Parked {
     /// The topic it was written in.
@@ -181,7 +187,8 @@ impl Parked {
     }
 
     /// What the session reads: the group history block and a blank line
-    /// (TASK-077), the quoted words as `> ` lines and a blank line, then
+    /// (TASK-077), [`MENTION_MARK`] on its own line for a mention
+    /// (TASK-080), the quoted words as `> ` lines and a blank line, then
     /// `Name: ` of a team member (TASK-036), then [`FORWARDED`] on its own
     /// line for a forward, then the text.
     pub fn content(&self) -> String {
@@ -189,6 +196,10 @@ impl Parked {
         if let Some(history) = &self.history {
             content.push_str(&history.block());
             content.push_str("\n\n");
+        }
+        if self.mention {
+            content.push_str(MENTION_MARK);
+            content.push('\n');
         }
         if let Some(quote) = &self.quote {
             for line in quote.lines() {
@@ -352,6 +363,7 @@ mod tests {
             file: None,
             from_name: None,
             history: None,
+            mention: false,
         }
     }
 
@@ -527,6 +539,42 @@ mod tests {
         ] {
             assert_eq!(messages(n), word, "{n}");
         }
+    }
+
+    /// TASK-080: a mention is marked after the history block and before its
+    /// quote; a plain message has no mark and no `mention` key.
+    #[test]
+    fn a_mention_is_marked_as_addressed_to_the_session() {
+        let mention = Parked {
+            from_name: Some("Анна".into()),
+            text: "дальше что?".into(),
+            mention: true,
+            ..parked(3)
+        };
+        assert_eq!(
+            mention.content(),
+            "(обращение к вам из группы, где открыта эта сессия)\nАнна: дальше что?"
+        );
+        let with_all = Parked {
+            quote: Some("q".into()),
+            history: Some(history(HistoryState::Full, 0)),
+            ..mention.clone()
+        };
+        assert_eq!(
+            with_all.content(),
+            "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
+             Анна: a\n\n---\n\nИван: b\n(конец истории)\n\n\
+             (обращение к вам из группы, где открыта эта сессия)\n> q\n\nАнна: дальше что?"
+        );
+        assert!(!parked(1).content().contains(MENTION_MARK));
+        assert!(
+            !serde_json::to_string(&parked(1))
+                .unwrap()
+                .contains("mention")
+        );
+        let text = serde_json::to_string(&mention).unwrap();
+        assert!(text.contains(r#""mention":true"#), "{text}");
+        assert_eq!(serde_json::from_str::<Parked>(&text).unwrap(), mention);
     }
 
     /// TASK-077: a message without history is written as before; one with

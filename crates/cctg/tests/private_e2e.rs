@@ -2936,9 +2936,10 @@ async fn e2e_a_shared_group_topic_answers_mentions_with_the_history() {
         content,
         "(история темы группы с прошлого обращения к вам: 3 сообщения)\n\
          Анна: где логи?\n\n---\n\nИван: в /var/log\n\n---\n\nАнна: ок\n(конец истории)\n\n\
-         Иван: @CCTG_test_bot сделай"
+         (обращение к вам из группы, где открыта эта сессия)\nИван: сделай"
     );
     assert_eq!(meta["message_id"], mention.to_string());
+    assert_eq!(meta["mention"], "true", "TASK-080");
     assert!(!meta.contains_key("history"), "{meta:?}");
     hub.until("the mention echoed in private and 👀", |fake| {
         fake.layout(owner())
@@ -2965,7 +2966,8 @@ async fn e2e_a_shared_group_topic_answers_mentions_with_the_history() {
     assert_eq!(
         content,
         "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
-         Анна: ещё\n(конец истории)\n\nИван: и это"
+         Анна: ещё\n(конец истории)\n\n\
+         (обращение к вам из группы, где открыта эта сессия)\nИван: и это"
     );
     // The owner's limit 2000: a longer history is compressed by the agent.
     hub.menu_press("menu:ghl:s").await;
@@ -2989,7 +2991,8 @@ async fn e2e_a_shared_group_topic_answers_mentions_with_the_history() {
     assert_eq!(
         content,
         "(история темы группы с прошлого обращения к вам: 2 сообщения, сжато)\n\
-         Анна и Иван прислали по букве\n(конец истории)\n\nАнна: @cctg_test_bot итог"
+         Анна и Иван прислали по букве\n(конец истории)\n\n\
+         (обращение к вам из группы, где открыта эта сессия)\nАнна: итог"
     );
     // An agent that cannot compress: the newest part only.
     hub.say_group("Анна", &older, None);
@@ -3007,7 +3010,8 @@ async fn e2e_a_shared_group_topic_answers_mentions_with_the_history() {
         content,
         format!(
             "(история темы группы с прошлого обращения к вам: 2 сообщения, начало обрезано)\n\
-             Иван: {newer}\n(конец истории)\n\nАнна: @cctg_test_bot ещё итог"
+             Иван: {newer}\n(конец истории)\n\n\
+             (обращение к вам из группы, где открыта эта сессия)\nАнна: ещё итог"
         )
     );
     // 📣: every message goes at once.
@@ -3018,8 +3022,9 @@ async fn e2e_a_shared_group_topic_answers_mentions_with_the_history() {
     })
     .await;
     hub.say_group("Анна", "без обращения", None);
-    let (content, _) = agent.inbound().await;
+    let (content, meta) = agent.inbound().await;
     assert_eq!(content, "Анна: без обращения");
+    assert!(!meta.contains_key("mention"), "{meta:?}");
     assert!(
         hub.fake
             .menu(owner())
@@ -3399,7 +3404,8 @@ async fn e2e_groups_mentions_per_group() {
     assert!(content.contains("Иван: в группе Б"), "{content}");
     assert!(!content.contains("в группе А"), "{content}");
     assert!(
-        content.ends_with("Иван: @cctg_test_bot что скажешь?"),
+        content
+            .ends_with("(обращение к вам из группы, где открыта эта сессия)\nИван: что скажешь?"),
         "{content}"
     );
 }
