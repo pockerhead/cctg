@@ -51,6 +51,11 @@ pub const FETCH_FAILED_NOTICE: &str =
     "Не удалось скачать файл из Telegram, в сессию он не передан. Пришлите его ещё раз.";
 /// The agent's link closed during every try to hand the file over.
 pub const LINK_LOST_NOTICE: &str = "Файл не передан: связь с сессией обрывалась при каждой попытке его передать. Пришлите его ещё раз.";
+/// [`FETCH_FAILED_NOTICE`] for a message whose caption goes on as words
+/// (a mention with a group history, TASK-077): only the file is sent again.
+pub const FETCH_FAILED_WORDS_NOTICE: &str = "Не удалось скачать файл из Telegram, в сессию передан только текст сообщения. Пришлите ещё раз один файл, текст повторять не нужно.";
+/// [`LINK_LOST_NOTICE`] for a message whose caption goes on as words.
+pub const LINK_LOST_WORDS_NOTICE: &str = "Файл не передан: связь с сессией обрывалась при каждой попытке его передать, дойдёт только текст сообщения. Пришлите ещё раз один файл, текст повторять не нужно.";
 /// The session's agent is too old for files; its caption still goes.
 pub const OLD_AGENT_NOTICE: &str = "Файл не передан: клиент cctg этой сессии не принимает файлы. Обновите его (⬆️ Обновить) и пришлите файл ещё раз.";
 

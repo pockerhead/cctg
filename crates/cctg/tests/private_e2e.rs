@@ -3413,3 +3413,69 @@ async fn e2e_groups_mentions_per_group() {
         "{content}"
     );
 }
+
+// ---------------------------------------------------------------- TASK-072
+
+/// Review 2 of TASK-063, finding 1: a private-only slot met a 403 while a
+/// prompt was open, and the prompt went to the group's fallback topic. The
+/// owner presses Start: the slot keeps that group topic while the prompt
+/// waits there (a message written there still reaches the session), and
+/// once the prompt is decided the topic is told and left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_fallback_topic_with_an_open_prompt_stays_until_it_is_decided() {
+    let hub = start_hub("fallback-open-prompt", PRIVATE, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.until("the status in the private chat", |fake| {
+        fake.layout(owner()) == ["STATUS"]
+    })
+    .await;
+    hub.fake.forbid_private.store(true, Ordering::SeqCst);
+    agent.send(permission("abcde")).await;
+    hub.until("the prompt in the group", |fake| {
+        asks_in(fake, GROUP, "abcde")
+    })
+    .await;
+    hub.fake.forbid_private.store(false, Ordering::SeqCst);
+    hub.say_general(owner(), "/start");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let notice = FALLBACK_END_NOTICE.to_owned();
+    assert!(
+        !hub.fake.layout(GROUP).contains(&notice),
+        "not left while its prompt waits there: {:?}",
+        hub.fake.layout(GROUP)
+    );
+    hub.say(GROUP, "в группу");
+    let (content, _) = agent.inbound().await;
+    assert_eq!(content, "в группу");
+    allow_in(&hub, &mut agent, GROUP, "abcde").await;
+    hub.until("decided, then the topic is told and left", |fake| {
+        allowed_in(fake, GROUP, "abcde") && fake.layout(GROUP).contains(&notice)
+    })
+    .await;
+}
+
+/// Review 2 of TASK-063, finding 7: a shared slot whose owner blocked the
+/// bot (403) gets a reply: the group, the slot's view now, shows it once,
+/// with the status message below it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_after_a_403_the_group_status_goes_below_the_reply() {
+    let hub = start_hub("403-status-below", SHARED, Fake::default()).await;
+    hub.start().await;
+    let mut agent = Agent::connect(&hub, true).await;
+    hub.both("a status message in both views", &["STATUS"])
+        .await;
+    hub.fake.forbid_private.store(true, Ordering::SeqCst);
+    agent
+        .send(AgentMsg::Reply {
+            text: "раз".into()
+        })
+        .await;
+    hub.until("the reply once, the status below it", |fake| {
+        fake.layout(GROUP) == ["раз", "STATUS"]
+    })
+    .await;
+    // And it stays so (the review saw ["STATUS", "раз"] for 3 s).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hub.fake.layout(GROUP), ["раз", "STATUS"]);
+}

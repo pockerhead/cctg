@@ -176,7 +176,7 @@ docker compose up -d
 Как вернуть слоты «только в личке» в группу: остановить hub и в `registry.json` поставить таким слотам первым видом группу без темы, старый hub создаст им темы в группе. С `jq` на машине, где лежит файл (для Docker это том `/data`):
 
 ```sh
-jq '.slots |= map(if .views[0].chat == "group" then . else .views = [{"chat": "group"}] + .views end)' registry.json > registry.new && mv registry.new registry.json
+jq '.slots |= map(if any(.views[]; .chat == "group") then . else .views = [{"chat": "group"}] + .views end)' registry.json > registry.new && mv registry.new registry.json
 ```
 
 После этого запустить старый hub. Тема лички у таких слотов остаётся, но не обновляется: её можно удалить в Telegram.
