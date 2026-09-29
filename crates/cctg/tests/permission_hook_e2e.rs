@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cctg::hub::api::{ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress::{self, AgentEvent};
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -22,6 +22,11 @@ use cctg::hub::updates::CallbackInput;
 use cctg::wire::{AgentMsg, HookEvent, HookPost, HubMsg, PermissionRequest, Register, Secret};
 use serde_json::Value;
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 mod common;
 
@@ -167,7 +172,12 @@ async fn hub(test: &str) -> Hub {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let mut slots = Slots::new(store.load().unwrap(), store, outbox, options);
+    let mut slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).unwrap(),
+        store,
+        outbox,
+        options,
+    );
     let asks = slots.permission_asks();
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
@@ -335,7 +345,7 @@ fn assert_clean(output: &Output) {
 fn press(hub: &Hub, message_id: i64, data: String) {
     hub.control
         .send(Control::Callback(CallbackInput {
-            chat: Some(Chat::Group),
+            chat: Some(GROUP),
             query_id: "q".into(),
             data: Some(data),
             message_id: Some(message_id),

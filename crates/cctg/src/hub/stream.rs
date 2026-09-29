@@ -1514,7 +1514,7 @@ mod tests {
 
     fn stream_op(text: &str) -> Op {
         Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: 100,
             text: text.into(),
             html: None,
@@ -1721,7 +1721,7 @@ mod tests {
 
     /// A message of the group.
     fn key(id: i64) -> MessageKey {
-        MessageKey::new(Chat::Group, id)
+        MessageKey::new(Chat::GROUP, id)
     }
 
     fn keys(ids: &[i64]) -> Vec<MessageKey> {
@@ -1865,7 +1865,7 @@ mod tests {
     fn a_rewind_holds_again_the_answers_not_in_the_topic_before_the_held_ones() {
         let now = Instant::now();
         let held = |answer: &str| Held {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             answer: answer.into(),
             until: now,
             end: None,
@@ -1918,7 +1918,7 @@ mod tests {
     fn an_answer_gone_by_its_timeout_keeps_its_turn_end() {
         let now = Instant::now();
         let held = |answer: &str| Held {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             answer: answer.into(),
             until: now,
             end: Some(40),
@@ -1962,7 +1962,7 @@ mod tests {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
         live.held.push_back(Held {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             answer: "a file".into(),
             until: now,
             end: None,
@@ -1979,7 +1979,7 @@ mod tests {
         assert!(live.stuck());
         live.rewind(Some(0), Vec::new(), now, Duration::ZERO);
         live.held.push_back(Held {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             answer: "next".into(),
             until: now,
             end: None,
@@ -2004,7 +2004,7 @@ mod tests {
         let now = Instant::now();
         let mut live = Live::new(Some(0), Vec::new());
         live.held.push_back(Held {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             answer: "first".into(),
             until: now,
             end: None,
@@ -2091,7 +2091,7 @@ mod tests {
 
     fn unpaired(answer: &str, now: Instant) -> Held {
         Held {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             answer: answer.into(),
             until: now,
             end: None,
@@ -2313,7 +2313,7 @@ mod tests {
 
     fn open(key: Option<i64>, number: u64, text: &str) -> Open {
         Open {
-            key: key.map(|id| MessageKey::new(Chat::Group, id)),
+            key: key.map(|id| MessageKey::new(Chat::GROUP, id)),
             number,
             text: text.into(),
             html: None,
@@ -2373,7 +2373,7 @@ mod tests {
     fn built(compact: bool, pieces: &[(&str, Option<&str>, bool)]) -> Open {
         let (text, html, tool) = pieces[0];
         let mut turn = Open::new(
-            Some(MessageKey::new(Chat::Group, 7)),
+            Some(MessageKey::new(Chat::GROUP, 7)),
             1,
             text.into(),
             html.map(str::to_owned),
@@ -2532,9 +2532,9 @@ mod tests {
         live.open = Some(open(None, number, "one"));
         assert!(live.open_pending());
         live.barrier(10);
-        live.opened(number + 1, Some(MessageKey::new(Chat::Group, 9)));
+        live.opened(number + 1, Some(MessageKey::new(Chat::GROUP, 9)));
         assert!(live.open_pending(), "another message's answer");
-        live.opened(number, Some(MessageKey::new(Chat::Group, 9)));
+        live.opened(number, Some(MessageKey::new(Chat::GROUP, 9)));
         assert_eq!(live.open, Some(open(Some(9), number, "one")));
         live.answered(number, true);
         live.advance();
@@ -2654,7 +2654,7 @@ mod tests {
     }
 
     fn group_key(id: i64) -> MessageKey {
-        MessageKey::new(Chat::Group, id)
+        MessageKey::new(Chat::GROUP, id)
     }
 
     #[test]

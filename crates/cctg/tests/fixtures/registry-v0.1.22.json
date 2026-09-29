@@ -1,0 +1,342 @@
+{
+  "version": 2,
+  "seq": 4,
+  "slots": [
+    {
+      "host": "box",
+      "folder_key": "c:/work/project",
+      "folder_name": "Project",
+      "ordinal": 1,
+      "current_session": "aaaaaaaa-0000-4000-8000-000000000001",
+      "buffer": {
+        "messages": [
+          {
+            "chat": "group",
+            "message_id": 7,
+            "thread_id": 100,
+            "text": "подпись",
+            "file": {
+              "kind": "photo",
+              "file_id": "AgAC-file",
+              "size": 1234
+            }
+          },
+          {
+            "chat": "group",
+            "message_id": 8,
+            "thread_id": 100,
+            "text": "@cctg_bot глянь",
+            "reply_to": 6,
+            "quote": "цитата",
+            "from_name": "Анна",
+            "history": {
+              "text": "Анна: раз\nБорис: два",
+              "count": 2,
+              "dropped": 1,
+              "limit": 4000,
+              "state": "pending"
+            }
+          }
+        ],
+        "overflow_told": true,
+        "queued_told": false,
+        "resume": {
+          "session": "aaaaaaaa-0000-4000-8000-000000000001",
+          "number": 1,
+          "message": {
+            "chat": "group",
+            "id": 900
+          }
+        },
+        "resume_asked": false
+      },
+      "views": [
+        {
+          "chat": {
+            "private": 7319402518
+          },
+          "topic_id": 200,
+          "applied_title": "[box] Project · aaaaaaaa",
+          "applied_icon": "5312016608254762256",
+          "pending_separator": null,
+          "status": {
+            "message_id": 600,
+            "pinned": false
+          }
+        },
+        {
+          "chat": "group",
+          "topic_id": 100,
+          "applied_title": "[box] Project · aaaaaaaa",
+          "applied_icon": "5312016608254762256",
+          "pending_separator": "── session aaaaaaaa · new ──",
+          "status": {
+            "message_id": 500,
+            "pinned": true
+          },
+          "opening": "── общий доступ: Анна ──",
+          "backlog": {
+            "parts": [
+              "Анна: первое",
+              "Борис: второе"
+            ],
+            "dropped": 1
+          },
+          "every_message": true,
+          "mention_told": true
+        }
+      ]
+    },
+    {
+      "host": "box",
+      "folder_key": "c:/work/project",
+      "folder_name": "Project",
+      "ordinal": 2,
+      "current_session": "bbbbbbbb-0000-4000-8000-000000000002",
+      "views": [
+        {
+          "chat": {
+            "private": 7319402518
+          },
+          "topic_id": 201,
+          "applied_title": null,
+          "applied_icon": null,
+          "pending_separator": null
+        },
+        {
+          "chat": "group",
+          "topic_id": 101,
+          "applied_title": null,
+          "applied_icon": null,
+          "pending_separator": null,
+          "fallback": true,
+          "mention_told": true
+        }
+      ]
+    },
+    {
+      "host": "box",
+      "folder_key": "c:/work/other",
+      "folder_name": "Other",
+      "ordinal": 1,
+      "current_session": "cccccccc-0000-4000-8000-000000000003",
+      "views": [
+        {
+          "chat": "group",
+          "topic_id": 102,
+          "applied_title": "[box] Other · cccccccc",
+          "applied_icon": null,
+          "pending_separator": null
+        }
+      ]
+    }
+  ],
+  "sessions": {
+    "aaaaaaaa-0000-4000-8000-000000000001": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 0,
+      "transcript_path": "/t/aaaaaaaa-0000-4000-8000-000000000001.jsonl",
+      "claude_pid": 10,
+      "title": null,
+      "ended": false,
+      "seen": 1,
+      "stream": {
+        "offset": 4096,
+        "calls": [
+          {
+            "id": "toolu_1",
+            "line": "• Bash: ls",
+            "done": false
+          }
+        ],
+        "receipts": [
+          {
+            "chat": "group",
+            "id": 5
+          },
+          {
+            "chat": {
+              "private": 7319402518
+            },
+            "id": 8
+          }
+        ],
+        "parts": [
+          [
+            {
+              "chat": "group",
+              "id": 5
+            },
+            [
+              {
+                "chat": "group",
+                "id": 3
+              },
+              {
+                "chat": "group",
+                "id": 4
+              }
+            ]
+          ]
+        ]
+      }
+    },
+    "bbbbbbbb-0000-4000-8000-000000000002": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 1,
+      "transcript_path": "/t/bbbbbbbb-0000-4000-8000-000000000002.jsonl",
+      "claude_pid": 11,
+      "title": null,
+      "ended": false,
+      "seen": 2,
+      "stream": {
+        "offset": 0,
+        "calls": [],
+        "receipts": []
+      }
+    },
+    "cccccccc-0000-4000-8000-000000000003": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 2,
+      "transcript_path": "/t/cccccccc-0000-4000-8000-000000000003.jsonl",
+      "claude_pid": 12,
+      "title": null,
+      "ended": false,
+      "seen": 3,
+      "stream": {
+        "offset": 0,
+        "calls": [],
+        "receipts": []
+      }
+    },
+    "dddddddd-0000-4000-8000-000000000004": {
+      "host": "box",
+      "kind": {
+        "kind": "nested",
+        "parent": "aaaaaaaa-0000-4000-8000-000000000001"
+      },
+      "slot": 0,
+      "transcript_path": "/t/dddddddd-0000-4000-8000-000000000004.jsonl",
+      "claude_pid": 13,
+      "title": null,
+      "ended": false,
+      "seen": 4,
+      "block": {
+        "header": "⇣ nested dddddddd",
+        "place": {
+          "chat": "group",
+          "thread": 102
+        },
+        "message_id": 502,
+        "pending": null,
+        "running": false,
+        "sending": false,
+        "answer": "готово"
+      }
+    }
+  },
+  "subagents": {
+    "a1": {
+      "parent_session": "aaaaaaaa-0000-4000-8000-000000000001",
+      "slot": 0,
+      "block": {
+        "header": "↳ Explore a1: look",
+        "place": {
+          "chat": "group",
+          "thread": 100
+        },
+        "message_id": 501,
+        "pending": "↳ Explore a1: look\ndone",
+        "running": false,
+        "sending": false
+      },
+      "seen": 3
+    }
+  },
+  "pids": {
+    "box/10": "aaaaaaaa-0000-4000-8000-000000000001",
+    "box/11": "bbbbbbbb-0000-4000-8000-000000000002",
+    "box/12": "cccccccc-0000-4000-8000-000000000003",
+    "box/13": "dddddddd-0000-4000-8000-000000000004"
+  },
+  "twins": [
+    {
+      "primary": {
+        "chat": {
+          "private": 7319402518
+        },
+        "id": 610
+      },
+      "twin": {
+        "chat": "group",
+        "id": 510
+      },
+      "thread": 100
+    },
+    {
+      "primary": {
+        "chat": {
+          "private": 7319402518
+        },
+        "id": 611
+      },
+      "twin": {
+        "chat": "group",
+        "id": 511
+      }
+    }
+  ],
+  "unshared": [
+    {
+      "place": {
+        "chat": "group",
+        "thread": 103
+      },
+      "status": 520
+    }
+  ],
+  "people": [
+    {
+      "chat": 7319402518,
+      "menu": 42,
+      "settings": {
+        "detail": "full",
+        "thinking": true,
+        "turn": "full",
+        "sound": "replies",
+        "quiet": {
+          "from": 23,
+          "to": 7
+        },
+        "tz": 180,
+        "group": {
+          "detail": "brief",
+          "thinking": false,
+          "turn": "compact",
+          "rich": false
+        },
+        "rich": false,
+        "history": "long"
+      }
+    },
+    {
+      "chat": 1001,
+      "settings": {
+        "detail": "full",
+        "thinking": true,
+        "turn": "full",
+        "sound": "replies",
+        "rich": true
+      }
+    }
+  ]
+}

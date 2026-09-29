@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use cctg::device::canonical_cwd;
 use cctg::hub::api::{ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress::serve_agents;
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
@@ -24,6 +24,11 @@ use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 mod common;
 
@@ -205,7 +210,7 @@ async fn start_hub(state: &std::path::Path, listener: TcpListener) -> Hub {
     let (scheduler, outbox) = Scheduler::new(fake.clone(), bucket);
     let sched = tokio::spawn(scheduler.run());
     let store = RegistryStore::open(state).expect("store");
-    let registry = store.load().expect("load registry");
+    let registry = store.load(GroupChat::of(GROUP_ID)).expect("load registry");
     let options = Options {
         grace: Duration::ZERO,
         stream_every: Duration::from_millis(50),
@@ -445,7 +450,7 @@ async fn e2e_the_status_message_rolls_below_the_turn() {
     hub.control
         .send(Control::Message(Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: GROUP,
             sender: cctg::hub::chat::PrivateChat::of_user(1001),
             message_id: user,
             thread_id: Some(THREAD),

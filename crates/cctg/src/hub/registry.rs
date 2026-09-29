@@ -12,9 +12,16 @@
 //! slot made while its owner's private chat is usable shows there alone
 //! ([`Registry::make_private`]); one made in the group keeps its group view.
 //! The session is answered in the primary view ([`Registry::primary_view`]:
-//! the private one once it has a topic); the other views mirror it. `Chat`
-//! names the one group of TASK-061; views and places carry their chat, so
-//! more groups would be more `Chat` values, not a new model.
+//! the private one once it has a topic); the other views mirror it.
+//!
+//! Several groups (TASK-069): views and places carry their chat, a group
+//! by its id ([`GroupChat`]). The group of `CCTG_CHAT_ID` is the default one
+//! ([`Registry::default_group`]): fallback views and new slots without a
+//! private chat show there, and it is always usable. Other groups are
+//! [`Registry::groups`] records; a group the bot left is `left`, its views
+//! are not usable and stay for its return. `registry.json` version 3 names
+//! the group of every stored chat; a version 2 file is migrated
+//! ([`migrate_v2`]) into the default group.
 //!
 //! Sharing a slot to the group (TASK-064) is a property of the slot: a group
 //! view that is no fallback. It holds for every later session of the slot.
@@ -36,16 +43,18 @@ use serde::{Deserialize, Serialize};
 use transcript::telegram_len;
 
 use super::buffer::Buffer;
-use super::chat::{Chat, MessageKey, Place, PrivateChat};
+use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
+use super::groups::{DEFAULT_GROUP_TITLE, Group, fallback_title};
 use super::mention::Backlog;
 use super::menu::Person;
 use super::status::Metrics;
 use crate::wire::{HookEvent, HookPost};
 
 /// 2 since TASK-061 (a slot's topic moved into its views, stored message ids
-/// carry their chat). Version 1 files are migrated on load
-/// ([`migrate_v1`]); a hub older than 2 refuses a version 2 file.
-pub const VERSION: u32 = 2;
+/// carry their chat), 3 since TASK-069 (a group chat carries its id).
+/// Version 1 and 2 files are migrated on load ([`migrate_v1`],
+/// [`migrate_v2`]); an older hub refuses a newer file.
+pub const VERSION: u32 = 3;
 /// Telegram limit for a topic name. Measured in UTF-16 units, which is never
 /// less than the character count.
 pub const MAX_TITLE: usize = 128;
@@ -65,6 +74,9 @@ const TEMP_NAME: &str = "registry.json.tmp";
 /// A version 1 file as the migration found it, for a rollback (TASK-061).
 const V1_COPY_NAME: &str = "registry.v1.json";
 const V1_COPY_TEMP_NAME: &str = "registry.v1.json.tmp";
+/// A version 2 file as the migration found it, for a rollback (TASK-069).
+const V2_COPY_NAME: &str = "registry.v2.json";
+const V2_COPY_TEMP_NAME: &str = "registry.v2.json.tmp";
 
 /// Preferred icons, from `getForumTopicIconStickers` (2026-09-23, 112
 /// stickers). Used only while Telegram offers them, see [`Icons::from_offered`].
@@ -755,6 +767,32 @@ pub struct Registry {
     /// (TASK-073).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub people: Vec<Person>,
+    /// The groups the hub knows (TASK-069), the default one among them
+    /// once a hub loaded the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<Group>,
+    /// The group of `CCTG_CHAT_ID`, set by [`RegistryStore::load`]; a
+    /// registry no hub loaded (unit tests) has [`unset_group`].
+    #[serde(skip, default = "unset_group")]
+    pub default_group: GroupChat,
+}
+
+/// The default group of a registry no hub loaded: 0 is no Telegram chat id.
+fn unset_group() -> GroupChat {
+    GroupChat::of(0)
+}
+
+/// What [`Registry::join_group`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupChange {
+    /// A new group; `ready`: sessions may show there.
+    Added { ready: bool },
+    /// A known group became ready or stopped being so.
+    ReadyChanged(bool),
+    /// A group the bot had left is back.
+    Returned { ready: bool },
+    /// Nothing that needs telling.
+    Quiet,
 }
 
 /// The group topic of a slot taken out of the group (TASK-064), to delete.
@@ -817,6 +855,8 @@ impl Default for Registry {
             twins: Vec::new(),
             unshared: Vec::new(),
             people: Vec::new(),
+            groups: Vec::new(),
+            default_group: unset_group(),
         }
     }
 }
@@ -869,13 +909,122 @@ impl Registry {
             .map(SlotId)
     }
 
-    /// The bot writes to `chat` now: the group, or a private chat while
-    /// private chats are on and it is not closed (TASK-063).
+    /// The bot writes to `chat` now: the default group, a known group it
+    /// has not left (TASK-069), or a private chat while private chats are
+    /// on and it is not closed (TASK-063).
     pub fn usable(&self, chat: Chat) -> bool {
         match chat {
-            Chat::Group => true,
+            Chat::Group(group) => {
+                group == self.default_group || self.group(group).is_some_and(|known| !known.left)
+            }
             Chat::Private(private) => self.private && !self.closed.contains(&private),
         }
+    }
+
+    /// The default group (`CCTG_CHAT_ID`) as a chat.
+    pub fn default_chat(&self) -> Chat {
+        Chat::Group(self.default_group)
+    }
+
+    /// The record of group `chat` (TASK-069).
+    pub fn group(&self, chat: GroupChat) -> Option<&Group> {
+        self.groups.iter().find(|group| group.chat == chat)
+    }
+
+    /// Group `chat`'s number in the registry, from 1: what logs name it by.
+    pub fn group_number(&self, chat: GroupChat) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|group| group.chat == chat)
+            .map(|at| at + 1)
+    }
+
+    /// The bot is in group `chat` (TASK-069): its record made or updated
+    /// with its title (when known), readiness and right to delete; a group
+    /// it had left is back.
+    pub fn join_group(
+        &mut self,
+        chat: GroupChat,
+        title: Option<String>,
+        ready: bool,
+        can_delete: bool,
+    ) -> GroupChange {
+        let Some(group) = self.groups.iter_mut().find(|group| group.chat == chat) else {
+            self.groups.push(Group {
+                chat,
+                title,
+                ready,
+                can_delete,
+                left: false,
+            });
+            self.dirty = true;
+            return GroupChange::Added { ready };
+        };
+        let before = group.clone();
+        if title.is_some() {
+            group.title = title;
+        }
+        group.can_delete = can_delete;
+        group.ready = ready;
+        let returned = std::mem::take(&mut group.left);
+        let change = if returned {
+            GroupChange::Returned { ready }
+        } else if before.ready != ready {
+            GroupChange::ReadyChanged(ready)
+        } else {
+            GroupChange::Quiet
+        };
+        if *group != before {
+            self.dirty = true;
+        }
+        change
+    }
+
+    /// The bot is no longer in group `chat`; `true` when that is news.
+    pub fn leave_group(&mut self, chat: GroupChat) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|group| group.chat == chat) else {
+            return false;
+        };
+        if group.left {
+            return false;
+        }
+        group.left = true;
+        self.dirty = true;
+        true
+    }
+
+    /// The groups `slot` may be shared to or taken out of (TASK-069), each
+    /// with whether it shows there: the default group first, then the
+    /// ready groups the bot is in, in the order they came, and any group
+    /// the slot is shared to.
+    pub fn share_targets(&self, id: SlotId) -> Vec<(GroupChat, bool)> {
+        let known = self
+            .groups
+            .iter()
+            .map(|group| group.chat)
+            .filter(|chat| *chat != self.default_group);
+        std::iter::once(self.default_group)
+            .chain(known)
+            .filter_map(|chat| {
+                let shared = self.shared(id, Chat::Group(chat));
+                let open = chat == self.default_group
+                    || self
+                        .group(chat)
+                        .is_some_and(|group| group.ready && !group.left);
+                (open || shared).then_some((chat, shared))
+            })
+            .collect()
+    }
+
+    /// How group `chat` is named to people: its title, else a fixed name.
+    pub fn group_title(&self, chat: GroupChat) -> String {
+        if let Some(title) = self.group(chat).and_then(|group| group.title.clone()) {
+            return title;
+        }
+        if chat == self.default_group {
+            return DEFAULT_GROUP_TITLE.to_owned();
+        }
+        fallback_title(self.group_number(chat).unwrap_or(self.groups.len() + 1))
     }
 
     /// The view the slot's session is answered in: a usable view with a
@@ -995,11 +1144,20 @@ impl Registry {
     /// Shares the slot to `chat` (TASK-064): a new view whose topic starts
     /// with `line`, or the fallback view kept as the shared one (its topic
     /// gets `line` next). `None`: no such slot.
+    /// A new view takes the slot's mention mode (TASK-077) from its other
+    /// shared group views (TASK-069: one mode per slot).
     pub fn share(&mut self, id: SlotId, chat: Chat, line: String) -> Option<Shared> {
         let slot = self.slots.get_mut(id.0)?;
+        let every_message = slot.views.iter().any(|view| {
+            matches!(view.chat, Chat::Group(_))
+                && view.chat != chat
+                && !view.fallback
+                && view.every_message
+        });
         let Some(view) = slot.view_mut(chat) else {
             slot.views.push(View {
                 opening: Some(line),
+                every_message,
                 ..View::new(chat)
             });
             self.dirty = true;
@@ -1150,7 +1308,7 @@ impl Registry {
             ordinal,
             current_session: None,
             buffer: Buffer::default(),
-            views: vec![View::new(Chat::Group)],
+            views: vec![View::new(self.default_chat())],
         });
         SlotId(self.slots.len() - 1)
     }
@@ -1614,6 +1772,23 @@ impl Registry {
     }
 
     /// After a restart no agent is connected and nothing is in flight.
+    /// `default` is the default group (TASK-069); its record is made when
+    /// missing (a new file, or `CCTG_CHAT_ID` changed: the old group stays a
+    /// known one).
+    fn adopt_default_group(&mut self, default: GroupChat) {
+        self.default_group = default;
+        if self.group(default).is_none() {
+            self.groups.push(Group {
+                chat: default,
+                title: None,
+                ready: true,
+                can_delete: false,
+                left: false,
+            });
+            self.dirty = true;
+        }
+    }
+
     pub fn after_restart(&mut self) {
         for entry in self.sessions.values_mut() {
             entry.agent = None;
@@ -2282,8 +2457,35 @@ fn migrate_v1(registry: &mut serde_json::Value) -> Option<()> {
             block(found);
         }
     }
-    root.insert("version".into(), json!(VERSION));
+    root.insert("version".into(), json!(2));
     Some(())
+}
+
+/// Turns a version 2 `registry.json` into version 3, as JSON (TASK-069):
+/// every stored chat `"group"` becomes the default group `{"group": <id>}`,
+/// the only group a version 2 hub knew. Nothing else is touched (a
+/// person's `chat` is a number, their `settings.group` no chat).
+fn migrate_v2(registry: &mut serde_json::Value, default: GroupChat) {
+    use serde_json::{Value, json};
+    fn walk(value: &mut Value, group: &Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    if key == "chat" && value.as_str() == Some("group") {
+                        *value = group.clone();
+                    } else {
+                        walk(value, group);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| walk(item, group)),
+            _ => {}
+        }
+    }
+    walk(registry, &json!({ "group": default.expose() }));
+    if let Some(root) = registry.as_object_mut() {
+        root.insert("version".into(), json!(3));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2306,6 +2508,9 @@ pub enum LoadError {
     /// migrated then.
     #[error("cannot keep the version 1 {FILE_NAME} as {V1_COPY_NAME} ({0:?})")]
     KeepV1(io::ErrorKind),
+    /// The version 2 file could not be kept for a rollback (TASK-069).
+    #[error("cannot keep the version 2 {FILE_NAME} as {V2_COPY_NAME} ({0:?})")]
+    KeepV2(io::ErrorKind),
 }
 
 /// `registry.json` in the hub state directory.
@@ -2324,14 +2529,22 @@ impl RegistryStore {
 
     /// An empty registry when there is no file. A file that does not parse
     /// is an error: starting empty would create a second topic per folder.
-    /// A version 1 file (v0.1.12 and older) is migrated ([`migrate_v1`]) and
-    /// marked dirty, so the actor writes it as version 2 at once; before
-    /// that its bytes are kept as `registry.v1.json`, which a rollback to an
-    /// older hub puts back (docs/remote-hub.md).
-    pub fn load(&self) -> Result<Registry, LoadError> {
+    /// A version 1 file (v0.1.12 and older) is migrated ([`migrate_v1`],
+    /// then [`migrate_v2`]) and a version 2 file (v0.1.22 and older,
+    /// TASK-069) with [`migrate_v2`] into `default`, the group of
+    /// `CCTG_CHAT_ID`, and marked dirty, so the actor writes it as version 3
+    /// at once; before that its bytes are kept as `registry.v1.json` or
+    /// `registry.v2.json`, which a rollback to an older hub puts back
+    /// (docs/remote-hub.md). `default` is the registry's default group; its
+    /// record is made when missing.
+    pub fn load(&self, default: GroupChat) -> Result<Registry, LoadError> {
         let bytes = match std::fs::read(self.dir.join(FILE_NAME)) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut registry = Registry::default();
+                registry.adopt_default_group(default);
+                return Ok(registry);
+            }
             Err(error) => return Err(LoadError::Read(error.kind())),
         };
         let mut value: serde_json::Value =
@@ -2343,9 +2556,14 @@ impl RegistryStore {
         let migrated = match version {
             1 => {
                 migrate_v1(&mut value).ok_or(LoadError::Invalid)?;
-                true
+                migrate_v2(&mut value, default);
+                Some(1)
             }
-            2 => false,
+            2 => {
+                migrate_v2(&mut value, default);
+                Some(2)
+            }
+            3 => None,
             other => return Err(LoadError::Version(u32::try_from(other).unwrap_or(u32::MAX))),
         };
         let mut registry: Registry =
@@ -2363,12 +2581,18 @@ impl RegistryStore {
                         || view.place().is_some_and(|place| !topics.insert(place))
                 })
         });
+        let mut groups = HashSet::new();
+        let duplicate_group = !registry
+            .groups
+            .iter()
+            .all(|group| groups.insert(group.chat));
         if registry.sessions.values().any(|entry| bad_slot(entry.slot))
             || registry
                 .subagents
                 .values()
                 .any(|agent| bad_slot(agent.slot))
             || duplicate_slot
+            || duplicate_group
         {
             return Err(LoadError::Invalid);
         }
@@ -2377,12 +2601,18 @@ impl RegistryStore {
         registry
             .subagents
             .retain(|_, agent| !agent.block.header.is_empty());
-        if migrated {
-            self.replace(V1_COPY_TEMP_NAME, V1_COPY_NAME, &bytes)
-                .map_err(|error| LoadError::KeepV1(error.kind()))?;
+        match migrated {
+            Some(1) => self
+                .replace(V1_COPY_TEMP_NAME, V1_COPY_NAME, &bytes)
+                .map_err(|error| LoadError::KeepV1(error.kind()))?,
+            Some(_) => self
+                .replace(V2_COPY_TEMP_NAME, V2_COPY_NAME, &bytes)
+                .map_err(|error| LoadError::KeepV2(error.kind()))?,
+            None => {}
         }
         registry.after_restart();
-        registry.dirty |= migrated;
+        registry.dirty |= migrated.is_some();
+        registry.adopt_default_group(default);
         Ok(registry)
     }
 
@@ -2495,7 +2725,7 @@ mod tests {
                 TopicJob::Create {
                     slot, name, icon, ..
                 } => {
-                    registry.topic_created(*slot, Chat::Group, *next_topic, name, icon.as_deref());
+                    registry.topic_created(*slot, Chat::GROUP, *next_topic, name, icon.as_deref());
                     *next_topic += 1;
                 }
                 TopicJob::Edit {
@@ -2506,7 +2736,7 @@ mod tests {
                     ..
                 } => registry.topic_edited(
                     *slot,
-                    Chat::Group,
+                    Chat::GROUP,
                     *thread_id,
                     name.as_deref(),
                     icon.as_deref(),
@@ -2516,7 +2746,7 @@ mod tests {
                     thread_id,
                     text,
                     ..
-                } => registry.topic_separated(*slot, Chat::Group, *thread_id, text),
+                } => registry.topic_separated(*slot, Chat::GROUP, *thread_id, text),
             }
         }
         jobs
@@ -2563,7 +2793,7 @@ mod tests {
         let mut next = 100;
         settle(&mut registry, &mut next);
         assert!(!registry.make_private(other, owner));
-        assert_eq!(registry.slots[other.0].views[0].chat, Chat::Group);
+        assert_eq!(registry.slots[other.0].views[0].chat, Chat::GROUP);
     }
 
     /// TASK-063: a slot answers in its owner's private view once that has a
@@ -2581,10 +2811,10 @@ mod tests {
         let mut next = 100;
         settle(&mut registry, &mut next);
         let group = registry.place(slot).unwrap();
-        assert_eq!(group.chat, Chat::Group);
+        assert_eq!(group.chat, Chat::GROUP);
         assert!(registry.add_view(slot, owner));
         assert!(!registry.add_view(slot, owner), "one view per chat");
-        assert_eq!(registry.slots[slot.0].views[0].chat, Chat::Group);
+        assert_eq!(registry.slots[slot.0].views[0].chat, Chat::GROUP);
         // Its topic is not made yet: the group answers, nothing mirrors.
         assert_eq!(registry.place(slot), Some(group));
         assert!(registry.mirrors(slot).is_empty());
@@ -2609,7 +2839,7 @@ mod tests {
             registry
                 .topic_work(&Icons::default(), true)
                 .iter()
-                .all(|job| job.view().1 == Chat::Group),
+                .all(|job| job.view().1 == Chat::GROUP),
             "no call into a closed chat"
         );
         registry.closed.clear();
@@ -2642,44 +2872,44 @@ mod tests {
         let (mut registry, slot, owner) = private_slot();
         let line = share_line("Анна");
         assert_eq!(line, "── общий доступ: Анна ──");
-        assert!(!registry.shared(slot, Chat::Group));
+        assert!(!registry.shared(slot, Chat::GROUP));
         assert_eq!(
-            registry.share(slot, Chat::Group, line.clone()),
+            registry.share(slot, Chat::GROUP, line.clone()),
             Some(Shared::Added)
         );
-        assert!(registry.shared(slot, Chat::Group));
-        assert_eq!(registry.share(SlotId(9), Chat::Group, line.clone()), None);
+        assert!(registry.shared(slot, Chat::GROUP));
+        assert_eq!(registry.share(SlotId(9), Chat::GROUP, line.clone()), None);
         let jobs = registry.topic_work(&Icons::default(), true);
         assert!(
             jobs.iter().any(|job| matches!(
                 job,
                 TopicJob::Create {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     ..
                 }
             )),
             "{jobs:?}"
         );
-        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        registry.topic_created(slot, Chat::GROUP, 100, "t", None);
         let group = &registry.slots[slot.0].views[1];
         assert_eq!(group.pending_separator.as_deref(), Some(line.as_str()));
         assert_eq!(group.opening, None);
-        let job = registry.separator_job(slot, Chat::Group);
+        let job = registry.separator_job(slot, Chat::GROUP);
         assert_eq!(
             job,
             Some(TopicJob::Separator {
                 slot,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: 100,
                 text: line.clone(),
             })
         );
-        assert_eq!(registry.separator_job(slot, Chat::Group), None, "once");
+        assert_eq!(registry.separator_job(slot, Chat::GROUP), None, "once");
         assert_eq!(registry.separator_job(slot, owner), None, "none there");
-        registry.topic_separated(slot, Chat::Group, 100, &line);
+        registry.topic_separated(slot, Chat::GROUP, 100, &line);
         assert_eq!(registry.slots[slot.0].views[1].pending_separator, None);
         assert_eq!(registry.place(slot), Some(Place::topic(owner, 700)));
-        assert_eq!(registry.mirrors(slot), [Place::topic(Chat::Group, 100)]);
+        assert_eq!(registry.mirrors(slot), [Place::topic(Chat::GROUP, 100)]);
     }
 
     /// TASK-064: a share keeps a fallback group view as the shared one: its
@@ -2689,13 +2919,13 @@ mod tests {
     fn a_share_makes_a_fallback_group_view_explicit_and_keeps_its_topic() {
         let (mut registry, slot, _) = private_slot();
         let line = share_line("Анна");
-        assert!(registry.add_view(slot, Chat::Group));
+        assert!(registry.add_view(slot, Chat::GROUP));
         registry.slots[slot.0].views[1].fallback = true;
-        assert!(!registry.shared(slot, Chat::Group));
+        assert!(!registry.shared(slot, Chat::GROUP));
         registry.slots[slot.0].views[1].topic_id = Some(100);
         registry.slots[slot.0].views[1].pending_separator = Some(separator(B, false));
         assert_eq!(
-            registry.share(slot, Chat::Group, line.clone()),
+            registry.share(slot, Chat::GROUP, line.clone()),
             Some(Shared::Adopted)
         );
         let group = &registry.slots[slot.0].views[1];
@@ -2706,16 +2936,16 @@ mod tests {
             Some(format!("{line}\n{}", separator(B, false)))
         );
         assert_eq!(
-            registry.share(slot, Chat::Group, line.clone()),
+            registry.share(slot, Chat::GROUP, line.clone()),
             Some(Shared::Already)
         );
         // Without its topic yet: the topic starts with the line.
         registry.slots[slot.0].views[1] = View {
             fallback: true,
-            ..View::new(Chat::Group)
+            ..View::new(Chat::GROUP)
         };
         assert_eq!(
-            registry.share(slot, Chat::Group, line.clone()),
+            registry.share(slot, Chat::GROUP, line.clone()),
             Some(Shared::Adopted)
         );
         assert_eq!(registry.slots[slot.0].views[1].opening, Some(line));
@@ -2727,18 +2957,18 @@ mod tests {
     #[test]
     fn an_unshare_forgets_the_group_view_and_keeps_its_topic_to_delete() {
         let (mut registry, slot, owner) = private_slot();
-        assert!(registry.add_view(slot, Chat::Group));
+        assert!(registry.add_view(slot, Chat::GROUP));
         registry.slots[slot.0].views[1].fallback = true;
-        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::NotShared);
+        assert_eq!(registry.unshare(slot, Chat::GROUP), Unshared::NotShared);
         registry.slots[slot.0].views[1].fallback = false;
-        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        registry.topic_created(slot, Chat::GROUP, 100, "t", None);
         registry.slots[slot.0].views[1].status = Some(StatusMessage {
             message_id: 900,
             pinned: false,
         });
-        let group = Place::topic(Chat::Group, 100);
+        let group = Place::topic(Chat::GROUP, 100);
         assert_eq!(registry.slot_by_topic(group), Some(slot));
-        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Removed);
+        assert_eq!(registry.unshare(slot, Chat::GROUP), Unshared::Removed);
         assert_eq!(
             registry.unshared,
             [UnsharedTopic {
@@ -2751,21 +2981,21 @@ mod tests {
             registry.primary_view(slot).map(|view| view.chat),
             Some(owner)
         );
-        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::NotShared);
+        assert_eq!(registry.unshare(slot, Chat::GROUP), Unshared::NotShared);
         // Its topic being made: nothing changes.
         registry.unshared.clear();
-        registry.share(slot, Chat::Group, share_line("x"));
+        registry.share(slot, Chat::GROUP, share_line("x"));
         registry.slots[slot.0].views[1].busy = true;
-        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Creating);
+        assert_eq!(registry.unshare(slot, Chat::GROUP), Unshared::Creating);
         assert_eq!(registry.slots[slot.0].views.len(), 2);
         // Not made and not being made: nothing to delete.
         registry.slots[slot.0].views[1].busy = false;
-        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Removed);
+        assert_eq!(registry.unshare(slot, Chat::GROUP), Unshared::Removed);
         assert!(registry.unshared.is_empty());
         // A slot in the group alone is not taken out of it.
         registry.apply_hook(&start(B, "/work/other", Some(2), None));
         let other = slot_of(&registry, B).unwrap();
-        assert_eq!(registry.unshare(other, Chat::Group), Unshared::NotShared);
+        assert_eq!(registry.unshare(other, Chat::GROUP), Unshared::NotShared);
         assert_eq!(registry.slots[other.0].views.len(), 1);
     }
 
@@ -2780,16 +3010,16 @@ mod tests {
         assert!(!plain.contains("opening") && !plain.contains("unshared"));
         // As v0.1.16 wrote it: loads.
         store.save(plain.as_bytes()).unwrap();
-        let old = store.load().unwrap();
+        let old = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(old.slots, registry.slots);
         assert!(old.unshared.is_empty());
-        registry.share(slot, Chat::Group, share_line("Анна"));
+        registry.share(slot, Chat::GROUP, share_line("Анна"));
         registry.unshared.push(UnsharedTopic {
-            place: Place::topic(Chat::Group, 55),
+            place: Place::topic(Chat::GROUP, 55),
             status: None,
         });
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(
             loaded.slots[slot.0].views[1].opening,
             Some(share_line("Анна"))
@@ -2809,7 +3039,7 @@ mod tests {
         assert!(!plain.contains("people"), "{plain}");
         // As v0.1.17 wrote it: loads with nobody.
         store.save(plain.as_bytes()).unwrap();
-        assert!(store.load().unwrap().people.is_empty());
+        assert!(store.load(GroupChat::UNIT).unwrap().people.is_empty());
 
         let anna = PrivateChat::of_user(7);
         let boris = PrivateChat::of_user(8);
@@ -2833,7 +3063,7 @@ mod tests {
         registry.person_mut(boris);
         assert_eq!(registry.people.len(), 2);
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(loaded.people, registry.people);
         assert_eq!(loaded.person(anna).unwrap().menu, Some(41));
         assert_eq!(loaded.person(boris).unwrap().settings, Settings::default());
@@ -3100,7 +3330,7 @@ mod tests {
             jobs,
             [BlockJob::Send {
                 key: BlockKey::Nested(N.to_owned()),
-                place: Place::topic(Chat::Group, 100),
+                place: Place::topic(Chat::GROUP, 100),
                 text: format!("⇣ nested dddddddd\n{BLOCK_RUNNING}"),
             }]
         );
@@ -3117,7 +3347,7 @@ mod tests {
             jobs,
             [BlockJob::Edit {
                 key: BlockKey::Nested(N.to_owned()),
-                message: MessageKey::new(Chat::Group, 500),
+                message: MessageKey::new(Chat::GROUP, 500),
                 text: format!("⇣ nested dddddddd\n{BLOCK_LOST}"),
             }]
         );
@@ -3154,7 +3384,7 @@ mod tests {
         );
         store.save(&RegistryStore::encode(&registry)).unwrap();
 
-        let mut registry = store.load().unwrap();
+        let mut registry = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(registry.subagents.len(), 3);
         assert!(!registry.confirm_subagent("a2", A, "↳ Explore a2".into()));
         // Only a1's pending edit goes out; a3 is never sent again.
@@ -3163,7 +3393,7 @@ mod tests {
             jobs,
             [BlockJob::Edit {
                 key: BlockKey::Agent("a1".into()),
-                message: MessageKey::new(Chat::Group, 500),
+                message: MessageKey::new(Chat::GROUP, 500),
                 text: "↳ Explore a1\ndone".into(),
             }]
         );
@@ -3177,7 +3407,7 @@ mod tests {
             jobs,
             [BlockJob::Edit {
                 key: BlockKey::Agent("a2".into()),
-                message: MessageKey::new(Chat::Group, 501),
+                message: MessageKey::new(Chat::GROUP, 501),
                 text: format!("↳ Explore a2\n{BLOCK_LOST}"),
             }]
         );
@@ -3201,7 +3431,7 @@ mod tests {
 
     fn notice(reply_to: i64, text: &str) -> BlockNotice {
         BlockNotice {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             reply_to,
             text: text.to_owned(),
         }
@@ -3275,7 +3505,7 @@ mod tests {
         registry.confirm_subagent("a4", A, "↳ Explore a4".into());
         assert!(settle_notices(&mut registry, &mut message).is_empty());
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let mut registry = store.load().unwrap();
+        let mut registry = store.load(GroupChat::UNIT).unwrap();
         assert!(registry.subagents["a0000000000000001"].block.notified);
         registry.show_block(
             &a1,
@@ -3332,7 +3562,7 @@ mod tests {
             .unwrap()
             .remove("block");
         store.save(&serde_json::to_vec(&json).unwrap()).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(loaded.subagents.keys().collect::<Vec<_>>(), ["a1"]);
     }
 
@@ -3407,7 +3637,7 @@ mod tests {
         assert!(registry.set_nested_answer(N, "first"));
         assert!(registry.set_nested_answer(N, "last"));
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let mut registry = store.load().unwrap();
+        let mut registry = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(registry.take_nested_answer(N).as_deref(), Some("last"));
         assert_eq!(registry.take_nested_answer(N), None);
         // A run lost with its parent keeps no answer.
@@ -3425,7 +3655,7 @@ mod tests {
         settle(&mut registry, &mut topic);
         registry.confirm_subagent("a1", A, "↳ Explore a1".into());
         settle_blocks(&mut registry, &mut message);
-        let topic = |id| Place::topic(Chat::Group, id);
+        let topic = |id| Place::topic(Chat::GROUP, id);
         assert_eq!(registry.subagent_of_message(topic(100), 500, A), Some("a1"));
         assert_eq!(registry.subagent_of_message(topic(100), 500, B), None);
         assert_eq!(registry.subagent_of_message(topic(101), 500, A), None);
@@ -3909,7 +4139,7 @@ mod tests {
             jobs,
             [TopicJob::Edit {
                 slot: id,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: 100,
                 name: None,
                 icon: Some(ICON_DEAD.to_owned())
@@ -3962,12 +4192,12 @@ mod tests {
         registry.apply_hook(&start(B, CWD, Some(11), None));
         settle(&mut registry, &mut topic); // topics 100 and 101
         let id = slot_of(&registry, A).unwrap();
-        registry.topic_invalid(id, Chat::Group, 100);
-        registry.topic_invalid(id, Chat::Group, 100); // a second failure report of the same topic
+        registry.topic_invalid(id, Chat::GROUP, 100);
+        registry.topic_invalid(id, Chat::GROUP, 100); // a second failure report of the same topic
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(creates(&jobs), 1);
-        registry.topic_created(id, Chat::Group, 200, "x", None);
-        registry.topic_invalid(id, Chat::Group, 100); // late report of the old topic
+        registry.topic_created(id, Chat::GROUP, 200, "x", None);
+        registry.topic_invalid(id, Chat::GROUP, 100); // late report of the old topic
         assert_eq!(registry.slots[id.0].views[0].topic_id, Some(200));
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 0);
         // The other slot keeps its topic.
@@ -3989,16 +4219,16 @@ mod tests {
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(jobs.len(), 1, "one call per slot: {jobs:?}");
         assert_eq!(separators(&jobs).len(), 1);
-        registry.topic_invalid(id, Chat::Group, 100);
+        registry.topic_invalid(id, Chat::GROUP, 100);
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(creates(&jobs), 1);
         // Late reports about topic 100 while the replacement is in flight.
-        registry.topic_invalid(id, Chat::Group, 100);
-        registry.topic_edited(id, Chat::Group, 100, Some("x"), None);
-        registry.topic_separated(id, Chat::Group, 100, "x");
+        registry.topic_invalid(id, Chat::GROUP, 100);
+        registry.topic_edited(id, Chat::GROUP, 100, Some("x"), None);
+        registry.topic_separated(id, Chat::GROUP, 100, "x");
         assert!(registry.slots[id.0].views[0].busy);
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
-        registry.topic_created(id, Chat::Group, 200, "y", None);
+        registry.topic_created(id, Chat::GROUP, 200, "y", None);
         let mut total = 1;
         for _ in 0..3 {
             total += creates(&settle(&mut registry, &mut topic));
@@ -4028,7 +4258,7 @@ mod tests {
         );
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         // Refused: kept, not repeated until the retry.
-        registry.topic_failed(id, Chat::Group, Some(100), &Icons::default());
+        registry.topic_failed(id, Chat::GROUP, Some(100), &Icons::default());
         assert_eq!(
             registry.slots[id.0].views[0].pending_separator.as_deref(),
             Some(text)
@@ -4037,7 +4267,7 @@ mod tests {
         registry.retry_failed();
         let jobs = registry.topic_work(&Icons::default(), true);
         assert_eq!(separators(&jobs), [text]);
-        registry.topic_separated(id, Chat::Group, 100, text);
+        registry.topic_separated(id, Chat::GROUP, 100, text);
         assert_eq!(registry.slots[id.0].views[0].pending_separator, None);
         let jobs = registry.topic_work(&Icons::default(), true);
         assert!(separators(&jobs).is_empty());
@@ -4058,7 +4288,7 @@ mod tests {
             registry.topic_work(&Icons::default(), true).is_empty(),
             "busy"
         );
-        registry.topic_failed(slot, Chat::Group, None, &Icons::default());
+        registry.topic_failed(slot, Chat::GROUP, None, &Icons::default());
         assert!(registry.topic_work(&Icons::default(), true).is_empty());
         registry.retry_failed();
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
@@ -4162,8 +4392,16 @@ mod tests {
     fn saves_are_atomic_and_round_trip() {
         let dir = TempDir::new("registry-store");
         let store = RegistryStore::open(dir.path()).unwrap();
-        assert_eq!(store.load().unwrap(), Registry::default());
-        let mut registry = Registry::default();
+        // TASK-069: a new registry has the record of its default group.
+        let fresh = || {
+            let mut registry = Registry::default();
+            registry.adopt_default_group(GroupChat::UNIT);
+            registry
+        };
+        let empty = store.load(GroupChat::UNIT).unwrap();
+        assert!(empty.dirty, "the default group's record is written");
+        assert_eq!(empty, fresh());
+        let mut registry = fresh();
         let mut topic = 100;
         registry.apply_hook(&start(A, CWD, Some(10), None));
         settle(&mut registry, &mut topic);
@@ -4176,17 +4414,23 @@ mod tests {
             b"{\"version\":1,\"slots\":[{\"ho",
         )
         .unwrap();
-        let mut loaded = store.load().unwrap();
+        let mut loaded = store.load(GroupChat::UNIT).unwrap();
         loaded.dirty = registry.dirty;
         assert!(loaded.recent_starts.is_empty(), "never saved");
         loaded.recent_starts.clone_from(&registry.recent_starts);
         assert_eq!(loaded, registry);
         assert_eq!(loaded.slots[0].views[0].topic_id, Some(100));
 
-        store
-            .save(&RegistryStore::encode(&Registry::default()))
-            .unwrap();
-        assert_eq!(store.load().unwrap(), Registry::default());
+        store.save(&RegistryStore::encode(&fresh())).unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
+        assert!(!loaded.dirty, "nothing to write");
+        assert_eq!(
+            loaded,
+            Registry {
+                dirty: false,
+                ..fresh()
+            }
+        );
         assert!(!dir.path().join(TEMP_NAME).exists());
     }
 
@@ -4200,7 +4444,7 @@ mod tests {
         registry.set_waiting(A, true);
         registry.slots[0].views[0].busy = true;
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(loaded.sessions[A].agent, None);
         assert!(!loaded.sessions[A].waiting);
         assert!(!loaded.slots[0].views[0].busy);
@@ -4221,7 +4465,7 @@ mod tests {
         std::fs::write(dir.path().join(FILE_NAME), &idle).unwrap();
         assert!(
             store
-                .load()
+                .load(GroupChat::UNIT)
                 .unwrap()
                 .slots
                 .iter()
@@ -4231,7 +4475,7 @@ mod tests {
         let buffer = &mut registry.slots[0].buffer;
         buffer.push(
             Parked {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: 5,
                 thread_id: 100,
                 text: "kept".into(),
@@ -4248,10 +4492,10 @@ mod tests {
         buffer.resume = Some(ResumeNote {
             session: A.into(),
             number: 1,
-            message: Some(MessageKey::new(Chat::Group, 900)),
+            message: Some(MessageKey::new(Chat::GROUP, 900)),
         });
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(loaded.slots[0].buffer, registry.slots[0].buffer);
         assert!(loaded.slots[1].buffer.is_idle());
     }
@@ -4269,17 +4513,23 @@ mod tests {
             ),
         )
         .unwrap();
-        let error = store.load().unwrap_err();
+        let error = store.load(GroupChat::UNIT).unwrap_err();
         assert!(matches!(error, LoadError::Invalid));
         assert!(!error.to_string().contains("private-name"));
-        std::fs::write(dir.path().join(FILE_NAME), b"{\"version\":3}").unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Version(3))));
+        std::fs::write(dir.path().join(FILE_NAME), b"{\"version\":4}").unwrap();
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::Version(4))
+        ));
         std::fs::write(
             dir.path().join(FILE_NAME),
             b"{\"version\":1,\"sessions\":{\"s\":{\"host\":\"h\",\"kind\":{\"kind\":\"top_level\"},\"slot\":3}}}",
         )
         .unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Invalid)));
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::Invalid)
+        ));
     }
 
     #[test]
@@ -4292,12 +4542,18 @@ mod tests {
         registry.slots[0].views[0].topic_id = Some(100);
         registry.slots[1].views[0].topic_id = Some(100);
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Invalid)));
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::Invalid)
+        ));
 
         registry.slots[1].views[0].topic_id = Some(101);
         registry.slots[1].ordinal = registry.slots[0].ordinal;
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Invalid)));
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::Invalid)
+        ));
     }
 
     /// The `registry.json` the v0.1.12 encoder wrote for a registry that
@@ -4306,15 +4562,16 @@ mod tests {
     const V1: &str = include_str!("../../tests/fixtures/registry-v0.1.12.json");
 
     /// TASK-061: a v0.1.12 file loads into group views and group message
-    /// keys, is marked for saving, saves as version 2 without the old keys
-    /// and loads again unchanged.
+    /// keys, is marked for saving, saves as version 3 (TASK-069: through
+    /// version 2, its groups the default one) without the old keys and
+    /// loads again unchanged.
     #[test]
     fn a_v0_1_12_registry_migrates_into_group_views() {
         let dir = TempDir::new("registry-v1");
         std::fs::write(dir.path().join(FILE_NAME), V1).unwrap();
         let store = RegistryStore::open(dir.path()).unwrap();
-        let loaded = store.load().unwrap();
-        assert!(loaded.dirty, "written as version 2 at once");
+        let loaded = store.load(GroupChat::UNIT).unwrap();
+        assert!(loaded.dirty, "written as version 3 at once");
         // The old file stays, byte for byte, for a rollback.
         let copy = dir.path().join(V1_COPY_NAME);
         assert_eq!(std::fs::read(&copy).unwrap(), V1.as_bytes());
@@ -4323,14 +4580,18 @@ mod tests {
             std::fs::read(dir.path().join(FILE_NAME)).unwrap(),
             V1.as_bytes()
         );
-        assert_eq!(loaded.version, 2);
-        let group = |id| MessageKey::new(Chat::Group, id);
-        let topic = |id| Place::topic(Chat::Group, id);
+        assert_eq!(loaded.version, 3);
+        assert!(
+            !dir.path().join(V2_COPY_NAME).exists(),
+            "only the version 1 file is kept"
+        );
+        let group = |id| MessageKey::new(Chat::GROUP, id);
+        let topic = |id| Place::topic(Chat::GROUP, id);
 
         let views = &loaded.slots[0].views;
         assert_eq!(views.len(), 1);
         let view = &views[0];
-        assert_eq!(view.chat, Chat::Group);
+        assert_eq!(view.chat, Chat::GROUP);
         assert_eq!(view.place(), Some(topic(100)));
         assert_eq!(
             view.applied_title.as_deref(),
@@ -4346,7 +4607,7 @@ mod tests {
             second.pending_separator.as_deref(),
             Some("── session bbbbbbbb · resumed ──")
         );
-        assert_eq!(loaded.slots[2].views, [View::new(Chat::Group)]);
+        assert_eq!(loaded.slots[2].views, [View::new(Chat::GROUP)]);
         assert_eq!(loaded.place(SlotId(1)), Some(topic(101)));
         assert_eq!(loaded.slot_by_topic(topic(101)), Some(SlotId(1)));
 
@@ -4380,7 +4641,7 @@ mod tests {
         store.save(&RegistryStore::encode(&loaded)).unwrap();
         let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         for old in [
             "topic_id",
             "applied_title",
@@ -4390,14 +4651,17 @@ mod tests {
         ] {
             assert!(value["slots"][0].get(old).is_none(), "{old} left the slot");
         }
-        assert_eq!(value["slots"][0]["views"][0]["chat"], "group");
+        assert_eq!(
+            value["slots"][0]["views"][0]["chat"],
+            serde_json::json!({ "group": 0 })
+        );
         assert!(
             value["subagents"]["a1"]["block"].get("thread_id").is_none(),
             "{text}"
         );
         std::fs::remove_file(&copy).unwrap();
-        let again = store.load().unwrap();
-        assert!(!again.dirty, "a version 2 file is not written again");
+        let again = store.load(GroupChat::UNIT).unwrap();
+        assert!(!again.dirty, "a version 3 file is not written again");
         assert!(!copy.exists(), "only a version 1 file is kept");
         assert_eq!(again.slots, loaded.slots);
         assert_eq!(again.sessions, loaded.sessions);
@@ -4416,7 +4680,10 @@ mod tests {
         assert_ne!(parts, v1);
         for text in [parts, v1.replacen("\"slots\": [", "\"slots\": [7, ", 1)] {
             std::fs::write(dir.path().join(FILE_NAME), text).unwrap();
-            assert!(matches!(store.load(), Err(LoadError::Invalid)));
+            assert!(matches!(
+                store.load(GroupChat::UNIT),
+                Err(LoadError::Invalid)
+            ));
         }
         assert!(
             !dir.path().join(V1_COPY_NAME).exists(),
@@ -4426,10 +4693,16 @@ mod tests {
         registry.apply_hook(&start(A, CWD, Some(10), None));
         registry.slots[0].views.clear();
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Invalid)));
-        registry.slots[0].views = vec![View::new(Chat::Group), View::new(Chat::Group)];
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::Invalid)
+        ));
+        registry.slots[0].views = vec![View::new(Chat::GROUP), View::new(Chat::GROUP)];
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        assert!(matches!(store.load(), Err(LoadError::Invalid)));
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::Invalid)
+        ));
     }
 
     /// TASK-061: a version 1 file that cannot be kept for a rollback is not
@@ -4441,14 +4714,17 @@ mod tests {
         // A folder in the copy's place: the rename onto it fails everywhere.
         std::fs::create_dir_all(dir.path().join(V1_COPY_NAME).join("x")).unwrap();
         let store = RegistryStore::open(dir.path()).unwrap();
-        assert!(matches!(store.load(), Err(LoadError::KeepV1(_))));
+        assert!(matches!(
+            store.load(GroupChat::UNIT),
+            Err(LoadError::KeepV1(_))
+        ));
         assert_eq!(
             std::fs::read(dir.path().join(FILE_NAME)).unwrap(),
             V1.as_bytes()
         );
         // The next start, with the way cleared, migrates and keeps the copy.
         std::fs::remove_dir_all(dir.path().join(V1_COPY_NAME)).unwrap();
-        assert!(store.load().unwrap().dirty);
+        assert!(store.load(GroupChat::UNIT).unwrap().dirty);
         assert_eq!(
             std::fs::read(dir.path().join(V1_COPY_NAME)).unwrap(),
             V1.as_bytes()
@@ -4468,10 +4744,10 @@ mod tests {
         registry.apply_hook(&start(A, CWD, Some(10), None));
         registry.apply_hook(&start(B, CWD, Some(11), None));
         registry.slots[1].views.push(View::new(private));
-        registry.topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        registry.topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         registry.topic_created(SlotId(1), private, 100, "b", None);
         assert_eq!(
-            registry.slot_by_topic(Place::topic(Chat::Group, 100)),
+            registry.slot_by_topic(Place::topic(Chat::GROUP, 100)),
             Some(SlotId(0))
         );
         assert_eq!(
@@ -4482,10 +4758,10 @@ mod tests {
         // A gone report of the private topic 100 leaves the group's alone.
         registry.topic_invalid(SlotId(0), private, 100);
         assert_eq!(registry.slots[0].views[0].topic_id, Some(100));
-        registry.topic_invalid(SlotId(1), Chat::Group, 100);
+        registry.topic_invalid(SlotId(1), Chat::GROUP, 100);
         assert_eq!(registry.slots[1].views[1].topic_id, Some(100));
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert_eq!(
             loaded.slots[1].views[1].place(),
             Some(Place::topic(private, 100))
@@ -4501,21 +4777,21 @@ mod tests {
         let store = RegistryStore::open(dir.path()).unwrap();
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, CWD, Some(10), None));
-        registry.topic_created(SlotId(0), Chat::Group, 100, "a", None);
+        registry.topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let plain = serde_json::to_string(&registry.slots[0].views[0]).unwrap();
         for key in ["backlog", "every_message", "mention_told"] {
             assert!(!plain.contains(key), "{plain}");
         }
-        let view = registry.slots[0].view_mut(Chat::Group).unwrap();
+        let view = registry.slots[0].view_mut(Chat::GROUP).unwrap();
         view.backlog.push("Анна: a".into());
         view.every_message = true;
         view.mention_told = true;
         store.save(&RegistryStore::encode(&registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         let view = &loaded.slots[0].views[0];
         assert_eq!(view.backlog.parts, ["Анна: a"]);
         assert!(view.every_message && view.mention_told);
-        registry.topic_invalid(SlotId(0), Chat::Group, 100);
+        registry.topic_invalid(SlotId(0), Chat::GROUP, 100);
         let view = &registry.slots[0].views[0];
         assert_eq!(view.topic_id, None);
         assert!(view.every_message, "the mode stays");
@@ -4532,10 +4808,10 @@ mod tests {
         let separator_b = separator(B, false);
         // Its first try failed: it waits for the retry tick.
         let (mut registry, slot, _) = private_slot();
-        registry.share(slot, Chat::Group, line.clone());
-        registry.topic_created(slot, Chat::Group, 100, "t", None);
-        assert!(registry.separator_job(slot, Chat::Group).is_some());
-        registry.topic_failed(slot, Chat::Group, Some(100), &Icons::default());
+        registry.share(slot, Chat::GROUP, line.clone());
+        registry.topic_created(slot, Chat::GROUP, 100, "t", None);
+        assert!(registry.separator_job(slot, Chat::GROUP).is_some());
+        registry.topic_failed(slot, Chat::GROUP, Some(100), &Icons::default());
         registry.apply_hook(&end(A));
         registry.apply_hook(&start(B, CWD, Some(2), None));
         assert_eq!(slot_of(&registry, B), Some(slot));
@@ -4553,26 +4829,26 @@ mod tests {
         let jobs = registry.topic_work(&Icons::default(), true);
         assert!(
             jobs.iter().any(|job| matches!(job,
-                TopicJob::Separator { chat: Chat::Group, text, .. } if *text == joined)),
+                TopicJob::Separator { chat: Chat::GROUP, text, .. } if *text == joined)),
             "{jobs:?}"
         );
-        registry.topic_separated(slot, Chat::Group, 100, &joined);
+        registry.topic_separated(slot, Chat::GROUP, 100, &joined);
         assert_eq!(registry.slots[slot.0].views[1].pending_separator, None);
 
         // On its way when the session came: only the separator is left.
         for sent in [line.clone(), format!("{line}\n{}", separator(C, false))] {
             let (mut registry, slot, _) = private_slot();
-            registry.share(slot, Chat::Group, line.clone());
-            registry.topic_created(slot, Chat::Group, 100, "t", None);
+            registry.share(slot, Chat::GROUP, line.clone());
+            registry.topic_created(slot, Chat::GROUP, 100, "t", None);
             registry.slots[slot.0].views[1].pending_separator = Some(sent.clone());
-            assert!(registry.separator_job(slot, Chat::Group).is_some());
+            assert!(registry.separator_job(slot, Chat::GROUP).is_some());
             registry.apply_hook(&end(A));
             registry.apply_hook(&start(B, CWD, Some(2), None));
             assert_eq!(
                 registry.slots[slot.0].views[1].pending_separator.as_deref(),
                 Some(joined.as_str())
             );
-            registry.topic_separated(slot, Chat::Group, 100, &sent);
+            registry.topic_separated(slot, Chat::GROUP, 100, &sent);
             assert_eq!(
                 registry.slots[slot.0].views[1].pending_separator.as_deref(),
                 Some(separator_b.as_str()),
@@ -4587,23 +4863,23 @@ mod tests {
     #[test]
     fn an_adopted_separator_on_its_way_is_posted_once() {
         let (mut registry, slot, _) = private_slot();
-        assert!(registry.add_view(slot, Chat::Group));
+        assert!(registry.add_view(slot, Chat::GROUP));
         registry.slots[slot.0].views[1].fallback = true;
-        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        registry.topic_created(slot, Chat::GROUP, 100, "t", None);
         let separator = separator(B, false);
         registry.slots[slot.0].views[1].pending_separator = Some(separator.clone());
         let jobs = registry.topic_work(&Icons::default(), true);
         assert!(
             jobs.iter().any(|job| matches!(job,
-                TopicJob::Separator { chat: Chat::Group, text, .. } if *text == separator)),
+                TopicJob::Separator { chat: Chat::GROUP, text, .. } if *text == separator)),
             "{jobs:?}"
         );
         let line = share_line("Анна");
         assert_eq!(
-            registry.share(slot, Chat::Group, line.clone()),
+            registry.share(slot, Chat::GROUP, line.clone()),
             Some(Shared::Adopted)
         );
-        registry.topic_separated(slot, Chat::Group, 100, &separator);
+        registry.topic_separated(slot, Chat::GROUP, 100, &separator);
         assert_eq!(
             registry.slots[slot.0].views[1].pending_separator,
             Some(line)
@@ -4626,8 +4902,8 @@ mod tests {
     #[test]
     fn a_stale_failure_of_an_unshared_view_leaves_the_new_create_alone() {
         let (mut registry, slot, _) = private_slot();
-        registry.share(slot, Chat::Group, share_line("Анна"));
-        registry.topic_created(slot, Chat::Group, 100, "t", None);
+        registry.share(slot, Chat::GROUP, share_line("Анна"));
+        registry.topic_created(slot, Chat::GROUP, 100, "t", None);
         registry.slots[slot.0].views[1].pending_separator = None;
         // A rename of the group topic goes out.
         registry.slots[slot.0].views[1].applied_title = Some("old".into());
@@ -4636,16 +4912,16 @@ mod tests {
             jobs.iter().any(|job| matches!(
                 job,
                 TopicJob::Edit {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     ..
                 }
             )),
             "{jobs:?}"
         );
         // Unshared and shared again while it is on its way.
-        assert_eq!(registry.unshare(slot, Chat::Group), Unshared::Removed);
+        assert_eq!(registry.unshare(slot, Chat::GROUP), Unshared::Removed);
         assert_eq!(
-            registry.share(slot, Chat::Group, share_line("Анна")),
+            registry.share(slot, Chat::GROUP, share_line("Анна")),
             Some(Shared::Added)
         );
         let creates = |jobs: &[TopicJob]| {
@@ -4654,7 +4930,7 @@ mod tests {
                     matches!(
                         job,
                         TopicJob::Create {
-                            chat: Chat::Group,
+                            chat: Chat::GROUP,
                             ..
                         }
                     )
@@ -4663,7 +4939,7 @@ mod tests {
         };
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
         // The old rename fails (not "topic gone").
-        registry.topic_failed(slot, Chat::Group, Some(100), &Icons::default());
+        registry.topic_failed(slot, Chat::GROUP, Some(100), &Icons::default());
         registry.retry_failed();
         assert_eq!(
             creates(&registry.topic_work(&Icons::default(), true)),
@@ -4671,9 +4947,281 @@ mod tests {
             "a second createForumTopic while the first is on its way"
         );
         // The new create's own failure still counts.
-        registry.topic_failed(slot, Chat::Group, None, &Icons::default());
+        registry.topic_failed(slot, Chat::GROUP, None, &Icons::default());
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 0);
         registry.retry_failed();
         assert_eq!(creates(&registry.topic_work(&Icons::default(), true)), 1);
+    }
+
+    /// The `registry.json` the v0.1.22 encoder wrote for a registry with a
+    /// chat in every place one is stored (TASK-069 step 1, generated on
+    /// v0.1.22 44875f5 before `Chat` changed).
+    const V2: &str = include_str!("../../tests/fixtures/registry-v0.1.22.json");
+
+    /// TASK-069: a v0.1.22 file migrates into version 3: every stored chat
+    /// `"group"` becomes the default group with its id, nothing else
+    /// changes, the old bytes are kept as `registry.v2.json` before
+    /// anything is written, and the saved file loads without a change.
+    #[test]
+    fn a_v0_1_22_registry_migrates_into_version_3() {
+        const ID: i64 = -100_777;
+        let default = GroupChat::of(ID);
+        let dir = TempDir::new("registry-v2");
+        std::fs::write(dir.path().join(FILE_NAME), V2).unwrap();
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let loaded = store.load(default).unwrap();
+        assert!(loaded.dirty, "written as version 3 at once");
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.default_group, default);
+        assert_eq!(
+            std::fs::read(dir.path().join(V2_COPY_NAME)).unwrap(),
+            V2.as_bytes()
+        );
+        assert!(!dir.path().join(V2_COPY_TEMP_NAME).exists());
+        assert!(!dir.path().join(V1_COPY_NAME).exists());
+        assert_eq!(
+            std::fs::read(dir.path().join(FILE_NAME)).unwrap(),
+            V2.as_bytes(),
+            "not written by the load"
+        );
+        assert_eq!(
+            loaded.groups,
+            [Group {
+                chat: default,
+                title: None,
+                ready: true,
+                can_delete: false,
+                left: false,
+            }]
+        );
+
+        let group = Chat::Group(default);
+        let views = &loaded.slots[0].views;
+        assert_eq!(views[1].chat, group);
+        assert!(views[1].every_message && views[1].mention_told);
+        assert_eq!(views[1].backlog.parts.len(), 2);
+        assert_eq!(views[1].backlog.dropped, 1);
+        assert_eq!(views[1].status_message(), Some(MessageKey::new(group, 500)));
+        assert!(loaded.slots[1].views[1].fallback);
+        assert_eq!(loaded.slots[2].views[0].chat, group);
+        let buffer = &loaded.slots[0].buffer;
+        assert!(buffer.messages.iter().all(|parked| parked.chat == group));
+        assert!(buffer.messages[1].pending());
+        assert_eq!(
+            buffer.resume.as_ref().and_then(|note| note.message),
+            Some(MessageKey::new(group, 900))
+        );
+        let stream = loaded.sessions[A].stream.as_ref().unwrap();
+        assert_eq!(stream.receipts[0], MessageKey::new(group, 5));
+        assert!(stream.receipts[1].chat.is_private());
+        assert_eq!(stream.parts[0].1[1], MessageKey::new(group, 4));
+        assert_eq!(
+            loaded.sessions[N].block.as_ref().unwrap().message(),
+            Some(MessageKey::new(group, 502))
+        );
+        assert_eq!(
+            loaded.subagents["a1"].block.message(),
+            Some(MessageKey::new(group, 501))
+        );
+        assert!(loaded.twins.iter().all(|link| link.twin.chat == group));
+        assert_eq!(loaded.unshared[0].place, Place::topic(group, 103));
+        let person = &loaded.people[0];
+        assert_eq!(
+            person.settings.history,
+            crate::hub::menu::HistoryLimit::Long
+        );
+        assert!(!person.settings.group.rich && !person.settings.rich);
+        assert_eq!(person.settings.tz, Some(180));
+
+        store.save(&RegistryStore::encode(&loaded)).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        let before = V2.matches("\"chat\": \"group\"").count();
+        assert!(before > 10, "{before}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["version"], 3);
+        assert!(!text.contains("\"chat\": \"group\""), "{text}");
+        let old: serde_json::Value = serde_json::from_str(V2).unwrap();
+        // The person's chat and group settings are no chats.
+        assert_eq!(value["people"], old["people"]);
+        let mut chats = 0;
+        count_group(&value, &serde_json::json!({ "group": ID }), &mut chats);
+        assert_eq!(chats, before);
+
+        std::fs::remove_file(dir.path().join(V2_COPY_NAME)).unwrap();
+        let again = store.load(default).unwrap();
+        assert!(!again.dirty, "a version 3 file is not written again");
+        assert!(!dir.path().join(V2_COPY_NAME).exists());
+        assert_eq!(again.slots, loaded.slots);
+        assert_eq!(again.sessions, loaded.sessions);
+        assert_eq!(again.groups, loaded.groups);
+    }
+
+    /// The values of key `chat` equal to `group` in `value`.
+    fn count_group(value: &serde_json::Value, group: &serde_json::Value, count: &mut usize) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "chat" && value == group {
+                        *count += 1;
+                    } else {
+                        count_group(value, group, count);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    count_group(item, group, count);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// TASK-069: a version 2 file that cannot be kept for a rollback is not
+    /// migrated; the next load with the way clear migrates it.
+    #[test]
+    fn a_v2_file_that_cannot_be_kept_is_not_migrated() {
+        let dir = TempDir::new("registry-v2-keep");
+        std::fs::write(dir.path().join(FILE_NAME), V2).unwrap();
+        std::fs::create_dir_all(dir.path().join(V2_COPY_NAME).join("x")).unwrap();
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let error = store.load(GroupChat::of(-100_777)).unwrap_err();
+        assert!(matches!(error, LoadError::KeepV2(_)), "{error}");
+        assert!(error.to_string().contains("registry.v2.json"));
+        assert_eq!(
+            std::fs::read(dir.path().join(FILE_NAME)).unwrap(),
+            V2.as_bytes()
+        );
+        std::fs::remove_dir_all(dir.path().join(V2_COPY_NAME)).unwrap();
+        assert!(store.load(GroupChat::of(-100_777)).unwrap().dirty);
+        assert_eq!(
+            std::fs::read(dir.path().join(V2_COPY_NAME)).unwrap(),
+            V2.as_bytes()
+        );
+    }
+
+    /// TASK-069: `CCTG_CHAT_ID` changed: the old group stays a known one,
+    /// the new one is the default; two records of one group refuse to load.
+    #[test]
+    fn a_new_default_group_is_added_and_duplicates_refuse_to_load() {
+        let (old, new) = (GroupChat::of(-1001), GroupChat::of(-1002));
+        let dir = TempDir::new("registry-groups");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let first = store.load(old).unwrap();
+        store.save(&RegistryStore::encode(&first)).unwrap();
+        let loaded = store.load(new).unwrap();
+        assert!(loaded.dirty);
+        assert_eq!(loaded.default_group, new);
+        let chats: Vec<GroupChat> = loaded.groups.iter().map(|group| group.chat).collect();
+        assert_eq!(chats, [old, new]);
+        assert!(loaded.usable(Chat::Group(old)) && loaded.usable(Chat::Group(new)));
+        let mut twice = loaded.clone();
+        twice.groups.push(twice.groups[0].clone());
+        store.save(&RegistryStore::encode(&twice)).unwrap();
+        assert!(matches!(store.load(new), Err(LoadError::Invalid)));
+    }
+
+    /// TASK-069: the default group is usable without a record, an unknown
+    /// group is not, nor a group the bot left; a left group's view is no
+    /// primary view.
+    #[test]
+    fn which_groups_are_usable() {
+        let (b, c) = (GroupChat::of(-1002), GroupChat::of(-1003));
+        let mut registry = Registry::default();
+        assert!(registry.usable(Chat::GROUP));
+        assert!(!registry.usable(Chat::Group(b)));
+        assert_eq!(
+            registry.join_group(b, Some("B".into()), true, true),
+            GroupChange::Added { ready: true }
+        );
+        assert!(registry.usable(Chat::Group(b)));
+        assert!(!registry.usable(Chat::Group(c)));
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        let slot = slot_of(&registry, A).unwrap();
+        registry.slots[slot.0].views = vec![View::new(Chat::Group(b))];
+        registry.topic_created(slot, Chat::Group(b), 100, "t", None);
+        assert_eq!(
+            registry.place(slot),
+            Some(Place::topic(Chat::Group(b), 100))
+        );
+        assert!(registry.leave_group(b));
+        assert!(!registry.leave_group(b), "once");
+        assert!(!registry.usable(Chat::Group(b)));
+        assert_eq!(registry.place(slot), None);
+        assert!(registry.topic_work(&Icons::default(), true).is_empty());
+    }
+
+    /// TASK-069: joining a group tells what changed once.
+    #[test]
+    fn joining_a_group_tells_only_changes() {
+        let b = GroupChat::of(-1002);
+        let mut registry = Registry::default();
+        assert_eq!(
+            registry.join_group(b, Some("B".into()), false, false),
+            GroupChange::Added { ready: false }
+        );
+        registry.dirty = false;
+        assert_eq!(
+            registry.join_group(b, None, false, false),
+            GroupChange::Quiet
+        );
+        assert!(!registry.dirty, "nothing changed");
+        assert_eq!(registry.group(b).unwrap().title.as_deref(), Some("B"));
+        assert_eq!(
+            registry.join_group(b, Some("B2".into()), true, true),
+            GroupChange::ReadyChanged(true)
+        );
+        assert!(registry.dirty);
+        assert_eq!(registry.group_title(b), "B2");
+        assert!(registry.leave_group(b));
+        assert_eq!(
+            registry.join_group(b, None, true, true),
+            GroupChange::Returned { ready: true }
+        );
+        assert!(!registry.group(b).unwrap().left);
+        assert_eq!(registry.group_number(b), Some(1));
+        assert_eq!(registry.group_title(GroupChat::UNIT), DEFAULT_GROUP_TITLE);
+        registry.groups[0].title = None;
+        assert_eq!(registry.group_title(b), "группа 1");
+    }
+
+    /// TASK-069: the groups a slot may go to: the default one first, then
+    /// ready groups the bot is in; one it is shared to stays for the
+    /// unshare. A new share takes the slot's mention mode.
+    #[test]
+    fn share_targets_and_the_mode_of_a_new_share() {
+        let (b, c, d) = (
+            GroupChat::of(-1002),
+            GroupChat::of(-1003),
+            GroupChat::of(-1004),
+        );
+        let (mut registry, slot, _) = private_slot();
+        registry.join_group(b, None, true, true);
+        registry.join_group(c, None, false, true);
+        registry.join_group(d, None, true, true);
+        assert_eq!(
+            registry.share_targets(slot),
+            [(GroupChat::UNIT, false), (b, false), (d, false)]
+        );
+        registry.share(slot, Chat::Group(b), share_line("Анна"));
+        registry.share(slot, Chat::Group(c), share_line("Анна"));
+        registry.leave_group(d);
+        assert_eq!(
+            registry.share_targets(slot),
+            [(GroupChat::UNIT, false), (b, true), (c, true)],
+            "a shared group that is not ready stays for the unshare"
+        );
+        registry.slots[slot.0]
+            .view_mut(Chat::Group(b))
+            .unwrap()
+            .every_message = true;
+        registry.share(slot, Chat::GROUP, share_line("Анна"));
+        assert!(
+            registry.slots[slot.0]
+                .view_mut(Chat::GROUP)
+                .unwrap()
+                .every_message,
+            "the new share takes the slot's mode"
+        );
     }
 }

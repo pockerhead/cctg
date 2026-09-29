@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use super::buffer::{Attachment, PART_SEPARATOR, Parked};
-use super::chat::Chat;
+use super::chat::{Chat, GroupChat};
 use crate::wire::FileKind;
 
 /// Messages kept per group view; one more drops the oldest.
@@ -131,8 +131,9 @@ pub fn part(
         Some(file) => format!("{} {text}", placeholder(file)),
         None => text.to_owned(),
     };
+    // Only its content is read: the chat is a placeholder.
     Parked {
-        chat: Chat::Group,
+        chat: Chat::Group(GroupChat::of(0)),
         message_id: 0,
         thread_id: 0,
         text: words,

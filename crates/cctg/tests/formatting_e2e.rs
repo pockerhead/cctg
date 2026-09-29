@@ -5,12 +5,17 @@
 use std::sync::{Arc, Mutex};
 
 use cctg::hub::api::{BotApi, Document};
-use cctg::hub::chat::{Chat, PrivateChat};
+use cctg::hub::chat::{Chat, GroupChat, PrivateChat};
 use cctg::hub::config::Config;
 use cctg::hub::scheduler::{BucketConfig, Op, Outbox, Outcome, Scheduler};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 const CANT_PARSE: &str = r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Unsupported start tag \"x\" at byte offset 0"}"#;
 const SENT: &str = r#"{"ok":true,"result":{"message_id":7,"chat":{"id":-1001}}}"#;
@@ -82,7 +87,7 @@ async fn scheduler(bodies: Arc<Mutex<Vec<Value>>>) -> (Scheduler<BotApi>, Outbox
     })
     .unwrap()
     .token;
-    let api = Arc::new(BotApi::with_api_url(&url, &token, -1001, None).unwrap());
+    let api = Arc::new(BotApi::with_api_url(&url, &token, None).unwrap());
     let fast = BucketConfig {
         capacity: 100,
         refill_every: std::time::Duration::from_millis(1),
@@ -98,7 +103,7 @@ async fn html_refused_by_telegram_is_sent_again_once_as_plain_text() {
     let running = tokio::spawn(scheduler.run());
     let answer = outbox
         .submit(Op::Send {
-            chat: Chat::Group,
+            chat: GROUP,
             thread_id: Some(5),
             text: "**done** <ok>".to_owned(),
             html: Some("<b>done</b> &lt;ok&gt;".to_owned()),
@@ -130,7 +135,7 @@ async fn only_loud_sends_go_without_disable_notification() {
     let (scheduler, outbox) = scheduler(bodies.clone()).await;
     let running = tokio::spawn(scheduler.run());
     let send = |text: &str, notify| Op::Send {
-        chat: Chat::Group,
+        chat: GROUP,
         thread_id: Some(5),
         text: text.to_owned(),
         html: None,
@@ -141,7 +146,7 @@ async fn only_loud_sends_go_without_disable_notification() {
         notify,
     };
     let line = |text: &str, notify| Op::Stream {
-        chat: Chat::Group,
+        chat: GROUP,
         thread_id: 5,
         text: text.to_owned(),
         html: None,
@@ -152,7 +157,7 @@ async fn only_loud_sends_go_without_disable_notification() {
         into: None,
     };
     let document = |name: &str, notify| Op::SendDocument {
-        chat: Chat::Group,
+        chat: GROUP,
         thread_id: Some(5),
         document: Document {
             file_name: name.to_owned(),
@@ -206,7 +211,7 @@ async fn only_loud_sends_go_without_disable_notification() {
 }
 
 /// TASK-061: every request names its chat: the configured group for
-/// `Chat::Group`, the user's id for the private chat with that user. The same
+/// `GROUP`, the user's id for the private chat with that user. The same
 /// message id goes to each chat as asked.
 #[tokio::test]
 async fn every_request_goes_to_the_chat_its_op_names() {
@@ -254,7 +259,7 @@ async fn every_request_goes_to_the_chat_its_op_names() {
         },
         notify: false,
     };
-    for chat in [Chat::Group, private] {
+    for chat in [GROUP, private] {
         for op in [
             send(chat),
             edit(chat),

@@ -194,9 +194,9 @@
 //! ([`Registry::primary_view`]): everything above happens there, the stream
 //! offset moves with it, and every message the actor puts there and every
 //! later call about it goes to the other views, the group's, as twins
-//! ([`mirror`]); at most [`MAX_TWIN_POSTS`] new twins (also the new
-//! messages of a mirror topic's own turn stream) wait for Telegram, more
-//! are dropped and the mirror topic is told once it caught up. A press or a
+//! ([`mirror`]); at most [`MAX_TWIN_POSTS`] new twins per chat (also the
+//! new messages of a mirror topic's own turn stream) wait for Telegram,
+//! more are dropped and the mirror topic is told once its chat caught up. A press or a
 //! reply on a twin counts for its primary message; a user's message, a
 //! notice or a command answer in a mirror topic moves the status message in
 //! every view. Turn lines and the turn message are no twins (TASK-078): a
@@ -306,8 +306,25 @@
 //! that fails. The owner switches a slot to every message and back in the
 //! menu's session row.
 //!
-//! Logs carry short session ids, slot ordinals and fixed text; never a path,
-//! a folder, a title, message text, a file name or a caption.
+//! Several groups (TASK-069, see [`groups`]): the group of `CCTG_CHAT_ID`
+//! is the default one; others join while the hub runs, when an allowlisted
+//! user adds the bot as an administrator (`my_chat_member`, [`Control::Member`])
+//! or writes `/connect@<bot>` there ([`Control::Connect`], checked with
+//! `getChatMember` by the lookup task, [`Slots::look_up_groups`]). The bot
+//! leaves a group a stranger added it to. Known groups are rechecked
+//! silently at start (`getChat`, `getChatMember`): one the bot was removed
+//! from is `left`, one without topics is not ready. A slot may show in
+//! several groups, each a view with its own topic and its own mention mode
+//! state (backlog, albums, hint); 📣/💬 of the menu sets the mode of all of
+//! them. With two or more groups to choose from, the share button, the menu
+//! row and `/share`/`/unshare` open a group picker in the slot's private
+//! topic (callback `grp:<slot>:<chat id>:<s|u|c>`, owner only). Each group
+//! has its own scheduler and its own twin budget; the right to delete is
+//! each group's own.
+//!
+//! Logs carry short session ids, slot ordinals, group numbers and fixed
+//! text; never a path, a folder, a title, a chat id, message text, a file
+//! name or a caption.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -322,13 +339,14 @@ use transcript::{
     split_markdown_for_telegram, telegram_len,
 };
 
-use super::api::{ApiError, Document};
+use super::api::{ApiError, ChatInfo, ChatMember, Document};
 use super::buffer::{self, Attachment, Parked, ResumeNote};
-use super::chat::{Chat, MessageKey, Place, PrivateChat};
+use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
 use super::console;
 use super::devices::Devices;
 use super::fetch::{self, Fetch, Fetched};
+use super::groups::{self, GroupLookup, KnownGroups, Membership, Missing, PickAction, PickRow};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
 use super::mention;
 use super::menu::{self, MenuPress, Page, RowState, SlotAction};
@@ -336,8 +354,8 @@ use super::mirror::{Detached, Follow, Landed, Mirror, Write};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
 use super::registry::{
-    BlockJob, BlockKey, Icons, Registry, RegistryStore, SessionKind, Shared, SlotId, SlotState,
-    StatusMessage, TopicJob, TwinLink, Unshared, UnsharedTopic, View, cut, share_line,
+    BlockJob, BlockKey, GroupChange, Icons, Registry, RegistryStore, SessionKind, Shared, SlotId,
+    SlotState, StatusMessage, TopicJob, TwinLink, Unshared, UnsharedTopic, View, cut, share_line,
 };
 use super::scheduler::{Delivery, LiveText, Op, Outbox, Outcome, Rich};
 use super::status::{self, Activity, Buttons, Press, ShareButton};
@@ -345,7 +363,7 @@ use super::stream::{self, Format, Held, Live, MirrorOp, Open, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
 };
-use super::updates::{CallbackInput, Inbound};
+use super::updates::{self, CallbackInput, ConnectInput, Inbound, MemberUpdate};
 use crate::channel::is_request_id;
 use crate::files;
 use crate::wire::{
@@ -532,6 +550,12 @@ pub const NOT_SHARED_NOTICE: &str = "Сессия и так не в группе
 pub const SHARE_OWNER_ONLY_NOTICE: &str = "Добавить сессию в группу или убрать из неё может только владелец: /share и /unshare в теме сессии в личке с ботом.";
 pub const SHARE_LATER_NOTICE: &str = "Сейчас нельзя: тема сессии или её тема в группе ещё не готова. Повторите через несколько секунд.";
 pub const SHARE_GENERAL_NOTICE: &str = "/share и /unshare работают в теме сессии.";
+/// The answer to a press that opened the group picker (TASK-069).
+pub const ANSWER_PICKER: &str = "Выбор группы ниже";
+/// The answer to the menu's group button (TASK-069).
+pub const ANSWER_PICKER_TOPIC: &str = "Выбор группы в теме сессии";
+/// Group lookups (`/connect`, leaving a group) waiting for the lookup task.
+const LOOKUP_QUEUE: usize = 16;
 /// Told in a group topic an unshare could not delete (TASK-064).
 pub const UNSHARED_KEPT_NOTICE: &str = "Сессию убрали из группы, но удалить эту тему бот не смог (нужно право удалять сообщения): она больше не обновляется.";
 /// Starts the echo of a user's message in the slot's other views (TASK-063):
@@ -642,6 +666,9 @@ pub struct Options {
     /// has failed and the history is cut ([`COMPRESS_WAIT`] in the hub);
     /// each piece of the summary starts the wait again.
     pub compress_wait: Duration,
+    /// The groups the update poll lets through (TASK-069); the actor
+    /// writes the registry's groups into it.
+    pub groups: KnownGroups,
 }
 
 /// Who the agent is in a group topic (TASK-077): `getMe`'s id and username.
@@ -771,6 +798,7 @@ impl Default for Options {
             menu: false,
             mentions: None,
             compress_wait: COMPRESS_WAIT,
+            groups: KnownGroups::default(),
         }
     }
 }
@@ -798,6 +826,10 @@ pub enum Control {
     /// The command worker answered a command in `place` (TASK-062): its
     /// messages are below the status message now.
     Posted { place: Place },
+    /// The bot's membership in a group changed (TASK-069).
+    Member(MemberUpdate),
+    /// `/connect` in a group (TASK-069).
+    Connect(ConnectInput),
     /// The hub stops: [`Slots::run`] handles what already came in, writes
     /// the registry and returns.
     Stop,
@@ -928,6 +960,61 @@ enum Done {
         job: MenuJob,
         delivery: Option<Delivery>,
     },
+    /// An edit of a group picker (TASK-069).
+    Picker(Option<Delivery>),
+    /// The lookup task answered (TASK-069).
+    GroupChecked(GroupAnswer),
+}
+
+/// What the group lookup task found (TASK-069).
+#[derive(Debug)]
+enum GroupAnswer {
+    /// The bot's membership in the group of a `/connect`.
+    Connect {
+        input: ConnectInput,
+        member: Result<ChatMember, ApiError>,
+    },
+    /// A known group rechecked at start: `getChat`, then `getChatMember`.
+    Refresh {
+        chat: GroupChat,
+        checked: Result<(ChatInfo, ChatMember), ApiError>,
+    },
+    /// The bot left a group a stranger added it to.
+    Left(Result<(), ApiError>),
+}
+
+/// A job of the group lookup task (TASK-069).
+#[derive(Debug)]
+enum LookupJob {
+    Connect(ConnectInput),
+    Leave(GroupChat),
+}
+
+/// Runs the lookups one at a time: first the startup checks of `refresh`,
+/// then the jobs until the actor drops the sender.
+async fn serve_lookups<L: GroupLookup>(
+    lookup: Arc<L>,
+    refresh: Vec<GroupChat>,
+    mut jobs: mpsc::Receiver<LookupJob>,
+    done: mpsc::UnboundedSender<Done>,
+) {
+    for chat in refresh {
+        let checked = match lookup.info(chat).await {
+            Ok(info) => lookup.member(chat).await.map(|member| (info, member)),
+            Err(error) => Err(error),
+        };
+        let _ = done.send(Done::GroupChecked(GroupAnswer::Refresh { chat, checked }));
+    }
+    while let Some(job) = jobs.recv().await {
+        let answer = match job {
+            LookupJob::Connect(input) => {
+                let member = lookup.member(input.chat).await;
+                GroupAnswer::Connect { input, member }
+            }
+            LookupJob::Leave(chat) => GroupAnswer::Left(lookup.leave(chat).await),
+        };
+        let _ = done.send(Done::GroupChecked(answer));
+    }
 }
 
 /// A call about the menu in the General of a private chat (TASK-073).
@@ -1210,6 +1297,8 @@ enum Work {
     DeleteTopic(Place),
     /// A call about a menu (TASK-073).
     Menu(MenuJob),
+    /// An edit of a group picker (TASK-069).
+    Picker,
     /// A call in a mirror topic (TASK-063): `id` its twin send in the
     /// [`Mirror`] when the answer links it, `place` the topic of a new
     /// message, `status` the text of a status message or of its edit (it
@@ -1587,8 +1676,9 @@ pub struct Slots {
     /// Slots whose front message waits for its history's compression
     /// (TASK-077): at most one per slot.
     compressing: HashSet<SlotId>,
-    /// The album of each slot's latest group file (TASK-077).
-    mention_albums: HashMap<SlotId, MentionAlbum>,
+    /// The album of the latest file of each group topic of a slot
+    /// (TASK-077; by group, TASK-069).
+    mention_albums: HashMap<(SlotId, Chat), MentionAlbum>,
     /// Hooks waiting for their channel twin, oldest first.
     hook_asks: Vec<HookAsk>,
     /// Hooks waiting for a press, by the key of their prompt.
@@ -1688,8 +1778,9 @@ pub struct Slots {
     /// Jobs handed to the dispatch task so far: the dispatch number of the
     /// next one is one more.
     handed: u64,
-    /// New twin messages waiting for Telegram, at most [`MAX_TWIN_POSTS`].
-    twin_posts: usize,
+    /// New twin messages waiting for Telegram, at most [`MAX_TWIN_POSTS`]
+    /// per chat (TASK-069: a group on a 429 pause holds up no other).
+    twin_posts: HashMap<Chat, usize>,
     /// The text of each status twin send still waiting, by its twin send id
     /// in the [`Mirror`]: cancelled when its primary goes away first.
     status_twins: HashMap<u64, LiveText>,
@@ -1737,6 +1828,11 @@ pub struct Slots {
     /// Private chats whose menu Telegram did not take for now: offered
     /// again on the retry tick.
     menu_later: HashSet<PrivateChat>,
+    /// The group lookup task, once [`Slots::look_up_groups`] started it.
+    lookups: Option<mpsc::Sender<LookupJob>>,
+    /// A first unshare press in a group picker waits for its second until
+    /// then, by slot (TASK-069).
+    picks: HashMap<SlotId, (GroupChat, Instant)>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1802,7 +1898,7 @@ impl Slots {
         let (dispatch, work) = mpsc::unbounded_channel();
         tokio::spawn(dispatch_loop(outbox, work, done_tx.clone()));
         let now = Instant::now();
-        Self {
+        let slots = Self {
             registry,
             dispatch,
             saver,
@@ -1866,7 +1962,7 @@ impl Slots {
             retire_warned: false,
             mirror,
             handed: 0,
-            twin_posts: 0,
+            twin_posts: HashMap::new(),
             status_twins: HashMap::new(),
             gaps: HashSet::new(),
             mirror_turns: HashMap::new(),
@@ -1885,12 +1981,46 @@ impl Slots {
             menus: HashMap::new(),
             pending_menus: HashMap::new(),
             menu_later: HashSet::new(),
+            lookups: None,
+            picks: HashMap::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
             done_rx: Some(done_rx),
             options,
-        }
+        };
+        slots.publish_groups();
+        slots
+    }
+
+    /// The update poll lets through the registry's groups (TASK-069).
+    fn publish_groups(&self) {
+        let known = self.registry.groups.iter().map(|group| group.chat);
+        self.options
+            .groups
+            .replace(std::iter::once(self.registry.default_group).chain(known));
+    }
+
+    /// Starts the task that checks groups with `lookup` (TASK-069): the
+    /// known groups but the default one at once, then `/connect` and the
+    /// leaving of groups; call before [`Self::run`]. Without it `/connect`
+    /// gets [`groups::CONNECT_FAILED_NOTICE`].
+    pub fn look_up_groups<L: GroupLookup>(&mut self, lookup: Arc<L>) {
+        let refresh: Vec<GroupChat> = self
+            .registry
+            .groups
+            .iter()
+            .filter(|group| group.chat != self.registry.default_group && !group.left)
+            .map(|group| group.chat)
+            .collect();
+        let (jobs, jobs_rx) = mpsc::channel(LOOKUP_QUEUE);
+        tokio::spawn(serve_lookups(
+            lookup,
+            refresh,
+            jobs_rx,
+            self.done_tx.clone(),
+        ));
+        self.lookups = Some(jobs);
     }
 
     /// Starts the task that downloads the files of kept messages with
@@ -3575,10 +3705,12 @@ impl Slots {
                 }
                 return;
             }
+            Control::Member(update) => return self.on_member(update),
+            Control::Connect(input) => return self.on_connect(input),
             // Handled by `run`.
             Control::Stop => return,
         };
-        if !self.options.can_delete
+        if !self.can_delete(chat)
             || self
                 .registry
                 .slot_by_topic(Place::new(chat, thread_id))
@@ -3598,11 +3730,10 @@ impl Slots {
             Chat::Private(private) => {
                 self.registry.person(private).and_then(|person| person.menu) == Some(pinned)
             }
-            Chat::Group => false,
+            Chat::Group(_) => false,
         };
         if menu
-            || (self.options.can_delete
-                && self.status_slot(MessageKey::new(chat, pinned)).is_some())
+            || (self.can_delete(chat) && self.status_slot(MessageKey::new(chat, pinned)).is_some())
         {
             self.hand_off(Work::Delete, Op::Delete { chat, message_id });
         }
@@ -3812,32 +3943,34 @@ impl Slots {
         let Some(bot) = &self.options.mentions else {
             return false;
         };
+        // Each group topic of the slot by its own view (TASK-069).
         let group_view = self
             .registry
             .slot(slot)
-            .and_then(|entry| entry.views.iter().find(|view| view.chat == Chat::Group));
+            .and_then(|entry| entry.views.iter().find(|view| view.chat == place.chat));
         let console = !input.forwarded
             && input
                 .text
                 .as_deref()
                 .is_some_and(|text| console::classify(text).is_some());
-        place.chat == Chat::Group
+        matches!(place.chat, Chat::Group(_))
             && self
                 .registry
                 .place(slot)
                 .is_some_and(|primary| primary.chat.is_private())
-            && self.registry.shared(slot, Chat::Group)
+            && self.registry.shared(slot, place.chat)
             && group_view.is_some_and(|view| !view.every_message)
             && !mentioned(bot, input)
-            && !self.album_mentioned(slot, input)
+            && !self.album_mentioned(slot, place.chat, input)
             && !console
     }
 
-    /// `input` is a file of the album of `slot` that addressed the agent.
-    fn album_mentioned(&self, slot: SlotId, input: &Inbound) -> bool {
+    /// `input` is a file of the album of `slot`'s topic in `chat` that
+    /// addressed the agent.
+    fn album_mentioned(&self, slot: SlotId, chat: Chat, input: &Inbound) -> bool {
         album_of(input).is_some_and(|id| {
             self.mention_albums
-                .get(&slot)
+                .get(&(slot, chat))
                 .is_some_and(|album| album.mentioned && album.id == id)
         })
     }
@@ -3855,7 +3988,7 @@ impl Slots {
             .mentions
             .as_ref()
             .is_some_and(|bot| mentioned(bot, input));
-        if place.chat != Chat::Group || !addressed {
+        if !matches!(place.chat, Chat::Group(_)) || !addressed {
             return Vec::new();
         }
         let album = MentionAlbum {
@@ -3863,7 +3996,7 @@ impl Slots {
             mentioned: true,
             kept: Vec::new(),
         };
-        let kept = match self.mention_albums.insert(slot, album) {
+        let kept = match self.mention_albums.insert((slot, place.chat), album) {
             Some(album) if album.id == id => album.kept,
             _ => return Vec::new(),
         };
@@ -3873,7 +4006,7 @@ impl Slots {
         if let Some(view) = self
             .registry
             .slot_mut(slot)
-            .and_then(|entry| entry.view_mut(Chat::Group))
+            .and_then(|entry| entry.view_mut(place.chat))
         {
             // Newest first: each is the latest part equal to it.
             for (_, part) in kept.iter().rev() {
@@ -3917,7 +4050,7 @@ impl Slots {
         let Some(view) = self
             .registry
             .slot_mut(slot)
-            .and_then(|entry| entry.view_mut(Chat::Group))
+            .and_then(|entry| entry.view_mut(place.chat))
         else {
             return;
         };
@@ -3926,7 +4059,7 @@ impl Slots {
         self.registry.dirty = true;
         info!(ordinal, kept, "group message kept for the next mention");
         if let Some((id, input)) = album {
-            match self.mention_albums.get_mut(&slot) {
+            match self.mention_albums.get_mut(&(slot, place.chat)) {
                 Some(album) if album.id == id => {
                     if album.kept.len() < MAX_ALBUM {
                         album.kept.push((input, part));
@@ -3938,7 +4071,7 @@ impl Slots {
                         mentioned: false,
                         kept: vec![(input, part)],
                     };
-                    self.mention_albums.insert(slot, album);
+                    self.mention_albums.insert((slot, place.chat), album);
                 }
             }
         }
@@ -3955,7 +4088,7 @@ impl Slots {
             && let Some(view) = self
                 .registry
                 .slot_mut(slot)
-                .and_then(|entry| entry.view_mut(Chat::Group))
+                .and_then(|entry| entry.view_mut(place.chat))
         {
             view.mention_told = true;
         }
@@ -3966,11 +4099,11 @@ impl Slots {
     /// compress first when it is longer than the owner's limit. `None` for
     /// another topic or an empty backlog.
     fn take_history(&mut self, slot: SlotId, place: Place) -> Option<buffer::History> {
-        if place.chat != Chat::Group {
+        if !matches!(place.chat, Chat::Group(_)) {
             return None;
         }
         let limit = self.history_limit(slot);
-        let view = self.registry.slot_mut(slot)?.view_mut(Chat::Group)?;
+        let view = self.registry.slot_mut(slot)?.view_mut(place.chat)?;
         if view.backlog.parts.is_empty() {
             return None;
         }
@@ -7399,11 +7532,11 @@ impl Slots {
         );
         // Pointed at the slot's primary topic once there is one; rich, which
         // its target's view may drop then ([`Self::in_own_view`]).
-        let nowhere = Place::new(Chat::Group, None);
+        let nowhere = Place::new(self.registry.default_chat(), None);
         for op in text_ops(nowhere, session, text, kind, notify, true) {
             self.keep_lost(LostMessage {
                 slot,
-                chat: Chat::Group,
+                chat: nowhere.chat,
                 gone: false,
                 op,
             });
@@ -7493,11 +7626,19 @@ impl Slots {
             return;
         }
         // The share button counts only where it was pressed (TASK-064):
-        // before a press on a twin becomes one on its primary.
-        if let Some(press @ (Press::Share | Press::Unshare | Press::UnshareConfirm)) =
-            input.data.as_deref().and_then(status::parse_callback)
-        {
-            let answer = self.press_share(&input, press);
+        // before a press on a twin becomes one on its primary. So does a
+        // group picker's (TASK-069).
+        let answer = match input.data.as_deref() {
+            Some(data) => match status::parse_callback(data) {
+                Some(
+                    press @ (Press::Share | Press::Unshare | Press::UnshareConfirm | Press::Groups),
+                ) => Some(self.press_share(&input, press)),
+                _ => groups::parse_pick(data)
+                    .map(|(slot, group, action)| self.press_pick(&input, slot, group, action)),
+            },
+            None => None,
+        };
+        if let Some(answer) = answer {
             self.hand_off(
                 Work::Callback,
                 Op::AnswerCallback {
@@ -7743,7 +7884,9 @@ impl Slots {
         match press {
             Press::Update => unreachable!("answered above"),
             // Answered by `press_share` before a press gets here.
-            Press::Share | Press::Unshare | Press::UnshareConfirm => status::ANSWER_STALE,
+            Press::Share | Press::Unshare | Press::UnshareConfirm | Press::Groups => {
+                status::ANSWER_STALE
+            }
             _ if !busy => status::ANSWER_IDLE,
             Press::Confirm if armed => {
                 shown.confirm = None;
@@ -8196,7 +8339,7 @@ impl Slots {
                         .slot(slot)?
                         .views
                         .iter()
-                        .find(|view| view.chat == Chat::Group)
+                        .find(|view| matches!(view.chat, Chat::Group(_)))
                 });
             if let Some(view) = view {
                 meta.insert("place".to_owned(), view.chat.label().to_owned());
@@ -8648,9 +8791,13 @@ impl Slots {
                 .unshare_confirm
                 .is_some_and(|until| now < until || unseen)
         });
+        // Several groups to choose from: the picker (TASK-069).
+        if self.registry.share_targets(slot).len() > 1 {
+            return Some(ShareButton::Pick);
+        }
         Some(if confirm {
             ShareButton::Confirm
-        } else if self.registry.shared(slot, Chat::Group) {
+        } else if self.registry.shared(slot, self.registry.default_chat()) {
             ShareButton::Unshare
         } else {
             ShareButton::Share
@@ -9504,6 +9651,7 @@ impl Slots {
                     | Work::Answer
                     | Work::Twin { .. }
                     | Work::Menu(_)
+                    | Work::Picker
             )
         {
             return Vec::new();
@@ -9773,6 +9921,13 @@ impl Slots {
     /// stream nor its status closes the topic's turn message, except while
     /// `on_chunk` hands out what it decided.
     fn hand_twin(&mut self, seq: u64, call: TwinCall) -> bool {
+        // Nothing goes to a group the bot left (TASK-069), not even an edit
+        // or a delete of a twin there.
+        if let Some(chat @ Chat::Group(_)) = call.op.chat()
+            && !self.registry.usable(chat)
+        {
+            return false;
+        }
         let posts = call.op.posts();
         let asks = matches!(
             call.op,
@@ -9782,7 +9937,7 @@ impl Slots {
             }
         );
         if let Some(place) = posts
-            && self.twin_posts >= MAX_TWIN_POSTS
+            && self.twin_posts_in(place.chat) >= MAX_TWIN_POSTS
             && !asks
         {
             if self.gaps.insert(place) {
@@ -9790,7 +9945,9 @@ impl Slots {
             }
             return false;
         }
-        let to = posts.unwrap_or_else(|| Place::new(call.op.chat().unwrap_or(Chat::Group), None));
+        let to = posts.unwrap_or_else(|| {
+            Place::new(call.op.chat().unwrap_or(self.registry.default_chat()), None)
+        });
         let id = match call.link {
             Link::Seq { ghost, lasting } => self.mirror.send(seq, to, ghost, lasting),
             Link::Of(primary) => self.mirror.send_for(primary, to),
@@ -9843,7 +10000,7 @@ impl Slots {
         }
         self.handed += 1;
         if let Some(place) = posts {
-            self.twin_posts += 1;
+            *self.twin_posts.entry(place.chat).or_default() += 1;
             self.bottoms.entry(place).or_default().posting += 1;
             if own.is_none() && status_slot.is_none() && !self.read_closes_mirrors {
                 self.close_turn_message(place);
@@ -10041,8 +10198,13 @@ impl Slots {
         turn: Option<(Place, u64)>,
         delivery: Option<Delivery>,
     ) {
-        if place.is_some() {
-            self.twin_posts = self.twin_posts.saturating_sub(1);
+        if let Some(place) = place
+            && let Some(posts) = self.twin_posts.get_mut(&place.chat)
+        {
+            *posts = posts.saturating_sub(1);
+            if *posts == 0 {
+                self.twin_posts.remove(&place.chat);
+            }
         }
         let made = match &delivery {
             Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => Some(message.message_id),
@@ -10086,13 +10248,25 @@ impl Slots {
             (Some(Err(error)), _) => debug!(%error, "call in a mirror topic failed"),
             _ => {}
         }
-        if self.twin_posts == 0 && !self.gaps.is_empty() {
-            for place in std::mem::take(&mut self.gaps) {
-                if self.registry.slot_by_topic(place).is_some() {
-                    self.send_messages(vec![message_op(place, MIRROR_GAP_NOTICE.to_owned())]);
-                }
+        // A mirror topic is told once its chat caught up (TASK-069: each
+        // chat by its own count).
+        let caught_up: Vec<Place> = self
+            .gaps
+            .iter()
+            .copied()
+            .filter(|place| self.twin_posts_in(place.chat) == 0)
+            .collect();
+        for place in caught_up {
+            self.gaps.remove(&place);
+            if self.registry.slot_by_topic(place).is_some() {
+                self.send_messages(vec![message_op(place, MIRROR_GAP_NOTICE.to_owned())]);
             }
         }
+    }
+
+    /// New twin messages of `chat` waiting for Telegram.
+    fn twin_posts_in(&self, chat: Chat) -> usize {
+        self.twin_posts.get(&chat).copied().unwrap_or(0)
     }
 
     /// The topic `place` is gone in Telegram (a user deleted a private
@@ -10122,7 +10296,7 @@ impl Slots {
         warn!("the bot may not write to a private chat; its views wait until its user writes");
         if self.closed_told.insert(private) {
             self.send_messages(vec![message_op(
-                Place::new(Chat::Group, None),
+                Place::new(self.registry.default_chat(), None),
                 PRIVATE_CLOSED_NOTICE.to_owned(),
             )]);
         }
@@ -10213,7 +10387,8 @@ impl Slots {
                 .views
                 .iter()
                 .any(|view| self.registry.usable(view.chat));
-            if live && !usable && self.registry.add_view(slot, Chat::Group) {
+            let default = self.registry.default_chat();
+            if live && !usable && self.registry.add_view(slot, default) {
                 self.mark_fallback(slot);
                 info!(
                     ordinal = self.ordinal(slot),
@@ -10227,10 +10402,11 @@ impl Slots {
     /// The group view of `slot` is there only while its private chat is
     /// not usable (TASK-063).
     fn mark_fallback(&mut self, slot: SlotId) {
+        let default = self.registry.default_chat();
         if let Some(view) = self
             .registry
             .slot_mut(slot)
-            .and_then(|entry| entry.view_mut(Chat::Group))
+            .and_then(|entry| entry.view_mut(default))
         {
             view.fallback = true;
             self.registry.dirty = true;
@@ -10258,10 +10434,11 @@ impl Slots {
             if !self.proven.contains(&private) {
                 continue;
             }
+            let default = self.registry.default_chat();
             let fallback = self.registry.slots[index]
                 .views
                 .iter()
-                .find(|view| view.chat == Chat::Group && view.fallback);
+                .find(|view| view.chat == default && view.fallback);
             // A topic being made goes once it is known.
             if fallback.is_none_or(|view| view.topic_id.is_none() && view.busy) {
                 continue;
@@ -10272,7 +10449,7 @@ impl Slots {
                 .primaries
                 .get(&slot)
                 .is_some_and(|place| place.chat == Chat::Private(private));
-            let Some(view) = self.registry.remove_view(slot, Chat::Group) else {
+            let Some(view) = self.registry.remove_view(slot, default) else {
                 continue;
             };
             self.leave_group(
@@ -10299,10 +10476,7 @@ impl Slots {
                     "slot leaves the group: its private chat takes the session again"
                 );
                 if let Some(status) = view.status {
-                    self.retire(
-                        MessageKey::new(Chat::Group, status.message_id),
-                        status.pinned,
-                    );
+                    self.retire(MessageKey::new(view.chat, status.message_id), status.pinned);
                 }
                 if let Some(place) = view.place() {
                     self.end_group_topic(place, FALLBACK_END_NOTICE);
@@ -10392,6 +10566,15 @@ impl Slots {
             self.notify_author(slot, place, SHARE_OWNER_ONLY_NOTICE);
             return;
         }
+        // Several groups to choose from: the picker (TASK-069).
+        if self.registry.share_targets(slot).len() > 1 {
+            self.reopen(input.chat);
+            let bottom = self.bottoms.entry(place).or_default();
+            bottom.last = bottom.last.max(input.message_id);
+            self.close_turn_message(place);
+            self.send_picker(slot, place);
+            return;
+        }
         // Before `reopen`, which would drop a fallback group view.
         let adopted = match command {
             ShareCommand::Share => self.adopt_fallback(slot, input.display_name.as_deref()),
@@ -10401,10 +10584,13 @@ impl Slots {
         let bottom = self.bottoms.entry(place).or_default();
         bottom.last = bottom.last.max(input.message_id);
         self.close_turn_message(place);
+        let group = self.registry.default_group;
         let outcome = match (adopted, command) {
             (Some(outcome), _) => outcome,
-            (None, ShareCommand::Share) => self.share_slot(slot, input.display_name.as_deref()),
-            (None, ShareCommand::Unshare) => self.unshare_slot(slot),
+            (None, ShareCommand::Share) => {
+                self.share_slot(slot, group, input.display_name.as_deref())
+            }
+            (None, ShareCommand::Unshare) => self.unshare_slot(slot, group),
         };
         self.send_as(true, vec![message_op(place, outcome.notice().to_owned())]);
     }
@@ -10431,12 +10617,21 @@ impl Slots {
             debug!("share button of a message that is no private status message");
             return status::ANSWER_STALE;
         };
+        if press == Press::Groups || self.registry.share_targets(slot).len() > 1 {
+            self.reopen(chat);
+            return match input.topic() {
+                Some(place) if self.send_picker(slot, place) => ANSWER_PICKER,
+                _ => status::ANSWER_SHARE_LATER,
+            };
+        }
         self.press_share_of(slot, chat, press, input.display_name.as_deref())
     }
 
     /// A share button of `slot` pressed by its owner in private chat `chat`:
     /// on its status message or in the menu (TASK-073), which share the
     /// unshare question.
+    /// With one group to choose from (TASK-069) it is the default group's;
+    /// with more, the picker goes to the slot's private topic.
     fn press_share_of(
         &mut self,
         slot: SlotId,
@@ -10444,12 +10639,21 @@ impl Slots {
         press: Press,
         author: Option<&str>,
     ) -> &'static str {
+        if press == Press::Groups || self.registry.share_targets(slot).len() > 1 {
+            self.reopen(chat);
+            let place = self.registry.place(slot).filter(|place| place.chat == chat);
+            return match place {
+                Some(place) if self.send_picker(slot, place) => ANSWER_PICKER_TOPIC,
+                _ => status::ANSWER_SHARE_LATER,
+            };
+        }
+        let group = self.registry.default_group;
         if press == Press::Share {
             // Before `reopen`, which would drop a fallback group view.
             let adopted = self.adopt_fallback(slot, author);
             self.reopen(chat);
             return adopted
-                .unwrap_or_else(|| self.share_slot(slot, author))
+                .unwrap_or_else(|| self.share_slot(slot, group, author))
                 .answer();
         }
         self.reopen(chat);
@@ -10463,9 +10667,9 @@ impl Slots {
             if let Some(shown) = self.shown.get_mut(&slot) {
                 shown.unshare_confirm = None;
             }
-            return self.unshare_slot(slot).answer();
+            return self.unshare_slot(slot, group).answer();
         }
-        if !self.registry.shared(slot, Chat::Group) {
+        if !self.registry.shared(slot, Chat::Group(group)) {
             return status::ANSWER_NOT_SHARED;
         }
         // A first press, or a second one after the wait ran out.
@@ -10478,27 +10682,26 @@ impl Slots {
 
     /// A fallback group view of `slot` becomes the shared one (TASK-064):
     /// its topic stays, with the share line next. `None`: there is none.
+    /// Only the default group has fallback views (TASK-069).
     fn adopt_fallback(&mut self, slot: SlotId, author: Option<&str>) -> Option<ShareOutcome> {
+        let default = self.registry.default_chat();
         let fallback = self
             .registry
             .slot(slot)?
             .views
             .iter()
-            .any(|view| view.chat == Chat::Group && view.fallback);
+            .any(|view| view.chat == default && view.fallback);
         if !fallback {
             return None;
         }
-        self.registry.share(
-            slot,
-            Chat::Group,
-            share_line(author.unwrap_or(ECHO_NO_NAME)),
-        )?;
+        self.registry
+            .share(slot, default, share_line(author.unwrap_or(ECHO_NO_NAME)))?;
         self.after_share(slot);
         Some(ShareOutcome::Shared)
     }
 
-    /// Shares `slot` to the group (TASK-064), from its private view.
-    fn share_slot(&mut self, slot: SlotId, author: Option<&str>) -> ShareOutcome {
+    /// Shares `slot` to `group` (TASK-064, TASK-069), from its private view.
+    fn share_slot(&mut self, slot: SlotId, group: GroupChat, author: Option<&str>) -> ShareOutcome {
         let private = self
             .registry
             .place(slot)
@@ -10507,7 +10710,7 @@ impl Slots {
             return ShareOutcome::Later;
         }
         let line = share_line(author.unwrap_or(ECHO_NO_NAME));
-        match self.registry.share(slot, Chat::Group, line) {
+        match self.registry.share(slot, Chat::Group(group), line) {
             Some(Shared::Added | Shared::Adopted) => {
                 self.after_share(slot);
                 ShareOutcome::Shared
@@ -10520,7 +10723,7 @@ impl Slots {
     /// The group shows `slot` from here on: the turn message so far stays
     /// the private view's, and the status shows the unshare button at once.
     fn after_share(&mut self, slot: SlotId) {
-        info!(ordinal = self.ordinal(slot), "slot shared to the group");
+        info!(ordinal = self.ordinal(slot), "slot shared to a group");
         if let Some(place) = self.registry.place(slot) {
             self.close_turn_message(place);
         }
@@ -10529,9 +10732,9 @@ impl Slots {
         shown.urgent = true;
     }
 
-    /// Takes `slot` out of the group (TASK-064), from its private view: its
-    /// group topic is deleted ([`Self::delete_unshared`]).
-    fn unshare_slot(&mut self, slot: SlotId) -> ShareOutcome {
+    /// Takes `slot` out of `group` (TASK-064, TASK-069), from its private
+    /// view: its topic there is deleted ([`Self::delete_unshared`]).
+    fn unshare_slot(&mut self, slot: SlotId, group: GroupChat) -> ShareOutcome {
         let Some(place) = self
             .registry
             .place(slot)
@@ -10539,16 +10742,17 @@ impl Slots {
         else {
             return ShareOutcome::Later;
         };
+        let chat = Chat::Group(group);
         let topic = self
             .registry
             .slot(slot)
-            .and_then(|entry| entry.views.iter().find(|view| view.chat == Chat::Group))
+            .and_then(|entry| entry.views.iter().find(|view| view.chat == chat))
             .and_then(View::place);
-        match self.registry.unshare(slot, Chat::Group) {
+        match self.registry.unshare(slot, chat) {
             Unshared::NotShared => ShareOutcome::NotShared,
             Unshared::Creating => ShareOutcome::Later,
             Unshared::Removed => {
-                info!(ordinal = self.ordinal(slot), "slot unshared from the group");
+                info!(ordinal = self.ordinal(slot), "slot unshared from a group");
                 self.leave_group(slot, GroupEnd::Unshare { topic });
                 self.close_turn_message(place);
                 let shown = self.shown.entry(slot).or_default();
@@ -10573,11 +10777,16 @@ impl Slots {
             })
             .collect();
         for entry in due {
-            let Some(thread_id) = entry.place.thread else {
+            // A group the bot left (TASK-069): nothing can go there.
+            let Some(thread_id) = entry
+                .place
+                .thread
+                .filter(|_| self.registry.usable(entry.place.chat))
+            else {
                 self.forget_unshared(entry.place);
                 continue;
             };
-            if !self.options.can_delete {
+            if !self.can_delete(entry.place.chat) {
                 self.end_unshared(entry);
                 continue;
             }
@@ -10595,6 +10804,349 @@ impl Slots {
     fn forget_unshared(&mut self, place: Place) {
         self.registry.unshared.retain(|entry| entry.place != place);
         self.registry.dirty = true;
+    }
+
+    /// The bot may delete messages in `chat`: a private chat and the
+    /// default group by the start check, another group by its record
+    /// (TASK-069).
+    fn can_delete(&self, chat: Chat) -> bool {
+        match chat {
+            Chat::Group(group) if group != self.registry.default_group => self
+                .registry
+                .group(group)
+                .is_some_and(|known| known.can_delete),
+            _ => self.options.can_delete,
+        }
+    }
+
+    /// The group picker of `slot` into its private topic `place`
+    /// (TASK-069): no twins, like an answer to the owner. `false`: it did
+    /// not go.
+    fn send_picker(&mut self, slot: SlotId, place: Place) -> bool {
+        if !place.chat.is_private() {
+            return false;
+        }
+        let (text, keyboard) = self.picker_content(slot);
+        self.send_as(
+            true,
+            vec![Op::Send {
+                chat: place.chat,
+                thread_id: place.thread,
+                text,
+                html: None,
+                rich: None,
+                reply_markup: Some(keyboard),
+                permission: false,
+                reply_to: None,
+                notify: false,
+            }],
+        )
+    }
+
+    /// The text and keyboard of `slot`'s group picker now.
+    fn picker_content(&self, slot: SlotId) -> (String, serde_json::Value) {
+        let now = Instant::now();
+        let armed = self
+            .picks
+            .get(&slot)
+            .filter(|(_, until)| now < *until)
+            .map(|(group, _)| *group);
+        let rows: Vec<PickRow> = self
+            .registry
+            .share_targets(slot)
+            .into_iter()
+            .map(|(group, shared)| PickRow {
+                group,
+                title: self.registry.group_title(group),
+                shared,
+                confirm: shared && armed == Some(group),
+            })
+            .collect();
+        groups::picker(u32::try_from(slot.0).unwrap_or(u32::MAX), &rows)
+    }
+
+    /// A press in a group picker (TASK-069): only the owner, in the slot's
+    /// private topic, on a group the slot may go to or is in. The picker
+    /// shows the new state after it.
+    fn press_pick(
+        &mut self,
+        input: &CallbackInput,
+        slot: u32,
+        group: GroupChat,
+        action: PickAction,
+    ) -> &'static str {
+        let slot = SlotId(slot as usize);
+        let Some(chat @ Chat::Private(_)) = input.chat else {
+            return status::ANSWER_OWNER_ONLY;
+        };
+        if self.registry.place(slot).map(|place| place.chat) != Some(chat) {
+            return status::ANSWER_OWNER_ONLY;
+        }
+        let Some(&(_, shared)) = self
+            .registry
+            .share_targets(slot)
+            .iter()
+            .find(|(target, _)| *target == group)
+        else {
+            return status::ANSWER_STALE;
+        };
+        let now = Instant::now();
+        let armed = self
+            .picks
+            .get(&slot)
+            .is_some_and(|(armed, until)| *armed == group && now < *until);
+        let answer = match action {
+            PickAction::Share if shared => {
+                self.reopen(chat);
+                status::ANSWER_ALREADY_SHARED
+            }
+            PickAction::Share => {
+                // Before `reopen`, which would drop a fallback group view.
+                let adopted = (group == self.registry.default_group)
+                    .then(|| self.adopt_fallback(slot, input.display_name.as_deref()))
+                    .flatten();
+                self.reopen(chat);
+                adopted
+                    .unwrap_or_else(|| self.share_slot(slot, group, input.display_name.as_deref()))
+                    .answer()
+            }
+            _ if !shared => {
+                self.reopen(chat);
+                status::ANSWER_NOT_SHARED
+            }
+            PickAction::Confirm if armed => {
+                self.reopen(chat);
+                self.picks.remove(&slot);
+                self.unshare_slot(slot, group).answer()
+            }
+            // A first press, or a second one after the wait ran out.
+            PickAction::Unshare | PickAction::Confirm => {
+                self.reopen(chat);
+                self.picks.insert(slot, (group, now + status::CONFIRM_FOR));
+                status::ANSWER_UNSHARE_CONFIRM
+            }
+        };
+        if let Some(message) = input.message() {
+            let (text, keyboard) = self.picker_content(slot);
+            self.hand_off(
+                Work::Picker,
+                Op::Edit {
+                    chat: message.chat,
+                    message_id: message.id,
+                    text,
+                    reply_markup: Some(keyboard),
+                    background: false,
+                },
+            );
+        }
+        answer
+    }
+
+    /// The bot's membership in a group changed (TASK-069).
+    fn on_member(&mut self, update: MemberUpdate) {
+        let chat = update.chat;
+        let known = chat == self.registry.default_group || self.registry.group(chat).is_some();
+        let membership = groups::membership(update.supergroup, update.is_forum, &update.member);
+        match membership {
+            Membership::Gone => {
+                if !known {
+                    return;
+                }
+                if chat == self.registry.default_group {
+                    warn!(
+                        "the bot was removed from the CCTG_CHAT_ID group; the hub will not start until it is back"
+                    );
+                }
+                if self.registry.leave_group(chat) {
+                    info!(
+                        group = self.registry.group_number(chat),
+                        "the bot left a group; its sessions stop showing there"
+                    );
+                    self.publish_groups();
+                }
+            }
+            Membership::Present { .. } if !known && !update.by_allowed => {
+                info!("bot added to a group by someone outside the allowlist; leaving it");
+                if let Some(lookups) = &self.lookups
+                    && lookups.try_send(LookupJob::Leave(chat)).is_err()
+                {
+                    debug!("group lookups are busy; the group is not left");
+                }
+            }
+            Membership::Present { missing, .. } if !known && !update.supergroup => {
+                let text = groups::not_ready_notice(&missing, true, self.bot_username());
+                self.send_messages(vec![message_op(Place::new(Chat::Group(chat), None), text)]);
+            }
+            Membership::Present {
+                missing,
+                can_delete,
+            } => {
+                self.group_joined(
+                    chat,
+                    update.title,
+                    &missing,
+                    can_delete,
+                    !update.supergroup,
+                    None,
+                );
+            }
+        }
+    }
+
+    /// The bot's username, for `/connect@<bot>` in texts.
+    fn bot_username(&self) -> Option<&str> {
+        self.options
+            .mentions
+            .as_ref()
+            .map(|bot| bot.username.as_str())
+    }
+
+    /// The bot is in group `chat` with what is `missing` for sessions to
+    /// show there (TASK-069): its record made or updated. A new group, a
+    /// change of readiness or a return is told in its General; `reply`, a
+    /// `/connect`'s place, is told always.
+    fn group_joined(
+        &mut self,
+        chat: GroupChat,
+        title: Option<String>,
+        missing: &[Missing],
+        can_delete: bool,
+        basic: bool,
+        reply: Option<Place>,
+    ) {
+        let ready = missing.is_empty();
+        let change = self.registry.join_group(chat, title, ready, can_delete);
+        self.publish_groups();
+        let group = self.registry.group_number(chat);
+        match change {
+            GroupChange::Added { ready } => info!(group, ready, "group connected"),
+            GroupChange::ReadyChanged(ready) => info!(group, ready, "group readiness changed"),
+            GroupChange::Returned { ready } => info!(group, ready, "group is back"),
+            GroupChange::Quiet => {}
+        }
+        if change == GroupChange::Quiet && reply.is_none() {
+            return;
+        }
+        let mut text = if ready {
+            groups::GROUP_READY_NOTICE.to_owned()
+        } else {
+            groups::not_ready_notice(missing, basic, self.bot_username())
+        };
+        if !can_delete {
+            text.push_str("\n\n");
+            text.push_str(groups::NO_DELETE_LINE);
+        }
+        let place = reply.unwrap_or(Place::new(Chat::Group(chat), None));
+        self.send_messages(vec![message_op(place, text)]);
+    }
+
+    /// `/connect` in a group (TASK-069): the bot's rights there are asked
+    /// of Telegram, the answer goes where the command was.
+    fn on_connect(&mut self, input: ConnectInput) {
+        if let Some(target) = &input.target
+            && !self
+                .bot_username()
+                .is_some_and(|name| name.eq_ignore_ascii_case(target))
+        {
+            debug!("/connect for another bot; ignored");
+            return;
+        }
+        let place = Place::new(Chat::Group(input.chat), input.thread_id);
+        let queued = self
+            .lookups
+            .as_ref()
+            .is_some_and(|lookups| lookups.try_send(LookupJob::Connect(input)).is_ok());
+        if !queued {
+            self.send_messages(vec![message_op(
+                place,
+                groups::CONNECT_FAILED_NOTICE.to_owned(),
+            )]);
+        }
+    }
+
+    /// The group lookup task answered (TASK-069). No error text is logged:
+    /// a decode error quotes Telegram's answer.
+    fn on_group_checked(&mut self, answer: GroupAnswer) {
+        match answer {
+            GroupAnswer::Connect { input, member } => {
+                let place = Place::new(Chat::Group(input.chat), input.thread_id);
+                let Ok(member) = member else {
+                    info!("/connect could not be checked with Telegram");
+                    self.send_messages(vec![message_op(
+                        place,
+                        groups::CONNECT_FAILED_NOTICE.to_owned(),
+                    )]);
+                    return;
+                };
+                match groups::membership(input.supergroup, input.is_forum, &member) {
+                    Membership::Gone => debug!("/connect in a group the bot is not in"),
+                    Membership::Present { missing, .. } if !input.supergroup => {
+                        let text = groups::not_ready_notice(&missing, true, self.bot_username());
+                        self.send_messages(vec![message_op(place, text)]);
+                    }
+                    Membership::Present {
+                        missing,
+                        can_delete,
+                    } => self.group_joined(
+                        input.chat,
+                        input.title,
+                        &missing,
+                        can_delete,
+                        false,
+                        Some(place),
+                    ),
+                }
+            }
+            GroupAnswer::Refresh { chat, checked } => {
+                let group = self.registry.group_number(chat);
+                match checked {
+                    Ok((info, member)) => {
+                        let supergroup = info.kind == "supergroup";
+                        match groups::membership(supergroup, info.is_forum, &member) {
+                            Membership::Gone => {
+                                if self.registry.leave_group(chat) {
+                                    info!(group, "the bot is no longer in a group");
+                                    self.publish_groups();
+                                }
+                            }
+                            Membership::Present {
+                                missing,
+                                can_delete,
+                            } => self.group_joined(
+                                chat,
+                                info.title.as_deref().and_then(updates::group_title),
+                                &missing,
+                                can_delete,
+                                !supergroup,
+                                None,
+                            ),
+                        }
+                    }
+                    Err(ApiError::Telegram { code, description })
+                        if code == 403
+                            || (code == 400
+                                && description.to_ascii_lowercase().contains("chat not found")) =>
+                    {
+                        if self.registry.leave_group(chat) {
+                            info!(group, code, "the bot is no longer in a group");
+                            self.publish_groups();
+                        }
+                    }
+                    Err(ApiError::Telegram { code, .. }) => {
+                        warn!(
+                            group,
+                            code, "cannot check a group at start; it stays as it was"
+                        );
+                    }
+                    Err(_) => warn!(group, "cannot check a group at start; it stays as it was"),
+                }
+            }
+            GroupAnswer::Left(result) => {
+                if result.is_err() {
+                    debug!("leaving a group failed");
+                }
+            }
+        }
     }
 
     /// A message in the General of private chat `chat` with the menu on
@@ -10769,23 +11321,30 @@ impl Slots {
         };
         let shown = self.shown.get(&slot);
         // The share buttons act from the private view only.
+        let targets = self.registry.share_targets(slot);
         let shared = self
             .registry
             .place(slot)
             .is_some_and(|place| place.chat == Chat::Private(chat))
-            .then(|| self.registry.shared(slot, Chat::Group));
+            .then(|| targets.iter().any(|(_, shared)| *shared));
         let share_confirm = shown
             .and_then(|shown| shown.unshare_confirm)
             .is_some_and(|until| now < until);
-        // TASK-077: how its group topic takes messages, once shared.
+        // TASK-077: how its group topics take messages, once shared.
         let mentions = shared.filter(|shared| *shared).map(|_| {
             self.registry.slot(slot).is_some_and(|entry| {
-                entry
-                    .views
-                    .iter()
-                    .any(|view| view.chat == Chat::Group && !view.every_message)
+                entry.views.iter().any(|view| {
+                    matches!(view.chat, Chat::Group(_)) && !view.fallback && !view.every_message
+                })
             })
         });
+        // TASK-069: several groups to choose from, and where it shows.
+        let pick = targets.len() > 1;
+        let groups = targets
+            .iter()
+            .filter(|(_, shared)| pick && *shared)
+            .map(|(group, _)| self.registry.group_title(*group))
+            .collect();
         let stop = self
             .live_agent(slot)
             .filter(|(session, conn)| {
@@ -10804,6 +11363,8 @@ impl Slots {
             share_confirm,
             stop,
             mentions,
+            pick,
+            groups,
         }
     }
 
@@ -10937,40 +11498,54 @@ impl Slots {
             }
             SlotAction::Mentions => self.set_every_message(slot, private, false).to_owned(),
             SlotAction::EveryMessage => self.set_every_message(slot, private, true).to_owned(),
+            SlotAction::Groups => self
+                .press_share_of(slot, private, Press::Groups, author)
+                .to_owned(),
         }
     }
 
-    /// 💬 or 📣 of the menu of `private` (TASK-077): the group topic of
-    /// shared `slot` takes every message, or mentions only; the owner only
-    /// (its private view is the primary one), and the group topic is told.
+    /// 💬 or 📣 of the menu of `private` (TASK-077): the group topics of
+    /// shared `slot` take every message, or mentions only; the owner only
+    /// (its private view is the primary one), and each group topic that
+    /// changed is told. Every group of the slot at once (TASK-069).
     fn set_every_message(&mut self, slot: SlotId, private: Chat, every: bool) -> &'static str {
         let owner = self
             .registry
             .place(slot)
             .is_some_and(|place| place.chat == private);
-        if !owner || !self.registry.shared(slot, Chat::Group) {
+        if !owner {
             return menu::ANSWER_UNCHANGED;
         }
         let ordinal = self.ordinal(slot);
-        let Some(view) = self
-            .registry
-            .slot_mut(slot)
-            .and_then(|entry| entry.view_mut(Chat::Group))
-            .filter(|view| view.every_message != every)
-        else {
+        let Some(entry) = self.registry.slot_mut(slot) else {
             return menu::ANSWER_UNCHANGED;
         };
-        view.every_message = every;
-        let place = view.place();
+        let mut changed = Vec::new();
+        for view in entry.views.iter_mut().filter(|view| {
+            matches!(view.chat, Chat::Group(_)) && !view.fallback && view.every_message != every
+        }) {
+            view.every_message = every;
+            changed.push(view.place());
+        }
+        if changed.is_empty() {
+            return menu::ANSWER_UNCHANGED;
+        }
         self.registry.dirty = true;
-        info!(ordinal, every, "group topic mode changed from the menu");
+        info!(
+            ordinal,
+            every,
+            groups = changed.len(),
+            "group topic mode changed from the menu"
+        );
         let text = match (&self.options.mentions, every) {
             (_, true) => Some(mention::MODE_ALL_TEXT.to_owned()),
             (Some(bot), false) => Some(mention::mode_mention_text(&bot.username)),
             (None, false) => None,
         };
-        if let (Some(place), Some(text)) = (place, text) {
-            self.send_messages(vec![message_op(place, text)]);
+        if let Some(text) = text {
+            for place in changed.into_iter().flatten() {
+                self.send_messages(vec![message_op(place, text.clone())]);
+            }
         }
         menu::ANSWER_SAVED
     }
@@ -11089,7 +11664,7 @@ impl Slots {
     fn display_in(&self, slot: SlotId, chat: Chat) -> menu::Display {
         let (owner, group) = match chat {
             Chat::Private(private) => (Some(private), false),
-            Chat::Group => (self.owner_of(slot), true),
+            Chat::Group(_) => (self.owner_of(slot), true),
         };
         owner
             .and_then(|owner| self.registry.person(owner))
@@ -11120,7 +11695,7 @@ impl Slots {
         self.registry.slot(slot).and_then(|entry| {
             entry.views.iter().find_map(|view| match view.chat {
                 Chat::Private(private) => Some(private),
-                Chat::Group => None,
+                Chat::Group(_) => None,
             })
         })
     }
@@ -11370,16 +11945,14 @@ impl Slots {
         };
         let (primary_chat, status) = (primary.chat, primary.status_message());
         let place = primary.place();
+        // Only a mirror whose chat has room for a twin (TASK-069).
         let untwinned = status.is_some_and(|status| {
-            self.registry
-                .mirrors(slot)
-                .iter()
-                .any(|mirror| !self.mirror.knows(status, mirror.chat))
+            self.registry.mirrors(slot).iter().any(|mirror| {
+                !self.mirror.knows(status, mirror.chat)
+                    && self.twin_posts_in(mirror.chat) < MAX_TWIN_POSTS
+            })
         });
-        if untwinned
-            && self.twin_posts < MAX_TWIN_POSTS
-            && let Some(place) = place
-        {
+        if untwinned && let Some(place) = place {
             self.bottoms.entry(place).or_default().foreign = true;
         }
         // A closed private chat's view keeps its own (stale) status message.
@@ -11644,6 +12217,12 @@ impl Slots {
             } => self.on_album_done(conn, transfer_id, size, &parts, delivery),
             Done::TopicDeleted { place, delivery } => self.on_topic_deleted(place, delivery),
             Done::Menu { job, delivery } => self.on_menu_done(job, delivery),
+            Done::Picker(delivery) => {
+                if let Some(Err(error)) = delivery {
+                    debug!(%error, "group picker edit failed");
+                }
+            }
+            Done::GroupChecked(answer) => self.on_group_checked(answer),
         }
     }
 
@@ -12662,6 +13241,7 @@ async fn dispatch_loop(
                 },
                 Work::DeleteTopic(place) => Done::TopicDeleted { place, delivery },
                 Work::Menu(job) => Done::Menu { job, delivery },
+                Work::Picker => Done::Picker(delivery),
             });
         });
     }
@@ -12898,7 +13478,7 @@ mod tests {
     fn rig_with(fake: Fake, options: Options, dir: TempDir, limits: impl Into<Limits>) -> Rig {
         let fake = Arc::new(fake);
         let store = RegistryStore::open(dir.path()).unwrap();
-        let registry = store.load().unwrap();
+        let registry = store.load(GroupChat::UNIT).unwrap();
         let (scheduler, outbox) = Scheduler::new(fake.clone(), limits);
         tokio::spawn(scheduler.run());
         let mut slots = Slots::new(registry, store, outbox, options);
@@ -13020,7 +13600,7 @@ mod tests {
     fn say(thread_id: Option<i64>, message_id: i64, text: Option<&str>) -> Control {
         Control::Message(Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id,
@@ -13101,7 +13681,7 @@ mod tests {
         rig.control
             .send(Control::Message(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 43,
                 thread_id: Some(101),
@@ -13118,7 +13698,7 @@ mod tests {
         rig.control
             .send(Control::Message(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 46,
                 thread_id: Some(101),
@@ -13193,7 +13773,7 @@ again"
             .iter()
             .map(|op| match op {
                 Op::React {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id,
                     emoji,
                 } => (*message_id, emoji.as_str()),
@@ -13336,7 +13916,7 @@ again"
         })
         .await;
         assert!(ops.iter().any(|op| matches!(op,
-            Op::SendDocument { chat: Chat::Group, thread_id: Some(100), document, notify: false } if document.bytes == huge.as_bytes())));
+            Op::SendDocument { chat: Chat::GROUP, thread_id: Some(100), document, notify: false } if document.bytes == huge.as_bytes())));
     }
 
     #[tokio::test]
@@ -13358,7 +13938,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.on_hook(&hook(
             A,
@@ -13387,7 +13967,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         connect(&mut slots, 2, A, Some(10));
 
@@ -13457,7 +14037,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, None);
         slots.on_hook(&hook(
             A,
@@ -13557,7 +14137,7 @@ again"
         })
         .await;
         assert!(ops.iter().any(|op| matches!(op,
-            Op::SendDocument { chat: Chat::Group, thread_id: Some(100), document, notify: true }
+            Op::SendDocument { chat: Chat::GROUP, thread_id: Some(100), document, notify: true }
                 if document.bytes == huge.as_bytes() && document.file_name == "answer-aaaaaaaa.txt")));
     }
 
@@ -13571,7 +14151,7 @@ again"
         assert_eq!(slots.queued_messages, 0);
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         // Absent, empty and blank answers.
         for answer in [None, Some(""), Some(" \n\t ")] {
             slots.on_hook(&stop(A, answer));
@@ -13623,7 +14203,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
         let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
@@ -13695,7 +14275,7 @@ again"
 
     fn press(query: &str, message_id: Option<i64>, data: &str) -> Control {
         Control::Callback(CallbackInput {
-            chat: Some(Chat::Group),
+            chat: Some(Chat::GROUP),
             query_id: query.into(),
             data: Some(data.into()),
             message_id,
@@ -13936,7 +14516,7 @@ again"
         rig.control
             .send(Control::Message(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 51,
                 thread_id: Some(100),
@@ -14494,7 +15074,7 @@ again"
             .collect();
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert!(
-            matches!(edits[0], Op::Edit { chat: Chat::Group, message_id: id, text: edited, reply_markup: Some(markup), background: false }
+            matches!(edits[0], Op::Edit { chat: Chat::GROUP, message_id: id, text: edited, reply_markup: Some(markup), background: false }
             if *id == message_id
                 && *edited == format!("{text}{}", permissions::ALLOWED_MARK)
                 && *markup == permissions::no_keyboard())
@@ -14682,7 +15262,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
         assert!(slots.activity.contains_key(A));
@@ -14792,7 +15372,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
         slots.on_hook(&hook(A, compact("auto")));
         let now = Instant::now();
@@ -14870,7 +15450,7 @@ again"
         assert!(slots.compactions.is_empty());
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&hook(A, HookEvent::PreCompact { trigger: None }));
         assert_eq!(status_head(&slots, A, Instant::now()), "🗜 Сжимаю контекст…");
         slots.on_hook(&hook(A, compacted(10)));
@@ -14899,7 +15479,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
 
         // Cancelled (Esc, an error): the next prompt ends the status at once,
@@ -14971,7 +15551,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
         slots.on_hook(&hook(A, compact("auto")));
         slots.on_hook(&hook(A, compacted(10)));
@@ -14996,7 +15576,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&hook(A, context(80)));
         slots.on_hook(&hook(A, compact("manual")));
         slots.on_hook(&hook(A, compacted(10)));
@@ -15022,7 +15602,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&hook(
             A,
             HookEvent::StatusLine {
@@ -15049,7 +15629,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -15105,7 +15685,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(1);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -15169,7 +15749,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         let queued = permission(1, "abcde", "before clear");
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -15239,12 +15819,12 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.on_agent(permission(1, "abcde", "p"));
         let shown = slots.prompts.get_mut(0).unwrap();
         shown.sent = true;
-        shown.place = Some(Place::topic(Chat::Group, 100));
+        shown.place = Some(Place::topic(Chat::GROUP, 100));
         slots.prompts.delivered(0, 500);
 
         for i in 0..crate::hub::registry::MAX_SESSIONS - 1 {
@@ -15373,7 +15953,7 @@ again"
         slots.on_hook(&start(B, 11));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         slots.pump();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -15741,7 +16321,7 @@ again"
             let key = key as u64;
             let shown = slots.prompts.get_mut(key).unwrap();
             shown.sent = true;
-            shown.place = Some(Place::topic(Chat::Group, 100));
+            shown.place = Some(Place::topic(Chat::GROUP, 100));
             slots.prompts.delivered(key, 500 + key as i64);
             slots.finish(key, State::Closed);
             slots.on_prompt_edit_done(
@@ -15764,7 +16344,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         for n in 0..permissions::MAX_PROMPTS {
             slots.on_agent(permission(1, &request_id(n), "p"));
@@ -15773,7 +16353,7 @@ again"
         for key in 0..permissions::MAX_PROMPTS as u64 {
             let shown = slots.prompts.get_mut(key).unwrap();
             shown.sent = true;
-            shown.place = Some(Place::topic(Chat::Group, 100));
+            shown.place = Some(Place::topic(Chat::GROUP, 100));
             slots.prompts.delivered(key, 5000 + key as i64);
         }
         slots.on_agent(permission(1, "zzzzz", "p"));
@@ -15857,7 +16437,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         connect(&mut slots, 1, A, Some(10));
         slots.queued_messages = MAX_QUEUED_MESSAGES - 1;
         let text = format!("{}\n\n{}", "a".repeat(3000), "b".repeat(3000));
@@ -15976,10 +16556,10 @@ again"
         slots.on_hook(&start(B, 11));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots
             .registry
-            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
+            .topic_created(SlotId(1), Chat::GROUP, 101, "b", None);
         for i in 0..10 {
             slots.on_control(say(Some(100), i, None));
         }
@@ -16069,7 +16649,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&end(A, 10));
         for i in 0..60 {
             slots.on_control(say(Some(100), i, Some("x")));
@@ -16110,7 +16690,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         for i in 0..6 {
             slots.on_control(say(Some(100), i, Some("x")));
         }
@@ -16131,7 +16711,7 @@ again"
             slots.on_hook(&start(A, 10));
             slots
                 .registry
-                .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+                .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
             let mut next = match how {
                 // `/clear` with no agent on line: the slot never looked dead.
                 "clear" => {
@@ -16196,7 +16776,7 @@ again"
         slots.on_hook(&start(B, 11));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&end(A, 10));
         for i in 0..3 {
             slots.on_control(say(Some(100), i, Some("x")));
@@ -16250,7 +16830,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         // Photos: each asks for a text-only notice.
         for i in 0..MAX_QUEUED_MESSAGES as i64 + 50 {
             slots.on_control(say(Some(100), i, None));
@@ -16270,7 +16850,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let mut old_run = connect_queue(&mut slots, 1, A, Some(10), 64);
         slots.on_hook(&end(A, 10));
         for i in 0..3 {
@@ -16303,10 +16883,10 @@ again"
         slots.on_hook(&start(B, 11));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots
             .registry
-            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
+            .topic_created(SlotId(1), Chat::GROUP, 101, "b", None);
         let mut agent_b = connect_queue(&mut slots, 2, B, Some(11), 64);
         slots.on_hook(&end(A, 10));
         for i in 0..3 {
@@ -16433,14 +17013,14 @@ again"
             slots.on_hook(&start(A, 10));
             slots
                 .registry
-                .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+                .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
             slots.on_hook(&end(A, 10));
             for i in 1..=3 {
                 slots.on_control(say(Some(100), i, Some(&format!("m{i}"))));
             }
             slots.offer_resume();
             if let Some(note) = slots.registry.slots[0].buffer.resume.as_mut() {
-                note.message = Some(MessageKey::new(Chat::Group, 900));
+                note.message = Some(MessageKey::new(Chat::GROUP, 900));
             }
             let store = RegistryStore::open(dir.path()).unwrap();
             store.save(&RegistryStore::encode(&slots.registry)).unwrap();
@@ -16514,7 +17094,7 @@ again"
         slots.on_done(Done::Resume {
             slot: SlotId(0),
             number,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             delivery: Some(Ok(Outcome::Sent(Message {
                 message_id,
                 ..Message::default()
@@ -16542,7 +17122,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.on_hook(&end(A, 10));
         slots.on_control(say(Some(100), 1, Some("m1")));
         slots.pump();
@@ -16604,7 +17184,7 @@ again"
         assert!(handed(&mut work).1.is_empty(), "the live button stays");
         assert_eq!(
             note(&slots).message,
-            Some(MessageKey::new(Chat::Group, 902))
+            Some(MessageKey::new(Chat::GROUP, 902))
         );
         assert_eq!(buffered(&slots, 0), [2]);
     }
@@ -16777,7 +17357,7 @@ again"
         let ops = rig.ops_after(1).await;
         assert_eq!(ops.len(), 1);
         assert!(
-            matches!(&ops[0], Op::CreateTopic { chat: Chat::Group, name, icon_custom_emoji_id }
+            matches!(&ops[0], Op::CreateTopic { chat: Chat::GROUP, name, icon_custom_emoji_id }
             if name == "[box] Project · aaaaaaaa" && icon_custom_emoji_id.as_deref() == Some(ICON_NO_CHANNEL))
         );
 
@@ -16790,7 +17370,7 @@ again"
         for (thread, message_id) in [(Some(100), 55), (Some(999), 56), (None, 57)] {
             rig.control
                 .send(Control::TopicEdited {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     thread_id: thread,
                     message_id,
                 })
@@ -16801,7 +17381,7 @@ again"
         assert!(matches!(
             ops[2],
             Op::Delete {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: 55
             }
         ));
@@ -16847,7 +17427,7 @@ again"
         let store = RegistryStore::open(rig.dir.path()).unwrap();
         let saved_b = async {
             loop {
-                if let Ok(saved) = store.load()
+                if let Ok(saved) = store.load(GroupChat::UNIT)
                     && saved
                         .slots
                         .first()
@@ -16924,7 +17504,7 @@ again"
         let ops = rig.ops_after(2).await;
         assert_eq!(count(&ops, is_create), 2);
         assert!(
-            matches!(&ops[1], Op::CreateTopic { chat: Chat::Group, name, icon_custom_emoji_id }
+            matches!(&ops[1], Op::CreateTopic { chat: Chat::GROUP, name, icon_custom_emoji_id }
             if name == "[box] Project #2 · bbbbbbbb" && icon_custom_emoji_id.as_deref() == Some(ICON_ALIVE))
         );
     }
@@ -17486,7 +18066,7 @@ again"
             rig.control
                 .send(Control::Message(Inbound {
                     display_name: None,
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     sender: crate::hub::chat::PrivateChat::of_user(1001),
                     message_id,
                     thread_id: Some(100),
@@ -17590,7 +18170,7 @@ again"
                 slot, name, icon, ..
             } = job
             {
-                registry.topic_created(slot, Chat::Group, topic, &name, icon.as_deref());
+                registry.topic_created(slot, Chat::GROUP, topic, &name, icon.as_deref());
             }
         }
         registry.confirm_subagent(S1, A, format!("↳ Explore {S1}"));
@@ -17685,7 +18265,7 @@ again"
                 slot, name, icon, ..
             } = job
             {
-                registry.topic_created(slot, Chat::Group, 100, &name, icon.as_deref());
+                registry.topic_created(slot, Chat::GROUP, 100, &name, icon.as_deref());
             }
         }
         for agent in agents {
@@ -17728,7 +18308,7 @@ again"
         {
             let store = RegistryStore::open(dir.path()).unwrap();
             saved_with_subagents(&dir, &[S1], false);
-            let mut registry = store.load().unwrap();
+            let mut registry = store.load(GroupChat::UNIT).unwrap();
             assert_eq!(registry.block_work(usize::MAX).len(), 1);
             store.save(&RegistryStore::encode(&registry)).unwrap();
         }
@@ -17743,7 +18323,10 @@ again"
             "at most once: {ops:?}"
         );
         // The tombstone is on disk: no text waits, the send is marked.
-        let saved = RegistryStore::open(rig.dir.path()).unwrap().load().unwrap();
+        let saved = RegistryStore::open(rig.dir.path())
+            .unwrap()
+            .load(GroupChat::UNIT)
+            .unwrap();
         let block = &saved.subagents[S1].block;
         assert!(block.sending && block.pending.is_none() && !block.running);
         assert_eq!(block.message_id, None);
@@ -18054,7 +18637,7 @@ again"
         let slot = slots.registry.sessions[A].slot.unwrap();
         slots
             .registry
-            .topic_created(slot, Chat::Group, 100, "t", None);
+            .topic_created(slot, Chat::GROUP, 100, "t", None);
         for i in 0..100 {
             let agent = format!("a{i:016}");
             slots
@@ -18105,7 +18688,7 @@ again"
     ) -> oneshot::Receiver<Prepared> {
         let (answer, answered) = oneshot::channel();
         slots.on_transcript_ask(TranscriptAsk {
-            place: Place::new(Chat::Group, None),
+            place: Place::new(Chat::GROUP, None),
             command: commands::TranscriptCommand {
                 view,
                 prompts,
@@ -18613,7 +19196,7 @@ again"
         let ops = rig.ops_after(4).await;
         assert_eq!(ops.len(), 4, "{ops:?}");
         assert!(
-            matches!(&ops[3], Op::CreateTopic { chat: Chat::Group, name, icon_custom_emoji_id }
+            matches!(&ops[3], Op::CreateTopic { chat: Chat::GROUP, name, icon_custom_emoji_id }
             if name == "[box] Project · aaaaaaaa" && icon_custom_emoji_id.as_deref() == Some(ICON_ALIVE))
         );
         // Topic 101 of the other slot was never touched.
@@ -18659,7 +19242,7 @@ again"
         rig.ops_after(1).await;
         rig.control
             .send(Control::TopicEdited {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: Some(100),
                 message_id: 5,
             })
@@ -18681,7 +19264,7 @@ again"
                 slot, name, icon, ..
             } = job
             {
-                registry.topic_created(slot, Chat::Group, 100, &name, icon.as_deref());
+                registry.topic_created(slot, Chat::GROUP, 100, &name, icon.as_deref());
             }
         }
         store.save(&RegistryStore::encode(&registry)).unwrap();
@@ -18917,7 +19500,7 @@ again"
             loop {
                 let store = RegistryStore::open(rig.dir.path()).unwrap();
                 if store
-                    .load()
+                    .load(GroupChat::UNIT)
                     .is_ok_and(|saved| saved.slots.len() == SESSIONS as usize)
                 {
                     break;
@@ -19030,7 +19613,7 @@ again"
     fn stream_rig(fake: Fake, options: Options, dir: TempDir) -> Rig {
         let fake = Arc::new(fake);
         let store = RegistryStore::open(dir.path()).unwrap();
-        let registry = store.load().unwrap();
+        let registry = store.load(GroupChat::UNIT).unwrap();
         let (scheduler, outbox) = Scheduler::new(fake.clone(), FAST);
         tokio::spawn(scheduler.run());
         let mut slots = Slots::new(registry, store, outbox, options);
@@ -19237,7 +19820,7 @@ again"
         ops.iter()
             .filter_map(|op| match op {
                 Op::React {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id,
                     emoji,
                 } => Some((*message_id, emoji.clone())),
@@ -19630,7 +20213,7 @@ again"
         slots.on_hook(&start_with(A, 10, &path, "startup"));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -19679,7 +20262,7 @@ again"
         slots.on_hook(&start_with(A, 10, &path, "startup"));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -19740,7 +20323,7 @@ again"
         slots.on_hook(&start_with(A, 10, &path, "startup"));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, mut from_hub) = mpsc::channel(4);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -21164,7 +21747,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, from_hub) = mpsc::channel(8);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -21245,11 +21828,11 @@ again"
         });
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
         assert_eq!(
-            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Stop),
+            slots.press_status(Some(MessageKey::new(Chat::GROUP, 500)), Press::Stop),
             status::ANSWER_CONFIRM
         );
         assert_eq!(
-            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Confirm),
+            slots.press_status(Some(MessageKey::new(Chat::GROUP, 500)), Press::Confirm),
             status::ANSWER_INTERRUPTING
         );
         let Some(HubMsg::ConsoleKey { key_id, .. }) = from_hub.recv().await else {
@@ -21306,7 +21889,7 @@ again"
         );
         // ⏹: the question goes next to it as a foreground edit.
         assert_eq!(
-            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Stop),
+            slots.press_status(Some(MessageKey::new(Chat::GROUP, 500)), Press::Stop),
             status::ANSWER_CONFIRM
         );
         slots.pump();
@@ -21331,7 +21914,7 @@ again"
         // 14 s after the press, 5 s after it showed: still the second press.
         tokio::time::advance(Duration::from_secs(5)).await;
         assert_eq!(
-            slots.press_status(Some(MessageKey::new(Chat::Group, 500)), Press::Confirm),
+            slots.press_status(Some(MessageKey::new(Chat::GROUP, 500)), Press::Confirm),
             status::ANSWER_INTERRUPTING
         );
         assert!(matches!(
@@ -21887,7 +22470,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
@@ -22408,7 +22991,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         (fake, slots)
     }
 
@@ -22484,7 +23067,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let windows = windows_client.clone().unwrap();
         let _same = register_client(&mut slots, 1, client(&windows, true));
         slots.pump();
@@ -22613,7 +23196,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let mut first = register_client(&mut slots, 1, client(OLD_BUILD, true));
         let failures = [
             (
@@ -23076,7 +23659,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let _agent = register_client(&mut slots, 1, None);
         slots.pump();
         assert!(sent_texts(&fake).await.is_empty());
@@ -23100,7 +23683,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let (to_agent, from_hub) = mpsc::channel(8);
         slots.on_agent(AgentEvent::Registered {
             conn: 1,
@@ -23129,7 +23712,7 @@ again"
     fn topic_text(message_id: i64, text: &str, forwarded: bool) -> Inbound {
         Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id: Some(100),
@@ -23203,7 +23786,7 @@ again"
         );
         let reached = async {
             while !fake.ops().iter().any(
-                |op| matches!(op, Op::React { chat: Chat::Group, message_id: 11, emoji } if emoji == stream::ACCEPTED),
+                |op| matches!(op, Op::React { chat: Chat::GROUP, message_id: 11, emoji } if emoji == stream::ACCEPTED),
             ) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -23335,7 +23918,7 @@ again"
     fn photo(message_id: i64, file_id: &str, caption: Option<&str>, size: Option<u64>) -> Control {
         Control::Message(Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id,
             thread_id: Some(100),
@@ -23415,7 +23998,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         (slots, work, done)
     }
 
@@ -23805,7 +24388,7 @@ again"
         ));
         match op {
             Op::SendPhoto {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: Some(100),
                 document,
                 notify: false,
@@ -23966,7 +24549,7 @@ again"
         assert_eq!((parts, size), (vec![0, 2], (png.len() + jpeg.len()) as u64));
         match op {
             Op::SendAlbum {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: Some(100),
                 items,
                 photos: true,
@@ -24162,7 +24745,7 @@ again"
         slots.on_hook(&start(B, 12));
         slots
             .registry
-            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
+            .topic_created(SlotId(1), Chat::GROUP, 101, "b", None);
         let mut second = connect_files(&mut slots, 2, B, Some(12), true);
         offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
         assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
@@ -24193,7 +24776,7 @@ again"
         slots.on_hook(&start(B, 12));
         slots
             .registry
-            .topic_created(SlotId(1), Chat::Group, 101, "b", None);
+            .topic_created(SlotId(1), Chat::GROUP, 101, "b", None);
         let mut second = connect_files(&mut slots, 2, B, Some(12), true);
         offer(&mut slots, 1, 1, "a.bin", files::MAX_UPLOAD);
         assert_eq!(file_answers(&mut first), [(1, FileOutcome::Accepted)]);
@@ -24226,7 +24809,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let agent = connect_queue(&mut slots, 1, A, Some(10), 64);
         slots.pump();
         (slots, work, agent)
@@ -24301,7 +24884,7 @@ again"
         assert_eq!(topic_ops(&mut work).1, [1, 2, 3, 4], "👀 on every message");
         assert!(slots.registry.slots[0].buffer.is_idle());
         let stream = slots.registry.sessions[A].stream.as_ref().unwrap();
-        let key = |id| MessageKey::new(Chat::Group, id);
+        let key = |id| MessageKey::new(Chat::GROUP, id);
         assert_eq!(stream.receipts, [key(4)]);
         assert_eq!(stream.parts, [(key(4), vec![key(1), key(2), key(3)])]);
         pass(&mut slots, GATHER_MAX).await;
@@ -24413,7 +24996,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let mut agent = connect_files(&mut slots, 1, A, Some(10), true);
         slots.pump();
         let mut bytes = Vec::new();
@@ -24594,7 +25177,7 @@ again"
                 parent_session: A.to_owned(),
                 slot: Some(SlotId(0)),
                 block: crate::hub::registry::Block {
-                    place: Some(Place::topic(Chat::Group, 100)),
+                    place: Some(Place::topic(Chat::GROUP, 100)),
                     message_id: Some(900),
                     ..Default::default()
                 },
@@ -24664,7 +25247,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         // Kept while A had no agent; its agent's queue then takes one.
         slots.on_topic_message(topic_text(1, "one", false));
         slots.on_topic_message(topic_text(2, "two", false));
@@ -24737,7 +25320,7 @@ again"
         assert_eq!(topic_ops(&mut work).1, [1, 2, 3], "👀 on every message");
         // Both channel records turn their parts ✍.
         let stream = slots.registry.sessions[A].stream.as_ref().unwrap();
-        let key = |id| MessageKey::new(Chat::Group, id);
+        let key = |id| MessageKey::new(Chat::GROUP, id);
         assert_eq!(stream.receipts, [key(2), key(3)]);
         assert_eq!(stream.parts, [(key(2), vec![key(1)])]);
         assert!(slots.registry.slots[0].buffer.is_idle());
@@ -24766,7 +25349,7 @@ again"
             from_name: None,
             history: None,
         };
-        for (chat, label) in [(Chat::Group, "group"), (private, "private")] {
+        for (chat, label) in [(Chat::GROUP, "group"), (private, "private")] {
             let meta = slots.burst_meta(A, &[parked(chat, 5), parked(chat, 6)]);
             assert_eq!(meta["place"], label);
             assert_eq!(meta["message_id"], "6");
@@ -24835,7 +25418,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
         slots.on_hook(&session_end(A, 10));
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
@@ -24892,7 +25475,7 @@ again"
         for (index, topic) in [(0, 100), (1, 101)] {
             slots
                 .registry
-                .topic_created(SlotId(index), Chat::Group, topic, "a", None);
+                .topic_created(SlotId(index), Chat::GROUP, topic, "a", None);
             slots.registry.slots[index].views[0].pending_separator = None;
             slots.registry.slots[index].views[0].status = Some(StatusMessage {
                 message_id: 500 + topic,
@@ -24947,13 +25530,13 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
             pinned: false,
         });
-        let place = Place::topic(Chat::Group, 100);
+        let place = Place::topic(Chat::GROUP, 100);
         // A message came below the status message.
         slots.bottoms.entry(place).or_default().last = 501;
         let mut work = capture_dispatch(&mut slots);
@@ -25037,12 +25620,12 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
-        let key = MessageKey::new(Chat::Group, 500);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
+        let key = MessageKey::new(Chat::GROUP, 500);
         assert_eq!(slots.status_slot(key), None);
         slots
             .bottoms
-            .entry(Place::topic(Chat::Group, 100))
+            .entry(Place::topic(Chat::GROUP, 100))
             .or_default()
             .absorbing = Some((A.to_owned(), 1, key));
         assert_eq!(slots.status_slot(key), Some(SlotId(0)));
@@ -25062,7 +25645,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
         slots.on_hook(&session_end(A, 10));
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
@@ -25077,7 +25660,7 @@ again"
         slots.on_hook(&start_with(A, 12, "x.jsonl", "resume"));
         assert!(slots.registry.is_live_top_level(A), "live again");
         assert_eq!(slots.registry.slots[0].views[0].pending_separator, None);
-        let place = Place::topic(Chat::Group, 100);
+        let place = Place::topic(Chat::GROUP, 100);
         assert_eq!(
             slots.absorbable(SlotId(0), place),
             None,
@@ -25122,7 +25705,7 @@ again"
         slots.on_hook(&start_with(A, 10, path, "startup"));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
         if ended {
             slots.on_hook(&session_end(A, 10));
@@ -25282,9 +25865,9 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
-        let place = Place::topic(Chat::Group, 100);
+        let place = Place::topic(Chat::GROUP, 100);
         let mut work = capture_dispatch(&mut slots);
         slots.pump();
         let (job, _) = status_work(&mut work).remove(0);
@@ -25325,7 +25908,7 @@ again"
         assert!(slots.shown[&SlotId(0)].sending.is_none());
         assert_eq!(
             slots.absorbable(SlotId(0), place),
-            Some(MessageKey::new(Chat::Group, 502)),
+            Some(MessageKey::new(Chat::GROUP, 502)),
             "the last message of its topic"
         );
     }
@@ -25342,7 +25925,7 @@ again"
         for (index, topic) in [(0, 100), (1, 101)] {
             slots
                 .registry
-                .topic_created(SlotId(index), Chat::Group, topic, "a", None);
+                .topic_created(SlotId(index), Chat::GROUP, topic, "a", None);
             slots.registry.slots[index].views[0].pending_separator = None;
             slots.registry.slots[index].views[0].status = Some(StatusMessage {
                 message_id: 500 + topic,
@@ -25350,8 +25933,8 @@ again"
             });
         }
         let (place, other) = (
-            Place::topic(Chat::Group, 100),
-            Place::topic(Chat::Group, 101),
+            Place::topic(Chat::GROUP, 100),
+            Place::topic(Chat::GROUP, 101),
         );
         let mut work = capture_dispatch(&mut slots);
         // Answers the edits in place; the moves are returned.
@@ -25435,13 +26018,13 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.registry.slots[0].views[0].pending_separator = None;
         slots.registry.slots[0].views[0].status = Some(StatusMessage {
             message_id: 500,
             pinned: false,
         });
-        let place = Place::topic(Chat::Group, 100);
+        let place = Place::topic(Chat::GROUP, 100);
         slots.bottoms.entry(place).or_default().last = 501;
         let mut work = capture_dispatch(&mut slots);
         // Answers the edits in place; the moves are returned.
@@ -25509,7 +26092,7 @@ again"
         );
         assert_eq!(
             slots.absorbable(SlotId(0), place),
-            Some(MessageKey::new(Chat::Group, 504)),
+            Some(MessageKey::new(Chat::GROUP, 504)),
             "below the second prompt (503), the last message of its topic"
         );
     }
@@ -25561,7 +26144,7 @@ again"
             .iter()
             .map(|view| (view.chat, view.fallback))
             .collect();
-        assert_eq!(chats, [(owner, false), (Chat::Group, true)]);
+        assert_eq!(chats, [(owner, false), (Chat::GROUP, true)]);
         // A new slot while the chat is closed: the group, as before, until
         // the chat opens.
         slots.on_hook(&start(B, 11));
@@ -25569,7 +26152,7 @@ again"
             slots.registry.slots[1].views,
             [crate::hub::registry::View {
                 fallback: true,
-                ..crate::hub::registry::View::new(Chat::Group)
+                ..crate::hub::registry::View::new(Chat::GROUP)
             }]
         );
     }
@@ -25610,23 +26193,23 @@ again"
         slots.pump();
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         // A slot shared from before: its group view is no fallback.
         slots.on_hook(&start(B, 11));
         slots.registry.slots[1].views = vec![
-            crate::hub::registry::View::new(Chat::Group),
+            crate::hub::registry::View::new(Chat::GROUP),
             crate::hub::registry::View::new(owner),
         ];
         slots
             .registry
-            .topic_created(SlotId(1), Chat::Group, 101, "t", None);
+            .topic_created(SlotId(1), Chat::GROUP, 101, "t", None);
         slots
             .registry
             .topic_created(SlotId(1), owner, 701, "t", None);
         slots.pump();
         assert_eq!(
             slots.registry.place(SlotId(0)),
-            Some(Place::topic(Chat::Group, 100))
+            Some(Place::topic(Chat::GROUP, 100))
         );
         let mut work = capture_dispatch(&mut slots);
         // Still closed: nothing changes.
@@ -25654,7 +26237,7 @@ again"
         let group: Vec<Op> = all_work(&mut work)
             .into_iter()
             .map(|(_, op)| op)
-            .filter(|op| op.chat() == Some(Chat::Group))
+            .filter(|op| op.chat() == Some(Chat::GROUP))
             .collect();
         assert!(
             group.iter().any(
@@ -25685,7 +26268,7 @@ again"
         let dir = TempDir::new("slots-private-zombie");
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, 10));
-        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         registry.after_restart();
         let store = RegistryStore::open(dir.path()).unwrap();
         let stalled = Arc::new(Fake {
@@ -25708,7 +26291,7 @@ again"
             .iter()
             .map(|view| view.chat)
             .collect();
-        assert_eq!(chats, [Chat::Group, private_owner()]);
+        assert_eq!(chats, [Chat::GROUP, private_owner()]);
     }
 
     /// TASK-063 (code review 5): when the private chat closes (403), its
@@ -25722,7 +26305,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         slots.registry.add_view(SlotId(0), owner);
         slots
             .registry
@@ -25737,7 +26320,7 @@ again"
         });
         slots.mirror.link(
             MessageKey::new(owner, 5900),
-            MessageKey::new(Chat::Group, 900),
+            MessageKey::new(Chat::GROUP, 900),
             Some(100),
         );
         slots.pump();
@@ -25746,7 +26329,7 @@ again"
         slots.pump();
         assert_eq!(
             slots.registry.place(SlotId(0)),
-            Some(Place::topic(Chat::Group, 100))
+            Some(Place::topic(Chat::GROUP, 100))
         );
         assert_eq!(
             slots.registry.slots[0].views[1].status,
@@ -25851,7 +26434,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         slots.registry.add_view(SlotId(0), owner);
         slots
             .registry
@@ -25872,7 +26455,7 @@ again"
                     seq = Some(before + 1 + n as u64);
                 }
                 Work::Twin { id, place, .. } => {
-                    assert_eq!(place, Some(Place::topic(Chat::Group, 100)));
+                    assert_eq!(place, Some(Place::topic(Chat::GROUP, 100)));
                     twin = Some((id, place));
                 }
                 _ => {}
@@ -25910,7 +26493,7 @@ again"
             handed.iter().all(|(_, op)| !matches!(
                 op,
                 Op::Delete {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id: 950
                 }
             )),
@@ -25924,7 +26507,7 @@ again"
         );
         slots.on_control(press("q", Some(950), "allow:abcde"));
         assert_eq!(
-            slots.prompts.by_message(MessageKey::new(Chat::Group, 950)),
+            slots.prompts.by_message(MessageKey::new(Chat::GROUP, 950)),
             Some(key)
         );
         assert!(matches!(
@@ -25964,7 +26547,7 @@ again"
         let owner = private_owner();
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, 10));
-        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         registry.add_view(SlotId(0), owner);
         registry.topic_created(SlotId(0), owner, 700, "t", None);
         registry.slots[0].views[0].status = Some(StatusMessage {
@@ -25990,7 +26573,7 @@ again"
             Some(Place::topic(owner, 700))
         );
         assert_eq!(
-            slots.mirror.primary_of(MessageKey::new(Chat::Group, 900)),
+            slots.mirror.primary_of(MessageKey::new(Chat::GROUP, 900)),
             Some(primary)
         );
         slots.hand_off(
@@ -26012,7 +26595,7 @@ again"
                 _ => None,
             })
             .collect();
-        assert_eq!(edited, [primary, MessageKey::new(Chat::Group, 900)]);
+        assert_eq!(edited, [primary, MessageKey::new(Chat::GROUP, 900)]);
     }
 
     /// TASK-063: the twin of a lasting message (a subagent block) is kept
@@ -26024,12 +26607,12 @@ again"
         let owner = private_owner();
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, 10));
-        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         registry.add_view(SlotId(0), owner);
         registry.topic_created(SlotId(0), owner, 700, "t", None);
         let (primary, twin) = (
             MessageKey::new(owner, 5100),
-            MessageKey::new(Chat::Group, 910),
+            MessageKey::new(Chat::GROUP, 910),
         );
         registry.twins = vec![TwinLink {
             primary,
@@ -26113,7 +26696,7 @@ again"
             assert_eq!(landed_of(&prompt, owner, Some(lost), None), Landed::Again);
             assert_eq!(landed_of(&question, owner, Some(lost), None), Landed::Again);
             assert_eq!(
-                landed_of(&prompt, Chat::Group, Some(lost), None),
+                landed_of(&prompt, Chat::GROUP, Some(lost), None),
                 Landed::Nothing
             );
         }
@@ -26132,13 +26715,13 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         slots.registry.add_view(SlotId(0), owner);
         slots
             .registry
             .topic_created(SlotId(0), owner, 700, "t", None);
         let mut work = capture_dispatch(&mut slots);
-        let (primary, mirror) = (Place::topic(owner, 700), Place::topic(Chat::Group, 100));
+        let (primary, mirror) = (Place::topic(owner, 700), Place::topic(Chat::GROUP, 100));
         for n in 0..MAX_TWIN_POSTS + 3 {
             assert!(slots.send_messages(vec![message_op(primary, format!("m{n}"))]));
         }
@@ -26309,7 +26892,7 @@ again"
             .find_map(|(job, _)| match job {
                 Work::Topic(
                     job @ TopicJob::Create {
-                        chat: Chat::Group, ..
+                        chat: Chat::GROUP, ..
                     },
                 ) => Some(job),
                 _ => None,
@@ -26385,13 +26968,13 @@ again"
         while from_hub.try_recv().is_ok() {}
         slots.on_control(owner_says(Some(700), 5001, "/share"));
         slots.pump();
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
         let handed = all_work(&mut work);
         assert!(
             handed.iter().any(|(job, _)| matches!(
                 job,
                 Work::Topic(TopicJob::Create {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     ..
                 })
             )),
@@ -26429,7 +27012,7 @@ again"
         slots.on_control(owner_says(Some(700), 5002, "/share"));
         slots.pump();
         let after = group_topic_made(&mut slots, &mut work, 100);
-        let group = Place::topic(Chat::Group, 100);
+        let group = Place::topic(Chat::GROUP, 100);
         let line = crate::hub::registry::share_line(SHARER);
         assert!(
             matches!(after.first(), Some((Work::Topic(TopicJob::Separator { text, .. }), _)) if *text == line),
@@ -26532,12 +27115,12 @@ again"
         };
         let ops = settled(&rig, |ops| {
             !status_sends(ops, private_owner()).is_empty()
-                && !status_sends(ops, Chat::Group).is_empty()
+                && !status_sends(ops, Chat::GROUP).is_empty()
         })
         .await;
         let (index, markup) = status_sends(&ops, private_owner()).pop().unwrap();
         assert!(has(&markup, "status:unshare"), "{markup:?}");
-        for (_, markup) in status_sends(&ops, Chat::Group) {
+        for (_, markup) in status_sends(&ops, Chat::GROUP) {
             assert!(
                 !has(&markup, "status:unshare") && !has(&markup, "status:share"),
                 "{ops:#?}"
@@ -26570,12 +27153,12 @@ again"
         .await;
         for op in &ops {
             if let Op::Edit {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 reply_markup,
                 ..
             }
             | Op::Send {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 reply_markup,
                 ..
             } = op
@@ -26610,7 +27193,7 @@ again"
         });
         slots.mirror.link(
             MessageKey::new(private_owner(), 5900),
-            MessageKey::new(Chat::Group, 900),
+            MessageKey::new(Chat::GROUP, 900),
             Some(100),
         );
 
@@ -26635,17 +27218,17 @@ again"
             [Some(status::ANSWER_UNSHARE_CONFIRM.to_owned())]
         );
         assert!(topic_deletes(&handed).is_empty());
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
         let (_, keyboard) = slots.status_view(SlotId(0), A, Instant::now());
         assert!(status::asks_unshare_confirm(&keyboard), "{keyboard}");
-        slots.on_control(press_in(Chat::Group, 100, 900, "status:unshare_confirm"));
+        slots.on_control(press_in(Chat::GROUP, 100, 900, "status:unshare_confirm"));
         slots.pump();
         let handed = all_work(&mut work);
         assert_eq!(
             callback_answers(&handed),
             [Some(status::ANSWER_OWNER_ONLY.to_owned())]
         );
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
         slots.on_control(press_in(owner, 700, 5900, "status:unshare_confirm"));
         slots.pump();
         let handed = all_work(&mut work);
@@ -26653,8 +27236,8 @@ again"
             callback_answers(&handed),
             [Some(status::ANSWER_UNSHARED.to_owned())]
         );
-        assert!(!slots.registry.shared(SlotId(0), Chat::Group));
-        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::Group, 100)]);
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
+        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::GROUP, 100)]);
         // The wait ran out: the confirming press asks again.
         slots.on_control(press_in(owner, 700, 5900, "status:share"));
         slots.on_control(press_in(owner, 700, 5900, "status:unshare"));
@@ -26671,7 +27254,7 @@ again"
                 Some(status::ANSWER_UNSHARE_CONFIRM.to_owned())
             ]
         );
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
     }
 
     /// An unshare while the group topic is being made waits: the view
@@ -26690,14 +27273,14 @@ again"
             sends_into(&handed, Place::topic(private_owner(), 700)),
             [SHARE_LATER_NOTICE]
         );
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
         assert!(topic_deletes(&handed).is_empty());
     }
 
     /// The group topic an unshare leaves (no right to delete, or Telegram
     /// refused): told, the dead icon, its status twin cleared away.
     fn assert_kept_and_dead(slots: &Slots, handed: &[(Work, Op)]) {
-        let group = Place::topic(Chat::Group, 100);
+        let group = Place::topic(Chat::GROUP, 100);
         assert_eq!(sends_into(handed, group), [UNSHARED_KEPT_NOTICE]);
         assert!(
             handed.iter().any(|(_, op)| matches!(op, Op::EditTopic { thread_id: 100, icon_custom_emoji_id: Some(icon), .. }
@@ -26708,7 +27291,7 @@ again"
             handed.iter().any(|(_, op)| matches!(
                 op,
                 Op::Delete {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id: 900
                 }
             )),
@@ -26742,14 +27325,14 @@ again"
         slots.on_control(owner_says(Some(700), 5002, "/unshare"));
         slots.pump();
         let handed = all_work(&mut work);
-        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::Group, 100)]);
+        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::GROUP, 100)]);
         assert_eq!(slots.registry.unshared.len(), 1);
         (slots, work)
     }
 
     fn deleted(slots: &mut Slots, delivery: Option<Delivery>) {
         slots.on_done(Done::TopicDeleted {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             delivery,
         });
         slots.pump();
@@ -26786,7 +27369,7 @@ again"
         let handed = all_work(&mut work);
         assert!(slots.registry.unshared.is_empty());
         assert!(
-            handed.iter().all(|(_, op)| op.chat() != Some(Chat::Group)),
+            handed.iter().all(|(_, op)| op.chat() != Some(Chat::GROUP)),
             "{handed:#?}"
         );
         // Done: never asked again.
@@ -26813,7 +27396,7 @@ again"
         slots.pump();
         assert_eq!(
             topic_deletes(&all_work(&mut work)),
-            [Place::topic(Chat::Group, 100)]
+            [Place::topic(Chat::GROUP, 100)]
         );
         deleted(&mut slots, None);
         assert!(topic_deletes(&all_work(&mut work)).is_empty());
@@ -26822,7 +27405,7 @@ again"
         slots.pump();
         assert_eq!(
             topic_deletes(&all_work(&mut work)),
-            [Place::topic(Chat::Group, 100)]
+            [Place::topic(Chat::GROUP, 100)]
         );
         deleted(&mut slots, Some(Ok(Outcome::Done)));
         assert!(slots.registry.unshared.is_empty());
@@ -26835,7 +27418,7 @@ again"
         let dir = TempDir::new("slots-unshare-restart");
         let mut registry = Registry::default();
         registry.unshared.push(UnsharedTopic {
-            place: Place::topic(Chat::Group, 100),
+            place: Place::topic(Chat::GROUP, 100),
             status: Some(900),
         });
         let saved: Registry = serde_json::from_slice(&RegistryStore::encode(&registry)).unwrap();
@@ -26852,7 +27435,7 @@ again"
         slots.pump();
         assert_eq!(
             topic_deletes(&all_work(&mut work)),
-            [Place::topic(Chat::Group, 100)]
+            [Place::topic(Chat::GROUP, 100)]
         );
     }
 
@@ -26869,7 +27452,7 @@ again"
         slots.pump();
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         assert!(slots.registry.slots[0].views[1].fallback);
         slots.pump();
         let _ = all_work(&mut work);
@@ -26886,7 +27469,7 @@ again"
                 .any(|(_, op)| matches!(op, Op::CreateTopic { .. })),
             "{handed:#?}"
         );
-        let group = sends_into(&handed, Place::topic(Chat::Group, 100));
+        let group = sends_into(&handed, Place::topic(Chat::GROUP, 100));
         assert!(!group.iter().any(|text| text == FALLBACK_END_NOTICE));
         // Next in that topic, once its name edit is answered.
         assert_eq!(
@@ -26911,7 +27494,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "t", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         slots.registry.add_view(SlotId(0), owner);
         slots
             .registry
@@ -26958,7 +27541,7 @@ again"
             }))),
         });
         assert_eq!(
-            slots.mirror.primary_of(MessageKey::new(Chat::Group, 950)),
+            slots.mirror.primary_of(MessageKey::new(Chat::GROUP, 950)),
             Some(MessageKey::new(owner, 5950))
         );
         (slots, work, key)
@@ -26978,8 +27561,8 @@ again"
         let (mut slots, _work, key) = prompt_with_twin(&dir, options);
         slots.on_control(owner_says(Some(700), 5001, "/unshare"));
         slots.pump();
-        assert!(!slots.registry.shared(SlotId(0), Chat::Group));
-        slots.on_control(press_in(Chat::Group, 100, 950, "allow:abcde"));
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
+        slots.on_control(press_in(Chat::GROUP, 100, 950, "allow:abcde"));
         assert!(
             matches!(
                 slots.prompts.get(key).map(|prompt| prompt.state),
@@ -26994,9 +27577,9 @@ again"
         slots.pump();
         assert_eq!(
             slots.registry.place(SlotId(0)),
-            Some(Place::topic(Chat::Group, 100))
+            Some(Place::topic(Chat::GROUP, 100))
         );
-        slots.on_control(press_in(Chat::Group, 100, 950, "allow:abcde"));
+        slots.on_control(press_in(Chat::GROUP, 100, 950, "allow:abcde"));
         assert!(matches!(
             slots.prompts.get(key).map(|prompt| prompt.state),
             Some(State::Selected {
@@ -27026,7 +27609,7 @@ again"
         handed
             .iter()
             .map(|(_, op)| op)
-            .filter(|op| op.chat() == Some(Chat::Group))
+            .filter(|op| op.chat() == Some(Chat::GROUP))
             .collect()
     }
 
@@ -27059,7 +27642,7 @@ again"
             slots.on_control(owner_says(Some(700), 5001, "/unshare"));
             slots.pump();
             let handed = all_work(&mut work);
-            let group = Place::topic(Chat::Group, 100);
+            let group = Place::topic(Chat::GROUP, 100);
             if can_delete {
                 assert_eq!(topic_deletes(&handed), [group]);
             } else {
@@ -27069,7 +27652,7 @@ again"
                 );
             }
             assert_eq!(
-                slots.mirror.primary_of(MessageKey::new(Chat::Group, 950)),
+                slots.mirror.primary_of(MessageKey::new(Chat::GROUP, 950)),
                 None
             );
             edit_prompt(&mut slots, "new content after the unshare");
@@ -27092,12 +27675,12 @@ again"
         let owner = private_owner();
         let mut registry = Registry::default();
         registry.apply_hook(&start(A, 10));
-        registry.topic_created(SlotId(0), Chat::Group, 100, "t", None);
+        registry.topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
         registry.add_view(SlotId(0), owner);
         registry.topic_created(SlotId(0), owner, 700, "t", None);
         let (primary, twin) = (
             MessageKey::new(owner, 5100),
-            MessageKey::new(Chat::Group, 910),
+            MessageKey::new(Chat::GROUP, 910),
         );
         registry.slots[0].buffer.resume = Some(ResumeNote {
             session: A.into(),
@@ -27569,7 +28152,7 @@ again"
             let mut slots = stalled_slots(&dir, options);
             slots.on_hook(&start_with(A, 10, &path, "startup"));
             slots.registry.slots[0].views = vec![
-                crate::hub::registry::View::new(Chat::Group),
+                crate::hub::registry::View::new(Chat::GROUP),
                 crate::hub::registry::View::new(owner),
             ];
             slots
@@ -27577,11 +28160,11 @@ again"
                 .topic_created(SlotId(0), owner, 700, "a", None);
             slots
                 .registry
-                .topic_created(SlotId(0), Chat::Group, 100, "a", None);
-            assert!(slots.registry.shared(SlotId(0), Chat::Group));
+                .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
+            assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
             slots.registry.person_mut(owner_chat()).settings = settings.clone();
             assert_eq!(slots.display_in(SlotId(0), owner), settings.display());
-            assert_eq!(slots.display_in(SlotId(0), Chat::Group), settings.group);
+            assert_eq!(slots.display_in(SlotId(0), Chat::GROUP), settings.group);
             let (to_agent, _from_hub) = mpsc::channel(4);
             slots.on_agent(AgentEvent::Registered {
                 conn: 1,
@@ -27652,7 +28235,7 @@ again"
             "{handed:#?}"
         );
         assert_eq!(
-            lines(&handed, Chat::Group),
+            lines(&handed, Chat::GROUP),
             [tool(), ("done".to_owned(), true)],
             "{handed:#?}"
         );
@@ -27661,7 +28244,7 @@ again"
             .iter()
             .position(|(work, op)| {
                 matches!(work, Work::Twin { turn: Some(_), .. })
-                    && matches!(op, Op::Stream { chat: Chat::Group, text, .. } if text == "• Bash: ls ✓")
+                    && matches!(op, Op::Stream { chat: Chat::GROUP, text, .. } if text == "• Bash: ls ✓")
             })
             .expect("the group's own line");
         let answer_at = handed
@@ -27671,7 +28254,7 @@ again"
                     && matches!(
                         op,
                         Op::Stream {
-                            chat: Chat::Group,
+                            chat: Chat::GROUP,
                             notify: true,
                             ..
                         }
@@ -27693,7 +28276,7 @@ again"
             "{handed:#?}"
         );
         assert_eq!(
-            lines(&handed, Chat::Group),
+            lines(&handed, Chat::GROUP),
             [("done".to_owned(), true)],
             "{handed:#?}"
         );
@@ -27909,9 +28492,9 @@ again"
             quiet.display()
         );
         // TASK-078: the group view of a slot by its owner's group settings.
-        assert_eq!(slots.display_in(SlotId(1), Chat::Group), boris_group);
+        assert_eq!(slots.display_in(SlotId(1), Chat::GROUP), boris_group);
         assert_eq!(
-            slots.display_in(SlotId(0), Chat::Group),
+            slots.display_in(SlotId(0), Chat::GROUP),
             menu::Display::default()
         );
         let answer = |chat: Chat, thread: i64| Op::Send {
@@ -27932,7 +28515,7 @@ again"
         assert!(!loud(
             slots.voiced(&Work::Message, answer(Chat::Private(boris), 800))
         ));
-        assert!(loud(slots.voiced(&Work::Message, answer(Chat::Group, 100))));
+        assert!(loud(slots.voiced(&Work::Message, answer(Chat::GROUP, 100))));
     }
 
     /// TASK-073: a menu press counts only in a private chat, and only for
@@ -27944,7 +28527,7 @@ again"
         let mut from_hub = connect_typing(&mut slots, 1);
         slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
         // In the group.
-        slots.on_control(press_in(Chat::Group, 100, 900, "menu:dl:a"));
+        slots.on_control(press_in(Chat::GROUP, 100, 900, "menu:dl:a"));
         // From the private chat of another allowlisted user, about A's slot.
         slots.on_control(Control::Callback(CallbackInput {
             query_id: "q".into(),
@@ -28285,7 +28868,7 @@ again"
         slots.pump();
         let handed = group_topic_made(&mut slots, &mut work, 100);
         let _ = handed;
-        assert!(slots.registry.shared(SlotId(0), Chat::Group));
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
         slots.on_control(menu_press(MENU, "menu:us:0:0"));
         slots.pump();
         let handed = all_work(&mut work);
@@ -28305,8 +28888,8 @@ again"
             callback_answers(&handed),
             [Some(status::ANSWER_UNSHARED.to_owned())]
         );
-        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::Group, 100)]);
-        assert!(!slots.registry.shared(SlotId(0), Chat::Group));
+        assert_eq!(topic_deletes(&handed), [Place::topic(Chat::GROUP, 100)]);
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
     }
 
     /// Registers agent `conn` of `session` (claude `pid`) with `client`.
@@ -28860,18 +29443,18 @@ again"
                 })
             };
             assert!(
-                !sent(owner).is_empty() && !sent(Chat::Group).is_empty(),
+                !sent(owner).is_empty() && !sent(Chat::GROUP).is_empty(),
                 "{handed:#?}"
             );
             assert_eq!(quoted(owner), !group_compact, "{handed:#?}");
-            assert_eq!(quoted(Chat::Group), group_compact, "{handed:#?}");
+            assert_eq!(quoted(Chat::GROUP), group_compact, "{handed:#?}");
         }
     }
 
     // ------------------------------------------------------------ TASK-078
 
     fn group_topic() -> Place {
-        Place::topic(Chat::Group, 100)
+        Place::topic(Chat::GROUP, 100)
     }
 
     /// Session A streaming in the owner's private chat (topic 700) with its
@@ -28890,10 +29473,10 @@ again"
         let owner = private_owner();
         slots.registry.slots[0]
             .views
-            .push(crate::hub::registry::View::new(Chat::Group));
+            .push(crate::hub::registry::View::new(Chat::GROUP));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         for view in &mut slots.registry.slots[0].views {
             view.pending_separator = None;
         }
@@ -28912,7 +29495,7 @@ again"
                 .last = 900;
             slots.mirror.link(
                 MessageKey::new(owner, 900),
-                MessageKey::new(Chat::Group, 950),
+                MessageKey::new(Chat::GROUP, 950),
                 Some(100),
             );
             slots.bottoms.entry(group_topic()).or_default().last = 950;
@@ -28996,7 +29579,7 @@ again"
         assert!(
             matches!(
                 group.as_slice(),
-                [(_, Op::Stream { chat: Chat::Group, into: Some(950), merge: false, text, .. })]
+                [(_, Op::Stream { chat: Chat::GROUP, into: Some(950), merge: false, text, .. })]
                     if text == "Looking.\n• Bash: one ✓"
             ),
             "{handed:#?}"
@@ -29011,7 +29594,7 @@ again"
             ) || matches!(op, Op::Delete { .. })),
             "{handed:#?}"
         );
-        assert!(!slots.mirror.knows(MessageKey::new(owner, 900), Chat::Group));
+        assert!(!slots.mirror.knows(MessageKey::new(owner, 900), Chat::GROUP));
     }
 
     /// A turn only the group shows: the group's stream takes the status
@@ -29057,7 +29640,7 @@ again"
                 ) && matches!(
                     op,
                     Op::Send {
-                        chat: Chat::Group,
+                        chat: Chat::GROUP,
                         thread_id: Some(100),
                         ..
                     }
@@ -29066,7 +29649,7 @@ again"
             .expect("a new status twin");
         assert!(absorbed < fresh, "{handed:#?}");
         assert!(!handed.iter().any(|(_, op)| matches!(op, Op::Delete { .. })));
-        assert!(slots.mirror.knows(status, Chat::Group));
+        assert!(slots.mirror.knows(status, Chat::GROUP));
         let (Work::Twin { id, place, .. }, _) = &handed[fresh] else {
             unreachable!()
         };
@@ -29080,8 +29663,8 @@ again"
             }))),
         });
         assert_eq!(
-            slots.mirror.twin(status, Chat::Group),
-            Some(MessageKey::new(Chat::Group, 960))
+            slots.mirror.twin(status, Chat::GROUP),
+            Some(MessageKey::new(Chat::GROUP, 960))
         );
         let bottom = &slots.bottoms[&group_topic()];
         assert_eq!(
@@ -29104,7 +29687,7 @@ again"
             handed.iter().any(|(_, op)| matches!(
                 op,
                 Op::Delete {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id: 960
                 }
             )),
@@ -29148,7 +29731,7 @@ again"
             handed.iter().any(|(_, op)| matches!(
                 op,
                 Op::Delete {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id: 950
                 }
             )),
@@ -29164,7 +29747,7 @@ again"
             )),
             "{handed:#?}"
         );
-        assert!(!slots.mirror.knows(MessageKey::new(owner, 900), Chat::Group));
+        assert!(!slots.mirror.knows(MessageKey::new(owner, 900), Chat::GROUP));
     }
 
     /// Review finding 3: a twin this run of the hub did not see go in as
@@ -29192,7 +29775,7 @@ again"
                 handed.iter().any(|(_, op)| matches!(
                     op,
                     Op::Delete {
-                        chat: Chat::Group,
+                        chat: Chat::GROUP,
                         message_id: 950
                     }
                 )),
@@ -29328,7 +29911,7 @@ again"
         assert!(group_turn(&handed).is_empty(), "{handed:#?}");
         assert!(
             handed.iter().any(|(work, op)| matches!(work, Work::Twin { turn: None, .. })
-                && matches!(op, Op::Stream { chat: Chat::Group, notify: true, text, .. } if text == "done")),
+                && matches!(op, Op::Stream { chat: Chat::GROUP, notify: true, text, .. } if text == "done")),
             "the answer's twin: {handed:#?}"
         );
         group_took(&mut slots, write, &op, 800);
@@ -29403,7 +29986,7 @@ again"
         });
         slots.mirror.link(
             MessageKey::new(owner, 900),
-            MessageKey::new(Chat::Group, 950),
+            MessageKey::new(Chat::GROUP, 950),
             Some(100),
         );
         *slots.bottoms.entry(group_topic()).or_default() = Bottom {
@@ -29433,7 +30016,7 @@ again"
             .iter()
             .position(|(work, op)| {
                 matches!(work, Work::Twin { turn: None, .. })
-                    && matches!(op, Op::Stream { chat: Chat::Group, notify: true, text, .. } if text == "first")
+                    && matches!(op, Op::Stream { chat: Chat::GROUP, notify: true, text, .. } if text == "first")
             })
             .expect("the answer's twin");
         let line = handed
@@ -29604,7 +30187,7 @@ again"
     /// A user's message in the group topic of the slot.
     fn group_says(message_id: i64, text: &str) -> Control {
         Control::Message(Inbound {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: PrivateChat::of_user(7),
             message_id,
             thread_id: Some(100),
@@ -29758,7 +30341,7 @@ again"
             handed
                 .iter()
                 .any(|(work, op)| matches!(work, Work::Stream { .. })
-                    && matches!(op, Op::Stream { chat: Chat::Group, thread_id: 100, text, .. }
+                    && matches!(op, Op::Stream { chat: Chat::GROUP, thread_id: 100, text, .. }
                     if text.contains("• Bash: two ✓"))),
             "the group's settings show the tool line: {handed:#?}"
         );
@@ -29912,7 +30495,7 @@ again"
                 (
                     Work::Stream { number, .. },
                     Op::Stream {
-                        chat: Chat::Group, ..
+                        chat: Chat::GROUP, ..
                     },
                 ) => Some((*number, op.clone())),
                 _ => None,
@@ -30072,7 +30655,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         slots.pump();
         let mut work = capture_dispatch(&mut slots);
         slots.on_hook(&stop(A, Some(&answer)));
@@ -30125,7 +30708,7 @@ again"
             ("answer-aaaaaaaa.txt", long.as_bytes())
         );
         assert!(
-            matches!(twins.as_slice(), [Op::SendDocument { chat: Chat::Group, thread_id: Some(100), document, .. }]
+            matches!(twins.as_slice(), [Op::SendDocument { chat: Chat::GROUP, thread_id: Some(100), document, .. }]
                 if document.file_name == "answer-aaaaaaaa.txt" && document.bytes == long.as_bytes()),
             "{twins:#?}"
         );
@@ -30140,7 +30723,7 @@ again"
             let (primary, twins) = rich_contents(&all_work(&mut work));
             assert_rich_of(&primary[0], private_owner(), &short, true);
             assert_eq!(twins.len(), 1, "{twins:#?}");
-            assert_rich_of(&twins[0], Chat::Group, &short, group_rich);
+            assert_rich_of(&twins[0], Chat::GROUP, &short, group_rich);
         }
     }
 
@@ -30165,7 +30748,7 @@ again"
             assert_rich_of(op, private_owner(), &short, false);
         }
         for op in &twins {
-            assert_rich_of(op, Chat::Group, &short, true);
+            assert_rich_of(op, Chat::GROUP, &short, true);
         }
 
         let long = table_answer(6);
@@ -30182,7 +30765,7 @@ again"
             "{primary:#?}"
         );
         assert_eq!(twins.len(), 1, "{twins:#?}");
-        assert_rich_of(&twins[0], Chat::Group, &long, true);
+        assert_rich_of(&twins[0], Chat::GROUP, &long, true);
     }
 
     /// A long streamed answer held while its view showed rich messages, and
@@ -30265,7 +30848,7 @@ again"
             "{own:?}"
         );
         let twin = slots
-            .as_new_twin(op, Place::topic(Chat::Group, 100))
+            .as_new_twin(op, Place::topic(Chat::GROUP, 100))
             .expect("a twin into the group");
         assert_eq!(
             rich_form(&twin),
@@ -30457,7 +31040,7 @@ again"
                     .unwrap_or_else(|| panic!("{handed:#?}"))
             };
             assert_eq!(into(owner), (900, true));
-            assert_eq!(into(Chat::Group), (950, group_rich));
+            assert_eq!(into(Chat::GROUP), (950, group_rich));
         }
     }
 
@@ -30520,7 +31103,7 @@ again"
     /// reply to message 42 of `reply_from` when given.
     fn group_by(message_id: i64, text: &str, name: &str, reply_from: Option<i64>) -> Control {
         Control::Message(Inbound {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: PrivateChat::of_user(7),
             message_id,
             thread_id: Some(100),
@@ -30582,7 +31165,7 @@ again"
         slots.registry.slots[0]
             .views
             .iter()
-            .find(|view| view.chat == Chat::Group)
+            .find(|view| view.chat == Chat::GROUP)
             .map(|view| view.backlog.parts.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -30619,7 +31202,7 @@ again"
     }
 
     fn group_100() -> Place {
-        Place::topic(Chat::Group, 100)
+        Place::topic(Chat::GROUP, 100)
     }
 
     fn long_text(id: i64) -> String {
@@ -30879,7 +31462,7 @@ again"
         assert_eq!(got(&mut agent).compress.len(), 1);
         let store = RegistryStore::open(dir.path()).unwrap();
         store.save(&RegistryStore::encode(&slots.registry)).unwrap();
-        let loaded = store.load().unwrap();
+        let loaded = store.load(GroupChat::UNIT).unwrap();
         assert!(loaded.slots[0].buffer.messages[0].pending());
         let stalled = Arc::new(Fake {
             stall: true,
@@ -30911,7 +31494,7 @@ again"
         slots.on_hook(&start(A, 10));
         slots
             .registry
-            .topic_created(SlotId(0), Chat::Group, 100, "a", None);
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
         let mut agent = mention_agent(&mut slots, 1, 64, false);
         slots.pump();
         let _ = got(&mut agent);
@@ -31006,13 +31589,13 @@ again"
         let dir = TempDir::new("slots-rich-group-default");
         let (mut slots, _work) = shared_slot(&dir, private_only_options());
         assert!(slots.registry.person(owner_chat()).is_none());
-        assert!(slots.display_in(SlotId(0), Chat::Group).rich);
+        assert!(slots.display_in(SlotId(0), Chat::GROUP).rich);
         slots.registry.person_mut(owner_chat());
-        assert!(slots.display_in(SlotId(0), Chat::Group).rich);
+        assert!(slots.display_in(SlotId(0), Chat::GROUP).rich);
         let dir = TempDir::new("slots-rich-group-alone");
         let mut slots = stalled_slots(&dir, message_options());
         slots.on_hook(&start(A, 10));
-        assert!(!slots.display_in(SlotId(0), Chat::Group).rich);
+        assert!(!slots.display_in(SlotId(0), Chat::GROUP).rich);
     }
 
     /// (к): a console command in the group topic works as before and leaves
@@ -31212,7 +31795,7 @@ again"
             .iter()
             .filter_map(|(_, op)| match op {
                 Op::Send {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     text,
                     ..
                 } => Some(text.as_str()),
@@ -31244,5 +31827,697 @@ again"
         );
         assert!(slots.registry.slots[0].buffer.messages.is_empty());
         assert_eq!(reactions_on(&all_work(&mut work)), [10]);
+    }
+
+    // ------------------------------------------------------------ TASK-069
+
+    const B_ID: i64 = -1_002_222;
+    const C_ID: i64 = -1_003_333;
+
+    fn group_b() -> Chat {
+        Chat::Group(GroupChat::of(B_ID))
+    }
+
+    fn b_200() -> Place {
+        Place::topic(group_b(), 200)
+    }
+
+    fn admin(rights: bool, delete: bool) -> ChatMember {
+        ChatMember {
+            status: "administrator".into(),
+            can_manage_topics: rights,
+            can_delete_messages: delete,
+            ..ChatMember::default()
+        }
+    }
+
+    fn member_of(id: i64, member: ChatMember, forum: bool, by_allowed: bool) -> Control {
+        Control::Member(MemberUpdate {
+            chat: GroupChat::of(id),
+            supergroup: true,
+            title: Some("Команда".into()),
+            is_forum: forum,
+            member,
+            by_allowed,
+        })
+    }
+
+    fn kicked() -> ChatMember {
+        ChatMember {
+            status: "kicked".into(),
+            ..ChatMember::default()
+        }
+    }
+
+    /// Slot 0 of `shared_slot` (private 700, the default group's topic 100)
+    /// shared into group B too, its topic 200.
+    fn shared_in_b(
+        dir: &TempDir,
+        options: Options,
+    ) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = shared_slot(dir, options);
+        slots
+            .registry
+            .join_group(GroupChat::of(B_ID), Some("Бета".into()), true, true);
+        slots.registry.share(
+            SlotId(0),
+            group_b(),
+            crate::hub::registry::share_line(SHARER),
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), group_b(), 200, "t", None);
+        slots.registry.slots[0].views[2].pending_separator = None;
+        slots.pump();
+        let _ = all_work(&mut work);
+        (slots, work)
+    }
+
+    /// (TASK-069) A group the owner adds the bot to is known at once and
+    /// told so once; one a stranger adds it to is left without a word; a
+    /// group the bot was removed from is `left` until it is back.
+    #[tokio::test]
+    async fn a_group_the_owner_adds_is_known_at_once_and_a_strangers_is_left() {
+        let dir = TempDir::new("slots-groups-member");
+        let mut slots = stalled_slots(&dir, mention_options());
+        let mut work = capture_dispatch(&mut slots);
+        let (lookups, mut jobs) = mpsc::channel(4);
+        slots.lookups = Some(lookups);
+        let general = Place::new(group_b(), None);
+        let b = GroupChat::of(B_ID);
+        slots.on_control(member_of(B_ID, admin(true, true), true, true));
+        let group = slots.registry.group(b).cloned().expect("a record");
+        assert!(group.ready && group.can_delete && !group.left);
+        assert_eq!(group.title.as_deref(), Some("Команда"));
+        assert!(slots.options.groups.contains(B_ID) && slots.options.groups.contains(0));
+        assert_eq!(
+            sends_into(&all_work(&mut work), general),
+            [groups::GROUP_READY_NOTICE]
+        );
+        // The same news again says nothing.
+        slots.on_control(member_of(B_ID, admin(true, true), true, true));
+        assert!(all_work(&mut work).is_empty());
+        // A stranger adds the bot elsewhere: it leaves, nothing goes there.
+        slots.on_control(member_of(C_ID, admin(true, true), true, false));
+        assert!(
+            matches!(jobs.try_recv(), Ok(LookupJob::Leave(chat)) if chat == GroupChat::of(C_ID))
+        );
+        assert!(slots.registry.group(GroupChat::of(C_ID)).is_none());
+        assert!(!slots.options.groups.contains(C_ID));
+        assert!(all_work(&mut work).is_empty());
+        // Removed: left, not usable; its record and the poll's set stay.
+        slots.on_control(member_of(B_ID, kicked(), true, false));
+        assert!(slots.registry.group(b).unwrap().left);
+        assert!(!slots.registry.usable(group_b()));
+        assert!(slots.options.groups.contains(B_ID));
+        assert!(all_work(&mut work).is_empty());
+        // Back (anyone may promote the bot in a known group): one notice.
+        slots.on_control(member_of(B_ID, admin(true, true), true, false));
+        assert!(!slots.registry.group(b).unwrap().left);
+        assert_eq!(
+            sends_into(&all_work(&mut work), general),
+            [groups::GROUP_READY_NOTICE]
+        );
+    }
+
+    /// (TASK-069) A group that is not ready is told what is missing; the
+    /// change to ready is told once; a plain group gets no record; without
+    /// the right to delete the notice says what that costs.
+    #[tokio::test]
+    async fn a_group_that_is_not_ready_is_told_what_is_missing() {
+        let dir = TempDir::new("slots-groups-missing");
+        let mut slots = stalled_slots(&dir, mention_options());
+        let mut work = capture_dispatch(&mut slots);
+        let general = Place::new(group_b(), None);
+        slots.on_control(member_of(B_ID, admin(false, true), false, true));
+        assert!(!slots.registry.group(GroupChat::of(B_ID)).unwrap().ready);
+        let told = sends_into(&all_work(&mut work), general);
+        assert_eq!(told.len(), 1);
+        assert!(told[0].contains("включите темы"), "{told:?}");
+        assert!(told[0].contains("\"Управление темами\""), "{told:?}");
+        assert!(told[0].contains("/connect@cctg_bot"), "{told:?}");
+        slots.on_control(member_of(B_ID, admin(true, true), true, true));
+        assert!(slots.registry.group(GroupChat::of(B_ID)).unwrap().ready);
+        assert_eq!(
+            sends_into(&all_work(&mut work), general),
+            [groups::GROUP_READY_NOTICE]
+        );
+        // A plain group: told, no record.
+        let mut plain = member_of(C_ID, admin(true, true), false, true);
+        if let Control::Member(update) = &mut plain {
+            update.supergroup = false;
+        }
+        slots.on_control(plain);
+        assert!(slots.registry.group(GroupChat::of(C_ID)).is_none());
+        let told = sends_into(
+            &all_work(&mut work),
+            Place::new(Chat::Group(GroupChat::of(C_ID)), None),
+        );
+        assert!(
+            told.len() == 1 && told[0].contains("супергруппой"),
+            "{told:?}"
+        );
+        // No right to delete.
+        slots.on_control(member_of(-1_004_444, admin(true, false), true, true));
+        let told = sends_into(
+            &all_work(&mut work),
+            Place::new(Chat::Group(GroupChat::of(-1_004_444)), None),
+        );
+        assert!(
+            told.len() == 1
+                && told[0].starts_with(groups::GROUP_READY_NOTICE)
+                && told[0].ends_with(groups::NO_DELETE_LINE),
+            "{told:?}"
+        );
+    }
+
+    /// (TASK-069) `/connect` asks Telegram and answers where it was
+    /// written, every time; one for another bot is ignored; without the
+    /// lookup task, or when Telegram could not say, it says so.
+    #[tokio::test]
+    async fn connect_checks_the_rights_and_answers_where_it_was_written() {
+        let dir = TempDir::new("slots-groups-connect");
+        let mut slots = stalled_slots(&dir, mention_options());
+        let mut work = capture_dispatch(&mut slots);
+        let connect = |target: Option<&str>| ConnectInput {
+            chat: GroupChat::of(B_ID),
+            supergroup: true,
+            title: Some("Команда".into()),
+            is_forum: true,
+            thread_id: Some(5),
+            target: target.map(str::to_owned),
+        };
+        let there = Place::topic(group_b(), 5);
+        slots.on_control(Control::Connect(connect(None)));
+        assert_eq!(
+            sends_into(&all_work(&mut work), there),
+            [groups::CONNECT_FAILED_NOTICE]
+        );
+        let (lookups, mut jobs) = mpsc::channel(4);
+        slots.lookups = Some(lookups);
+        slots.on_control(Control::Connect(connect(Some("Other_Bot"))));
+        assert!(jobs.try_recv().is_err());
+        assert!(all_work(&mut work).is_empty());
+        slots.on_control(Control::Connect(connect(Some("CCTG_Bot"))));
+        let Ok(LookupJob::Connect(input)) = jobs.try_recv() else {
+            panic!("no lookup");
+        };
+        slots.on_done(Done::GroupChecked(GroupAnswer::Connect {
+            input: input.clone(),
+            member: Err(ApiError::Telegram {
+                code: 500,
+                description: "Internal".into(),
+            }),
+        }));
+        assert_eq!(
+            sends_into(&all_work(&mut work), there),
+            [groups::CONNECT_FAILED_NOTICE]
+        );
+        assert!(slots.registry.group(GroupChat::of(B_ID)).is_none());
+        slots.on_done(Done::GroupChecked(GroupAnswer::Connect {
+            input: input.clone(),
+            member: Ok(admin(false, true)),
+        }));
+        let told = sends_into(&all_work(&mut work), there);
+        assert!(
+            told.len() == 1 && told[0].contains("Управление темами"),
+            "{told:?}"
+        );
+        assert!(!slots.registry.group(GroupChat::of(B_ID)).unwrap().ready);
+        for _ in 0..2 {
+            slots.on_done(Done::GroupChecked(GroupAnswer::Connect {
+                input: input.clone(),
+                member: Ok(admin(true, true)),
+            }));
+            assert_eq!(
+                sends_into(&all_work(&mut work), there),
+                [groups::GROUP_READY_NOTICE],
+                "every /connect is answered"
+            );
+        }
+        assert!(slots.options.groups.contains(B_ID));
+    }
+
+    /// Answers group lookups like Telegram: every group a forum supergroup
+    /// with the bot an administrator; counts the calls.
+    #[derive(Default)]
+    struct FakeLookup(Mutex<Vec<String>>);
+
+    impl GroupLookup for FakeLookup {
+        async fn member(&self, _: GroupChat) -> Result<ChatMember, ApiError> {
+            self.0.lock().unwrap().push("member".into());
+            Ok(admin(true, true))
+        }
+
+        async fn info(&self, _: GroupChat) -> Result<ChatInfo, ApiError> {
+            self.0.lock().unwrap().push("info".into());
+            Ok(ChatInfo {
+                kind: "supergroup".into(),
+                title: Some("Бета".into()),
+                is_forum: true,
+            })
+        }
+
+        async fn leave(&self, _: GroupChat) -> Result<(), ApiError> {
+            self.0.lock().unwrap().push("leave".into());
+            Ok(())
+        }
+    }
+
+    /// (TASK-069) At start the known groups but the default one and those
+    /// left are checked, one call at a time; a 403 or a gone chat is left,
+    /// a group without topics is not ready (told once), a failure keeps it.
+    #[tokio::test]
+    async fn known_groups_are_checked_at_start() {
+        let dir = TempDir::new("slots-groups-refresh");
+        let mut slots = stalled_slots(&dir, mention_options());
+        let mut work = capture_dispatch(&mut slots);
+        let [b, c, d, e] = [B_ID, C_ID, -1_004_444, -1_005_555].map(GroupChat::of);
+        for group in [b, c, d, e] {
+            slots.registry.join_group(group, None, true, true);
+        }
+        slots.registry.leave_group(e);
+        let lookup = Arc::new(FakeLookup::default());
+        let mut done = slots.done_rx.take().unwrap();
+        slots.look_up_groups(lookup.clone());
+        let mut checked = Vec::new();
+        for _ in 0..3 {
+            let answer = tokio::time::timeout(Duration::from_secs(5), done.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let Done::GroupChecked(GroupAnswer::Refresh {
+                chat,
+                checked: Ok(_),
+            }) = answer
+            else {
+                panic!("{answer:?}");
+            };
+            checked.push(chat);
+        }
+        assert_eq!(checked, [b, c, d], "not the default group, not a left one");
+        assert_eq!(lookup.0.lock().unwrap().len(), 6);
+        // What the answers do.
+        let refresh = |chat, checked| Done::GroupChecked(GroupAnswer::Refresh { chat, checked });
+        slots.on_done(refresh(
+            b,
+            Err(ApiError::Telegram {
+                code: 403,
+                description: "Forbidden: bot was kicked".into(),
+            }),
+        ));
+        slots.on_done(refresh(
+            d,
+            Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: chat not found".into(),
+            }),
+        ));
+        assert!(slots.registry.group(b).unwrap().left && slots.registry.group(d).unwrap().left);
+        let no_topics = ChatInfo {
+            kind: "supergroup".into(),
+            title: Some("Гамма".into()),
+            is_forum: false,
+        };
+        slots.on_done(refresh(c, Ok((no_topics, admin(true, true)))));
+        let group = slots.registry.group(c).unwrap();
+        assert!(!group.ready && group.title.as_deref() == Some("Гамма"));
+        let told = sends_into(&all_work(&mut work), Place::new(Chat::Group(c), None));
+        assert!(
+            told.len() == 1 && told[0].contains("включите темы"),
+            "{told:?}"
+        );
+        slots.on_done(refresh(
+            e,
+            Err(ApiError::Telegram {
+                code: 502,
+                description: "Bad Gateway".into(),
+            }),
+        ));
+        assert!(slots.registry.group(e).unwrap().left, "unchanged");
+        assert!(all_work(&mut work).is_empty());
+        // A leave goes through the task too.
+        slots.on_control(member_of(-1_006_666, admin(true, true), true, false));
+        let answer = tokio::time::timeout(Duration::from_secs(5), done.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            answer,
+            Done::GroupChecked(GroupAnswer::Left(Ok(())))
+        ));
+    }
+
+    /// The buttons of the markup of `op`: (text, data).
+    fn buttons_of(op: &Op) -> Vec<(String, String)> {
+        let markup = match op {
+            Op::Send { reply_markup, .. } | Op::Edit { reply_markup, .. } => reply_markup.clone(),
+            _ => None,
+        };
+        markup
+            .as_ref()
+            .and_then(|markup| markup["inline_keyboard"].as_array().cloned())
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.as_array().cloned())
+            .flatten()
+            .map(|button| {
+                (
+                    button["text"].as_str().unwrap_or_default().to_owned(),
+                    button["callback_data"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// (TASK-069) With two groups the share goes through the picker in the
+    /// private topic: the chosen group gets the view and the topic, the
+    /// other none; unshare asks twice and deletes that group's topic alone.
+    /// Only the owner's press in the private topic counts.
+    #[tokio::test]
+    async fn a_slot_is_shared_into_the_chosen_group_through_the_picker() {
+        let dir = TempDir::new("slots-groups-picker");
+        let (mut slots, mut work) = private_slot(&dir, private_only_options());
+        let b = GroupChat::of(B_ID);
+        slots
+            .registry
+            .join_group(b, Some("Бета".into()), true, true);
+        slots.registry.slots[0].views[0].status = Some(StatusMessage {
+            message_id: 5900,
+            pinned: false,
+        });
+        assert_eq!(
+            slots.share_button(SlotId(0), Instant::now()),
+            Some(ShareButton::Pick)
+        );
+        let row = slots.session_row(SlotId(0), PrivateChat::of_user(7), Instant::now());
+        assert!(row.pick && row.groups.is_empty() && row.shared == Some(false));
+        // The status button opens the picker as an answer to the owner.
+        slots.on_control(press_in(private_owner(), 700, 5900, "status:groups"));
+        let handed = all_work(&mut work);
+        assert_eq!(callback_answers(&handed), [Some(ANSWER_PICKER.to_owned())]);
+        let (job, picker) = handed
+            .iter()
+            .find(|(_, op)| op.place() == Some(private_700()) && !buttons_of(op).is_empty())
+            .expect("the picker");
+        assert!(matches!(job, Work::Answer));
+        let pick = |action: &str| format!("grp:0:{B_ID}:{action}");
+        assert_eq!(
+            buttons_of(picker),
+            [
+                ("👥 основная группа".to_owned(), "grp:0:0:s".to_owned()),
+                ("👥 Бета".to_owned(), pick("s")),
+            ]
+        );
+        // Not the owner's place: nothing.
+        slots.on_control(press_in(Chat::GROUP, 100, 6000, &pick("s")));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(status::ANSWER_OWNER_ONLY.to_owned())]
+        );
+        slots.on_control(press_in(
+            private_owner(),
+            700,
+            6000,
+            &format!("grp:0:{C_ID}:s"),
+        ));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(status::ANSWER_STALE.to_owned())]
+        );
+        // B chosen.
+        slots.on_control(press_in(private_owner(), 700, 6000, &pick("s")));
+        assert!(slots.registry.shared(SlotId(0), group_b()));
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_SHARED.to_owned())]
+        );
+        let edit = handed
+            .iter()
+            .find(|(job, _)| matches!(job, Work::Picker))
+            .map(|(_, op)| op)
+            .expect("the picker edited");
+        assert!(buttons_of(edit).contains(&("🙈 Бета".to_owned(), pick("u"))));
+        let creates: Vec<Chat> = handed
+            .iter()
+            .filter_map(|(job, _)| match job {
+                Work::Topic(TopicJob::Create { chat, .. }) => Some(*chat),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, [group_b()], "no topic in the default group");
+        let job = handed
+            .into_iter()
+            .find_map(|(job, _)| match job {
+                Work::Topic(job @ TopicJob::Create { .. }) => Some(job),
+                _ => None,
+            })
+            .unwrap();
+        slots.on_done(Done::Topic {
+            job,
+            delivery: Some(Ok(Outcome::Topic(ForumTopic {
+                message_thread_id: 200,
+                name: "t".into(),
+                icon_custom_emoji_id: None,
+            }))),
+        });
+        slots.pump();
+        let row = slots.session_row(SlotId(0), PrivateChat::of_user(7), Instant::now());
+        assert_eq!(row.groups, ["Бета"]);
+        let _ = all_work(&mut work);
+        // `/unshare` with two groups: the picker.
+        slots.on_control(owner_says(Some(700), 5002, "/unshare"));
+        let handed = all_work(&mut work);
+        assert!(
+            handed
+                .iter()
+                .any(|(_, op)| op.place() == Some(private_700()) && !buttons_of(op).is_empty()),
+            "{handed:#?}"
+        );
+        assert!(slots.registry.shared(SlotId(0), group_b()));
+        // Unshare B: twice.
+        slots.on_control(press_in(private_owner(), 700, 6000, &pick("u")));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_UNSHARE_CONFIRM.to_owned())]
+        );
+        let edit = handed
+            .iter()
+            .find(|(job, _)| matches!(job, Work::Picker))
+            .map(|(_, op)| op)
+            .unwrap();
+        assert!(buttons_of(edit).contains(&("🙈 Бета — точно?".to_owned(), pick("c"))));
+        slots.on_control(press_in(private_owner(), 700, 6000, &pick("c")));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(status::ANSWER_UNSHARED.to_owned())]
+        );
+        assert_eq!(topic_deletes(&handed), [b_200()]);
+        assert!(!slots.registry.shared(SlotId(0), group_b()));
+    }
+
+    /// (TASK-069) A group whose twins wait for Telegram (a 429 pause) holds
+    /// up no other group's: the twin budget is per chat, and the gap notice
+    /// comes when that chat caught up.
+    #[tokio::test]
+    async fn each_group_has_its_own_twin_budget() {
+        let dir = TempDir::new("slots-groups-twins");
+        let (mut slots, mut work) = shared_in_b(&dir, private_only_options());
+        let send = |place: Place| TwinCall {
+            op: message_op(place, "x".into()),
+            link: Link::None,
+            status: None,
+            turn: None,
+        };
+        slots.twin_posts.insert(Chat::GROUP, MAX_TWIN_POSTS);
+        assert!(!slots.hand_twin(0, send(group_100())));
+        assert!(slots.gaps.contains(&group_100()));
+        assert!(slots.hand_twin(0, send(b_200())));
+        assert_eq!(slots.twin_posts_in(group_b()), 1);
+        let sent = || Some(Ok(Outcome::Sent(Message::default())));
+        slots.on_twin_done(None, Some(b_200()), None, sent());
+        assert_eq!(slots.twin_posts_in(group_b()), 0);
+        assert!(sends_into(&all_work(&mut work), group_100()).is_empty());
+        slots.twin_posts.insert(Chat::GROUP, 1);
+        slots.on_twin_done(None, Some(group_100()), None, sent());
+        assert_eq!(
+            sends_into(&all_work(&mut work), group_100()),
+            [MIRROR_GAP_NOTICE]
+        );
+        assert!(slots.gaps.is_empty());
+    }
+
+    /// (TASK-069 on TASK-077) Each group topic of a slot keeps its own
+    /// messages for the next mention, its own albums and its own hint; a
+    /// mention in B takes B's history only. 📣 in the menu switches every
+    /// group topic of the slot and tells each; a new share takes the mode.
+    #[tokio::test]
+    async fn mention_mode_is_kept_per_group() {
+        let dir = TempDir::new("slots-groups-mentions");
+        let (mut slots, mut work, mut agent) = mention_slot(&dir, 64);
+        slots
+            .registry
+            .join_group(GroupChat::of(B_ID), Some("Бета".into()), true, true);
+        slots.registry.share(
+            SlotId(0),
+            group_b(),
+            crate::hub::registry::share_line(SHARER),
+        );
+        slots
+            .registry
+            .topic_created(SlotId(0), group_b(), 200, "t", None);
+        slots.registry.slots[0].views[2].pending_separator = None;
+        slots.pump();
+        let _ = all_work(&mut work);
+        let in_b = |control: Control| match control {
+            Control::Message(input) => Control::Message(Inbound {
+                chat: group_b(),
+                thread_id: Some(200),
+                ..input
+            }),
+            other => other,
+        };
+        slots.on_control(group_by(10, "в A", "Анна", None));
+        slots.on_control(in_b(group_by(11, "в B", "Иван", None)));
+        slots.pump();
+        assert!(got(&mut agent).inbounds.is_empty());
+        let handed = all_work(&mut work);
+        let hint = mention::mention_hint("cctg_bot");
+        for place in [group_100(), b_200()] {
+            assert_eq!(sends_into(&handed, place), [hint.as_str()]);
+        }
+        // Albums of the two topics do not push each other out.
+        let file = |control: Control| match control {
+            Control::Message(input) => Control::Message(Inbound {
+                text: None,
+                media: Some(crate::hub::updates::Media {
+                    file: Attachment {
+                        kind: crate::wire::FileKind::Photo,
+                        file_id: "f".into(),
+                        name: None,
+                        size: Some(1),
+                    },
+                    caption: None,
+                    album: Some("album".into()),
+                }),
+                ..input
+            }),
+            other => other,
+        };
+        slots.on_control(file(group_by(12, "", "Анна", None)));
+        slots.on_control(in_b(file(group_by(13, "", "Иван", None))));
+        assert!(slots.mention_albums.contains_key(&(SlotId(0), Chat::GROUP)));
+        assert!(slots.mention_albums.contains_key(&(SlotId(0), group_b())));
+        slots.on_control(in_b(group_by(14, "@cctg_bot что там?", "Иван", None)));
+        slots.pump();
+        let contents = mention_contents(&got(&mut agent))
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let last = contents.last().expect("the mention went");
+        assert!(last.contains("Иван: в B"), "{contents:?}");
+        assert!(!last.contains("в A"), "{contents:?}");
+        assert_eq!(backlog_of(&slots).len(), 2, "A keeps its own");
+        let _ = all_work(&mut work);
+        // 📣: both topics.
+        assert_eq!(
+            slots.set_every_message(SlotId(0), private_owner(), true),
+            menu::ANSWER_SAVED
+        );
+        let handed = all_work(&mut work);
+        assert_eq!(sends_into(&handed, group_100()), [mention::MODE_ALL_TEXT]);
+        assert_eq!(sends_into(&handed, b_200()), [mention::MODE_ALL_TEXT]);
+        let views = &slots.registry.slots[0].views;
+        assert!(views[1].every_message && views[2].every_message);
+        assert_eq!(
+            slots.set_every_message(SlotId(0), private_owner(), true),
+            menu::ANSWER_UNCHANGED
+        );
+        slots
+            .registry
+            .join_group(GroupChat::of(C_ID), None, true, true);
+        slots.registry.share(
+            SlotId(0),
+            Chat::Group(GroupChat::of(C_ID)),
+            crate::hub::registry::share_line(SHARER),
+        );
+        assert!(slots.registry.slots[0].views[3].every_message);
+    }
+
+    /// (TASK-069) The right to delete is each group's: a topic rename
+    /// notice in B, whose record has no such right, stays; in the default
+    /// group it goes.
+    #[tokio::test]
+    async fn the_right_to_delete_is_each_groups_own() {
+        let dir = TempDir::new("slots-groups-delete");
+        let (mut slots, mut work) = shared_in_b(&dir, private_only_options());
+        slots
+            .registry
+            .join_group(GroupChat::of(B_ID), None, true, false);
+        let edited = |chat: Chat, thread: i64| Control::TopicEdited {
+            chat,
+            thread_id: Some(thread),
+            message_id: 77,
+        };
+        slots.on_control(edited(group_b(), 200));
+        assert!(
+            !all_work(&mut work)
+                .iter()
+                .any(|(job, _)| matches!(job, Work::Delete))
+        );
+        slots.on_control(edited(Chat::GROUP, 100));
+        assert!(
+            all_work(&mut work)
+                .iter()
+                .any(|(job, op)| matches!(job, Work::Delete)
+                    && matches!(op, Op::Delete { chat, message_id: 77 } if *chat == Chat::GROUP))
+        );
+    }
+
+    /// (TASK-069) A group the bot left gets nothing; the picker still
+    /// offers it for the unshare, which forgets its topic without a delete.
+    #[tokio::test]
+    async fn a_left_group_gets_nothing_and_its_unshare_deletes_nothing() {
+        let dir = TempDir::new("slots-groups-left");
+        let (mut slots, mut work) = shared_in_b(&dir, private_only_options());
+        assert!(slots.registry.mirrors(SlotId(0)).contains(&b_200()));
+        slots.on_control(member_of(B_ID, kicked(), true, false));
+        assert!(!slots.registry.mirrors(SlotId(0)).contains(&b_200()));
+        assert!(slots.registry.mirrors(SlotId(0)).contains(&group_100()));
+        slots.pump();
+        let _ = all_work(&mut work);
+        assert_eq!(
+            slots.registry.share_targets(SlotId(0)),
+            [(GroupChat::UNIT, true), (GroupChat::of(B_ID), true)]
+        );
+        let pick = |action: &str| format!("grp:0:{B_ID}:{action}");
+        slots.on_control(press_in(private_owner(), 700, 6000, &pick("u")));
+        slots.on_control(press_in(private_owner(), 700, 6000, &pick("c")));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(status::ANSWER_UNSHARE_CONFIRM.to_owned()),
+                Some(status::ANSWER_UNSHARED.to_owned())
+            ]
+        );
+        assert!(topic_deletes(&handed).is_empty(), "{handed:#?}");
+        assert!(handed.iter().all(|(_, op)| op.chat() != Some(group_b())));
+        assert!(slots.registry.unshared.is_empty());
+        assert_eq!(
+            slots.registry.share_targets(SlotId(0)),
+            [(GroupChat::UNIT, true)],
+            "a left group is no target any more"
+        );
     }
 }

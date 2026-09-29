@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
+use cctg::hub::chat::GroupChat;
 use cctg::hub::config::Allowlist;
+use cctg::hub::groups::KnownGroups;
 use cctg::hub::ingress::AgentEvent;
 use cctg::hub::permissions;
 use cctg::hub::registry::RegistryStore;
@@ -20,6 +22,15 @@ use cctg::hub::updates::{Ignored, Routed, route_batch};
 use cctg::wire::{AgentMsg, Behavior, HookEvent, HookPost, HubMsg, PermissionRequest, Register};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = CHAT;
+
+/// The groups the poll lets through: the default one.
+fn known_groups() -> KnownGroups {
+    KnownGroups::of([GroupChat::of(GROUP_ID)])
+}
 
 const CHAT: i64 = -1000000000001;
 /// Distinctive enough not to appear by chance (logs run `.without_time()`).
@@ -131,7 +142,12 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
         grace: Duration::ZERO,
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -214,7 +230,7 @@ async fn permission_relay_logs_carry_no_request_and_no_user_id() {
     let (_, routed) = route_batch(
         vec![press(1, STRANGER), press(2, USER)],
         None,
-        CHAT,
+        &known_groups(),
         &allowlist,
     );
     assert_eq!(routed[0], Routed::Ignored(Ignored::NotAllowed));

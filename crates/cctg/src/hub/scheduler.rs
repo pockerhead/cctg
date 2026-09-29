@@ -1136,7 +1136,7 @@ impl Chats {
             .or_insert_with(|| {
                 (self.start)(match chat {
                     Some(Chat::Private(_)) => self.private,
-                    Some(Chat::Group) => self.group,
+                    Some(Chat::Group(_)) => self.group,
                     // Callback answers take no token of any budget.
                     None => Limits::from(BucketConfig::default()),
                 })
@@ -1147,11 +1147,11 @@ impl Chats {
 
 impl Outbox {
     /// A scheduler per chat (TASK-063), each started on the runtime the
-    /// first op for its chat is submitted on: `group` paces the group,
-    /// `private` each private chat, each with its own budgets and its own
-    /// rate after a 429 (TASK-068); callback answers go unmetered on a
-    /// scheduler of their own. A 429 pauses and slows only the chat that
-    /// got it.
+    /// first op for its chat is submitted on: `group` paces each group
+    /// (TASK-069: every group its own scheduler), `private` each private
+    /// chat, each with its own budgets and its own rate after a 429
+    /// (TASK-068); callback answers go unmetered on a scheduler of their
+    /// own. A 429 pauses and slows only the chat that got it.
     pub fn per_chat<T: Transport>(transport: Arc<T>, group: Limits, private: Limits) -> Self {
         let start: Start = Box::new(move |limits| {
             let (scheduler, outbox) = Scheduler::new(transport.clone(), limits);
@@ -2246,7 +2246,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_429_in_one_chat_holds_back_no_other_chat() {
         let private = Chat::Private(crate::hub::chat::PrivateChat::of_user(77));
-        for (flooded, other) in [(private, Chat::Group), (Chat::Group, private)] {
+        for (flooded, other) in [(private, Chat::GROUP), (Chat::GROUP, private)] {
             let fake = ChatFlood::new(flooded);
             let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
             let first = outbox.submit(send_in(flooded, "a")).await;
@@ -2282,7 +2282,7 @@ mod tests {
             let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
             let mut answers = Vec::new();
             for n in 0..12i64 {
-                for chat in [private, Chat::Group] {
+                for chat in [private, Chat::GROUP] {
                     answers.push(outbox.submit(send_in(chat, &format!("s{n}"))).await);
                     let edit = Op::Edit {
                         chat,
@@ -2300,7 +2300,7 @@ mod tests {
             fake
         };
         let calm = run(nobody).await;
-        for (flooded, other) in [(private, Chat::Group), (Chat::Group, private)] {
+        for (flooded, other) in [(private, Chat::GROUP), (Chat::GROUP, private)] {
             let fake = run(flooded).await;
             assert_eq!(
                 fake.at(Some(other)),
@@ -2369,19 +2369,80 @@ mod tests {
         let mut answers = Vec::new();
         for n in 0..10 {
             answers.push(outbox.submit(send_in(private, &format!("p{n}"))).await);
-            answers.push(outbox.submit(send_in(Chat::Group, &format!("g{n}"))).await);
+            answers.push(outbox.submit(send_in(Chat::GROUP, &format!("g{n}"))).await);
         }
         for answer in answers {
             assert!(matches!(answer.await, Ok(Ok(Outcome::Sent(_)))));
         }
-        let (private_at, group_at) = (fake.at(Some(private)), fake.at(Some(Chat::Group)));
+        let (private_at, group_at) = (fake.at(Some(private)), fake.at(Some(Chat::GROUP)));
         assert!(private_at[9] <= Duration::from_secs(4), "{private_at:?}");
         assert!(group_at[9] >= Duration::from_secs(19), "{group_at:?}");
     }
 
+    /// TASK-069: every group has its own scheduler: a 429 of group A holds
+    /// back neither group B nor a private chat.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_in_one_group_holds_back_no_other_group() {
+        use crate::hub::chat::{GroupChat, PrivateChat};
+        let (a, b) = (
+            Chat::Group(GroupChat::of(-1001)),
+            Chat::Group(GroupChat::of(-1002)),
+        );
+        let private = Chat::Private(PrivateChat::of_user(77));
+        let fake = ChatFlood::new(a);
+        let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
+        let first = outbox.submit(send_in(a, "a")).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let others = [
+            outbox.submit(send_in(b, "b")).await,
+            outbox.submit(send_in(private, "p")).await,
+        ];
+        for other in others {
+            assert!(matches!(other.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        assert!(matches!(first.await, Ok(Ok(Outcome::Sent(_)))));
+        assert!(fake.at(Some(b))[0] < Duration::from_secs(1));
+        assert!(fake.at(Some(private))[0] < Duration::from_secs(1));
+        let flooded = fake.at(Some(a));
+        assert_eq!(flooded.len(), 2, "sent again after the pause");
+        assert!(flooded[1] >= Duration::from_secs(30), "{flooded:?}");
+    }
+
+    /// TASK-069: each group has its own message budget: 25 messages into
+    /// each of two groups, at most 20 of each in the first minute, more
+    /// than 20 of both together.
+    #[tokio::test(start_paused = true)]
+    async fn each_group_has_its_own_message_budget() {
+        use crate::hub::chat::{GroupChat, PrivateChat};
+        let (a, b) = (
+            Chat::Group(GroupChat::of(-1001)),
+            Chat::Group(GroupChat::of(-1002)),
+        );
+        let fake = ChatFlood::new(Chat::Private(PrivateChat::of_user(1)));
+        let outbox = Outbox::per_chat(fake.clone(), Limits::default(), Limits::private());
+        let mut answers = Vec::new();
+        for n in 0..25 {
+            answers.push(outbox.submit(send_in(a, &format!("a{n}"))).await);
+            answers.push(outbox.submit(send_in(b, &format!("b{n}"))).await);
+        }
+        for answer in answers {
+            assert!(matches!(answer.await, Ok(Ok(Outcome::Sent(_)))));
+        }
+        let minute = Duration::from_secs(60);
+        let in_minute = |chat| {
+            fake.at(Some(chat))
+                .iter()
+                .filter(|at| **at < minute)
+                .count()
+        };
+        let (in_a, in_b) = (in_minute(a), in_minute(b));
+        assert!(in_a <= 20 && in_b <= 20, "{in_a} {in_b}");
+        assert!(in_a + in_b > 20, "{in_a} {in_b}");
+    }
+
     fn send(thread: i64, text: &str) -> Op {
         Op::Send {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: Some(thread),
             text: text.to_owned(),
             html: None,
@@ -2395,7 +2456,7 @@ mod tests {
 
     fn edit(message_id: i64, text: &str) -> Op {
         Op::Edit {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             message_id,
             text: text.to_owned(),
             reply_markup: None,
@@ -2406,7 +2467,7 @@ mod tests {
     /// A periodic status refresh.
     fn refresh(message_id: i64, text: &str) -> Op {
         Op::Edit {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             message_id,
             text: text.to_owned(),
             reply_markup: None,
@@ -2494,7 +2555,7 @@ mod tests {
         let fake = Fake::new(&[]);
         let mut ops: Vec<Op> = (0..10).map(|i| send(1, &format!("m{i}"))).collect();
         ops.push(Op::Send {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: Some(2),
             text: "permission".to_owned(),
             html: None,
@@ -2569,18 +2630,18 @@ mod tests {
         let mut ops: Vec<Op> = (0..6).map(|i| send(1, &format!("m{i}"))).collect();
         for i in 0..10 {
             ops.push(Op::CreateTopic {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 name: format!("t{i}"),
                 icon_custom_emoji_id: None,
             });
             ops.push(Op::EditTopic {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: i,
                 name: None,
                 icon_custom_emoji_id: Some("5".to_owned()),
             });
             ops.push(Op::Delete {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: i,
             });
             ops.push(edit(100 + i, "e"));
@@ -2604,7 +2665,7 @@ mod tests {
             send(1, "first"),
             send(1, "second"),
             Op::CreateTopic {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 name: "topic".to_owned(),
                 icon_custom_emoji_id: None,
             },
@@ -2649,7 +2710,7 @@ mod tests {
 
     fn permission(thread: i64, text: &str) -> Op {
         Op::Send {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: Some(thread),
             text: text.to_owned(),
             html: None,
@@ -2672,7 +2733,7 @@ mod tests {
     async fn permission_never_overtakes_its_own_topic() {
         let fake = Fake::new(&[]);
         let document = Op::SendDocument {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: Some(7),
             document: Document {
                 file_name: "doc".to_owned(),
@@ -2894,7 +2955,7 @@ mod tests {
 
     fn line(thread: i64, text: &str) -> Op {
         Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: thread,
             text: text.to_owned(),
             html: None,
@@ -3057,7 +3118,7 @@ mod tests {
 
     fn stream_op(thread: i64, text: &str, restart: bool) -> Op {
         Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: thread,
             text: text.to_owned(),
             html: None,
@@ -3161,7 +3222,7 @@ mod tests {
         let fake = Fake::new(&[]);
         let mut ops: Vec<Op> = (0..8)
             .map(|i| Op::Stream {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: 1,
                 text: format!("s{i}"),
                 html: None,
@@ -3181,7 +3242,7 @@ mod tests {
     async fn reactions_are_unmetered_and_the_newest_one_per_message_wins() {
         let fake = Fake::new(&[]);
         let react = |id: i64, emoji: &str| Op::React {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             message_id: id,
             emoji: emoji.to_owned(),
         };
@@ -3194,7 +3255,7 @@ mod tests {
             .iter()
             .filter_map(|call| match &call.op {
                 Op::React {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id,
                     emoji,
                 } => Some((*message_id, emoji.clone(), call.at)),
@@ -3239,7 +3300,7 @@ mod tests {
 
     fn formatted_send(text: &str, html: &str) -> Op {
         Op::Send {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: Some(1),
             text: text.to_owned(),
             html: Some(html.to_owned()),
@@ -3271,7 +3332,7 @@ mod tests {
         let answer = outbox.submit(formatted_send("**a**", "<b>a</b>")).await;
         let line = outbox
             .submit(Op::Stream {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: 1,
                 text: "_b_".to_owned(),
                 html: Some("<i>b</i>".to_owned()),
@@ -3326,7 +3387,7 @@ mod tests {
     async fn a_formatted_line_merged_with_plain_lines_makes_one_html_message() {
         let fake = Fake::new(&[]);
         let formatted = Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: 1,
             text: "\u{1F4AD} **x**".to_owned(),
             html: Some("\u{1F4AD} <b>x</b>".to_owned()),
@@ -3367,7 +3428,7 @@ mod tests {
         let mut receivers = Vec::new();
         for i in 0..5 {
             let op = Op::Stream {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: 1,
                 text: format!("**l{i}**"),
                 html: Some(format!("<b>l{i}</b>")),
@@ -3480,14 +3541,14 @@ mod tests {
     #[test]
     fn a_topic_delete_rides_the_topic_lane_and_takes_an_edit_token() {
         let op = Op::DeleteTopic {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: 100,
         };
         assert_eq!(op.lane(), Lane::Topic);
         assert!(op.edit_metered());
         assert!(!op.metered());
         assert_eq!(op.posts(), None);
-        assert_eq!(op.chat(), Some(Chat::Group));
+        assert_eq!(op.chat(), Some(Chat::GROUP));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3673,7 +3734,7 @@ mod tests {
             ops.push((
                 0,
                 Op::React {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id: 1000 + i,
                     emoji: "👀".to_owned(),
                 },
@@ -3681,7 +3742,7 @@ mod tests {
             ops.push((
                 0,
                 Op::EditTopic {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     thread_id: i,
                     name: None,
                     icon_custom_emoji_id: Some("5".to_owned()),
@@ -3813,28 +3874,28 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(20)).await;
         let ops = [
             Op::CreateTopic {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 name: "new session".to_owned(),
                 icon_custom_emoji_id: None,
             },
             edit(900, "✅ Разрешено"),
             Op::EditTopic {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id: 5,
                 name: None,
                 icon_custom_emoji_id: Some("5".to_owned()),
             },
             Op::React {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: 901,
                 emoji: "👀".to_owned(),
             },
             Op::Unpin {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: 902,
             },
             Op::Delete {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: 903,
             },
             edit(904, "↳ Explore: итог"),
@@ -3882,7 +3943,7 @@ mod tests {
             receivers.push(
                 outbox
                     .submit(Op::Unpin {
-                        chat: Chat::Group,
+                        chat: Chat::GROUP,
                         message_id: 900 + i,
                     })
                     .await,
@@ -3898,7 +3959,7 @@ mod tests {
             .iter()
             .filter_map(|call| match &call.op {
                 Op::Unpin {
-                    chat: Chat::Group,
+                    chat: Chat::GROUP,
                     message_id,
                 } if *message_id >= 900 => Some('T'),
                 Op::Edit {
@@ -4048,9 +4109,9 @@ mod tests {
                 edit(7, "group a"),
                 in_chat(private(), edit(7, "private")),
                 edit(7, "group b"),
-                react(Chat::Group, "👀"),
+                react(Chat::GROUP, "👀"),
                 react(private(), "👀"),
-                react(Chat::Group, "✍"),
+                react(Chat::GROUP, "✍"),
             ],
         )
         .await;
@@ -4062,7 +4123,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(edits, [(Chat::Group, "group b"), (private(), "private")]);
+        assert_eq!(edits, [(Chat::GROUP, "group b"), (private(), "private")]);
         let reactions: Vec<(Chat, &str)> = calls
             .iter()
             .filter_map(|call| match &call.op {
@@ -4070,7 +4131,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(reactions, [(Chat::Group, "✍"), (private(), "👀")]);
+        assert_eq!(reactions, [(Chat::GROUP, "✍"), (private(), "👀")]);
         assert!(matches!(results[0], Ok(Outcome::Superseded)));
         assert!(matches!(results[1], Ok(Outcome::Done)));
         assert!(matches!(results[4], Ok(Outcome::Done)));
@@ -4151,8 +4212,8 @@ mod tests {
         let op = into(7, "a");
         assert_eq!(op.posts(), None);
         assert!(!op.metered() && op.edit_metered());
-        assert_eq!(line(1, "a").posts(), Some(Place::topic(Chat::Group, 1)));
-        assert_eq!(send(2, "x").posts(), Some(Place::topic(Chat::Group, 2)));
+        assert_eq!(line(1, "a").posts(), Some(Place::topic(Chat::GROUP, 1)));
+        assert_eq!(send(2, "x").posts(), Some(Place::topic(Chat::GROUP, 2)));
         assert_eq!(edit(7, "x").posts(), None);
     }
 
@@ -4355,7 +4416,7 @@ mod tests {
                 for i in 0u64.. {
                     let answer = outbox
                         .submit(Op::EditTopic {
-                            chat: Chat::Group,
+                            chat: Chat::GROUP,
                             thread_id: 10 + slot,
                             name: None,
                             icon_custom_emoji_id: Some(format!("{i}")),
@@ -4371,7 +4432,7 @@ mod tests {
         let delete = waited(
             &outbox,
             Op::Delete {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 message_id: 77,
             },
         )
@@ -4382,7 +4443,7 @@ mod tests {
         let create = waited(
             &outbox,
             Op::CreateTopic {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 name: "new".to_owned(),
                 icon_custom_emoji_id: None,
             },
@@ -4472,7 +4533,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_mirror_turn_message_not_merge_is_never_joined() {
         let mirror = |text: &str, merge: bool| Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: 1,
             text: text.to_owned(),
             html: None,
@@ -4631,7 +4692,7 @@ mod tests {
 
     fn rich_send(markdown: Option<&str>, before: &[&str], text: &str) -> Op {
         Op::Send {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: Some(1),
             text: text.to_owned(),
             html: Some(format!("<b>{text}</b>")),
@@ -4645,7 +4706,7 @@ mod tests {
 
     fn rich_stream(into: Option<i64>, markdown: Option<&str>, text: &str, merge: bool) -> Op {
         Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: 1,
             text: text.to_owned(),
             html: Some(format!("<b>{text}</b>")),
@@ -4915,7 +4976,7 @@ mod tests {
         });
         let (scheduler, outbox) = Scheduler::new(fake.clone(), BucketConfig::default());
         let answer = Op::Stream {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             thread_id: 1,
             text: "c".to_owned(),
             html: Some("<b>c</b>".to_owned()),

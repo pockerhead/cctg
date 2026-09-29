@@ -8,6 +8,7 @@ pub mod config;
 pub mod console;
 pub mod devices;
 pub mod fetch;
+pub mod groups;
 pub mod ingress;
 pub mod mention;
 pub mod menu;
@@ -36,7 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use api::{ApiError, BotApi, ChatMember, Sticker};
-use chat::{Chat, PrivateChat};
+use chat::{Chat, GroupChat, PrivateChat};
 use config::{
     AGENT_LISTEN_VAR, API_URL_VAR, Config, HOOK_LISTEN_VAR, SECRET_VAR, SHARED_VAR, STATE_VAR,
 };
@@ -44,7 +45,7 @@ use devices::Devices;
 use ingress::Listener;
 use offset::OffsetStore;
 use registry::{Icons, RegistryStore};
-use scheduler::{Limits, Outbox, Scheduler};
+use scheduler::{Limits, Outbox};
 use slots::{Control, Slots};
 use updates::{Inbound, Routed, ServiceKind};
 
@@ -77,20 +78,26 @@ pub fn check_topic_rights(member: &ChatMember) -> Result<(), RightsError> {
 /// presses and topic edit notices go to the slot actor. Nothing here waits,
 /// so a slow command or a slow Telegram never holds up polling. A pin notice
 /// goes to the slot actor only when this bot (`bot_id`) pinned: a person's
-/// pin, even of a status message, is theirs to keep.
+/// pin, even of a status message, is theirs to keep. `/join` and `/devices`
+/// are the device list's only in a private chat and in the default group
+/// (TASK-069: in another group a join code would be read by people outside
+/// the allowlist); group membership changes and `/connect` go to the slot
+/// actor.
 fn route_inbound<'a>(
     commands: &'a mpsc::UnboundedSender<Inbound>,
     roster: &'a mpsc::UnboundedSender<roster::Input>,
     control: &'a mpsc::UnboundedSender<Control>,
     bot_id: i64,
+    default_group: GroupChat,
 ) -> impl FnMut(Routed) + 'a {
+    let roster_chat = move |chat: Chat| chat.is_private() || chat == Chat::Group(default_group);
     move |routed| match routed {
         Routed::Input(input) if commands::is_command(&input) => {
             if commands.send(input).is_err() {
                 warn!("command worker stopped; command dropped");
             }
         }
-        Routed::Input(input) if roster::is_command(&input) => {
+        Routed::Input(input) if roster_chat(input.chat) && roster::is_command(&input) => {
             if roster.send(roster::Input::Command(input)).is_err() {
                 warn!("device list worker stopped; command dropped");
             }
@@ -136,6 +143,16 @@ fn route_inbound<'a>(
                 .is_err()
             {
                 warn!("slot actor stopped; service message kept");
+            }
+        }
+        Routed::Member(update) => {
+            if control.send(Control::Member(update)).is_err() {
+                warn!("slot actor stopped; group membership change dropped");
+            }
+        }
+        Routed::Connect(input) => {
+            if control.send(Control::Connect(input)).is_err() {
+                warn!("slot actor stopped; /connect dropped");
             }
         }
         Routed::Service(_) | Routed::Ignored(_) => {}
@@ -258,8 +275,10 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
     let registry_store = RegistryStore::open(&config.state_dir)
         .with_context(|| format!("cannot create the hub state directory; check {STATE_VAR}"))?;
-    let registry = registry_store
-        .load()
+    // The group of CCTG_CHAT_ID is the default one (TASK-069).
+    let default_group = GroupChat::of(config.chat_id);
+    let mut registry = registry_store
+        .load(default_group)
         .with_context(|| format!("cannot load the slot registry from {STATE_VAR}"))?;
     let shared = if config.shared_secret {
         Some(config.hub_secret.clone().with_context(|| {
@@ -313,7 +332,6 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     let api = Arc::new(BotApi::with_api_url(
         &config.api_url,
         &config.token,
-        config.chat_id,
         config.proxy.as_ref(),
     )?);
 
@@ -330,14 +348,26 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
             answer => break answer.context("getMe failed; check CCTG_BOT_TOKEN")?,
         }
     };
-    let member = api.get_chat_member(Chat::Group, me.id).await.context(
-        "getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group",
-    )?;
+    let member = api
+        .get_chat_member(Chat::Group(default_group), me.id)
+        .await
+        .context(
+            "getChatMember for the bot failed; check CCTG_CHAT_ID and that the bot is in the group",
+        )?;
     check_topic_rights(&member)?;
     let can_delete = member.status == "creator" || member.can_delete_messages;
     if !can_delete {
         warn!("the bot lacks can_delete_messages; forum service messages will stay visible");
     }
+    // Its name for the group picker (TASK-069); not needed to start.
+    let title = match api.get_chat(Chat::Group(default_group)).await {
+        Ok(info) => info.title.as_deref().and_then(updates::group_title),
+        Err(_) => {
+            warn!("getChat of the CCTG_CHAT_ID group failed; it goes by a fixed name");
+            None
+        }
+    };
+    registry.join_group(default_group, title, true, can_delete);
     let can_pin = member.status == "creator" || member.can_pin_messages;
     if !can_pin {
         warn!(
@@ -364,9 +394,9 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     );
 
     // Topics in private chats (TASK-063): Threaded Mode of the bot in
-    // @BotFather. Each chat is paced on its own then.
+    // @BotFather. Each chat is paced on its own, each group too (TASK-069).
     let private = me.has_topics_enabled;
-    let outbox = if private {
+    if private {
         info!(
             "the bot has topics in private chats: sessions show in their owner's private chat too"
         );
@@ -380,15 +410,12 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
                 "several allowed users: a device shows in the private chat of who ran its /join, else of the first allowed user"
             );
         }
-        Outbox::per_chat(api.clone(), Limits::default(), Limits::private())
     } else {
         warn!(
             "the bot has no topics in private chats (Threaded Mode in @BotFather); sessions show in the group only"
         );
-        let (scheduler, outbox) = Scheduler::new(api.clone(), Limits::default());
-        tokio::spawn(scheduler.run());
-        outbox
-    };
+    }
+    let outbox = Outbox::per_chat(api.clone(), Limits::default(), Limits::private());
     let owners = config
         .allowlist
         .first()
@@ -409,6 +436,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
             None
         }
     };
+    let groups = groups::KnownGroups::default();
     let options = slots::Options {
         icons,
         can_delete,
@@ -423,6 +451,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         owners,
         menu: true,
         mentions,
+        groups: groups.clone(),
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
@@ -430,6 +459,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     let question_asks = slots.question_asks();
     let transcript_asks = slots.transcript_asks();
     slots.fetch_files(api.clone());
+    slots.look_up_groups(Arc::new(groups::BotLookup::new(api.clone(), me.id)));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     tokio::spawn(commands::serve(
@@ -464,10 +494,11 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
 
     updates::poll_until(
         api.as_ref(),
+        &groups,
         &config.allowlist,
         private,
         &offsets,
-        route_inbound(&commands_tx, &roster_tx, &control_tx, me.id),
+        route_inbound(&commands_tx, &roster_tx, &control_tx, me.id, default_group),
         stop_requested(stop_on_stdin),
     )
     .await;
@@ -493,11 +524,12 @@ mod tests {
     use super::*;
     use api::Message;
     use commands::{Prepared, TranscriptCommand, TranscriptSource};
-    use scheduler::{BucketConfig, Delivery, Op, Outcome, Transport};
+    use scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
     use testdir::TempDir;
     use updates::UpdateSource;
 
     const CHAT: i64 = -1000000000001;
+    const GROUP: Chat = Chat::Group(GroupChat::of(CHAT));
     const ALLOWED: i64 = 1001;
     /// The bot's own user id (`getMe`).
     const BOT: i64 = 4242;
@@ -510,10 +542,6 @@ mod tests {
     }
 
     impl UpdateSource for Batches {
-        fn chat_id(&self) -> i64 {
-            CHAT
-        }
-
         async fn get_updates(&self, _: Option<i64>, _: Duration) -> Result<Vec<Value>, ApiError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let text = match call {
@@ -587,13 +615,21 @@ mod tests {
             let (source, store) = (source.clone(), store.clone());
             tokio::spawn(async move {
                 let allowlist: config::Allowlist = [ALLOWED].into_iter().collect();
+                let groups = groups::KnownGroups::of([GroupChat::of(CHAT)]);
                 let (control_tx, _control_rx) = mpsc::unbounded_channel();
                 let (roster_tx, _roster_rx) = mpsc::unbounded_channel();
                 updates::poll(
                     source.as_ref(),
+                    &groups,
                     &allowlist,
                     &store,
-                    route_inbound(&commands_tx, &roster_tx, &control_tx, BOT),
+                    route_inbound(
+                        &commands_tx,
+                        &roster_tx,
+                        &control_tx,
+                        BOT,
+                        GroupChat::of(CHAT),
+                    ),
                 )
                 .await;
             })
@@ -633,7 +669,7 @@ mod tests {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let input = |text: &str| Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 5,
             thread_id: Some(100),
@@ -646,7 +682,13 @@ mod tests {
             author: None,
             reply_from: None,
         };
-        let mut route = route_inbound(&commands_tx, &roster_tx, &control_tx, BOT);
+        let mut route = route_inbound(
+            &commands_tx,
+            &roster_tx,
+            &control_tx,
+            BOT,
+            GroupChat::of(CHAT),
+        );
         route(Routed::Input(input("hello")));
         route(Routed::Input(input("/brief 2")));
         // `/devices` is the device list's in General, the session's in a
@@ -661,7 +703,7 @@ mod tests {
             ..input("/join")
         }));
         route(Routed::Callback(updates::CallbackInput {
-            chat: Some(Chat::Group),
+            chat: Some(GROUP),
             query_id: "d".to_owned(),
             data: Some("dev:n".to_owned()),
             message_id: Some(8),
@@ -674,7 +716,7 @@ mod tests {
             ..input("")
         }));
         let press = updates::CallbackInput {
-            chat: Some(Chat::Group),
+            chat: Some(GROUP),
             query_id: "q".to_owned(),
             data: Some("allow:abcde".to_owned()),
             message_id: Some(9),
@@ -685,7 +727,7 @@ mod tests {
         route(Routed::Callback(press.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {
             route(Routed::Service(updates::ServiceMessage {
-                chat: Chat::Group,
+                chat: GROUP,
                 kind,
                 message_id: 9,
                 thread_id: Some(100),
@@ -696,7 +738,7 @@ mod tests {
         // by nobody known stay; only the bot's own pin notice goes on.
         for from in [Some(ALLOWED), Some(BOT + 1), None, Some(BOT)] {
             route(Routed::Service(updates::ServiceMessage {
-                chat: Chat::Group,
+                chat: GROUP,
                 kind: ServiceKind::Pinned(1000),
                 message_id: 11,
                 thread_id: Some(100),
@@ -744,7 +786,7 @@ mod tests {
         assert_eq!(
             control_rx.try_recv().unwrap(),
             Control::Pinned {
-                chat: Chat::Group,
+                chat: GROUP,
                 message_id: 11,
                 pinned: 1000
             }
@@ -755,12 +797,84 @@ mod tests {
         );
     }
 
+    /// TASK-069: `/join` and `/devices` in General are the device list's
+    /// only in a private chat and the default group; in another group they
+    /// go to the slot actor (which answers nothing in General). Membership
+    /// changes and `/connect` go to the slot actor.
+    #[test]
+    fn the_device_list_answers_only_in_private_chats_and_the_default_group() {
+        let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+        let (roster_tx, mut roster_rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let other = Chat::Group(GroupChat::of(CHAT - 1));
+        let private = Chat::Private(PrivateChat::of_user(ALLOWED));
+        let join = |chat: Chat| Inbound {
+            display_name: None,
+            chat,
+            sender: PrivateChat::of_user(ALLOWED),
+            message_id: 5,
+            thread_id: None,
+            text: Some("/join".to_owned()),
+            reply_to: None,
+            quote: None,
+            forwarded: false,
+            media: None,
+            from_name: None,
+            author: None,
+            reply_from: None,
+        };
+        let member = updates::MemberUpdate {
+            chat: GroupChat::of(CHAT - 1),
+            supergroup: true,
+            title: None,
+            is_forum: true,
+            member: ChatMember::default(),
+            by_allowed: true,
+        };
+        let connect = updates::ConnectInput {
+            chat: GroupChat::of(CHAT - 1),
+            supergroup: true,
+            title: None,
+            is_forum: true,
+            thread_id: None,
+            target: None,
+        };
+        let mut route = route_inbound(
+            &commands_tx,
+            &roster_tx,
+            &control_tx,
+            BOT,
+            GroupChat::of(CHAT),
+        );
+        route(Routed::Input(join(other)));
+        route(Routed::Input(join(GROUP)));
+        route(Routed::Input(join(private)));
+        route(Routed::Member(member.clone()));
+        route(Routed::Connect(connect.clone()));
+        drop(route);
+        for chat in [GROUP, private] {
+            assert!(matches!(
+                roster_rx.try_recv().unwrap(),
+                roster::Input::Command(Inbound { chat: to, .. }) if to == chat
+            ));
+        }
+        assert!(roster_rx.try_recv().is_err());
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            Control::Message(join(other))
+        );
+        assert_eq!(control_rx.try_recv().unwrap(), Control::Member(member));
+        assert_eq!(control_rx.try_recv().unwrap(), Control::Connect(connect));
+        assert!(control_rx.try_recv().is_err());
+    }
+
     fn member(status: &str, topics: bool) -> ChatMember {
         ChatMember {
             status: status.to_owned(),
             can_manage_topics: topics,
             can_delete_messages: true,
             can_pin_messages: true,
+            is_member: false,
         }
     }
 

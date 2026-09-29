@@ -342,7 +342,7 @@ mod tests {
 
     fn parked(message_id: i64) -> Parked {
         Parked {
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             message_id,
             thread_id: 100,
             text: format!("m{message_id}"),
@@ -536,7 +536,7 @@ mod tests {
         let plain = serde_json::to_string(&parked(1)).unwrap();
         assert_eq!(
             plain,
-            r#"{"chat":"group","message_id":1,"thread_id":100,"text":"m1"}"#
+            r#"{"chat":{"group":0},"message_id":1,"thread_id":100,"text":"m1"}"#
         );
         let with = Parked {
             history: Some(history(HistoryState::Pending, 3)),
@@ -565,7 +565,7 @@ mod tests {
             resume: Some(ResumeNote {
                 session: A.into(),
                 number: 1,
-                message: Some(MessageKey::new(Chat::Group, 7)),
+                message: Some(MessageKey::new(Chat::GROUP, 7)),
             }),
             ..Buffer::default()
         };
@@ -573,7 +573,7 @@ mod tests {
         let note = buffer.close();
         assert_eq!(
             note.and_then(|note| note.message),
-            Some(MessageKey::new(Chat::Group, 7))
+            Some(MessageKey::new(Chat::GROUP, 7))
         );
         assert!(buffer.is_idle());
     }
@@ -622,9 +622,10 @@ mod tests {
         assert!(old.is_idle());
         // A message kept before quotes and forwards were read (its chat
         // comes from the version 1 migration, TASK-061).
-        let old: Parked =
-            serde_json::from_str(r#"{"chat":"group","message_id":1,"thread_id":100,"text":"m1"}"#)
-                .unwrap();
+        let old: Parked = serde_json::from_str(
+            r#"{"chat":{"group":0},"message_id":1,"thread_id":100,"text":"m1"}"#,
+        )
+        .unwrap();
         assert_eq!(old, parked(1));
         let plain = serde_json::to_string(&parked(1)).unwrap();
         assert!(

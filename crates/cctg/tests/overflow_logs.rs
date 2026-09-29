@@ -10,13 +10,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cctg::hub::api::{ForumTopic, Message};
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::registry::RegistryStore;
 use cctg::hub::scheduler::{BucketConfig, Delivery, Op, Outcome, Scheduler, Transport};
 use cctg::hub::slots::{Control, MAX_QUEUED_MESSAGES, Options, Slots};
 use cctg::hub::updates::Inbound;
 use cctg::wire::{HookEvent, HookPost};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = -1001;
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 const OVERFLOW: &str = "too many messages wait for Telegram";
 
@@ -116,7 +121,12 @@ async fn one_overflow_warning_per_episode() {
         notice_every: Duration::ZERO,
         ..Options::default()
     };
-    let slots = Slots::new(store.load().expect("load"), store, outbox, options);
+    let slots = Slots::new(
+        store.load(GroupChat::of(GROUP_ID)).expect("load"),
+        store,
+        outbox,
+        options,
+    );
     let (_agents, agents_rx) = mpsc::channel(16);
     let (hooks, hooks_rx) = mpsc::channel(16);
     let (control, control_rx) = mpsc::unbounded_channel();
@@ -140,7 +150,7 @@ async fn one_overflow_warning_per_episode() {
         control
             .send(Control::Message(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: GROUP,
                 sender: cctg::hub::chat::PrivateChat::of_user(1001),
                 message_id,
                 thread_id: Some(100),

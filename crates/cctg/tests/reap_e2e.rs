@@ -12,11 +12,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use cctg::hub::chat::Chat;
+use cctg::hub::chat::{Chat, GroupChat};
 use cctg::hub::ingress;
 use cctg::hub::registry::{Registry, RegistryStore, SlotId};
 use cctg::wire::{HookEvent, HookPost, Secret};
 use tokio::sync::mpsc;
+
+/// The default group of this test (TASK-069): the chat its Bot API fake
+/// and its registry name.
+const GROUP_ID: i64 = 0; // the default group of `Registry::default()`
+const GROUP: Chat = Chat::Group(GroupChat::of(GROUP_ID));
 
 mod common;
 
@@ -107,11 +112,11 @@ async fn a_start_after_a_killed_session_takes_its_topic() {
     registry.apply_hook(&post("box", LIVE, "/work/other", Some(live_pid)));
     registry.apply_hook(&post("far", FAR, &folder, Some(dead_pid)));
     registry.apply_hook(&post("box", NO_PID, "/work/third", None));
-    registry.topic_created(SlotId(0), Chat::Group, 100, "project", None);
+    registry.topic_created(SlotId(0), GROUP, 100, "project", None);
     // Saved and loaded: the starts are older than any grace.
     let store = RegistryStore::open(&root).unwrap();
     store.save(&RegistryStore::encode(&registry)).unwrap();
-    let mut registry = store.load().unwrap();
+    let mut registry = store.load(GroupChat::of(GROUP_ID)).unwrap();
 
     // The next session in the folder, through the real hook.
     let listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))

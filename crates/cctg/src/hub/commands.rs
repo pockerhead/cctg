@@ -539,7 +539,7 @@ mod tests {
     use crate::hub::chat::{Chat, Place};
 
     const GENERAL: Place = Place {
-        chat: Chat::Group,
+        chat: Chat::GROUP,
         thread: None,
     };
 
@@ -547,7 +547,7 @@ mod tests {
     fn only_our_commands_are_commands() {
         let input = |text: &str| crate::hub::updates::Inbound {
             display_name: None,
-            chat: Chat::Group,
+            chat: Chat::GROUP,
             sender: crate::hub::chat::PrivateChat::of_user(1001),
             message_id: 1,
             thread_id: Some(2),
@@ -681,7 +681,7 @@ mod tests {
         for text in texts {
             tx.send(Inbound {
                 display_name: None,
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 sender: crate::hub::chat::PrivateChat::of_user(1001),
                 message_id: 1,
                 thread_id: THREAD,
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             Op::SendDocument {
-                chat: Chat::Group,
+                chat: Chat::GROUP,
                 thread_id,
                 document,
                 notify: false,
@@ -883,17 +883,17 @@ mod tests {
         // A slot topic: its current session; General: the newest running
         // top-level one (the nested run is newer but not top-level).
         assert_eq!(
-            resolve(&registry, Place::topic(Chat::Group, 100), None),
+            resolve(&registry, Place::topic(Chat::GROUP, 100), None),
             Ok(A.to_owned())
         );
         assert_eq!(resolve(&registry, GENERAL, None), Ok(B.to_owned()));
         assert_eq!(
-            resolve(&registry, Place::topic(Chat::Group, 555), None),
+            resolve(&registry, Place::topic(Chat::GROUP, 555), None),
             Ok(B.to_owned())
         );
         // A prefix, anywhere, among every known session.
         assert_eq!(
-            resolve(&registry, Place::topic(Chat::Group, 100), Some("aaaab")),
+            resolve(&registry, Place::topic(Chat::GROUP, 100), Some("aaaab")),
             Ok(B.to_owned())
         );
         assert_eq!(resolve(&registry, GENERAL, Some("cc")), Ok(N.to_owned()));

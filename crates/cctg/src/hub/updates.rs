@@ -1,7 +1,11 @@
 //! Inbound side: long polling, allowlist gate, service-message classification.
 //!
 //! `Routed` values carry no Telegram user id, so nothing downstream can log one.
-//! A private chat is a [`Chat::Private`], whose id never prints.
+//! A private chat is a [`Chat::Private`], whose id never prints; so is a
+//! group's ([`GroupChat`]). Messages and presses come only from the groups
+//! the hub knows ([`KnownGroups`], TASK-069); from another group only the
+//! bot's own membership changes (`my_chat_member`) and `/connect` of an
+//! allowlisted user get through.
 
 use std::future::Future;
 use std::io;
@@ -11,10 +15,11 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::api::{ApiError, BotApi, FileInfo, Message, MessageChat, Update, User};
+use super::api::{ApiError, BotApi, ChatMember, FileInfo, Message, MessageChat, Update, User};
 use super::buffer::Attachment;
-use super::chat::{Chat, MessageKey, Place, PrivateChat};
+use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::config::Allowlist;
+use super::groups::KnownGroups;
 use super::offset::OffsetStore;
 use super::registry::cut;
 use crate::wire::FileKind;
@@ -39,7 +44,41 @@ pub enum Routed {
     Callback(CallbackInput),
     /// A forum service message. Never user input; the hub may delete it.
     Service(ServiceMessage),
+    /// The bot's membership in a group changed (`my_chat_member`,
+    /// TASK-069), known group or not.
+    Member(MemberUpdate),
+    /// `/connect` from an allowlisted user in a group, known or not
+    /// (TASK-069).
+    Connect(ConnectInput),
     Ignored(Ignored),
+}
+
+/// The bot's new membership in a group (TASK-069). Who changed it is only
+/// `by_allowed`; the id never leaves here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberUpdate {
+    pub chat: GroupChat,
+    /// A supergroup, not a plain group.
+    pub supergroup: bool,
+    /// Its title ([`group_title`]); never logged.
+    pub title: Option<String>,
+    pub is_forum: bool,
+    pub member: ChatMember,
+    /// An allowlisted user made the change.
+    pub by_allowed: bool,
+}
+
+/// `/connect` in a group (TASK-069).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectInput {
+    pub chat: GroupChat,
+    pub supergroup: bool,
+    pub title: Option<String>,
+    pub is_forum: bool,
+    /// Its topic, as [`Inbound::thread_id`].
+    pub thread_id: Option<i64>,
+    /// The bot `/connect@<name>` names; `None` for a bare `/connect`.
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +209,8 @@ pub struct CallbackInput {
 
 /// UTF-16 units kept of an author's name.
 pub const NAME_LIMIT: usize = 32;
+/// UTF-16 units kept of a group's title (TASK-069).
+pub const GROUP_TITLE_LIMIT: usize = 64;
 
 /// How a team member is shown to the session and in signed answers: the
 /// username, else the first name. Line breaks and other whitespace become
@@ -179,8 +220,12 @@ pub const NAME_LIMIT: usize = 32;
 pub fn author_name(from: &User) -> Option<String> {
     from.username
         .as_deref()
-        .and_then(clean_name)
-        .or_else(|| from.first_name.as_deref().and_then(clean_name))
+        .and_then(|name| clean_name(name, NAME_LIMIT))
+        .or_else(|| {
+            from.first_name
+                .as_deref()
+                .and_then(|name| clean_name(name, NAME_LIMIT))
+        })
 }
 
 /// How a person is named in a share line (TASK-064): the first and last
@@ -190,11 +235,21 @@ pub fn display_name(from: &User) -> Option<String> {
         .into_iter()
         .flatten()
         .collect();
-    clean_name(&name.join(" ")).or_else(|| from.username.as_deref().and_then(clean_name))
+    clean_name(&name.join(" "), NAME_LIMIT).or_else(|| {
+        from.username
+            .as_deref()
+            .and_then(|name| clean_name(name, NAME_LIMIT))
+    })
 }
 
-/// [`author_name`]'s cleaning of one name.
-fn clean_name(raw: &str) -> Option<String> {
+/// A group's title as the hub shows it (TASK-069): cleaned like
+/// [`author_name`], at most [`GROUP_TITLE_LIMIT`].
+pub fn group_title(raw: &str) -> Option<String> {
+    clean_name(raw, GROUP_TITLE_LIMIT)
+}
+
+/// [`author_name`]'s cleaning of one name, at most `limit` UTF-16 units.
+fn clean_name(raw: &str, limit: usize) -> Option<String> {
     let invisible = |c: char| {
         matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}'
             | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}')
@@ -205,7 +260,7 @@ fn clean_name(raw: &str) -> Option<String> {
         .filter(|&c| !c.is_control() && !invisible(c) && !matches!(c, '<' | '>' | '"'))
         .collect();
     let name = kept.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!name.is_empty()).then(|| cut(&name, NAME_LIMIT))
+    (!name.is_empty()).then(|| cut(&name, limit))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +289,7 @@ pub enum Ignored {
     NotAllowed,
     /// No `from` (channel posts and similar).
     NoSender,
-    /// Another chat than the configured supergroup or an allowlisted user's
+    /// A chat the hub does not know: no known group, no allowlisted user's
     /// private chat.
     OtherChat,
     /// An allowlisted user's private chat while the hub serves none (the
@@ -263,22 +318,66 @@ fn service_kind(message: &Message) -> Option<ServiceKind> {
     }
 }
 
-/// The chat of a message: the group `chat_id`, or the private chat of an
+/// The chat of a message: a known group, or the private chat of an
 /// allowlisted user (a private chat's id is its user's id). Anything else is
 /// no chat of the hub.
-fn chat_of(chat: &MessageChat, chat_id: i64, allowlist: &Allowlist) -> Option<Chat> {
-    if chat.id == chat_id {
-        return Some(Chat::Group);
+fn chat_of(chat: &MessageChat, groups: &KnownGroups, allowlist: &Allowlist) -> Option<Chat> {
+    if chat.kind != "private" && groups.contains(chat.id) {
+        return Some(Chat::Group(GroupChat::of(chat.id)));
     }
     (chat.kind == "private" && allowlist.contains(chat.id))
         .then(|| Chat::Private(PrivateChat::of_user(chat.id)))
 }
 
+/// A group or supergroup chat (TASK-069).
+fn is_group(chat: &MessageChat) -> bool {
+    matches!(chat.kind.as_str(), "group" | "supergroup")
+}
+
+/// The bot a `/connect` text names: `Some(None)` for a bare `/connect`,
+/// `Some(Some(name))` for `/connect@name`; `None` for any other text.
+fn connect_target(text: &str) -> Option<Option<String>> {
+    let word = text.split_whitespace().next()?;
+    let (command, target) = match word.split_once('@') {
+        Some((command, target)) => (command, Some(target.to_owned())),
+        None => (word, None),
+    };
+    command.eq_ignore_ascii_case("/connect").then_some(target)
+}
+
+/// `/connect` of an allowlisted user in a group, known or not (TASK-069).
+fn connect_of(message: &Message, allowlist: &Allowlist) -> Option<ConnectInput> {
+    if !is_group(&message.chat) || message.forward_origin.is_some() {
+        return None;
+    }
+    let target = connect_target(message.text.as_deref()?)?;
+    if !message
+        .from
+        .as_ref()
+        .is_some_and(|from| allowlist.contains(from.id))
+    {
+        return None;
+    }
+    Some(ConnectInput {
+        chat: GroupChat::of(message.chat.id),
+        supergroup: message.chat.kind == "supergroup",
+        title: message.chat.title.as_deref().and_then(group_title),
+        is_forum: message.chat.is_forum,
+        thread_id: message
+            .message_thread_id
+            .filter(|_| message.is_topic_message),
+        target,
+    })
+}
+
 /// Classifies one parsed update. Service messages are recognised before the
 /// allowlist check because the bot itself is their sender.
-pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
+pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> Routed {
     if let Some(mut message) = update.message {
-        let Some(chat) = chat_of(&message.chat, chat_id, allowlist) else {
+        if let Some(connect) = connect_of(&message, allowlist) {
+            return Routed::Connect(connect);
+        }
+        let Some(chat) = chat_of(&message.chat, groups, allowlist) else {
             return Routed::Ignored(Ignored::OtherChat);
         };
         if let Some(kind) = service_kind(&message) {
@@ -340,7 +439,7 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
 
     if let Some(query) = update.callback_query {
         let chat = match &query.message {
-            Some(message) => match chat_of(&message.chat, chat_id, allowlist) {
+            Some(message) => match chat_of(&message.chat, groups, allowlist) {
                 Some(chat) => Some(chat),
                 None => return Routed::Ignored(Ignored::OtherChat),
             },
@@ -368,6 +467,27 @@ pub fn classify(update: Update, chat_id: i64, allowlist: &Allowlist) -> Routed {
         });
     }
 
+    if let Some(changed) = update.my_chat_member {
+        let chat = &changed.chat;
+        if chat.kind == "private" {
+            return Routed::Ignored(Ignored::Unsupported);
+        }
+        if !is_group(chat) {
+            return Routed::Ignored(Ignored::OtherChat);
+        }
+        return Routed::Member(MemberUpdate {
+            chat: GroupChat::of(chat.id),
+            supergroup: chat.kind == "supergroup",
+            title: chat.title.as_deref().and_then(group_title),
+            is_forum: chat.is_forum,
+            member: changed.new_chat_member,
+            by_allowed: changed
+                .from
+                .as_ref()
+                .is_some_and(|from| allowlist.contains(from.id)),
+        });
+    }
+
     Routed::Ignored(Ignored::Unsupported)
 }
 
@@ -378,7 +498,7 @@ fn group_only(routed: Routed) -> Routed {
         Routed::Input(input) => input.chat.is_private(),
         Routed::Callback(input) => input.chat.is_some_and(Chat::is_private),
         Routed::Service(service) => service.chat.is_private(),
-        Routed::Ignored(_) => false,
+        Routed::Member(_) | Routed::Connect(_) | Routed::Ignored(_) => false,
     };
     if private {
         Routed::Ignored(Ignored::PrivateChat)
@@ -421,10 +541,10 @@ impl CallbackInput {
 pub fn route_batch(
     raw: Vec<Value>,
     offset: Option<i64>,
-    chat_id: i64,
+    groups: &KnownGroups,
     allowlist: &Allowlist,
 ) -> (Option<i64>, Vec<Routed>) {
-    route_batch_with(raw, offset, chat_id, allowlist, false)
+    route_batch_with(raw, offset, groups, allowlist, false)
 }
 
 /// [`route_batch`]; `private`: the private chats of allowlisted users are
@@ -432,7 +552,7 @@ pub fn route_batch(
 pub fn route_batch_with(
     raw: Vec<Value>,
     offset: Option<i64>,
-    chat_id: i64,
+    groups: &KnownGroups,
     allowlist: &Allowlist,
     private: bool,
 ) -> (Option<i64>, Vec<Routed>) {
@@ -443,14 +563,14 @@ pub fn route_batch_with(
             highest = Some(highest.map_or(id, |current| current.max(id)));
         }
         let item = match serde_json::from_value::<Update>(value) {
-            Ok(update) if private => classify(update, chat_id, allowlist),
-            Ok(update) => group_only(classify(update, chat_id, allowlist)),
+            Ok(update) if private => classify(update, groups, allowlist),
+            Ok(update) => group_only(classify(update, groups, allowlist)),
             Err(_) => Routed::Ignored(Ignored::Malformed),
         };
         match &item {
             Routed::Ignored(reason) => debug!(?reason, "update ignored"),
             Routed::Service(service) => debug!(kind = ?service.kind, "forum service message"),
-            Routed::Input(_) | Routed::Callback(_) => {}
+            Routed::Input(_) | Routed::Callback(_) | Routed::Member(_) | Routed::Connect(_) => {}
         }
         routed.push(item);
     }
@@ -460,7 +580,6 @@ pub fn route_batch_with(
 
 /// Where updates come from: `BotApi` in production, a fake in tests.
 pub trait UpdateSource {
-    fn chat_id(&self) -> i64;
     fn get_updates(
         &self,
         offset: Option<i64>,
@@ -469,10 +588,6 @@ pub trait UpdateSource {
 }
 
 impl UpdateSource for BotApi {
-    fn chat_id(&self) -> i64 {
-        BotApi::chat_id(self)
-    }
-
     async fn get_updates(
         &self,
         offset: Option<i64>,
@@ -522,12 +637,14 @@ async fn save_offset(store: &OffsetStore, offset: i64) {
 /// handling them twice (at most once, so a command is never answered twice).
 pub async fn poll<S: UpdateSource>(
     source: &S,
+    groups: &KnownGroups,
     allowlist: &Allowlist,
     store: &OffsetStore,
     handle: impl FnMut(Routed),
 ) {
     poll_until(
         source,
+        groups,
         allowlist,
         false,
         store,
@@ -540,9 +657,11 @@ pub async fn poll<S: UpdateSource>(
 /// [`poll`] until `stop` completes. It is only noticed while no batch is
 /// being handled: a batch whose offset was saved is always handed out whole,
 /// and an interrupted `getUpdates` confirms nothing, so its updates come again.
-/// `private`: as in [`route_batch_with`].
+/// `private`: as in [`route_batch_with`]; `groups`: read for each batch, so
+/// a group the actor adds counts from the next one.
 pub async fn poll_until<S: UpdateSource>(
     source: &S,
+    groups: &KnownGroups,
     allowlist: &Allowlist,
     private: bool,
     store: &OffsetStore,
@@ -563,8 +682,7 @@ pub async fn poll_until<S: UpdateSource>(
                 backoff = Duration::from_secs(1);
                 let batch_len = raw.len();
                 let previous = offset;
-                let (next, routed) =
-                    route_batch_with(raw, offset, source.chat_id(), allowlist, private);
+                let (next, routed) = route_batch_with(raw, offset, groups, allowlist, private);
                 offset = next;
                 if next != previous
                     && let Some(next) = next
@@ -675,12 +793,17 @@ mod tests {
     use super::*;
 
     const CHAT: i64 = -1000000000001;
+    const GROUP: Chat = Chat::Group(GroupChat::of(CHAT));
     const ALLOWED: i64 = 1001;
     const STRANGER: i64 = 2002;
     const BOT: i64 = 3003;
 
     fn allowlist() -> Allowlist {
         [ALLOWED].into_iter().collect()
+    }
+
+    fn groups() -> KnownGroups {
+        KnownGroups::of([GroupChat::of(CHAT)])
     }
 
     fn message(from: i64, extra: Value) -> Value {
@@ -699,7 +822,7 @@ mod tests {
     }
 
     fn route_one(update: Value) -> Routed {
-        let (_, mut routed) = route_batch(vec![update], None, CHAT, &allowlist());
+        let (_, mut routed) = route_batch(vec![update], None, &groups(), &allowlist());
         routed.remove(0)
     }
 
@@ -711,7 +834,7 @@ mod tests {
         assert_eq!(
             ok,
             Routed::Input(Inbound {
-                chat: Chat::Group,
+                chat: GROUP,
                 sender: PrivateChat::of_user(ALLOWED),
                 message_id: 10,
                 thread_id: Some(7),
@@ -746,7 +869,7 @@ mod tests {
         assert_eq!(
             route_one(callback(ALLOWED)),
             Routed::Callback(CallbackInput {
-                chat: Some(Chat::Group),
+                chat: Some(GROUP),
                 query_id: "q1".to_owned(),
                 data: Some("allow:abcde".to_owned()),
                 message_id: Some(10),
@@ -762,7 +885,7 @@ mod tests {
         const MATE: i64 = 1002;
         let team: Allowlist = [ALLOWED, MATE].into_iter().collect();
         let route = |update: Value, allowlist: &Allowlist| {
-            let (_, mut routed) = route_batch(vec![update], None, CHAT, allowlist);
+            let (_, mut routed) = route_batch(vec![update], None, &groups(), allowlist);
             routed.remove(0)
         };
         let from =
@@ -1190,7 +1313,7 @@ mod tests {
         let text = private(ALLOWED, json!({ "text": "hi" }));
         let classified = classify(
             serde_json::from_value(json!({ "update_id": 1, "message": text.clone() })).unwrap(),
-            CHAT,
+            &groups(),
             &allowlist(),
         );
         let Routed::Input(input) = &classified else {
@@ -1236,7 +1359,8 @@ mod tests {
     #[test]
     fn a_private_chat_is_served_when_the_bot_has_topics_there() {
         let route = |update: Value| {
-            let (_, mut routed) = route_batch_with(vec![update], None, CHAT, &allowlist(), true);
+            let (_, mut routed) =
+                route_batch_with(vec![update], None, &groups(), &allowlist(), true);
             routed.remove(0)
         };
         let private = |from: i64, extra: Value| {
@@ -1280,7 +1404,8 @@ mod tests {
     #[test]
     fn a_strangers_menu_press_is_ignored() {
         let route = |update: Value| {
-            let (_, mut routed) = route_batch_with(vec![update], None, CHAT, &allowlist(), true);
+            let (_, mut routed) =
+                route_batch_with(vec![update], None, &groups(), &allowlist(), true);
             routed.remove(0)
         };
         let private = |of: i64| {
@@ -1345,7 +1470,7 @@ mod tests {
                 assert_eq!(
                     route_one(update),
                     Routed::Service(ServiceMessage {
-                        chat: Chat::Group,
+                        chat: GROUP,
                         kind,
                         message_id: 10,
                         thread_id: Some(7),
@@ -1369,7 +1494,7 @@ mod tests {
             json!(["not", "an", "object"]),
             json!({ "update_id": 8, "message": message(ALLOWED, json!({ "text": "last" })) }),
         ];
-        let (next, routed) = route_batch(batch, Some(3), CHAT, &allowlist());
+        let (next, routed) = route_batch(batch, Some(3), &groups(), &allowlist());
         assert_eq!(next, Some(9));
         assert_eq!(routed.len(), 6);
         assert_eq!(routed[0], Routed::Ignored(Ignored::Unsupported));
@@ -1381,7 +1506,7 @@ mod tests {
             matches!(&routed[5], Routed::Input(input) if input.text.as_deref() == Some("last"))
         );
 
-        let (next, routed) = route_batch(Vec::new(), Some(3), CHAT, &allowlist());
+        let (next, routed) = route_batch(Vec::new(), Some(3), &groups(), &allowlist());
         assert_eq!((next, routed.len()), (Some(3), 0));
     }
 
@@ -1389,9 +1514,9 @@ mod tests {
     fn next_offset_follows_the_batch_even_below_the_old_one() {
         // Telegram restarts ids at random after a week without updates.
         let batch = vec![json!({ "update_id": 40 }), json!({ "update_id": 42 })];
-        let (next, _) = route_batch(batch, Some(9000), CHAT, &allowlist());
+        let (next, _) = route_batch(batch, Some(9000), &groups(), &allowlist());
         assert_eq!(next, Some(43));
-        let (next, _) = route_batch(vec![json!({ "x": 1 })], Some(9000), CHAT, &allowlist());
+        let (next, _) = route_batch(vec![json!({ "x": 1 })], Some(9000), &groups(), &allowlist());
         assert_eq!(next, Some(9000));
     }
 
@@ -1401,10 +1526,6 @@ mod tests {
     struct FakeTelegram(Vec<Value>);
 
     impl UpdateSource for FakeTelegram {
-        fn chat_id(&self) -> i64 {
-            CHAT
-        }
-
         async fn get_updates(
             &self,
             offset: Option<i64>,
@@ -1435,7 +1556,8 @@ mod tests {
         let mut texts = Vec::new();
         let source = FakeTelegram(updates);
         let allowlist = allowlist();
-        let polling = poll(&source, &allowlist, store, |routed| {
+        let groups = groups();
+        let polling = poll(&source, &groups, &allowlist, store, |routed| {
             if let Routed::Input(input) = routed {
                 texts.push(input.text.unwrap_or_default());
             }
@@ -1472,10 +1594,6 @@ mod tests {
     struct RestartedIds(Vec<Value>, std::sync::Mutex<i64>);
 
     impl UpdateSource for RestartedIds {
-        fn chat_id(&self) -> i64 {
-            CHAT
-        }
-
         async fn get_updates(
             &self,
             offset: Option<i64>,
@@ -1511,7 +1629,8 @@ mod tests {
         let mut texts = Vec::new();
         let source = RestartedIds(vec![text_update(7, "/brief")], std::sync::Mutex::new(0));
         let allowlist = allowlist();
-        let polling = poll(&source, &allowlist, &store, |routed| {
+        let groups = groups();
+        let polling = poll(&source, &groups, &allowlist, &store, |routed| {
             if let Routed::Input(input) = routed {
                 texts.push(input.text.unwrap_or_default());
             }
@@ -1528,7 +1647,10 @@ mod tests {
         let mut seen = Vec::new();
         let source = FakeTelegram(vec![text_update(5, "/brief")]);
         let allowlist = allowlist();
-        let polling = poll(&source, &allowlist, &store, |_| seen.push(store.load()));
+        let groups = groups();
+        let polling = poll(&source, &groups, &allowlist, &store, |_| {
+            seen.push(store.load())
+        });
         let _ = tokio::time::timeout(Duration::from_secs(180), polling).await;
         assert_eq!(seen, [Some(6)]);
     }
@@ -1576,5 +1698,165 @@ mod tests {
         );
         assert_eq!(stalled_batch_backoff(0, Some(3), Some(3)), None);
         assert_eq!(stalled_batch_backoff(2, Some(3), Some(4)), None);
+    }
+
+    /// TASK-069: messages, presses and service messages count only from a
+    /// known group; another group is `OtherChat`.
+    #[test]
+    fn only_known_groups_get_through() {
+        const OTHER: i64 = -1000000000002;
+        let known = KnownGroups::of([GroupChat::of(CHAT), GroupChat::of(OTHER)]);
+        let in_chat = |id: i64, extra: Value| {
+            let mut message = message(ALLOWED, extra);
+            message["chat"]["id"] = json!(id);
+            message
+        };
+        let route = |update: Value, groups: &KnownGroups| {
+            let (_, mut routed) = route_batch(vec![update], None, groups, &allowlist());
+            routed.remove(0)
+        };
+        let text = json!({ "update_id": 1, "message": in_chat(OTHER, json!({ "text": "hi" })) });
+        match route(text.clone(), &known) {
+            Routed::Input(input) => {
+                assert_eq!(input.chat, Chat::Group(GroupChat::of(OTHER)));
+                assert_ne!(input.chat, GROUP);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(route(text, &groups()), Routed::Ignored(Ignored::OtherChat));
+        let press = json!({ "update_id": 2, "callback_query": {
+            "id": "q1", "from": { "id": ALLOWED, "is_bot": false, "first_name": "x" },
+            "chat_instance": "c", "data": "allow:abcde",
+            "message": in_chat(OTHER, json!({ "text": "prompt" })),
+        }});
+        assert_eq!(route(press, &groups()), Routed::Ignored(Ignored::OtherChat));
+        let service = json!({ "update_id": 3,
+            "message": in_chat(OTHER, json!({ "forum_topic_edited": { "name": "x" } })) });
+        assert_eq!(
+            route(service, &groups()),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+    }
+
+    fn member_update(chat: Value, from: i64, status: &str) -> Value {
+        json!({ "update_id": 1, "my_chat_member": {
+            "chat": chat,
+            "from": { "id": from, "is_bot": false, "first_name": "x" },
+            "date": 1,
+            "old_chat_member": { "status": "left", "user": { "id": BOT, "is_bot": true, "first_name": "b" } },
+            "new_chat_member": { "status": status, "user": { "id": BOT, "is_bot": true, "first_name": "b" },
+                "can_manage_topics": true, "can_delete_messages": true },
+        }})
+    }
+
+    /// TASK-069: the bot's membership changes of any group reach the actor
+    /// with whether an allowlisted user made them; a private chat's (a
+    /// block) and a channel's do not.
+    #[test]
+    fn membership_changes_of_any_group_get_through() {
+        const NEW: i64 = -1000000000009;
+        let group = json!({ "id": NEW, "type": "supergroup", "title": "Команда\n\u{202E}x", "is_forum": true });
+        let Routed::Member(added) =
+            route_one(member_update(group.clone(), ALLOWED, "administrator"))
+        else {
+            panic!("not a member update");
+        };
+        assert_eq!(added.chat, GroupChat::of(NEW));
+        assert!(added.supergroup && added.is_forum && added.by_allowed);
+        assert_eq!(added.title.as_deref(), Some("Команда x"));
+        assert_eq!(added.member.status, "administrator");
+        assert!(added.member.can_manage_topics);
+        let Routed::Member(by_stranger) = route_one(member_update(group, STRANGER, "member"))
+        else {
+            panic!("not a member update");
+        };
+        assert!(!by_stranger.by_allowed);
+        let basic = json!({ "id": NEW, "type": "group", "title": "g" });
+        let Routed::Member(basic) = route_one(member_update(basic, ALLOWED, "member")) else {
+            panic!("not a member update");
+        };
+        assert!(!basic.supergroup && !basic.is_forum);
+        let private = json!({ "id": ALLOWED, "type": "private", "first_name": "x" });
+        assert_eq!(
+            route_one(member_update(private, ALLOWED, "kicked")),
+            Routed::Ignored(Ignored::Unsupported)
+        );
+        let channel = json!({ "id": NEW, "type": "channel", "title": "c" });
+        assert_eq!(
+            route_one(member_update(channel, ALLOWED, "administrator")),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+    }
+
+    /// TASK-069: `/connect` of an allowlisted user in any group is its own
+    /// input, also in a topic of a known group; a stranger's is dropped
+    /// like any message there; in a private chat it is a plain message.
+    #[test]
+    fn connect_comes_from_allowlisted_users_in_any_group() {
+        const NEW: i64 = -1000000000009;
+        let connect = |from: i64, chat: Value, text: &str| {
+            let mut message = message(from, json!({ "text": text }));
+            message["chat"] = chat;
+            json!({ "update_id": 1, "message": message })
+        };
+        let unknown =
+            json!({ "id": NEW, "type": "supergroup", "title": "Новая", "is_forum": false });
+        assert_eq!(
+            route_one(connect(STRANGER, unknown.clone(), "/connect")),
+            Routed::Ignored(Ignored::OtherChat)
+        );
+        assert_eq!(
+            route_one(connect(ALLOWED, unknown.clone(), "/connect")),
+            Routed::Connect(ConnectInput {
+                chat: GroupChat::of(NEW),
+                supergroup: true,
+                title: Some("Новая".to_owned()),
+                is_forum: false,
+                thread_id: Some(7),
+                target: None,
+            })
+        );
+        match route_one(connect(ALLOWED, unknown, "/CONNECT@Other_Bot please")) {
+            Routed::Connect(input) => assert_eq!(input.target.as_deref(), Some("Other_Bot")),
+            other => panic!("{other:?}"),
+        }
+        let known = json!({ "id": CHAT, "type": "supergroup", "is_forum": true });
+        match route_one(connect(ALLOWED, known.clone(), "/connect@cctg_bot")) {
+            Routed::Connect(input) => {
+                assert_eq!(input.chat, GroupChat::of(CHAT));
+                assert_eq!(input.thread_id, Some(7));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            route_one(connect(STRANGER, known.clone(), "/connect")),
+            Routed::Ignored(Ignored::NotAllowed)
+        );
+        assert!(matches!(
+            route_one(connect(ALLOWED, known, "/connected")),
+            Routed::Input(_)
+        ));
+        let private = json!({ "id": ALLOWED, "type": "private", "first_name": "x" });
+        let (_, mut routed) = route_batch_with(
+            vec![connect(ALLOWED, private, "/connect")],
+            None,
+            &groups(),
+            &allowlist(),
+            true,
+        );
+        assert!(matches!(routed.remove(0), Routed::Input(_)));
+    }
+
+    #[test]
+    fn a_group_title_is_cleaned_and_bounded() {
+        let long = "Группа ".repeat(20);
+        let title = group_title(&long).unwrap();
+        assert!(
+            transcript::telegram_len(&title) <= GROUP_TITLE_LIMIT,
+            "{title}"
+        );
+        assert!(title.ends_with('…'));
+        assert_eq!(group_title("a\u{0000}b\n c").as_deref(), Some("ab c"));
+        assert_eq!(group_title(" \u{200B} "), None);
     }
 }

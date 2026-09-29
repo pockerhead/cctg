@@ -87,6 +87,10 @@ pub struct MessageChat {
     /// `private`, `group`, `supergroup` or `channel`.
     #[serde(rename = "type")]
     pub kind: String,
+    /// A group's title (TASK-069); never logged.
+    pub title: Option<String>,
+    /// A supergroup with topics.
+    pub is_forum: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -231,15 +235,41 @@ pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
+    /// The bot's own membership in a chat changed (TASK-069).
+    pub my_chat_member: Option<ChatMemberUpdated>,
 }
 
+/// A change of a chat member (`my_chat_member`): only the fields the hub
+/// reads.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ChatMemberUpdated {
+    pub chat: MessageChat,
+    /// Who made the change.
+    pub from: Option<User>,
+    pub new_chat_member: ChatMember,
+}
+
+/// The fields of a `getChat` answer the hub reads (TASK-069).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ChatInfo {
+    /// `private`, `group`, `supergroup` or `channel`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub title: Option<String>,
+    pub is_forum: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ChatMember {
     pub status: String,
     pub can_manage_topics: bool,
     pub can_delete_messages: bool,
     pub can_pin_messages: bool,
+    /// A `restricted` member is in the chat only with this set.
+    pub is_member: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -265,16 +295,14 @@ pub struct Document {
     pub caption: Option<String>,
 }
 
-/// Bot API client of one bot; every call names its [`Chat`], and the id of
-/// [`Chat::Group`] is the configured forum supergroup's (TASK-061).
+/// Bot API client of one bot; every call names its [`Chat`], which carries
+/// its id (TASK-061, TASK-069).
 pub struct BotApi {
     http: reqwest::Client,
     /// `<api>/bot<token>`; never logged, see the manual `Debug`.
     base: String,
     /// `<api>/file/bot<token>`, for downloads; never logged either.
     file_base: String,
-    /// The forum supergroup, [`Chat::Group`].
-    group_id: i64,
 }
 
 impl fmt::Debug for BotApi {
@@ -284,8 +312,8 @@ impl fmt::Debug for BotApi {
 }
 
 impl BotApi {
-    pub fn new(token: &BotToken, chat_id: i64) -> Result<Self, ApiError> {
-        Self::with_api_url(TELEGRAM_API, token, chat_id, None)
+    pub fn new(token: &BotToken) -> Result<Self, ApiError> {
+        Self::with_api_url(TELEGRAM_API, token, None)
     }
 
     /// Same as [`BotApi::new`] against another Bot API server (tests, local
@@ -293,7 +321,6 @@ impl BotApi {
     pub fn with_api_url(
         api_url: &str,
         token: &BotToken,
-        chat_id: i64,
         proxy: Option<&ProxyUrl>,
     ) -> Result<Self, ApiError> {
         let mut builder = reqwest::Client::builder()
@@ -310,19 +337,13 @@ impl BotApi {
             http,
             base: format!("{api_url}/bot{}", token.expose()),
             file_base: format!("{api_url}/file/bot{}", token.expose()),
-            group_id: chat_id,
         })
-    }
-
-    /// The forum supergroup's id.
-    pub fn chat_id(&self) -> i64 {
-        self.group_id
     }
 
     /// The Bot API `chat_id` of `chat`; only request bodies carry it.
     fn id_of(&self, chat: Chat) -> i64 {
         match chat {
-            Chat::Group => self.group_id,
+            Chat::Group(group) => group.expose(),
             Chat::Private(private) => private.expose(),
         }
     }
@@ -336,6 +357,18 @@ impl BotApi {
         self.call("getChatMember", body, None).await
     }
 
+    /// `getChat` (TASK-069): a group's kind, title and topics.
+    pub async fn get_chat(&self, chat: Chat) -> Result<ChatInfo, ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat) });
+        self.call("getChat", body, None).await
+    }
+
+    /// `leaveChat` (TASK-069): the bot leaves a group.
+    pub async fn leave_chat(&self, chat: Chat) -> Result<bool, ApiError> {
+        let body = json!({ "chat_id": self.id_of(chat) });
+        self.call("leaveChat", body, None).await
+    }
+
     /// Long polling. Returns raw updates so that one malformed update cannot
     /// fail the whole batch; see `updates::route_batch`.
     pub async fn get_updates(
@@ -343,15 +376,12 @@ impl BotApi {
         offset: Option<i64>,
         timeout: Duration,
     ) -> Result<Vec<Value>, ApiError> {
-        let mut body = json!({
-            "timeout": timeout.as_secs(),
-            "allowed_updates": ["message", "callback_query"],
-        });
-        if let Some(offset) = offset {
-            body["offset"] = json!(offset);
-        }
-        self.call("getUpdates", body, Some(timeout + POLL_GRACE))
-            .await
+        self.call(
+            "getUpdates",
+            updates_body(offset, timeout),
+            Some(timeout + POLL_GRACE),
+        )
+        .await
     }
 
     /// `parse_mode`: `Some("HTML")` sends `text` as Telegram HTML; `None` as plain text.
@@ -732,6 +762,19 @@ impl BotApi {
     }
 }
 
+/// The body of `getUpdates`: `my_chat_member` tells the hub it was added
+/// to or removed from a group (TASK-069).
+fn updates_body(offset: Option<i64>, timeout: Duration) -> Value {
+    let mut body = json!({
+        "timeout": timeout.as_secs(),
+        "allowed_updates": ["message", "callback_query", "my_chat_member"],
+    });
+    if let Some(offset) = offset {
+        body["offset"] = json!(offset);
+    }
+    body
+}
+
 async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ApiError> {
     let status = response.status();
     let bytes = response.bytes().await.map_err(ApiError::http)?;
@@ -778,6 +821,72 @@ fn parse_envelope<T: DeserializeOwned>(status: u16, body: &[u8]) -> Result<T, Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::chat::GroupChat;
+
+    /// TASK-069: `my_chat_member` as the Bot API docs shape it
+    /// (`ChatMemberUpdated`): an administrator with its rights, a
+    /// restricted member in or out of the chat, a kicked one.
+    #[test]
+    fn my_chat_member_updates_decode() {
+        let update = |member: Value| {
+            let raw = json!({ "update_id": 1, "my_chat_member": {
+                "chat": { "id": -1_002_000, "type": "supergroup", "title": "Команда", "is_forum": true },
+                "from": { "id": 1001, "is_bot": false, "first_name": "Анна" },
+                "date": 1,
+                "old_chat_member": { "status": "left", "user": { "id": 42, "is_bot": true, "first_name": "b" } },
+                "new_chat_member": member,
+            }});
+            serde_json::from_value::<Update>(raw)
+                .unwrap()
+                .my_chat_member
+                .unwrap()
+        };
+        let admin = update(json!({
+            "status": "administrator", "user": { "id": 42, "is_bot": true, "first_name": "b" },
+            "can_be_edited": false, "is_anonymous": false, "can_manage_chat": true,
+            "can_delete_messages": true, "can_manage_video_chats": false,
+            "can_restrict_members": false, "can_promote_members": false,
+            "can_change_info": false, "can_invite_users": true, "can_manage_topics": true,
+        }));
+        assert_eq!(admin.chat.id, -1_002_000);
+        assert_eq!(admin.chat.title.as_deref(), Some("Команда"));
+        assert!(admin.chat.is_forum);
+        assert_eq!(admin.from.as_ref().map(|from| from.id), Some(1001));
+        let member = &admin.new_chat_member;
+        assert_eq!(member.status, "administrator");
+        assert!(member.can_manage_topics && member.can_delete_messages);
+        let restricted = |is_member: bool| {
+            update(json!({
+                "status": "restricted", "user": { "id": 42, "is_bot": true, "first_name": "b" },
+                "is_member": is_member, "can_send_messages": true, "until_date": 0,
+            }))
+            .new_chat_member
+        };
+        assert!(restricted(true).is_member);
+        assert!(!restricted(false).is_member);
+        let kicked = update(json!({
+            "status": "kicked", "user": { "id": 42, "is_bot": true, "first_name": "b" },
+            "until_date": 0,
+        }));
+        assert_eq!(kicked.new_chat_member.status, "kicked");
+    }
+
+    #[test]
+    fn get_updates_asks_for_membership_changes() {
+        let body = updates_body(Some(7), Duration::from_secs(50));
+        assert_eq!(
+            body["allowed_updates"],
+            json!(["message", "callback_query", "my_chat_member"])
+        );
+        assert_eq!(body["offset"], 7);
+    }
+
+    #[test]
+    fn each_group_is_its_own_chat_id() {
+        let api = test_api("http://127.0.0.1:9");
+        assert_eq!(api.id_of(Chat::Group(GroupChat::of(-1001))), -1001);
+        assert_eq!(api.id_of(Chat::Group(GroupChat::of(-1002))), -1002);
+    }
 
     /// Key set of a real `getChatMember` answer for the bot (2026-09-23),
     /// values replaced.
@@ -973,7 +1082,7 @@ mod tests {
         })
         .unwrap()
         .token;
-        BotApi::with_api_url(url, &token, -1001, None).unwrap()
+        BotApi::with_api_url(url, &token, None).unwrap()
     }
 
     /// A raw HTTP answer with `head` lines, closing the connection.
@@ -1053,7 +1162,7 @@ mod tests {
         .await;
         let api = test_api(&url);
         let op = Op::SendPhoto {
-            chat: Chat::Group,
+            chat: Chat::Group(GroupChat::of(-1001)),
             thread_id: Some(100),
             document: Document {
                 file_name: "shot.png".into(),
@@ -1127,7 +1236,7 @@ mod tests {
             },
         ];
         let photos = Op::SendAlbum {
-            chat: Chat::Group,
+            chat: Chat::Group(GroupChat::of(-1001)),
             thread_id: Some(100),
             items: items.clone(),
             photos: true,
@@ -1143,7 +1252,7 @@ mod tests {
         }
         assert!(api.execute(&photos).await.is_err(), "not a 400");
         let documents = Op::SendAlbum {
-            chat: Chat::Group,
+            chat: Chat::Group(GroupChat::of(-1001)),
             thread_id: Some(100),
             items,
             photos: false,
@@ -1171,7 +1280,7 @@ mod tests {
         })
         .unwrap()
         .token;
-        let api = BotApi::with_api_url("http://127.0.0.1:9", &token, -1001, None).unwrap();
+        let api = BotApi::with_api_url("http://127.0.0.1:9", &token, None).unwrap();
 
         let error = api.get_me().await.unwrap_err();
         assert!(matches!(error, ApiError::Http(_)));
