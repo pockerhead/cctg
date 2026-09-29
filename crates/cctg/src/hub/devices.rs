@@ -97,6 +97,9 @@ pub struct Listed {
     pub joined: SystemTime,
     /// The last time its secret was taken since the hub started.
     pub seen: Option<SystemTime>,
+    /// Who enrolled it (TASK-063), for the devices tab of the menu
+    /// (TASK-074). `Debug` never prints the id.
+    pub owner: Option<PrivateChat>,
 }
 
 /// What `/devices` shows about the shared secret.
@@ -405,6 +408,7 @@ impl Devices {
                     .checked_add(Duration::from_secs(device.joined))
                     .unwrap_or(UNIX_EPOCH),
                 seen: inner.seen.get(&device.id).copied(),
+                owner: device.owner,
             })
             .collect();
         let shared = match self.0.shared {
@@ -993,8 +997,13 @@ mod tests {
         devices.set_owner(&third, anna).unwrap();
         devices.set_owner(&second, boris).unwrap();
         assert_eq!(devices.owned_by(anna), [first, third]);
-        assert_eq!(devices.owned_by(boris), [second]);
+        assert_eq!(devices.owned_by(boris), std::slice::from_ref(&second));
         assert!(devices.owned_by(PrivateChat::of_user(9)).is_empty());
+        // TASK-074: the list names each device's owner.
+        let (listed, _) = devices.list();
+        let owners: Vec<Option<PrivateChat>> = listed.iter().map(|entry| entry.owner).collect();
+        assert_eq!(owners, [Some(anna), Some(boris), Some(anna)]);
+        assert_eq!(listed[1].id, second);
     }
 
     #[test]
