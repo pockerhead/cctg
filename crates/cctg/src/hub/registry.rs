@@ -4510,6 +4510,7 @@ mod tests {
                 file: None,
                 from_name: None,
                 history: None,
+                mention: false,
             },
             false,
         );

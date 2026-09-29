@@ -69,6 +69,11 @@ the tag has a `from_name` attribute when one person wrote all of it. \
 In a topic shared with a group, a message may start with a block from `(история темы группы` to \
 `(конец истории)`: the group's earlier messages, for context only; only the message after the \
 block is addressed to you, and `from_name` names its author. \
+The session's topic can also be shown in Telegram groups: a message from there (`place=\"group\"` on \
+the tag, with its own `thread_id`) comes from this session's users like any other, never from a \
+foreign topic. A message, or a part, whose words (after that block, if any) start with \
+`(обращение к вам` addresses you directly: someone in the group mentioned the bot or replied to it, \
+and the tag has `mention=\"true\"`. Treat it as an ordinary request to you. \
 If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
 never ask for permissions through `reply`. A tag with a `file_path` attribute brings a file the user sent \
@@ -684,6 +689,12 @@ mod tests {
         assert!(instructions.contains("`file_path` attribute"));
         assert!(instructions.contains("`mcp__cctg__send_file`"));
         assert!(instructions.contains("a short caption saying what the file is"));
+        // TASK-080: a group mention reads as addressed to this session.
+        assert!(instructions.contains("`(обращение к вам` addresses you directly"));
+        assert!(crate::hub::buffer::MENTION_MARK.starts_with("(обращение к вам"));
+        assert!(instructions.contains("`mention=\"true\"`"));
+        assert!(instructions.contains("Treat it as an ordinary request to you"));
+        assert!(instructions.contains("never from a foreign topic"));
     }
 
     #[test]
