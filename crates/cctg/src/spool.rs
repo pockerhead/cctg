@@ -250,6 +250,28 @@ fn make_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Makes `root` and the session directory `dir`, then creates `temp` in it
+/// with `open`. Another hook's `prune` or the end of a replay removes every
+/// empty session directory, also one just made here: when `open` finds it
+/// gone, both go once more (the file keeps a later `remove_dir` off).
+fn create_temp(
+    root: &Path,
+    dir: &Path,
+    temp: &Path,
+    mut open: impl FnMut(&Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<std::fs::File> {
+    make_dir(root)?;
+    make_dir(dir)?;
+    match open(temp) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            make_dir(root)?;
+            make_dir(dir)?;
+            open(temp)
+        }
+        opened => opened,
+    }
+}
+
 /// Keeps `post` for a later replay. `now` names and ages the file. The live
 /// claude pids are dropped: replayed later, they would end sessions started
 /// after the list was taken. `Ok(n)`: `n` older turn files of the session
@@ -286,8 +308,6 @@ pub fn save(root: &Path, post: &HookPost, now: SystemTime) -> Result<usize, Spoo
         return Err(SpoolError::Full);
     }
     let io = |error: std::io::Error| SpoolError::Io(error.kind());
-    make_dir(root).map_err(io)?;
-    make_dir(&dir).map_err(io)?;
     let name = format!("{:020}-{}", nanos(now), post.event_id.as_str());
     let (temp, done) = if turn {
         (TURN_TMP_SUFFIX, TURN_SUFFIX)
@@ -302,7 +322,7 @@ pub fn save(root: &Path, post: &HookPost, now: SystemTime) -> Result<usize, Spoo
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temp).map_err(io)?;
+    let mut file = create_temp(root, &dir, &temp, |path| options.open(path)).map_err(io)?;
     // Flushed before the rename: a crash never leaves an empty `.json`.
     let written = file.write_all(&body).and_then(|()| file.sync_all());
     drop(file);
@@ -663,6 +683,49 @@ mod tests {
         let kept = pending(&root, SESSION, at(1));
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].1, long);
+    }
+
+    /// TASK-088 review, finding 1: a `prune` or a replay of another process
+    /// removes the empty session directory between its creation and the
+    /// file's; the save makes it again once instead of losing the event.
+    #[test]
+    fn a_session_dir_removed_before_the_file_is_made_again() {
+        let dir = TempDir::new("spool-dir-race");
+        let root = dir.path().join("spool");
+        let session = root.join(SESSION);
+        let temp = session.join("x.tmp");
+        let open = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        };
+        let mut calls = 0;
+        let made = create_temp(&root, &session, &temp, |path| {
+            calls += 1;
+            if calls == 1 {
+                // The racing `remove_dir` of the empty directory.
+                std::fs::remove_dir(&session).unwrap();
+            }
+            open(path)
+        });
+        assert!(made.is_ok(), "{made:?}");
+        assert_eq!(calls, 2);
+        assert!(temp.is_file());
+        // Only once: a directory that keeps vanishing is an error.
+        let again = session.join("y.tmp");
+        let mut calls = 0;
+        let made = create_temp(&root, &session, &again, |path| {
+            calls += 1;
+            let _ = std::fs::remove_file(&temp);
+            std::fs::remove_dir(&session).unwrap();
+            open(path)
+        });
+        assert_eq!(
+            made.map_err(|error| error.kind()).err(),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(calls, 2);
     }
 
     #[test]
