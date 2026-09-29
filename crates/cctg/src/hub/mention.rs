@@ -110,14 +110,28 @@ pub fn unmention(text: &str, username: &str) -> String {
 /// The group messages kept for the next mention, each as the session will
 /// read it; the oldest go first when there are more than [`MAX_BACKLOG`]
 /// or [`MAX_BACKLOG_BYTES`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Backlog {
     #[serde(default)]
     pub parts: VecDeque<String>,
     /// Kept messages dropped for newer ones.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub dropped: u32,
+    /// Per part, the id a voice message's words find it by (TASK-085; 0:
+    /// none). In memory only: after a restart no recognition waits for a
+    /// part, and a part loaded from `registry.json` has none.
+    #[serde(skip)]
+    ids: VecDeque<u64>,
 }
+
+/// What is kept: the ids are only the way to a part.
+impl PartialEq for Backlog {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts == other.parts && self.dropped == other.dropped
+    }
+}
+
+impl Eq for Backlog {}
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -125,35 +139,63 @@ fn is_zero(n: &u32) -> bool {
 
 impl Backlog {
     pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+        self.parts.is_empty() && self.dropped == 0
     }
 
     /// Keeps `part` as the newest; the oldest go while over a cap (the
     /// newest always stays).
     pub fn push(&mut self, part: String) {
+        self.push_with(part, 0);
+    }
+
+    /// [`Backlog::push`] of a part that [`Backlog::replace_at`] finds by
+    /// `id` (not 0) while it is kept.
+    pub fn push_with(&mut self, part: String, id: u64) {
+        self.align();
         self.parts.push_back(part);
+        self.ids.push_back(id);
         self.keep_caps();
     }
 
-    /// The oldest part equal to `old` becomes `new` (a voice message
-    /// recognized after it was kept, TASK-085), within the same caps as
-    /// [`Backlog::push`]; `false` when no part equals `old` (a mention took
-    /// the backlog meanwhile).
-    pub fn replace(&mut self, old: &str, new: String) -> bool {
-        let Some(part) = self.parts.iter_mut().find(|part| *part == old) else {
+    /// The part pushed with `id` becomes `new` (a voice message recognized
+    /// after it was kept, TASK-085), within the same caps as
+    /// [`Backlog::push`]; `false` when it is no longer kept (a mention took
+    /// the backlog, or it was dropped for newer ones).
+    pub fn replace_at(&mut self, id: u64, new: String) -> bool {
+        self.align();
+        let Some(at) = self.ids.iter().position(|kept| id != 0 && *kept == id) else {
             return false;
         };
-        *part = new;
+        self.parts[at] = new;
         self.keep_caps();
         true
     }
 
+    /// Takes the newest part equal to `part` out (a file of an album that
+    /// addressed the agent, TASK-077); `false` when there is none.
+    pub fn remove_latest(&mut self, part: &str) -> bool {
+        self.align();
+        let Some(at) = self.parts.iter().rposition(|kept| kept == part) else {
+            return false;
+        };
+        self.parts.remove(at);
+        self.ids.remove(at);
+        true
+    }
+
+    /// One id per part: parts loaded from `registry.json` get none.
+    fn align(&mut self) {
+        self.ids.resize(self.parts.len(), 0);
+    }
+
     fn keep_caps(&mut self) {
+        self.align();
         while self.parts.len() > 1
             && (self.parts.len() > MAX_BACKLOG
                 || self.parts.iter().map(String::len).sum::<usize>() > MAX_BACKLOG_BYTES)
         {
             self.parts.pop_front();
+            self.ids.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
     }
@@ -466,24 +508,42 @@ mod tests {
         );
     }
 
+    /// TASK-085 review 1: a part is found by its id, never by equal text.
     #[test]
-    fn a_replaced_part_is_the_oldest_equal_one_within_the_caps() {
+    fn a_replaced_part_is_the_one_of_its_id_within_the_caps() {
         let mut backlog = Backlog::default();
-        for part in ["a", "[голосовое]", "b", "[голосовое]"] {
-            backlog.push(part.into());
-        }
-        assert!(backlog.replace("[голосовое]", "слова".into()));
-        assert_eq!(backlog.parts, ["a", "слова", "b", "[голосовое]"]);
-        assert!(!backlog.replace("нет такой", "x".into()));
+        backlog.push("a".into());
+        backlog.push_with("[голосовое]".into(), 7);
+        backlog.push("b".into());
+        backlog.push_with("[голосовое]".into(), 8);
+        assert!(backlog.replace_at(8, "слова".into()));
+        assert_eq!(backlog.parts, ["a", "[голосовое]", "b", "слова"]);
+        assert!(!backlog.replace_at(9, "x".into()), "no such id");
+        assert!(!backlog.replace_at(0, "x".into()), "0 is no id");
         assert_eq!(backlog.dropped, 0);
+        // An album file taken out keeps the ids of the others in place.
+        assert!(backlog.remove_latest("a"));
+        assert!(backlog.replace_at(7, "другие".into()));
+        assert_eq!(backlog.parts, ["другие", "b", "слова"]);
+        // A part taken away (a mention) or loaded without ids is not found.
+        let taken = std::mem::take(&mut backlog);
+        assert!(!backlog.replace_at(7, "x".into()));
+        let loaded: Backlog =
+            serde_json::from_str(&serde_json::to_string(&taken).unwrap()).unwrap();
+        assert_eq!(loaded, taken, "ids are not kept");
+        let mut loaded = loaded;
+        assert!(!loaded.replace_at(7, "x".into()));
+        loaded.push_with("[голосовое]".into(), 10);
+        assert!(loaded.replace_at(10, "новое".into()));
+        assert_eq!(loaded.parts, ["другие", "b", "слова", "новое"]);
         // A longer part pushes the oldest out of the byte cap.
         let mut backlog = Backlog::default();
         for n in 0..15 {
             backlog.push(format!("{n:04}{}", "x".repeat(4092)));
         }
-        backlog.push("[голосовое]".into());
+        backlog.push_with("[голосовое]".into(), 1);
         assert_eq!((backlog.parts.len(), backlog.dropped), (16, 0));
-        assert!(backlog.replace("[голосовое]", "y".repeat(8192)));
+        assert!(backlog.replace_at(1, "y".repeat(8192)));
         assert_eq!(backlog.parts.len(), 15);
         assert_eq!(backlog.dropped, 1);
         assert!(backlog.parts[0].starts_with("0001"));
