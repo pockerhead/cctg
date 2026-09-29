@@ -286,7 +286,7 @@ fn no_hub_listening_is_quiet_and_fast() {
 }
 
 #[test]
-fn an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure() {
+fn an_undelivered_stop_without_a_state_dir_is_not_kept() {
     // Held: nothing listens there (TASK-066).
     let (_held, port) = common::held_port();
     let port = std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port));
@@ -311,7 +311,8 @@ fn an_undelivered_stop_without_a_state_dir_is_not_a_spool_failure() {
     assert_quiet(&output, &[]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("hook event not delivered"), "{stderr}");
-    assert!(!stderr.contains("not kept"), "{stderr}");
+    // A `Stop` is kept since TASK-088; without a spool it cannot be.
+    assert!(stderr.contains("not kept"), "{stderr}");
 }
 
 #[test]

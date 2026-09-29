@@ -1395,3 +1395,244 @@ async fn a_compaction_from_the_real_hook_shows_in_the_status_and_the_topic() {
     let everything = format!("{ops:?}");
     assert!(!everything.contains(COMPACT_FOCUS));
 }
+
+// ---------------------------------------------------------------- TASK-088
+
+/// What the relay does to the first hook request it takes; later ones pass
+/// untouched.
+#[derive(Clone, Copy)]
+enum Fault {
+    /// Reads the request and never forwards or answers it.
+    Hold,
+    /// Forwards the request and holds the hub's answer for 2 s.
+    LateAnswer,
+}
+
+/// A loopback relay in front of the hub's hook endpoint that counts its
+/// connections.
+struct Relay {
+    addr: String,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn relay(to: String, fault: Fault) -> Relay {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = connections.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+            let to = to.clone();
+            tokio::spawn(async move {
+                if !first {
+                    if let Ok(mut hub) = TcpStream::connect(&to).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut hub).await;
+                    }
+                    return;
+                }
+                match fault {
+                    Fault::Hold => {
+                        let mut buf = [0u8; 4096];
+                        while matches!(client.read(&mut buf).await, Ok(n) if n > 0) {}
+                    }
+                    Fault::LateAnswer => {
+                        let Ok(hub) = TcpStream::connect(&to).await else {
+                            return;
+                        };
+                        let (mut from_client, mut to_client) = client.into_split();
+                        let (mut from_hub, mut to_hub) = hub.into_split();
+                        let up = tokio::spawn(async move {
+                            let _ = tokio::io::copy(&mut from_client, &mut to_hub).await;
+                        });
+                        // The hub's status line and head.
+                        let mut answer = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        let read = async {
+                            while !answer.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match from_hub.read(&mut buf).await {
+                                    Ok(n) if n > 0 => answer.extend_from_slice(&buf[..n]),
+                                    _ => break,
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(WAIT, read).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let _ = to_client.write_all(&answer).await;
+                        let _ = to_client.shutdown().await;
+                        up.abort();
+                    }
+                }
+            });
+        }
+    });
+    Relay {
+        addr,
+        connections,
+        task,
+    }
+}
+
+/// The session's agent: the real link code in process, its spool replays
+/// going through `relay`. Its link events are drained once it is up.
+async fn replaying_agent(
+    hub: &Hub,
+    home: &Path,
+    relay: &Relay,
+) -> (mpsc::Sender<AgentMsg>, JoinHandle<()>) {
+    use cctg::agent::{self, Backoff, LinkConfig, LinkEvent, Replay, StatusWatch};
+    let state = home.join(".cctg");
+    let (outbox, mut events) = agent::spawn(LinkConfig {
+        addr: cctg::tls::HubAddr::plain(hub.agent_addr.to_string()),
+        secret: Secret::parse(SECRET).unwrap(),
+        register: Register {
+            session_id: A.into(),
+            host: HOST.into(),
+            cwd: CWD.into(),
+            claude_pid: Some(10),
+            verdict_ack: true,
+            transcript_reads: false,
+            console_keys: false,
+            console_commands: false,
+            console_line_chars: 0,
+            client: None,
+            files: false,
+            session_reads: false,
+            status_lines: true,
+            private_place: false,
+            enrolled: None,
+            heartbeat: false,
+        },
+        backoff: Backoff::default(),
+        replay: Some(Replay {
+            spool: cctg::spool::dir(&state),
+            hook_addr: cctg::tls::HubAddr::plain(relay.addr.as_str()),
+        }),
+        heartbeat: Default::default(),
+        status: Some(StatusWatch::new(state)),
+    });
+    let up = async {
+        loop {
+            match events.recv().await {
+                Some(LinkEvent::Up { .. }) => return,
+                Some(_) => continue,
+                None => panic!("link stopped"),
+            }
+        }
+    };
+    tokio::time::timeout(WAIT, up).await.expect("agent up");
+    // An undrained receiver would block the link.
+    let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+    (outbox, drain)
+}
+
+const ANSWER: &str = "answer of turn one";
+
+/// Runs the real `cctg hook Stop` of session A with [`ANSWER`]; its stderr.
+async fn stop_hook(home: &Path) -> String {
+    let input = serde_json::json!({
+        "session_id": A,
+        "transcript_path": "/p/a.jsonl",
+        "cwd": CWD,
+        "hook_event_name": "Stop",
+        "stop_hook_active": false,
+        "last_assistant_message": ANSWER,
+    })
+    .to_string();
+    let home = home.to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut child = common::spawn(
+            common::cctg(&home)
+                .args(["hook", "Stop"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("cctg starts");
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(input.as_bytes());
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(output.status.success(), "{:?}", output.status);
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !stderr.contains(SECRET) && !stderr.contains(ANSWER),
+        "{stderr}"
+    );
+    stderr
+}
+
+/// Sends of [`ANSWER`] into topic `thread`.
+fn answer_sends(ops: &[Op], thread: i64) -> usize {
+    ops.iter()
+        .filter(|op| {
+            matches!(op, Op::Send { thread_id: Some(t), text, .. } if *t == thread && text.contains(ANSWER))
+        })
+        .count()
+}
+
+/// Waits until the spool of `home` holds no file of session A.
+async fn spool_emptied(home: &Path) {
+    let dir = cctg::spool::dir(&home.join(".cctg")).join(A);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_some()) {
+        assert!(tokio::time::Instant::now() < deadline, "the spool emptied");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// TASK-088 acceptance: the hub does not answer the `Stop` hook in time (the
+/// request never reaches it); the hook keeps the event and the session's
+/// agent delivers it, with no other hook: the answer reaches the topic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_the_hub_did_not_answer_in_time_still_reaches_the_topic() {
+    let hub = start_hub("stop-held", Duration::from_millis(50)).await;
+    hub.start(A, 10).await;
+    let relay = relay(hub.hook_addr.clone(), Fault::Hold).await;
+    let home = hook_home("stop-held", &relay.addr);
+    let (_outbox, _drain) = replaying_agent(&hub, &home, &relay).await;
+    hub.agent_bound(100).await;
+
+    let stderr = stop_hook(&home).await;
+    assert!(stderr.contains("kept for the next hook"), "{stderr}");
+    hub.until("the answer in the topic", |ops| answer_sends(ops, 100) == 1)
+        .await;
+    spool_emptied(&home).await;
+}
+
+/// TASK-088: the hub took the `Stop` but its answer came after the hook's
+/// budget; the agent sends the kept copy and the hub drops it as a repeat:
+/// the answer shows exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_the_hub_took_but_answered_late_shows_once() {
+    let hub = start_hub("stop-late", Duration::from_millis(50)).await;
+    hub.start(A, 10).await;
+    let relay = relay(hub.hook_addr.clone(), Fault::LateAnswer).await;
+    let home = hook_home("stop-late", &relay.addr);
+    let (_outbox, _drain) = replaying_agent(&hub, &home, &relay).await;
+    hub.agent_bound(100).await;
+
+    let stderr = stop_hook(&home).await;
+    assert!(stderr.contains("kept for the next hook"), "{stderr}");
+    hub.until("the answer in the topic", |ops| answer_sends(ops, 100) >= 1)
+        .await;
+    spool_emptied(&home).await;
+    // A negative check: the replayed copy never shows.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(answer_sends(&hub.fake.ops(), 100), 1);
+    assert_eq!(relay.connections.load(Ordering::SeqCst), 2);
+}
