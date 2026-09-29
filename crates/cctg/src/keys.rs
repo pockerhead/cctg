@@ -153,21 +153,57 @@ const WAITS: Waits = Waits {
     exit_escapes: 3,
 };
 
-/// Longest command [`type_line`] types, in characters.
-pub const MAX_LINE_CHARS: usize = 200;
+/// Longest command [`type_line`] types, in characters (200 before
+/// TASK-084). Claude Code 2.1.284 takes input that reaches it in one piece
+/// longer than 800 UTF-16 units for a paste and shows `[Pasted text #N]`
+/// instead of the text (probe TASK-084: 800 characters in one write are
+/// typed, 801 become the placeholder, on the console and the byte path);
+/// the placeholder would fail the read-back, and one Backspace erases it
+/// whole, so the rest would eat the user's draft. Every text goes in as
+/// one write or two (`Run`), so no piece of it can pass 800; the margin is
+/// for keys that share its read (a user's keystroke, a focus report).
+pub const MAX_LINE_CHARS: usize = 750;
+
+/// Why [`type_line`] may not type a text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Untypable {
+    /// Nothing but whitespace.
+    Blank,
+    /// A control character (a newline would submit early, Esc or Backspace
+    /// would edit the box), a line or a paragraph separator.
+    NotOneLine,
+    /// A character outside the Basic Multilingual Plane (an emoji): one key
+    /// event per UTF-16 unit, so the typed text could not be erased again
+    /// one Backspace per character.
+    OutsideBmp,
+    /// More than [`MAX_LINE_CHARS`] characters: `chars` of them.
+    TooLong { chars: usize },
+}
 
 /// Whether [`type_line`] may type `text`: one non-blank line of at most
-/// [`MAX_LINE_CHARS`] characters without control characters (a newline
-/// would submit early, Esc or Backspace would edit the box), line or
-/// paragraph separators, or characters outside the Basic Multilingual Plane
-/// (one key event per character, so the typed text can be erased again one
-/// Backspace per character).
+/// [`MAX_LINE_CHARS`] characters (see [`Untypable`]).
 pub fn typable(text: &str) -> bool {
-    !text.trim().is_empty()
-        && text.chars().count() <= MAX_LINE_CHARS
-        && text.chars().all(|c| {
-            !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}') && u32::from(c) <= 0xFFFF
-        })
+    untypable(text).is_none()
+}
+
+/// Why `text` may not be typed, the first rule it breaks in the order of
+/// [`Untypable`]; `None` when it may.
+pub fn untypable(text: &str) -> Option<Untypable> {
+    let chars = text.chars().count();
+    if text.trim().is_empty() {
+        Some(Untypable::Blank)
+    } else if text
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        Some(Untypable::NotOneLine)
+    } else if text.chars().any(|c| u32::from(c) > 0xFFFF) {
+        Some(Untypable::OutsideBmp)
+    } else if chars > MAX_LINE_CHARS {
+        Some(Untypable::TooLong { chars })
+    } else {
+        None
+    }
 }
 
 /// What [`type_line`] did.
@@ -1036,20 +1072,177 @@ mod tests {
         assert!(typable("/model sonnet"));
         assert!(typable("!echo привет"));
         assert!(typable(&"x".repeat(MAX_LINE_CHARS)));
-        for text in [
-            "",
-            "   ",
-            "!echo a\nb",
-            "!echo a\rb",
-            "/x\u{1b}[A",
-            "/x\u{8}",
-            "/x\ty",
-            "/x\u{2028}y",
-            "!echo \u{1F600}",
+        assert!(typable(&"я".repeat(MAX_LINE_CHARS)));
+        for (text, why) in [
+            ("", Untypable::Blank),
+            ("   ", Untypable::Blank),
+            ("!echo a\nb", Untypable::NotOneLine),
+            ("!echo a\rb", Untypable::NotOneLine),
+            ("/x\u{1b}[A", Untypable::NotOneLine),
+            ("/x\u{8}", Untypable::NotOneLine),
+            ("/x\ty", Untypable::NotOneLine),
+            ("/x\u{2028}y", Untypable::NotOneLine),
+            ("!echo \u{1F600}", Untypable::OutsideBmp),
         ] {
             assert!(!typable(text), "{text:?}");
+            assert_eq!(untypable(text), Some(why), "{text:?}");
         }
-        assert!(!typable(&"x".repeat(MAX_LINE_CHARS + 1)));
+        let long = "x".repeat(MAX_LINE_CHARS + 1);
+        assert!(!typable(&long));
+        assert_eq!(
+            untypable(&long),
+            Some(Untypable::TooLong {
+                chars: MAX_LINE_CHARS + 1
+            })
+        );
+        // A line that breaks several rules is refused for the first one.
+        assert_eq!(
+            untypable(&format!("{long}\n\u{1F600}")),
+            Some(Untypable::NotOneLine)
+        );
+        assert_eq!(
+            untypable(&format!("{long}\u{1F600}")),
+            Some(Untypable::OutsideBmp)
+        );
+    }
+
+    /// Claude Code takes a piece of input longer than this, in UTF-16
+    /// units, for a paste (2.1.284: `A.key.length>B8`, `B8=800`; probe
+    /// TASK-084).
+    const PASTE_THRESHOLD: usize = 800;
+
+    #[test]
+    fn the_longest_line_stays_under_the_paste_threshold() {
+        // A typable text is BMP only: characters are UTF-16 units. Both
+        // writes of it together stay under the threshold.
+        const { assert!(MAX_LINE_CHARS < PASTE_THRESHOLD) };
+        let text = "я".repeat(MAX_LINE_CHARS);
+        assert!(typable(&text));
+        assert!(text.encode_utf16().count() < PASTE_THRESHOLD);
+    }
+
+    #[test]
+    fn a_line_of_the_longest_length_is_read_back_over_wrapped_rows() {
+        // Probe TASK-084 (2.1.284, 120 columns): 800 characters of
+        // `!echo w0001 … END84` in one write, shown in bash mode over seven
+        // rows, broken after a word, the rows after the first indented.
+        let mut command = "!echo".to_owned();
+        let mut i = 1;
+        while command.len() + " w0000 END".len() <= MAX_LINE_CHARS {
+            command.push_str(&format!(" w{i:04}"));
+            i += 1;
+        }
+        command.push_str(" END");
+        command.push_str(&"x".repeat(MAX_LINE_CHARS - command.len()));
+        assert_eq!(command.chars().count(), MAX_LINE_CHARS);
+        let mut rows = Vec::new();
+        let mut row = "!\u{a0}echo".to_owned();
+        for word in command["!echo ".len()..].split(' ') {
+            if row.chars().count() + 1 + word.len() > 118 {
+                rows.push(std::mem::replace(&mut row, format!("  {word}")));
+            } else {
+                row.push(' ');
+                row.push_str(word);
+            }
+        }
+        rows.push(row);
+        assert!(rows.len() >= 6, "{}", rows.len());
+        assert!(box_shows(&rows, &command));
+        // One character less, or more, in any row is not the command.
+        let mut short = rows.clone();
+        short[3].pop();
+        assert!(!box_shows(&short, &command));
+        let mut draft = rows.clone();
+        draft.last_mut().unwrap().push('z');
+        assert!(!box_shows(&draft, &command));
+        // The placeholder Claude Code shows for a longer piece is never
+        // taken for the text.
+        let pasted = screen(&["\u{276f}\u{a0}[Pasted text #1]"]);
+        assert!(!box_shows(&pasted, &command));
+    }
+
+    #[test]
+    fn a_line_of_the_longest_length_goes_through_a_narrow_screen() {
+        // The typing both platforms share, on a vt100 copy 100 columns wide
+        // and 30 rows high (the box of 750 characters takes 8 rows).
+        let text = format!("!echo {}", "abcdefghi ".repeat(80));
+        let text = text[..MAX_LINE_CHARS].trim_end().to_owned();
+        let mut claude = Wide::default();
+        assert_eq!(
+            watch(&mut claude, &text, After::Nothing, QUICK),
+            (Typed::Sent, None)
+        );
+        assert_eq!(claude.sent, std::slice::from_ref(&text));
+        // With a draft of the user's in the box: every typed character is
+        // erased again, the draft stays.
+        let mut claude = Wide {
+            draft: "fix the".into(),
+            ..Wide::default()
+        };
+        assert_eq!(
+            watch(&mut claude, &text, After::Nothing, QUICK),
+            (Typed::Draft, None)
+        );
+        assert_eq!(
+            (claude.draft.as_str(), claude.input.as_str()),
+            ("fix the", "")
+        );
+        assert!(claude.sent.is_empty());
+    }
+
+    /// A claude stand-in whose box wraps a long input the way Claude Code
+    /// does (probe TASK-057/084): 100 columns, broken after a word, the
+    /// rows after the first indented by two spaces.
+    #[derive(Default)]
+    struct Wide {
+        draft: String,
+        input: String,
+        sent: Vec<String>,
+    }
+
+    impl Terminal for Wide {
+        fn rows(&mut self) -> Option<crate::term::Rows> {
+            const COLS: usize = 100;
+            let value = format!("{}{}", self.draft, self.input);
+            let mut rows = vec!["\u{25cf} earlier answer".to_owned(), RULE.to_owned()];
+            let mut row = "\u{276f}\u{a0}".to_owned();
+            for (index, word) in value.split(' ').enumerate() {
+                if index > 0 && row.chars().count() + 1 + word.chars().count() > COLS {
+                    rows.push(std::mem::replace(&mut row, format!("  {word}")));
+                } else {
+                    if index > 0 {
+                        row.push(' ');
+                    }
+                    row.push_str(word);
+                }
+            }
+            rows.push(row);
+            rows.push(RULE.to_owned());
+            rows.push("  \u{23f5}\u{23f5} auto mode on".to_owned());
+            assert!(rows.len() <= 30, "the box fits the screen");
+            let mut screen = crate::term::Screen::new(30, COLS as u16 + 20);
+            screen.feed(rows.join("\r\n").as_bytes());
+            screen.rows()
+        }
+
+        fn write(&mut self, text: &str) -> bool {
+            for c in text.chars() {
+                match c {
+                    '\r' => {
+                        self.sent.push(format!("{}{}", self.draft, self.input));
+                        self.draft.clear();
+                        self.input.clear();
+                    }
+                    '\u{8}' => {
+                        if self.input.pop().is_none() {
+                            self.draft.pop();
+                        }
+                    }
+                    c => self.input.push(c),
+                }
+            }
+            true
+        }
     }
 
     /// A claude stand-in for [`watch`], the typing both platforms share: an

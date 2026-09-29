@@ -249,6 +249,7 @@ impl Claude {
             transcript_reads: false,
             console_keys: false,
             console_commands: false,
+            console_line_chars: 0,
             client: None,
             files: true,
             session_reads: false,

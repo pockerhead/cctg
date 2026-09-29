@@ -551,6 +551,7 @@ impl Agent {
             transcript_reads: false,
             console_keys: true,
             console_commands: true,
+            console_line_chars: 0,
             client: None,
             files: false,
             session_reads: false,

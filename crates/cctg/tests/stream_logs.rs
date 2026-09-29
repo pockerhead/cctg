@@ -163,6 +163,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
                 transcript_reads: true,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
