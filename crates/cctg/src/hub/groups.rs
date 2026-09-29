@@ -124,11 +124,28 @@ pub fn membership(supergroup: bool, is_forum: bool, member: &ChatMember) -> Memb
 
 /// Told in a group's General once sessions may show there.
 pub const GROUP_READY_NOTICE: &str = "Группа подключена к cctg. Сессию из лички можно показать здесь: 👥 на статусе сессии, в меню или /share в её теме.";
+/// [`GROUP_READY_NOTICE`] while the bot's private chat has no topics
+/// (Threaded Mode off): nothing can be shared then.
+pub const GROUP_READY_NO_SHARE_NOTICE: &str = "Группа подключена к cctg, но показать здесь сессию пока нельзя: у бота выключены темы в личке (Threaded Mode в @BotFather). Включите их и перезапустите hub.";
 /// Added to the notices of a group where the bot may not delete messages.
 pub const NO_DELETE_LINE: &str = "Без права \"Удаление сообщений\" служебные строки о темах останутся видны, а когда сессию уберут из группы, её тема не удалится.";
+
 /// `/connect` could not be checked with Telegram.
-pub const CONNECT_FAILED_NOTICE: &str =
-    "Не удалось проверить права бота в группе. Напишите /connect ещё раз чуть позже.";
+pub fn connect_failed_notice(username: Option<&str>) -> String {
+    format!(
+        "Не удалось проверить права бота в группе. Напишите {} ещё раз чуть позже.",
+        connect_command(username)
+    )
+}
+
+/// `/connect@<bot>`: a bot that is no administrator (privacy mode) sees
+/// only commands with its name.
+fn connect_command(username: Option<&str>) -> String {
+    match username {
+        Some(username) => format!("/connect@{username}"),
+        None => "/connect".to_owned(),
+    }
+}
 /// The default group's name when Telegram gave none.
 pub const DEFAULT_GROUP_TITLE: &str = "основная группа";
 /// UTF-16 units of a group title on a button or in a menu row.
@@ -153,10 +170,7 @@ pub fn not_ready_notice(missing: &[Missing], basic: bool, username: Option<&str>
             Missing::ManageTopics => "дайте боту право \"Управление темами\"",
         })
         .collect();
-    let command = match username {
-        Some(username) => format!("/connect@{username}"),
-        None => "/connect".to_owned(),
-    };
+    let command = connect_command(username);
     format!(
         "Бот в группе, но показывать здесь сессии пока нельзя: {}. Исправьте и напишите здесь {command}.",
         items.join("; ")
@@ -470,12 +484,20 @@ mod tests {
         let basic = not_ready_notice(&[Missing::Topics], true, None);
         assert!(basic.contains("супергруппой"), "{basic}");
         assert!(basic.ends_with("напишите здесь /connect."), "{basic}");
+        // A bot in privacy mode sees only `/connect@<bot>` (TASK-069 review).
+        let failed = connect_failed_notice(Some("cctg_bot"));
+        assert!(
+            failed.contains("Напишите /connect@cctg_bot ещё раз"),
+            "{failed}"
+        );
+        assert!(connect_failed_notice(None).contains("Напишите /connect ещё раз"));
         for text in [
             text,
             basic,
+            failed,
             GROUP_READY_NOTICE.to_owned(),
+            GROUP_READY_NO_SHARE_NOTICE.to_owned(),
             NO_DELETE_LINE.to_owned(),
-            CONNECT_FAILED_NOTICE.to_owned(),
         ] {
             assert!(text.chars().count() < 300, "{text}");
         }

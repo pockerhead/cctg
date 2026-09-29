@@ -909,16 +909,22 @@ impl Registry {
             .map(SlotId)
     }
 
-    /// The bot writes to `chat` now: the default group, a known group it
-    /// has not left (TASK-069), or a private chat while private chats are
-    /// on and it is not closed (TASK-063).
+    /// The bot writes to `chat` now: a known group it has not left, the
+    /// default group also without a record (TASK-069), or a private chat
+    /// while private chats are on and it is not closed (TASK-063).
     pub fn usable(&self, chat: Chat) -> bool {
         match chat {
-            Chat::Group(group) => {
-                group == self.default_group || self.group(group).is_some_and(|known| !known.left)
-            }
+            Chat::Group(group) => self
+                .group(group)
+                .map_or(group == self.default_group, |known| !known.left),
             Chat::Private(private) => self.private && !self.closed.contains(&private),
         }
+    }
+
+    /// `chat` is a known group the bot left (TASK-069): nothing goes there.
+    /// A group without a record is not: a `/connect` there is answered.
+    pub fn left(&self, chat: Chat) -> bool {
+        matches!(chat, Chat::Group(group) if self.group(group).is_some_and(|known| known.left))
     }
 
     /// The default group (`CCTG_CHAT_ID`) as a chat.
