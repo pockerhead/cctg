@@ -14,10 +14,14 @@
 //! [`post`] again with the same value re-sends the same event, which the hub
 //! drops as a repeat.
 //!
-//! A session start or end the hub did not take is kept in the device spool
+//! A session start or end, or an event of a turn (prompt, answer, subagent,
+//! compaction), that the hub did not take is kept in the device spool
 //! ([`crate::spool`]); every hook of the same session first sends what its
 //! session has kept, in order, then its own event. Everything shares the one
-//! POST budget: a hub that is down costs a hook no more than before.
+//! POST budget: a hub that is down costs a hook no more than before. The
+//! session's agent sends what its session kept within about a second while
+//! its hub link is up (TASK-088). A 4xx answer to a turn event is final: it
+//! is not kept.
 //!
 //! `cctg hook PermissionRequest` is the one hook that waits: it asks the hub
 //! for an answer from Telegram ([`crate::wire::PERMISSION_PATH`]) and prints
@@ -166,14 +170,21 @@ pub async fn run(event: &str) {
     let Err(error) = deliver(spool.as_deref(), &hub, secret, &hook_post, timeout).await else {
         return;
     };
+    // The hub read the event and refused it: it would refuse it again.
+    let refused = matches!(error, Undelivered::Own(PostError::Status(400..=499)))
+        && spool::is_turn(&hook_post.event);
     let kept = match spool {
+        _ if refused => Err(spool::SpoolError::NotKept),
         Some(root) => spool::save(&root, &hook_post, SystemTime::now()),
         None if !spool::keeps(&hook_post.event) => Err(spool::SpoolError::NotKept),
         None => Err(spool::SpoolError::Io(std::io::ErrorKind::NotFound)),
     };
     match kept {
-        Ok(()) => {
+        Ok(0) => {
             warn!(event = hook_post.event.kind(), %error, "hook event not delivered; kept for the next hook")
+        }
+        Ok(evicted) => {
+            warn!(event = hook_post.event.kind(), %error, evicted, "hook event not delivered; kept for the next hook")
         }
         Err(spool::SpoolError::NotKept) => {
             warn!(event = hook_post.event.kind(), %error, "hook event not delivered");
@@ -622,29 +633,43 @@ fn held_body(answer: &[u8]) -> Result<Option<&[u8]>, PostError> {
     }
 }
 
+/// Why `deliver` did not deliver `post`: a kept event before it failed
+/// (the own event was not tried), or the own event failed.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum Undelivered {
+    #[error("{0}")]
+    Kept(PostError),
+    #[error("{0}")]
+    Own(PostError),
+}
+
 /// Sends what the session kept in `spool` (when there is one), then `post`,
 /// all within `timeout`. An error means `post` did not reach the hub: either
-/// it failed itself or a kept event before it did (then it was not tried,
-/// so the order holds).
+/// a kept event before it failed ([`Undelivered::Kept`]: then it was not
+/// tried, so the order holds) or it failed itself ([`Undelivered::Own`]).
 async fn deliver(
     spool: Option<&Path>,
     addr: &HubAddr,
     secret: &Secret,
     hook_post: &HookPost,
     timeout: Duration,
-) -> Result<(), PostError> {
+) -> Result<(), Undelivered> {
     let deadline = tokio::time::Instant::now() + timeout;
     if let Some(root) = spool {
-        let sent = spool::replay(root, &hook_post.session_id, addr, secret, deadline).await?;
+        let sent = spool::replay(root, &hook_post.session_id, addr, secret, deadline)
+            .await
+            .map_err(Undelivered::Kept)?;
         if sent > 0 {
             debug!(sent, "kept hook events delivered");
         }
     }
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
     if left.is_zero() {
-        return Err(PostError::Timeout(timeout));
+        return Err(Undelivered::Own(PostError::Timeout(timeout)));
     }
-    post(addr, secret, hook_post, left).await
+    post(addr, secret, hook_post, left)
+        .await
+        .map_err(Undelivered::Own)
 }
 
 /// The POST budget of `event`; `tls`: the hub is reached over TLS.
@@ -1229,7 +1254,10 @@ mod tests {
             timeout,
         )
         .await;
-        assert!(matches!(result, Err(PostError::Timeout(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(Undelivered::Kept(PostError::Timeout(_)))),
+            "{result:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "{:?}",
@@ -1274,10 +1302,39 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert_eq!(result, Err(PostError::Status(503)));
+        assert_eq!(result, Err(Undelivered::Kept(PostError::Status(503))));
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Time was left, yet the own event was not sent past the kept start.
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// TASK-088: the hook keeps a turn event back only when the hub did not
+    /// refuse it; a refusal of the own event is told apart from a kept one's.
+    #[tokio::test]
+    async fn a_refused_own_event_is_reported_as_own() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let result = deliver(
+            None,
+            &HubAddr::plain(addr.as_str()),
+            &secret(),
+            &sample(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(result, Err(Undelivered::Own(PostError::Status(400))));
     }
 
     fn permission_post() -> PermissionPost {

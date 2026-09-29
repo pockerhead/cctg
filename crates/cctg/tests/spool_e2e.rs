@@ -244,10 +244,11 @@ async fn a_missed_session_start_reaches_the_hub_before_the_next_hook() {
     assert!(home.kept().is_empty());
 }
 
-/// Only session starts and ends are kept, never a prompt or an answer, and
-/// a session keeps at most `MAX_PER_SESSION` files.
+/// Turn events are kept too (TASK-088): the answer of a `Stop`, but never
+/// the prompt text (a `UserPromptSubmit` posts only its id) or the secret;
+/// a session keeps at most `MAX_PER_SESSION` files for its starts and ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_spool_holds_no_text_and_is_bounded() {
+async fn turn_events_are_kept_and_the_spool_is_bounded() {
     let port = refusing_hub().await;
     let (_agent_port, agent_port) = common::held_port();
     let home = std::sync::Arc::new(Home::new("bounded", port, agent_port));
@@ -258,8 +259,8 @@ async fn the_spool_holds_no_text_and_is_bounded() {
             serde_json::json!({"last_assistant_message": "private answer text"}),
         );
         let stderr = hook(&h, "Stop", stop);
-        assert!(stderr.contains("hook event not delivered"), "{stderr}");
-        hook(
+        assert!(stderr.contains("kept for the next hook"), "{stderr}");
+        let stderr = hook(
             &h,
             "UserPromptSubmit",
             input(
@@ -267,10 +268,23 @@ async fn the_spool_holds_no_text_and_is_bounded() {
                 serde_json::json!({"prompt": "private prompt text", "prompt_id": "p1"}),
             ),
         );
+        assert!(stderr.contains("kept for the next hook"), "{stderr}");
     })
     .await
     .unwrap();
-    assert!(home.kept().is_empty(), "no prompt or answer is kept");
+    let turns = home.kept();
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    assert!(
+        turns
+            .iter()
+            .all(|(path, _)| path.to_string_lossy().ends_with(".turn.json"))
+    );
+    assert!(turns[0].1.contains("private answer text"));
+    assert!(
+        turns
+            .iter()
+            .all(|(_, text)| !text.contains("private prompt text") && !text.contains(SECRET))
+    );
     let h = home.clone();
     let last = blocking(move || {
         let mut last = String::new();
@@ -295,8 +309,12 @@ async fn the_spool_holds_no_text_and_is_bounded() {
     .unwrap();
     assert!(last.contains("not kept") && last.contains("full"), "{last}");
     let kept = home.kept();
+    // The two turn files count against the bound of starts and ends.
     assert_eq!(kept.len(), cctg::spool::MAX_PER_SESSION);
-    for (_, text) in &kept {
+    for (path, text) in &kept {
+        if path.to_string_lossy().ends_with(".turn.json") {
+            continue;
+        }
         assert!(!text.contains("private"), "{text}");
         assert!(!text.contains(SECRET));
         let value: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -320,6 +338,54 @@ async fn the_spool_holds_no_text_and_is_bounded() {
             ]
         );
     }
+}
+
+/// TASK-088, the headless path (no agent): a `Stop` that found the hub down
+/// is kept and reaches the hub before the next prompt, once each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missed_stop_reaches_the_hub_before_the_next_prompt() {
+    let (hook_held, hook_port) = common::held_port();
+    let (_agent_port, agent_port) = common::held_port();
+    let home = std::sync::Arc::new(Home::new("missed-stop", hook_port, agent_port));
+    let h = home.clone();
+    let stderr = blocking(move || {
+        hook(
+            &h,
+            "Stop",
+            input(
+                "Stop",
+                serde_json::json!({"last_assistant_message": "answer of turn one"}),
+            ),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(stderr.contains("kept for the next hook"), "{stderr}");
+    assert!(!stderr.contains("answer of turn one"), "{stderr}");
+    assert_eq!(home.kept().len(), 1);
+
+    let mut events = hooks_hub(hook_held);
+    let h = home.clone();
+    blocking(move || {
+        hook(
+            &h,
+            "UserPromptSubmit",
+            input(
+                "UserPromptSubmit",
+                serde_json::json!({"prompt": "private prompt text", "prompt_id": "p2"}),
+            ),
+        )
+    })
+    .await
+    .unwrap();
+    let first = next(&mut events).await;
+    assert!(
+        matches!(&first.event, HookEvent::Stop { last_assistant_message: Some(text), .. } if text == "answer of turn one"),
+        "{first:?}"
+    );
+    assert_eq!(next(&mut events).await.event.kind(), "user_prompt_submit");
+    nothing_more(&mut events).await;
+    assert!(home.kept().is_empty(), "the spool is empty after delivery");
 }
 
 struct Agent(Child);

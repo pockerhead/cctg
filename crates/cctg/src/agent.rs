@@ -21,10 +21,15 @@
 //! arrives, so the agent remembers recent ids across reconnects and passes
 //! each on only once.
 //!
-//! After every registration the agent sends the session starts and ends its
-//! session's hooks could not deliver ([`crate::spool`]) to the hub's hook
-//! endpoint: a session that started while the hub was down becomes known as
-//! soon as the hub is back, without waiting for its next hook.
+//! After every registration, and while registered within about a second of
+//! a hook keeping one, the agent sends the hook events its session's hooks
+//! could not deliver ([`crate::spool`]) to the hub's hook endpoint: those of
+//! its session and of the session the hub bound it to (after `/clear` the env
+//! id is stale). A session that started while the hub was down becomes known
+//! as soon as the hub is back, and a turn's answer whose `Stop` hook ran out
+//! of time still reaches the topic, without waiting for the next hook. After
+//! failures it waits longer (2 s doubling to 60 s); once a minute it sweeps
+//! old spool files.
 //!
 //! The agent also presses Esc in its claude's terminal when the hub asks
 //! (`console_key`, see [`crate::keys`]) and answers whether the key events
@@ -83,6 +88,7 @@ use crate::compress::{self, COMPRESS_TIMEOUT, Compressor};
 use crate::device::{self, DeviceConfig};
 use crate::download;
 use crate::files;
+use crate::hook::PostError;
 use crate::keys::{self, Typed};
 use crate::proctree;
 use crate::reads;
@@ -101,8 +107,14 @@ use crate::wire::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE: usize = 256;
-/// Budget of one spool replay after a registration.
+/// Budget of one spool replay.
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a registered link looks for kept hook events.
+const SPOOL_POLL: Duration = Duration::from_secs(1);
+/// Longest pause after failed replays.
+const SPOOL_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// How often a registered link deletes old spool files of every session.
+const SPOOL_SWEEP: Duration = Duration::from_secs(60);
 /// Verdict ids remembered for dropping a verdict the hub sent again.
 const RECENT_VERDICTS: usize = 256;
 /// How often the link looks at its session's status line numbers.
@@ -250,36 +262,132 @@ pub struct Replay {
     pub hook_addr: HubAddr,
 }
 
-/// Sends the kept hook events of the registered session. Its own task: the
-/// link does not wait for it. At most one runs: a registration while the
-/// last replay still runs starts none. A replay of a hook at the same time
-/// only sends an event twice, and the hub keeps one.
-fn spawn_replay(config: &LinkConfig, running: &mut Option<JoinHandle<()>>) {
-    if running.as_ref().is_some_and(|task| !task.is_finished()) {
+/// The link's spool replay (TASK-088), owned by [`run`].
+#[derive(Default)]
+struct Replaying {
+    task: Option<JoinHandle<Result<usize, PostError>>>,
+    /// Replays that failed in a row.
+    failures: u32,
+    /// No poll-started replay before this.
+    not_before: Option<Instant>,
+}
+
+/// The sessions whose kept events the link sends: its own (env) session,
+/// then the session the hub bound it to when that is another one.
+fn replay_sessions(config: &LinkConfig) -> Vec<String> {
+    let mut sessions = vec![config.register.session_id.clone()];
+    let bound = config
+        .status
+        .as_ref()
+        .and_then(|watch| watch.bound.lock().ok().and_then(|bound| bound.clone()));
+    if let Some(bound) = bound
+        && bound != sessions[0]
+    {
+        sessions.push(bound);
+    }
+    sessions
+}
+
+/// Sends the kept hook events of `sessions`, each session in order and on
+/// its own, within one [`REPLAY_TIMEOUT`]: a session whose spool is stuck
+/// (the stale env session after `/clear`) never holds back the next one. The
+/// first error is the task's result, for the backoff. Its own task: the link
+/// does not wait for it. At most one runs: a start while the last replay
+/// still runs starts none. A replay of a hook at the same time only sends an
+/// event twice, and the hub keeps one.
+fn spawn_replay(config: &LinkConfig, sessions: Vec<String>, replaying: &mut Replaying) {
+    if replaying.task.is_some() {
         return;
     }
     let Some(replay) = config.replay.clone() else {
         return;
     };
-    let (session, secret) = (config.register.session_id.clone(), config.secret.clone());
-    *running = Some(tokio::spawn(async move {
+    let secret = config.secret.clone();
+    replaying.task = Some(tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + REPLAY_TIMEOUT;
-        match spool::replay(
-            &replay.spool,
-            &session,
-            &replay.hook_addr,
-            &secret,
-            deadline,
-        )
-        .await
-        {
-            Ok(0) => {}
-            Ok(sent) => info!(sent, "kept hook events delivered"),
-            Err(error) => {
-                warn!(%error, "kept hook events not delivered; the next hook tries again")
+        let mut total = 0;
+        let mut failed = None;
+        for session in &sessions {
+            match spool::replay(&replay.spool, session, &replay.hook_addr, &secret, deadline).await
+            {
+                Ok(sent) => total += sent,
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
             }
         }
+        if total > 0 {
+            info!(sent = total, "kept hook events delivered");
+        }
+        failed.map_or(Ok(total), Err)
     }));
+}
+
+/// Takes the result of a finished replay: a success clears the backoff, a
+/// failure doubles it (2 s up to [`SPOOL_BACKOFF_MAX`]), warning once per
+/// run of failures.
+async fn reap(replaying: &mut Replaying) {
+    if !replaying.task.as_ref().is_some_and(JoinHandle::is_finished) {
+        return;
+    }
+    let Some(task) = replaying.task.take() else {
+        return;
+    };
+    let error = match task.await {
+        Ok(Ok(_)) => {
+            replaying.failures = 0;
+            replaying.not_before = None;
+            return;
+        }
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "the replay task stopped".to_owned(),
+    };
+    if replaying.failures == 0 {
+        warn!(%error, "kept hook events not delivered; retrying");
+    } else {
+        debug!(%error, failures = replaying.failures, "kept hook events not delivered again");
+    }
+    replaying.failures = replaying.failures.saturating_add(1);
+    let factor = 1u32
+        .checked_shl(replaying.failures.min(31))
+        .unwrap_or(u32::MAX);
+    let pause = SPOOL_POLL.saturating_mul(factor).min(SPOOL_BACKOFF_MAX);
+    replaying.not_before = Some(Instant::now() + pause);
+}
+
+/// One look of a registered link at the spool: starts a replay when one of
+/// its sessions has kept events, none runs and the backoff allows it. An
+/// empty spool ends the backoff: whatever failed was sent by someone else (a
+/// hook) or aged out, so the next kept event goes within a poll.
+async fn poll_spool(config: &LinkConfig, replaying: &mut Replaying) {
+    reap(replaying).await;
+    let Some(replay) = &config.replay else {
+        return;
+    };
+    if replaying.task.is_some() {
+        return;
+    }
+    let sessions = replay_sessions(config);
+    // Names only, a directory or two: inline, once a second.
+    if !sessions
+        .iter()
+        .any(|session| spool::has_kept(&replay.spool, session))
+    {
+        replaying.failures = 0;
+        replaying.not_before = None;
+        return;
+    }
+    if replaying.not_before.is_none_or(|at| Instant::now() >= at) {
+        spawn_replay(config, sessions, replaying);
+    }
+}
+
+/// Deletes old spool files of every session, off the loop; nobody waits.
+fn spawn_sweep(config: &LinkConfig) {
+    if let Some(replay) = &config.replay {
+        let root = replay.spool.clone();
+        tokio::task::spawn_blocking(move || spool::sweep(&root, SystemTime::now()));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,7 +432,7 @@ async fn run(
     let mut attempt = 0u32;
     let mut last_error = String::new();
     let mut verdicts = VecDeque::with_capacity(RECENT_VERDICTS);
-    let mut replaying = None;
+    let mut replaying = Replaying::default();
     loop {
         if outbox.is_closed() || events.is_closed() {
             return;
@@ -340,7 +448,11 @@ async fn run(
                 attempt = 0;
                 last_error.clear();
                 info!("registered with the hub");
-                spawn_replay(&config, &mut replaying);
+                reap(&mut replaying).await;
+                replaying.failures = 0;
+                replaying.not_before = None;
+                spawn_replay(&config, replay_sessions(&config), &mut replaying);
+                spawn_sweep(&config);
                 if events.send(LinkEvent::Up { files, albums }).await.is_err() {
                     return;
                 }
@@ -356,7 +468,8 @@ async fn run(
                     &mut outbox,
                     &events,
                     &mut verdicts,
-                    config.status.as_ref(),
+                    &config,
+                    &mut replaying,
                 )
                 .await;
                 if stopped || events.send(LinkEvent::Down).await.is_err() {
@@ -449,14 +562,18 @@ struct Link {
 /// `false` when the link dropped (reconnect). `verdicts`: ids of verdicts
 /// already passed on, newest last. The hub's pings end here and never
 /// reach the owner, so a busy owner does not hold them up; so do its
-/// `bound`s, after which the link sends the numbers of `status` itself.
+/// `bound`s, after which the link sends the numbers of `config.status`
+/// itself. While it runs, the link sends kept hook events once a second
+/// when there are some ([`Replaying`]).
 async fn serve(
     link: Link,
     outbox: &mut mpsc::Receiver<AgentMsg>,
     events: &mpsc::Sender<LinkEvent>,
     verdicts: &mut VecDeque<u64>,
-    status: Option<&StatusWatch>,
+    config: &LinkConfig,
+    replaying: &mut Replaying,
 ) -> bool {
+    let status = config.status.as_ref();
     let Link {
         reader,
         mut write,
@@ -469,6 +586,10 @@ async fn serve(
     let mut numbers: Option<StatusState> = None;
     let mut poll = tokio::time::interval(STATUS_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut spool_poll = tokio::time::interval(SPOOL_POLL);
+    spool_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The registration swept just now.
+    let mut swept = Instant::now();
     let stopped = loop {
         let next_beat = liveness.next();
         // What to write to the hub now.
@@ -534,6 +655,14 @@ async fn serve(
                 None => break true,
             },
             _ = poll.tick(), if numbers.is_some() => numbers.as_mut().and_then(StatusState::due),
+            _ = spool_poll.tick(), if config.replay.is_some() => {
+                poll_spool(config, replaying).await;
+                if swept.elapsed() >= SPOOL_SWEEP {
+                    swept = Instant::now();
+                    spawn_sweep(config);
+                }
+                None
+            }
             beat = wire::beat(next_beat) => match beat {
                 Beat::Ping => Some(AgentMsg::Ping),
                 // A frame read meanwhile goes first.
@@ -2441,13 +2570,307 @@ mod tests {
             spool: spool_dir,
             hook_addr,
         });
-        let mut running = None;
-        spawn_replay(&link, &mut running);
+        let mut running = Replaying::default();
+        spawn_replay(&link, replay_sessions(&link), &mut running);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        spawn_replay(&link, &mut running);
+        spawn_replay(&link, replay_sessions(&link), &mut running);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
-        running.take().unwrap().abort();
+        running.task.take().unwrap().abort();
+    }
+
+    fn kept_stop(session: &str) -> crate::wire::HookPost {
+        crate::wire::HookPost::new(
+            "box".into(),
+            session.into(),
+            "/w".into(),
+            "/w/s.jsonl".into(),
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: Some("answer".into()),
+            },
+        )
+    }
+
+    /// A hub whose agent listener and hook endpoint run in process; the
+    /// link's replays go to its hook endpoint.
+    struct SpoolHub {
+        agents: mpsc::Receiver<AgentEvent>,
+        hooks: mpsc::Receiver<crate::wire::HookPost>,
+        link: LinkConfig,
+        _tasks: [tokio::task::JoinHandle<()>; 2],
+    }
+
+    async fn spool_hub(spool_dir: PathBuf, status: Option<StatusWatch>) -> SpoolHub {
+        let secret = Secret::parse(SECRET).unwrap();
+        let agent_listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let hook_listener = ingress::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let mut link = config(agent_listener.local_addr().unwrap(), Backoff::default());
+        link.replay = Some(Replay {
+            spool: spool_dir,
+            hook_addr: HubAddr::plain(hook_listener.local_addr().unwrap().to_string()),
+        });
+        link.status = status;
+        let (agents_tx, agents) = mpsc::channel(16);
+        let (hooks_tx, hooks) = mpsc::channel(16);
+        let tasks = [
+            tokio::spawn(ingress::serve_agents(
+                agent_listener,
+                secret.clone(),
+                agents_tx,
+            )),
+            tokio::spawn(ingress::serve_hooks(hook_listener, secret, hooks_tx)),
+        ];
+        SpoolHub {
+            agents,
+            hooks,
+            link,
+            _tasks: tasks,
+        }
+    }
+
+    /// Waits until `session` has no kept file left.
+    async fn spool_empty(root: &Path, session: &str) {
+        let deadline = Instant::now() + WAIT;
+        while spool::has_kept(root, session) {
+            assert!(Instant::now() < deadline, "the spool emptied");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// TASK-088: a `Stop` a hook kept while the link is up goes out within
+    /// a poll, without another registration or hook.
+    #[tokio::test]
+    async fn a_turn_event_kept_while_registered_goes_out_within_a_poll() {
+        let dir = crate::hub::testdir::TempDir::new("agent-spool-poll");
+        let spool_dir = dir.path().join("spool");
+        let mut hub = spool_hub(spool_dir.clone(), None).await;
+        let (_outbox, _events) = spawn(hub.link.clone());
+        let _ = registered(&mut hub.agents).await;
+        // The registration's replay found nothing; then a hook keeps one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stop = kept_stop(&register().session_id);
+        spool::save(&spool_dir, &stop, SystemTime::now()).unwrap();
+        let got = tokio::time::timeout(SPOOL_POLL + Duration::from_secs(2), hub.hooks.recv())
+            .await
+            .expect("the kept stop within a poll");
+        assert_eq!(got, Some(stop));
+        spool_empty(&spool_dir, &register().session_id).await;
+    }
+
+    /// TASK-088: after `/clear` the hub binds the link to another session;
+    /// that session's kept events go out too.
+    #[tokio::test]
+    async fn a_kept_event_of_the_bound_session_goes_out() {
+        const OTHER: &str = "5e551017-0000-4000-8000-000000000002";
+        let dir = crate::hub::testdir::TempDir::new("agent-spool-bound");
+        let spool_dir = dir.path().join("spool");
+        let watch = StatusWatch::new(dir.path().to_owned());
+        let mut hub = spool_hub(spool_dir.clone(), Some(watch)).await;
+        let (_outbox, _events) = spawn(hub.link.clone());
+        let (_, to_agent) = registered(&mut hub.agents).await;
+        to_agent
+            .send(HubMsg::Bound {
+                session_id: OTHER.into(),
+            })
+            .await
+            .unwrap();
+        let stop = kept_stop(OTHER);
+        spool::save(&spool_dir, &stop, SystemTime::now()).unwrap();
+        let got = tokio::time::timeout(WAIT, hub.hooks.recv())
+            .await
+            .expect("the bound session's stop");
+        assert_eq!(got, Some(stop));
+        spool_empty(&spool_dir, OTHER).await;
+    }
+
+    /// TASK-088: a spool the hook endpoint keeps failing is retried with a
+    /// growing pause, not every second.
+    #[tokio::test]
+    async fn a_failing_spool_is_retried_with_backoff() {
+        let dir = crate::hub::testdir::TempDir::new("agent-spool-backoff");
+        let spool_dir = dir.path().join("spool");
+        spool::save(
+            &spool_dir,
+            &kept_stop(&register().session_id),
+            SystemTime::now(),
+        )
+        .unwrap();
+        // Answers every request 503 at once and counts them.
+        let refusing = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let hook_addr = HubAddr::plain(refusing.local_addr().unwrap().to_string());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            while let Ok((mut stream, _)) = refusing.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let mut hub = spool_hub(spool_dir.clone(), None).await;
+        hub.link.replay = Some(Replay {
+            spool: spool_dir.clone(),
+            hook_addr,
+        });
+        let (_outbox, _events) = spawn(hub.link.clone());
+        let _ = registered(&mut hub.agents).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Registration, then 2 s and 4 s pauses: 2 or 3. A poll every
+        // second would make about 6.
+        let seen = requests.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=3).contains(&seen), "{seen} requests in 5 s");
+        assert!(spool::has_kept(&spool_dir, &register().session_id));
+    }
+
+    /// A hook endpoint that answers 400 to a `session_start` and 204 to any
+    /// other event, and records the (session, kind) of each, after reading
+    /// the whole request.
+    async fn refusing_starts() -> (HubAddr, Arc<Mutex<Vec<(String, String)>>>) {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = HubAddr::plain(listener.local_addr().unwrap().to_string());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    let Ok(read) = stream.read(&mut buf).await else {
+                        break None;
+                    };
+                    if read == 0 {
+                        break None;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    let Some(head) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let body = &request[head + 4..];
+                    if let Ok(post) = serde_json::from_slice::<serde_json::Value>(body) {
+                        break Some(post);
+                    }
+                };
+                let Some(post) = body else {
+                    continue;
+                };
+                let kind = post["event"]["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let session = post["session_id"].as_str().unwrap_or_default().to_owned();
+                let code = if kind == "session_start" { 400 } else { 204 };
+                record.lock().unwrap().push((session, kind));
+                let answer = format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n");
+                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, seen)
+    }
+
+    /// TASK-088 review, finding 4: after `/clear` the env session is stale;
+    /// its stuck spool (a start the hub refuses) must not keep the bound
+    /// session's `Stop` back.
+    #[tokio::test]
+    async fn a_stuck_env_session_does_not_hold_back_the_bound_one() {
+        const OTHER: &str = "5e551017-0000-4000-8000-000000000002";
+        let dir = crate::hub::testdir::TempDir::new("agent-spool-stuck");
+        let spool_dir = dir.path().join("spool");
+        let env = register().session_id;
+        let start = crate::wire::HookPost::new(
+            "box".into(),
+            env.clone(),
+            "/w".into(),
+            "/w/s.jsonl".into(),
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: None,
+                parent_claude_pid: None,
+            },
+        );
+        spool::save(&spool_dir, &start, SystemTime::now()).unwrap();
+        spool::save(&spool_dir, &kept_stop(OTHER), SystemTime::now()).unwrap();
+        let (hook_addr, seen) = refusing_starts().await;
+        let watch = StatusWatch::new(dir.path().to_owned());
+        *watch.bound.lock().unwrap() = Some(OTHER.to_owned());
+        let mut link = config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Backoff::default(),
+        );
+        link.replay = Some(Replay {
+            spool: spool_dir.clone(),
+            hook_addr,
+        });
+        link.status = Some(watch);
+        let mut replaying = Replaying::default();
+        spawn_replay(&link, replay_sessions(&link), &mut replaying);
+        let result = tokio::time::timeout(WAIT, replaying.task.take().unwrap())
+            .await
+            .expect("replay in time")
+            .unwrap();
+        // The stuck start is the result, for the backoff.
+        assert_eq!(result, Err(PostError::Status(400)));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (env.clone(), "session_start".to_owned()),
+                (OTHER.to_owned(), "stop".to_owned())
+            ]
+        );
+        assert!(!spool::has_kept(&spool_dir, OTHER), "the bound stop went");
+        assert!(spool::has_kept(&spool_dir, &env), "the refused start stays");
+    }
+
+    /// TASK-088 review, finding 5: when the spool is empty (a hook sent what
+    /// the agent failed to), the backoff ends; while something is kept it
+    /// holds.
+    #[tokio::test]
+    async fn an_empty_spool_ends_the_backoff() {
+        let dir = crate::hub::testdir::TempDir::new("agent-spool-reset");
+        let spool_dir = dir.path().join("spool");
+        let mut link = config(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 9)),
+            Backoff::default(),
+        );
+        link.replay = Some(Replay {
+            spool: spool_dir.clone(),
+            hook_addr: HubAddr::plain("127.0.0.1:9"),
+        });
+        let later = Instant::now() + SPOOL_BACKOFF_MAX;
+        let mut replaying = Replaying {
+            task: None,
+            failures: 6,
+            not_before: Some(later),
+        };
+        spool::save(
+            &spool_dir,
+            &kept_stop(&register().session_id),
+            SystemTime::now(),
+        )
+        .unwrap();
+        poll_spool(&link, &mut replaying).await;
+        assert!(replaying.task.is_none(), "still waiting");
+        assert_eq!((replaying.failures, replaying.not_before), (6, Some(later)));
+        // A hook delivered it meanwhile.
+        std::fs::remove_dir_all(&spool_dir).unwrap();
+        poll_spool(&link, &mut replaying).await;
+        assert!(replaying.task.is_none());
+        assert_eq!((replaying.failures, replaying.not_before), (0, None));
     }
 
     #[tokio::test]
