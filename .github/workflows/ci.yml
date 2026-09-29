@@ -102,10 +102,16 @@ jobs:
         run: python3 .github/smoke/smoke.py cctg:smoke target/debug/cctg "${{ github.sha }}"
       # TASK-085: the image size, the helper's and the model's sizes, and the
       # helper's own numbers on the fixture (a cached build log has none).
+      # TASK-086: the fixture twice to one helper process (a request is the
+      # byte count on a line, then the bytes); both answers need the words.
       - name: image size and voice helper numbers
         run: |
           docker image inspect cctg:smoke --format 'image size: {{.Size}} bytes'
           docker run --rm --entrypoint sh cctg:smoke -c \
             'ls -l /usr/local/bin/cctg /usr/local/bin/cctg-voice && du -sh /usr/local/share/cctg/voice-ru'
-          docker run --rm -i --entrypoint cctg-voice cctg:smoke /usr/local/share/cctg/voice-ru \
-            < crates/voice/tests/fixtures/voice-ru.ogg
+          fixture=crates/voice/tests/fixtures/voice-ru.ogg
+          size=$(stat -c %s "$fixture")
+          heard=$({ printf '%s\n' "$size"; cat "$fixture"; printf '%s\n' "$size"; cat "$fixture"; } \
+            | docker run --rm -i --entrypoint cctg-voice cctg:smoke /usr/local/share/cctg/voice-ru)
+          echo "$heard"
+          test "$(grep -c 'запусти тесты' <<< "$heard")" -eq 2

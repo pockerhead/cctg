@@ -1,25 +1,32 @@
-//! `cctg-voice` (TASK-085): recognizes one Telegram voice message for the
-//! hub. Usage: `cctg-voice <model dir> < voice.ogg`.
+//! `cctg-voice` (TASK-085, a request loop since TASK-086): recognizes
+//! Telegram voice messages for the hub, one at a time. Usage:
+//! `cctg-voice <model dir>`, requests on stdin.
 //!
-//! Reads OGG/Opus from stdin (at most [`MAX_INPUT`]), decodes it to 16 kHz
-//! mono (at most [`MAX_SECONDS`], counted while decoding), recognizes it with
-//! the sherpa-onnx streaming transducer in `<model dir>` on one thread and
-//! prints one JSON line: `{"text", "audio_ms", "took_ms", "peak_rss_kb"}`.
+//! Loads the sherpa-onnx streaming transducer in `<model dir>` once, then
+//! answers requests until stdin closes. A request is the byte count of one
+//! OGG/Opus voice in ASCII digits and `\n`, then those bytes (at most
+//! [`MAX_INPUT`]). The voice is decoded to 16 kHz mono (at most
+//! [`MAX_SECONDS`], counted while decoding) and recognized on one thread.
+//! The answer is one JSON line on stdout: `{"text", "audio_ms", "took_ms",
+//! "peak_rss_kb"}`, or `{"error", "took_ms"}` with the error `not_opus`,
+//! `too_long`, `too_big` or `failed`. `took_ms` is the time of this request.
 //!
-//! Exit codes: 0 done; 2 the input is not OGG/Opus, empty or too big; 3 the
-//! audio is longer than [`MAX_SECONDS`]; 4 the model did not load (or this
-//! build has no recognizer: only Linux builds link sherpa-onnx); anything
-//! else is a failure. stderr gets one short phrase, never the text or paths.
+//! Exit codes: 0 stdin closed; 2 a broken request; 4 the model did not load
+//! (or this build has no recognizer: only Linux builds link sherpa-onnx);
+//! anything else is a failure. stderr gets one short phrase, never the text
+//! or paths.
 
-use std::io::{Cursor, Read, Write};
+use std::io::{BufRead, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use opus_pure::{MAX_PACKET_SAMPLES, OggOpusReader, Trim};
 
-/// Bytes of OGG read from stdin at most.
+/// Bytes of OGG in one request at most.
 const MAX_INPUT: u64 = 8 << 20;
+/// Bytes of a request header at most: the digits and `\n`.
+const MAX_HEADER: u64 = 24;
 /// Seconds of audio recognized at most.
 const MAX_SECONDS: usize = 300;
 /// The model's sample rate.
@@ -33,8 +40,38 @@ enum DecodeError {
     TooLong,
 }
 
+/// Why a request got no words: the `error` of its answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    NotOpus,
+    TooLong,
+    TooBig,
+    Failed,
+}
+
+impl Refused {
+    fn name(&self) -> &'static str {
+        match self {
+            Refused::NotOpus => "not_opus",
+            Refused::TooLong => "too_long",
+            Refused::TooBig => "too_big",
+            Refused::Failed => "failed",
+        }
+    }
+}
+
+/// How the request loop ended.
+#[derive(Debug, PartialEq, Eq)]
+enum End {
+    /// stdin closed between requests.
+    Closed,
+    /// A header that is not digits and `\n`, or a request cut short.
+    Broken,
+    /// An answer could not be written.
+    Unwritable,
+}
+
 fn main() -> ExitCode {
-    let started = Instant::now();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let model = match args.as_slice() {
         [flag] if flag == "--version" => {
@@ -43,50 +80,97 @@ fn main() -> ExitCode {
         }
         [model] => PathBuf::from(model),
         _ => {
-            eprintln!("usage: cctg-voice <model dir> < voice.ogg");
+            eprintln!("usage: cctg-voice <model dir>, requests on stdin");
             return ExitCode::from(2);
         }
     };
     lower_priority();
-    let mut input = Vec::new();
-    let read = std::io::stdin()
-        .lock()
-        .take(MAX_INPUT + 1)
-        .read_to_end(&mut input);
-    if read.is_err() || input.len() as u64 > MAX_INPUT {
-        eprintln!("input unreadable or larger than 8 MiB");
-        return ExitCode::from(2);
-    }
-    let samples = match decode(&input, MAX_SECONDS * RATE as usize) {
-        Ok(samples) => samples,
-        Err(DecodeError::NotOpus) => {
-            eprintln!("input is not OGG/Opus");
-            return ExitCode::from(2);
-        }
-        Err(DecodeError::TooLong) => {
-            eprintln!("audio longer than {MAX_SECONDS} s");
-            return ExitCode::from(3);
-        }
-    };
-    drop(input);
-    let text = match recognize(&model, &samples) {
-        Ok(text) => text,
+    let recognizer = match Recognizer::load(&model) {
+        Ok(recognizer) => recognizer,
         Err(code) => {
-            eprintln!("recognition failed");
+            eprintln!("model not loaded");
             return ExitCode::from(code);
         }
     };
-    let audio_ms = samples.len() as u64 * 1000 / RATE as u64;
-    let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let line = output_line(&text, audio_ms, took_ms, peak_rss_kb());
-    let mut stdout = std::io::stdout().lock();
-    if writeln!(stdout, "{line}")
-        .and_then(|()| stdout.flush())
-        .is_err()
-    {
-        return ExitCode::FAILURE;
+    let hear = |ogg: &[u8]| {
+        let samples = decode(ogg, MAX_SECONDS * RATE as usize).map_err(|error| match error {
+            DecodeError::NotOpus => Refused::NotOpus,
+            DecodeError::TooLong => Refused::TooLong,
+        })?;
+        let text = recognizer.recognize(&samples).ok_or(Refused::Failed)?;
+        Ok((text, samples.len() as u64 * 1000 / RATE as u64))
+    };
+    match serve(std::io::stdin().lock(), std::io::stdout().lock(), hear) {
+        End::Closed => ExitCode::SUCCESS,
+        End::Broken => {
+            eprintln!("broken request");
+            ExitCode::from(2)
+        }
+        End::Unwritable => ExitCode::FAILURE,
     }
-    ExitCode::SUCCESS
+}
+
+/// Answers the requests on `input` with `hear` (the words and the audio
+/// length in ms), one JSON line each on `output`, until `input` closes.
+fn serve(
+    mut input: impl BufRead,
+    mut output: impl Write,
+    mut hear: impl FnMut(&[u8]) -> Result<(String, u64), Refused>,
+) -> End {
+    loop {
+        let size = match read_header(&mut input) {
+            Ok(Some(size)) => size,
+            Ok(None) => return End::Closed,
+            Err(()) => return End::Broken,
+        };
+        let started = Instant::now();
+        let heard = if size > MAX_INPUT {
+            // Skipped, so the next request is read from its header.
+            match std::io::copy(&mut (&mut input).take(size), &mut std::io::sink()) {
+                Ok(skipped) if skipped == size => Err(Refused::TooBig),
+                _ => return End::Broken,
+            }
+        } else {
+            let mut ogg = Vec::new();
+            match (&mut input).take(size).read_to_end(&mut ogg) {
+                Ok(read) if read as u64 == size => hear(&ogg),
+                _ => return End::Broken,
+            }
+        };
+        let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let line = match heard {
+            Ok((text, audio_ms)) => output_line(&text, audio_ms, took_ms, peak_rss_kb()),
+            Err(refused) => error_line(&refused, took_ms),
+        };
+        if writeln!(output, "{line}")
+            .and_then(|()| output.flush())
+            .is_err()
+        {
+            return End::Unwritable;
+        }
+    }
+}
+
+/// The byte count of the next request; `None` when `input` closed before
+/// the request began.
+fn read_header(input: &mut impl BufRead) -> Result<Option<u64>, ()> {
+    let mut header = Vec::new();
+    input
+        .take(MAX_HEADER)
+        .read_until(b'\n', &mut header)
+        .map_err(|_| ())?;
+    if header.is_empty() {
+        return Ok(None);
+    }
+    let digits = header.strip_suffix(b"\n").ok_or(())?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(());
+    }
+    std::str::from_utf8(digits)
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .map(Some)
+        .ok_or(())
 }
 
 /// Recognition runs in the background of the hub's machine.
@@ -133,42 +217,62 @@ fn decode(ogg: &[u8], max_samples: usize) -> Result<Vec<f32>, DecodeError> {
     Ok(mono)
 }
 
-/// The words of `samples` by the model in `model`, trimmed; `Err` is the
-/// exit code.
+/// The model in memory, loaded once for every request.
 #[cfg(target_os = "linux")]
-fn recognize(model: &Path, samples: &[f32]) -> Result<String, u8> {
-    use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig};
+struct Recognizer(sherpa_onnx::OnlineRecognizer);
 
-    // Silence after the words: the streaming model decides its last tokens
-    // on audio that follows them.
-    const TAIL_SAMPLES: usize = RATE as usize * 6 / 10;
+#[cfg(target_os = "linux")]
+impl Recognizer {
+    /// The model in `model`; `Err` is the exit code.
+    fn load(model: &Path) -> Result<Self, u8> {
+        use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineTransducerModelConfig};
 
-    let file = |name: &str| Some(model.join(name).to_string_lossy().into_owned());
-    let mut config = OnlineRecognizerConfig::default();
-    config.model_config.transducer = OnlineTransducerModelConfig {
-        encoder: file("encoder.int8.onnx"),
-        decoder: file("decoder.int8.onnx"),
-        joiner: file("joiner.int8.onnx"),
-    };
-    config.model_config.tokens = file("tokens.txt");
-    config.model_config.num_threads = 1;
-    config.model_config.debug = false;
-    config.decoding_method = Some("greedy_search".to_owned());
-    let recognizer = OnlineRecognizer::create(&config).ok_or(4)?;
-    let stream = recognizer.create_stream();
-    stream.accept_waveform(RATE, samples);
-    stream.accept_waveform(RATE, &vec![0.0; TAIL_SAMPLES]);
-    stream.input_finished();
-    while recognizer.is_ready(&stream) {
-        recognizer.decode(&stream);
+        let file = |name: &str| Some(model.join(name).to_string_lossy().into_owned());
+        let mut config = OnlineRecognizerConfig::default();
+        config.model_config.transducer = OnlineTransducerModelConfig {
+            encoder: file("encoder.int8.onnx"),
+            decoder: file("decoder.int8.onnx"),
+            joiner: file("joiner.int8.onnx"),
+        };
+        config.model_config.tokens = file("tokens.txt");
+        config.model_config.num_threads = 1;
+        config.model_config.debug = false;
+        config.decoding_method = Some("greedy_search".to_owned());
+        OnlineRecognizer::create(&config).map(Self).ok_or(4)
     }
-    let result = recognizer.get_result(&stream).ok_or(1)?;
-    Ok(result.text.trim().to_owned())
+
+    /// The words of `samples`, trimmed, on a stream of their own.
+    fn recognize(&self, samples: &[f32]) -> Option<String> {
+        // Silence after the words: the streaming model decides its last
+        // tokens on audio that follows them.
+        const TAIL_SAMPLES: usize = RATE as usize * 6 / 10;
+
+        let recognizer = &self.0;
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(RATE, samples);
+        stream.accept_waveform(RATE, &vec![0.0; TAIL_SAMPLES]);
+        stream.input_finished();
+        while recognizer.is_ready(&stream) {
+            recognizer.decode(&stream);
+        }
+        let result = recognizer.get_result(&stream)?;
+        Some(result.text.trim().to_owned())
+    }
 }
 
+/// No recognizer outside Linux: it never loads.
 #[cfg(not(target_os = "linux"))]
-fn recognize(_model: &Path, _samples: &[f32]) -> Result<String, u8> {
-    Err(4)
+enum Recognizer {}
+
+#[cfg(not(target_os = "linux"))]
+impl Recognizer {
+    fn load(_model: &Path) -> Result<Self, u8> {
+        Err(4)
+    }
+
+    fn recognize(&self, _samples: &[f32]) -> Option<String> {
+        match *self {}
+    }
 }
 
 /// The process's peak resident memory (`VmHWM`), in kB.
@@ -201,6 +305,11 @@ fn output_line(text: &str, audio_ms: u64, took_ms: u64, peak_rss_kb: Option<u64>
         line["peak_rss_kb"] = peak.into();
     }
     line.to_string()
+}
+
+/// The one JSON line of a request without words.
+fn error_line(refused: &Refused, took_ms: u64) -> String {
+    serde_json::json!({ "error": refused.name(), "took_ms": took_ms }).to_string()
 }
 
 #[cfg(test)]
@@ -252,5 +361,76 @@ mod tests {
         assert_eq!(back["peak_rss_kb"], 131_072);
         let without = output_line("", 0, 1, None);
         assert!(!without.contains("peak_rss_kb"), "{without}");
+    }
+
+    fn request(body: &[u8]) -> Vec<u8> {
+        let mut request = format!("{}\n", body.len()).into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
+    /// The answers of `serve` over `input`, `hear` answering with the
+    /// request's bytes as text (`bad` refused as not Opus), and its end.
+    fn served(input: &[u8]) -> (Vec<serde_json::Value>, End, Vec<Vec<u8>>) {
+        let mut output = Vec::new();
+        let mut heard = Vec::new();
+        let end = serve(input, &mut output, |ogg| {
+            heard.push(ogg.to_vec());
+            if ogg == b"bad" {
+                return Err(Refused::NotOpus);
+            }
+            Ok((String::from_utf8_lossy(ogg).into_owned(), 7))
+        });
+        let answers = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        (answers, end, heard)
+    }
+
+    #[test]
+    fn requests_are_answered_one_line_each_until_stdin_closes() {
+        let input = [request("раз".as_bytes()), request(b"bad"), request(b"")].concat();
+        let (answers, end, heard) = served(&input);
+        assert_eq!(end, End::Closed);
+        assert_eq!(heard, ["раз".as_bytes(), b"bad", b""]);
+        assert_eq!(answers.len(), 3, "{answers:?}");
+        assert_eq!(answers[0]["text"], "раз");
+        assert_eq!(answers[0]["audio_ms"], 7);
+        assert_eq!(answers[1]["error"], "not_opus");
+        assert!(answers[1].get("text").is_none(), "{:?}", answers[1]);
+        assert_eq!(answers[2]["text"], "");
+        assert!(answers.iter().all(|answer| answer["took_ms"].is_u64()));
+        assert_eq!(served(b""), (Vec::new(), End::Closed, Vec::new()));
+    }
+
+    #[test]
+    fn a_too_big_request_is_skipped_and_the_next_one_is_heard() {
+        let big = vec![b'x'; MAX_INPUT as usize + 1];
+        let input = [request(&big), request(b"next")].concat();
+        let (answers, end, heard) = served(&input);
+        assert_eq!(end, End::Closed);
+        assert_eq!(heard, [b"next"]);
+        assert_eq!(answers[0]["error"], "too_big");
+        assert_eq!(answers[1]["text"], "next");
+    }
+
+    #[test]
+    fn a_broken_request_ends_the_loop_after_the_answers_before_it() {
+        for broken in [
+            &b"abc\n"[..],
+            b"\n",
+            b"-1\n",
+            b"12",
+            b"10\nshort",
+            b"99999999999999999999999999\n",
+        ] {
+            let input = [request(b"one"), broken.to_vec()].concat();
+            let (answers, end, heard) = served(&input);
+            assert_eq!(end, End::Broken, "{:?}", String::from_utf8_lossy(broken));
+            assert_eq!(heard, [b"one"]);
+            assert_eq!(answers.len(), 1);
+        }
     }
 }

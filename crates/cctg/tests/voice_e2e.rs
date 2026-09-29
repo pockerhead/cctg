@@ -7,14 +7,16 @@
 //! This test binary is also the `cctg-voice` stand-in: the hub starts it
 //! with one argument, the model folder, whose `role.txt` says how to answer
 //! (a role in the environment would not reach it: the hub scrubs `CCTG_*`).
-//! The stand-in writes what came on stdin to `stdin.ogg` there, and the
-//! names of the `CCTG_*` variables it sees to `env.txt`. No real model, no
-//! console window, everything in a temp folder.
+//! Like the helper (TASK-086) it answers requests until stdin closes. Each
+//! start adds a line to `starts.txt` there (a start is a model load), each
+//! request's voice goes to `stdin.ogg`, and the names of the `CCTG_*`
+//! variables it sees to `env.txt`. No real model, no console window,
+//! everything in a temp folder.
 //!
 //! Its own log subscriber: at the end, no recognized word, caption, model
 //! path or token is in the logs.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -49,7 +51,7 @@ const USER: i64 = 7_318_046_259;
 const TOKEN: &str = "1:voice";
 const WAIT: Duration = Duration::from_secs(30);
 /// The `slow` role's sleep; its helper timeout is shorter.
-const SLOW: Duration = Duration::from_secs(4);
+const SLOW: Duration = Duration::from_secs(5);
 /// Set in this process; the stand-in must not see it.
 const CANARY: &str = "CCTG_VOICE_E2E_CANARY";
 
@@ -75,33 +77,59 @@ fn main() {
     println!("voice_e2e: ok");
 }
 
+/// Answers every request; in its first start `fail` exits on its first
+/// request and `slow` answers it only after [`SLOW`].
 fn stand_in(model: &Path) -> ! {
     let role = std::fs::read_to_string(model.join("role.txt")).unwrap_or_default();
-    let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input).unwrap();
-    std::fs::write(model.join("stdin.ogg"), &input).unwrap();
+    let mut started = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(model.join("starts.txt"))
+        .unwrap();
+    writeln!(started, "start").unwrap();
+    drop(started);
+    let first_start = starts(model) == 1;
     let seen: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .filter(|name| name.to_ascii_uppercase().starts_with("CCTG_"))
         .collect();
     std::fs::write(model.join("env.txt"), seen.join("\n")).unwrap();
-    let answer = || {
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        let mut header = String::new();
+        if stdin.read_line(&mut header).unwrap() == 0 {
+            std::process::exit(0);
+        }
+        let mut input = vec![0; header.trim().parse().unwrap()];
+        stdin.read_exact(&mut input).unwrap();
+        std::fs::write(model.join("stdin.ogg"), &input).unwrap();
+        match (role.trim(), first_start) {
+            ("fail", true) => std::process::exit(1),
+            ("slow", true) => {
+                std::thread::sleep(SLOW);
+                std::fs::write(model.join("survived"), "").unwrap();
+            }
+            ("ok" | "fail" | "slow", _) => {}
+            (other, _) => panic!("unknown role {other:?}"),
+        }
         let line = json!({ "text": WORDS, "audio_ms": 4590, "took_ms": 1 });
         let mut out = std::io::stdout();
         writeln!(out, "{line}").unwrap();
         out.flush().unwrap();
-    };
-    match role.trim() {
-        "ok" => answer(),
-        "fail" => std::process::exit(1),
-        "slow" => {
-            std::thread::sleep(SLOW);
-            std::fs::write(model.join("survived"), "").unwrap();
-            answer();
-        }
-        other => panic!("unknown role {other:?}"),
     }
-    std::process::exit(0);
+}
+
+/// How often the stand-in with the model folder `model` started.
+fn starts(model: &Path) -> usize {
+    std::fs::read_to_string(model.join("starts.txt"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// The end of what the session got for a voice heard as [`WORDS`].
+fn heard_content(caption: &str) -> String {
+    format!("\n\n(голосовое, распознано) {WORDS}\n{caption}")
 }
 
 #[derive(Clone, Default)]
@@ -404,11 +432,11 @@ async fn rig(root: &Path, role: &str, timeout: Duration, captured: &Captured) ->
     slots.fetch_files(api.clone());
     slots.recognize_voices(
         api,
-        Arc::new(Helper {
-            program: std::env::current_exe().unwrap(),
-            model: model.clone(),
+        Arc::new(Helper::new(
+            std::env::current_exe().unwrap(),
+            model.clone(),
             timeout,
-        }),
+        )),
     );
     let (agents, agents_rx) = mpsc::channel(64);
     let (hooks, hooks_rx) = mpsc::channel(64);
@@ -482,10 +510,7 @@ async fn scenario() {
     assert_eq!(post["message_thread_id"], 100, "{post}");
     // The agent says where it saved the file, then the words.
     let content = note["params"]["content"].as_str().unwrap();
-    assert!(
-        content.ends_with(&format!("\n\n(голосовое, распознано) {WORDS}\n{caption}")),
-        "{note}"
-    );
+    assert!(content.ends_with(&heard_content(&caption)), "{note}");
     let meta = &note["params"]["meta"];
     assert_eq!(
         (meta["file_kind"].as_str(), meta["message_id"].as_str()),
@@ -501,6 +526,20 @@ async fn scenario() {
         "",
         "the helper saw CCTG_ variables"
     );
+    // TASK-086: the second voice goes to the same helper, started once
+    // (with the hub), so the model is not loaded again.
+    std::fs::remove_file(ok.model.join("stdin.ogg")).unwrap();
+    ok.control.send(voice_message(11, &caption)).unwrap();
+    let note = ok.claude.recv().await;
+    assert!(
+        note["params"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with(&heard_content(&caption)),
+        "{note}"
+    );
+    assert_eq!(std::fs::read(ok.model.join("stdin.ogg")).unwrap(), VOICE);
+    assert_eq!(starts(&ok.model), 1, "the helper started again");
 
     // A helper that fails: the author is told, the file still goes.
     let mut fail = rig(&root.0, "fail", WAIT, &captured).await;
@@ -529,9 +568,20 @@ async fn scenario() {
             .is_some_and(|text| text.starts_with(VOICE_HEARD_PREFIX))),
         "nothing heard, nothing posted"
     );
+    // The next voice starts a new helper, which hears it.
+    fail.control.send(voice_message(12, &caption)).unwrap();
+    let note = fail.claude.recv().await;
+    assert!(
+        note["params"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with(&heard_content(&caption)),
+        "{note}"
+    );
+    assert_eq!(starts(&fail.model), 2);
 
     // Too slow: killed at the timeout, it never finishes; the voice goes on.
-    let mut slow = rig(&root.0, "slow", Duration::from_secs(1), &captured).await;
+    let mut slow = rig(&root.0, "slow", Duration::from_secs(2), &captured).await;
     let started = Instant::now();
     slow.control.send(voice_message(9, &caption)).unwrap();
     let note = slow.claude.recv().await;
@@ -555,14 +605,26 @@ async fn scenario() {
         !slow.model.join("survived").exists(),
         "the slow helper was not killed"
     );
+    // The next voice starts a new helper, which hears it.
+    slow.control.send(voice_message(13, &caption)).unwrap();
+    let note = slow.claude.recv().await;
+    assert!(
+        note["params"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with(&heard_content(&caption)),
+        "{note}"
+    );
+    assert_eq!(starts(&slow.model), 2);
 
     // Outcomes and times in the logs, never words, captions, paths or the
     // token.
     let logs = captured.text();
     assert!(logs.contains("voice recognition"), "{logs}");
+    assert!(logs.contains("voice helper started"), "{logs}");
     for outcome in [
         "outcome=\"ok\"",
-        "outcome=\"failed\"",
+        "outcome=\"crashed\"",
         "outcome=\"timeout\"",
     ] {
         assert!(logs.contains(outcome), "{outcome} not logged:\n{logs}");

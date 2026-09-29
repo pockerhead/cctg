@@ -487,11 +487,11 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         Some(files) if files.present() => {
             slots.recognize_voices(
                 api.clone(),
-                Arc::new(voice::Helper {
-                    program: files.helper.clone(),
-                    model: files.model.clone(),
-                    timeout: voice::VOICE_TIMEOUT,
-                }),
+                Arc::new(voice::Helper::new(
+                    files.helper.clone(),
+                    files.model.clone(),
+                    voice::VOICE_TIMEOUT,
+                )),
             );
             info!("voice recognition on");
         }
