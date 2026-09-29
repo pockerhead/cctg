@@ -22,6 +22,10 @@
 //! between that and every message, and [`Settings::history`] is how much of
 //! the group's history a mention takes along.
 //!
+//! TASK-081: an owner's menu has a «👥 Люди» tab: the members owners added
+//! to the allowlist ([`super::people`]), a remove button each (asking once
+//! more) and the invite link button.
+//!
 //! This module is pure: data, rendering and the press codes. The slot actor
 //! sends, pins and edits.
 
@@ -29,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::chat::PrivateChat;
+use super::people;
 use super::registry::cut;
 
 /// Session rows per page of the sessions tab.
@@ -422,7 +427,13 @@ pub fn change(
         | MenuPress::Sound
         | MenuPress::Zone { .. }
         | MenuPress::Slot { .. }
-        | MenuPress::UpdateAll { .. } => return Err((Page::Sessions(0), ANSWER_UNCHANGED)),
+        | MenuPress::UpdateAll { .. }
+        | MenuPress::People
+        | MenuPress::Remove { .. }
+        | MenuPress::RemoveConfirm { .. }
+        | MenuPress::Invite
+        | MenuPress::AddYes { .. }
+        | MenuPress::AddNo { .. } => return Err((Page::Sessions(0), ANSWER_UNCHANGED)),
     };
     Ok((new, page))
 }
@@ -517,6 +528,26 @@ pub enum MenuPress {
     QuietFrom(u8),
     QuietTo(u8),
     SetZone(i16),
+    /// The people tab (TASK-081), an owner's only.
+    People,
+    /// 🗑 of member `key`: asks once more.
+    Remove {
+        key: u32,
+    },
+    /// «точно?» of member `key`: removes them.
+    RemoveConfirm {
+        key: u32,
+    },
+    /// A new invite link.
+    Invite,
+    /// «Добавить» of proposal `token`, on its own message.
+    AddYes {
+        token: u32,
+    },
+    /// «Отмена» of proposal `token`.
+    AddNo {
+        token: u32,
+    },
 }
 
 impl MenuPress {
@@ -529,6 +560,20 @@ impl MenuPress {
                 | Self::GroupDisplay
                 | Self::Sound
                 | Self::Zone { .. }
+                | Self::People
+        )
+    }
+
+    /// A press about the members (TASK-081): an owner's only.
+    pub fn manages_people(self) -> bool {
+        matches!(
+            self,
+            Self::People
+                | Self::Remove { .. }
+                | Self::RemoveConfirm { .. }
+                | Self::Invite
+                | Self::AddYes { .. }
+                | Self::AddNo { .. }
         )
     }
 }
@@ -580,6 +625,12 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::QuietFrom(hour) => format!("qf:{hour}"),
         MenuPress::QuietTo(hour) => format!("qt:{hour}"),
         MenuPress::SetZone(tz) => format!("tz:{tz}"),
+        MenuPress::People => "pp".to_owned(),
+        MenuPress::Remove { key } => format!("pr:{key}"),
+        MenuPress::RemoveConfirm { key } => format!("prc:{key}"),
+        MenuPress::Invite => "pi".to_owned(),
+        MenuPress::AddYes { token } => format!("pa:{token}"),
+        MenuPress::AddNo { token } => format!("pn:{token}"),
     };
     format!("{PREFIX}{rest}")
 }
@@ -651,6 +702,16 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ["qf", hour] => MenuPress::QuietFrom(hour.parse().ok()?),
         ["qt", hour] => MenuPress::QuietTo(hour.parse().ok()?),
         ["tz", minutes] => MenuPress::SetZone(minutes.parse().ok()?),
+        ["pp"] => MenuPress::People,
+        ["pr", key] => MenuPress::Remove { key: number(key)? },
+        ["prc", key] => MenuPress::RemoveConfirm { key: number(key)? },
+        ["pi"] => MenuPress::Invite,
+        ["pa", token] => MenuPress::AddYes {
+            token: number(token)?,
+        },
+        ["pn", token] => MenuPress::AddNo {
+            token: number(token)?,
+        },
         _ => return None,
     })
 }
@@ -750,6 +811,45 @@ pub enum Page {
     Zone {
         fractions: bool,
     },
+    /// The people tab (TASK-081).
+    People,
+}
+
+/// The people tab of an owner (TASK-081).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeopleView {
+    /// Owners of `CCTG_ALLOWED_USER_IDS`.
+    pub owners: usize,
+    /// The members, in the order they were added.
+    pub members: Vec<PersonRow>,
+    /// The bot has a username: an invite link can be made.
+    pub invite: bool,
+}
+
+/// A member in the people tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonRow {
+    pub key: u32,
+    pub name: String,
+    pub username: Option<String>,
+    /// Their 🗑 asks for its second press.
+    pub confirm: bool,
+}
+
+/// A member's name on a button, at most (UTF-16 units).
+const PERSON_BUTTON_LIMIT: usize = 40;
+
+/// The buttons of a proposal (TASK-081): «Добавить» and «Отмена».
+pub fn add_keyboard(token: u32) -> Value {
+    json!({ "inline_keyboard": [[
+        button("✅ Добавить", MenuPress::AddYes { token }),
+        button("✖ Отмена", MenuPress::AddNo { token }),
+    ]] })
+}
+
+/// The invite link button alone (TASK-081).
+pub fn invite_keyboard() -> Value {
+    json!({ "inline_keyboard": [[button(people::INVITE_BUTTON, MenuPress::Invite)]] })
 }
 
 fn button(text: impl Into<String>, press: MenuPress) -> Value {
@@ -792,13 +892,20 @@ fn clock(unix_secs: i64, tz: i16) -> String {
 }
 
 /// The text and keyboard of `page` for a person with `settings`;
-/// `sessions` is the sessions tab's page (`None` shows it empty).
+/// `sessions` is the sessions tab's page (`None` shows it empty); `people`
+/// the people tab of an owner (`None`: no such tab, and its page shows the
+/// sessions tab).
 pub fn render(
     page: &Page,
     settings: &Settings,
     sessions: Option<&SessionsView>,
+    people: Option<&PeopleView>,
     unix_secs: i64,
 ) -> (String, Value) {
+    let page = match (page, people) {
+        (Page::People, None) => &Page::Sessions(0),
+        _ => page,
+    };
     let tab = |label: &str, current: bool, press: MenuPress| {
         let text = if current {
             format!("· {label}")
@@ -824,12 +931,20 @@ pub fn render(
             MenuPress::Sound,
         ),
     ]];
-    let text = match page {
-        Page::Sessions(_) => render_sessions(sessions, &mut rows),
-        Page::Display => render_display(settings, &mut rows),
-        Page::GroupDisplay => render_group_display(settings, &mut rows),
-        Page::Sound => render_sound(settings, &mut rows),
-        Page::Zone { fractions } => render_zone(*fractions, unix_secs, &mut rows),
+    if people.is_some() {
+        rows[0].push(tab(
+            "👥 Люди",
+            matches!(page, Page::People),
+            MenuPress::People,
+        ));
+    }
+    let text = match (page, people) {
+        (Page::Sessions(_), _) | (Page::People, None) => render_sessions(sessions, &mut rows),
+        (Page::Display, _) => render_display(settings, &mut rows),
+        (Page::GroupDisplay, _) => render_group_display(settings, &mut rows),
+        (Page::Sound, _) => render_sound(settings, &mut rows),
+        (Page::Zone { fractions }, _) => render_zone(*fractions, unix_secs, &mut rows),
+        (Page::People, Some(view)) => render_people(view, &mut rows),
     };
     (
         cut(&text, transcript::TELEGRAM_TEXT_LIMIT),
@@ -1079,6 +1194,41 @@ fn render_sound(settings: &Settings, rows: &mut Vec<Vec<Value>>) -> String {
         .to_owned()
 }
 
+fn render_people(view: &PeopleView, rows: &mut Vec<Vec<Value>>) -> String {
+    let mut text = format!(
+        "Люди\n\nВладельцев из .env: {} (меняются только в .env).\nУчастники:",
+        view.owners
+    );
+    if view.members.is_empty() {
+        text.push_str(" пока никого.");
+    }
+    for (index, member) in view.members.iter().enumerate() {
+        let label = people::label(&member.name, member.username.as_deref());
+        text.push_str(&format!("\n{}. {label}", index + 1));
+        let name = cut(&member.name, PERSON_BUTTON_LIMIT);
+        rows.push(vec![if member.confirm {
+            button(
+                format!("🗑 {name} точно?"),
+                MenuPress::RemoveConfirm { key: member.key },
+            )
+        } else {
+            button(format!("🗑 {name}"), MenuPress::Remove { key: member.key })
+        }]);
+    }
+    text.push_str(
+        "\n\nКак добавить: перешлите сюда, вне тем, любое сообщение человека. Если Telegram скрывает его аккаунт в пересылках, дайте ему ссылку-приглашение.\n\
+Участник пишет сессиям и отвечает на вопросы и разрешения, как вы; не подключает и не отзывает устройства и не меняет этот список.\n\
+Удаление сразу закрывает доступ и отключает его устройства, но не убирает его из групп Telegram.",
+    );
+    let mut last = Vec::new();
+    if view.invite {
+        last.push(button(people::INVITE_BUTTON, MenuPress::Invite));
+    }
+    last.push(button("↻", MenuPress::People));
+    rows.push(last);
+    text
+}
+
 fn render_zone(fractions: bool, unix_secs: i64, rows: &mut Vec<Vec<Value>>) -> String {
     let mut zones: Vec<i16> = (-12..=14).map(|hours: i16| hours * 60).collect();
     if fractions {
@@ -1160,10 +1310,124 @@ mod tests {
             Page::Sound,
             Page::Zone { fractions: false },
             Page::Zone { fractions: true },
+            Page::People,
         ]
         .iter()
-        .map(|page| render(page, settings, Some(view), 1_700_000_000))
+        .map(|page| {
+            render(
+                page,
+                settings,
+                Some(view),
+                Some(&people_view()),
+                1_700_000_000,
+            )
+        })
         .collect()
+    }
+
+    /// Two members, the second asking for its second press (TASK-081).
+    fn people_view() -> PeopleView {
+        PeopleView {
+            owners: 2,
+            members: vec![
+                PersonRow {
+                    key: 1,
+                    name: "Анна".into(),
+                    username: Some("anna".into()),
+                    confirm: false,
+                },
+                PersonRow {
+                    key: u32::MAX,
+                    name: "Борис Очень-Длинная-Фамилия-Которая-Не-Влезает".into(),
+                    username: None,
+                    confirm: true,
+                },
+            ],
+            invite: true,
+        }
+    }
+
+    /// TASK-081: the people tab only with a view; its rows, buttons and the
+    /// proposal's buttons.
+    #[test]
+    fn the_people_tab_lists_members_with_their_buttons() {
+        let (text, keyboard) = render(&Page::People, &Settings::default(), None, None, 0);
+        assert!(text.starts_with("Сессии"), "no tab, the sessions: {text}");
+        assert!(!labels(&keyboard).iter().any(|label| label.contains("Люди")));
+        assert!(!datas(&keyboard).contains(&"menu:pp".to_owned()));
+
+        let (_, keyboard) = render(
+            &Page::Sound,
+            &Settings::default(),
+            None,
+            Some(&people_view()),
+            0,
+        );
+        assert!(labels(&keyboard).contains(&"👥 Люди".to_owned()));
+
+        let (text, keyboard) = render(
+            &Page::People,
+            &Settings::default(),
+            None,
+            Some(&people_view()),
+            0,
+        );
+        assert!(text.starts_with("Люди"), "{text}");
+        assert!(text.contains("Владельцев из .env: 2"), "{text}");
+        assert!(text.contains("\n1. Анна (@anna)"), "{text}");
+        assert!(text.contains("\n2. Борис"), "{text}");
+        let shown = labels(&keyboard);
+        let pressed = datas(&keyboard);
+        assert!(shown.contains(&"· 👥 Люди".to_owned()), "{shown:?}");
+        let at = shown.iter().position(|label| label == "🗑 Анна").unwrap();
+        assert_eq!(pressed[at], "menu:pr:1");
+        let at = shown
+            .iter()
+            .position(|label| label.ends_with("точно?"))
+            .unwrap();
+        assert_eq!(pressed[at], format!("menu:prc:{}", u32::MAX));
+        assert!(shown[at].starts_with("🗑 Борис"), "{}", shown[at]);
+        assert!(pressed.contains(&"menu:pi".to_owned()));
+        assert!(pressed.contains(&"menu:pp".to_owned()));
+
+        let alone = PeopleView {
+            owners: 1,
+            members: Vec::new(),
+            invite: false,
+        };
+        let (text, keyboard) = render(&Page::People, &Settings::default(), None, Some(&alone), 0);
+        assert!(text.contains("Участники: пока никого."), "{text}");
+        assert!(!datas(&keyboard).contains(&"menu:pi".to_owned()));
+
+        assert_eq!(datas(&add_keyboard(7)), ["menu:pa:7", "menu:pn:7"]);
+        assert_eq!(datas(&invite_keyboard()), ["menu:pi"]);
+        for press in [
+            MenuPress::People,
+            MenuPress::Remove { key: 3 },
+            MenuPress::RemoveConfirm { key: 3 },
+            MenuPress::Invite,
+            MenuPress::AddYes { token: u32::MAX },
+            MenuPress::AddNo { token: 0 },
+        ] {
+            assert!(press.manages_people());
+            assert_eq!(parse_callback(&data(&press)), Some(press));
+            assert!(
+                change(&Settings::default(), press).is_err(),
+                "{press:?} is no setting"
+            );
+        }
+        assert!(MenuPress::People.navigates());
+        assert!(!MenuPress::Remove { key: 1 }.navigates());
+        assert!(!MenuPress::Sound.manages_people());
+        for junk in [
+            "menu:pr",
+            "menu:pr:x",
+            "menu:pa:-1",
+            "menu:pp:1",
+            "menu:pi:1",
+        ] {
+            assert_eq!(parse_callback(junk), None, "{junk}");
+        }
     }
 
     #[test]
@@ -1414,7 +1678,13 @@ mod tests {
             pages: 2,
             outdated: 2,
         };
-        let (text, keyboard) = render(&Page::Sessions(0), &Settings::default(), Some(&first), 0);
+        let (text, keyboard) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            Some(&first),
+            None,
+            0,
+        );
         assert!(text.starts_with("Сессии (стр. 1/2)"), "{text}");
         assert!(
             text.contains("\n1. ⚡ [box] project · 10 — работает"),
@@ -1457,7 +1727,13 @@ mod tests {
             pages: 2,
             outdated: 0,
         };
-        let (text, keyboard) = render(&Page::Sessions(1), &Settings::default(), Some(&last), 0);
+        let (text, keyboard) = render(
+            &Page::Sessions(1),
+            &Settings::default(),
+            Some(&last),
+            None,
+            0,
+        );
         assert!(text.starts_with("Сессии (стр. 2/2)"), "{text}");
         let labels = super::tests::labels(&keyboard);
         assert!(labels.contains(&"‹".to_owned()));
@@ -1465,7 +1741,7 @@ mod tests {
         assert!(labels.contains(&"🙈 1".to_owned()));
         assert!(labels.contains(&"⬆️ Обновить все клиенты".to_owned()));
         // None at all.
-        let (text, _) = render(&Page::Sessions(0), &Settings::default(), None, 0);
+        let (text, _) = render(&Page::Sessions(0), &Settings::default(), None, None, 0);
         assert!(text.ends_with("Сессий пока нет."), "{text}");
     }
 
@@ -1476,6 +1752,7 @@ mod tests {
         let (text, keyboard) = render(
             &Page::Zone { fractions: false },
             &Settings::default(),
+            None,
             None,
             now,
         );
@@ -1494,6 +1771,7 @@ mod tests {
             &Page::Zone { fractions: true },
             &Settings::default(),
             None,
+            None,
             now,
         );
         let labels = super::tests::labels(&keyboard);
@@ -1509,7 +1787,7 @@ mod tests {
             quiet: Some(Quiet { from: 23, to: 8 }),
             ..Settings::default()
         };
-        let (_, keyboard) = render(&Page::Sound, &settings, None, now);
+        let (_, keyboard) = render(&Page::Sound, &settings, None, None, now);
         let labels = super::tests::labels(&keyboard);
         assert!(
             labels.contains(&"🕒 Пояс: UTC+5:45".to_owned()),
@@ -1530,9 +1808,9 @@ mod tests {
             tz: Some(180),
             ..Settings::default()
         };
-        let (_, keyboard) = render(&Page::Display, &before, None, 0);
+        let (_, keyboard) = render(&Page::Display, &before, None, None, 0);
         assert!(datas(&keyboard).contains(&"menu:th:0".to_owned()));
-        let (_, keyboard) = render(&Page::Sound, &before, None, 0);
+        let (_, keyboard) = render(&Page::Sound, &before, None, None, 0);
         assert!(datas(&keyboard).contains(&"menu:q:1".to_owned()));
         for press in [MenuPress::Thinking(false), MenuPress::Quiet(true)] {
             let (once, _) = change(&before, press).unwrap();
@@ -1547,7 +1825,7 @@ mod tests {
         let (off, _) = change(&on, MenuPress::Quiet(false)).unwrap();
         assert_eq!(off.quiet, None);
         assert_eq!(change(&off, MenuPress::Quiet(false)).unwrap().0, off);
-        let (_, keyboard) = render(&Page::Sound, &on, None, 0);
+        let (_, keyboard) = render(&Page::Sound, &on, None, None, 0);
         assert!(datas(&keyboard).contains(&"menu:q:0".to_owned()));
     }
 
@@ -1556,7 +1834,7 @@ mod tests {
     #[test]
     fn the_turn_view_is_chosen_on_the_display_tab() {
         let full = Settings::default();
-        let (text, keyboard) = render(&Page::Display, &full, None, 0);
+        let (text, keyboard) = render(&Page::Display, &full, None, None, 0);
         assert!(text.contains("Ход сжатый: "), "{text}");
         let labels = labels(&keyboard);
         assert!(labels.contains(&"✅ Ход: полный".to_owned()), "{labels:?}");
@@ -1578,7 +1856,7 @@ mod tests {
             "nothing else changes"
         );
         assert_eq!(change(&compact, press).unwrap().0, compact);
-        let (_, keyboard) = render(&Page::Display, &compact, None, 0);
+        let (_, keyboard) = render(&Page::Display, &compact, None, None, 0);
         assert!(super::tests::labels(&keyboard).contains(&"✅ Ход: сжатый".to_owned()));
         let (back, _) = change(&compact, MenuPress::TurnView(TurnView::Full)).unwrap();
         assert_eq!(back, full);
@@ -1604,7 +1882,7 @@ mod tests {
             tz: Some(0),
             ..Settings::default()
         };
-        let (_, keyboard) = render(&Page::Sound, &wild, None, 0);
+        let (_, keyboard) = render(&Page::Sound, &wild, None, None, 0);
         let datas = datas(&keyboard);
         for want in ["menu:qf:14", "menu:qf:16", "menu:qt:9", "menu:qt:11"] {
             assert!(datas.contains(&want.to_owned()), "{want}: {datas:?}");
@@ -1744,7 +2022,7 @@ mod tests {
             },
             ..Settings::default()
         };
-        let (text, keyboard) = render(&Page::Display, &settings, None, 0);
+        let (text, keyboard) = render(&Page::Display, &settings, None, None, 0);
         assert!(text.starts_with("Что показывать в темах лички"), "{text}");
         assert!(text.contains("«👥 Группа»"), "{text}");
         let private = labels(&keyboard);
@@ -1761,7 +2039,7 @@ mod tests {
         }
         assert!(datas(&keyboard).contains(&"menu:rc:0".to_owned()));
         assert!(datas(&keyboard).contains(&"menu:dg".to_owned()));
-        let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, 0);
+        let (text, keyboard) = render(&Page::GroupDisplay, &settings, None, None, 0);
         assert!(text.starts_with("Что показывать в темах группы"), "{text}");
         assert!(
             text.ends_with("По умолчанию всё, rich-разметка включена. Звук в группе не меняется.")
@@ -1867,7 +2145,7 @@ mod tests {
             HistoryLimit::ALL.map(HistoryLimit::chars),
             [2000, 4000, 8000]
         );
-        let (text, keyboard) = render(&Page::GroupDisplay, &Settings::default(), None, 0);
+        let (text, keyboard) = render(&Page::GroupDisplay, &Settings::default(), None, None, 0);
         assert!(text.contains("📜 История до обращения: "), "{text}");
         let labels = labels(&keyboard);
         for want in ["📜 2000", "✅ 📜 4000", "📜 8000"] {
@@ -1887,10 +2165,10 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_value(&short).unwrap()["history"], "short");
-        let (_, keyboard) = render(&Page::GroupDisplay, &short, None, 0);
+        let (_, keyboard) = render(&Page::GroupDisplay, &short, None, None, 0);
         assert!(super::tests::labels(&keyboard).contains(&"✅ 📜 2000".to_owned()));
         // The private page has no such row.
-        let (_, keyboard) = render(&Page::Display, &short, None, 0);
+        let (_, keyboard) = render(&Page::Display, &short, None, None, 0);
         assert!(
             !datas(&keyboard)
                 .iter()
@@ -1916,7 +2194,13 @@ mod tests {
             pages: 1,
             outdated: 0,
         };
-        let (text, keyboard) = render(&Page::Sessions(0), &Settings::default(), Some(&view), 0);
+        let (text, keyboard) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            Some(&view),
+            None,
+            0,
+        );
         assert!(
             text.contains("\n1. ⚡ [box] project · 2 — работает, в группе, по упоминанию"),
             "{text}"
@@ -1987,7 +2271,13 @@ mod tests {
             pages: 1,
             outdated: 0,
         };
-        let (text, keyboard) = render(&Page::Sessions(0), &Settings::default(), Some(&view), 0);
+        let (text, keyboard) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            Some(&view),
+            None,
+            0,
+        );
         assert!(
             text.contains(
                 "\n1. ⚡ [box] project · 2 — работает, в группе «Группа 1», по упоминанию"

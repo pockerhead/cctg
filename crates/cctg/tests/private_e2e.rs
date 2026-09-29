@@ -781,6 +781,7 @@ impl Hub {
                 thread_id: None,
                 from_name: None,
                 display_name: Some(NAME.into()),
+                sender: PrivateChat::of_user(OWNER),
             }))
             .unwrap();
     }
@@ -827,6 +828,7 @@ impl Hub {
                 thread_id: self.fake.topic(chat),
                 from_name: None,
                 display_name: Some(NAME.into()),
+                sender: PrivateChat::of_user(OWNER),
             }))
             .unwrap();
     }

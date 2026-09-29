@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
+use super::chat::PrivateChat;
 use crate::tls::{CERT_VAR, KEY_VAR};
 use crate::wire::{Secret, SecretError};
 
@@ -114,32 +116,80 @@ impl fmt::Debug for BotToken {
     }
 }
 
-/// Telegram user ids allowed to reach handlers, in the order of
+/// Telegram user ids allowed to reach handlers: the owners, in the order of
 /// `CCTG_ALLOWED_USER_IDS` (TASK-063: the first one owns the devices no
-/// `/join` gave an owner). `Debug` prints only the count.
+/// `/join` gave an owner), and the members owners added from the menu
+/// (TASK-081, kept in `registry.json`). A shared handle: the slots actor
+/// writes the members, the update poll reads them for each update, so a
+/// change counts at once. `Debug` prints only the counts.
 #[derive(Clone, Default)]
-pub struct Allowlist(Vec<i64>);
+pub struct Allowlist(Arc<RwLock<Lists>>);
+
+#[derive(Default)]
+struct Lists {
+    owners: Vec<i64>,
+    members: Vec<i64>,
+}
 
 impl Allowlist {
+    fn lists(&self) -> RwLockReadGuard<'_, Lists> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// An owner or a member.
     pub fn contains(&self, user_id: i64) -> bool {
-        self.0.contains(&user_id)
+        let lists = self.lists();
+        lists.owners.contains(&user_id) || lists.members.contains(&user_id)
     }
 
     /// More than one person may write (TASK-036): messages and button
     /// answers then carry their author's name.
     pub fn is_team(&self) -> bool {
-        self.0.len() > 1
+        let lists = self.lists();
+        lists.owners.len() + lists.members.len() > 1
     }
 
-    /// The first allowed user (TASK-063): the owner of every device whose
-    /// owner no `/join` recorded, and with one user of all of them.
+    /// The first owner (TASK-063): the owner of every device whose owner
+    /// no `/join` recorded, and with one user of all of them.
     pub fn first(&self) -> Option<i64> {
-        self.0.first().copied()
+        self.lists().owners.first().copied()
+    }
+
+    /// One of `CCTG_ALLOWED_USER_IDS` (TASK-081): only they manage the
+    /// members and devices.
+    pub fn is_owner(&self, user_id: i64) -> bool {
+        self.lists().owners.contains(&user_id)
+    }
+
+    /// The user of private chat `chat` is an owner or a member.
+    pub fn allows(&self, chat: PrivateChat) -> bool {
+        self.contains(chat.expose())
+    }
+
+    pub fn owners_len(&self) -> usize {
+        self.lists().owners.len()
+    }
+
+    pub fn members_len(&self) -> usize {
+        self.lists().members.len()
+    }
+
+    /// The members are `members` now; owners and repeats among them are
+    /// dropped.
+    pub(crate) fn set_members(&self, members: impl IntoIterator<Item = PrivateChat>) {
+        let mut lists = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        let mut kept: Vec<i64> = Vec::new();
+        for id in members.into_iter().map(PrivateChat::expose) {
+            if !lists.owners.contains(&id) && !kept.contains(&id) {
+                kept.push(id);
+            }
+        }
+        lists.members = kept;
     }
 }
 
 impl FromIterator<i64> for Allowlist {
-    /// Keeps the first of repeated ids.
+    /// The owners; keeps the first of repeated ids.
     fn from_iter<I: IntoIterator<Item = i64>>(iter: I) -> Self {
         let mut ids = Vec::new();
         for id in iter {
@@ -147,13 +197,22 @@ impl FromIterator<i64> for Allowlist {
                 ids.push(id);
             }
         }
-        Self(ids)
+        Self(Arc::new(RwLock::new(Lists {
+            owners: ids,
+            members: Vec::new(),
+        })))
     }
 }
 
 impl fmt::Debug for Allowlist {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Allowlist({} ids)", self.0.len())
+        let lists = self.lists();
+        write!(
+            f,
+            "Allowlist({} owners, {} members)",
+            lists.owners.len(),
+            lists.members.len()
+        )
     }
 }
 
@@ -259,7 +318,7 @@ impl Config {
                     .map_err(|_| ConfigError::AllowlistEntry(index + 1))
             })
             .collect::<Result<Allowlist, _>>()?;
-        if allowlist.0.is_empty() {
+        if allowlist.owners_len() == 0 {
             return Err(ConfigError::AllowlistEmpty);
         }
 
@@ -461,6 +520,36 @@ mod tests {
         assert!(repeated.is_team() && repeated.contains(11));
         let one: Allowlist = [11, 11].into_iter().collect();
         assert!(!one.is_team());
+    }
+
+    /// TASK-081: members added at run time count in every clone at once;
+    /// owners stay owners and first.
+    #[test]
+    fn members_are_live_and_never_owners() {
+        let owners: Allowlist = [11, 22].into_iter().collect();
+        let poll = owners.clone();
+        let member = PrivateChat::of_user(33);
+        owners.set_members([
+            member,
+            member,
+            PrivateChat::of_user(11),
+            PrivateChat::of_user(44),
+        ]);
+        assert!(poll.contains(33) && poll.contains(44) && poll.contains(11));
+        assert!(poll.allows(member));
+        assert_eq!((poll.owners_len(), poll.members_len()), (2, 2));
+        assert!(poll.is_owner(11) && !poll.is_owner(33));
+        assert_eq!(poll.first(), Some(11));
+        let debug = format!("{poll:?}");
+        assert_eq!(debug, "Allowlist(2 owners, 2 members)");
+        owners.set_members([]);
+        assert!(!poll.contains(33) && poll.contains(22));
+
+        let alone: Allowlist = [11].into_iter().collect();
+        assert!(!alone.is_team());
+        alone.set_members([member]);
+        assert!(alone.is_team(), "one owner and one member are a team");
+        assert_eq!(alone.first(), Some(11));
     }
 
     #[test]

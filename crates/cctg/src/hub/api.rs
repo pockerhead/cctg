@@ -109,9 +109,10 @@ pub struct Message {
     pub reply_to_message: Option<Box<MessageRef>>,
     /// The part of the replied message the user selected (`TextQuote`).
     pub quote: Option<TextQuote>,
-    /// Present on a forwarded message (`MessageOrigin`); only its presence
-    /// is read.
-    pub forward_origin: Option<IgnoredAny>,
+    /// Present on a forwarded message: who wrote it first (TASK-081: a
+    /// forward in an owner's General adds that person). Boxed: it keeps
+    /// `Message` small.
+    pub forward_origin: Option<Box<MessageOrigin>>,
     pub forum_topic_created: Option<IgnoredAny>,
     pub forum_topic_edited: Option<IgnoredAny>,
     pub forum_topic_closed: Option<IgnoredAny>,
@@ -122,6 +123,18 @@ pub struct Message {
     /// message in every scheduler answer stays small.
     #[serde(flatten)]
     pub media: Box<MessageMedia>,
+}
+
+/// The author of a forwarded message (`MessageOrigin`), only what the hub
+/// reads: `user` with `sender_user`, `hidden_user` with a name alone (the
+/// person hides their account in forwards), or `chat` / `channel`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MessageOrigin {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub sender_user: Option<User>,
+    pub sender_user_name: Option<String>,
 }
 
 /// The file fields of a message.
@@ -919,6 +932,49 @@ mod tests {
             "reply_to_message":{"message_id":4}}}"#;
         let message: Message = parse_envelope(200, body.as_bytes()).unwrap();
         assert!(message.reply_to_message.unwrap().from.is_none());
+    }
+
+    /// TASK-081: the author of a forward, by the kind of its origin.
+    #[test]
+    fn forward_origins_decode_by_kind() {
+        let origin = |origin: &str| {
+            let body = format!(
+                r#"{{"ok":true,"result":{{"message_id":5,"chat":{{"id":7}},"text":"t",
+                "forward_origin":{origin}}}}}"#
+            );
+            let message: Message = parse_envelope(200, body.as_bytes()).unwrap();
+            message.forward_origin.expect("a forward")
+        };
+        let user = origin(
+            r#"{"type":"user","date":1,"sender_user":{"id":42,"is_bot":false,"first_name":"Анна","username":"anna"}}"#,
+        );
+        assert_eq!(user.kind, "user");
+        let sender = user.sender_user.unwrap();
+        assert_eq!((sender.id, sender.is_bot), (42, false));
+        assert_eq!(sender.username.as_deref(), Some("anna"));
+        let hidden = origin(r#"{"type":"hidden_user","date":1,"sender_user_name":"Анна"}"#);
+        assert_eq!(hidden.kind, "hidden_user");
+        assert!(hidden.sender_user.is_none());
+        assert_eq!(hidden.sender_user_name.as_deref(), Some("Анна"));
+        let nameless = origin(r#"{"type":"hidden_user","date":1}"#);
+        assert!(nameless.sender_user_name.is_none());
+        for (kind, raw) in [
+            (
+                "chat",
+                r#"{"type":"chat","date":1,"sender_chat":{"id":-1001,"type":"supergroup"}}"#,
+            ),
+            (
+                "channel",
+                r#"{"type":"channel","date":1,"chat":{"id":-1002,"type":"channel"},"message_id":3}"#,
+            ),
+            ("future", r#"{"type":"future","date":1}"#),
+        ] {
+            let other = origin(raw);
+            assert_eq!(other.kind, kind);
+            assert!(other.sender_user.is_none());
+        }
+        let bare = origin(r#"{"type":"user","date":1}"#);
+        assert!(bare.sender_user.is_none());
     }
 
     #[test]

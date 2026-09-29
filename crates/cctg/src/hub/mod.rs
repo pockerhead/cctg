@@ -14,6 +14,7 @@ pub mod mention;
 pub mod menu;
 pub mod mirror;
 pub mod offset;
+pub mod people;
 pub mod permissions;
 pub mod questions;
 pub mod registry;
@@ -153,6 +154,16 @@ fn route_inbound<'a>(
         Routed::Connect(input) => {
             if control.send(Control::Connect(input)).is_err() {
                 warn!("slot actor stopped; /connect dropped");
+            }
+        }
+        Routed::Forward(input) => {
+            if control.send(Control::Forward(input)).is_err() {
+                warn!("slot actor stopped; forward dropped");
+            }
+        }
+        Routed::Invite(input) => {
+            if control.send(Control::Invite(input)).is_err() {
+                warn!("slot actor stopped; invite dropped");
             }
         }
         Routed::Service(_) | Routed::Ignored(_) => {}
@@ -405,7 +416,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
                 "users may create and delete topics in their private chat with the bot; turn that off in @BotFather (Threaded Mode)"
             );
         }
-        if config.allowlist.is_team() {
+        if config.allowlist.owners_len() > 1 {
             info!(
                 "several allowed users: a device shows in the private chat of who ran its /join, else of the first allowed user"
             );
@@ -422,7 +433,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         .filter(|_| private)
         .map(|first| slots::Owners {
             first: PrivateChat::of_user(first),
-            devices: config.allowlist.is_team().then(|| devices.clone()),
+            devices: (config.allowlist.owners_len() > 1).then(|| devices.clone()),
             share_new: false,
         });
     // A shared slot's group topic answers mentions of the bot (TASK-077).
@@ -452,6 +463,10 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         menu: true,
         mentions,
         groups: groups.clone(),
+        // TASK-081: the members added from the menu, and the devices of a
+        // removed one to revoke.
+        allowlist: config.allowlist.clone(),
+        devices: Some(devices.clone()),
         ..slots::Options::default()
     };
     let mut slots = Slots::new(registry, registry_store, outbox.clone(), options);
@@ -475,6 +490,7 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
         devices.clone(),
         join,
         me.username.clone(),
+        config.allowlist.clone(),
     ));
     let (agents_tx, agents_rx) = mpsc::channel(256);
     let (hooks_tx, hooks_rx) = mpsc::channel(256);
@@ -710,6 +726,7 @@ mod tests {
             thread_id: None,
             from_name: None,
             display_name: None,
+            sender: PrivateChat::of_user(ALLOWED),
         }));
         route(Routed::Input(Inbound {
             text: None,
@@ -723,8 +740,33 @@ mod tests {
             thread_id: None,
             from_name: None,
             display_name: None,
+            sender: PrivateChat::of_user(ALLOWED),
         };
         route(Routed::Callback(press.clone()));
+        // TASK-081: a forward in a private General and an invite are the
+        // slot actor's.
+        let forward = updates::ForwardInput {
+            chat: PrivateChat::of_user(ALLOWED),
+            message_id: 12,
+            origin: updates::Origin::Hidden,
+        };
+        route(Routed::Forward(forward.clone()));
+        let start = json!({ "update_id": 1, "message": {
+            "message_id": 13, "date": 1, "text": "/start inv_AbCdEfGhIjKlMnOpQr-_09",
+            "from": { "id": 5005, "is_bot": false, "first_name": "x" },
+            "chat": { "id": 5005, "type": "private" },
+        }});
+        let (_, mut routed) = updates::route_batch_with(
+            vec![start],
+            None,
+            &groups::KnownGroups::default(),
+            &config::Allowlist::default(),
+            true,
+        );
+        let Routed::Invite(invite) = routed.remove(0) else {
+            panic!("an invite");
+        };
+        route(Routed::Invite(invite.clone()));
         for kind in [ServiceKind::TopicCreated, ServiceKind::TopicClosed] {
             route(Routed::Service(updates::ServiceMessage {
                 chat: GROUP,
@@ -783,6 +825,8 @@ mod tests {
             Control::Message(Inbound { text: None, .. })
         ));
         assert_eq!(control_rx.try_recv().unwrap(), Control::Callback(press));
+        assert_eq!(control_rx.try_recv().unwrap(), Control::Forward(forward));
+        assert_eq!(control_rx.try_recv().unwrap(), Control::Invite(invite));
         assert_eq!(
             control_rx.try_recv().unwrap(),
             Control::Pinned {

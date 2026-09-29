@@ -344,6 +344,7 @@ use super::api::{ApiError, ChatInfo, ChatMember, Document};
 use super::buffer::{self, Attachment, Parked, ResumeNote};
 use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::commands::{self, Prepared, TranscriptAsk, Unavailable};
+use super::config::Allowlist;
 use super::console;
 use super::devices::Devices;
 use super::fetch::{self, Fetch, Fetched};
@@ -352,6 +353,7 @@ use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAs
 use super::mention;
 use super::menu::{self, MenuPress, Page, RowState, SlotAction};
 use super::mirror::{Detached, Follow, Landed, Mirror, Write};
+use super::people::{self, Book, Refusal};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
 use super::questions::{self, Asks};
 use super::registry::{
@@ -364,7 +366,9 @@ use super::stream::{self, Format, Held, Live, MirrorOp, Open, Step};
 use super::subagents::{
     self, AgentCall, AgentIndex, BodyInput, Candidates, Reports, Scan, Stopped,
 };
-use super::updates::{self, CallbackInput, ConnectInput, Inbound, MemberUpdate};
+use super::updates::{
+    self, CallbackInput, ConnectInput, ForwardInput, Inbound, InviteInput, MemberUpdate, Origin,
+};
 use crate::channel::is_request_id;
 use crate::files;
 use crate::wire::{
@@ -674,6 +678,13 @@ pub struct Options {
     /// The groups the update poll lets through (TASK-069); the actor
     /// writes the registry's groups into it.
     pub groups: KnownGroups,
+    /// The allowlist the update poll reads (TASK-081): the actor writes
+    /// the members owners add and remove from the menu into it; only its
+    /// owners manage them.
+    pub allowlist: Allowlist,
+    /// The device list (TASK-081): the devices of a removed member are
+    /// revoked; `None`: none are.
+    pub devices: Option<Devices>,
 }
 
 /// Who the agent is in a group topic (TASK-077): `getMe`'s id and username.
@@ -804,6 +815,8 @@ impl Default for Options {
             mentions: None,
             compress_wait: COMPRESS_WAIT,
             groups: KnownGroups::default(),
+            allowlist: Allowlist::default(),
+            devices: None,
         }
     }
 }
@@ -835,6 +848,11 @@ pub enum Control {
     Member(MemberUpdate),
     /// `/connect` in a group (TASK-069).
     Connect(ConnectInput),
+    /// A forward in the General of an allowlisted user's private chat
+    /// (TASK-081).
+    Forward(ForwardInput),
+    /// `/start inv_<code>` of someone not allowlisted (TASK-081).
+    Invite(InviteInput),
     /// The hub stops: [`Slots::run`] handles what already came in, writes
     /// the registry and returns.
     Stop,
@@ -1043,6 +1061,10 @@ enum MenuJob {
     },
     /// The delete of a `/start` or `/menu` message.
     Clean,
+    /// A message about the people (TASK-081): a proposal, its answer, an
+    /// invite link, a greeting or a farewell. Quiet: a 403 (a person who
+    /// never pressed Start) closes no chat and tells no group.
+    People,
 }
 
 /// A call about a slot's status message; at most one per slot in flight,
@@ -1863,6 +1885,14 @@ pub struct Slots {
     /// default group as a fallback (TASK-069): that view is held out of the
     /// registry, so nothing goes there, until a pick or the hold's end.
     choosing: HashMap<SlotId, Choosing>,
+    /// Proposals and invite links of the people tab (TASK-081).
+    people: Book,
+    /// A first 🗑 of an owner waits for its second until then: (member
+    /// key, until), by owner.
+    remove_confirm: HashMap<PrivateChat, (u32, Instant)>,
+    /// Members removed in this run: what the poll let through before the
+    /// removal is dropped (TASK-081).
+    removed: HashSet<PrivateChat>,
     grace_until: Instant,
     next_retry: Instant,
     done_tx: mpsc::UnboundedSender<Done>,
@@ -1887,6 +1917,11 @@ impl Slots {
             .collect();
         registry.lose_blocks(&ended);
         registry.private = options.owners.is_some();
+        // TASK-081: a member who became an owner, and a repeated one, go.
+        let mut seen = HashSet::new();
+        registry.retain_members(|member| {
+            !options.allowlist.is_owner(member.chat.expose()) && seen.insert(member.chat)
+        });
         // The twins kept in `registry.json` (TASK-063): of lasting messages,
         // and of the status messages below.
         let mut mirror = Mirror::default();
@@ -2015,6 +2050,9 @@ impl Slots {
             lookups: None,
             picks: HashMap::new(),
             choosing: HashMap::new(),
+            people: Book::default(),
+            remove_confirm: HashMap::new(),
+            removed: HashSet::new(),
             grace_until: now + options.grace,
             next_retry: now + options.retry_every,
             done_tx,
@@ -2022,6 +2060,7 @@ impl Slots {
             options,
         };
         slots.publish_groups();
+        slots.publish_members();
         slots
     }
 
@@ -2031,6 +2070,13 @@ impl Slots {
         self.options
             .groups
             .replace(std::iter::once(self.registry.default_group).chain(known));
+    }
+
+    /// The update poll lets through the registry's members (TASK-081).
+    fn publish_members(&self) {
+        self.options
+            .allowlist
+            .set_members(self.registry.members.iter().map(|member| member.chat));
     }
 
     /// Starts the task that checks groups with `lookup` (TASK-069): the
@@ -3716,6 +3762,16 @@ impl Slots {
                 thread_id,
                 message_id,
             } => (chat, thread_id, message_id),
+            // TASK-081: the poll let these through before their author was
+            // removed.
+            Control::Message(input) if self.removed.contains(&input.sender) => {
+                debug!("input of a removed person dropped");
+                return;
+            }
+            Control::Callback(input) if self.removed.contains(&input.sender) => {
+                debug!("input of a removed person dropped");
+                return;
+            }
             Control::Message(input) => return self.on_topic_message(input),
             Control::Callback(input) => return self.on_callback(input),
             Control::Pinned {
@@ -3739,6 +3795,8 @@ impl Slots {
             }
             Control::Member(update) => return self.on_member(update),
             Control::Connect(input) => return self.on_connect(input),
+            Control::Forward(input) => return self.on_forward(input),
+            Control::Invite(input) => return self.on_invite(input),
             // Handled by `run`.
             Control::Stop => return,
         };
@@ -11467,6 +11525,326 @@ impl Slots {
         );
     }
 
+    /// A forward in the General of `input.chat` (TASK-081): an owner is
+    /// asked to confirm its author as a member; anyone else, and a forward
+    /// that names nobody to add, is told why not.
+    fn on_forward(&mut self, input: ForwardInput) {
+        if !self.options.menu || !self.registry.private {
+            return;
+        }
+        let owner = input.chat;
+        self.reopen(Chat::Private(owner));
+        let reply = Some(input.message_id);
+        if !self.options.allowlist.is_owner(owner.expose()) {
+            self.tell_person(
+                owner,
+                people::ONLY_OWNER_ADDS.to_owned(),
+                None,
+                reply,
+                false,
+            );
+            return;
+        }
+        match input.origin {
+            Origin::User { is_bot: true, .. } => {
+                self.tell_person(owner, people::NO_BOTS.to_owned(), None, reply, false);
+            }
+            Origin::User {
+                user,
+                name,
+                username,
+                ..
+            } => self.propose_member(owner, user, name, username, reply, false),
+            Origin::Hidden => {
+                // The link needs the bot's username.
+                let keyboard = self.options.mentions.is_some().then(menu::invite_keyboard);
+                self.tell_person(owner, people::HIDDEN.to_owned(), keyboard, reply, false);
+            }
+            Origin::Other => {
+                self.tell_person(owner, people::OTHER.to_owned(), None, reply, false);
+            }
+        }
+    }
+
+    /// `/start inv_<code>` (TASK-081): a valid code asks its owner to
+    /// confirm the person; any other gets no answer.
+    fn on_invite(&mut self, input: InviteInput) {
+        if !self.options.menu || !self.registry.private {
+            return;
+        }
+        let Some(owner) = self.people.redeem(input.code.as_str(), StdInstant::now()) else {
+            debug!("invite code not valid");
+            return;
+        };
+        if self.options.allowlist.allows(input.user) {
+            return;
+        }
+        self.tell_person(
+            input.user,
+            people::INVITE_RECEIVED.to_owned(),
+            None,
+            None,
+            false,
+        );
+        self.propose_member(owner, input.user, input.name, input.username, None, true);
+    }
+
+    /// Asks `owner` to confirm `user` as a member, or tells why not.
+    fn propose_member(
+        &mut self,
+        owner: PrivateChat,
+        user: PrivateChat,
+        name: Option<String>,
+        username: Option<String>,
+        reply_to: Option<i64>,
+        notify: bool,
+    ) {
+        let text = if self.options.allowlist.allows(user) {
+            people::ALREADY.to_owned()
+        } else if self.options.allowlist.members_len() >= people::MAX_MEMBERS {
+            people::full_list()
+        } else {
+            let name = name
+                .or_else(|| username.clone())
+                .unwrap_or_else(|| people::NO_NAME.to_owned());
+            let label = people::label(&name, username.as_deref());
+            match self
+                .people
+                .propose(owner, user, name, username, StdInstant::now())
+            {
+                Ok(token) => {
+                    let text = people::confirm_text(&label);
+                    let keyboard = Some(menu::add_keyboard(token));
+                    self.tell_person(owner, text, keyboard, reply_to, notify);
+                    return;
+                }
+                Err(Refusal::Waiting) => people::WAITING.to_owned(),
+                Err(Refusal::Full) => people::TOO_MANY_PENDING.to_owned(),
+            }
+        };
+        self.tell_person(owner, text, None, reply_to, false);
+    }
+
+    /// A message about the people into the General of `chat` (TASK-081):
+    /// quiet, a 403 closes nothing.
+    fn tell_person(
+        &mut self,
+        chat: PrivateChat,
+        text: String,
+        keyboard: Option<serde_json::Value>,
+        reply_to: Option<i64>,
+        notify: bool,
+    ) {
+        self.hand_off(
+            Work::Menu(MenuJob::People),
+            Op::Send {
+                chat: Chat::Private(chat),
+                thread_id: None,
+                text,
+                html: None,
+                rich: None,
+                reply_markup: keyboard,
+                permission: false,
+                reply_to,
+                notify,
+            },
+        );
+    }
+
+    /// The people tab of owner `owner` now (TASK-081).
+    fn people_view(&self, owner: PrivateChat) -> menu::PeopleView {
+        let now = Instant::now();
+        let armed = self
+            .remove_confirm
+            .get(&owner)
+            .filter(|(_, until)| now < *until)
+            .map(|(key, _)| *key);
+        menu::PeopleView {
+            owners: self.options.allowlist.owners_len(),
+            members: self
+                .registry
+                .members
+                .iter()
+                .map(|member| menu::PersonRow {
+                    key: member.key,
+                    name: member.name.clone(),
+                    username: member.username.clone(),
+                    confirm: armed == Some(member.key),
+                })
+                .collect(),
+            invite: self.options.mentions.is_some(),
+        }
+    }
+
+    /// A people press of owner `owner` (TASK-081); `on_menu`: it was on
+    /// their current menu. The page to show and the answer.
+    fn press_people(
+        &mut self,
+        owner: PrivateChat,
+        press: MenuPress,
+        on_menu: bool,
+        message: Option<i64>,
+    ) -> (Page, String) {
+        let answer = match press {
+            MenuPress::Remove { .. } | MenuPress::RemoveConfirm { .. } if !on_menu => {
+                menu::ANSWER_STALE_MENU.to_owned()
+            }
+            MenuPress::Remove { key } => {
+                if self.registry.members.iter().any(|member| member.key == key) {
+                    let until = Instant::now() + status::CONFIRM_FOR;
+                    self.remove_confirm.insert(owner, (key, until));
+                    String::new()
+                } else {
+                    people::ANSWER_GONE.to_owned()
+                }
+            }
+            MenuPress::RemoveConfirm { key } => {
+                let now = Instant::now();
+                let armed = self
+                    .remove_confirm
+                    .get(&owner)
+                    .is_some_and(|(armed, until)| *armed == key && now < *until);
+                if armed {
+                    self.remove_member(owner, key)
+                        .unwrap_or_else(|| people::ANSWER_GONE.to_owned())
+                } else {
+                    menu::ANSWER_UNCHANGED.to_owned()
+                }
+            }
+            MenuPress::Invite => self.press_invite(owner),
+            MenuPress::AddYes { token } => self.press_add(owner, message, token, true),
+            MenuPress::AddNo { token } => self.press_add(owner, message, token, false),
+            _ => String::new(),
+        };
+        (Page::People, answer)
+    }
+
+    /// 🔗 of owner `owner` (TASK-081): a new one-time link, as a message
+    /// of its own.
+    fn press_invite(&mut self, owner: PrivateChat) -> String {
+        let Some(bot) = self
+            .options
+            .mentions
+            .as_ref()
+            .map(|bot| bot.username.clone())
+        else {
+            return people::ANSWER_NO_USERNAME.to_owned();
+        };
+        match self.people.mint_invite(owner, StdInstant::now()) {
+            Ok(code) => {
+                info!("invite link minted");
+                let link = people::invite_link(&bot, &code);
+                self.tell_person(owner, people::invite_text(&link), None, None, false);
+                String::new()
+            }
+            Err(_) => people::invites_full(),
+        }
+    }
+
+    /// «Добавить» (`yes`) or «Отмена» of proposal `token` of `owner` on
+    /// `message` (TASK-081): the proposal message says what came of it and
+    /// loses its buttons.
+    fn press_add(
+        &mut self,
+        owner: PrivateChat,
+        message: Option<i64>,
+        token: u32,
+        yes: bool,
+    ) -> String {
+        let text = match self.people.take(owner, token, StdInstant::now()) {
+            None => people::STALE.to_owned(),
+            Some(_) if !yes => people::CANCELLED.to_owned(),
+            Some(pending) => self.add_member(pending),
+        };
+        let Some(message) = message else {
+            return cut(&text, 190);
+        };
+        self.hand_off(
+            Work::Menu(MenuJob::People),
+            Op::Edit {
+                chat: Chat::Private(owner),
+                message_id: message,
+                text,
+                reply_markup: Some(permissions::no_keyboard()),
+                background: false,
+            },
+        );
+        String::new()
+    }
+
+    /// Adds the person of `pending` (TASK-081): they write from the next
+    /// update on and are greeted. What the proposal message says then.
+    fn add_member(&mut self, pending: people::Pending) -> String {
+        if self.options.allowlist.allows(pending.user) {
+            return people::ALREADY.to_owned();
+        }
+        if self.registry.members.len() >= people::MAX_MEMBERS {
+            return people::full_list();
+        }
+        let label = people::label(&pending.name, pending.username.as_deref());
+        let user = pending.user;
+        self.registry
+            .add_member(user, pending.name, pending.username);
+        self.removed.remove(&user);
+        self.publish_members();
+        info!(
+            members = self.registry.members.len(),
+            "person added from the menu"
+        );
+        let bot = self
+            .options
+            .mentions
+            .as_ref()
+            .map(|bot| bot.username.clone());
+        self.tell_person(user, people::welcome_text(bot.as_deref()), None, None, true);
+        people::added_text(&label, bot.as_deref())
+    }
+
+    /// Removes member `key` at the second press of `owner` (TASK-081):
+    /// their access ends at once, their menu goes (their settings stay),
+    /// their devices are revoked and they are told. The answer to show.
+    fn remove_member(&mut self, owner: PrivateChat, key: u32) -> Option<String> {
+        let member = self.registry.remove_member(key)?;
+        let gone = member.chat;
+        self.removed.insert(gone);
+        self.publish_members();
+        self.remove_confirm.remove(&owner);
+        if let Some(menu) = self.registry.person(gone).and_then(|person| person.menu) {
+            self.retire(MessageKey::new(Chat::Private(gone), menu), true);
+        }
+        if self.registry.person(gone).is_some() {
+            let person = self.registry.person_mut(gone);
+            person.menu = None;
+            person.on_request = true;
+        }
+        self.menus.remove(&gone);
+        self.pending_menus.remove(&gone);
+        self.menu_later.remove(&gone);
+        let devices = match &self.options.devices {
+            Some(devices) => {
+                let ids = devices.owned_by(gone);
+                let count = ids.len();
+                if count > 0 {
+                    let devices = devices.clone();
+                    // Revoking writes `devices.json`: off the actor.
+                    tokio::task::spawn_blocking(move || {
+                        for id in ids {
+                            devices.revoke(&id);
+                        }
+                    });
+                }
+                count
+            }
+            None => 0,
+        };
+        self.tell_person(gone, people::FAREWELL.to_owned(), None, None, true);
+        info!(
+            members = self.registry.members.len(),
+            devices, "person removed from the menu"
+        );
+        Some(people::removed_answer(&member.label(), devices))
+    }
+
     /// Sends the menu into the General of private chat `chat` (TASK-073);
     /// once Telegram took it, it is pinned and the old one goes.
     fn show_menu(&mut self, chat: PrivateChat, page: Page) {
@@ -11537,7 +11915,16 @@ impl Slots {
             Page::Sessions(page) => Some(self.sessions_view(chat, page)),
             _ => None,
         };
-        menu::render(&page, &settings, sessions.as_ref(), unix_now())
+        // The people tab is an owner's (TASK-081).
+        let people = (self.registry.private && self.options.allowlist.is_owner(chat.expose()))
+            .then(|| self.people_view(chat));
+        menu::render(
+            &page,
+            &settings,
+            sessions.as_ref(),
+            people.as_ref(),
+            unix_now(),
+        )
     }
 
     /// Page `page` of the sessions of `chat`: the slots that show there,
@@ -11686,6 +12073,13 @@ impl Slots {
         ) {
             self.reopen(Chat::Private(chat));
         }
+        // Only owners manage the people (TASK-081).
+        if press.manages_people() && !self.options.allowlist.is_owner(chat.expose()) {
+            return people::ANSWER_OWNER_ONLY.to_owned();
+        }
+        let on_menu = input.thread_id.is_none()
+            && input.message_id.is_some()
+            && input.message_id == self.registry.person(chat).and_then(|person| person.menu);
         let (page, answer) = match press {
             MenuPress::Sessions { page } => (Page::Sessions(page as usize), String::new()),
             MenuPress::Display => (Page::Display, String::new()),
@@ -11697,6 +12091,14 @@ impl Slots {
                 self.press_menu_slot(chat, action, slot, input.display_name.as_deref()),
             ),
             MenuPress::UpdateAll { page } => (Page::Sessions(page as usize), self.update_all(chat)),
+            MenuPress::People => (Page::People, String::new()),
+            people_press @ (MenuPress::Remove { .. }
+            | MenuPress::RemoveConfirm { .. }
+            | MenuPress::Invite
+            | MenuPress::AddYes { .. }
+            | MenuPress::AddNo { .. }) => {
+                self.press_people(chat, people_press, on_menu, input.message_id)
+            }
             setting => {
                 let old = self
                     .registry
@@ -11948,6 +12350,17 @@ impl Slots {
             MenuJob::Pin | MenuJob::Clean => {
                 if let Some(Err(error)) = delivery {
                     debug!(%error, "menu call failed");
+                }
+            }
+            // TASK-081: a person who never pressed Start is no chat to
+            // close. The code only: Telegram's text is not ours to log.
+            MenuJob::People => {
+                if let Some(Err(error)) = delivery {
+                    let code = match error {
+                        ApiError::Telegram { code, .. } => Some(code),
+                        _ => None,
+                    };
+                    debug!(?code, "people message not delivered");
                 }
             }
         }
@@ -13469,7 +13882,10 @@ async fn dispatch_loop(
                     seq,
                     landed,
                     gone: delivery.as_ref().is_some_and(topic_gone),
-                    closed: delivery.as_ref().is_some_and(forbidden),
+                    // A people message (TASK-081) closes no chat: its
+                    // person may never have pressed Start.
+                    closed: delivery.as_ref().is_some_and(forbidden)
+                        && !matches!(work, Work::Menu(MenuJob::People)),
                 });
             }
             let _ = done.send(match work {
@@ -14585,6 +15001,7 @@ again"
             thread_id: None,
             from_name: None,
             display_name: None,
+            sender: PrivateChat::of_user(1001),
         })
     }
 
@@ -15452,6 +15869,7 @@ again"
             thread_id: Some(thread),
             from_name: None,
             display_name: None,
+            sender: crate::hub::chat::PrivateChat::of_user(7_319_402_518),
         });
         rig.control.send(elsewhere).unwrap();
         let ops = settled(&rig, |ops| answers(ops).len() == 1).await;
@@ -27159,6 +27577,7 @@ again"
             thread_id: Some(thread),
             from_name: None,
             display_name: Some(SHARER.into()),
+            sender: owner_chat(),
         })
     }
 
@@ -28108,6 +28527,7 @@ again"
             thread_id: None,
             from_name: None,
             display_name: Some(SHARER.into()),
+            sender: owner_chat(),
         })
     }
 
@@ -28863,6 +29283,7 @@ again"
             thread_id: None,
             from_name: None,
             display_name: None,
+            sender: PrivateChat::of_user(8),
         }));
         slots.pump();
         let handed = all_work(&mut work);
@@ -33500,5 +33921,666 @@ again"
         });
         assert_eq!(slots.queued_for(Some(group_b())), 1);
         assert_eq!(slots.queued_messages, base);
+    }
+
+    // ------------------------------------------------------------ TASK-081
+
+    /// The person the owner (private chat 7) adds in these tests.
+    const MEMBER: i64 = 7_319_402_777;
+
+    fn member_chat() -> PrivateChat {
+        PrivateChat::of_user(MEMBER)
+    }
+
+    /// The menu of [`menu_options`] with the owner in the allowlist and a
+    /// bot username (invite links).
+    fn people_options() -> Options {
+        Options {
+            allowlist: [7].into_iter().collect(),
+            mentions: Some(MentionBot {
+                id: 9,
+                username: "cctg_bot".into(),
+            }),
+            ..menu_options()
+        }
+    }
+
+    /// A forward of `origin` in the General of `chat` as message 50.
+    fn forward_in(chat: PrivateChat, origin: Origin) -> Control {
+        Control::Forward(ForwardInput {
+            chat,
+            message_id: 50,
+            origin,
+        })
+    }
+
+    /// A forward of a message of [`MEMBER`], «Анна» (@anna).
+    fn forward_of_member() -> Control {
+        forward_in(
+            owner_chat(),
+            Origin::User {
+                user: member_chat(),
+                is_bot: false,
+                name: Some("Анна".into()),
+                username: Some("anna".into()),
+            },
+        )
+    }
+
+    /// A press of `data` by `sender` on message `message_id` in the General
+    /// of `sender`'s private chat.
+    fn press_by(sender: PrivateChat, message_id: i64, data: &str) -> Control {
+        Control::Callback(CallbackInput {
+            query_id: format!("q-{data}-{message_id}"),
+            data: Some(data.into()),
+            chat: Some(Chat::Private(sender)),
+            message_id: Some(message_id),
+            thread_id: None,
+            from_name: None,
+            display_name: None,
+            sender,
+        })
+    }
+
+    /// `/start inv_<code>` of user `user`, as the poll routes it.
+    fn invite_from(user: i64, code: &str) -> Control {
+        let update = serde_json::json!({ "update_id": 1, "message": {
+            "message_id": 3, "date": 1, "text": format!("/start inv_{code}"),
+            "from": { "id": user, "is_bot": false, "first_name": "Гость" },
+            "chat": { "id": user, "type": "private" },
+        }});
+        let (_, mut routed) = updates::route_batch_with(
+            vec![update],
+            None,
+            &KnownGroups::default(),
+            &Allowlist::default(),
+            true,
+        );
+        match routed.remove(0) {
+            updates::Routed::Invite(input) => Control::Invite(input),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A people message: to whom, its text, keyboard and the message it
+    /// answers.
+    type PeopleSend = (PrivateChat, String, Option<serde_json::Value>, Option<i64>);
+
+    /// The people messages among `handed`.
+    fn people_sends(handed: &[(Work, Op)]) -> Vec<PeopleSend> {
+        handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (
+                    Work::Menu(MenuJob::People),
+                    Op::Send {
+                        chat: Chat::Private(to),
+                        thread_id: None,
+                        text,
+                        reply_markup,
+                        reply_to,
+                        ..
+                    },
+                ) => Some((*to, text.clone(), reply_markup.clone(), *reply_to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The people edits among `handed`: (message, text); each drops the
+    /// buttons.
+    fn people_edits(handed: &[(Work, Op)]) -> Vec<(i64, String)> {
+        handed
+            .iter()
+            .filter_map(|(work, op)| match (work, op) {
+                (
+                    Work::Menu(MenuJob::People),
+                    Op::Edit {
+                        message_id,
+                        text,
+                        reply_markup,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(reply_markup, &Some(permissions::no_keyboard()));
+                    Some((*message_id, text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn button_datas(keyboard: &serde_json::Value) -> Vec<String> {
+        keyboard["inline_keyboard"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(|button| button["callback_data"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The token of the one proposal among `handed`.
+    fn proposal_token(handed: &[(Work, Op)]) -> u32 {
+        let sends = people_sends(handed);
+        let keyboards: Vec<&serde_json::Value> = sends
+            .iter()
+            .filter_map(|(_, _, keyboard, _)| keyboard.as_ref())
+            .collect();
+        assert_eq!(keyboards.len(), 1, "{sends:?}");
+        let datas = button_datas(keyboards[0]);
+        let token = datas[0].strip_prefix("menu:pa:").unwrap();
+        assert_eq!(datas[1], format!("menu:pn:{token}"));
+        token.parse().unwrap()
+    }
+
+    /// Slot 0 of the owner with the menu, and [`MEMBER`] added.
+    fn with_member(dir: &TempDir) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = menu_slot(dir, people_options());
+        slots.on_control(forward_of_member());
+        let token = proposal_token(&all_work(&mut work));
+        slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
+        let _ = all_work(&mut work);
+        assert!(slots.options.allowlist.allows(member_chat()));
+        (slots, work)
+    }
+
+    /// TASK-081: a forward of an owner asks to confirm its author; «Добавить»
+    /// adds them at once, edits the question and greets them; the button
+    /// counts once.
+    #[tokio::test]
+    async fn a_forward_asks_the_owner_and_add_opens_access() {
+        let dir = TempDir::new("slots-people-add");
+        let (mut slots, mut work) = menu_slot(&dir, people_options());
+        assert!(!slots.options.allowlist.contains(MEMBER));
+        slots.on_control(forward_of_member());
+        let handed = all_work(&mut work);
+        let sends = people_sends(&handed);
+        assert_eq!(sends.len(), 1, "{handed:#?}");
+        let (to, text, _, reply) = &sends[0];
+        assert_eq!((*to, *reply), (owner_chat(), Some(50)));
+        assert!(
+            text.starts_with("Добавить «Анна (@anna)» в cctg?"),
+            "{text}"
+        );
+        let token = proposal_token(&handed);
+
+        // The same forward again: the question waits above.
+        slots.on_control(forward_of_member());
+        let again = people_sends(&all_work(&mut work));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].1, people::WAITING);
+
+        slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
+        let handed = all_work(&mut work);
+        assert!(slots.options.allowlist.contains(MEMBER));
+        assert!(slots.options.allowlist.is_team());
+        assert_eq!(slots.registry.members.len(), 1);
+        assert!(slots.registry.dirty);
+        let edits = people_edits(&handed);
+        assert_eq!(edits.len(), 1, "{handed:#?}");
+        assert_eq!(edits[0].0, 1200);
+        assert!(
+            edits[0].1.starts_with("Добавлен(а): Анна (@anna).")
+                && edits[0].1.contains("@cctg_bot"),
+            "{}",
+            edits[0].1
+        );
+        let sends = people_sends(&handed);
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].0, member_chat());
+        assert!(
+            sends[0].1.starts_with("Вам открыт доступ"),
+            "{}",
+            sends[0].1
+        );
+        assert_eq!(callback_answers(&handed), [None]);
+        assert!(
+            menu_edits(&handed).is_empty(),
+            "the menu is not the proposal"
+        );
+
+        // A second press of the same button: stale.
+        slots.on_control(press_by(owner_chat(), 1200, &format!("menu:pa:{token}")));
+        let handed = all_work(&mut work);
+        assert_eq!(people_edits(&handed), [(1200, people::STALE.to_owned())]);
+        assert_eq!(slots.registry.members.len(), 1);
+
+        // Forwarded again, they are in the list already.
+        slots.on_control(forward_of_member());
+        let sends = people_sends(&all_work(&mut work));
+        assert_eq!(sends[0].1, people::ALREADY);
+    }
+
+    /// TASK-081: what a forward that adds nobody answers; «Отмена» adds
+    /// nobody.
+    #[tokio::test]
+    async fn a_forward_that_adds_nobody_says_why() {
+        let dir = TempDir::new("slots-people-refusals");
+        let (mut slots, mut work) = menu_slot(&dir, people_options());
+        let told = |slots: &mut Slots, work: &mut mpsc::UnboundedReceiver<(Work, Op)>, control| {
+            slots.on_control(control);
+            let sends = people_sends(&all_work(work));
+            assert_eq!(sends.len(), 1, "{sends:?}");
+            sends.into_iter().next().unwrap()
+        };
+        let bot = Origin::User {
+            user: PrivateChat::of_user(9),
+            is_bot: true,
+            name: Some("bot".into()),
+            username: Some("cctg_bot".into()),
+        };
+        let (to, text, keyboard, _) = told(&mut slots, &mut work, forward_in(owner_chat(), bot));
+        assert_eq!(
+            (to, text.as_str(), keyboard),
+            (owner_chat(), people::NO_BOTS, None)
+        );
+        let (_, text, keyboard, _) = told(
+            &mut slots,
+            &mut work,
+            forward_in(owner_chat(), Origin::Hidden),
+        );
+        assert_eq!(text, people::HIDDEN);
+        assert_eq!(button_datas(&keyboard.unwrap()), ["menu:pi"]);
+        let (_, text, keyboard, _) = told(
+            &mut slots,
+            &mut work,
+            forward_in(owner_chat(), Origin::Other),
+        );
+        assert_eq!((text.as_str(), keyboard), (people::OTHER, None));
+        // Someone who is no owner (a member) adds nobody.
+        let (to, text, _, _) = told(
+            &mut slots,
+            &mut work,
+            forward_in(member_chat(), Origin::Hidden),
+        );
+        assert_eq!(
+            (to, text.as_str()),
+            (member_chat(), people::ONLY_OWNER_ADDS)
+        );
+
+        // «Отмена».
+        slots.on_control(forward_of_member());
+        let token = proposal_token(&all_work(&mut work));
+        slots.on_control(press_by(owner_chat(), 1201, &format!("menu:pn:{token}")));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            people_edits(&handed),
+            [(1201, people::CANCELLED.to_owned())]
+        );
+        assert!(slots.registry.members.is_empty());
+        assert!(!slots.options.allowlist.contains(MEMBER));
+        assert!(people_sends(&handed).is_empty());
+
+        // Without a bot username the hidden author gets no link button.
+        let dir = TempDir::new("slots-people-no-username");
+        let (mut slots, mut work) = menu_slot(
+            &dir,
+            Options {
+                mentions: None,
+                ..people_options()
+            },
+        );
+        let (_, _, keyboard, _) = told(
+            &mut slots,
+            &mut work,
+            forward_in(owner_chat(), Origin::Hidden),
+        );
+        assert_eq!(keyboard, None);
+        slots.on_control(menu_press(MENU, "menu:pi"));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(people::ANSWER_NO_USERNAME.to_owned())]
+        );
+    }
+
+    /// TASK-081: a greeting Telegram refuses with 403 (the person never
+    /// pressed Start) closes no chat and tells the group nothing; the
+    /// dispatch task and the scheduler are the real ones.
+    #[tokio::test]
+    async fn a_people_message_refused_with_403_closes_nothing() {
+        #[derive(Default)]
+        struct Forbidding(Mutex<Vec<Op>>);
+
+        impl Transport for Forbidding {
+            async fn execute(&self, op: &Op) -> Delivery {
+                self.0.lock().unwrap().push(op.clone());
+                match op {
+                    Op::Send {
+                        chat: Chat::Private(to),
+                        ..
+                    } if *to == member_chat() => Err(ApiError::Telegram {
+                        code: 403,
+                        description: "Forbidden: bot can't initiate conversation with a user"
+                            .into(),
+                    }),
+                    Op::Send { .. } => Ok(Outcome::Sent(Message {
+                        message_id: 1300,
+                        ..Message::default()
+                    })),
+                    _ => Ok(Outcome::Done),
+                }
+            }
+        }
+
+        let dir = TempDir::new("slots-people-403");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let transport = Arc::new(Forbidding::default());
+        let (scheduler, outbox) = Scheduler::new(transport.clone(), FAST);
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(Registry::default(), store, outbox, people_options());
+        let mut done = slots.done_rx.take().unwrap();
+        slots.registry.person_mut(owner_chat()).menu = Some(MENU);
+        slots.on_control(forward_of_member());
+        // The question to the owner goes; its token from what Telegram got.
+        let answer = tokio::time::timeout(WAIT, done.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        slots.on_done(answer);
+        let token = {
+            let ops = transport.0.lock().unwrap();
+            let keyboard = ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::Send {
+                        reply_markup: Some(keyboard),
+                        ..
+                    } => Some(keyboard.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            button_datas(&keyboard)[0]
+                .strip_prefix("menu:pa:")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+        };
+        slots.on_control(press_by(owner_chat(), 1300, &format!("menu:pa:{token}")));
+        assert!(slots.options.allowlist.contains(MEMBER));
+        // The edit, the greeting (403) and the press answer come back.
+        let mut greeting_refused = false;
+        while !greeting_refused {
+            let answer = tokio::time::timeout(WAIT, done.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Done::Menu {
+                job: MenuJob::People,
+                delivery: Some(delivery),
+            } = &answer
+                && forbidden(delivery)
+            {
+                greeting_refused = true;
+            }
+            slots.on_done(answer);
+        }
+        slots.pump();
+        // Whatever else is on its way lands first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while let Ok(answer) = done.try_recv() {
+            slots.on_done(answer);
+        }
+        slots.pump();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(slots.registry.closed.is_empty());
+        assert!(slots.closed_told.is_empty());
+        let ops = transport.0.lock().unwrap();
+        assert!(
+            !ops.iter().any(|op| matches!(
+                op,
+                Op::Send {
+                    chat: Chat::Group(_),
+                    ..
+                }
+            )),
+            "the group heard nothing: {ops:#?}"
+        );
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            Op::Send { chat: Chat::Private(to), .. } if *to == member_chat()
+        )));
+    }
+
+    /// TASK-081: a member goes only with two presses on the owner's current
+    /// menu; then their access ends at once, their menu goes, they are
+    /// told; what the poll let through before is dropped; added again they
+    /// are back.
+    #[tokio::test]
+    async fn a_member_goes_after_two_presses_on_the_current_menu() {
+        let dir = TempDir::new("slots-people-remove");
+        let (mut slots, mut work) = with_member(&dir);
+        let key = slots.registry.members[0].key;
+        slots.registry.person_mut(member_chat()).menu = Some(7700);
+        let settings_before = slots
+            .registry
+            .person(member_chat())
+            .unwrap()
+            .settings
+            .clone();
+
+        slots.on_control(menu_press(MENU, "menu:pp"));
+        let handed = all_work(&mut work);
+        let edits = menu_edits(&handed);
+        assert_eq!(edits.len(), 1, "{handed:#?}");
+        assert!(edits[0].1.starts_with("Люди"), "{}", edits[0].1);
+        assert!(edits[0].1.contains("1. Анна (@anna)"), "{}", edits[0].1);
+        let datas = button_datas(&edits[0].2);
+        assert!(datas.contains(&format!("menu:pr:{key}")), "{datas:?}");
+        assert!(datas.contains(&"menu:pi".to_owned()));
+        assert_eq!(
+            datas
+                .iter()
+                .filter(|data| data.starts_with("menu:pr:"))
+                .count(),
+            1,
+            "no button removes an owner"
+        );
+
+        // A second press without the first, a first on an old menu, a forged
+        // key: nothing changes.
+        for (message, data) in [
+            (MENU, format!("menu:prc:{key}")),
+            (MENU - 1, format!("menu:pr:{key}")),
+            (MENU, "menu:pr:999".to_owned()),
+            (MENU, "menu:prc:999".to_owned()),
+        ] {
+            slots.on_control(menu_press(message, &data));
+            let _ = all_work(&mut work);
+            assert!(slots.options.allowlist.contains(MEMBER), "{data}");
+        }
+        slots.on_control(menu_press(MENU - 1, &format!("menu:prc:{key}")));
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(menu::ANSWER_STALE_MENU.to_owned())]
+        );
+
+        slots.on_control(menu_press(MENU, &format!("menu:pr:{key}")));
+        let edits = menu_edits(&all_work(&mut work));
+        assert!(
+            edits.last().is_some_and(
+                |(_, _, keyboard)| button_texts(keyboard).contains(&"🗑 Анна точно?".to_owned())
+            ),
+            "{edits:?}"
+        );
+        // Armed, but on an old menu: nothing.
+        slots.on_control(menu_press(MENU - 1, &format!("menu:prc:{key}")));
+        let _ = all_work(&mut work);
+        assert!(slots.options.allowlist.contains(MEMBER));
+
+        slots.on_control(menu_press(MENU, &format!("menu:prc:{key}")));
+        let handed = all_work(&mut work);
+        assert!(!slots.options.allowlist.contains(MEMBER));
+        assert!(!slots.options.allowlist.is_team());
+        assert!(slots.registry.members.is_empty());
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(
+                "Удалён(а): Анна (@anna). Устройств отключено: 0".to_owned()
+            )]
+        );
+        assert!(
+            handed.iter().any(|(work, op)| matches!(
+                (work, op),
+                (Work::Retire(_), Op::Delete { chat: Chat::Private(to), message_id: 7700 })
+                    if *to == member_chat()
+            )),
+            "their menu goes: {handed:#?}"
+        );
+        let person = slots.registry.person(member_chat()).unwrap();
+        assert!(person.menu.is_none() && person.on_request);
+        assert_eq!(person.settings, settings_before, "settings stay");
+        let sends = people_sends(&handed);
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            (sends[0].0, sends[0].1.as_str()),
+            (member_chat(), people::FAREWELL)
+        );
+        let edits = menu_edits(&handed);
+        assert!(
+            edits
+                .last()
+                .is_some_and(|(_, text, _)| text.contains("пока никого")),
+            "{edits:?}"
+        );
+
+        // What the poll let through before the removal is dropped.
+        let parked = |slots: &Slots| slots.registry.slots[0].buffer.messages.len();
+        let before = parked(&slots);
+        let said = || {
+            Control::Message(Inbound {
+                sender: member_chat(),
+                ..match owner_says(Some(700), 5001, "после удаления") {
+                    Control::Message(input) => input,
+                    _ => unreachable!(),
+                }
+            })
+        };
+        slots.on_control(said());
+        let pressed = || {
+            Control::Callback(CallbackInput {
+                sender: member_chat(),
+                ..match press_in(private_owner(), 700, 900, "allow:abcde") {
+                    Control::Callback(input) => input,
+                    _ => unreachable!(),
+                }
+            })
+        };
+        slots.on_control(pressed());
+        slots.pump();
+        assert_eq!(parked(&slots), before);
+        let handed = all_work(&mut work);
+        assert!(callback_answers(&handed).is_empty(), "{handed:#?}");
+
+        // Added again, they get through.
+        slots.on_control(forward_of_member());
+        let token = proposal_token(&all_work(&mut work));
+        slots.on_control(press_by(owner_chat(), 1202, &format!("menu:pa:{token}")));
+        let _ = all_work(&mut work);
+        assert!(slots.options.allowlist.contains(MEMBER));
+        assert_eq!(slots.registry.members[0].key, key, "max + 1 of none");
+        slots.on_control(said());
+        slots.on_control(pressed());
+        slots.pump();
+        assert_eq!(parked(&slots), before + 1);
+        assert_eq!(callback_answers(&all_work(&mut work)).len(), 1);
+    }
+
+    /// TASK-081: a member has no people tab and their presses of it are
+    /// refused.
+    #[tokio::test]
+    async fn only_owners_see_and_change_the_people() {
+        let dir = TempDir::new("slots-people-owners");
+        let (mut slots, mut work) = with_member(&dir);
+        slots.registry.person_mut(member_chat()).menu = Some(7700);
+        let (text, keyboard) = slots.menu_content(member_chat(), Page::People);
+        assert!(text.starts_with("Сессии"), "{text}");
+        assert!(!button_datas(&keyboard).contains(&"menu:pp".to_owned()));
+        let (_, keyboard) = slots.menu_content(owner_chat(), Page::Sessions(0));
+        assert!(button_datas(&keyboard).contains(&"menu:pp".to_owned()));
+        for data in ["menu:pp", "menu:pr:1", "menu:prc:1", "menu:pi", "menu:pa:1"] {
+            slots.on_control(press_by(member_chat(), 7700, data));
+            let handed = all_work(&mut work);
+            assert_eq!(
+                callback_answers(&handed),
+                [Some(people::ANSWER_OWNER_ONLY.to_owned())],
+                "{data}"
+            );
+            assert!(people_sends(&handed).is_empty() && people_edits(&handed).is_empty());
+        }
+        assert!(slots.options.allowlist.contains(MEMBER));
+    }
+
+    /// TASK-081: 🔗 sends a one-time link; `/start` with its code asks the
+    /// owner, the code works once, a wrong one gets no answer.
+    #[tokio::test]
+    async fn an_invite_link_asks_the_owner_once() {
+        const GUEST: i64 = 7_319_402_888;
+        let dir = TempDir::new("slots-people-invite");
+        let (mut slots, mut work) = menu_slot(&dir, people_options());
+        slots.on_control(menu_press(MENU, "menu:pi"));
+        let handed = all_work(&mut work);
+        let sends = people_sends(&handed);
+        assert_eq!(sends.len(), 1, "{handed:#?}");
+        let text = &sends[0].1;
+        let code = text
+            .split("https://t.me/cctg_bot?start=inv_")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap()
+            .to_owned();
+        assert_eq!(code.len(), people::INVITE_LEN, "{text}");
+
+        slots.on_control(invite_from(GUEST, "AAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(all_work(&mut work).is_empty(), "a wrong code: no answer");
+
+        slots.on_control(invite_from(GUEST, &code));
+        let handed = all_work(&mut work);
+        let sends = people_sends(&handed);
+        assert_eq!(sends.len(), 2, "{handed:#?}");
+        assert_eq!(
+            (sends[0].0, sends[0].1.as_str()),
+            (PrivateChat::of_user(GUEST), people::INVITE_RECEIVED)
+        );
+        assert_eq!(sends[1].0, owner_chat());
+        assert!(
+            sends[1].1.starts_with("Добавить «Гость» в cctg?"),
+            "{}",
+            sends[1].1
+        );
+        let token = proposal_token(&handed);
+
+        slots.on_control(invite_from(GUEST, &code));
+        assert!(all_work(&mut work).is_empty(), "used once");
+
+        slots.on_control(press_by(owner_chat(), 1203, &format!("menu:pa:{token}")));
+        let _ = all_work(&mut work);
+        assert!(slots.options.allowlist.contains(GUEST));
+    }
+
+    /// TASK-081: at start the saved members count; one who is an owner now
+    /// and a repeated one go.
+    #[tokio::test]
+    async fn saved_members_count_at_start() {
+        let dir = TempDir::new("slots-people-start");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let (scheduler, outbox) = Scheduler::new(Arc::new(Fake::default()), FAST);
+        tokio::spawn(scheduler.run());
+        let mut registry = Registry::default();
+        registry.add_member(member_chat(), "Анна".into(), None);
+        registry.add_member(owner_chat(), "Владелец".into(), None);
+        registry.add_member(member_chat(), "Анна".into(), None);
+        registry.dirty = false;
+        let options = people_options();
+        let allowlist = options.allowlist.clone();
+        let slots = Slots::new(registry, store, outbox, options);
+        assert!(slots.registry.dirty);
+        let members: Vec<PrivateChat> = slots.registry.members.iter().map(|m| m.chat).collect();
+        assert_eq!(members, [member_chat()]);
+        assert!(allowlist.contains(MEMBER) && allowlist.is_owner(7));
+        assert_eq!(allowlist.members_len(), 1);
     }
 }

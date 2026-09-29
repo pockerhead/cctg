@@ -260,6 +260,7 @@ async fn group_logs_carry_no_group_ids_titles_or_users() {
             thread_id: private_topic(),
             from_name: None,
             display_name: Some(TITLE.into()),
+            sender: PrivateChat::of_user(OWNER),
         }))
     };
     let shared = async {

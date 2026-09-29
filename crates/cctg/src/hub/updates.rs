@@ -15,12 +15,15 @@ use std::time::Duration;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::api::{ApiError, BotApi, ChatMember, FileInfo, Message, MessageChat, Update, User};
+use super::api::{
+    ApiError, BotApi, ChatMember, FileInfo, Message, MessageChat, MessageOrigin, Update, User,
+};
 use super::buffer::Attachment;
 use super::chat::{Chat, GroupChat, MessageKey, Place, PrivateChat};
 use super::config::Allowlist;
 use super::groups::KnownGroups;
 use super::offset::OffsetStore;
+use super::people;
 use super::registry::cut;
 use crate::wire::FileKind;
 
@@ -50,7 +53,63 @@ pub enum Routed {
     /// `/connect` from an allowlisted user in a group, known or not
     /// (TASK-069).
     Connect(ConnectInput),
+    /// A forward in the General of an allowlisted user's private chat
+    /// (TASK-081): the person to add.
+    Forward(ForwardInput),
+    /// `/start inv_<code>` of someone not allowlisted in their private chat
+    /// with the bot (TASK-081).
+    Invite(InviteInput),
     Ignored(Ignored),
+}
+
+/// A forward in the General of `chat` (TASK-081). Never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardInput {
+    pub chat: PrivateChat,
+    pub message_id: i64,
+    pub origin: Origin,
+}
+
+/// Who wrote a forwarded message first (TASK-081).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A user Telegram names: their private chat, their [`display_name`]
+    /// and cleaned username.
+    User {
+        user: PrivateChat,
+        is_bot: bool,
+        name: Option<String>,
+        username: Option<String>,
+    },
+    /// A user who hides their account in forwards.
+    Hidden,
+    /// A chat, a channel, or a kind the hub does not know.
+    Other,
+}
+
+/// `/start inv_<code>` from `user` (TASK-081). Never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteInput {
+    pub user: PrivateChat,
+    pub code: InviteCode,
+    pub name: Option<String>,
+    pub username: Option<String>,
+}
+
+/// An invite code without its prefix. `Debug` never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteCode(String);
+
+impl InviteCode {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for InviteCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InviteCode(..)")
+    }
 }
 
 /// The bot's new membership in a group (TASK-069). Who changed it is only
@@ -205,6 +264,9 @@ pub struct CallbackInput {
     /// Who pressed, as [`Inbound::display_name`]: it signs the share line
     /// (TASK-064). Never logged.
     pub display_name: Option<String>,
+    /// Who pressed, as the private chat with them (TASK-081: only owners
+    /// manage people and devices). Never logged.
+    pub sender: PrivateChat,
 }
 
 /// UTF-16 units kept of an author's name.
@@ -370,12 +432,66 @@ fn connect_of(message: &Message, allowlist: &Allowlist) -> Option<ConnectInput> 
     })
 }
 
+/// Who first wrote a forwarded message (TASK-081). A `user` origin without
+/// a real user id is no user.
+fn origin_of(origin: &MessageOrigin) -> Origin {
+    match origin.kind.as_str() {
+        "user" => match &origin.sender_user {
+            Some(user) if user.id > 0 => Origin::User {
+                user: PrivateChat::of_user(user.id),
+                is_bot: user.is_bot,
+                name: display_name(user),
+                username: user
+                    .username
+                    .as_deref()
+                    .and_then(|name| clean_name(name, NAME_LIMIT)),
+            },
+            _ => Origin::Other,
+        },
+        "hidden_user" => Origin::Hidden,
+        _ => Origin::Other,
+    }
+}
+
+/// `/start inv_<code>` (TASK-081): someone not allowlisted, no bot, in their
+/// own private chat with the bot, typed (not forwarded), exactly two words.
+fn invite_of(message: &Message, allowlist: &Allowlist) -> Option<InviteInput> {
+    let from = message.from.as_ref()?;
+    if message.chat.kind != "private"
+        || from.id != message.chat.id
+        || from.is_bot
+        || allowlist.contains(from.id)
+        || message.forward_origin.is_some()
+    {
+        return None;
+    }
+    let mut words = message.text.as_deref()?.split_whitespace();
+    let (Some("/start"), Some(payload), None) = (words.next(), words.next(), words.next()) else {
+        return None;
+    };
+    if !people::is_invite_payload(payload) {
+        return None;
+    }
+    Some(InviteInput {
+        user: PrivateChat::of_user(from.id),
+        code: InviteCode(payload[people::INVITE_PREFIX.len()..].to_owned()),
+        name: display_name(from),
+        username: from
+            .username
+            .as_deref()
+            .and_then(|name| clean_name(name, NAME_LIMIT)),
+    })
+}
+
 /// Classifies one parsed update. Service messages are recognised before the
 /// allowlist check because the bot itself is their sender.
 pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> Routed {
     if let Some(mut message) = update.message {
         if let Some(connect) = connect_of(&message, allowlist) {
             return Routed::Connect(connect);
+        }
+        if let Some(invite) = invite_of(&message, allowlist) {
+            return Routed::Invite(invite);
         }
         let Some(chat) = chat_of(&message.chat, groups, allowlist) else {
             return Routed::Ignored(Ignored::OtherChat);
@@ -402,6 +518,17 @@ pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> 
         let thread_id = message
             .message_thread_id
             .filter(|_| message.is_topic_message);
+        // A forward in the General of a private chat names a person to add
+        // (TASK-081); in a topic or a group it is a message as any other.
+        if let (Chat::Private(private), None, Some(origin)) =
+            (chat, thread_id, message.forward_origin.as_deref())
+        {
+            return Routed::Forward(ForwardInput {
+                chat: private,
+                message_id: message.message_id,
+                origin: origin_of(origin),
+            });
+        }
         let replied = message
             .reply_to_message
             .filter(|replied| replied.message_id != 0 && Some(replied.message_id) != thread_id);
@@ -464,6 +591,7 @@ pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> 
             thread_id,
             from_name: author_name(&from).filter(|_| allowlist.is_team()),
             display_name: display_name(&from),
+            sender: PrivateChat::of_user(from.id),
         });
     }
 
@@ -498,6 +626,7 @@ fn group_only(routed: Routed) -> Routed {
         Routed::Input(input) => input.chat.is_private(),
         Routed::Callback(input) => input.chat.is_some_and(Chat::is_private),
         Routed::Service(service) => service.chat.is_private(),
+        Routed::Forward(_) | Routed::Invite(_) => true,
         Routed::Member(_) | Routed::Connect(_) | Routed::Ignored(_) => false,
     };
     if private {
@@ -570,7 +699,12 @@ pub fn route_batch_with(
         match &item {
             Routed::Ignored(reason) => debug!(?reason, "update ignored"),
             Routed::Service(service) => debug!(kind = ?service.kind, "forum service message"),
-            Routed::Input(_) | Routed::Callback(_) | Routed::Member(_) | Routed::Connect(_) => {}
+            Routed::Input(_)
+            | Routed::Callback(_)
+            | Routed::Member(_)
+            | Routed::Connect(_)
+            | Routed::Forward(_)
+            | Routed::Invite(_) => {}
         }
         routed.push(item);
     }
@@ -876,6 +1010,7 @@ mod tests {
                 thread_id: Some(7),
                 from_name: None,
                 display_name: Some("x".to_owned()),
+                sender: PrivateChat::of_user(ALLOWED),
             })
         );
     }
@@ -1435,6 +1570,206 @@ mod tests {
                 if *chat == owner && data == "menu:dl:a"),
             "{own:?}"
         );
+    }
+
+    /// TASK-081: a forward in the General of an allowlisted user's private
+    /// chat names a person to add; anywhere else it is a message.
+    #[test]
+    fn a_forward_in_a_private_general_names_its_author() {
+        let route = |update: Value, private: bool| {
+            let (_, mut routed) =
+                route_batch_with(vec![update], None, &groups(), &allowlist(), private);
+            routed.remove(0)
+        };
+        let general = |origin: Value| {
+            let mut message = message(
+                ALLOWED,
+                json!({ "text": "их слова", "forward_origin": origin }),
+            );
+            message["chat"] = json!({ "id": ALLOWED, "type": "private", "first_name": "x" });
+            message.as_object_mut().unwrap().remove("message_thread_id");
+            message["is_topic_message"] = json!(false);
+            json!({ "update_id": 1, "message": message })
+        };
+        let owner = PrivateChat::of_user(ALLOWED);
+        let user = json!({ "type": "user", "date": 1, "sender_user": {
+            "id": STRANGER, "is_bot": false, "first_name": "Анна", "last_name": "К",
+            "username": "anna\u{202E}" } });
+        assert_eq!(
+            route(general(user.clone()), true),
+            Routed::Forward(ForwardInput {
+                chat: owner,
+                message_id: 10,
+                origin: Origin::User {
+                    user: PrivateChat::of_user(STRANGER),
+                    is_bot: false,
+                    name: Some("Анна К".into()),
+                    username: Some("anna".into()),
+                },
+            })
+        );
+        let bot = json!({ "type": "user", "date": 1, "sender_user": {
+            "id": BOT, "is_bot": true, "first_name": "b" } });
+        assert!(matches!(
+            route(general(bot), true),
+            Routed::Forward(ForwardInput {
+                origin: Origin::User { is_bot: true, .. },
+                ..
+            })
+        ));
+        for (origin, want) in [
+            (
+                json!({ "type": "hidden_user", "date": 1, "sender_user_name": "Анна" }),
+                Origin::Hidden,
+            ),
+            (json!({ "type": "hidden_user", "date": 1 }), Origin::Hidden),
+            (
+                json!({ "type": "chat", "date": 1, "sender_chat": { "id": CHAT, "type": "supergroup" } }),
+                Origin::Other,
+            ),
+            (json!({ "type": "channel", "date": 1 }), Origin::Other),
+            (json!({ "type": "user", "date": 1 }), Origin::Other),
+            (
+                json!({ "type": "user", "date": 1, "sender_user": { "first_name": "x" } }),
+                Origin::Other,
+            ),
+        ] {
+            assert_eq!(
+                route(general(origin.clone()), true),
+                Routed::Forward(ForwardInput {
+                    chat: owner,
+                    message_id: 10,
+                    origin: want,
+                }),
+                "{origin}"
+            );
+        }
+        // Without topics in private chats the private chat is not served.
+        assert_eq!(
+            route(general(user.clone()), false),
+            Routed::Ignored(Ignored::PrivateChat)
+        );
+        // In a topic of the private chat and in the group: a forwarded message.
+        let mut topic = message(
+            ALLOWED,
+            json!({ "text": "t", "forward_origin": user.clone() }),
+        );
+        topic["chat"] = json!({ "id": ALLOWED, "type": "private", "first_name": "x" });
+        assert!(matches!(
+            route(json!({ "update_id": 2, "message": topic }), true),
+            Routed::Input(Inbound {
+                forwarded: true,
+                thread_id: Some(7),
+                ..
+            })
+        ));
+        let group = message(ALLOWED, json!({ "text": "t", "forward_origin": user }));
+        assert!(matches!(
+            route(json!({ "update_id": 3, "message": group }), true),
+            Routed::Input(Inbound {
+                forwarded: true,
+                ..
+            })
+        ));
+    }
+
+    /// TASK-081: `/start inv_<code>` of someone not allowlisted in their own
+    /// private chat is an invite; nothing else of a stranger is.
+    #[test]
+    fn only_a_typed_start_with_an_invite_code_of_a_stranger_is_an_invite() {
+        const CODE: &str = "AbCdEfGhIjKlMnOpQr-_09";
+        let route = |update: Value, private: bool| {
+            let (_, mut routed) =
+                route_batch_with(vec![update], None, &groups(), &allowlist(), private);
+            routed.remove(0)
+        };
+        let start = |from: i64, text: &str| {
+            let mut message = message(from, json!({ "text": text }));
+            message["chat"] = json!({ "id": from, "type": "private", "first_name": "x" });
+            message["from"]["username"] = json!("anna");
+            json!({ "update_id": 1, "message": message })
+        };
+        let invite = route(start(STRANGER, &format!("/start inv_{CODE}")), true);
+        let Routed::Invite(input) = &invite else {
+            panic!("{invite:?}");
+        };
+        assert_eq!(input.user, PrivateChat::of_user(STRANGER));
+        assert_eq!(input.code.as_str(), CODE);
+        assert_eq!(input.name.as_deref(), Some("x"));
+        assert_eq!(input.username.as_deref(), Some("anna"));
+        let shown = format!("{invite:?}");
+        assert!(
+            !shown.contains(CODE) && !shown.contains(&STRANGER.to_string()),
+            "{shown}"
+        );
+        // Topics are off: the private chat is not served.
+        assert_eq!(
+            route(start(STRANGER, &format!("/start inv_{CODE}")), false),
+            Routed::Ignored(Ignored::PrivateChat)
+        );
+        for text in [
+            "/start".to_owned(),
+            "/start inv_short".to_owned(),
+            "/start inv_AbCdEfGhIjKlMnOpQr-_0!".to_owned(),
+            format!("/start inv_{CODE} extra"),
+            format!("/menu inv_{CODE}"),
+        ] {
+            assert_eq!(
+                route(start(STRANGER, &text), true),
+                Routed::Ignored(Ignored::OtherChat),
+                "{text}"
+            );
+        }
+        // An allowlisted user's is their message.
+        assert!(matches!(
+            route(start(ALLOWED, &format!("/start inv_{CODE}")), true),
+            Routed::Input(_)
+        ));
+        // In a group, from a bot, forwarded: nothing.
+        let group = message(STRANGER, json!({ "text": format!("/start inv_{CODE}") }));
+        assert_eq!(
+            route(json!({ "update_id": 2, "message": group }), true),
+            Routed::Ignored(Ignored::NotAllowed)
+        );
+        let mut bot = start(STRANGER, &format!("/start inv_{CODE}"));
+        bot["message"]["from"]["is_bot"] = json!(true);
+        assert_eq!(route(bot, true), Routed::Ignored(Ignored::OtherChat));
+        let mut forwarded = start(STRANGER, &format!("/start inv_{CODE}"));
+        forwarded["message"]["forward_origin"] = json!({ "type": "hidden_user", "date": 1 });
+        assert_eq!(route(forwarded, true), Routed::Ignored(Ignored::OtherChat));
+    }
+
+    /// TASK-081: a member added at run time writes from the next update on,
+    /// named as in a team; removed, they are dropped again.
+    #[test]
+    fn members_count_from_the_next_update() {
+        let allowlist = allowlist();
+        let route = |allowlist: &Allowlist| {
+            let update =
+                json!({ "update_id": 1, "message": message(STRANGER, json!({ "text": "hi" })) });
+            let (_, mut routed) = route_batch(vec![update], None, &groups(), allowlist);
+            routed.remove(0)
+        };
+        assert_eq!(route(&allowlist), Routed::Ignored(Ignored::NotAllowed));
+        allowlist.set_members([PrivateChat::of_user(STRANGER)]);
+        assert!(matches!(
+            route(&allowlist),
+            Routed::Input(Inbound { from_name: Some(ref name), .. }) if name == "x"
+        ));
+        let press = json!({ "update_id": 2, "callback_query": {
+            "id": "q1", "from": { "id": STRANGER, "is_bot": false, "first_name": "x" },
+            "chat_instance": "c", "data": "allow:abcde",
+            "message": message(BOT, json!({ "text": "prompt" })),
+        }});
+        let (_, mut routed) = route_batch(vec![press.clone()], None, &groups(), &allowlist);
+        assert!(matches!(
+            routed.remove(0),
+            Routed::Callback(CallbackInput { sender, .. }) if sender == PrivateChat::of_user(STRANGER)
+        ));
+        allowlist.set_members([]);
+        assert_eq!(route(&allowlist), Routed::Ignored(Ignored::NotAllowed));
+        let (_, mut routed) = route_batch(vec![press], None, &groups(), &allowlist);
+        assert_eq!(routed.remove(0), Routed::Ignored(Ignored::NotAllowed));
     }
 
     #[test]

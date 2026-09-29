@@ -352,6 +352,7 @@ fn press(hub: &Hub, message_id: i64, data: String) {
             thread_id: Some(100),
             from_name: None,
             display_name: None,
+            sender: cctg::hub::chat::PrivateChat::of_user(1001),
         }))
         .unwrap();
 }
