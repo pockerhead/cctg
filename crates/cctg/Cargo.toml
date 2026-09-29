@@ -85,3 +85,9 @@ harness = false
 [[test]]
 name = "run_pty_e2e"
 harness = false
+
+# The TASK-085 voice test runs its own main: the test binary is also the
+# `cctg-voice` stand-in (started with the model folder alone).
+[[test]]
+name = "voice_e2e"
+harness = false

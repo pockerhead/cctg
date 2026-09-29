@@ -191,6 +191,8 @@ pub struct Media {
     /// Telegram's `media_group_id`: the album of the file (TASK-077).
     /// Never logged.
     pub album: Option<String>,
+    /// Seconds of a voice message, as its sender set it (TASK-085).
+    pub duration: Option<u64>,
 }
 
 /// The file of a message: an animation before its `document` twin, the
@@ -213,6 +215,7 @@ fn media(message: &mut Message) -> Option<Media> {
                 size: largest.file_size,
             })
     });
+    let duration = message.media.voice.as_ref().and_then(|info| info.duration);
     let file = message
         .media
         .animation
@@ -249,6 +252,7 @@ fn media(message: &mut Message) -> Option<Media> {
         })
         .filter(|file| !file.file_id.is_empty())?;
     Some(Media {
+        duration: duration.filter(|_| file.kind == FileKind::Voice),
         file,
         caption: message.media.caption.take(),
         album: message.media.media_group_id.take(),
@@ -1424,6 +1428,16 @@ mod tests {
         }
         // Text keeps its old shape.
         assert_eq!(input(json!({ "text": "hi" })).media, None);
+        // TASK-085: a voice message's length, as its sender set it.
+        let voice = input(json!({
+            "voice": { "file_id": "o", "file_unique_id": "u", "duration": 42 },
+        }));
+        assert_eq!(voice.media.unwrap().duration, Some(42));
+        assert_eq!(media.duration, None);
+        let audio = input(json!({
+            "audio": { "file_id": "a", "file_unique_id": "u", "duration": 42 },
+        }));
+        assert_eq!(audio.media.unwrap().duration, None);
     }
 
     #[test]

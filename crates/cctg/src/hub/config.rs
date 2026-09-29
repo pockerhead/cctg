@@ -47,6 +47,12 @@ pub const PUBLIC_HOOK_VAR: &str = "CCTG_PUBLIC_HOOK_ADDR";
 /// Optional in the env file: the proxy of the Bot API client when the
 /// process environment names none (TASK-046, a hub started at logon).
 pub const PROXY_VAR: &str = "HTTPS_PROXY";
+/// Optional, with [`VOICE_MODEL_VAR`] (TASK-085): the `cctg-voice` helper
+/// that turns voice messages into text; the hub image sets both. Unset or
+/// empty: voice messages go to the session as files only.
+pub const VOICE_HELPER_VAR: &str = "CCTG_VOICE_HELPER";
+/// Optional, with [`VOICE_HELPER_VAR`]: the helper's model directory.
+pub const VOICE_MODEL_VAR: &str = "CCTG_VOICE_MODEL";
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
@@ -242,6 +248,24 @@ pub struct Config {
     /// `HTTPS_PROXY` of the env file, taken only when the process
     /// environment names no proxy (then reqwest takes that one, as before).
     pub proxy: Option<ProxyUrl>,
+    /// [`VOICE_HELPER_VAR`] and [`VOICE_MODEL_VAR`], both set: voice
+    /// messages are recognized.
+    pub voice: Option<VoiceFiles>,
+}
+
+/// The voice recognition helper and its model (TASK-085).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceFiles {
+    pub helper: PathBuf,
+    pub model: PathBuf,
+}
+
+impl VoiceFiles {
+    /// The helper is a file and the model a folder. Here, with the rest of
+    /// the hub's own setup: no other hub module probes files (TASK-034).
+    pub fn present(&self) -> bool {
+        self.helper.is_file() && self.model.is_dir()
+    }
 }
 
 /// How other devices reach the hub: `host:port` each, checked to be safe
@@ -359,6 +383,13 @@ impl Config {
             (None, None) => None,
             _ => return Err(ConfigError::PublicPair),
         };
+        let voice = match (optional(VOICE_HELPER_VAR), optional(VOICE_MODEL_VAR)) {
+            (Some(helper), Some(model)) => Some(VoiceFiles {
+                helper: PathBuf::from(helper),
+                model: PathBuf::from(model),
+            }),
+            _ => None,
+        };
 
         Ok(Self {
             token: BotToken(token),
@@ -373,6 +404,7 @@ impl Config {
             tls,
             public,
             proxy: None,
+            voice,
         })
     }
 }
@@ -808,6 +840,52 @@ mod tests {
                 ConfigError::TlsPair
             );
         }
+    }
+
+    /// TASK-085: recognition only with both the helper and the model.
+    #[test]
+    fn voice_recognition_needs_the_helper_and_the_model() {
+        let base = [
+            (TOKEN_VAR, TOKEN),
+            (CHAT_VAR, "-1001"),
+            (ALLOWLIST_VAR, "1"),
+        ];
+        assert_eq!(Config::from_vars(vars(&base)).unwrap().voice, None);
+        let both = [
+            base.as_slice(),
+            &[
+                (VOICE_HELPER_VAR, " /usr/local/bin/cctg-voice "),
+                (VOICE_MODEL_VAR, "/usr/local/share/cctg/voice-ru"),
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            Config::from_vars(vars(&both)).unwrap().voice,
+            Some(VoiceFiles {
+                helper: PathBuf::from("/usr/local/bin/cctg-voice"),
+                model: PathBuf::from("/usr/local/share/cctg/voice-ru"),
+            })
+        );
+        for one in [
+            [(VOICE_HELPER_VAR, "/bin/cctg-voice"), (VOICE_MODEL_VAR, "")],
+            [(VOICE_HELPER_VAR, "  "), (VOICE_MODEL_VAR, "/model")],
+        ] {
+            let half = [base.as_slice(), &one].concat();
+            assert_eq!(Config::from_vars(vars(&half)).unwrap().voice, None);
+        }
+        let helper_only = [base.as_slice(), &[(VOICE_HELPER_VAR, "/bin/cctg-voice")]].concat();
+        assert_eq!(Config::from_vars(vars(&helper_only)).unwrap().voice, None);
+        // Present: the helper a file, the model a folder.
+        let exe = std::env::current_exe().unwrap();
+        let folder = exe.parent().unwrap().to_owned();
+        let files = |helper: &Path, model: &Path| VoiceFiles {
+            helper: helper.to_owned(),
+            model: model.to_owned(),
+        };
+        assert!(files(&exe, &folder).present());
+        assert!(!files(&folder, &folder).present());
+        assert!(!files(&exe, &exe).present());
+        assert!(!files(&exe, &folder.join("no-such-model-085")).present());
     }
 
     #[test]

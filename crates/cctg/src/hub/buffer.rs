@@ -58,6 +58,20 @@ pub const FETCH_FAILED_WORDS_NOTICE: &str = "Не удалось скачать 
 pub const LINK_LOST_WORDS_NOTICE: &str = "Файл не передан: связь с сессией обрывалась при каждой попытке его передать, дойдёт только текст сообщения. Пришлите ещё раз один файл, текст повторять не нужно.";
 /// The session's agent is too old for files; its caption still goes.
 pub const OLD_AGENT_NOTICE: &str = "Файл не передан: клиент cctg этой сессии не принимает файлы. Обновите его (⬆️ Обновить) и пришлите файл ещё раз.";
+/// Starts the post with the recognized words of a voice message (TASK-085),
+/// a reply to it in its topic.
+pub const VOICE_HEARD_PREFIX: &str = "Голосовое сообщение распознано. Текст: ";
+/// A voice message on a hub without recognition.
+pub const VOICE_OFF_NOTICE: &str = "Голосовое не распознано: распознавание речи на этом hub не настроено. В сессию оно передано файлом.";
+/// A voice message longer than the recognition limit.
+pub const VOICE_TOO_LONG_NOTICE: &str =
+    "Голосовое длиннее 5 минут не распознаётся. В сессию оно передано файлом.";
+/// Recognition failed, found no words or did not finish in time.
+pub const VOICE_FAILED_NOTICE: &str =
+    "Голосовое не удалось распознать. В сессию оно передано файлом.";
+/// The file of a recognized voice message did not reach the session.
+pub const VOICE_FILE_FAILED_NOTICE: &str =
+    "Файл голосового не передан в сессию, дошёл только распознанный текст.";
 
 /// The Telegram file of a kept message: enough to download it later
 /// (`file_id` stays valid), never its bytes.
@@ -104,6 +118,33 @@ pub struct Parked {
     /// words (taken out of `text`) or a reply to the bot's message.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mention: bool,
+    /// A voice message (TASK-085): its recognition and, once heard, its
+    /// words; `text` stays its caption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<Voice>,
+}
+
+/// The recognition of a kept voice message (TASK-085).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voice {
+    pub state: VoiceState,
+    /// The recognized words, only for `Heard`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+}
+
+/// Where a voice message is in its recognition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceState {
+    /// Being recognized: it does not go yet.
+    Pending,
+    /// Recognized: its words go with it.
+    Heard,
+    /// Goes as a file only. A state of a later hub reads as this: the
+    /// message goes, never waits.
+    #[serde(other)]
+    Unheard,
 }
 
 /// The kept group messages a mention takes along ([`crate::hub::mention`]).
@@ -191,11 +232,49 @@ impl Parked {
             .is_some_and(|history| history.state == HistoryState::Pending)
     }
 
+    /// A voice message being recognized (TASK-085): it does not go yet.
+    pub fn voice_pending(&self) -> bool {
+        self.voice_state() == Some(VoiceState::Pending)
+    }
+
+    /// A recognized voice message: its words go even without its file.
+    pub fn voice_heard(&self) -> bool {
+        self.voice_state() == Some(VoiceState::Heard)
+    }
+
+    fn voice_state(&self) -> Option<VoiceState> {
+        self.voice.as_ref().map(|voice| voice.state)
+    }
+
+    /// Something of it goes to the session without its file: a caption, a
+    /// group history (TASK-077) or recognized words (TASK-085).
+    pub fn has_words(&self) -> bool {
+        !self.text.is_empty() || self.history.is_some() || self.voice_heard()
+    }
+
+    /// Its own words as the session reads them: the text, or for a voice
+    /// message (TASK-085) what recognition made of it, then its caption on
+    /// a line of its own.
+    pub fn words(&self) -> String {
+        let Some(voice) = &self.voice else {
+            return self.text.clone();
+        };
+        let mut words = match voice.state {
+            VoiceState::Heard => format!("(голосовое, распознано) {}", voice.text),
+            VoiceState::Pending | VoiceState::Unheard => "(голосовое, не распознано)".to_owned(),
+        };
+        if !self.text.is_empty() {
+            words.push('\n');
+            words.push_str(&self.text);
+        }
+        words
+    }
+
     /// What the session reads: the group history block and a blank line
     /// (TASK-077), [`MENTION_MARK`] on its own line for a mention
     /// (TASK-080), the quoted words as `> ` lines and a blank line, then
     /// `Name: ` of a team member (TASK-036), then [`FORWARDED`] on its own
-    /// line for a forward, then the text.
+    /// line for a forward, then its [`Parked::words`].
     pub fn content(&self) -> String {
         let mut content = String::new();
         if let Some(history) = &self.history {
@@ -213,10 +292,11 @@ impl Parked {
             }
             content.push('\n');
         }
+        let words = self.words();
         if let Some(name) = &self.from_name {
             content.push_str(name);
             content.push(':');
-            if self.forwarded || !self.text.is_empty() {
+            if self.forwarded || !words.is_empty() {
                 content.push(' ');
             }
         }
@@ -224,7 +304,7 @@ impl Parked {
             content.push_str(FORWARDED);
             content.push('\n');
         }
-        content.push_str(&self.text);
+        content.push_str(&words);
         content
     }
 }
@@ -369,6 +449,7 @@ mod tests {
             from_name: None,
             history: None,
             mention: false,
+            voice: None,
         }
     }
 
@@ -607,6 +688,113 @@ mod tests {
         let later: History =
             serde_json::from_str(r#"{"text":"t","count":1,"limit":5,"state":"future"}"#).unwrap();
         assert_eq!(later.state, HistoryState::Cut);
+    }
+
+    fn voice(state: VoiceState, text: &str) -> Option<Voice> {
+        Some(Voice {
+            state,
+            text: text.into(),
+        })
+    }
+
+    /// TASK-085: a recognized voice message reads as its words, one that is
+    /// not as a mark; the caption follows on its own line.
+    #[test]
+    fn a_voice_message_reads_as_what_recognition_made_of_it() {
+        let heard = Parked {
+            text: String::new(),
+            file: Some(Attachment {
+                kind: FileKind::Voice,
+                file_id: "v".into(),
+                name: None,
+                size: Some(15_497),
+            }),
+            voice: voice(VoiceState::Heard, "привет запусти тесты"),
+            ..parked(1)
+        };
+        assert_eq!(
+            heard.content(),
+            "(голосовое, распознано) привет запусти тесты"
+        );
+        assert!(heard.voice_heard() && !heard.voice_pending() && heard.has_words());
+        let named = Parked {
+            from_name: Some("Анна".into()),
+            ..heard.clone()
+        };
+        assert_eq!(
+            named.content(),
+            "Анна: (голосовое, распознано) привет запусти тесты"
+        );
+        let captioned = Parked {
+            text: "срочно".into(),
+            ..named.clone()
+        };
+        assert_eq!(
+            captioned.content(),
+            "Анна: (голосовое, распознано) привет запусти тесты\nсрочно"
+        );
+        let forwarded = Parked {
+            forwarded: true,
+            ..named.clone()
+        };
+        assert_eq!(
+            forwarded.content(),
+            "Анна: (переслано)\n(голосовое, распознано) привет запусти тесты"
+        );
+        let mention = Parked {
+            mention: true,
+            ..named.clone()
+        };
+        assert_eq!(
+            mention.content(),
+            "(обращение к вам из группы, где открыта эта сессия)\n\
+             Анна: (голосовое, распознано) привет запусти тесты"
+        );
+        for state in [VoiceState::Unheard, VoiceState::Pending] {
+            let unheard = Parked {
+                voice: voice(state, ""),
+                ..named.clone()
+            };
+            assert_eq!(unheard.content(), "Анна: (голосовое, не распознано)");
+            assert!(!unheard.has_words() && !unheard.voice_heard());
+        }
+        let pending = Parked {
+            voice: voice(VoiceState::Pending, ""),
+            ..parked(2)
+        };
+        assert!(pending.voice_pending());
+        assert!(!parked(3).voice_pending() && !parked(3).voice_heard());
+    }
+
+    /// TASK-085: the voice state is written only for a voice message and
+    /// round-trips; a state of a later hub reads as unheard (it never waits).
+    #[test]
+    fn the_voice_is_written_only_with_one_and_an_unknown_state_is_unheard() {
+        assert!(!serde_json::to_string(&parked(1)).unwrap().contains("voice"));
+        for kept in [
+            Parked {
+                voice: voice(VoiceState::Heard, "да \"так\""),
+                ..parked(1)
+            },
+            Parked {
+                voice: voice(VoiceState::Pending, ""),
+                ..parked(2)
+            },
+        ] {
+            let text = serde_json::to_string(&kept).unwrap();
+            assert_eq!(serde_json::from_str::<Parked>(&text).unwrap(), kept);
+        }
+        let pending = serde_json::to_string(&Parked {
+            voice: voice(VoiceState::Pending, ""),
+            ..parked(2)
+        })
+        .unwrap();
+        assert!(
+            pending.ends_with(r#""voice":{"state":"pending"}}"#),
+            "{pending}"
+        );
+        let later: Voice = serde_json::from_str(r#"{"state":"future"}"#).unwrap();
+        assert_eq!(later.state, VoiceState::Unheard);
     }
 
     #[test]

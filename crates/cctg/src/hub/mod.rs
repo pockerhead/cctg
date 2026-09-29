@@ -27,6 +27,7 @@ pub mod subagents;
 #[cfg(test)]
 pub(crate) mod testdir;
 pub mod updates;
+pub mod voice;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -480,6 +481,23 @@ pub async fn run(env_file: Option<&Path>, stop_on_stdin: bool) -> anyhow::Result
     let question_asks = slots.question_asks();
     let transcript_asks = slots.transcript_asks();
     slots.fetch_files(api.clone());
+    // TASK-085: voice messages to text, when the helper and its model are
+    // here (the hub image has them). Paths are never logged.
+    match &config.voice {
+        Some(files) if files.present() => {
+            slots.recognize_voices(
+                api.clone(),
+                Arc::new(voice::Helper {
+                    program: files.helper.clone(),
+                    model: files.model.clone(),
+                    timeout: voice::VOICE_TIMEOUT,
+                }),
+            );
+            info!("voice recognition on");
+        }
+        Some(_) => warn!("voice recognition off: helper or model missing"),
+        None => info!("voice recognition off"),
+    }
     slots.look_up_groups(Arc::new(groups::BotLookup::new(api.clone(), me.id)));
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
