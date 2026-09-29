@@ -29,9 +29,9 @@ use cctg::hub::registry::{ICON_ALIVE, ICON_DEAD, RegistryStore, share_line};
 use cctg::hub::scheduler::{BucketConfig, Delivery, Limits, Op, Outbox, Outcome, Transport};
 use cctg::hub::slots::{
     ANSWER_PICKER, Control, ECHO_MARK, FALLBACK_END_NOTICE, FOREIGN_TOPIC_NOTICE, MAX_TWIN_POSTS,
-    MIRROR_GAP_NOTICE, MentionBot, Options, Owners, PRIVATE_CLOSED_NOTICE, PRIVATE_GENERAL_NOTICE,
-    PRIVATE_START_TEXT, SHARE_OWNER_ONLY_NOTICE, SHARED_NOTICE, Slots, UNSHARED_KEPT_NOTICE,
-    UNSHARED_NOTICE,
+    MIRROR_GAP_NOTICE, MOVED_MARK, MentionBot, Options, Owners, PRIVATE_CLOSED_NOTICE,
+    PRIVATE_GENERAL_NOTICE, PRIVATE_START_TEXT, SHARE_OWNER_ONLY_NOTICE, SHARED_NOTICE, Slots,
+    UNSHARED_KEPT_NOTICE, UNSHARED_NOTICE,
 };
 use cctg::hub::status;
 use cctg::hub::updates::{CallbackInput, ConnectInput, Inbound, MemberUpdate};
@@ -3416,14 +3416,11 @@ async fn e2e_groups_mentions_per_group() {
 
 // ---------------------------------------------------------------- TASK-072
 
-/// Review 2 of TASK-063, finding 1: a private-only slot met a 403 while a
-/// prompt was open, and the prompt went to the group's fallback topic. The
-/// owner presses Start: the slot keeps that group topic while the prompt
-/// waits there (a message written there still reaches the session), and
-/// once the prompt is decided the topic is told and left.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_a_fallback_topic_with_an_open_prompt_stays_until_it_is_decided() {
-    let hub = start_hub("fallback-open-prompt", PRIVATE, Fake::default()).await;
+/// A private-only slot met a 403 while a prompt was open, and the prompt
+/// went to the group's fallback topic (prompt `abcde`); then the owner
+/// pressed Start. The hub and its agent.
+async fn fallback_prompt_then_start(name: &str) -> (Hub, Agent) {
+    let hub = start_hub(name, PRIVATE, Fake::default()).await;
     hub.start().await;
     let mut agent = Agent::connect(&hub, true).await;
     hub.until("the status in the private chat", |fake| {
@@ -3438,21 +3435,79 @@ async fn e2e_a_fallback_topic_with_an_open_prompt_stays_until_it_is_decided() {
     .await;
     hub.fake.forbid_private.store(false, Ordering::SeqCst);
     hub.say_general(owner(), "/start");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    (hub, agent)
+}
+
+/// Review 2 of TASK-063, finding 1: after Start the slot leaves the group
+/// at once, and the prompt that waited in the group topic is not lost: it
+/// comes again into the private topic with its buttons, the group copy
+/// loses them. A message written into the old group topic reaches no
+/// session and gets the fallback-end answer; the press in private decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_prompt_of_an_ended_fallback_topic_goes_into_the_private_chat() {
+    let (hub, mut agent) = fallback_prompt_then_start("fallback-open-prompt").await;
     let notice = FALLBACK_END_NOTICE.to_owned();
-    assert!(
-        !hub.fake.layout(GROUP).contains(&notice),
-        "not left while its prompt waits there: {:?}",
-        hub.fake.layout(GROUP)
-    );
-    hub.say(GROUP, "в группу");
-    let (content, _) = agent.inbound().await;
-    assert_eq!(content, "в группу");
-    allow_in(&hub, &mut agent, GROUP, "abcde").await;
-    hub.until("decided, then the topic is told and left", |fake| {
-        allowed_in(fake, GROUP, "abcde") && fake.layout(GROUP).contains(&notice)
+    hub.until("the group told, the prompt in private", |fake| {
+        fake.layout(GROUP).contains(&notice)
+            && asks_in(fake, owner(), "abcde")
+            && prompt_in(fake, GROUP, "abcde")
+                .is_some_and(|copy| copy.buttons.is_empty() && copy.text.ends_with(MOVED_MARK))
     })
     .await;
+    hub.say(GROUP, "в старую тему");
+    hub.until("the old topic answered", |fake| {
+        fake.layout(GROUP)
+            .iter()
+            .filter(|text| **text == notice)
+            .count()
+            == 2
+    })
+    .await;
+    assert!(
+        !matches!(
+            agent.next_within(Duration::from_millis(300)).await,
+            Some(HubMsg::Inbound { .. })
+        ),
+        "the old group topic reaches no session"
+    );
+    allow_in(&hub, &mut agent, owner(), "abcde").await;
+    hub.until("decided in private", |fake| {
+        allowed_in(fake, owner(), "abcde")
+    })
+    .await;
+}
+
+/// Code review of TASK-072 (R1): what the owner writes in the private topic
+/// after Start, and the session's answers there, never reach the group
+/// topic the prompt waited in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_after_start_private_text_stays_out_of_the_old_fallback_topic() {
+    let (hub, mut agent) = fallback_prompt_then_start("fallback-no-echo").await;
+    hub.until("the prompt in private", |fake| {
+        asks_in(fake, owner(), "abcde")
+    })
+    .await;
+    hub.say(owner(), "секрет из лички");
+    let (content, _) = agent.inbound().await;
+    assert_eq!(content, "секрет из лички");
+    agent
+        .send(AgentMsg::Reply {
+            text: "ответ только для лички".into(),
+        })
+        .await;
+    hub.until("the reply in private", |fake| {
+        fake.layout(owner())
+            .contains(&"ответ только для лички".to_owned())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let group = hub.fake.layout(GROUP);
+    assert!(
+        !group
+            .iter()
+            .any(|text| text.contains("секрет из лички") || text.contains("ответ только для лички")),
+        "private text in the group: {group:?}"
+    );
 }
 
 /// Review 2 of TASK-063, finding 7: a shared slot whose owner blocked the

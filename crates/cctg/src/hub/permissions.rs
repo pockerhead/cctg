@@ -381,6 +381,26 @@ impl Prompts {
         true
     }
 
+    /// Active prompt `key` goes again, into another topic: its message is
+    /// no longer its own (TASK-072, the end of a fallback view).
+    pub fn unsend(&mut self, key: u64) {
+        let Some(prompt) = self
+            .prompts
+            .get_mut(&key)
+            .filter(|prompt| prompt.state.is_active())
+        else {
+            return;
+        };
+        if let Some(message) = prompt.message()
+            && self.by_message.get(&message) == Some(&key)
+        {
+            self.by_message.remove(&message);
+        }
+        prompt.sent = false;
+        prompt.place = None;
+        prompt.message_id = None;
+    }
+
     pub fn by_message(&self, message: MessageKey) -> Option<u64> {
         self.by_message.get(&message).copied()
     }

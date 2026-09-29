@@ -552,6 +552,11 @@ pub const PRIVATE_GENERAL_MENU_NOTICE: &str =
 /// chat was closed, once that chat takes the session again (TASK-063).
 pub const FALLBACK_END_NOTICE: &str =
     "Личка владельца снова доступна: сессия идёт там, эта тема больше не обновляется.";
+/// Ends the copy of a prompt or question that went on from an ended
+/// fallback topic into the private chat (TASK-072).
+pub const MOVED_MARK: &str = "\n\n↪ Перенесено в личку владельца";
+/// Ended fallback topics remembered for [`FALLBACK_END_NOTICE`] answers.
+const MAX_FALLBACK_ENDED: usize = 64;
 /// The answers to `/share` and `/unshare` (TASK-064), in the topic they came
 /// from.
 pub const SHARED_NOTICE: &str =
@@ -1882,6 +1887,10 @@ pub struct Slots {
     closed_told: HashSet<PrivateChat>,
     /// Private topics that are no slot's, when they were last answered.
     foreign_told: HashMap<Place, Instant>,
+    /// Group topics whose fallback view ended in this run, newest last, at
+    /// most [`MAX_FALLBACK_ENDED`] (TASK-072): a message there is answered
+    /// with [`FALLBACK_END_NOTICE`].
+    fallback_ended: VecDeque<Place>,
     /// Prompts and questions lost in a private chat, by the dispatch number
     /// of the lost send, until they went again or ended (TASK-063).
     again: HashMap<u64, Lost>,
@@ -2067,6 +2076,7 @@ impl Slots {
             hook_owners: HashMap::new(),
             closed_told: HashSet::new(),
             foreign_told: HashMap::new(),
+            fallback_ended: VecDeque::new(),
             again: HashMap::new(),
             unlanded: HashMap::new(),
             lost_messages: VecDeque::new(),
@@ -3964,6 +3974,12 @@ impl Slots {
             // A topic the user made in the private chat (TASK-063).
             None if input.chat.is_private() => {
                 self.tell_foreign(place, FOREIGN_TOPIC_NOTICE);
+                return;
+            }
+            // The group topic of an ended fallback view: its session goes on
+            // in the private chat (TASK-072).
+            None if self.fallback_ended.contains(&place) => {
+                self.tell_foreign(place, FALLBACK_END_NOTICE);
                 return;
             }
             None => {}
@@ -7212,7 +7228,17 @@ impl Slots {
                 continue;
             }
             let again = match self.again_to(Asked::Question(key), slot, place) {
-                Again::Wait => continue,
+                Again::Wait => {
+                    // Its private topic is not made again and no kept twin
+                    // shows it elsewhere (one cut or refused): the terminal
+                    // after the same wait (TASK-072).
+                    let late = lost
+                        .is_some_and(|since| since.elapsed() >= self.options.lost_question_wait);
+                    if late && !self.kept_twin_shown(Asked::Question(key)) {
+                        self.end_question(key, questions::State::Expired);
+                    }
+                    continue;
+                }
                 Again::Adopt(old, twin) => {
                     self.adopt(old, twin, place);
                     continue;
@@ -7305,6 +7331,14 @@ impl Slots {
             Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
                 ask.message_id = Some(message.message_id);
                 ask.shown = version;
+                // Into a fallback topic that ended meanwhile: it goes on in
+                // the private chat (TASK-072).
+                let place = ask.place;
+                if self.moves_home(place)
+                    && let Some(place) = place
+                {
+                    self.move_asks_home(place);
+                }
                 return;
             }
             Some(Ok(_)) => warn!("question sent without a message id; its buttons cannot work"),
@@ -7571,6 +7605,19 @@ impl Slots {
             }
             self.hand_off_again(Work::Permission(key), op, again);
         }
+    }
+
+    /// Lost prompt or question `asked` has a kept twin Telegram shows.
+    fn kept_twin_shown(&self, asked: Asked) -> bool {
+        self.again
+            .iter()
+            .filter(|(_, lost)| lost.asked == asked)
+            .any(|(old, _)| {
+                self.mirror
+                    .kept(*old)
+                    .iter()
+                    .any(|(_, answer)| matches!(answer, Some(Some(_))))
+            })
     }
 
     /// Where lost prompt or question `asked` of `slot` goes now that the
@@ -10748,8 +10795,8 @@ impl Slots {
     /// Its group topic is told so, gets the dead icon and loses its status
     /// message. While its owner picks a group for it (TASK-069) it is held
     /// out of the registry instead, silently, and ends so once the hold is
-    /// over. A group topic with a prompt or question still waiting there
-    /// stays until it is answered (TASK-072).
+    /// over. A prompt or question still open in its group topic goes again
+    /// into the private topic (TASK-072).
     fn drop_fallback_views(&mut self) {
         let now = Instant::now();
         let over: Vec<SlotId> = self
@@ -10783,14 +10830,6 @@ impl Slots {
             if fallback.is_none_or(|view| view.topic_id.is_none() && view.busy) {
                 continue;
             }
-            // A prompt or question asked there is answered there first: the
-            // topic stays until then (TASK-072).
-            if fallback
-                .and_then(View::place)
-                .is_some_and(|place| self.asks_in(place))
-            {
-                continue;
-            }
             // It mirrored the private view (after a restart): twins may be
             // on their way there still.
             let mirrored = self
@@ -10800,6 +10839,9 @@ impl Slots {
             let Some(view) = self.registry.remove_view(slot, default) else {
                 continue;
             };
+            if let Some(place) = view.place() {
+                self.move_asks_home(place);
+            }
             if self.choosing.contains_key(&slot) {
                 self.hold_fallback(slot, view, mirrored);
                 continue;
@@ -10814,20 +10856,70 @@ impl Slots {
         }
     }
 
-    /// Topic `place` shows a prompt that still waits for an answer (see
-    /// [`Prompt::waits`]) or an open question.
-    fn asks_in(&self, place: Place) -> bool {
-        let prompt = self.prompts.active().into_iter().any(|key| {
-            self.prompts
+    /// Group topic `place` stopped being a view of its slot (the end of a
+    /// fallback view, TASK-072): every active prompt and open question
+    /// shown there goes again into the slot's primary topic, and its copy
+    /// there loses the buttons. One whose send there is still in flight
+    /// moves once Telegram answered it ([`Self::moves_home`]).
+    fn move_asks_home(&mut self, place: Place) {
+        for key in self.prompts.active() {
+            let shown = self
+                .prompts
                 .get(key)
-                .is_some_and(|prompt| prompt.waits && prompt.place == Some(place))
-        });
-        prompt
-            || self.questions.keys().into_iter().any(|key| {
-                self.questions
-                    .get(key)
-                    .is_some_and(|ask| ask.is_open() && ask.place == Some(place))
-            })
+                .filter(|prompt| prompt.place == Some(place))
+                .and_then(|prompt| {
+                    prompt
+                        .message()
+                        .map(|message| (message, prompt.text.clone()))
+                });
+            if let Some((message, text)) = shown {
+                self.prompts.unsend(key);
+                self.moved_copy(message, text);
+                info!("permission prompt of an ended fallback topic goes into the private chat");
+            }
+        }
+        for key in self.questions.keys() {
+            let Some(ask) = self
+                .questions
+                .get_mut(key)
+                .filter(|ask| ask.is_open() && ask.place == Some(place))
+            else {
+                continue;
+            };
+            let Some(message) = ask.message() else {
+                continue;
+            };
+            let text = ask.text();
+            ask.place = None;
+            ask.message_id = None;
+            ask.editing = false;
+            ask.retry = false;
+            self.moved_copy(message, text);
+            info!("question of an ended fallback topic goes into the private chat");
+        }
+    }
+
+    /// A prompt or question sent into `place` whose topic is an ended
+    /// fallback view (it was on its way as the view ended, TASK-072).
+    fn moves_home(&self, place: Option<Place>) -> bool {
+        place.is_some_and(|place| {
+            self.fallback_ended.contains(&place) && self.registry.slot_by_topic(place).is_none()
+        })
+    }
+
+    /// The copy of a moved prompt or question, `message`, shows `text`
+    /// with [`MOVED_MARK`] and no buttons.
+    fn moved_copy(&mut self, message: MessageKey, text: String) {
+        self.hand_off(
+            Work::Callback,
+            Op::Edit {
+                chat: message.chat,
+                message_id: message.id,
+                text: format!("{text}{MOVED_MARK}"),
+                reply_markup: Some(permissions::no_keyboard()),
+                background: false,
+            },
+        );
     }
 
     /// The fallback view of `slot`, out of the registry, waits for its
@@ -10880,6 +10972,10 @@ impl Slots {
                 }
                 if let Some(place) = view.place() {
                     self.end_group_topic(place, FALLBACK_END_NOTICE);
+                    if self.fallback_ended.len() >= MAX_FALLBACK_ENDED {
+                        self.fallback_ended.pop_front();
+                    }
+                    self.fallback_ended.push_back(place);
                 }
                 (mirrored, view.place())
             }
@@ -13027,6 +13123,14 @@ impl Slots {
                 match delivery {
                     Some(Ok(Outcome::Sent(message))) if message.message_id != 0 => {
                         self.prompts.delivered(key, message.message_id);
+                        // Into a fallback topic that ended meanwhile: it
+                        // goes on in the private chat (TASK-072).
+                        let place = self.prompts.get(key).and_then(|prompt| prompt.place);
+                        if self.moves_home(place)
+                            && let Some(place) = place
+                        {
+                            self.move_asks_home(place);
+                        }
                         return;
                     }
                     Some(Ok(_)) => {
@@ -27672,6 +27776,161 @@ again"
             slots.questions.get(key).map(|ask| ask.state),
             Some(questions::State::Expired),
             "the terminal dialog"
+        );
+    }
+
+    /// TASK-072 (code review 2): the same for a shared slot whose group
+    /// twin of the question never came (Telegram refused it): the question
+    /// shows nowhere, so it goes to the terminal after the same wait.
+    #[tokio::test]
+    async fn a_lost_question_of_a_shared_slot_without_its_twin_goes_to_the_terminal() {
+        let dir = TempDir::new("slots-072-question-lost-shared");
+        let owner = private_owner();
+        let options = Options {
+            lost_question_wait: Duration::from_millis(50),
+            ..private_options()
+        };
+        let mut slots = stalled_slots(&dir, options);
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        slots.registry.add_view(SlotId(0), owner);
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        let (answer, _answered) = oneshot::channel();
+        slots.on_question_ask(QuestionAsk {
+            post: question_post(A),
+            answer,
+        });
+        let before = slots.handed;
+        slots.pump();
+        let mut sent = None;
+        let mut twin = None;
+        for (n, (job, _)) in all_work(&mut work).into_iter().enumerate() {
+            match job {
+                Work::Question { key, version } => {
+                    sent = Some((before + 1 + n as u64, key, version))
+                }
+                Work::Twin { id, place, .. } => twin = Some((id, place)),
+                _ => {}
+            }
+        }
+        let ((seq, key, version), (id, place)) = (sent.unwrap(), twin.unwrap());
+        slots.on_done(Done::Twin {
+            id,
+            place,
+            turn: None,
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: not enough rights".into(),
+            })),
+        });
+        slots.on_done(Done::Landed {
+            place: Place::topic(owner, 700),
+            seq,
+            landed: Landed::Again,
+            gone: true,
+            closed: false,
+        });
+        slots.on_done(Done::Question {
+            key,
+            version,
+            seq,
+            delivery: Some(Err(ApiError::Telegram {
+                code: 400,
+                description: "Bad Request: message thread not found".into(),
+            })),
+        });
+        slots.pump();
+        assert!(
+            slots
+                .questions
+                .get(key)
+                .is_some_and(questions::Ask::is_open),
+            "it waits for its topic first"
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        slots.pump();
+        assert_eq!(
+            slots.questions.get(key).map(|ask| ask.state),
+            Some(questions::State::Expired),
+            "the terminal dialog"
+        );
+    }
+
+    /// TASK-072 (code review 1): a prompt on its way into the fallback group
+    /// topic as the owner's private chat opens again: once Telegram answers,
+    /// its group copy loses the buttons and it goes into the private topic.
+    #[tokio::test]
+    async fn a_prompt_sent_into_a_fallback_topic_as_it_ends_goes_into_the_private_chat() {
+        let dir = TempDir::new("slots-072-prompt-in-flight");
+        let owner = private_owner();
+        let mut slots = stalled_slots(&dir, private_only_options());
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), owner, 700, "t", None);
+        slots.close_chat(owner);
+        slots.pump();
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "t", None);
+        connect(&mut slots, 1, A, Some(10));
+        slots.pump();
+        let mut work = capture_dispatch(&mut slots);
+        slots.on_agent(permission(1, "abcde", "ls"));
+        let before = slots.handed;
+        slots.pump();
+        let seq = all_work(&mut work)
+            .into_iter()
+            .enumerate()
+            .find_map(|(n, (job, op))| {
+                matches!(job, Work::Permission(_)).then(|| {
+                    assert_eq!(op.place(), Some(Place::topic(Chat::GROUP, 100)));
+                    before + 1 + n as u64
+                })
+            })
+            .expect("the prompt goes to the group");
+        let key = slots.prompts.active()[0];
+        slots.reopen(owner);
+        slots.pump();
+        let chats: Vec<Chat> = slots.registry.slots[0]
+            .views
+            .iter()
+            .map(|view| view.chat)
+            .collect();
+        assert_eq!(chats, [owner], "the group view goes at once");
+        let _ = all_work(&mut work);
+        slots.on_done(Done::Permission {
+            key,
+            seq,
+            delivery: Some(Ok(Outcome::Sent(Message {
+                message_id: 1500,
+                ..Message::default()
+            }))),
+        });
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(
+            handed.iter().any(|(_, op)| matches!(op,
+                Op::Edit { chat: Chat::GROUP, message_id: 1500, text, reply_markup: Some(markup), .. }
+                    if text.ends_with(MOVED_MARK) && *markup == permissions::no_keyboard())),
+            "{handed:#?}"
+        );
+        let again: Vec<Option<Place>> = handed
+            .iter()
+            .filter(|(job, _)| matches!(job, Work::Permission(_)))
+            .map(|(_, op)| op.place())
+            .collect();
+        assert_eq!(again, [Some(Place::topic(owner, 700))]);
+        assert_eq!(
+            slots.prompts.by_message(MessageKey::new(Chat::GROUP, 1500)),
+            None,
+            "the group copy is no longer the prompt"
         );
     }
 
