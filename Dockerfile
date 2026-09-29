@@ -105,7 +105,7 @@ RUN --mount=type=bind,source=crates/voice/tests/fixtures/voice-ru.ogg,target=/tm
                    printf '%s\n' "${size}"; cat /tmp/voice-ru.ogg; } \
                  | cctg-voice /usr/local/share/cctg/voice-ru )" \
     && echo "cctg-voice on the fixture, twice: ${heard}" \
-    && test "$(echo "${heard}" | grep -c 'запусти тесты')" -eq 2
+    && test "$(echo "${heard}" | grep -c 'запусти тесты')" -eq 2     && test "$(echo "${heard}" | wc -l)" -eq 2
 USER 10001
 WORKDIR /data
 # Both listeners on every interface of the container; TLS comes from

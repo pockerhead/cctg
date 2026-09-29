@@ -115,3 +115,4 @@ jobs:
             | docker run --rm -i --entrypoint cctg-voice cctg:smoke /usr/local/share/cctg/voice-ru)
           echo "$heard"
           test "$(grep -c 'запусти тесты' <<< "$heard")" -eq 2
+          test "$(wc -l <<< "$heard")" -eq 2
