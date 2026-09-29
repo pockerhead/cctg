@@ -154,6 +154,12 @@ pub struct Register {
     /// (TASK-043). Only Windows agents that know their claude pid announce it.
     #[serde(default)]
     pub console_commands: bool,
+    /// The longest `console_command` line the agent types, in characters
+    /// ([`crate::keys::MAX_LINE_CHARS`], TASK-084). Agents built before
+    /// leave it out (0): they type at most 200 and answer a longer line as
+    /// failed without typing it, so the hub refuses such a line itself.
+    #[serde(default)]
+    pub console_line_chars: usize,
     /// Which cctg build the agent runs and what it can do about a newer one
     /// (TASK-040). Agents built before leave it out: the hub shows them as
     /// outdated and never sends them `update`.
@@ -1401,6 +1407,7 @@ mod tests {
                 transcript_reads: true,
                 console_keys: true,
                 console_commands: true,
+                console_line_chars: 750,
                 client: None,
                 files: true,
                 session_reads: true,
@@ -1819,6 +1826,7 @@ mod tests {
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -1840,6 +1848,7 @@ mod tests {
             Ok(AgentMsg::Register(Register {
                 console_keys: true,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 ..
             }))
@@ -2060,6 +2069,7 @@ mod tests {
             transcript_reads: true,
             console_keys: true,
             console_commands: false,
+            console_line_chars: 0,
             files: false,
             session_reads: false,
             status_lines: false,

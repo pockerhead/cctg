@@ -1676,6 +1676,9 @@ struct Conn {
     keys: bool,
     /// It types console commands ([`crate::wire::Register::console_commands`]).
     commands: bool,
+    /// The longest command it types, in characters
+    /// ([`crate::wire::Register::console_line_chars`]).
+    line_chars: usize,
     /// Its build and update abilities ([`crate::wire::Register::client`]).
     client: Option<Client>,
     /// It takes files ([`crate::wire::Register::files`]).
@@ -2428,6 +2431,10 @@ impl Slots {
                         reads: register.transcript_reads,
                         keys: register.console_keys,
                         commands: register.console_commands,
+                        line_chars: match register.console_line_chars {
+                            0 => console::OLD_AGENT_LINE_CHARS,
+                            chars => chars,
+                        },
                         client: register.client,
                         files: register.files,
                         session_reads: register.session_reads,
@@ -8848,21 +8855,29 @@ impl Slots {
         command: Result<String, console::Invalid>,
     ) {
         let ordinal = self.ordinal(slot);
+        let line_chars = |conn: &u64| self.conns.get(conn).map_or(0, |bound| bound.line_chars);
         let refusal = match (command, self.live_agent(slot)) {
-            (Err(console::Invalid), _) => console::INVALID_NOTICE,
-            (Ok(_), None) => console::OFFLINE_NOTICE,
+            (Err(console::Invalid(why)), _) => console::invalid_notice(why),
+            (Ok(_), None) => console::OFFLINE_NOTICE.to_owned(),
             (Ok(_), Some((_, conn)))
                 if !self.conns.get(&conn).is_some_and(|bound| bound.commands) =>
             {
-                console::NO_CONSOLE_NOTICE
+                console::NO_CONSOLE_NOTICE.to_owned()
             }
-            (Ok(_), Some((session, _))) if self.waiting(&session) => console::WAITING_NOTICE,
+            // An agent older than the hub would answer a longer line as
+            // failed without typing it: say why instead.
+            (Ok(text), Some((_, conn))) if text.chars().count() > line_chars(&conn) => {
+                console::old_agent_notice(text.chars().count(), line_chars(&conn))
+            }
+            (Ok(_), Some((session, _))) if self.waiting(&session) => {
+                console::WAITING_NOTICE.to_owned()
+            }
             // Topic messages still in the slot, or texts that went a moment
             // ago, come before the command: the session is as good as busy.
             (Ok(_), Some((session, _)))
                 if self.busy(&session) || self.kept(slot) || self.settling(&session) =>
             {
-                console::BUSY_NOTICE
+                console::BUSY_NOTICE.to_owned()
             }
             (Ok(text), Some((session, conn))) => {
                 let command_id = crate::wire::random_u64();
@@ -8893,11 +8908,11 @@ impl Slots {
                     return;
                 }
                 warn!(conn, "agent queue full or closed; console command not sent");
-                console::FAILED_NOTICE
+                console::FAILED_NOTICE.to_owned()
             }
         };
         info!(ordinal, "console command refused");
-        self.answer_command(place, message_id, refusal);
+        self.answer_command(place, message_id, &refusal);
     }
 
     fn remember_command(&mut self, command_id: u64, ask: CommandAsk) {
@@ -14594,6 +14609,7 @@ mod tests {
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -16684,6 +16700,7 @@ again"
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -16740,6 +16757,7 @@ again"
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -17563,6 +17581,7 @@ again"
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -17661,6 +17680,7 @@ again"
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -18723,6 +18743,7 @@ again"
             transcript_reads: false,
             console_keys: false,
             console_commands: false,
+            console_line_chars: 0,
             client: None,
             files: false,
             session_reads: true,
@@ -20818,6 +20839,7 @@ again"
                 transcript_reads: true,
                 console_keys: keys,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -21215,6 +21237,7 @@ again"
                     transcript_reads: true,
                     console_keys: false,
                     console_commands: false,
+                    console_line_chars: 0,
                     client: None,
                     files: false,
                     session_reads: false,
@@ -21271,6 +21294,7 @@ again"
                 transcript_reads: true,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -21320,6 +21344,7 @@ again"
                 transcript_reads: true,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -21381,6 +21406,7 @@ again"
                 transcript_reads: true,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -22805,6 +22831,7 @@ again"
                 transcript_reads: false,
                 console_keys: true,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -23018,6 +23045,7 @@ again"
             transcript_reads: false,
             console_keys: true,
             console_commands: false,
+            console_line_chars: 0,
             client: None,
             files: false,
             session_reads: false,
@@ -24057,6 +24085,7 @@ again"
                 transcript_reads: false,
                 console_keys: true,
                 console_commands: false,
+                console_line_chars: 0,
                 client,
                 files: false,
                 session_reads: false,
@@ -24724,6 +24753,17 @@ again"
         commands: bool,
         options: Options,
     ) -> (Arc<Fake>, Slots, mpsc::Receiver<HubMsg>) {
+        console_slots_lines(dir, commands, crate::keys::MAX_LINE_CHARS, options)
+    }
+
+    /// [`console_slots_with`] for an agent that says it types lines of up
+    /// to `line_chars` characters (0: an agent from before TASK-084).
+    fn console_slots_lines(
+        dir: &TempDir,
+        commands: bool,
+        line_chars: usize,
+        options: Options,
+    ) -> (Arc<Fake>, Slots, mpsc::Receiver<HubMsg>) {
         let (fake, mut slots) = live_slots(dir, options);
         slots.on_hook(&start(A, 10));
         slots
@@ -24741,6 +24781,7 @@ again"
                 transcript_reads: false,
                 console_keys: true,
                 console_commands: commands,
+                console_line_chars: line_chars,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -24898,15 +24939,22 @@ again"
         slots.on_topic_message(topic_text(22, "/model", false));
         slots.on_topic_message(topic_text(23, "!echo a\nb", false));
         slots.on_topic_message(topic_text(24, "/compact \u{1b}[A", false));
-        let mut got = command_replies(&fake, 4).await;
+        slots.on_topic_message(topic_text(25, "!echo \u{1F600}", false));
+        let long = format!("!echo {}", "x".repeat(crate::keys::MAX_LINE_CHARS));
+        slots.on_topic_message(topic_text(26, &long, false));
+        let mut got = command_replies(&fake, 6).await;
         got.sort();
+        use crate::keys::Untypable;
+        let chars = long.chars().count();
         assert_eq!(
             got,
             [
                 (21, console::BUSY_NOTICE.to_owned()),
                 (22, console::WAITING_NOTICE.to_owned()),
-                (23, console::INVALID_NOTICE.to_owned()),
-                (24, console::INVALID_NOTICE.to_owned()),
+                (23, console::invalid_notice(Untypable::NotOneLine)),
+                (24, console::invalid_notice(Untypable::NotOneLine)),
+                (25, console::invalid_notice(Untypable::OutsideBmp)),
+                (26, console::invalid_notice(Untypable::TooLong { chars })),
             ]
         );
         while let Ok(msg) = from_hub.try_recv() {
@@ -24915,6 +24963,34 @@ again"
                 "{msg:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_an_old_agent_types_is_refused_before_it_is_sent() {
+        // An agent from before TASK-084 says no limit and types 200 at most:
+        // a longer line never reaches it, the answer says why.
+        let dir = TempDir::new("slots-console-old-agent");
+        let (fake, mut slots, mut from_hub) = console_slots_lines(&dir, true, 0, message_options());
+        let long = format!("!echo {}", "x".repeat(console::OLD_AGENT_LINE_CHARS));
+        slots.on_topic_message(topic_text(41, &long, false));
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(
+                41,
+                console::old_agent_notice(long.chars().count(), console::OLD_AGENT_LINE_CHARS)
+            )]
+        );
+        assert!(from_hub.try_recv().is_err(), "nothing sent to the agent");
+        // Its own length still goes.
+        let fits = format!("!echo {}", "x".repeat(console::OLD_AGENT_LINE_CHARS - 6));
+        slots.on_topic_message(topic_text(42, &fits, false));
+        assert_eq!(command_of(from_hub.try_recv().ok()).1, fits);
+        // A new agent takes the hub's longest line.
+        let dir = TempDir::new("slots-console-new-agent");
+        let (_fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        let longest = format!("!echo {}", "x".repeat(crate::keys::MAX_LINE_CHARS - 6));
+        slots.on_topic_message(topic_text(43, &longest, false));
+        assert_eq!(command_of(from_hub.try_recv().ok()).1, longest);
     }
 
     #[tokio::test]
@@ -25008,6 +25084,7 @@ again"
                 transcript_reads: false,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files,
                 session_reads: false,
@@ -28481,6 +28558,7 @@ again"
                 transcript_reads: false,
                 console_keys: true,
                 console_commands: true,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,
@@ -29565,6 +29643,7 @@ again"
                 transcript_reads: true,
                 console_keys: false,
                 console_commands: false,
+                console_line_chars: 0,
                 client: None,
                 files: false,
                 session_reads: false,

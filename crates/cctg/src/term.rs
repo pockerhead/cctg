@@ -24,7 +24,10 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-/// Longest ask line, in bytes (200 typed characters, JSON-escaped, fit).
+/// Longest ask line, in bytes: the longest typed line
+/// ([`crate::keys::MAX_LINE_CHARS`], at most 3 bytes a character after JSON
+/// escaping) and its erasing fit. Frozen with the ask format: a running
+/// `cctg run` keeps its own.
 pub const MAX_ASK: usize = 4096;
 
 /// One ask of the agent: `"screen"`, `"rows"` (TASK-057) or
@@ -696,6 +699,22 @@ mod tests {
         let long = format!("{{\"keys\":\"{}\"}}\n", "x".repeat(MAX_ASK));
         assert_eq!(ask(long.as_bytes(), &screen, &written), "");
         assert_eq!(written.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_longest_line_and_its_erasing_fit_one_ask() {
+        // The widest characters a typable line can have after JSON: three
+        // UTF-8 bytes, or an escaped quote; Backspace goes as DEL.
+        let most = crate::keys::MAX_LINE_CHARS;
+        for keys in ["日".repeat(most), "\"".repeat(most), "\u{7f}".repeat(most)] {
+            let mut line = serde_json::to_vec(&Ask::Keys(keys.clone())).unwrap();
+            line.push(b'\n');
+            assert!(line.len() <= MAX_ASK, "{}", line.len());
+            let screen = Mutex::new(Screen::new(2, 10));
+            let written = Mutex::new(Vec::new());
+            assert_eq!(ask(&line, &screen, &written), "true\n");
+            assert_eq!(written.lock().unwrap().as_slice(), keys.as_bytes());
+        }
     }
 
     #[test]

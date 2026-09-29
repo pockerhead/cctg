@@ -1418,6 +1418,7 @@ mod tests {
             transcript_reads: false,
             console_keys: false,
             console_commands: false,
+            console_line_chars: 0,
             client: None,
             files: false,
             session_reads: false,

@@ -898,6 +898,7 @@ impl Agent {
             transcript_reads,
             console_keys,
             console_commands: false,
+            console_line_chars: 0,
             client: None,
             files: false,
             session_reads,

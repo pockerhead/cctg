@@ -18,7 +18,9 @@
 //! messages waiting in the slot, for a command the user can simply send
 //! again), when the slot has no live session with an agent that types
 //! ([`crate::wire::Register::console_commands`]), when the text is not
-//! one short plain line ([`crate::keys::typable`]), and when the agent finds
+//! one short plain line ([`crate::keys::typable`]; the answer names the rule,
+//! TASK-084), when it is longer than the agent of the session types (an
+//! agent older than the hub, [`OLD_AGENT_LINE_CHARS`]), and when the agent finds
 //! the terminal showing the agent view or a working background agent
 //! (TASK-047).
 
@@ -32,8 +34,49 @@ pub const COMMAND_WAIT: Duration = Duration::from_secs(30);
 /// Commands asked and not answered, at most.
 pub const MAX_COMMAND_ASKS: usize = 32;
 
-pub const INVALID_NOTICE: &str = "Команда для терминала не набрана: нужна одна строка до 200 символов \
-без переводов строки, управляющих символов и эмодзи.";
+/// The longest line an agent that does not say its own limit types
+/// ([`crate::wire::Register::console_line_chars`]): TASK-043's.
+pub const OLD_AGENT_LINE_CHARS: usize = 200;
+
+/// Why a console command was not typed, the rule it broke named.
+pub fn invalid_notice(why: keys::Untypable) -> String {
+    let rule = match why {
+        keys::Untypable::Blank => "она пустая".to_owned(),
+        keys::Untypable::NotOneLine => {
+            "в ней перевод строки, табуляция или другой управляющий символ, а нужна одна строка"
+                .to_owned()
+        }
+        keys::Untypable::OutsideBmp => {
+            "в ней эмодзи или другой символ, который не набрать одной клавишей".to_owned()
+        }
+        keys::Untypable::TooLong { chars } => format!(
+            "в ней {chars} {}, а можно не больше {}",
+            symbols(chars),
+            keys::MAX_LINE_CHARS
+        ),
+    };
+    format!("Команда для терминала не набрана: {rule}.")
+}
+
+/// A command longer than the session agent types (an agent older than the
+/// hub, [`OLD_AGENT_LINE_CHARS`]): refused before it is sent.
+pub fn old_agent_notice(chars: usize, limit: usize) -> String {
+    format!(
+        "Команда для терминала не набрана: в ней {chars} {}, а клиент cctg этой сессии \
+         набирает не больше {limit}. Обновите его (⬆️ Обновить) или сократите команду.",
+        symbols(chars)
+    )
+}
+
+/// Russian plural of «символ» after `n`.
+fn symbols(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (1, 11) | (_, 12..=14) | (5..=9 | 0, _) => "символов",
+        (1, _) => "символ",
+        _ => "символа",
+    }
+}
+
 pub const OFFLINE_NOTICE: &str = "Команда для терминала не набрана: сессия не на связи.";
 pub const NO_CONSOLE_NOTICE: &str = "Команда для терминала не набрана: клиент этой сессии \
 не умеет набирать команды. Нужен свежий cctg и claude, запущенный через claude-cctg \
@@ -48,14 +91,14 @@ pub const FAILED_NOTICE: &str = "Не получилось набрать ком
 /// ([`crate::keys::agents_block`], TASK-047).
 pub const AGENTS_NOTICE: &str = "В терминале открыт вид субагента или работают фоновые агенты: команда не набрана. Повторите, когда они закончат (или вернитесь к main в терминале).";
 
-/// A console command whose text cannot be typed.
+/// A console command whose text cannot be typed, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Invalid;
+pub struct Invalid(pub keys::Untypable);
 
 /// `None`: `text` is a message for the model. `Some(Ok(line))`: a console
 /// command, `line` is what to type (trimmed; a slash command loses the
 /// `@bot` Telegram adds from its command menu). `Some(Err(Invalid))`: a
-/// console command that cannot be typed (see [`keys::typable`]).
+/// console command that cannot be typed (see [`keys::untypable`]).
 ///
 /// A slash command is `/` plus a name of letters, digits, `_`, `-`, `:` or
 /// `.`, then a space or the end: `/tmp/x fails` or `/ hello` are messages.
@@ -85,10 +128,9 @@ pub fn classify(text: &str) -> Option<Result<String, Invalid>> {
         }
         format!("/{name}{args}")
     };
-    Some(if keys::typable(&line) {
-        Ok(line)
-    } else {
-        Err(Invalid)
+    Some(match keys::untypable(&line) {
+        None => Ok(line),
+        Some(why) => Err(Invalid(why)),
     })
 }
 
@@ -99,6 +141,21 @@ fn is_bot_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_too_long_refusal_counts_characters_in_russian() {
+        for (n, word) in [
+            (751, "символ,"),
+            (752, "символа,"),
+            (755, "символов,"),
+            (811, "символов,"),
+            (1000, "символов,"),
+        ] {
+            let told = invalid_notice(keys::Untypable::TooLong { chars: n });
+            assert!(told.contains(&format!("{n} {word}")), "{told}");
+            assert!(old_agent_notice(n, 200).contains(&format!("{n} {word}")));
+        }
+    }
 
     #[test]
     fn bang_and_slash_commands_are_typed_and_the_rest_is_a_message() {
@@ -134,17 +191,45 @@ mod tests {
     }
 
     #[test]
-    fn a_command_that_cannot_be_typed_is_refused() {
-        for text in [
-            "!echo a\nb",
-            "/compact\nand more",
-            "!echo \u{1b}[31m",
-            "!echo \u{1F600}",
+    fn a_command_that_cannot_be_typed_is_refused_with_the_rule_it_broke() {
+        use keys::Untypable;
+        for (text, why) in [
+            ("!echo a\nb", Untypable::NotOneLine),
+            ("/compact\nand more", Untypable::NotOneLine),
+            ("!echo \u{1b}[31m", Untypable::NotOneLine),
+            ("!echo \u{1F600}", Untypable::OutsideBmp),
         ] {
-            assert_eq!(classify(text), Some(Err(Invalid)), "{text:?}");
+            assert_eq!(classify(text), Some(Err(Invalid(why))), "{text:?}");
         }
         let long = format!("!{}", "x".repeat(keys::MAX_LINE_CHARS));
-        assert_eq!(classify(&long), Some(Err(Invalid)));
-        assert!(INVALID_NOTICE.contains(&keys::MAX_LINE_CHARS.to_string()));
+        let chars = keys::MAX_LINE_CHARS + 1;
+        assert_eq!(
+            classify(&long),
+            Some(Err(Invalid(Untypable::TooLong { chars })))
+        );
+        let longest = format!("!{}", "x".repeat(keys::MAX_LINE_CHARS - 1));
+        assert_eq!(classify(&longest), Some(Ok(longest.clone())));
+        // Each rule has its own words; the length names both numbers.
+        let too_long = invalid_notice(Untypable::TooLong { chars });
+        assert!(too_long.contains(&chars.to_string()), "{too_long}");
+        assert!(
+            too_long.contains(&keys::MAX_LINE_CHARS.to_string()),
+            "{too_long}"
+        );
+        let notices = [
+            invalid_notice(Untypable::Blank),
+            invalid_notice(Untypable::NotOneLine),
+            invalid_notice(Untypable::OutsideBmp),
+            too_long,
+        ];
+        for (i, a) in notices.iter().enumerate() {
+            for b in &notices[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(notices[1].contains("одна строка"), "{}", notices[1]);
+        assert!(notices[2].contains("эмодзи"), "{}", notices[2]);
+        let old = old_agent_notice(300, OLD_AGENT_LINE_CHARS);
+        assert!(old.contains("300") && old.contains("200"), "{old}");
     }
 }
