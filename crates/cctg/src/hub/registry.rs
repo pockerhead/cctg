@@ -56,11 +56,13 @@ use crate::wire::{HookEvent, HookPost};
 /// 2 since TASK-061 (a slot's topic moved into its views, stored message ids
 /// carry their chat), 3 since TASK-069 (a group chat carries its id).
 /// Version 1 and 2 files are migrated on load ([`migrate_v1`],
-/// [`migrate_v2`]); an older hub refuses a newer file. A file that held an
-/// archived slot is [`ARCHIVE_VERSION`].
+/// [`migrate_v2`]); an older hub refuses a newer file. A file with an
+/// archived slot or a topic waiting for its cleanup is [`ARCHIVE_VERSION`]
+/// ([`Registry::settle_version`]).
 pub const VERSION: u32 = 3;
-/// A file in which a slot was archived (TASK-074): hub v0.1.26 and older
-/// do not read it, so they make no topics for archived slots.
+/// A file with an archived slot or a queued cleanup (TASK-074): hub v0.1.27
+/// and older do not read it, so they make no topics for archived slots.
+/// Once neither is left the file is [`VERSION`] again.
 pub const ARCHIVE_VERSION: u32 = 4;
 /// Telegram limit for a topic name. Measured in UTF-16 units, which is never
 /// less than the character count.
@@ -800,7 +802,17 @@ pub struct Registry {
     /// Topics of archived slots (TASK-074) that wait for their
     /// `deleteForumTopic`, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cleanup: Vec<Place>,
+    pub cleanup: Vec<CleanupTopic>,
+}
+
+/// A topic of an archived slot waiting for its delete (TASK-074), with the
+/// view it was: a message written there before the delete brings it back
+/// ([`Registry::revive_topic`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CleanupTopic {
+    pub place: Place,
+    pub slot: SlotId,
+    pub view: View,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -1528,11 +1540,11 @@ impl Registry {
                 let clear_pid = claude_pid.filter(|_| clear);
                 let id = self.allocate(session, &post.host, &post.cwd, clear_pid, clear_slot);
                 self.occupy(id, session, source == Some("resume"));
-                // A session takes an archived slot back (TASK-074); the file
-                // stays version 4.
+                // A session takes an archived slot back (TASK-074).
                 let slot = &mut self.slots[id.0];
                 slot.archived = false;
                 slot.dead_since = None;
+                self.settle_version();
                 Some(id)
             }
             SessionKind::Nested { parent } => parent
@@ -2282,16 +2294,17 @@ impl Registry {
     /// Archives slot `id` (TASK-074): it keeps no topic and gets the shape
     /// of a new slot (one view of the default group, no topic, empty
     /// buffer), and [`Self::topic_work`] skips it until a session takes it.
-    /// Its topics in chats of `deletable` wait in [`Self::cleanup`]; the
-    /// others stay as they are. The file is [`ARCHIVE_VERSION`] from now on.
-    /// Returns every topic the slot had.
+    /// Its topics in chats of `deletable` wait in [`Self::cleanup`] with
+    /// their views; the others stay as they are. The file is
+    /// [`ARCHIVE_VERSION`] while it has either. Returns every topic the
+    /// slot had.
     pub fn archive_slot(&mut self, id: SlotId, deletable: &HashSet<Chat>) -> Vec<Place> {
         let default = self.default_chat();
         let Some(slot) = self.slots.get_mut(id.0) else {
             return Vec::new();
         };
-        let places: Vec<Place> = slot.views.iter().filter_map(View::place).collect();
-        slot.views = vec![View::new(default)];
+        let old = std::mem::replace(&mut slot.views, vec![View::new(default)]);
+        let places: Vec<Place> = old.iter().filter_map(View::place).collect();
         slot.buffer = Buffer::default();
         slot.archived = true;
         // Its blocks show in topics that go: nothing is sent or edited there.
@@ -2301,14 +2314,80 @@ impl Registry {
                 block.running = false;
             }
         }
-        for place in &places {
-            if deletable.contains(&place.chat) && !self.cleanup.contains(place) {
-                self.cleanup.push(*place);
+        for view in old {
+            let Some(place) = view.place() else {
+                continue;
+            };
+            if deletable.contains(&place.chat) && !self.cleanup.iter().any(|t| t.place == place) {
+                self.cleanup.push(CleanupTopic {
+                    place,
+                    slot: id,
+                    view,
+                });
             }
         }
-        self.version = ARCHIVE_VERSION;
         self.dirty = true;
+        self.settle_version();
         places
+    }
+
+    /// Topic `place`, waiting for its cleanup, is its slot's again (TASK-074
+    /// review: a message was written there): an archived slot gets back
+    /// every topic of its own still queued, a slot a session took since
+    /// gets this one when it shows in no view of that chat. `None`: not
+    /// queued, or its slot has a view in that chat already.
+    pub fn revive_topic(&mut self, place: Place) -> Option<SlotId> {
+        let id = self.cleanup.iter().find(|t| t.place == place)?.slot;
+        let slot = self.slots.get_mut(id.0)?;
+        let back: Vec<Place> = if slot.archived {
+            self.cleanup
+                .iter()
+                .filter(|t| t.slot == id)
+                .map(|t| t.place)
+                .collect()
+        } else if slot.views.iter().any(|view| view.chat == place.chat) {
+            return None;
+        } else {
+            vec![place]
+        };
+        let mut views = Vec::new();
+        self.cleanup.retain(|t| {
+            if back.contains(&t.place) {
+                views.push(t.view.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for view in &mut views {
+            view.busy = false;
+            view.failed = None;
+        }
+        let slot = &mut self.slots[id.0];
+        if slot.archived {
+            slot.views = views;
+            slot.archived = false;
+        } else {
+            slot.views.extend(views);
+        }
+        self.dirty = true;
+        self.settle_version();
+        Some(id)
+    }
+
+    /// The version the file is written as (TASK-074 review): 4 while a slot
+    /// is archived or a topic waits for its cleanup (a hub up to v0.1.27
+    /// would make topics for them), else 3.
+    pub fn settle_version(&mut self) {
+        let wanted = if self.cleanup.is_empty() && !self.slots.iter().any(|slot| slot.archived) {
+            VERSION
+        } else {
+            ARCHIVE_VERSION
+        };
+        if self.version != wanted {
+            self.version = wanted;
+            self.dirty = true;
+        }
     }
 
     #[cfg(test)]
@@ -2768,6 +2847,10 @@ impl RegistryStore {
                 .subagents
                 .values()
                 .any(|agent| bad_slot(agent.slot))
+            || registry
+                .cleanup
+                .iter()
+                .any(|topic| bad_slot(Some(topic.slot)))
             || duplicate_slot
             || duplicate_group
         {
@@ -5541,10 +5624,18 @@ mod tests {
         registry.note_dead(1000);
         let private_topic = Place::topic(owner, 700);
         let group_topic = Place::topic(Chat::GROUP, 900);
-        registry.cleanup.push(private_topic);
+        let private_view = registry.slots[slot.0].views[0].clone();
         let places = registry.archive_slot(slot, &HashSet::from([owner]));
         assert_eq!(places, [private_topic, group_topic]);
-        assert_eq!(registry.cleanup, [private_topic], "no repeat, no group");
+        assert_eq!(
+            registry.cleanup,
+            [CleanupTopic {
+                place: private_topic,
+                slot,
+                view: private_view,
+            }],
+            "not the group's"
+        );
         let archived = &registry.slots[slot.0];
         assert!(archived.archived);
         assert_eq!(archived.views, [View::new(Chat::GROUP)]);
@@ -5562,10 +5653,11 @@ mod tests {
         assert_eq!(loaded.version, ARCHIVE_VERSION);
         assert!(loaded.slots[slot.0].archived);
         assert_eq!(loaded.slots[slot.0].dead_since, Some(1000));
-        assert_eq!(loaded.cleanup, [private_topic]);
+        assert_eq!(loaded.cleanup, registry.cleanup);
         assert!(loaded.topic_work(&Icons::default(), true).is_empty());
 
-        // The next session of the folder takes it back.
+        // The next session of the folder takes it back; the queue still
+        // waits, so the file stays version 4.
         loaded.apply_hook(&start(B, CWD, Some(2), None));
         assert_eq!(slot_of(&loaded, B), Some(slot));
         assert!(!loaded.slots[slot.0].archived);
@@ -5573,7 +5665,57 @@ mod tests {
         let jobs = loaded.topic_work(&Icons::default(), true);
         assert_eq!(creates(&jobs), 1, "{jobs:?}");
         assert_eq!(jobs.len(), 1, "{jobs:?}");
-        assert_eq!(loaded.version, ARCHIVE_VERSION, "never lowered");
+        assert_eq!(loaded.version, ARCHIVE_VERSION);
+        // Its old topic deleted: nothing needs version 4 any more.
+        loaded.cleanup.clear();
+        loaded.settle_version();
+        assert_eq!(loaded.version, VERSION);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&RegistryStore::encode(&loaded)).unwrap();
+        assert_eq!(saved["version"], 3);
+    }
+
+    /// TASK-074 review (finding 1): a message in a topic waiting for its
+    /// cleanup brings it back: an archived slot gets its queued topics back
+    /// and is no longer archived; a slot a session took since gets the
+    /// topic as another view, unless it shows in that chat already.
+    #[test]
+    fn a_queued_topic_comes_back_to_its_slot() {
+        let (mut registry, slot, owner) = private_slot();
+        registry.apply_hook(&end(A));
+        let private_topic = Place::topic(owner, 700);
+        let kept = registry.clone();
+        registry.archive_slot(slot, &HashSet::from([owner]));
+        assert_eq!(registry.revive_topic(Place::topic(owner, 701)), None);
+        assert_eq!(registry.revive_topic(private_topic), Some(slot));
+        assert!(!registry.slots[slot.0].archived);
+        assert!(registry.cleanup.is_empty());
+        assert_eq!(registry.slot_by_topic(private_topic), Some(slot));
+        assert_eq!(registry.slots[slot.0].views, kept.slots[slot.0].views);
+        assert_eq!(registry.version, VERSION, "nothing archived or queued");
+
+        // Taken by the next session, which shows in the group: the old
+        // private topic joins it.
+        registry.archive_slot(slot, &HashSet::from([owner]));
+        assert_eq!(registry.version, ARCHIVE_VERSION);
+        registry.apply_hook(&start(B, CWD, Some(2), None));
+        let chats: Vec<(Chat, Option<i64>)> = registry.slots[slot.0]
+            .views
+            .iter()
+            .map(|view| (view.chat, view.topic_id))
+            .collect();
+        assert_eq!(chats, [(Chat::GROUP, None)]);
+        assert_eq!(registry.revive_topic(private_topic), Some(slot));
+        assert_eq!(registry.slot_by_topic(private_topic), Some(slot));
+        assert_eq!(registry.slots[slot.0].views.len(), 2);
+
+        // Taken by a session in that private chat: it stays queued.
+        let mut taken = kept;
+        taken.archive_slot(slot, &HashSet::from([owner]));
+        taken.apply_hook(&start(B, CWD, Some(2), None));
+        assert!(taken.make_private(slot, owner));
+        assert_eq!(taken.revive_topic(private_topic), None);
+        assert_eq!(taken.cleanup.len(), 1);
     }
 
     /// TASK-074: a file without the new fields writes none and stays

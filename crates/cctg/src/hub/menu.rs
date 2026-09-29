@@ -584,16 +584,33 @@ pub enum MenuPress {
     Hub,
     /// The age of a cleanup, one of [`CLEANUP_DAYS`].
     CleanupDays(u16),
-    /// 🧹 of a cleanup of `days` that counted `topics`: asks once more.
+    /// 🧹 of a cleanup of `days` that counted `topics` of the slots whose
+    /// [`cleanup_key`] is `slots`: asks once more.
     Cleanup {
         days: u16,
         topics: u32,
+        slots: u32,
     },
-    /// «точно?» of that cleanup: it starts, when it still counts `topics`.
+    /// «точно?» of that cleanup: it starts, when it still takes those
+    /// slots and topics.
     CleanupConfirm {
         days: u16,
         topics: u32,
+        slots: u32,
     },
+}
+
+/// The key of the slots a cleanup takes (TASK-074 review): FNV-1a of their
+/// registry indices, so a confirmation acts only on the slots it counted.
+pub fn cleanup_key(slots: impl IntoIterator<Item = usize>) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for slot in slots {
+        for byte in (slot as u64).to_le_bytes() {
+            hash ^= u32::from(byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+    }
+    hash
 }
 
 impl MenuPress {
@@ -703,8 +720,16 @@ pub fn data(press: &MenuPress) -> String {
         MenuPress::DeviceAdd => "da".to_owned(),
         MenuPress::Hub => "hb".to_owned(),
         MenuPress::CleanupDays(days) => format!("hd:{days}"),
-        MenuPress::Cleanup { days, topics } => format!("hx:{days}:{topics}"),
-        MenuPress::CleanupConfirm { days, topics } => format!("hxc:{days}:{topics}"),
+        MenuPress::Cleanup {
+            days,
+            topics,
+            slots,
+        } => format!("hx:{days}:{topics}:{slots}"),
+        MenuPress::CleanupConfirm {
+            days,
+            topics,
+            slots,
+        } => format!("hxc:{days}:{topics}:{slots}"),
     };
     format!("{PREFIX}{rest}")
 }
@@ -738,14 +763,15 @@ pub fn parse_callback(data: &str) -> Option<MenuPress> {
         ["n"] => MenuPress::Sound,
         ["z", "0"] => MenuPress::Zone { fractions: false },
         ["z", "1"] => MenuPress::Zone { fractions: true },
-        // Before the slot buttons: that arm refuses any other three parts.
-        ["hx", days, topics] => MenuPress::Cleanup {
+        ["hx", days, topics, slots] => MenuPress::Cleanup {
             days: cleanup_days(days)?,
             topics: number(topics)?,
+            slots: number(slots)?,
         },
-        ["hxc", days, topics] => MenuPress::CleanupConfirm {
+        ["hxc", days, topics, slots] => MenuPress::CleanupConfirm {
             days: cleanup_days(days)?,
             topics: number(topics)?,
+            slots: number(slots)?,
         },
         [code, page, slot] => MenuPress::Slot {
             action: SlotAction::ALL
@@ -972,9 +998,10 @@ pub struct HubView {
     pub floods_day: bool,
     /// The chosen age of the cleanup, one of [`CLEANUP_DAYS`].
     pub days: u16,
-    /// What that cleanup would take: slots, topics to delete, and topics
-    /// the bot cannot delete, which stay.
+    /// What that cleanup would take: slots, their [`cleanup_key`], topics
+    /// to delete, and topics the bot cannot delete, which stay.
     pub slots: usize,
+    pub key: u32,
     pub clean: u32,
     pub kept: usize,
     /// Its 🧹 asks for its second press.
@@ -1498,10 +1525,10 @@ fn render_hub(view: &HubView, rows: &mut Vec<Vec<Value>>) -> String {
     } else {
         text.push_str(&format!("Завершены больше {} дн. назад", view.days));
     }
-    text.push_str(&format!(": слотов {}, тем {}", view.slots, view.clean));
+    text.push_str(&format!(": слоты: {}, темы: {}", view.slots, view.clean));
     if view.kept > 0 {
         text.push_str(&format!(
-            "\nещё {} тем бот удалить не может, они останутся как есть",
+            "\nТемы, которые бот удалить не может, останутся как есть: {}",
             view.kept
         ));
     }
@@ -1514,7 +1541,7 @@ fn render_hub(view: &HubView, rows: &mut Vec<Vec<Value>>) -> String {
     text.push_str(
         "\n\nУборка общая на весь hub: темы всех людей, в личках и в группах; делают её только владельцы. \
 Тема удаляется со всеми сообщениями. Слоты с сообщениями, ждущими Resume, и с открытым запросом разрешения или вопросом не трогаются. \
-Следующая сессия той же папки получит новую тему. \
+Следующая сессия той же папки получит новую тему; в группу её нужно добавить заново. \
 Возраст считается с того момента, когда hub увидел сессию завершённой; завершённые до этой версии hub считаются с обновления.",
     );
     rows.push(
@@ -1533,16 +1560,24 @@ fn render_hub(view: &HubView, rows: &mut Vec<Vec<Value>>) -> String {
             .collect(),
     );
     if view.clean > 0 {
-        let (days, topics) = (view.days, view.clean);
+        let (days, topics, slots) = (view.days, view.clean, view.key);
         rows.push(vec![if view.armed {
             button(
-                format!("🧹 Удалить {topics} тем — точно?"),
-                MenuPress::CleanupConfirm { days, topics },
+                format!("🧹 Удалить темы: {topics} — точно?"),
+                MenuPress::CleanupConfirm {
+                    days,
+                    topics,
+                    slots,
+                },
             )
         } else {
             button(
                 format!("🧹 Удалить темы: {topics}"),
-                MenuPress::Cleanup { days, topics },
+                MenuPress::Cleanup {
+                    days,
+                    topics,
+                    slots,
+                },
             )
         }]);
     }
@@ -1686,6 +1721,7 @@ mod tests {
             floods_day: true,
             days: 90,
             slots: 3,
+            key: u32::MAX,
             clean: u32::MAX,
             kept: 1,
             armed,
@@ -1799,8 +1835,9 @@ mod tests {
             "Версия: v0.1.27 (сборка 0123abcd)",
             "Сессии: живых 2, завершённых 5",
             "429 за сутки: 4",
-            "Завершены больше 90 дн. назад: слотов 3, тем 7",
-            "ещё 1 тем бот удалить не может",
+            "Завершены больше 90 дн. назад: слоты: 3, темы: 7",
+            "Темы, которые бот удалить не может, останутся как есть: 1",
+            "получит новую тему; в группу её нужно добавить заново",
             "Уборка: осталось 2, удалено 1, не удалось 0",
             "общая на весь hub",
         ] {
@@ -1816,14 +1853,16 @@ mod tests {
             .position(|label| label.starts_with("🧹"))
             .unwrap();
         assert_eq!(shown[at], "🧹 Удалить темы: 7");
-        assert_eq!(pressed[at], "menu:hx:90:7");
+        assert_eq!(pressed[at], format!("menu:hx:90:7:{}", u32::MAX));
         assert!(pressed.contains(&"menu:hd:0".to_owned()));
         assert!(pressed.contains(&"menu:hb".to_owned()));
         let (_, keyboard) = render_hub_page(HubView {
             clean: 7,
+            key: 12,
             ..hub_view(true)
         });
-        assert!(datas(&keyboard).contains(&"menu:hxc:90:7".to_owned()));
+        assert!(datas(&keyboard).contains(&"menu:hxc:90:7:12".to_owned()));
+        assert!(labels(&keyboard).contains(&"🧹 Удалить темы: 7 — точно?".to_owned()));
         // Nothing to clean: no button; now, since the start, nothing done.
         let (text, keyboard) = render_hub_page(HubView {
             days: 0,
@@ -1837,7 +1876,7 @@ mod tests {
             ..hub_view(false)
         });
         assert!(
-            text.contains("Мёртвые сейчас (дольше минуты): слотов 0, тем 0"),
+            text.contains("Мёртвые сейчас (дольше минуты): слоты: 0, темы: 0"),
             "{text}"
         );
         assert!(text.contains("429 с запуска: 4"), "{text}");
@@ -1866,10 +1905,12 @@ mod tests {
             MenuPress::Cleanup {
                 days: 30,
                 topics: 7,
+                slots: 0,
             },
             MenuPress::CleanupConfirm {
                 days: 0,
                 topics: u32::MAX,
+                slots: u32::MAX,
             },
         ] {
             assert_eq!(parse_callback(&data(&press)), Some(press), "{press:?}");
@@ -1881,15 +1922,20 @@ mod tests {
             Some(MenuPress::DeviceRevoke { id: 0x0123_abcd })
         );
         assert_eq!(
-            parse_callback("menu:hx:30:7"),
+            parse_callback("menu:hx:30:7:5"),
             Some(MenuPress::Cleanup {
                 days: 30,
-                topics: 7
+                topics: 7,
+                slots: 5,
             })
         );
         assert_eq!(
-            parse_callback("menu:hxc:0:1"),
-            Some(MenuPress::CleanupConfirm { days: 0, topics: 1 })
+            parse_callback("menu:hxc:0:1:9"),
+            Some(MenuPress::CleanupConfirm {
+                days: 0,
+                topics: 1,
+                slots: 9,
+            })
         );
         for junk in [
             "menu:dr:ABCDEF12",
@@ -1899,9 +1945,13 @@ mod tests {
             "menu:hd:5",
             "menu:hd",
             "menu:hx:30",
-            "menu:hxc:30:x",
-            "menu:hx:2:7",
-            "menu:hx:30:-1",
+            "menu:hx:30:7",
+            "menu:hxc:0:1",
+            "menu:hxc:30:x:1",
+            "menu:hx:2:7:1",
+            "menu:hx:30:-1:1",
+            "menu:hx:30:7:x",
+            "menu:hx:30:7:1:1",
             "menu:dv:1",
             "menu:hb:1",
         ] {
@@ -1911,7 +1961,18 @@ mod tests {
         assert!(MenuPress::Hub.navigates());
         assert!(MenuPress::CleanupDays(1).navigates());
         assert!(!MenuPress::DeviceAdd.navigates());
-        assert!(!MenuPress::Cleanup { days: 1, topics: 1 }.navigates());
+        assert!(
+            !MenuPress::Cleanup {
+                days: 1,
+                topics: 1,
+                slots: 1
+            }
+            .navigates()
+        );
+        // The key depends on the slots and their order.
+        assert_ne!(cleanup_key([0, 1]), cleanup_key([0, 2]));
+        assert_ne!(cleanup_key([0, 1]), cleanup_key([1, 0]));
+        assert_eq!(cleanup_key([3, 4]), cleanup_key(vec![3, 4]));
         assert!(MenuPress::People.owners_only());
         assert!(!MenuPress::Sound.owners_only());
         assert!(

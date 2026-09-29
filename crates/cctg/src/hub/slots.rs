@@ -2002,9 +2002,9 @@ pub struct Slots {
     revoking: HashSet<String>,
     /// The cleanup age each owner chose on the hub tab.
     hub_days: HashMap<PrivateChat, u16>,
-    /// A first 🧹 waits for its second until then: (days, topics, until),
-    /// by owner.
-    cleanup_confirm: HashMap<PrivateChat, (u16, u32, Instant)>,
+    /// A first 🧹 waits for its second until then: (days, topics, key of
+    /// the slots, until), by owner.
+    cleanup_confirm: HashMap<PrivateChat, (u16, u32, u32, Instant)>,
     /// Per chat, the cleaned topic whose delete is in flight, and the time
     /// before which the next one of that chat does not go.
     cleaning: HashMap<Chat, (Option<Place>, Instant)>,
@@ -4065,6 +4065,28 @@ impl Slots {
             return;
         };
         let place = input.place();
+        // A topic waiting for its cleanup (TASK-074 review 1): a message
+        // there brings it back to its slot, as if it was never cleaned; a
+        // slot a session took since, with a topic of its own in that chat,
+        // takes the message as it is.
+        if self.registry.slot_by_topic(place).is_none()
+            && let Some(slot) = self
+                .registry
+                .cleanup
+                .iter()
+                .find(|queued| queued.place == place)
+                .map(|queued| queued.slot)
+        {
+            if self.registry.revive_topic(place).is_some() {
+                info!(
+                    ordinal = self.ordinal(slot),
+                    "a message came into a topic waiting for its cleanup; it stays"
+                );
+            } else {
+                self.take_in(slot, place, thread_id, input);
+                return;
+            }
+        }
         // Kept for the next mention, it reaches no view but its own
         // (TASK-077).
         let holds = self
@@ -12446,13 +12468,14 @@ impl Slots {
             .copied()
             .unwrap_or(menu::DEFAULT_CLEANUP_DAYS);
         let (plan, clean, kept) = self.cleanup_plan(days);
+        let key = menu::cleanup_key(plan.iter().map(|slot| slot.0));
         let now = Instant::now();
-        let armed = self
-            .cleanup_confirm
-            .get(&owner)
-            .is_some_and(|(armed, topics, until)| {
-                *armed == days && *topics == clean && now < *until
-            });
+        let armed =
+            self.cleanup_confirm
+                .get(&owner)
+                .is_some_and(|(armed, topics, slots, until)| {
+                    *armed == days && *topics == clean && *slots == key && now < *until
+                });
         menu::HubView {
             release: self
                 .options
@@ -12482,6 +12505,7 @@ impl Slots {
             floods_day: uptime >= FLOOD_WINDOW,
             days,
             slots: plan.len(),
+            key,
             clean,
             kept,
             armed,
@@ -12582,25 +12606,38 @@ impl Slots {
             MenuPress::Cleanup { .. } | MenuPress::CleanupConfirm { .. } if !on_menu => {
                 menu::ANSWER_STALE_MENU.to_owned()
             }
-            MenuPress::Cleanup { days, topics } => {
-                if topics == 0 || self.cleanup_plan(days).1 != topics {
+            MenuPress::Cleanup {
+                days,
+                topics,
+                slots,
+            } => {
+                let (plan, clean, _) = self.cleanup_plan(days);
+                let key = menu::cleanup_key(plan.iter().map(|slot| slot.0));
+                if topics == 0 || clean != topics || key != slots {
                     CLEANUP_CHANGED.to_owned()
                 } else {
                     let until = Instant::now() + status::CONFIRM_FOR;
-                    self.cleanup_confirm.insert(owner, (days, topics, until));
+                    self.cleanup_confirm
+                        .insert(owner, (days, topics, slots, until));
                     String::new()
                 }
             }
-            MenuPress::CleanupConfirm { days, topics } => {
+            MenuPress::CleanupConfirm {
+                days,
+                topics,
+                slots,
+            } => {
                 let now = Instant::now();
                 let armed =
                     self.cleanup_confirm
                         .get(&owner)
-                        .is_some_and(|(armed, counted, until)| {
-                            *armed == days && *counted == topics && now < *until
+                        .is_some_and(|(armed, counted, key, until)| {
+                            *armed == days && *counted == topics && *key == slots && now < *until
                         });
                 let (plan, clean, _) = self.cleanup_plan(days);
-                if armed && clean == topics {
+                // The slots it counted, not only as many topics (review 5).
+                let same = menu::cleanup_key(plan.iter().map(|slot| slot.0)) == slots;
+                if armed && clean == topics && same {
                     self.cleanup_confirm.remove(&owner);
                     for slot in &plan {
                         self.archive_cleaned(*slot);
@@ -12609,7 +12646,7 @@ impl Slots {
                         slots = plan.len(),
                         topics, days, "cleanup started from the menu"
                     );
-                    format!("Уборка началась: тем {topics}")
+                    format!("Уборка началась, темы: {topics}")
                 } else {
                     CLEANUP_CHANGED.to_owned()
                 }
@@ -12649,17 +12686,24 @@ impl Slots {
 
     /// Hands the deletes of cleaned topics out, one per chat at a time and
     /// a pause after each answer (TASK-074); first notes which slots are
-    /// dead since when. A topic whose chat the bot can no longer delete in
-    /// leaves the queue and stays as it is.
+    /// dead since when. A topic of a private chat closed for now (403,
+    /// TASK-063) waits until it opens; one whose chat the bot can no longer
+    /// delete in leaves the queue and stays as it is.
     fn delete_cleaned(&mut self) {
         self.registry
             .note_dead(u64::try_from(unix_now()).unwrap_or(0));
         let now = Instant::now();
-        for place in self.registry.cleanup.clone() {
+        for topic in self.registry.cleanup.clone() {
+            let place = topic.place;
             let chat = place.chat;
+            let closed = matches!(chat, Chat::Private(private)
+                if self.registry.private && self.registry.closed.contains(&private));
+            if closed {
+                continue;
+            }
             let Some(thread_id) = place.thread.filter(|_| self.cleanup_deletable(chat)) else {
                 debug!("a cleaned topic cannot be deleted any more; it stays as it is");
-                self.registry.cleanup.retain(|queued| *queued != place);
+                self.registry.cleanup.retain(|queued| queued.place != place);
                 self.registry.dirty = true;
                 continue;
             };
@@ -12684,7 +12728,25 @@ impl Slots {
         };
         self.cleaning
             .insert(place.chat, (None, Instant::now() + gap));
-        if !self.registry.cleanup.contains(&place) {
+        if !self
+            .registry
+            .cleanup
+            .iter()
+            .any(|queued| queued.place == place)
+        {
+            // Brought back by a message while its delete was on its way
+            // (review 1): deleted all the same, its slot gets a new topic.
+            let gone = matches!(delivery, Some(Ok(_))) || delivery.as_ref().is_some_and(topic_gone);
+            if gone
+                && let (Some(slot), Some(thread_id)) =
+                    (self.registry.slot_by_topic(place), place.thread)
+            {
+                warn!(
+                    ordinal = self.ordinal(slot),
+                    "a cleaned topic came back but was deleted; creating a replacement"
+                );
+                self.registry.topic_invalid(slot, place.chat, thread_id);
+            }
             return;
         }
         let deleted = match &delivery {
@@ -12702,7 +12764,7 @@ impl Slots {
             debug!("topic of a cleaned slot not deleted yet; trying again");
             return;
         };
-        self.registry.cleanup.retain(|queued| *queued != place);
+        self.registry.cleanup.retain(|queued| queued.place != place);
         self.registry.dirty = true;
         if deleted {
             self.cleaned.0 += 1;
@@ -14130,6 +14192,8 @@ impl Slots {
             self.registry.twins = self.mirror.lasting();
             self.registry.dirty = true;
         }
+        // 4 only while a slot is archived or a topic waits (review 2).
+        self.registry.settle_version();
         if self.registry.dirty {
             self.registry.dirty = false;
             self.saver
@@ -36942,8 +37006,8 @@ again"
             "menu:da",
             "menu:hb",
             "menu:hd:0",
-            "menu:hx:0:1",
-            "menu:hxc:0:1",
+            "menu:hx:0:1:1",
+            "menu:hxc:0:1:1",
         ] {
             slots.on_control(press_by(member_chat(), 7700, data));
             let handed = all_work(&mut work);
@@ -37042,6 +37106,23 @@ again"
         panic!("topic calls never end");
     }
 
+    /// The callback data of 🧹 (`hx`) or its confirmation (`hxc`) of a
+    /// cleanup of `days` counting `topics` of slots `slots`.
+    fn cleanup_data(code: &str, days: u16, topics: u32, slots: &[usize]) -> String {
+        let key = menu::cleanup_key(slots.iter().copied());
+        format!("menu:{code}:{days}:{topics}:{key}")
+    }
+
+    /// The topics waiting for their cleanup.
+    fn queued(slots: &Slots) -> Vec<Place> {
+        slots
+            .registry
+            .cleanup
+            .iter()
+            .map(|queued| queued.place)
+            .collect()
+    }
+
     fn cleaned(slots: &mut Slots, place: Place, delivery: Option<Delivery>) {
         slots.on_done(Done::TopicCleaned { place, delivery });
         slots.pump();
@@ -37068,7 +37149,7 @@ again"
         assert!(text.contains("Сессии: живых 0, завершённых 3"), "{text}");
         assert!(text.contains("Темы: 4"), "{text}");
         assert!(
-            text.contains("Завершены больше 30 дн. назад: слотов 0, тем 0"),
+            text.contains("Завершены больше 30 дн. назад: слоты: 0, темы: 0"),
             "{text}"
         );
         assert!(
@@ -37080,40 +37161,59 @@ again"
         slots.on_control(menu_press(MENU, "menu:hd:0"));
         let (text, keyboard) = last_menu_edit(&all_work(&mut work));
         assert!(
-            text.contains("Мёртвые сейчас (дольше минуты): слотов 2, тем 2"),
+            text.contains("Мёртвые сейчас (дольше минуты): слоты: 2, темы: 2"),
             "{text}"
         );
-        assert!(text.contains("ещё 1 тем бот удалить не может"), "{text}");
-        assert!(button_datas(&keyboard).contains(&"menu:hx:0:2".to_owned()));
+        assert!(
+            text.contains("Темы, которые бот удалить не может, останутся как есть: 1"),
+            "{text}"
+        );
+        let both = [0, 1];
+        assert!(button_datas(&keyboard).contains(&cleanup_data("hx", 0, 2, &both)));
 
         // A count that no longer holds arms nothing.
-        slots.on_control(menu_press(MENU, "menu:hx:0:3"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 3, &both)));
         assert_eq!(
             callback_answers(&all_work(&mut work)),
             [Some(CLEANUP_CHANGED.to_owned())]
         );
-        slots.on_control(menu_press(MENU, "menu:hxc:0:2"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 2, &both)));
         assert_eq!(
             callback_answers(&all_work(&mut work)),
             [Some(CLEANUP_CHANGED.to_owned())],
             "not armed"
         );
+        // As many topics, other slots (review 5): arms nothing.
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 2, &[0, 2])));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(CLEANUP_CHANGED.to_owned())]
+        );
         assert!(!slots.registry.slots[0].archived);
 
-        slots.on_control(menu_press(MENU, "menu:hx:0:2"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 2, &both)));
         let (_, keyboard) = last_menu_edit(&all_work(&mut work));
-        assert!(button_datas(&keyboard).contains(&"menu:hxc:0:2".to_owned()));
-        slots.on_control(menu_press(MENU, "menu:hxc:0:2"));
+        assert!(button_datas(&keyboard).contains(&cleanup_data("hxc", 0, 2, &both)));
+        // Armed for these slots: a confirmation for others does nothing.
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 2, &[1, 0])));
+        assert_eq!(
+            callback_answers(&all_work(&mut work)),
+            [Some(CLEANUP_CHANGED.to_owned())]
+        );
+        assert!(!slots.registry.slots[0].archived);
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 2, &both)));
+        let _ = all_work(&mut work);
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 2, &both)));
         let handed = all_work(&mut work);
         assert_eq!(
             callback_answers(&handed),
-            [Some("Уборка началась: тем 2".to_owned())]
+            [Some("Уборка началась, темы: 2".to_owned())]
         );
         let (text, _) = last_menu_edit(&handed);
         assert!(text.contains("Уборка: осталось 2, удалено 0"), "{text}");
         assert!(slots.registry.slots[0].archived && slots.registry.slots[1].archived);
         assert!(!slots.registry.slots[2].archived, "its only topic stays");
-        assert_eq!(slots.registry.cleanup, [private_700, private_701]);
+        assert_eq!(queued(&slots), [private_700, private_701]);
         assert_eq!(
             slots.registry.version,
             crate::hub::registry::ARCHIVE_VERSION
@@ -37201,13 +37301,13 @@ again"
         slots.pump();
         topics_answered(&mut slots, &mut work);
         slots.on_control(menu_press(MENU, "menu:hd:0"));
-        slots.on_control(menu_press(MENU, "menu:hx:0:1"));
-        slots.on_control(menu_press(MENU, "menu:hxc:0:1"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 1, &[0])));
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 1, &[0])));
         slots.pump();
         let place = Place::topic(private_owner(), 700);
         assert_eq!(topic_deletes(&all_work(&mut work)), [place]);
         cleaned(&mut slots, place, refused(502, "Bad Gateway"));
-        assert_eq!(slots.registry.cleanup, [place], "kept");
+        assert_eq!(queued(&slots), [place], "kept");
         pause_over(&mut slots, private_owner());
         slots.pump();
         assert_eq!(topic_deletes(&all_work(&mut work)), [place]);
@@ -37276,5 +37376,233 @@ again"
         };
         slots.registry.closed.insert(private);
         assert!(slots.cleanup_plan(0).0.is_empty());
+    }
+
+    // ------------------------------------------------ TASK-074 code review
+
+    /// Slot 0 (session A, private topic 700) dead and cleaned with «сейчас»;
+    /// the delete of 700 handed out, no answer yet (review repro).
+    fn review_cleaned_slot(dir: &TempDir) -> (Slots, mpsc::UnboundedReceiver<(Work, Op)>) {
+        let (mut slots, mut work) = menu_slot(dir, cleanup_options());
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        topics_answered(&mut slots, &mut work);
+        slots.on_control(menu_press(MENU, "menu:hd:0"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 1, &[0])));
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 1, &[0])));
+        slots.pump();
+        let place = Place::topic(private_owner(), 700);
+        assert_eq!(topic_deletes(&all_work(&mut work)), [place]);
+        assert!(slots.registry.slots[0].archived);
+        (slots, work)
+    }
+
+    /// The owner's text `text` as message `message_id` of private topic
+    /// `thread`.
+    fn private_text(message_id: i64, thread: i64, text: &str) -> Inbound {
+        Inbound {
+            chat: private_owner(),
+            thread_id: Some(thread),
+            sender: owner_chat(),
+            ..topic_text(message_id, text, false)
+        }
+    }
+
+    fn parked_texts(slots: &Slots, slot: usize) -> Vec<String> {
+        slots.registry.slots[slot]
+            .buffer
+            .messages
+            .iter()
+            .map(|parked| parked.text.clone())
+            .collect()
+    }
+
+    /// Review finding 1 (repro R1): a message written into a topic whose
+    /// delete is on its way brings the topic back to its slot; the message
+    /// waits there as in any dead slot, nobody is told the topic is foreign.
+    /// The delete Telegram did anyway gives the slot a new topic.
+    #[tokio::test]
+    async fn a_message_in_a_topic_being_cleaned_keeps_it() {
+        let dir = TempDir::new("slots-074-review-r1");
+        let (mut slots, mut work) = review_cleaned_slot(&dir);
+        let place = Place::topic(private_owner(), 700);
+        slots.on_topic_message(private_text(900, 700, "ещё тут?"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(
+            !sends_into(&handed, place).contains(&FOREIGN_TOPIC_NOTICE.to_owned()),
+            "{handed:#?}"
+        );
+        assert!(!slots.registry.slots[0].archived);
+        assert_eq!(slots.registry.slot_by_topic(place), Some(SlotId(0)));
+        assert!(slots.registry.cleanup.is_empty());
+        assert_eq!(parked_texts(&slots, 0), ["ещё тут?"]);
+        // The delete that was on its way went through: a new topic.
+        cleaned(&mut slots, place, Some(Ok(Outcome::Done)));
+        let creates: Vec<(SlotId, Chat)> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(job, _)| match job {
+                Work::Topic(TopicJob::Create { slot, chat, .. }) => Some((slot, chat)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, [(SlotId(0), private_owner())]);
+        assert_eq!(parked_texts(&slots, 0), ["ещё тут?"], "still waits");
+    }
+
+    /// Review finding 1: a topic still in the queue (its chat waits for
+    /// another delete) is not deleted once a message brought it back.
+    #[tokio::test]
+    async fn a_message_in_a_queued_topic_cancels_its_delete() {
+        let dir = TempDir::new("slots-074-review-r1-queued");
+        let (mut slots, mut work) = three_dead_slots(&dir);
+        let both = [0, 1];
+        slots.on_control(menu_press(MENU, "menu:hd:0"));
+        slots.on_control(menu_press(MENU, &cleanup_data("hx", 0, 2, &both)));
+        slots.on_control(menu_press(MENU, &cleanup_data("hxc", 0, 2, &both)));
+        slots.pump();
+        let owner = private_owner();
+        assert_eq!(
+            topic_deletes(&all_work(&mut work)),
+            [Place::topic(owner, 700)]
+        );
+        slots.on_topic_message(private_text(901, 701, "подожди"));
+        slots.pump();
+        assert!(!slots.registry.slots[1].archived);
+        assert_eq!(queued(&slots), [Place::topic(owner, 700)]);
+        assert_eq!(parked_texts(&slots, 1), ["подожди"]);
+        cleaned(
+            &mut slots,
+            Place::topic(owner, 700),
+            Some(Ok(Outcome::Done)),
+        );
+        pause_over(&mut slots, owner);
+        slots.pump();
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+        assert_eq!(
+            slots.registry.slot_by_topic(Place::topic(owner, 701)),
+            Some(SlotId(1))
+        );
+    }
+
+    /// Review finding 1: the slot was taken by a new session with a topic
+    /// in the same private chat: a message in the old topic still reaches
+    /// the slot.
+    #[tokio::test]
+    async fn a_message_in_an_old_cleaned_topic_reaches_the_new_session() {
+        let dir = TempDir::new("slots-074-review-r1-taken");
+        let (mut slots, mut work) = review_cleaned_slot(&dir);
+        slots.on_hook(&resumed(A, 20));
+        slots
+            .registry
+            .topic_created(SlotId(0), private_owner(), 710, "t", None);
+        slots.pump();
+        let _ = all_work(&mut work);
+        let old = Place::topic(private_owner(), 700);
+        slots.on_topic_message(private_text(902, 700, "сюда"));
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(
+            !sends_into(&handed, old).contains(&FOREIGN_TOPIC_NOTICE.to_owned()),
+            "{handed:#?}"
+        );
+        assert_eq!(parked_texts(&slots, 0), ["сюда"]);
+        assert_eq!(queued(&slots), [old], "the old topic still goes");
+    }
+
+    /// Review repro R2: `claude --resume` of the archived slot's own session
+    /// takes the slot back like a new one: private view, one new topic; the
+    /// old topic is still deleted.
+    #[tokio::test]
+    async fn a_resume_of_the_archived_session_gets_one_new_topic() {
+        let dir = TempDir::new("slots-074-review-r2");
+        let (mut slots, mut work) = review_cleaned_slot(&dir);
+        slots.on_hook(&resumed(A, 20));
+        assert!(!slots.registry.slots[0].archived);
+        assert_eq!(slots.registry.slots[0].views, [View::new(private_owner())]);
+        slots.pump();
+        let creates: Vec<(SlotId, Chat)> = all_work(&mut work)
+            .into_iter()
+            .filter_map(|(job, _)| match job {
+                Work::Topic(TopicJob::Create { slot, chat, .. }) => Some((slot, chat)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(creates, [(SlotId(0), private_owner())]);
+        assert_eq!(queued(&slots), [Place::topic(private_owner(), 700)]);
+    }
+
+    /// Review repro R3: a flood answer (JSON or not) keeps the delete
+    /// queued, uncounted.
+    #[tokio::test]
+    async fn a_flood_answer_keeps_the_cleaned_topic_queued() {
+        let dir = TempDir::new("slots-074-review-r3");
+        let (mut slots, _work) = review_cleaned_slot(&dir);
+        let place = Place::topic(private_owner(), 700);
+        cleaned(
+            &mut slots,
+            place,
+            Some(Err(ApiError::RetryAfter(Duration::from_secs(5)))),
+        );
+        assert_eq!(queued(&slots), [place]);
+        cleaned(&mut slots, place, refused(429, "Too Many Requests"));
+        assert_eq!(queued(&slots), [place]);
+        assert_eq!(slots.cleaned, (0, 0));
+    }
+
+    /// Review finding 2 (repro R4): once nothing is archived and nothing
+    /// waits, the file is version 3 again (v0.1.27 reads it).
+    #[tokio::test]
+    async fn the_registry_is_version_3_again_once_everything_is_back() {
+        let dir = TempDir::new("slots-074-review-r4");
+        let (mut slots, _work) = review_cleaned_slot(&dir);
+        assert_eq!(
+            slots.registry.version,
+            crate::hub::registry::ARCHIVE_VERSION
+        );
+        cleaned(
+            &mut slots,
+            Place::topic(private_owner(), 700),
+            Some(Ok(Outcome::Done)),
+        );
+        assert_eq!(
+            slots.registry.version,
+            crate::hub::registry::ARCHIVE_VERSION,
+            "slot 0 is still archived"
+        );
+        slots.on_hook(&start(B, 21));
+        slots.pump();
+        assert!(slots.registry.cleanup.is_empty());
+        assert!(slots.registry.slots.iter().all(|slot| !slot.archived));
+        assert_eq!(slots.registry.version, crate::hub::registry::VERSION);
+        let written: serde_json::Value =
+            serde_json::from_slice(&RegistryStore::encode(&slots.registry)).unwrap();
+        assert_eq!(written["version"], 3);
+    }
+
+    /// Review finding 3 (repro R5): a private chat closed for now (403)
+    /// keeps its topics queued; they are deleted once it opens.
+    #[tokio::test]
+    async fn a_closed_private_chat_keeps_its_cleaned_topics() {
+        let dir = TempDir::new("slots-074-review-r5");
+        let (mut slots, mut work) = review_cleaned_slot(&dir);
+        let place = Place::topic(private_owner(), 700);
+        cleaned(&mut slots, place, None);
+        let Chat::Private(private) = private_owner() else {
+            unreachable!()
+        };
+        slots.registry.closed.insert(private);
+        pause_over(&mut slots, private_owner());
+        slots.pump();
+        assert!(topic_deletes(&all_work(&mut work)).is_empty());
+        assert_eq!(queued(&slots), [place], "waits");
+        slots.registry.closed.remove(&private);
+        pause_over(&mut slots, private_owner());
+        slots.pump();
+        assert_eq!(
+            topic_deletes(&all_work(&mut work)),
+            [place],
+            "deleted once the chat is open again"
+        );
     }
 }
