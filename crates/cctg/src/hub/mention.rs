@@ -74,7 +74,9 @@ fn mention_at(text: &str, at: usize, username: &str) -> bool {
 /// not know the bot's name; the content marks the message as addressed to
 /// it instead ([`crate::hub::buffer::MENTION_MARK`]). A `,` or `:` right
 /// after a mention that opens a phrase goes with it, and so do the spaces
-/// the cut would double; the result is trimmed.
+/// the cut would leave doubled or before a line end or a `.!?`. Only the
+/// whitespace around a cut goes: a cut at the start or end of the text
+/// takes the whitespace after or before it too.
 pub fn unmention(text: &str, username: &str) -> String {
     if !mentions(text, username) {
         return text.to_owned();
@@ -91,13 +93,18 @@ pub fn unmention(text: &str, username: &str) -> String {
             after = after.strip_prefix([',', ':']).unwrap_or(after);
             after = after.trim_start_matches([' ', '\t']);
         }
-        if after.starts_with(['.', '!', '?']) {
+        if out.is_empty() {
+            after = after.trim_start();
+        }
+        if after.is_empty() {
+            out.truncate(out.trim_end().len());
+        } else if after.starts_with(['.', '!', '?', '\n', '\r']) {
             out.truncate(out.trim_end_matches([' ', '\t']).len());
         }
         from = text.len() - after.len();
     }
     out.push_str(&text[from..]);
-    out.trim().to_owned()
+    out
 }
 
 /// The group messages kept for the next mention, each as the session will
@@ -287,6 +294,13 @@ mod tests {
             ("привет@cctg_cursor_bot", "привет"),
             ("/brief@cctg_cursor_bot 2", "/brief 2"),
             ("@cctg_cursor_bot\nи ещё", "и ещё"),
+            // Only the whitespace around a cut goes.
+            ("делаем @cctg_cursor_bot\nи ещё", "делаем\nи ещё"),
+            ("делаем @cctg_cursor_bot\r\nи ещё", "делаем\r\nи ещё"),
+            ("  отступ\n@cctg_cursor_bot сделай", "  отступ\nсделай"),
+            ("сделай @cctg_cursor_bot\n\n", "сделай\n\n"),
+            ("сделай\n@cctg_cursor_bot", "сделай"),
+            ("\n  @cctg_cursor_bot  сделай", "\n  сделай"),
             ("@cctg_cursor_bot", ""),
             ("@cctg_cursor_bot и @cctg_cursor_bot", "и"),
             // Not a mention: left as is.

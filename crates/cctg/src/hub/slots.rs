@@ -3900,13 +3900,21 @@ impl Slots {
     /// slot's session.
     fn take_in(&mut self, slot: SlotId, place: Place, thread_id: i64, input: Inbound) {
         let key = input.key();
-        // A group message that addresses the agent (TASK-080): marked, and
-        // without the bot's name, which the session does not know as its own.
+        // A message that addresses the agent (TASK-080) in a group the slot
+        // is shared to from its owner's private chat (TASK-077's mentions,
+        // in either mode; never the slot's own group topic, a fallback view
+        // or a group-only hub): marked, and without the bot's name, which
+        // the session does not know as its own.
         let mention_of = self
             .options
             .mentions
             .as_ref()
-            .filter(|bot| matches!(place.chat, Chat::Group(_)) && mentioned(bot, &input))
+            .filter(|bot| {
+                matches!(place.chat, Chat::Group(_))
+                    && self.owner_of(slot).is_some()
+                    && self.registry.shared(slot, place.chat)
+                    && mentioned(bot, &input)
+            })
             .map(|bot| bot.username.clone());
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
@@ -31857,6 +31865,54 @@ again"
               Анна: раньше\n(конец истории)\n\nИван: теперь"
             ]
         );
+    }
+
+    /// TASK-080 review: only a group the slot is shared to marks a mention.
+    /// In a group-only slot's own topic and in a fallback view, a reply to
+    /// the bot and an `@bot` text go as written, without `mention`.
+    #[tokio::test]
+    async fn a_mention_outside_a_shared_group_topic_is_not_marked() {
+        let unmarked = |got: Got, want: &[&str]| {
+            assert_eq!(mention_contents(&got), want, "{want:?}");
+            for (content, meta) in &got.inbounds {
+                assert!(!content.contains(buffer::MENTION_MARK), "{content}");
+                assert!(!meta.contains_key("mention"), "{meta:?}");
+            }
+        };
+        // A group-only slot: the group topic is its own.
+        let dir = TempDir::new("slots-mention-own-group");
+        let mut slots = stalled_slots(
+            &dir,
+            Options {
+                mentions: mention_options().mentions,
+                ..message_options()
+            },
+        );
+        slots.on_hook(&start(A, 10));
+        slots
+            .registry
+            .topic_created(SlotId(0), Chat::GROUP, 100, "a", None);
+        let mut agent = mention_agent(&mut slots, 1, 64, false);
+        slots.pump();
+        let _ = got(&mut agent);
+        // Its own group view counts as shared: the owner check decides.
+        assert!(slots.registry.shared(SlotId(0), Chat::GROUP));
+        slots.on_control(group_by(10, "и это", "Анна", Some(BOT_ID)));
+        slots.pump();
+        unmarked(got(&mut agent), &["Анна: и это"]);
+        slots.on_control(group_by(11, "@cctg_bot глянь", "Анна", Some(BOT_ID)));
+        slots.pump();
+        unmarked(got(&mut agent), &["Анна: @cctg_bot глянь"]);
+        // A fallback view of a private slot in the group: its owner's
+        // private chat is closed (a usable one would end the fallback).
+        let dir = TempDir::new("slots-mention-fallback");
+        let (mut slots, _work, mut agent) = mention_slot(&dir, 64);
+        slots.registry.closed.insert(owner_chat());
+        slots.registry.slots[0].views[1].fallback = true;
+        assert!(!slots.registry.shared(SlotId(0), Chat::GROUP));
+        slots.on_control(group_by(10, "@cctg_bot глянь", "Анна", Some(BOT_ID)));
+        slots.pump();
+        unmarked(got(&mut agent), &["Анна: @cctg_bot глянь"]);
     }
 
     /// (з): the owner switches the group topic to every message and back in
