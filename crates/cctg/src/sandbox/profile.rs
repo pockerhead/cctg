@@ -37,8 +37,6 @@ pub const FLAGS: [&str; 4] = [
 /// (docs/sandbox.md).
 // Probe P3 (WSL): all four are refused, P1, P5 and curl still work.
 pub const LINUX_EXTRA_DENY_READ: &[&str] = &[
-    "/tmp/cctg-inbox",
-    "/var/tmp/cctg-inbox",
     "/run/user",
     "/run/docker.sock",
     "/var/run/docker.sock",
@@ -48,19 +46,10 @@ pub const LINUX_EXTRA_DENY_READ: &[&str] = &[
 
 /// macOS: empty until probe P3m passes with `/tmp`, `/private/tmp`,
 /// `/var/tmp`, `/private/var/tmp` (no Mac probed: "not verified" in the doc).
-// probe P3m: the four paths above when a Mac run passes. The cctg inbox of
-// other sessions is closed on every system (see `INBOX`).
-pub const MACOS_EXTRA_DENY_READ: &[&str] = &["/private/tmp/cctg-inbox"];
-
-/// The folder other (unsandboxed) cctg sessions keep files from the topic
-/// in when their own folder cannot hold them: `<temp>/cctg-inbox`
-/// ([`crate::files::inboxes`]). Round-2 review N1: with `/tmp` open, a
-/// sandboxed command could read them; denied for the fixed temp paths above
-/// and for this user's own temp dir (macOS: `$TMPDIR`). Probe T0 (WSL,
-/// 2.1.285): a `denyRead` right in `/tmp` does not act, as `/tmp` is bound
-/// writable whole; the entries stay for sandboxes that honour them, and the
-/// limit is in docs/sandbox.md.
-const INBOX: &str = "cctg-inbox";
+// probe P3m: the four paths above when a Mac run passes. Other sessions'
+// files from the topic are not in temp any more (files::fallback_inbox, in
+// the device state dir the sandbox cannot read).
+pub const MACOS_EXTRA_DENY_READ: &[&str] = &[];
 
 /// `disableSkillShellExecution`: a user skill's `` !`cmd` `` might run
 /// outside the sandbox. Probe P6 was not run (it would put a skill into
@@ -317,15 +306,6 @@ fn prepare_in(
     };
     deny_read.extend(extra.iter().map(|path| (*path).to_owned()));
     deny_read.extend(other_projects_temp(probe, folder));
-    // A unix path, built as text: the profile is for Linux and macOS.
-    let temp = probe
-        .var("TMPDIR")
-        .filter(|dir| dir.starts_with('/'))
-        .unwrap_or_else(|| "/tmp".to_owned());
-    let own_inbox = format!("{}/{INBOX}", temp.trim_end_matches('/'));
-    if !deny_read.contains(&own_inbox) {
-        deny_read.push(own_inbox);
-    }
     let mut allow_read = allow_read
         .iter()
         .map(|dir| text(dir))
@@ -348,6 +328,31 @@ fn prepare_in(
     Ok(path)
 }
 
+/// Claude Code's shared temp on Linux is this plus the uid.
+const CLAUDE_TEMP: &str = "/tmp/claude-";
+
+/// A profile without the other projects' temp folders in `denyRead`
+/// ([`other_projects_temp`]): what a running session compares to decide
+/// whether its profile really changed. A new project under
+/// `/tmp/claude-<uid>` rewrites the file at the next start in the folder,
+/// but it is no reason to restart the sessions already running there.
+/// `None`: not a JSON object.
+pub fn stable_view(bytes: &[u8]) -> Option<Value> {
+    let mut profile: Value = serde_json::from_slice(bytes).ok()?;
+    if let Some(deny) = profile
+        .pointer_mut("/sandbox/filesystem/denyRead")
+        .and_then(Value::as_array_mut)
+    {
+        deny.retain(|entry| {
+            !entry.as_str().is_some_and(|path| {
+                path.strip_prefix(CLAUDE_TEMP)
+                    .is_some_and(|rest| rest.contains('/'))
+            })
+        });
+    }
+    profile.is_object().then_some(profile)
+}
+
 /// Linux: the folders other projects keep under Claude Code's shared temp
 /// `/tmp/claude-<uid>` (scratchpads, task output), as they are now; the
 /// session's own folder stays. Round-2 review N1 and probe TC (WSL,
@@ -358,6 +363,7 @@ fn prepare_in(
 /// project that first runs after this profile was written stays readable
 /// (docs/sandbox.md).
 fn other_projects_temp(probe: &dyn Probe, folder: &Path) -> Vec<String> {
+    // (the root is `CLAUDE_TEMP` plus the uid: `stable_view` relies on it)
     let Some((root, names)) = probe.claude_temp() else {
         return Vec::new();
     };
@@ -668,12 +674,13 @@ mod tests {
             deny_read[..2],
             [json!("~/.gitconfig"), json!("~/.config/git")]
         );
-        // Review N1: the other sessions' temp inbox; without TMPDIR the own
-        // inbox is /tmp/cctg-inbox, already in the list.
         assert_eq!(deny_read.len(), 2 + LINUX_EXTRA_DENY_READ.len());
-        for inbox in ["/tmp/cctg-inbox", "/var/tmp/cctg-inbox"] {
-            assert!(deny_read.contains(&json!(inbox)), "{inbox}");
-        }
+        // The cctg inbox left the temp dir (files::fallback_inbox): no entry.
+        assert!(
+            !deny_read
+                .iter()
+                .any(|entry| entry.as_str().unwrap().contains("cctg-inbox"))
+        );
         assert!(deny_read.contains(&json!("/run/user")));
         assert!(!deny_read.contains(&json!("/tmp")), "probe P2");
         assert_eq!(sandbox["network"]["allowAllUnixSockets"], false);
@@ -837,9 +844,6 @@ mod tests {
         let state = paths::canonical(dir.path()).unwrap().join("state");
         let mut fake = Fake::linux(&home);
         fake.os = Os::MacOs;
-        // macOS keeps temp under $TMPDIR: that user's cctg inbox is denied.
-        fake.vars
-            .insert("TMPDIR".to_owned(), "/var/folders/xy/T".to_owned());
         fake.files
             .insert(PathBuf::from("/usr/bin/sandbox-exec"), String::new());
         fake.vars.insert(
@@ -851,7 +855,6 @@ mod tests {
         let mut expected = vec![json!("~/.gitconfig"), json!("~/.config/git")];
         expected.push(json!(state.to_str().unwrap()));
         expected.extend(MACOS_EXTRA_DENY_READ.iter().map(|p| json!(p)));
-        expected.push(json!("/var/folders/xy/T/cctg-inbox"));
         assert_eq!(
             profile["sandbox"]["filesystem"]["denyRead"],
             json!(expected)

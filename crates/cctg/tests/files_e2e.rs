@@ -277,6 +277,7 @@ impl Claude {
             work: Some(work.to_owned()),
             claude: None,
             sandbox: None,
+            fallback_inbox: None,
         };
         tokio::spawn(agent::serve_channel(
             frames_rx,

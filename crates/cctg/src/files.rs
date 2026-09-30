@@ -11,7 +11,9 @@
 //! The agent keeps a file from the topic with [`save`]: in
 //! `<session folder>/.cctg/inbox/` (Claude reads it there without asking; a
 //! `.gitignore` of its own keeps the inbox out of `git status`), else in
-//! `<temp>/cctg-inbox/`, as `<UTC date>-<name>` with the name cleaned by
+//! the device's own `<state>/inbox/<session>/` (owner-only; not the temp
+//! dir, where other sessions' sandboxed commands could read it, TASK-087),
+//! as `<UTC date>-<name>` with the name cleaned by
 //! [`clean_name`], and never over an existing file. `send_file` reads with
 //! [`read_upload`].
 //!
@@ -253,30 +255,39 @@ pub fn date(now: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Where files from the topic go, in order of preference; the temp folder
-/// only with `temp_fallback`.
-pub fn inboxes(work: Option<&Path>, temp_fallback: bool) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = work
-        .map(|work| work.join(".cctg").join("inbox"))
+/// Where files from the topic go, in order of preference: the session
+/// folder's inbox, then `fallback` ([`fallback_inbox`]).
+pub fn inboxes(work: Option<&Path>, fallback: Option<&Path>) -> Vec<PathBuf> {
+    work.map(|work| work.join(".cctg").join("inbox"))
         .into_iter()
-        .collect();
-    if temp_fallback {
-        dirs.push(std::env::temp_dir().join("cctg-inbox"));
-    }
-    dirs
+        .chain(fallback.map(Path::to_path_buf))
+        .collect()
+}
+
+/// The inbox for when the session folder cannot hold a file:
+/// `<state>/inbox/<session>` in the device state dir (`~/.cctg` unless
+/// `CCTG_STATE_DIR`), which sandboxed commands cannot read (TASK-087 review
+/// round 2: in the temp dir they could). A session id that is no plain name
+/// becomes `session`.
+pub fn fallback_inbox(state: &Path, session: Option<&str>) -> PathBuf {
+    let session = session
+        .filter(|id| crate::update::is_session_id(id))
+        .unwrap_or("session");
+    state.join("inbox").join(session)
 }
 
 /// Saves `bytes` as a new file `<date>-<name>` (`name` already cleaned) in
 /// the first of [`inboxes`] that takes it; returns its path. A taken name
 /// gets `-2`, `-3`, ...; nothing is ever overwritten.
 ///
-/// `sandboxed` (TASK-087): only `<work>/.cctg/inbox`, never the temp folder
+/// `sandboxed` (TASK-087): only `<work>/.cctg/inbox`, never `fallback`
 /// (the model could not reach it), and only when neither `.cctg` nor the
 /// inbox is a link or a file and the inbox resolves inside `work` (a
 /// sandboxed command could have pointed it anywhere). A swap between that
 /// check and the write remains possible (docs/sandbox.md).
 pub fn save(
     work: Option<&Path>,
+    fallback: Option<&Path>,
     name: &str,
     bytes: &[u8],
     now: SystemTime,
@@ -285,11 +296,12 @@ pub fn save(
     let dated = format!("{}-{name}", date(now));
     if sandboxed {
         let work = work.ok_or_else(|| io::Error::other("no session folder"))?;
-        return save_in(&confined_inbox(work)?, &dated, bytes);
+        return save_in(&confined_inbox(work)?, &dated, bytes, false);
     }
     let mut last = io::Error::other("no inbox");
-    for dir in inboxes(work, true) {
-        match save_in(&dir, &dated, bytes) {
+    for dir in inboxes(work, fallback) {
+        let private = fallback.is_some_and(|fallback| dir == fallback);
+        match save_in(&dir, &dated, bytes, private) {
             Ok(path) => return Ok(path),
             Err(error) => last = error,
         }
@@ -324,12 +336,24 @@ fn confined_inbox(work: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn save_in(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    keep_out_of_git(dir);
+/// `private`: the fallback inbox of the device state dir, made 0700 with
+/// files 0600 on unix, like the hook spool.
+fn save_in(dir: &Path, name: &str, bytes: &[u8], private: bool) -> io::Result<PathBuf> {
+    if private {
+        crate::sandbox::create_private_dir(dir)?;
+    } else {
+        std::fs::create_dir_all(dir)?;
+        keep_out_of_git(dir);
+    }
     for n in 1..=MAX_COPIES {
         let path = dir.join(numbered(name, n));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        match options.open(&path) {
             Ok(mut file) => {
                 if let Err(error) = file.write_all(bytes).and_then(|()| file.flush()) {
                     drop(file);
@@ -610,8 +634,8 @@ mod tests {
     fn a_save_never_overwrites_and_keeps_the_inbox_out_of_git() {
         let dir = TempDir::new("files-save");
         let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
-        let first = save(Some(dir.path()), "shot.png", b"one", now, false).unwrap();
-        let second = save(Some(dir.path()), "shot.png", b"two", now, false).unwrap();
+        let first = save(Some(dir.path()), None, "shot.png", b"one", now, false).unwrap();
+        let second = save(Some(dir.path()), None, "shot.png", b"two", now, false).unwrap();
         let inbox = dir.path().join(".cctg").join("inbox");
         assert_eq!(first, inbox.join("2026-09-25-shot.png"));
         assert_eq!(second, inbox.join("2026-09-25-shot-2.png"));
@@ -621,17 +645,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
         // An existing .gitignore is the user's: left as it is.
         std::fs::write(&ignore, "mine\n").unwrap();
-        save(Some(dir.path()), "shot.png", b"three", now, false).unwrap();
+        save(Some(dir.path()), None, "shot.png", b"three", now, false).unwrap();
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "mine\n");
-        // A folder that cannot hold the inbox falls back to the temp dir.
+        // A folder that cannot hold the inbox falls back to the device's
+        // own inbox, never the temp dir (TASK-087).
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"a file, not a folder").unwrap();
-        let fallback = save(Some(&blocked), "x.txt", b"four", now, false).unwrap();
-        assert!(
-            fallback.starts_with(std::env::temp_dir().join("cctg-inbox")),
-            "{fallback:?}"
+        let own = fallback_inbox(&dir.path().join("state"), Some("5e55-ab"));
+        assert_eq!(own, dir.path().join("state").join("inbox").join("5e55-ab"));
+        let fallback = save(Some(&blocked), Some(&own), "x.txt", b"four", now, false).unwrap();
+        assert_eq!(fallback, own.join("2026-09-25-x.txt"));
+        assert!(!own.join(".gitignore").exists(), "not in a repository");
+        assert!(save(Some(&blocked), None, "x.txt", b"five", now, false).is_err());
+        assert_eq!(
+            fallback_inbox(Path::new("s"), Some("../x")),
+            Path::new("s").join("inbox").join("session")
         );
-        std::fs::remove_file(fallback).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&own), 0o700);
+            assert_eq!(mode(&fallback), 0o600);
+        }
     }
 
     #[test]
@@ -673,22 +709,24 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
         let work = dir.path().join("proj");
         std::fs::create_dir_all(&work).unwrap();
-        let saved = save(Some(&work), "a.txt", b"one", now, true).unwrap();
+        let own = dir.path().join("state-inbox");
+        let saved = save(Some(&work), Some(&own), "a.txt", b"one", now, true).unwrap();
         assert_eq!(
             saved,
             work.join(".cctg").join("inbox").join("2026-09-25-a.txt")
         );
         assert_eq!(
-            inboxes(Some(&work), false),
+            inboxes(Some(&work), None),
             [work.join(".cctg").join("inbox")]
         );
-        assert_eq!(inboxes(Some(&work), true).len(), 2);
-        assert!(save(None, "a.txt", b"one", now, true).is_err());
+        assert_eq!(inboxes(Some(&work), Some(&own)).len(), 2);
+        assert!(save(None, Some(&own), "a.txt", b"one", now, true).is_err());
         // A file where the inbox should be: no fallback anywhere.
         let blocked = dir.path().join("blocked");
         std::fs::create_dir_all(blocked.join(".cctg")).unwrap();
         std::fs::write(blocked.join(".cctg").join("inbox"), b"x").unwrap();
-        assert!(save(Some(&blocked), "x.txt", b"two", now, true).is_err());
+        assert!(save(Some(&blocked), Some(&own), "x.txt", b"two", now, true).is_err());
+        assert!(!own.exists(), "a sandboxed session never falls back");
         #[cfg(unix)]
         {
             let outside = dir.path().join("outside");
@@ -696,11 +734,11 @@ mod tests {
             let linked = dir.path().join("linked");
             std::fs::create_dir_all(linked.join(".cctg")).unwrap();
             std::os::unix::fs::symlink(&outside, linked.join(".cctg").join("inbox")).unwrap();
-            assert!(save(Some(&linked), "x.txt", b"three", now, true).is_err());
+            assert!(save(Some(&linked), Some(&own), "x.txt", b"three", now, true).is_err());
             let whole = dir.path().join("whole");
             std::fs::create_dir_all(&whole).unwrap();
             std::os::unix::fs::symlink(&outside, whole.join(".cctg")).unwrap();
-            assert!(save(Some(&whole), "x.txt", b"four", now, true).is_err());
+            assert!(save(Some(&whole), Some(&own), "x.txt", b"four", now, true).is_err());
             assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         }
     }
@@ -722,7 +760,7 @@ mod tests {
     fn the_inbox_ignores_only_itself() {
         let dir = TempDir::new("files-ignore");
         let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
-        save(Some(dir.path()), "shot.png", b"one", now, false).unwrap();
+        save(Some(dir.path()), None, "shot.png", b"one", now, false).unwrap();
         let cctg = dir.path().join(".cctg");
         assert_eq!(
             std::fs::read_to_string(cctg.join("inbox").join(".gitignore")).unwrap(),

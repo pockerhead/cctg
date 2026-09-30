@@ -164,7 +164,7 @@ impl Probe for RealProbe {
     fn claude_temp(&self) -> Option<(String, Vec<String>)> {
         // SAFETY: getuid has no preconditions and cannot fail.
         let uid = unsafe { libc::getuid() };
-        let root = format!("/tmp/claude-{uid}");
+        let root = format!("/tmp/claude-{uid}"); // profile::CLAUDE_TEMP
         let names = std::fs::read_dir(&root)
             .map(|entries| {
                 entries

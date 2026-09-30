@@ -95,6 +95,9 @@ pub struct Worker {
     pub folder: Option<PathBuf>,
     /// `<home>/.cctg/sandbox/folders.json`; `None` without a home.
     pub marks_file: Option<PathBuf>,
+    /// The sandbox profile this claude started with, as
+    /// [`profile::stable_view`] sees it ([`Self::remember_profile`]).
+    pub profile_seen: Option<serde_json::Value>,
 }
 
 /// What an `update` leads to.
@@ -137,6 +140,7 @@ impl Worker {
                 .filter(|dir| dir.is_absolute())
                 .map(|dir| PathBuf::from(crate::device::canonical_cwd(&dir.to_string_lossy()))),
             marks_file: sandbox::home_dir_of(&var).map(|home| sandbox::marks_file(&home)),
+            profile_seen: None,
         }
     }
 
@@ -147,6 +151,52 @@ impl Worker {
             (Some(file), Some(folder)) => marks::covered(file, folder) != Ok(false),
             _ => false,
         }
+    }
+
+    /// The sandbox profile file of this claude, when it runs with one.
+    pub fn active_profile(&self) -> Option<PathBuf> {
+        if !self.sandbox_active {
+            return None;
+        }
+        let base = profile::settings_base(&self.run_args)?;
+        Some(profile::profile_path(&base, self.folder.as_deref()?))
+    }
+
+    /// Keeps the profile as it is now, at the worker's start: later only a
+    /// change of its [`profile::stable_view`] counts. Blocking (one small
+    /// file).
+    pub fn remember_profile(&mut self) {
+        self.profile_seen = self
+            .active_profile()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| profile::stable_view(&bytes));
+    }
+
+    /// The files whose time tells a changed config: what `--settings` and
+    /// `--mcp-config` name, but for a remembered sandbox profile its base
+    /// `settings.json` instead (the profile itself is compared by content,
+    /// [`Self::profile_changed`]).
+    fn watched_files(&self) -> Vec<PathBuf> {
+        let mut files = config_files(&self.current_args());
+        if self.profile_seen.is_some()
+            && let Some(profile) = self.active_profile()
+        {
+            files.retain(|file| *file != profile);
+            files.extend(profile::settings_base(&self.run_args));
+        }
+        files
+    }
+
+    /// The remembered profile differs from the file now in more than the
+    /// other projects' temp folders.
+    fn profile_changed(&self) -> bool {
+        let (Some(seen), Some(path)) = (&self.profile_seen, self.active_profile()) else {
+            return false;
+        };
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| profile::stable_view(&bytes))
+            .is_none_or(|now| now != *seen)
     }
 
     /// The arguments this claude runs with: `run_args` are the first
@@ -213,9 +263,9 @@ impl Worker {
             Err(_) => return Plan::Failed,
         }
         let changed = self.wanted() != self.sandbox_active
+            || self.profile_changed()
             || self.shim_started.is_some_and(|started| {
-                started < RESTART_SINCE
-                    || changed_since(&config_files(&self.current_args()), started)
+                started < RESTART_SINCE || changed_since(&self.watched_files(), started)
             });
         match (changed, self.restartable()) {
             (false, _) => Plan::UpToDate,
@@ -806,6 +856,67 @@ mod tests {
                 .any(|arg| profile::FLAGS.contains(&arg.as_str()))
         );
         assert!(args.contains(&settings.to_string_lossy().into_owned()));
+    }
+
+    /// A new project folder under /tmp/claude-<uid> rewrites the profile
+    /// at the next start in the folder; the running session does not
+    /// restart for it. A real change of the profile or of its base
+    /// settings still restarts it.
+    #[test]
+    fn only_a_real_profile_change_restarts_a_sandboxed_session() {
+        let dir = TempDir::new("update-sandbox-stable");
+        let home = sandbox::paths::canonical(dir.path()).unwrap();
+        let exe = home.join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let mut w = sandbox_worker(&home, &exe, true);
+        let folder = w.folder.clone().unwrap();
+        marks::add(&sandbox::marks_file(&home), &folder).unwrap();
+        let settings = profile::settings_base(&w.run_args).unwrap();
+        let mut fake = preflight::tests::Fake::linux(&home);
+        fake.claude_temp = Some(("/tmp/claude-1000".to_owned(), vec!["-home-u-a".to_owned()]));
+        let path = profile::prepare(&fake, &settings, &folder, &exe).unwrap();
+        let old = UNIX_EPOCH + Duration::from_secs(RESTART_SINCE - 100);
+        for file in [&settings, &path] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        w.shim_started = Some(RESTART_SINCE + 10);
+        w.remember_profile();
+        assert!(w.profile_seen.is_some());
+        assert_eq!(w.plan(), Plan::UpToDate);
+        // Another project appears: the profile is written again (newer).
+        fake.claude_temp = Some((
+            "/tmp/claude-1000".to_owned(),
+            vec!["-home-u-a".to_owned(), "-home-u-new".to_owned()],
+        ));
+        profile::prepare(&fake, &settings, &folder, &exe).unwrap();
+        assert!(changed_since(
+            std::slice::from_ref(&path),
+            RESTART_SINCE + 10
+        ));
+        assert_eq!(
+            w.plan(),
+            Plan::UpToDate,
+            "only other projects' temp changed"
+        );
+        // A real change of the profile: restart.
+        let dirs = sandbox::sandbox_home(&home).join("read-dirs");
+        let tools = home.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(&dirs, format!("{}\n", tools.display())).unwrap();
+        profile::prepare(&fake, &settings, &folder, &exe).unwrap();
+        assert_eq!(w.plan(), Plan::Restart, "allowRead changed");
+        // And a change of the base settings (new hooks) alone: restart.
+        std::fs::remove_file(&dirs).unwrap();
+        profile::prepare(&fake, &settings, &folder, &exe).unwrap();
+        w.remember_profile();
+        assert_eq!(w.plan(), Plan::UpToDate);
+        std::fs::write(&settings, "{\"hooks\":{}}").unwrap();
+        assert_eq!(w.plan(), Plan::Restart, "base settings changed");
     }
 
     #[test]

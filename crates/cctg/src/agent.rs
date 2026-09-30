@@ -754,6 +754,9 @@ pub struct Dirs {
     /// inside the folder, files from the topic stay in the folder. `None`:
     /// never sandboxed (tests).
     pub sandbox: Option<Arc<Guard>>,
+    /// Where a file from the topic goes when `work` cannot hold it
+    /// ([`files::fallback_inbox`]); `None`: nowhere else.
+    pub fallback_inbox: Option<PathBuf>,
 }
 
 /// Runs the worker agent (`cctg agent-worker`, started by the shim) until
@@ -793,6 +796,9 @@ pub async fn run_stdio() -> i32 {
     if worker.folder.is_none() {
         worker.folder = Some(PathBuf::from(device::canonical_cwd(&current_dir())));
     }
+    // The profile this claude started with: later only a real change of it
+    // restarts the session on "Обновить" (TASK-087).
+    worker.remember_profile();
     worker.console = console_target(claude_pid, worker.run_pid, worker.state_dir.clone()).await;
     let console = worker.console.clone().map(|target| {
         let pressed = target.clone();
@@ -895,6 +901,10 @@ pub async fn run_stdio() -> i32 {
             path.is_file()
         })),
         sandbox: Some(Arc::new(Guard::from_env())),
+        fallback_inbox: config.state_dir.as_deref().map(|state| {
+            let session = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+            files::fallback_inbox(state, session.as_deref())
+        }),
     };
     let worker = Some(Arc::new(worker));
     let ended = serve_channel(
@@ -1387,7 +1397,7 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
                         };
                         if incoming.assembly.is_complete() {
                             inbox = None;
-                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone(), dirs.sandbox.clone())));
+                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone(), dirs.fallback_inbox.clone(), dirs.sandbox.clone())));
                             Vec::new()
                         } else {
                             inbox = Some(incoming);
@@ -1398,7 +1408,7 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
                 Some(LinkEvent::Message(HubMsg::FileChunk(chunk))) => {
                     match receive(&mut inbox, &chunk) {
                         Some(incoming) => {
-                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone(), dirs.sandbox.clone())));
+                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone(), dirs.fallback_inbox.clone(), dirs.sandbox.clone())));
                             Vec::new()
                         }
                         None => Vec::new(),
@@ -1610,7 +1620,12 @@ fn receive(inbox: &mut Option<Incoming>, chunk: &FileChunk) -> Option<Incoming> 
 /// Saves a complete file from the topic and makes the message Claude reads:
 /// where the file is, then the words that came with it; meta `file_kind`,
 /// `file_size` and, when it was saved, `file_path`.
-async fn deliver(incoming: Incoming, work: Option<PathBuf>, sandbox: Option<Arc<Guard>>) -> HubMsg {
+async fn deliver(
+    incoming: Incoming,
+    work: Option<PathBuf>,
+    fallback: Option<PathBuf>,
+    sandbox: Option<Arc<Guard>>,
+) -> HubMsg {
     let Incoming {
         name,
         kind,
@@ -1624,7 +1639,15 @@ async fn deliver(incoming: Incoming, work: Option<PathBuf>, sandbox: Option<Arc<
     let bytes = assembly.into_bytes();
     let saved = tokio::task::spawn_blocking(move || {
         let sandboxed = sandbox.is_some_and(|guard| guard.on());
-        files::save(work.as_deref(), &name, &bytes, SystemTime::now(), sandboxed).ok()
+        files::save(
+            work.as_deref(),
+            fallback.as_deref(),
+            &name,
+            &bytes,
+            SystemTime::now(),
+            sandboxed,
+        )
+        .ok()
     })
     .await
     .ok()
@@ -3411,6 +3434,7 @@ mod tests {
             work: None,
             claude: None,
             sandbox: None,
+            fallback_inbox: None,
         };
         tokio::spawn(serve_channel(
             frames_rx, ours, hub, events, dirs, None, None,
@@ -4202,6 +4226,7 @@ mod tests {
             work: Some(work.to_owned()),
             claude: None,
             sandbox: sandbox.map(Arc::new),
+            fallback_inbox: None,
         };
         tokio::spawn(serve_channel(
             frames_rx,
