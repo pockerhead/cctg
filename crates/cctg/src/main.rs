@@ -109,6 +109,10 @@ enum Command {
         /// cctg's settings.json.
         #[arg(long)]
         settings: PathBuf,
+        /// TASK-087 probes only: skip the WSL interop refusal and write
+        /// `sandbox/probe-<hash>.json`, which no start or restart takes.
+        #[arg(long, hide = true)]
+        probe_run: bool,
     },
 }
 
@@ -298,12 +302,15 @@ async fn main() -> anyhow::Result<()> {
             }));
             std::process::exit(cctg::sandbox::gate::run());
         }
-        Command::SandboxCheck { settings } => {
+        Command::SandboxCheck {
+            settings,
+            probe_run,
+        } => {
             std::panic::set_hook(Box::new(|_| {
                 eprintln!("cctg sandbox-check: internal error");
                 std::process::exit(cctg::sandbox::cli::CHECK_FAILED);
             }));
-            std::process::exit(cctg::sandbox::cli::check(&settings));
+            std::process::exit(cctg::sandbox::cli::check(&settings, probe_run));
         }
         Command::AgentInstall => {
             let exe = std::env::current_exe()?;
@@ -476,7 +483,22 @@ mod tests {
         assert!(Cli::try_parse_from(["cctg", "sandbox-gate", "extra"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["cctg", "sandbox-check", "--settings", "s.json"]).unwrap().command,
-            Command::SandboxCheck { settings } if settings == std::path::Path::new("s.json")
+            Command::SandboxCheck { settings, probe_run: false } if settings == std::path::Path::new("s.json")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cctg",
+                "sandbox-check",
+                "--settings",
+                "s.json",
+                "--probe-run"
+            ])
+            .unwrap()
+            .command,
+            Command::SandboxCheck {
+                probe_run: true,
+                ..
+            }
         ));
         assert!(Cli::try_parse_from(["cctg", "sandbox-check"]).is_err());
     }

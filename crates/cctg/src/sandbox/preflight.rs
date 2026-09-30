@@ -37,6 +37,7 @@ const BWRAP_PROBE: &[&str] = &[
     "true",
 ];
 const WSL_INTEROP: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
+const WSL_INTEROP_LATE: &str = "/proc/sys/fs/binfmt_misc/WSLInterop-late";
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// The wrapper `install.sh` writes, under the home directory.
 const WRAPPER: &str = ".local/bin/claude-cctg";
@@ -287,11 +288,24 @@ pub fn check(probe: &dyn Probe, folder: &Path) -> Result<Ready, Refusal> {
     device(probe)
 }
 
+/// [`check`] without the WSL interop refusal, for the TASK-087 probes only
+/// (probe P10 needs a profile while interop is on); see
+/// [`super::profile::prepare_probe_run`].
+pub fn check_probe_run(probe: &dyn Probe, folder: &Path) -> Result<Ready, Refusal> {
+    os(probe)?;
+    check_folder(probe, folder)?;
+    device_checks(probe, false)
+}
+
 /// The checks without a folder (for `cctg doctor`).
 pub fn device(probe: &dyn Probe) -> Result<Ready, Refusal> {
+    device_checks(probe, true)
+}
+
+fn device_checks(probe: &dyn Probe, interop: bool) -> Result<Ready, Refusal> {
     os(probe)?;
     let claude = claude_version(probe)?;
-    os_tools(probe)?;
+    os_tools(probe, interop)?;
     user_settings(probe)?;
     if probe
         .var("CLAUDE_CONFIG_DIR")
@@ -404,7 +418,7 @@ fn parse_version(stdout: &str) -> Option<((u64, u64, u64), String)> {
     parts.next().is_none().then(|| (version, token.to_owned()))
 }
 
-fn os_tools(probe: &dyn Probe) -> Result<(), Refusal> {
+fn os_tools(probe: &dyn Probe, interop: bool) -> Result<(), Refusal> {
     match probe.os() {
         Os::Linux => {
             for tool in ["bwrap", "socat"] {
@@ -416,7 +430,7 @@ fn os_tools(probe: &dyn Probe) -> Result<(), Refusal> {
             if ran.is_none_or(|ran| ran.code != Some(0)) {
                 return Err(Refusal::NoUserNamespaces);
             }
-            wsl_interop(probe)
+            if interop { wsl_interop(probe) } else { Ok(()) }
         }
         Os::MacOs if probe.exists(Path::new(SANDBOX_EXEC)) => Ok(()),
         Os::MacOs => Err(Refusal::MissingTool("sandbox-exec")),
@@ -426,22 +440,29 @@ fn os_tools(probe: &dyn Probe) -> Result<(), Refusal> {
 
 /// WSL2 with interop on: `cmd.exe` from inside the sandbox runs in Windows,
 /// outside any sandbox (docs sandboxing). Probe P10 decides whether this
-/// stays.
+/// stays. Distros with systemd register the handler as `WSLInterop-late`
+/// (review finding 3); either name enabled, or there and unreadable,
+/// refuses.
 // probe P10: drop this check if `cmd.exe /c ver` is refused inside the sandbox.
 fn wsl_interop(probe: &dyn Probe) -> Result<(), Refusal> {
-    match probe.read(Path::new(WSL_INTEROP)) {
-        Ok(text) if text.lines().next().map(str::trim) == Some("enabled") => {
-            Err(Refusal::WslInterop)
+    for entry in [WSL_INTEROP, WSL_INTEROP_LATE] {
+        match probe.read(Path::new(entry)) {
+            Ok(text) if text.lines().next().map(str::trim) == Some("enabled") => {
+                return Err(Refusal::WslInterop);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // It is there but unreadable: cannot tell, refuse.
+            Err(_) => return Err(Refusal::WslInterop),
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        // It is there but unreadable: cannot tell, refuse.
-        Err(_) => Err(Refusal::WslInterop),
     }
+    Ok(())
 }
 
 /// Arrays of the user's settings merge with the profile and `--settings`
-/// cannot take them back (docs settings, "lists merge").
+/// cannot take them back (docs settings, "lists merge"). The booleans that
+/// weaken the sandbox are forced off by the profile instead
+/// (`profile::overlay`).
 const WIDENING: &[(&str, &[&str])] = &[
     (
         "permissions.additionalDirectories",
@@ -459,6 +480,11 @@ const WIDENING: &[(&str, &[&str])] = &[
     (
         "sandbox.network.allowUnixSockets",
         &["sandbox", "network", "allowUnixSockets"],
+    ),
+    // macOS: Mach services commands may look up (review finding 2).
+    (
+        "sandbox.network.allowMachLookup",
+        &["sandbox", "network", "allowMachLookup"],
     ),
 ];
 
@@ -768,6 +794,17 @@ pub(crate) mod tests {
         fake.files
             .insert(interop.clone(), "enabled\ninterpreter /init\n".to_owned());
         assert_eq!(check(&fake, &folder), Err(Refusal::WslInterop));
+        // Review finding 3: systemd distros register it as WSLInterop-late.
+        let late = PathBuf::from(WSL_INTEROP_LATE);
+        fake.files.remove(&interop);
+        fake.files.insert(late.clone(), "enabled\n".to_owned());
+        assert_eq!(check(&fake, &folder), Err(Refusal::WslInterop));
+        fake.files.insert(late.clone(), "disabled\n".to_owned());
+        assert!(check(&fake, &folder).is_ok());
+        fake.files.remove(&late);
+        fake.unreadable.push(late.clone());
+        assert_eq!(check(&fake, &folder), Err(Refusal::WslInterop));
+        fake.unreadable.clear();
         fake.files.insert(interop.clone(), "disabled\n".to_owned());
         assert!(check(&fake, &folder).is_ok());
         fake.files.remove(&interop);
@@ -827,6 +864,13 @@ pub(crate) mod tests {
             Err(Refusal::UserSettingsWiden(vec![
                 "permissions.additionalDirectories",
                 "sandbox.excludedCommands"
+            ]))
+        );
+        // Review finding 2: an array that cannot be overridden is refused.
+        assert_eq!(
+            with(r#"{"sandbox":{"network":{"allowMachLookup":["com.example.*"]}}}"#),
+            Err(Refusal::UserSettingsWiden(vec![
+                "sandbox.network.allowMachLookup"
             ]))
         );
         assert_eq!(with("{broken"), Err(Refusal::UserSettingsUnreadable));

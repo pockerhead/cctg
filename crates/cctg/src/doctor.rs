@@ -123,7 +123,10 @@ pub fn sandbox_report(probe: &dyn preflight::Probe) -> (Vec<String>, bool) {
         Err(error) => {
             return (
                 vec![format!(
-                    "sandbox: {error}; claude-cctg starts nothing until it is fixed or removed"
+                    "sandbox: {error}; folders named in it or in folders.json.bak stay \
+                     sandboxed, folders it never named start as usual, and where that cannot \
+                     be told (a cut-off file without its .bak) claude-cctg starts nothing; \
+                     fix or remove it (docs/sandbox.md)"
                 )],
                 false,
             );

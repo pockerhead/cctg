@@ -223,7 +223,34 @@ pub fn prepare(
     folder: &Path,
     exe: &Path,
 ) -> Result<PathBuf, Refusal> {
-    preflight::check(probe, folder)?;
+    prepare_in(probe, base_settings, folder, exe, false)
+}
+
+/// A profile for the TASK-087 probes only: WSL interop is not refused
+/// (probe P10 runs with it on) and the file is `sandbox/probe-<hash>.json`,
+/// a name [`base_of`] does not know, so no wrapper start and no restart
+/// ever takes it.
+pub fn prepare_probe_run(
+    probe: &dyn Probe,
+    base_settings: &Path,
+    folder: &Path,
+    exe: &Path,
+) -> Result<PathBuf, Refusal> {
+    prepare_in(probe, base_settings, folder, exe, true)
+}
+
+fn prepare_in(
+    probe: &dyn Probe,
+    base_settings: &Path,
+    folder: &Path,
+    exe: &Path,
+    probe_run: bool,
+) -> Result<PathBuf, Refusal> {
+    if probe_run {
+        preflight::check_probe_run(probe, folder)?;
+    } else {
+        preflight::check(probe, folder)?;
+    }
     let home = probe.home().ok_or(Refusal::NoHome)?;
     let home = probe.canonical(&home).unwrap_or(home);
     let private = preflight::private_dirs(probe, &home);
@@ -277,7 +304,10 @@ pub fn prepare(
         ),
     );
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|_| Refusal::Io("профиль"))?;
-    let path = profile_path(base_settings, folder);
+    let mut path = profile_path(base_settings, folder);
+    if probe_run {
+        path.set_file_name(format!("probe-{}.json", hash(folder)));
+    }
     if let Some(dir) = path.parent() {
         create_private_dir(dir).map_err(|_| Refusal::Io("профиль"))?;
     }
@@ -313,12 +343,18 @@ fn overlay(
             "failIfUnavailable": true,
             "allowUnsandboxedCommands": false,
             "enableWeakerNestedSandbox": false,
+            // Review finding 2: user settings may set these; the profile's
+            // value wins (--settings is above user settings). Any new
+            // boolean that weakens the sandbox belongs here too.
+            "allowAppleEvents": false,
+            "enableWeakerNetworkIsolation": false,
+            "autoAllowBashIfSandboxed": false,
             "filesystem": {
                 "disabled": false,
                 "allowRead": allow_read,
                 "denyRead": deny_read
             },
-            "network": { "allowAllUnixSockets": false },
+            "network": { "allowAllUnixSockets": false, "allowLocalBinding": false },
             "credentials": { "envVars": secrets }
         },
         "permissions": {
@@ -631,6 +667,57 @@ mod tests {
             base_bytes,
             "the base is only read"
         );
+    }
+
+    /// Review finding 2: booleans of the user's settings that weaken the
+    /// sandbox lose against the profile, whatever they say.
+    #[test]
+    fn weakening_user_booleans_are_forced_off() {
+        let (_dir, home, folder) = home_and_folder("profile-weakening");
+        let (settings, exe) = install(&home);
+        let mut fake = Fake::linux(&home);
+        fake.files.insert(
+            home.join(".claude").join("settings.json"),
+            r#"{"sandbox":{"allowAppleEvents":true,"enableWeakerNetworkIsolation":true,
+                "autoAllowBashIfSandboxed":true,"network":{"allowLocalBinding":true}}}"#
+                .to_owned(),
+        );
+        let path = prepare(&fake, &settings, &folder, &exe).unwrap();
+        let profile: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let sandbox = &profile["sandbox"];
+        for key in [
+            "allowAppleEvents",
+            "enableWeakerNetworkIsolation",
+            "autoAllowBashIfSandboxed",
+        ] {
+            assert_eq!(sandbox[key], false, "{key}");
+        }
+        assert_eq!(sandbox["network"]["allowLocalBinding"], false);
+    }
+
+    /// The probe-only profile skips the WSL interop refusal alone and is
+    /// never a profile a start or restart takes.
+    #[test]
+    fn a_probe_run_profile_is_apart() {
+        let (_dir, home, folder) = home_and_folder("profile-probe-run");
+        let (settings, exe) = install(&home);
+        let mut fake = Fake::linux(&home);
+        fake.files.insert(
+            PathBuf::from("/proc/sys/fs/binfmt_misc/WSLInterop-late"),
+            "enabled\n".to_owned(),
+        );
+        assert_eq!(
+            prepare(&fake, &settings, &folder, &exe),
+            Err(Refusal::WslInterop)
+        );
+        let path = prepare_probe_run(&fake, &settings, &folder, &exe).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("probe-{}.json", hash(&folder))
+        );
+        assert_eq!(base_of(&path), None, "no start or restart takes it");
+        fake.answer("claude", 0, "2.1.1 (Claude Code)");
+        assert!(prepare_probe_run(&fake, &settings, &folder, &exe).is_err());
     }
 
     #[test]

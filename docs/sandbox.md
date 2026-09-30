@@ -29,9 +29,9 @@
 
 - Claude Code 2.1.284 или новее.
 - Linux: `bubblewrap` и `socat` (`apt install bubblewrap socat`), разрешённые user namespaces. На Ubuntu 24.04 их запрещает AppArmor для непривилегированных процессов; нужен профиль для `bwrap` или `sysctl kernel.apparmor_restrict_unprivileged_userns=0` (решение за вами, это системная настройка). Рекомендуется seccomp-фильтр Claude Code (`npm install -g @anthropic-ai/sandbox-runtime`): без него командам доступны Unix-сокеты вне закрытых путей.
-- WSL2: запуск программ Windows выключен (`[interop] enabled=false` в `/etc/wsl.conf`, затем `wsl --shutdown`). Иначе `cmd.exe` из сэндбокса выполняется в Windows вне всякого сэндбокса (не проверено пробой P10).
+- WSL2: запуск программ Windows выключен (`[interop] enabled=false` в `/etc/wsl.conf`, затем `wsl --shutdown`). Иначе `cmd.exe` из сэндбокса выполняется в Windows вне всякого сэндбокса (не проверено пробой P10). cctg смотрит оба имени обработчика: `WSLInterop` и `WSLInterop-late` (так его называют дистрибутивы с systemd).
 - macOS: `/usr/bin/sandbox-exec` (есть в системе).
-- В `~/.claude/settings.json` не должно быть ключей, которые расширяют сэндбокс: `permissions.additionalDirectories`, `sandbox.filesystem.allowWrite`, `sandbox.filesystem.allowRead`, `sandbox.excludedCommands`, `sandbox.network.allowUnixSockets` и правил `Edit(путь)`, `Write(путь)`, `NotebookEdit(путь)` в `permissions.allow`. Массивы из пользовательских настроек складываются с профилем, и отменить их нельзя, поэтому cctg с ними отказывает и называет ключи.
+- В `~/.claude/settings.json` не должно быть ключей, которые расширяют сэндбокс: `permissions.additionalDirectories`, `sandbox.filesystem.allowWrite`, `sandbox.filesystem.allowRead`, `sandbox.excludedCommands`, `sandbox.network.allowUnixSockets`, `sandbox.network.allowMachLookup` (macOS) и правил `Edit(путь)`, `Write(путь)`, `NotebookEdit(путь)` в `permissions.allow`. Массивы из пользовательских настроек складываются с профилем, и отменить их нельзя, поэтому cctg с ними отказывает и называет ключи. Флаги, которые ослабляют сэндбокс (`allowAppleEvents`, `enableWeakerNetworkIsolation`, `enableWeakerNestedSandbox`, `autoAllowBashIfSandboxed`, `network.allowLocalBinding`, `network.allowAllUnixSockets`, `filesystem.disabled`, `allowUnsandboxedCommands`), профиль ставит сам, и его значение сильнее пользовательского: с ними cctg не отказывает, они просто не действуют.
 - `CLAUDE_CONFIG_DIR` не задан.
 
 Каждый старт помеченной папки проверяет это заново. Если что-то сломалось, `claude-cctg` не запускается и пишет причину (без сэндбокса он в помеченной папке не стартует никогда).
@@ -52,11 +52,21 @@ claude запускается с `--strict-mcp-config --setting-sources user --n
 
 Свои пути наружу cctg закрывает сам:
 
-- `!` и слеш-команды из Telegram: `!` не набирается никогда; из слеш-команд только безопасные встроенные (`/compact`, `/clear`, `/model`, `/cost`, ...), встроенные скиллы и ваши скиллы из `~/.claude/skills`, `~/.claude/commands` и плагинов. `/add-dir`, `/cd`, `/config`, `/permissions`, `/mcp` и всё незнакомое отказаны, `@` в строке тоже. Ответ в теме нейтральный: «в этой папке такие команды отключены настройками папки».
+- `!` и слеш-команды из Telegram: строка с `!` в любом месте не набирается никогда. Из слеш-команд проходят только безопасные встроенные (`/compact`, `/clear`, `/model`, `/cost`, ...), встроенные скиллы, которые работают одними инструментами, и ваши скиллы из `~/.claude/skills`, `~/.claude/commands` и плагинов. `/add-dir`, `/cd`, `/config`, `/permissions`, `/mcp` и всё незнакомое отказаны, `@` в строке тоже. `/loop` отказан целиком: он потом сам запускает промпт или команду (`/loop 1m /add-dir ~`) мимо этой проверки. Строка проверяется вся, не только начало: `/слово` где угодно, похожее на опасную команду, отказывает всю строку. Ваш скилл не набирается, если опасная встроенная команда или слово в ней начинаются с его имени (скилл `add` или `dir`: меню подсветило бы `/add-dir`, и Enter запустил бы её). Ответ в теме нейтральный: «в этой папке такие команды отключены настройками папки».
 - `send_file` отдаёт только файлы папки, ссылки наружу не проходят.
 - Файлы из темы сохраняются только в `<папка>/.cctg/inbox/`, не во временный каталог, и не через ссылки.
 
 Кэши инструментов для Bash лежат в `<папка>/.cctg/sandbox/` (`CARGO_HOME`, `XDG_*`, npm, Go), `CARGO_TARGET_DIR` это `<папка>/target`. `HOME` не меняется. Внутри `<папка>/.cctg/sandbox/` есть `.gitignore` со `*`.
+
+## Если файл меток повреждён
+
+Метки лежат в `~/.cctg/sandbox/folders.json`, каждое сохранение пишет и копию `folders.json.bak`. Нет файла или он пустой: меток нет, всё как раньше. Если файл испорчен (правка руками, диск), cctg решает по каждой папке отдельно:
+
+- папка, которую называет испорченный файл или его копия `.bak` (или папка внутри неё), остаётся в сэндбоксе;
+- папка, которую не называет ни то ни другое, стартует как обычно, если в файле ничего не могло пропасть: он кончается как целый JSON (`}`) или копия `.bak` читается. `claude-cctg` при этом пишет предупреждение;
+- если файл обрезан и копии нет, если обрез пришёлся на путь, с которого начинается путь этой папки, или файл не читается совсем, решить нельзя: `claude-cctg` в такой папке не стартует, а `send_file` и консольные команды агента считаются в сэндбоксе.
+
+`cctg doctor` и `cctg sandbox status` показывают, что с файлом. Починить: поправьте JSON или удалите файл и включите нужные папки заново (`cctg sandbox on`).
 
 ## Каталоги программ
 
@@ -92,6 +102,7 @@ claude запускается с `--strict-mcp-config --setting-sources user --n
 - Если удалить бинарник cctg, хук gate не запустится, и Claude Code пропустит запись файловым инструментом (сам сэндбокс команд остаётся).
 - Подмена каталога inbox в короткий момент между проверкой и записью файла из темы.
 - Правило «все сборки в общем target» проекта cctg в сэндбокс-папках не действует: target там свой.
+- Хук gate стоит на `Write`, `Edit`, `MultiEdit`, `NotebookEdit` и `EnterWorktree`. Новый инструмент записи файлов в будущей версии Claude Code он не поймает, пока его не добавят в список.
 
 ## Как всё удалить
 

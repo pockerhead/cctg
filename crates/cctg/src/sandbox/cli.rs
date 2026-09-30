@@ -101,7 +101,16 @@ pub fn status(folder: Option<PathBuf>) -> i32 {
     };
     match marks_file(&probe).map(|file| marks::load(&file)) {
         None => println!("{}: сэндбокс выключен", folder.display()),
-        Some(Err(error)) => println!("{}: {error} (считается включённым)", folder.display()),
+        // Damaged: decided as `sandbox-check` decides (marks module docs).
+        Some(Err(error)) => {
+            let file = marks_file(&probe).unwrap_or_default();
+            let state = match marks::covered(&file, &folder) {
+                Ok(true) => "сэндбокс включён (по повреждённому файлу или его копии .bak)",
+                Ok(false) => "сэндбокс выключен (файл повреждён, но эту папку не называет)",
+                Err(_) => "не определить, claude-cctg здесь не стартует",
+            };
+            println!("{}: {error}; {state}", folder.display());
+        }
         Some(Ok(list)) => match marks::covering(&list, &folder) {
             Some(mark) if paths::within(&folder, mark) => {
                 println!("{}: сэндбокс включён", folder.display())
@@ -127,11 +136,23 @@ pub fn status(folder: Option<PathBuf>) -> i32 {
 /// `cctg sandbox-check --settings S` in the session folder (the current
 /// directory): the profile's path on stdout and 0, [`NOT_MARKED`] with empty
 /// stdout, or [`CHECK_FAILED`] with a reason on stderr.
-pub fn check(settings: &Path) -> i32 {
-    check_with(&RealProbe, settings, std::env::current_dir().ok())
+pub fn check(settings: &Path, probe_run: bool) -> i32 {
+    let cwd = std::env::current_dir().ok();
+    if probe_run {
+        eprintln!(
+            "cctg sandbox-check: a probe profile (TASK-087): WSL interop is not checked; \
+             not for real sessions"
+        );
+        return check_in(&RealProbe, settings, cwd, true);
+    }
+    check_with(&RealProbe, settings, cwd)
 }
 
 pub fn check_with(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>) -> i32 {
+    check_in(probe, settings, cwd, false)
+}
+
+fn check_in(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>, probe_run: bool) -> i32 {
     let Some(folder) = cwd.and_then(|cwd| paths::canonical(&cwd)) else {
         eprintln!("cctg sandbox-check: the current folder cannot be resolved");
         return CHECK_FAILED;
@@ -141,10 +162,21 @@ pub fn check_with(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>) -> i
         return NOT_MARKED;
     };
     match marks::covered(&file, &folder) {
-        Ok(false) => return NOT_MARKED,
+        Ok(false) => {
+            if marks::damaged(&file) {
+                eprintln!(
+                    "cctg sandbox-check: the sandbox marks file is damaged; it does not name \
+                     this folder, which starts as usual (cctg doctor)"
+                );
+            }
+            return NOT_MARKED;
+        }
         Ok(true) => {}
         Err(error) => {
-            eprintln!("cctg sandbox-check: {error}");
+            eprintln!(
+                "cctg sandbox-check: {error}; this folder may be marked, so claude does not \
+                 start (cctg doctor)"
+            );
             return CHECK_FAILED;
         }
     }
@@ -155,7 +187,12 @@ pub fn check_with(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>) -> i
             return CHECK_FAILED;
         }
     };
-    match profile::prepare(probe, settings, &folder, &exe) {
+    let prepared = if probe_run {
+        profile::prepare_probe_run(probe, settings, &folder, &exe)
+    } else {
+        profile::prepare(probe, settings, &folder, &exe)
+    };
+    match prepared {
         Ok(path) => {
             println!("{}", path.display());
             0
@@ -194,10 +231,21 @@ mod tests {
             0,
             "a subfolder is covered"
         );
+        // A damaged file: the backup of the last save still marks it.
         std::fs::write(&file, b"{broken").unwrap();
+        assert_eq!(check_with(&fake, &settings, Some(folder.clone())), 0);
+        // Without the backup a cut-off file decides nothing: no start.
+        std::fs::remove_file(file.with_file_name("folders.json.bak")).unwrap();
         assert_eq!(
             check_with(&fake, &settings, Some(folder.clone())),
             CHECK_FAILED
+        );
+        // Review finding 4: damaged but whole, and not naming this folder:
+        // it starts as before.
+        std::fs::write(&file, b"{\"version\":1,\"folders\":[],}").unwrap();
+        assert_eq!(
+            check_with(&fake, &settings, Some(folder.clone())),
+            NOT_MARKED
         );
         std::fs::remove_file(&file).unwrap();
         marks::add(&file, &folder).unwrap();

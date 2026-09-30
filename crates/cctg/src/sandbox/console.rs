@@ -6,11 +6,15 @@
 //!
 //! Closed by default: an unknown name, a built-in command not on the safe
 //! lists and every command of a newer Claude Code are refused. A skill counts
-//! only when its file exists and its name cannot be taken for a built-in
-//! (the command menu matches names ignoring case and `-`, `_`, `:`, and
-//! Enter runs the highlighted match, docs commands). `@` anywhere is refused:
-//! an `@` file mention in the input box inserts a file without a tool call
-//! (docs hooks).
+//! only when its file exists and no dangerous built-in starts with its name
+//! or has a word that does (the command menu matches the start of a name or
+//! of a word in it, ignoring case and `-`, `_`, `:`, and Enter runs the
+//! highlighted match, docs commands). The whole line is looked at, not only
+//! its start: a `!` anywhere, or a `/word` anywhere that could be taken for a
+//! dangerous built-in, refuses it, so no skill can take a command along in
+//! its arguments and run it later (review finding 1: `/loop 1m /add-dir ~`).
+//! `@` anywhere is refused: an `@` file mention in the input box inserts a
+//! file without a tool call (docs hooks).
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +25,8 @@ pub const SAFE_BUILTINS: &[&str] = &[
 ];
 
 /// Bundled skills: they act only through tools, under the sandbox and the
-/// gate.
+/// gate. Not `/loop`: it runs a prompt or a slash command later, typed by
+/// Claude Code itself, past this check.
 pub const BUNDLED_SKILLS: &[&str] = &[
     "batch",
     "claude-api",
@@ -33,7 +38,6 @@ pub const BUNDLED_SKILLS: &[&str] = &[
     "design-sync",
     "doctor",
     "fewer-permission-prompts",
-    "loop",
     "run",
     "run-skill-generator",
     "simplify",
@@ -279,7 +283,10 @@ fn plugin_has(dir: &Path, plugin: &str, name: &str, depth: usize, seen: &mut usi
 /// taken off by the hub) into a sandboxed session's console.
 pub fn allowed(line: &str, skills: &SkillIndex) -> bool {
     let line = line.trim();
-    if !line.starts_with('/') || line.contains('@') {
+    if !line.starts_with('/') || line.contains(['@', '!']) {
+        return false;
+    }
+    if command_words(line).any(dangerous) {
         return false;
     }
     let names: Vec<&str> = line
@@ -288,6 +295,28 @@ pub fn allowed(line: &str, skills: &SkillIndex) -> bool {
         .map_while(|word| word.strip_prefix('/'))
         .collect();
     !names.is_empty() && names.iter().all(|name| name_allowed(name, skills))
+}
+
+/// Every `/word` of `line` that could be read as a command: a `/` at the
+/// start or after anything but a path character (`src/config` is a path,
+/// `"/config` or `(/config` is not), and the name characters after it.
+fn command_words(line: &str) -> impl Iterator<Item = &str> {
+    let path_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '~' | '/');
+    line.char_indices().filter_map(move |(at, c)| {
+        let starts = c == '/'
+            && line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !path_char(before));
+        if !starts {
+            return None;
+        }
+        let rest = &line[at + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | ':')))
+            .unwrap_or(rest.len());
+        Some(&rest[..end]).filter(|word| !word.is_empty())
+    })
 }
 
 fn name_allowed(name: &str, skills: &SkillIndex) -> bool {
@@ -300,7 +329,7 @@ fn name_allowed(name: &str, skills: &SkillIndex) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     };
-    if taken_for_builtin(name) {
+    if dangerous(name) {
         return false;
     }
     match name.split_once(':') {
@@ -310,9 +339,14 @@ fn name_allowed(name: &str, skills: &SkillIndex) -> bool {
     }
 }
 
-/// `name` matches a built-in outside the safe lists when case and the
-/// separators `-`, `_`, `:` are ignored.
-fn taken_for_builtin(name: &str) -> bool {
+/// Typed as `/name`, the menu could highlight a built-in outside the safe
+/// lists: `name` (case and `-`, `_`, `:` ignored) starts that built-in or
+/// one of its words (`/add`, `/dir` -> `/add-dir`). A safe name itself is an
+/// exact command (`/status`, not `/statusline`).
+fn dangerous(name: &str) -> bool {
+    if SAFE_BUILTINS.contains(&name) || BUNDLED_SKILLS.contains(&name) {
+        return false;
+    }
     let key = |text: &str| -> String {
         text.chars()
             .filter(|c| !matches!(c, '-' | '_' | ':'))
@@ -320,10 +354,16 @@ fn taken_for_builtin(name: &str) -> bool {
             .collect()
     };
     let name = key(name);
+    if name.is_empty() {
+        return false;
+    }
     BUILTIN_COMMANDS
         .iter()
         .filter(|builtin| !SAFE_BUILTINS.contains(builtin) && !BUNDLED_SKILLS.contains(builtin))
-        .any(|builtin| key(builtin) == name)
+        .any(|builtin| {
+            let words: Vec<&str> = builtin.split('-').collect();
+            (0..words.len()).any(|from| key(&words[from..].concat()).starts_with(&name))
+        })
 }
 
 #[cfg(test)]
@@ -355,6 +395,11 @@ mod tests {
         std::fs::create_dir_all(config.join("commands").join("front")).unwrap();
         std::fs::write(config.join("commands").join("front").join("comp.md"), b"x").unwrap();
         std::fs::write(config.join("commands").join("mine.md"), b"x").unwrap();
+        // Review finding 6: user skills named like the start of a built-in
+        // or of a word in it.
+        for name in ["add", "dir", "perm", "sandb"] {
+            skill(config.join("skills").join(name));
+        }
         (
             dir,
             SkillIndex {
@@ -423,6 +468,48 @@ mod tests {
         }
     }
 
+    /// Review finding 1: a command or `!` anywhere in the line, also in the
+    /// arguments of a skill that runs them later (`/loop 1m /add-dir ~`).
+    #[test]
+    fn a_command_hidden_in_the_arguments_is_refused() {
+        let (_dir, skills) = index("console-hidden");
+        for no in [
+            "/loop 1m /add-dir x",
+            "/loop 5m !cat ~/x",
+            "/loop /add-dir x",
+            "/loop",
+            "/loop 1m check the build",
+            "/compact keep /add-dir notes",
+            "/myskill please run /config",
+            "/myskill \"/permissions\"",
+            "/myskill (/cd ..)",
+            "/myskill say hi!",
+            "/code-review /sandbox",
+        ] {
+            assert!(!allowed(no, &skills), "{no}");
+        }
+        for yes in [
+            "/code-review src/config/x.rs",
+            "/myskill fix ~/work/hooks",
+            "/compact keep the /tmp notes",
+        ] {
+            assert!(allowed(yes, &skills), "{yes}");
+        }
+    }
+
+    /// Review finding 6: the menu also highlights a built-in whose name or a
+    /// word of it starts with what was typed; Enter would run it.
+    #[test]
+    fn a_skill_named_like_the_start_of_a_builtin_is_refused() {
+        let (_dir, skills) = index("console-prefix");
+        for no in ["/add", "/dir", "/perm", "/sandb", "/add some text"] {
+            assert!(!allowed(no, &skills), "{no}");
+        }
+        for yes in ["/status", "/usage", "/design", "/myskill"] {
+            assert!(allowed(yes, &skills), "{yes}");
+        }
+    }
+
     #[test]
     fn without_a_config_dir_only_the_lists_count() {
         let skills = SkillIndex::default();
@@ -436,7 +523,13 @@ mod tests {
     fn the_lists_are_consistent() {
         for name in SAFE_BUILTINS.iter().chain(BUNDLED_SKILLS) {
             assert!(BUILTIN_COMMANDS.contains(name), "{name}");
-            assert!(!taken_for_builtin(name), "{name}");
+            assert!(
+                allowed(&format!("/{name}"), &SkillIndex::default()),
+                "{name}"
+            );
         }
+        // Review finding 1: a skill that runs prompts or commands later is
+        // no tool-only skill.
+        assert!(!BUNDLED_SKILLS.contains(&"loop"));
     }
 }
