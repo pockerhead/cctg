@@ -15,7 +15,7 @@ const FOLDS_CASE: bool = cfg!(any(windows, target_os = "macos"));
 const PROTECTED_DIRS: &[&str] = &[".claude", ".git", ".vscode", ".idea"];
 /// A protected file or directory right in the folder: the list of the
 /// Claude Code sandbox (docs sandboxing, "always write-protected").
-const PROTECTED_TOP: &[&str] = &[
+pub(crate) const PROTECTED_TOP: &[&str] = &[
     ".mcp.json",
     ".gitconfig",
     ".bashrc",
@@ -199,6 +199,76 @@ pub fn open_inside(root: &Path, path: &Path) -> Option<std::fs::File> {
     let resolved = canonical(path)?;
     let named = std::fs::metadata(&resolved).ok()?;
     (contains(root, &resolved) && same_file(&opened, &named)).then_some(file)
+}
+
+/// Windows: opens `path` for reading only when its final path (symlinks and
+/// junctions resolved by the OS) lies in `root` and it is a real disk file.
+/// Reading from the returned handle, a caller gains nothing from a later swap
+/// of the name.
+#[cfg(windows)]
+pub fn open_inside(root: &Path, path: &Path) -> Option<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_TYPE_DISK, GetFileType, GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+    };
+
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // GENERIC_READ, share read/write/delete, follow reparse points.
+    // SAFETY: `wide` is a valid NUL-terminated path.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0x8000_0000,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return None;
+    }
+    // SAFETY: a real disk file only (a directory open fails above without
+    // backup semantics; a pipe/char device is excluded here).
+    let is_disk = unsafe { GetFileType(handle) } == FILE_TYPE_DISK;
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: handle valid; buf is `buf.len()` wide chars.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    let final_path = if len == 0 || len as usize >= buf.len() {
+        None
+    } else {
+        let text = String::from_utf16_lossy(&buf[..len as usize]);
+        Some(PathBuf::from(crate::device::strip_verbatim(&text)))
+    };
+    let inside = is_disk
+        && final_path.is_some_and(|final_path| match canonical(root) {
+            Some(root) => within(&root, &final_path),
+            None => false,
+        });
+    if inside {
+        // SAFETY: we own `handle`; File takes ownership and closes it.
+        Some(unsafe { std::fs::File::from_raw_handle(handle as HANDLE as *mut _) })
+    } else {
+        // SAFETY: close the handle we opened but will not return.
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        None
+    }
 }
 
 #[cfg(test)]

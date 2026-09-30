@@ -44,6 +44,12 @@ pub fn on(folder: Option<PathBuf>) -> i32 {
         eprintln!("cctg sandbox: {}", preflight::Refusal::NoHome);
         return 1;
     };
+    #[cfg(windows)]
+    {
+        if let Err(code) = windows_on(&file, &folder) {
+            return code;
+        }
+    }
     if let Err(error) = marks::add(&file, &folder) {
         eprintln!("cctg sandbox: {error}");
         return 1;
@@ -57,6 +63,79 @@ pub fn on(folder: Option<PathBuf>) -> i32 {
     0
 }
 
+/// The Windows `sandbox on` preparation: refuse a nested mark, take a slot,
+/// make the folder dirs, and grant the slot the tree (before the mark is
+/// written, so a grant failure leaves no mark).
+#[cfg(windows)]
+fn windows_on(file: &Path, folder: &Path) -> Result<(), i32> {
+    use crate::sandbox::win;
+    // One slot per tree: no other mark inside or above.
+    if let Ok(marks) = marks::load(file) {
+        for mark in &marks {
+            if paths::within(folder, mark) && !paths::within(mark, folder)
+                || paths::within(mark, folder) && !paths::within(folder, mark)
+            {
+                eprintln!(
+                    "cctg sandbox: {}: {}",
+                    folder.display(),
+                    preflight::Refusal::BadFolder(preflight::FolderProblem::Nested)
+                );
+                return Err(1);
+            }
+        }
+    }
+    let mark = win::read_mark().ok_or_else(|| {
+        eprintln!("cctg sandbox: {}", preflight::Refusal::SandboxNotInstalled);
+        1
+    })?;
+    let Some(home) = crate::sandbox::home_dir_of(&|n| std::env::var(n).ok()) else {
+        eprintln!("cctg sandbox: {}", preflight::Refusal::NoHome);
+        return Err(1);
+    };
+    let win_dir = win::win_dir(&home);
+    let folder_str = folder.to_string_lossy().to_string();
+    let k = win::slots::take(&win_dir, mark.slots, &folder_str).map_err(|refusal| {
+        eprintln!("cctg sandbox: {refusal}");
+        1
+    })?;
+    let slot_sid = mark
+        .slot_sid(k)
+        .ok_or_else(|| {
+            eprintln!("cctg sandbox: {}", preflight::Refusal::NotPrepared);
+            1
+        })?
+        .to_owned();
+    if let Err(refusal) = profile::folder_dirs(folder, true) {
+        eprintln!("cctg sandbox: {refusal}");
+        return Err(1);
+    }
+    println!(
+        "Выдаю права учётке сэндбокса на {}; на больших папках это может занять минуты…",
+        folder.display()
+    );
+    let granted = win::acl::grant_folder(folder, &slot_sid, |seen| {
+        eprintln!("  … {seen} файлов");
+    });
+    let count = match granted {
+        Ok(count) => count,
+        Err(_) => {
+            eprintln!("cctg sandbox: не удалось выдать права; повторите cctg sandbox on");
+            return Err(1);
+        }
+    };
+    if win::acl::stamp_protected(folder, &slot_sid, true).is_err() {
+        eprintln!("cctg sandbox: не удалось защитить служебные файлы; повторите cctg sandbox on");
+        return Err(1);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = win::acl::grant_file(&exe, &mark.group_sid, win::acl::GROUP_READ_EXEC);
+    }
+    if count > 0 {
+        println!("Запрещена запись {count} файлам с несколькими жёсткими ссылками.");
+    }
+    Ok(())
+}
+
 /// `cctg sandbox off [--folder F]`.
 pub fn off(folder: Option<PathBuf>) -> i32 {
     let probe = RealProbe;
@@ -66,6 +145,8 @@ pub fn off(folder: Option<PathBuf>) -> i32 {
     };
     match marks::remove(&file, &folder) {
         Ok(Removed::Exact) => {
+            #[cfg(windows)]
+            windows_off(&folder);
             println!(
                 "Сэндбокс выключен для {}. Запущенные сессии выйдут из него после \
                  «⬆️ Обновить» или перезапуска.",
@@ -90,6 +171,41 @@ pub fn off(folder: Option<PathBuf>) -> i32 {
             1
         }
     }
+}
+
+/// The Windows `sandbox off` cleanup: list slot-owned protected names, retire
+/// the slot and revoke the tree ACEs (a new owner gets a fresh SID).
+#[cfg(windows)]
+fn windows_off(folder: &Path) {
+    use crate::sandbox::win;
+    let Some(home) = crate::sandbox::home_dir_of(&|n| std::env::var(n).ok()) else {
+        return;
+    };
+    let win_dir = win::win_dir(&home);
+    let folder_str = folder.to_string_lossy().to_string();
+    let mark = win::read_mark();
+    let slot = win::slots::active_slot(&win_dir, &folder_str)
+        .ok()
+        .flatten();
+    if let (Some(mark), Some(k)) = (&mark, slot)
+        && let Some(slot_sid) = mark.slot_sid(k)
+    {
+        let owned = win::acl::slot_owned_protected(folder, slot_sid);
+        if !owned.is_empty() {
+            println!(
+                "Эти служебные файлы создала команда из сэндбокса; проверьте их перед \
+                 запуском claude без сэндбокса:"
+            );
+            for path in &owned {
+                println!("  {}", path.display());
+            }
+        }
+        let errors = win::acl::revoke_folder(folder, slot_sid);
+        if errors > 0 {
+            println!("Права слота сняты с папки (ошибок: {errors}).");
+        }
+    }
+    let _ = win::slots::retire(&win_dir, &folder_str);
 }
 
 /// `cctg sandbox status [--folder F]`.
@@ -123,6 +239,8 @@ pub fn status(folder: Option<PathBuf>) -> i32 {
             None => println!("{}: сэндбокс выключен", folder.display()),
         },
     }
+    #[cfg(windows)]
+    windows_status(&folder);
     match preflight::check(&probe, &folder).and_then(|ready| {
         preflight::wrapper(&probe)?;
         Ok(ready)
@@ -133,30 +251,64 @@ pub fn status(folder: Option<PathBuf>) -> i32 {
     0
 }
 
+/// Prints the folder's slot and its state (Windows).
+#[cfg(windows)]
+fn windows_status(folder: &Path) {
+    use crate::sandbox::win;
+    let Some(home) = crate::sandbox::home_dir_of(&|n| std::env::var(n).ok()) else {
+        return;
+    };
+    let win_dir = win::win_dir(&home);
+    let folder_str = folder.to_string_lossy().to_string();
+    match win::slots::active_slot(&win_dir, &folder_str) {
+        Ok(Some(k)) => println!("слот сэндбокса: #{k} (активен)"),
+        Ok(None) => println!("слот сэндбокса: не назначен"),
+        Err(_) => println!("слот сэндбокса: файл слотов не читается"),
+    }
+}
+
 /// `cctg sandbox-check --settings S` in the session folder (the current
 /// directory): the profile's path on stdout and 0, [`NOT_MARKED`] with empty
-/// stdout, or [`CHECK_FAILED`] with a reason on stderr.
-pub fn check(settings: &Path, probe_run: bool) -> i32 {
+/// stdout, or [`CHECK_FAILED`] with a reason on stderr. With `cmd`, the `.cmd`
+/// wrapper form: `profile <path>` (0), `unmarked` (10), empty (3).
+pub fn check(settings: &Path, probe_run: bool, cmd: bool) -> i32 {
     let cwd = std::env::current_dir().ok();
     if probe_run {
         eprintln!("cctg sandbox-check: a probe profile (TASK-087), not for real sessions");
-        return check_in(&RealProbe, settings, cwd, true);
+        return check_in(&RealProbe, settings, cwd, true, cmd);
     }
-    check_with(&RealProbe, settings, cwd)
+    check_in(&RealProbe, settings, cwd, false, cmd)
 }
 
 pub fn check_with(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>) -> i32 {
-    check_in(probe, settings, cwd, false)
+    check_in(probe, settings, cwd, false, false)
 }
 
-fn check_in(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>, probe_run: bool) -> i32 {
+/// [`check_with`] in the `.cmd` output form (for the install_e2e tests).
+pub fn check_with_cmd(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>) -> i32 {
+    check_in(probe, settings, cwd, false, true)
+}
+
+fn check_in(
+    probe: &dyn Probe,
+    settings: &Path,
+    cwd: Option<PathBuf>,
+    probe_run: bool,
+    cmd: bool,
+) -> i32 {
+    let unmarked = |code: i32| {
+        if cmd {
+            println!("unmarked");
+        }
+        code
+    };
     let Some(folder) = cwd.and_then(|cwd| paths::canonical(&cwd)) else {
         eprintln!("cctg sandbox-check: the current folder cannot be resolved");
         return CHECK_FAILED;
     };
     // No home: no marks can exist.
     let Some(file) = marks_file(probe) else {
-        return NOT_MARKED;
+        return unmarked(NOT_MARKED);
     };
     match marks::covered(&file, &folder) {
         Ok(false) => {
@@ -166,7 +318,7 @@ fn check_in(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>, probe_run:
                      this folder, which starts as usual (cctg doctor)"
                 );
             }
-            return NOT_MARKED;
+            return unmarked(NOT_MARKED);
         }
         Ok(true) => {}
         Err(error) => {
@@ -191,7 +343,11 @@ fn check_in(probe: &dyn Probe, settings: &Path, cwd: Option<PathBuf>, probe_run:
     };
     match prepared {
         Ok(path) => {
-            println!("{}", path.display());
+            if cmd {
+                println!("profile {}", path.display());
+            } else {
+                println!("{}", path.display());
+            }
             0
         }
         Err(refusal) => {

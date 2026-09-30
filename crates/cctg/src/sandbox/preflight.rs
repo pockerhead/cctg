@@ -70,6 +70,16 @@ pub struct Ran {
     pub stdout: String,
 }
 
+/// The Windows sandbox install mark, as the checks need it (OS-independent so
+/// `Fake` can carry one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Installed {
+    pub version: u32,
+    pub slots: u32,
+    /// The recorded owner SID is the current Windows user.
+    pub owner_is_me: bool,
+}
+
 /// What the checks look at; [`RealProbe`] is the device.
 pub trait Probe {
     fn os(&self) -> Os;
@@ -90,6 +100,38 @@ pub trait Probe {
     /// Linux: Claude Code's temp shared by all projects of this user,
     /// `/tmp/claude-<uid>`, and the names in it now. `None` elsewhere.
     fn claude_temp(&self) -> Option<(String, Vec<String>)>;
+
+    /// Windows: the sandbox install mark, `None` when not installed. Other
+    /// systems have none.
+    fn sandbox_install(&self) -> Option<Installed> {
+        None
+    }
+
+    /// Windows: an ancestor of `folder` up to `home` that a broad principal
+    /// (Users, Authenticated Users, Everyone, a sandbox account…) may read or
+    /// write, so neighbours are exposed. `None` when none is, or off Windows.
+    fn shared_ancestor(&self, _folder: &Path, _home: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// Windows: the Git Bash `bash.exe` the sandbox launches, resolved like
+    /// Claude Code does. `None` when none is found or off Windows.
+    fn git_bash(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Windows: applies the folder's slot ACEs at session start (the slot must
+    /// be live and the tree granted) and returns the slot number. `root` is
+    /// the mark root, `gitconfig` the name-only copy, `read_dirs` the resolved
+    /// program directories. The default is off-Windows only.
+    fn windows_prepare(
+        &self,
+        _root: &Path,
+        _gitconfig: &Path,
+        _read_dirs: &[PathBuf],
+    ) -> Result<u32, Refusal> {
+        Err(Refusal::NotPrepared)
+    }
 }
 
 pub struct RealProbe;
@@ -180,13 +222,167 @@ impl Probe for RealProbe {
     fn claude_temp(&self) -> Option<(String, Vec<String>)> {
         None
     }
+
+    fn sandbox_install(&self) -> Option<Installed> {
+        #[cfg(windows)]
+        {
+            let mark = super::win::read_mark()?;
+            let me = super::win::current_user_sid().ok()?;
+            Some(Installed {
+                version: mark.version,
+                slots: mark.slots,
+                owner_is_me: mark.owner_sid.eq_ignore_ascii_case(&me),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn shared_ancestor(&self, _folder: &Path, _home: &Path) -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            super::win::acl::shared_ancestor(_folder, _home)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn git_bash(&self) -> Option<PathBuf> {
+        #[cfg(windows)]
+        {
+            real_git_bash(self)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn windows_prepare(
+        &self,
+        _root: &Path,
+        _gitconfig: &Path,
+        _read_dirs: &[PathBuf],
+    ) -> Result<u32, Refusal> {
+        #[cfg(windows)]
+        {
+            real_windows_prepare(self, _root, _gitconfig, _read_dirs)
+        }
+        #[cfg(not(windows))]
+        {
+            Err(Refusal::NotPrepared)
+        }
+    }
+}
+
+/// The real Windows session-start preparation: check the slot is live and the
+/// tree granted, re-stamp protected names, keep the gitconfig ACE, and sync
+/// the `read-dirs` group grants.
+#[cfg(windows)]
+fn real_windows_prepare(
+    probe: &dyn Probe,
+    root: &Path,
+    gitconfig: &Path,
+    read_dirs: &[PathBuf],
+) -> Result<u32, Refusal> {
+    use super::win;
+    let home = probe.home().ok_or(Refusal::NoHome)?;
+    let home = probe.canonical(&home).unwrap_or(home);
+    let win_dir = win::win_dir(&home);
+    let mark = win::read_mark().ok_or(Refusal::SandboxNotInstalled)?;
+    let root_str = root.to_string_lossy().to_string();
+    let slot = win::slots::active_slot(&win_dir, &root_str)
+        .map_err(|_| Refusal::NotPrepared)?
+        .ok_or(Refusal::NotPrepared)?;
+    let slot_sid = mark.slot_sid(slot).ok_or(Refusal::NotPrepared)?;
+    if !win::acl::has_ace(root, slot_sid) {
+        return Err(Refusal::NotPrepared);
+    }
+    let _ = win::acl::stamp_protected(root, slot_sid, false);
+    if !win::acl::has_ace(gitconfig, slot_sid) {
+        let _ = win::acl::grant_file(gitconfig, slot_sid, win::acl::FILE_READ);
+    }
+    // Sync the read-dir group grants under the slots lock.
+    let desired: Vec<String> = read_dirs
+        .iter()
+        .map(|d| d.to_string_lossy().to_string())
+        .collect();
+    if let Ok(previous) = win::slots::read_dirs(&win_dir) {
+        for dir in &desired {
+            if !previous.iter().any(|p| p.eq_ignore_ascii_case(dir)) {
+                let _ = win::acl::grant_tree_read(Path::new(dir), &mark.group_sid);
+            }
+        }
+        for dir in &previous {
+            if !desired.iter().any(|d| d.eq_ignore_ascii_case(dir)) {
+                let _ = win::acl::revoke_tree_read(Path::new(dir), &mark.group_sid);
+            }
+        }
+        let _ = win::slots::set_read_dirs(&win_dir, &desired);
+    }
+    Ok(slot)
+}
+
+/// Git Bash the way Claude Code finds it: `CLAUDE_CODE_GIT_BASH_PATH` when it
+/// names an existing `bash.exe`/`sh.exe`, else from `git.exe` on `PATH` (the
+/// Git root is the parent of its `cmd` or `bin` directory, then `<root>\bin\
+/// bash.exe`). Never `%SystemRoot%\System32\bash.exe` (that runs WSL).
+#[cfg(windows)]
+fn real_git_bash(probe: &dyn Probe) -> Option<PathBuf> {
+    let under_system = |path: &Path| {
+        probe
+            .var("SystemRoot")
+            .map(PathBuf::from)
+            .and_then(|root| probe.canonical(&root))
+            .is_some_and(|root| {
+                probe
+                    .canonical(path)
+                    .is_some_and(|resolved| paths::within(&root, &resolved))
+            })
+    };
+    let named = |name: &Path| {
+        name.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("bash.exe") || n.eq_ignore_ascii_case("sh.exe"))
+    };
+    if let Some(configured) = probe
+        .var("CLAUDE_CODE_GIT_BASH_PATH")
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        && probe.exists(&configured)
+        && named(&configured)
+        && !under_system(&configured)
+    {
+        return Some(configured);
+    }
+    let git = probe.which("git.exe")?;
+    let git = probe.canonical(&git).unwrap_or(git);
+    // <root>\cmd\git.exe or <root>\bin\git.exe -> <root>\bin\bash.exe.
+    let root = git.parent()?.parent()?;
+    let bash = root.join("bin").join("bash.exe");
+    (probe.exists(&bash) && !under_system(&bash)).then_some(bash)
 }
 
 /// Why a folder of this device cannot be sandboxed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    WindowsNotYet,
     UnsupportedOs,
+    /// Windows: `cctg sandbox-install` has not run on this device.
+    SandboxNotInstalled,
+    /// Windows: the install is of an older schema; re-run `sandbox-install`.
+    SandboxOutdated,
+    /// Windows: another Windows user installed the sandbox on this machine.
+    SandboxOtherOwner,
+    /// Windows: no Git Bash outside the profile (or in `read-dirs`).
+    NoGitBash,
+    /// Windows: every slot account is taken; the count is `N`.
+    NoFreeSlot(u32),
+    /// Windows: the folder has no live slot or ACE; run `cctg sandbox on`.
+    NotPrepared,
     NoHome,
     BadFolder(FolderProblem),
     /// The version claude reported (`X.Y.Z`), if it reported one.
@@ -223,13 +419,40 @@ pub enum FolderProblem {
     Home,
     /// In or above `~/.cctg`, claude's config dir or cctg's state dir.
     Private,
+    /// Windows: outside `%USERPROFILE%`, where neighbours are world-open.
+    OutsideProfile,
+    /// Windows: an ancestor is open to other accounts of the machine.
+    SharedParent,
+    /// Windows: inside or above another marked folder (one slot per tree).
+    Nested,
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WindowsNotYet => f.write_str("на Windows сэндбокс появится в следующей задаче"),
-            Self::UnsupportedOs => f.write_str("сэндбокс работает только на Linux и macOS"),
+            Self::UnsupportedOs => f.write_str("сэндбокс работает на Linux, macOS и Windows"),
+            Self::SandboxNotInstalled => f.write_str(
+                "сэндбокс на этом устройстве не установлен: выполните cctg sandbox-install \
+                 (один запрос UAC)",
+            ),
+            Self::SandboxOutdated => {
+                f.write_str("установка сэндбокса устарела: выполните cctg sandbox-install")
+            }
+            Self::SandboxOtherOwner => {
+                f.write_str("сэндбокс на этом компьютере установлен другим пользователем Windows")
+            }
+            Self::NoGitBash => f.write_str(
+                "нужен Git Bash (Git for Windows) вне профиля пользователя или в \
+                 ~/.cctg/sandbox/read-dirs",
+            ),
+            Self::NoFreeSlot(n) => write!(
+                f,
+                "все {n} учёток сэндбокса заняты помеченными папками: снимите метку с ненужной \
+                 или выполните cctg sandbox-install --slots M"
+            ),
+            Self::NotPrepared => f.write_str(
+                "папка не подготовлена для сэндбокса: выполните в ней cctg sandbox on ещё раз",
+            ),
             Self::NoHome => f.write_str("не найден домашний каталог (HOME)"),
             Self::BadFolder(problem) => write!(f, "эту папку нельзя запереть: {problem}"),
             Self::ClaudeTooOld(found) => {
@@ -285,6 +508,12 @@ impl fmt::Display for FolderProblem {
             Self::Root => "это корень диска",
             Self::Home => "это домашний каталог или каталог над ним",
             Self::Private => "это служебный каталог cctg или claude",
+            Self::OutsideProfile => {
+                "папка вне профиля пользователя: на Windows соседние папки там открыты любой \
+                 учётной записи"
+            }
+            Self::SharedParent => "каталог над папкой открыт другим учётным записям компьютера",
+            Self::Nested => "папка внутри или над другой помеченной папкой",
         })
     }
 }
@@ -321,19 +550,34 @@ pub fn device(probe: &dyn Probe) -> Result<Ready, Refusal> {
 }
 
 /// The installed `claude-cctg` asks `cctg sandbox-check`: an older one would
-/// start claude without the sandbox. For `cctg sandbox on` and doctor.
+/// start claude without the sandbox. For `cctg sandbox on` and doctor. On
+/// Windows the `.cmd` wrapper (used from cmd/PowerShell) and the shell-prefix
+/// shim must be the new ones too.
 pub fn wrapper(probe: &dyn Probe) -> Result<(), Refusal> {
     let home = probe.home().ok_or(Refusal::NoHome)?;
     match probe.read(&home.join(WRAPPER)) {
-        Ok(text) if text.contains("sandbox-check") => Ok(()),
-        _ => Err(Refusal::OldWrapper),
+        Ok(text) if text.contains("sandbox-check") => {}
+        _ => return Err(Refusal::OldWrapper),
     }
+    if probe.os() == Os::Windows {
+        let cmd = match probe.read(&home.join(WRAPPER).with_extension("cmd")) {
+            Ok(text) => text,
+            Err(_) => return Err(Refusal::OldWrapper),
+        };
+        if !cmd.contains("sandbox-check") || !cmd.contains("--cmd") {
+            return Err(Refusal::OldWrapper);
+        }
+        match probe.read(&super::win_shim_path(&home)) {
+            Ok(text) if text.contains("sandbox-exec") => {}
+            _ => return Err(Refusal::OldWrapper),
+        }
+    }
+    Ok(())
 }
 
 fn os(probe: &dyn Probe) -> Result<(), Refusal> {
     match probe.os() {
-        Os::Linux | Os::MacOs => Ok(()),
-        Os::Windows => Err(Refusal::WindowsNotYet),
+        Os::Linux | Os::MacOs | Os::Windows => Ok(()),
         Os::Other => Err(Refusal::UnsupportedOs),
     }
 }
@@ -369,6 +613,18 @@ fn check_folder(probe: &dyn Probe, folder: &Path) -> Result<(), Refusal> {
         .any(|dir| related(dir, folder))
     {
         return bad(FolderProblem::Private);
+    }
+    if probe.os() == Os::Windows {
+        // The folder must lie strictly inside the profile: outside it,
+        // neighbours are open to any account (icacls of C:\ grants Users and
+        // Authenticated Users on new folders). The Home problem above already
+        // caught the folder being the profile or above it.
+        if !paths::within(&home, folder) {
+            return bad(FolderProblem::OutsideProfile);
+        }
+        if probe.shared_ancestor(folder, &home).is_some() {
+            return bad(FolderProblem::SharedParent);
+        }
     }
     Ok(())
 }
@@ -442,8 +698,54 @@ fn os_tools(probe: &dyn Probe) -> Result<(), Refusal> {
         }
         Os::MacOs if probe.exists(Path::new(SANDBOX_EXEC)) => Ok(()),
         Os::MacOs => Err(Refusal::MissingTool("sandbox-exec")),
-        Os::Windows | Os::Other => os(probe),
+        Os::Windows => windows_tools(probe),
+        Os::Other => os(probe),
     }
+}
+
+/// Windows tool checks: the sandbox must be installed, of this schema and this
+/// user, with a Git Bash outside the profile (or in `read-dirs`).
+fn windows_tools(probe: &dyn Probe) -> Result<(), Refusal> {
+    let installed = probe
+        .sandbox_install()
+        .ok_or(Refusal::SandboxNotInstalled)?;
+    if installed.version != super::SETUP_VERSION {
+        return Err(Refusal::SandboxOutdated);
+    }
+    if !installed.owner_is_me {
+        return Err(Refusal::SandboxOtherOwner);
+    }
+    let bash = probe.git_bash().ok_or(Refusal::NoGitBash)?;
+    let home = probe.home().ok_or(Refusal::NoHome)?;
+    let home = probe.canonical(&home).unwrap_or(home);
+    let bash_resolved = probe.canonical(&bash).unwrap_or(bash);
+    if paths::within(&home, &bash_resolved) && !read_dir_covers(probe, &home, &bash_resolved) {
+        return Err(Refusal::NoGitBash);
+    }
+    Ok(())
+}
+
+/// Whether a directory in `~/.cctg/sandbox/read-dirs` (resolved leniently)
+/// contains `path`. For a Git Bash that lives under the profile.
+fn read_dir_covers(probe: &dyn Probe, home: &Path, path: &Path) -> bool {
+    let text = match probe.read(&super::sandbox_home(home).join("read-dirs")) {
+        Ok(text) => text,
+        Err(_) => return false,
+    };
+    text.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        let dir = match line.strip_prefix('~') {
+            Some("") => home.to_path_buf(),
+            Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
+            _ => PathBuf::from(line),
+        };
+        probe
+            .canonical(&dir)
+            .is_some_and(|dir| paths::within(&dir, path))
+    })
 }
 
 /// Arrays of the user's settings merge with the profile and `--settings`
@@ -549,6 +851,14 @@ pub(crate) mod tests {
         pub files: HashMap<PathBuf, String>,
         pub unreadable: Vec<PathBuf>,
         pub claude_temp: Option<(String, Vec<String>)>,
+        /// Windows: the install mark the checks see.
+        pub installed: Option<Installed>,
+        /// Windows: a shared ancestor of a folder, if the test sets one.
+        pub shared_parent: Option<PathBuf>,
+        /// Windows: the Git Bash path.
+        pub git_bash: Option<PathBuf>,
+        /// Windows: the slot `windows_prepare` returns.
+        pub win_slot: u32,
     }
 
     impl Fake {
@@ -563,12 +873,49 @@ pub(crate) mod tests {
                 files: HashMap::new(),
                 unreadable: Vec::new(),
                 claude_temp: None,
+                installed: None,
+                shared_parent: None,
+                git_bash: None,
+                win_slot: 1,
             };
             fake.answer("claude", 0, "2.1.284 (Claude Code)\n");
             fake.answer("bwrap", 0, "");
             fake.files.insert(
                 home.join(WRAPPER),
                 "#!/bin/sh\np=$(cctg sandbox-check --settings s)\n".to_owned(),
+            );
+            fake
+        }
+
+        /// A Windows device that can sandbox: installed, ours, with a Git Bash
+        /// outside the profile and the wrapper/shim in place.
+        pub(crate) fn windows(home: &Path) -> Self {
+            let mut fake = Self::linux(home);
+            fake.os = Os::Windows;
+            fake.tools.clear();
+            fake.runs.remove("bwrap");
+            fake.installed = Some(Installed {
+                version: super::super::SETUP_VERSION,
+                slots: 8,
+                owner_is_me: true,
+            });
+            let bash = home
+                .parent()
+                .unwrap()
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            std::fs::create_dir_all(bash.parent().unwrap()).unwrap();
+            std::fs::write(&bash, b"").unwrap();
+            fake.git_bash = Some(bash);
+            // The wrapper (sh + cmd) and the shim carry the new markers.
+            fake.files.insert(
+                home.join(WRAPPER).with_extension("cmd"),
+                "sandbox-check --settings s --cmd\n".to_owned(),
+            );
+            fake.files.insert(
+                super::super::win_shim_path(home),
+                "cctg sandbox-exec \"$@\"\n".to_owned(),
             );
             fake
         }
@@ -625,6 +972,23 @@ pub(crate) mod tests {
         fn claude_temp(&self) -> Option<(String, Vec<String>)> {
             self.claude_temp.clone()
         }
+        fn sandbox_install(&self) -> Option<Installed> {
+            self.installed
+        }
+        fn shared_ancestor(&self, _folder: &Path, _home: &Path) -> Option<PathBuf> {
+            self.shared_parent.clone()
+        }
+        fn git_bash(&self) -> Option<PathBuf> {
+            self.git_bash.clone()
+        }
+        fn windows_prepare(
+            &self,
+            _root: &Path,
+            _gitconfig: &Path,
+            _read_dirs: &[PathBuf],
+        ) -> Result<u32, Refusal> {
+            Ok(self.win_slot)
+        }
     }
 
     /// A canonical home with a project folder in it.
@@ -665,15 +1029,93 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn other_systems_are_refused_first() {
+    fn an_unsupported_system_is_refused_first() {
         let (_dir, home, folder) = home_and_folder("preflight-os");
         let mut fake = Fake::linux(&home);
-        fake.os = Os::Windows;
-        assert_eq!(check(&fake, &folder), Err(Refusal::WindowsNotYet));
-        assert_eq!(device(&fake), Err(Refusal::WindowsNotYet));
-        assert!(Refusal::WindowsNotYet.to_string().contains("Windows"));
         fake.os = Os::Other;
         assert_eq!(check(&fake, &folder), Err(Refusal::UnsupportedOs));
+        assert!(Refusal::UnsupportedOs.to_string().contains("Windows"));
+    }
+
+    /// Windows: not installed -> SandboxNotInstalled; old schema, other owner
+    /// and no Git Bash each surface; everything present -> Ready.
+    #[test]
+    fn windows_checks_the_install_and_git_bash() {
+        let (_dir, home, folder) = home_and_folder("preflight-win");
+        // Not installed.
+        let mut bare = Fake::windows(&home);
+        bare.installed = None;
+        assert_eq!(check(&bare, &folder), Err(Refusal::SandboxNotInstalled));
+        // Outdated schema.
+        let mut old = Fake::windows(&home);
+        old.installed = Some(Installed {
+            version: super::super::SETUP_VERSION + 1,
+            slots: 8,
+            owner_is_me: true,
+        });
+        assert_eq!(check(&old, &folder), Err(Refusal::SandboxOutdated));
+        // Another owner.
+        let mut other = Fake::windows(&home);
+        other.installed = Some(Installed {
+            version: super::super::SETUP_VERSION,
+            slots: 8,
+            owner_is_me: false,
+        });
+        assert_eq!(check(&other, &folder), Err(Refusal::SandboxOtherOwner));
+        // No Git Bash.
+        let mut no_bash = Fake::windows(&home);
+        no_bash.git_bash = None;
+        assert_eq!(check(&no_bash, &folder), Err(Refusal::NoGitBash));
+        // Everything present.
+        let ready = Fake::windows(&home);
+        assert!(
+            check(&ready, &folder).is_ok(),
+            "{:?}",
+            check(&ready, &folder)
+        );
+        assert_eq!(wrapper(&ready), Ok(()));
+    }
+
+    /// Windows: a folder outside the profile, and one with a shared ancestor.
+    #[test]
+    fn windows_refuses_folders_outside_the_profile_or_shared() {
+        let dir = TempDir::new("preflight-win-folder");
+        let base = paths::canonical(dir.path()).unwrap();
+        let home = base.join("home");
+        let folder = home.join("proj");
+        std::fs::create_dir_all(&folder).unwrap();
+        let outside = base.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        let fake = Fake::windows(&home);
+        assert_eq!(
+            check(&fake, &outside),
+            Err(Refusal::BadFolder(FolderProblem::OutsideProfile))
+        );
+        let mut shared = Fake::windows(&home);
+        shared.shared_parent = Some(home.clone());
+        assert_eq!(
+            check(&shared, &folder),
+            Err(Refusal::BadFolder(FolderProblem::SharedParent))
+        );
+    }
+
+    /// Windows: the `.cmd` wrapper and the shim must be current too.
+    #[test]
+    fn windows_wrapper_checks_the_cmd_and_shim() {
+        let (_dir, home, folder) = home_and_folder("preflight-win-wrapper");
+        let mut fake = Fake::windows(&home);
+        assert!(check(&fake, &folder).is_ok());
+        assert_eq!(wrapper(&fake), Ok(()));
+        // An old .cmd without --cmd.
+        fake.files.insert(
+            home.join(WRAPPER).with_extension("cmd"),
+            "run -- ...\n".to_owned(),
+        );
+        assert_eq!(wrapper(&fake), Err(Refusal::OldWrapper));
+        // The shim missing.
+        let mut no_shim = Fake::windows(&home);
+        no_shim.files.remove(&super::super::win_shim_path(&home));
+        assert_eq!(wrapper(&no_shim), Err(Refusal::OldWrapper));
     }
 
     #[test]

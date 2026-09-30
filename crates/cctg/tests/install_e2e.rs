@@ -534,10 +534,30 @@ fn install_update_and_uninstall_a_device() {
         "#!/bin/sh\necho handmade\n"
     );
     if cfg!(windows) {
+        // The .cmd wrapper is fail closed (TASK-089): it asks sandbox-check
+        // --cmd and starts claude only for a profile or an unmarked folder.
         let cmd = std::fs::read_to_string(run.wrapper().with_file_name("claude-cctg.cmd")).unwrap();
         assert!(
             cmd.starts_with("@echo off\r\n") && cmd.contains("%*\r\n"),
             "{cmd}"
+        );
+        assert!(cmd.contains("sandbox-check --settings "), "{cmd}");
+        assert!(cmd.contains(" --cmd`"), "{cmd}");
+        assert!(cmd.contains("exit /b 1\r\n"), "{cmd}");
+        assert!(
+            cmd.contains(":normal\r\n") && cmd.contains(":sandboxed\r\n"),
+            "{cmd}"
+        );
+        let flags = cctg::sandbox::profile::FLAGS.join(" ");
+        assert!(cmd.contains(&flags), "{flags}\n{cmd}");
+        // The shell-prefix shim runs cctg sandbox-exec without exec.
+        let shim = std::fs::read_to_string(run.cctg_dir().join("bin").join("cctg-sandbox-exec"))
+            .expect("the shim is written");
+        assert!(shim.contains("sandbox-exec \"$1\""), "{shim}");
+        assert!(shim.contains("MSYS_NO_PATHCONV=1"), "{shim}");
+        assert!(
+            !shim.lines().any(|l| l.trim_start().starts_with("exec ")),
+            "no exec statement in the shim: {shim}"
         );
     }
     #[cfg(unix)]
