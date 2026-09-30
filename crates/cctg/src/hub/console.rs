@@ -20,9 +20,11 @@
 //! ([`crate::wire::Register::console_commands`]), when the text is not
 //! one short plain line ([`crate::keys::typable`]; the answer names the rule,
 //! TASK-084), when it is longer than the agent of the session types (an
-//! agent older than the hub, [`OLD_AGENT_LINE_CHARS`]), and when the agent finds
+//! agent older than the hub, [`OLD_AGENT_LINE_CHARS`]), when the agent finds
 //! the terminal showing the agent view or a working background agent
-//! (TASK-047).
+//! (TASK-047), and when the session's folder is in sandbox mode and the line
+//! is a `!` command or a slash command that could lead out of the folder
+//! (TASK-087, [`REFUSED_NOTICE`]; the answer does not say "sandbox").
 
 use std::time::Duration;
 
@@ -87,6 +89,10 @@ pub const WAITING_NOTICE: &str =
 pub const DRAFT_NOTICE: &str =
     "В поле ввода терминала есть неотправленный текст: команда не набрана.";
 pub const FAILED_NOTICE: &str = "Не получилось набрать команду в терминале сессии.";
+/// The agent refused the line: the session folder is in sandbox mode
+/// (TASK-087). Neutral on purpose: the mode is not shown in topics.
+pub const REFUSED_NOTICE: &str =
+    "Команда для терминала не набрана: в этой папке такие команды отключены настройками папки.";
 /// The terminal shows the agent view or a working background agent
 /// ([`crate::keys::agents_block`], TASK-047).
 pub const AGENTS_NOTICE: &str = "В терминале открыт вид субагента или работают фоновые агенты: команда не набрана. Повторите, когда они закончат (или вернитесь к main в терминале).";

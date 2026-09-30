@@ -9742,6 +9742,9 @@ impl Slots {
             CommandOutcome::AgentsRunning => {
                 self.answer_command(ask.place, ask.message_id, console::AGENTS_NOTICE);
             }
+            CommandOutcome::Refused => {
+                self.answer_command(ask.place, ask.message_id, console::REFUSED_NOTICE);
+            }
             CommandOutcome::Failed | CommandOutcome::Other => {
                 self.answer_command(ask.place, ask.message_id, console::FAILED_NOTICE);
             }
@@ -26222,6 +26225,23 @@ again"
             1,
             "nothing more answered"
         );
+    }
+
+    /// TASK-087: an agent in a sandboxed folder refuses the line; the topic
+    /// gets the neutral notice, never the word "sandbox".
+    #[tokio::test]
+    async fn a_refused_command_is_answered_with_the_neutral_notice() {
+        let dir = TempDir::new("slots-console-refused");
+        let (fake, mut slots, mut from_hub) = console_slots(&dir, true);
+        slots.on_topic_message(topic_text(41, "!cat ~/marker", false));
+        let (refused, _) = command_of(from_hub.try_recv().ok());
+        slots.on_command_typed(1, A, refused, CommandOutcome::Refused, None);
+        assert_eq!(
+            command_replies(&fake, 1).await,
+            [(41, console::REFUSED_NOTICE.to_owned())]
+        );
+        assert!(!console::REFUSED_NOTICE.to_lowercase().contains("сэндбокс"));
+        assert!(!console::REFUSED_NOTICE.to_lowercase().contains("sandbox"));
     }
 
     #[tokio::test]

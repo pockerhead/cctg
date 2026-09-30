@@ -427,6 +427,7 @@ fn os_tools(probe: &dyn Probe) -> Result<(), Refusal> {
 /// WSL2 with interop on: `cmd.exe` from inside the sandbox runs in Windows,
 /// outside any sandbox (docs sandboxing). Probe P10 decides whether this
 /// stays.
+// probe P10: drop this check if `cmd.exe /c ver` is refused inside the sandbox.
 fn wsl_interop(probe: &dyn Probe) -> Result<(), Refusal> {
     match probe.read(Path::new(WSL_INTEROP)) {
         Ok(text) if text.lines().next().map(str::trim) == Some("enabled") => {

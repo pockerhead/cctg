@@ -276,6 +276,7 @@ impl Claude {
             project: None,
             work: Some(work.to_owned()),
             claude: None,
+            sandbox: None,
         };
         tokio::spawn(agent::serve_channel(
             frames_rx,

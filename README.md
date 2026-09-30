@@ -79,6 +79,10 @@ claude-cctg
 
 Все аргументы `claude` работают так же (`claude-cctg --resume`, `claude-cctg "почини тест"`). Claude Code при старте спрашивает про development channels: выберите пункт 1. В Windows в обычной консоли (PowerShell, cmd, Windows Terminal), на Linux и macOS в терминале cctg нажимает за вас; в окне Git Bash (mintty) нет, поэтому сессии в Windows лучше запускать из PowerShell или cmd.
 
+### Сэндбокс папки (Linux, macOS)
+
+`~/.cctg/bin/cctg sandbox on` в папке проекта: сессии `claude-cctg` в ней и во вложенных папках не читают и не пишут ничего вне папки (команды, скрипты, которые пишет модель, файловые инструменты, `send_file`, `!` и опасные слеш-команды из Telegram). Выключить: `cctg sandbox off`, состояние: `cctg sandbox status`. На Windows пока недоступно. Что закрыто, что нет и что для этого нужно на машине: `docs/sandbox.md`.
+
 ## Что видно в Telegram
 
 - Тема `[машина] папка · название сессии`. Иконка показывает, жива сессия, ждёт ли разрешения.

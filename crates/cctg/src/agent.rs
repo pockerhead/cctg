@@ -92,6 +92,7 @@ use crate::hook::PostError;
 use crate::keys::{self, Typed};
 use crate::proctree;
 use crate::reads;
+use crate::sandbox::{self, Guard};
 use crate::shim;
 use crate::spool;
 use crate::statusfile;
@@ -748,6 +749,11 @@ pub struct Dirs {
     /// history (TASK-077, [`compress::program`]); `None`: no compression,
     /// every such ask is answered `unreadable`.
     pub claude: Option<PathBuf>,
+    /// Sandbox mode of the session folder (TASK-087): `!` lines and slash
+    /// commands that widen the boundary are not typed, `send_file` reads only
+    /// inside the folder, files from the topic stay in the folder. `None`:
+    /// never sandboxed (tests).
+    pub sandbox: Option<Arc<Guard>>,
 }
 
 /// Runs the worker agent (`cctg agent-worker`, started by the shim) until
@@ -781,6 +787,11 @@ pub async fn run_stdio() -> i32 {
             debug!("CCTG_RUN is not this claude's parent; no restarts");
             worker.run_pid = None;
         }
+    }
+    // The sandbox mark of this folder (TASK-087): without CLAUDE_PROJECT_DIR
+    // the folder claude started the agent in.
+    if worker.folder.is_none() {
+        worker.folder = Some(PathBuf::from(device::canonical_cwd(&current_dir())));
     }
     worker.console = console_target(claude_pid, worker.run_pid, worker.state_dir.clone()).await;
     let console = worker.console.clone().map(|target| {
@@ -883,6 +894,7 @@ pub async fn run_stdio() -> i32 {
         claude: Some(compress::program(&|name| std::env::var_os(name), &|path| {
             path.is_file()
         })),
+        sandbox: Some(Arc::new(Guard::from_env())),
     };
     let worker = Some(Arc::new(worker));
     let ended = serve_channel(
@@ -1102,7 +1114,7 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
         Hub::Link(outbox) => (
             Some(spawn_reader(outbox.clone(), dirs.project.clone())),
             Some(spawn_session_reader(outbox.clone(), dirs.project.clone())),
-            Some(spawn_console(outbox.clone(), console)),
+            Some(spawn_console(outbox.clone(), console, dirs.sandbox.clone())),
             Some(outbox.clone()),
         ),
         Hub::Off(_) => (None, None, None, None),
@@ -1112,7 +1124,7 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
     let (hub_albums, albums) = watch::channel(false);
     let mut sender = outbox
         .clone()
-        .map(|outbox| spawn_sender(outbox, dirs.work.clone(), albums));
+        .map(|outbox| spawn_sender(outbox, dirs.work.clone(), dirs.sandbox.clone(), albums));
     let mut server = channel::Server::new(hub);
     if worker.as_ref().is_some_and(|worker| worker.resumed) {
         server = server.initialized();
@@ -1375,7 +1387,7 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
                         };
                         if incoming.assembly.is_complete() {
                             inbox = None;
-                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone())));
+                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone(), dirs.sandbox.clone())));
                             Vec::new()
                         } else {
                             inbox = Some(incoming);
@@ -1386,7 +1398,7 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
                 Some(LinkEvent::Message(HubMsg::FileChunk(chunk))) => {
                     match receive(&mut inbox, &chunk) {
                         Some(incoming) => {
-                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone())));
+                            saving = Some(tokio::spawn(deliver(incoming, dirs.work.clone(), dirs.sandbox.clone())));
                             Vec::new()
                         }
                         None => Vec::new(),
@@ -1598,7 +1610,7 @@ fn receive(inbox: &mut Option<Incoming>, chunk: &FileChunk) -> Option<Incoming> 
 /// Saves a complete file from the topic and makes the message Claude reads:
 /// where the file is, then the words that came with it; meta `file_kind`,
 /// `file_size` and, when it was saved, `file_path`.
-async fn deliver(incoming: Incoming, work: Option<PathBuf>) -> HubMsg {
+async fn deliver(incoming: Incoming, work: Option<PathBuf>, sandbox: Option<Arc<Guard>>) -> HubMsg {
     let Incoming {
         name,
         kind,
@@ -1611,7 +1623,8 @@ async fn deliver(incoming: Incoming, work: Option<PathBuf>) -> HubMsg {
     let name = files::clean_name(&name, kind.as_str());
     let bytes = assembly.into_bytes();
     let saved = tokio::task::spawn_blocking(move || {
-        files::save(work.as_deref(), &name, &bytes, SystemTime::now()).ok()
+        let sandboxed = sandbox.is_some_and(|guard| guard.on());
+        files::save(work.as_deref(), &name, &bytes, SystemTime::now(), sandboxed).ok()
     })
     .await
     .ok()
@@ -1714,6 +1727,7 @@ fn start_upload(sender: Option<&Sender>, hub_files: bool, call: FileCall) -> Opt
 fn spawn_sender(
     outbox: mpsc::Sender<AgentMsg>,
     work: Option<PathBuf>,
+    sandbox: Option<Arc<Guard>>,
     albums: watch::Receiver<bool>,
 ) -> Sender {
     let (calls, mut pending) = mpsc::channel::<FileCall>(UPLOADS);
@@ -1721,8 +1735,15 @@ fn spawn_sender(
     let (answer, answers) = mpsc::channel(UPLOADS + 1);
     tokio::spawn(async move {
         while let Some(call) = pending.recv().await {
-            let (text, is_error) =
-                upload(&call, &albums, &outbox, &mut uploads, work.as_deref()).await;
+            let (text, is_error) = upload(
+                &call,
+                &albums,
+                &outbox,
+                &mut uploads,
+                work.as_deref(),
+                sandbox.as_ref(),
+            )
+            .await;
             if answer
                 .send(channel::tool_answer(&call.id, &text, is_error))
                 .await
@@ -1808,25 +1829,66 @@ struct Readable {
     bytes: Vec<u8>,
 }
 
+/// Why a sandboxed session's `send_file` read nothing (TASK-087).
+pub const OUTSIDE_FOLDER: &str =
+    "in this folder send_file sends only files inside the session folder";
+
 /// Reads `path` (relative to `work` when relative) as [`files::read_upload`]
-/// does; the error is a clause for the tool answer.
-async fn read_file(path: &str, work: Option<&Path>) -> Result<Readable, String> {
-    let path = match (Path::new(path), work) {
-        (path, Some(work)) if path.is_relative() => work.join(path),
-        (path, _) => path.to_owned(),
-    };
+/// does; the error is a clause for the tool answer. In a sandboxed folder
+/// only a file inside it is read ([`read_confined`]), a relative path starts
+/// at the folder.
+async fn read_file(
+    path: &str,
+    work: Option<&Path>,
+    sandbox: Option<&Arc<Guard>>,
+) -> Result<Readable, String> {
+    let given = PathBuf::from(path);
     let name = files::clean_name(
-        &path
+        &given
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default(),
         "file",
     );
-    match tokio::task::spawn_blocking(move || files::read_upload(&path)).await {
+    let work = work.map(Path::to_path_buf);
+    let guard = sandbox.cloned();
+    let read = tokio::task::spawn_blocking(move || match guard.filter(|guard| guard.on()) {
+        Some(guard) => {
+            let path = if given.is_relative() {
+                guard.root.join(&given)
+            } else {
+                given
+            };
+            read_confined(&guard.root, &path)
+        }
+        None => {
+            let path = match work {
+                Some(work) if given.is_relative() => work.join(&given),
+                _ => given,
+            };
+            files::read_upload(&path).map_err(|error| error.to_string())
+        }
+    });
+    match read.await {
         Ok(Ok(bytes)) => Ok(Readable { name, bytes }),
-        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err("the file could not be read".to_owned()),
     }
+}
+
+/// A sandboxed session's `send_file`: only a file that
+/// [`sandbox::paths::open_inside`] opens in `root`, read from that handle.
+#[cfg(unix)]
+fn read_confined(root: &Path, path: &Path) -> Result<Vec<u8>, String> {
+    let file = sandbox::paths::open_inside(root, path).ok_or_else(|| OUTSIDE_FOLDER.to_owned())?;
+    files::read_upload_from(file).map_err(|error| error.to_string())
+}
+
+/// No sandbox on Windows yet (TASK-087 part C): a sandboxed session (a
+/// hand-set `CCTG_SANDBOX=1`) sends nothing rather than anything.
+#[cfg(not(unix))]
+fn read_confined(_root: &Path, _path: &Path) -> Result<Vec<u8>, String> {
+    Err(OUTSIDE_FOLDER.to_owned())
 }
 
 /// What came of one transfer.
@@ -1938,11 +2000,12 @@ async fn upload(
     outbox: &mpsc::Sender<AgentMsg>,
     uploads: &mut mpsc::UnboundedReceiver<Upload>,
     work: Option<&Path>,
+    sandbox: Option<&Arc<Guard>>,
 ) -> (String, bool) {
     let [path] = call.paths.as_slice() else {
-        return upload_several(call, albums, outbox, uploads, work).await;
+        return upload_several(call, albums, outbox, uploads, work, sandbox).await;
     };
-    let file = match read_file(path, work).await {
+    let file = match read_file(path, work, sandbox).await {
         Ok(file) => file,
         Err(error) => return (format!("Nothing was sent: {error}."), true),
     };
@@ -1976,13 +2039,14 @@ async fn upload_several(
     outbox: &mpsc::Sender<AgentMsg>,
     uploads: &mut mpsc::UnboundedReceiver<Upload>,
     work: Option<&Path>,
+    sandbox: Option<&Arc<Guard>>,
 ) -> (String, bool) {
     let mut results = vec![String::new(); call.paths.len()];
     let mut caption = call.caption.clone();
     let mut one_by_one = false;
     let mut group: Vec<(usize, Readable)> = Vec::new();
     for (index, path) in call.paths.iter().enumerate() {
-        let file = match read_file(path, work).await {
+        let file = match read_file(path, work, sandbox).await {
             Ok(file) => file,
             Err(error) => {
                 results[index] = format!("not sent: {error}");
@@ -2215,10 +2279,14 @@ enum ConsoleJob {
 /// The one worker that presses console keys and types commands off the
 /// loop, one at a time (a console is attached per process), and answers
 /// each with `console_key_written` or `console_command_typed`. A line that
-/// is not [`keys::typable`] is answered as failed without typing.
+/// is not [`keys::typable`] is answered as failed without typing. In a
+/// sandboxed folder a line the policy does not let through
+/// ([`sandbox::console::allowed`]) is answered `refused` without typing
+/// (TASK-087); keys are pressed as before.
 fn spawn_console(
     outbox: mpsc::Sender<AgentMsg>,
     console: Option<Console>,
+    sandbox: Option<Arc<Guard>>,
 ) -> mpsc::Sender<ConsoleJob> {
     let (requests, mut pending) = mpsc::channel::<ConsoleJob>(4);
     tokio::spawn(async move {
@@ -2237,6 +2305,16 @@ fn spawn_console(
                         warn!(?key, "console key not written");
                     }
                     AgentMsg::ConsoleKeyWritten { key_id, written }
+                }
+                ConsoleJob::Line(command_id, text)
+                    if console_refused(sandbox.clone(), &text).await =>
+                {
+                    info!("console command refused: the folder is sandboxed");
+                    AgentMsg::ConsoleCommandTyped {
+                        command_id,
+                        outcome: CommandOutcome::Refused,
+                        panel: None,
+                    }
                 }
                 ConsoleJob::Line(command_id, text) => {
                     let (typed, panel) = match console.clone().filter(|_| keys::typable(&text)) {
@@ -2267,6 +2345,20 @@ fn spawn_console(
         }
     });
     requests
+}
+
+/// The session is sandboxed and `line` may not be typed; blocking checks
+/// off the loop. A check that did not finish refuses.
+async fn console_refused(sandbox: Option<Arc<Guard>>, line: &str) -> bool {
+    let Some(guard) = sandbox else {
+        return false;
+    };
+    let line = line.to_owned();
+    tokio::task::spawn_blocking(move || {
+        guard.on() && !sandbox::console::allowed(&line, &sandbox::console::SkillIndex::from_env())
+    })
+    .await
+    .unwrap_or(true)
 }
 
 async fn recv_event(events: &mut Option<mpsc::Receiver<LinkEvent>>) -> Option<LinkEvent> {
@@ -3318,6 +3410,7 @@ mod tests {
             project: project.map(|folder| Arc::new(tail::OwnProject::at(folder))),
             work: None,
             claude: None,
+            sandbox: None,
         };
         tokio::spawn(serve_channel(
             frames_rx, ours, hub, events, dirs, None, None,
@@ -3931,6 +4024,94 @@ mod tests {
         assert_eq!(claude.recv().await["id"], 5);
     }
 
+    /// TASK-087: in a sandboxed folder `!` and widening slash commands are
+    /// answered `refused` and never typed; safe ones are typed; keys stay.
+    #[tokio::test]
+    async fn a_sandboxed_session_refuses_bang_and_widening_commands() {
+        let dir = crate::hub::testdir::TempDir::new("agent-console-sandbox");
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (outbox, events) = spawn(config(addr, Backoff::default()));
+        let typed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = typed.clone();
+        let typist: Typist = Arc::new(move |text: &str| {
+            seen.lock().unwrap().push(text.to_owned());
+            (Typed::Sent, None)
+        });
+        let console = Console {
+            press: Arc::new(|_| true),
+            type_line: typist,
+        };
+        let guard = Guard {
+            active: true,
+            root: dir.path().to_owned(),
+            marks_file: None,
+        };
+        let dirs = Dirs {
+            sandbox: Some(Arc::new(guard)),
+            ..Dirs::default()
+        };
+        let (_frames, frames_rx) = mpsc::channel(16);
+        let (ours, _theirs) = tokio::io::duplex(1 << 16);
+        tokio::spawn(serve_channel(
+            frames_rx,
+            ours,
+            Hub::Link(outbox),
+            Some(events),
+            dirs,
+            Some(console),
+            None,
+        ));
+        let (mut reader, mut write) = raw_hub(&listener).await;
+        let lines = [
+            (1, "!echo hi"),
+            (2, "/add-dir x"),
+            (3, "/compact"),
+            (4, "/config"),
+        ];
+        for (command_id, text) in lines {
+            let command = HubMsg::ConsoleCommand {
+                command_id,
+                text: text.into(),
+            };
+            wire::write_msg(&mut write, &command).await.unwrap();
+        }
+        for (command_id, outcome) in [
+            (1, CommandOutcome::Refused),
+            (2, CommandOutcome::Refused),
+            (3, CommandOutcome::Sent),
+            (4, CommandOutcome::Refused),
+        ] {
+            assert_eq!(
+                agent_line(&mut reader).await,
+                AgentMsg::ConsoleCommandTyped {
+                    command_id,
+                    outcome,
+                    panel: None,
+                }
+            );
+        }
+        assert_eq!(*typed.lock().unwrap(), ["/compact"]);
+        wire::write_msg(
+            &mut write,
+            &HubMsg::ConsoleKey {
+                key_id: 5,
+                key: ConsoleKey::Interrupt,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            agent_line(&mut reader).await,
+            AgentMsg::ConsoleKeyWritten {
+                key_id: 5,
+                written: true
+            }
+        );
+    }
+
     #[tokio::test]
     async fn without_a_presser_a_console_key_is_answered_as_failed() {
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -4004,6 +4185,11 @@ mod tests {
     /// Claude Code with the channel initialized, over a link to `addr`,
     /// keeping files in `work`.
     async fn claude_in(addr: SocketAddr, work: &Path) -> Claude {
+        claude_in_folder(addr, work, None).await
+    }
+
+    /// [`claude_in`] with the sandbox guard `sandbox`.
+    async fn claude_in_folder(addr: SocketAddr, work: &Path, sandbox: Option<Guard>) -> Claude {
         let backoff = Backoff {
             initial: Duration::from_millis(10),
             max: Duration::from_millis(20),
@@ -4015,6 +4201,7 @@ mod tests {
             project: None,
             work: Some(work.to_owned()),
             claude: None,
+            sandbox: sandbox.map(Arc::new),
         };
         tokio::spawn(serve_channel(
             frames_rx,
@@ -4195,6 +4382,94 @@ mod tests {
                 "after".to_owned()
             ]
         );
+    }
+
+    /// TASK-087: a sandboxed session's `send_file` offers only files inside
+    /// its folder (on Windows none: no sandbox there yet); anything else is a
+    /// tool error and the hub hears nothing of it.
+    #[tokio::test]
+    async fn a_sandboxed_send_file_stays_in_the_folder() {
+        let dir = crate::hub::testdir::TempDir::new("agent-send-sandbox");
+        let base = sandbox::paths::canonical(dir.path()).unwrap();
+        let root = base.join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("in.txt"), b"inside").unwrap();
+        std::fs::write(base.join("marker"), b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("marker"), root.join("link.txt")).unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let guard = Guard {
+            active: true,
+            root: root.clone(),
+            marks_file: None,
+        };
+        let mut claude = claude_in_folder(listener.local_addr().unwrap(), &root, Some(guard)).await;
+        let (mut reader, mut write) = raw_hub_files(&listener, true, false).await;
+        settle(&mut claude, &mut write).await;
+        let call = |id: u32, path: &str| {
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"send_file","arguments":{"path":path}}})
+            .to_string()
+        };
+        let outside = base.join("marker").to_string_lossy().into_owned();
+        let mut refused = vec![outside.as_str(), "../marker"];
+        if cfg!(unix) {
+            refused.push("link.txt");
+        } else {
+            refused.push("in.txt");
+        }
+        for (id, path) in (20..).zip(refused) {
+            claude.send(&call(id, path)).await;
+            let answer = claude.recv().await;
+            assert_eq!(answer["id"], id, "{answer}");
+            assert_eq!(answer["result"]["isError"], true, "{path}: {answer}");
+            let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(OUTSIDE_FOLDER), "{text}");
+            assert!(!text.contains("secret"));
+        }
+        if cfg!(unix) {
+            // A file of the folder goes: the first thing the hub hears.
+            claude.send(&call(30, "in.txt")).await;
+            let AgentMsg::FileOffer { name, size, .. } = agent_line(&mut reader).await else {
+                panic!("an offer");
+            };
+            assert_eq!((name.as_str(), size), ("in.txt", 6));
+        }
+    }
+
+    /// TASK-087: in a sandboxed folder a file from the topic is kept in the
+    /// folder's inbox and never follows a link out of it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sandboxed_inbox_is_not_followed_out_of_the_folder() {
+        let dir = crate::hub::testdir::TempDir::new("agent-inbox-sandbox");
+        let base = sandbox::paths::canonical(dir.path()).unwrap();
+        let root = base.join("proj");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join(".cctg")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".cctg").join("inbox")).unwrap();
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let guard = Guard {
+            active: true,
+            root: root.clone(),
+            marks_file: None,
+        };
+        let mut claude = claude_in_folder(listener.local_addr().unwrap(), &root, Some(guard)).await;
+        let (_reader, mut write) = raw_hub(&listener).await;
+        wire::write_msg(&mut write, &file_start(1, "x.png", 0))
+            .await
+            .unwrap();
+        let note = claude.recv().await;
+        assert!(note["params"]["meta"]["file_path"].is_null(), "{note}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let temp_inbox = std::env::temp_dir().join("cctg-inbox");
+        let date = files::date(SystemTime::now());
+        assert!(!temp_inbox.join(format!("{date}-x.png")).exists());
     }
 
     #[test]
@@ -4550,7 +4825,9 @@ mod tests {
         let (events, mut uploads) = mpsc::unbounded_channel();
         let albums = watch::channel(true).1;
         let sending =
-            tokio::spawn(async move { upload(&call, &albums, &outbox, &mut uploads, None).await });
+            tokio::spawn(
+                async move { upload(&call, &albums, &outbox, &mut uploads, None, None).await },
+            );
         let mut offers = Vec::new();
         for _ in 0..2 {
             let Some(AgentMsg::FileOffer {
@@ -4618,7 +4895,9 @@ mod tests {
         let (events, mut uploads) = mpsc::unbounded_channel();
         let albums = watch::channel(false).1;
         let sending =
-            tokio::spawn(async move { upload(&call, &albums, &outbox, &mut uploads, None).await });
+            tokio::spawn(
+                async move { upload(&call, &albums, &outbox, &mut uploads, None, None).await },
+            );
         let Some(AgentMsg::FileOffer { transfer_id, .. }) = link.recv().await else {
             panic!("an offer first");
         };

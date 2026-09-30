@@ -343,6 +343,59 @@ fn broken_input_and_missing_config_exit_zero_quietly() {
     );
 }
 
+/// TASK-087 step 6: a sandboxed session's SessionStart gives Bash the tool
+/// caches of its folder through `CLAUDE_ENV_FILE`; anything else leaves the
+/// file alone. The hook stays quiet and exits 0 either way.
+#[test]
+fn a_sandboxed_session_start_exports_the_caches_for_bash() {
+    let home = home("sandbox-env", None);
+    let folder = home.join("proj");
+    std::fs::create_dir_all(&folder).unwrap();
+    let env_file = home.join("claude-env.sh");
+    let start = |active: Option<&str>, folder: &Path| {
+        let _ = std::fs::remove_file(&env_file);
+        let mut command = common::cctg(&home);
+        command
+            .args(["hook", "SessionStart"])
+            .env("CLAUDE_ENV_FILE", &env_file)
+            .env("CLAUDE_PROJECT_DIR", folder)
+            .stdin(Stdio::null());
+        if let Some(active) = active {
+            command.env("CCTG_SANDBOX", active);
+        }
+        let output = common::output(&mut command).unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty());
+        std::fs::read_to_string(&env_file).ok()
+    };
+    let written = start(Some("1"), &folder).expect("CLAUDE_ENV_FILE written");
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines.len(), 7, "{written}");
+    for (line, name) in lines.iter().zip([
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "npm_config_cache",
+        "GOPATH",
+    ]) {
+        assert!(line.starts_with(&format!("export {name}='")), "{line}");
+        assert!(
+            line.ends_with('\'') && line.contains(&*folder.to_string_lossy()),
+            "{line}"
+        );
+    }
+    assert_eq!(start(None, &folder), None, "not a sandbox session");
+    let quoted = home.join("it's");
+    std::fs::create_dir_all(&quoted).unwrap();
+    assert_eq!(
+        start(Some("1"), &quoted),
+        None,
+        "a quote cannot be exported safely"
+    );
+}
+
 #[test]
 fn bad_hook_arguments_still_exit_zero() {
     for args in [&["hook"][..], &["hook", "Stop", "extra"][..]] {

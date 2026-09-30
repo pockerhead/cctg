@@ -21,6 +21,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub mod cli;
+pub mod console;
+pub mod gate;
 pub mod marks;
 pub mod paths;
 pub mod preflight;

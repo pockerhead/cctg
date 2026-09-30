@@ -716,12 +716,22 @@ write_wrappers() {
     s=$(native "$conf_dir/settings.json")
     # --settings (one value) goes last: the options before it take every
     # word up to the next option, so a prompt would become a channel name.
+    # sandbox-check (TASK-087): 0 prints the sandbox profile of a marked
+    # folder, 10 means not marked; anything else starts nothing (fail
+    # closed). The flags of branch 0) are sandbox::profile::FLAGS.
+    # probe P2p: if the profile's CLAUDE_CODE_SUBPROCESS_ENV_SCRUB does not
+    # act, branch 0) starts with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 exec.
     make_room "$wrapper"
     put "$wrapper" 755 <<EOF
 #!/bin/sh
 # claude-cctg: Claude Code with the cctg channel and hooks ($MARK).
 # Written by cctg install.sh; running it again rewrites this file.
-exec "$c" run -- --mcp-config "$m" --dangerously-load-development-channels server:cctg --settings "$s" "\$@"
+p=\$("$c" sandbox-check --settings "$s")
+case \$? in
+    0) exec "$c" run -- --mcp-config "$m" --dangerously-load-development-channels server:cctg --strict-mcp-config --setting-sources user --no-chrome --settings "\$p" "\$@" ;;
+    10) exec "$c" run -- --mcp-config "$m" --dangerously-load-development-channels server:cctg --settings "$s" "\$@" ;;
+    *) exit 1 ;;
+esac
 EOF
     if [ "$os" = windows ]; then
         cw=$(cygpath -w "$exe")
@@ -829,6 +839,12 @@ uninstall_all() {
     done
     remove "$conf_dir/mcp.json"
     remove "$conf_dir/settings.json"
+    # Sandbox profiles are generated; the marks, the read allowlist, temp and
+    # gitconfig copies in $root/sandbox stay (docs/sandbox.md).
+    if [ -d "$conf_dir/sandbox" ]; then
+        rm -rf "$conf_dir/sandbox" 2>/dev/null || true
+        if [ -e "$conf_dir/sandbox" ]; then say "left $conf_dir/sandbox (in use?)"; else say "removed $conf_dir/sandbox"; fi
+    fi
     strip_device_env
     strip_path_line
     if [ -f "$bin_dir/cctg.local-hub" ]; then

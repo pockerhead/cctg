@@ -122,6 +122,7 @@ fn key(component: Component<'_>) -> String {
 /// applies to the rest of the path (a worktree is a working folder of its
 /// own). A path outside the folder is not "protected" ([`contains`] says
 /// no); one that cannot be resolved is (fail closed).
+// probe P9: the worktree rule follows where EnterWorktree really writes.
 pub fn protected(root: &Path, path: &Path) -> bool {
     let (Some(root), Some(path)) = (canonical(root), resolve(root, path)) else {
         return true;
@@ -151,6 +152,7 @@ pub fn protected(root: &Path, path: &Path) -> bool {
 
 /// A plan file of plan mode: a `*.md` right in `<config_dir>/plans`, and
 /// when it exists, a plain file (no link out).
+// probe P8: plan mode must write its plan right in <config>/plans.
 pub fn plan_file(config_dir: &Path, path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
@@ -178,6 +180,24 @@ pub fn plan_file(config_dir: &Path, path: &Path) -> bool {
 pub fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Opens `path` for reading only when it lies in `root`: opened first
+/// (without blocking on a pipe), then its resolved path must be inside
+/// `root` and name the very file that is open. Reading from the handle, a
+/// caller gains nothing from a swap of the path for a link in between.
+#[cfg(unix)]
+pub fn open_inside(root: &Path, path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    let resolved = canonical(path)?;
+    let named = std::fs::metadata(&resolved).ok()?;
+    (contains(root, &resolved) && same_file(&opened, &named)).then_some(file)
 }
 
 #[cfg(test)]
@@ -358,5 +378,18 @@ mod tests {
         let c = std::fs::metadata(outside.join("marker")).unwrap();
         assert!(same_file(&a, &b));
         assert!(!same_file(&a, &c));
+
+        assert!(open_inside(&root, &root.join("src").join("a.rs")).is_some());
+        assert!(open_inside(&root, &root.join("in-dir").join("a.rs")).is_some());
+        assert!(open_inside(&root, &root.join("out-file")).is_none());
+        assert!(open_inside(&root, &root.join("out-dir").join("marker")).is_none());
+        assert!(open_inside(&root, &outside.join("marker")).is_none());
+        assert!(open_inside(&root, &root.join("missing")).is_none());
+        let fifo = root.join("pipe");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let pipe = open_inside(&root, &fifo).expect("a pipe opens without blocking");
+        assert!(!pipe.metadata().unwrap().is_file());
     }
 }

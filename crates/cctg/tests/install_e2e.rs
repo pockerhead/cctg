@@ -503,6 +503,29 @@ fn install_update_and_uninstall_a_device() {
         "{wrapper}"
     );
     assert!(wrapper.contains("server:cctg --settings "), "{wrapper}");
+    // TASK-087: a marked folder starts with its sandbox profile, anything
+    // but 0 and 10 from sandbox-check starts nothing.
+    assert!(
+        wrapper.contains("\" sandbox-check --settings \""),
+        "{wrapper}"
+    );
+    let sandboxed = format!(
+        "--dangerously-load-development-channels server:cctg {} --settings \"$p\" \"$@\" ;;",
+        cctg::sandbox::profile::FLAGS.join(" ")
+    );
+    let branch = wrapper
+        .lines()
+        .find(|line| line.trim_start().starts_with("0) exec \""))
+        .unwrap_or_default();
+    assert!(
+        branch.contains(" run -- --mcp-config \"") && branch.ends_with(&sandboxed),
+        "{sandboxed}\n{wrapper}"
+    );
+    assert!(
+        wrapper.contains(" 10) exec \"") && wrapper.contains("server:cctg --settings \""),
+        "{wrapper}"
+    );
+    assert!(wrapper.contains(" *) exit 1 ;;"), "{wrapper}");
     let aside = run
         .wrapper()
         .with_file_name("claude-cctg.before-cctg-install");
@@ -631,12 +654,20 @@ fn install_update_and_uninstall_a_device() {
     drop(session);
     untouched();
 
-    // 4. Uninstall: only what the script wrote goes.
+    // 4. Uninstall: only what the script wrote goes. Generated sandbox
+    // profiles go with it; the user's marks stay.
+    std::fs::create_dir_all(conf.join("sandbox")).unwrap();
+    std::fs::write(conf.join("sandbox").join("0123456789abcdef.json"), b"{}").unwrap();
+    let marks = run.cctg_dir().join("sandbox").join("folders.json");
+    std::fs::create_dir_all(marks.parent().unwrap()).unwrap();
+    std::fs::write(&marks, b"{\"version\":1,\"folders\":[]}").unwrap();
     let (output, text) = run.install(&["--uninstall"]);
     assert!(output.status.success(), "{text}");
+    assert!(marks.exists(), "{text}");
     for gone in [
         run.exe(),
         run.exe().with_file_name("cctg.old.exe"),
+        conf.join("sandbox"),
         conf.join("mcp.json"),
         conf.join("settings.json"),
         run.cctg_dir().join("device.env"),

@@ -92,6 +92,43 @@ enum Command {
         /// The join code; else CCTG_JOIN_CODE.
         code: Option<String>,
     },
+    /// Sandbox mode of a folder: sessions started in it cannot read or
+    /// write outside it (Linux, macOS; docs/sandbox.md).
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
+    /// The file-tool gate of a sandbox profile (PreToolUse hook): exit 2
+    /// blocks the call.
+    #[command(hide = true)]
+    SandboxGate,
+    /// For the claude-cctg wrapper: the sandbox profile of the current
+    /// folder (0), not marked (10), or do not start (3).
+    #[command(hide = true)]
+    SandboxCheck {
+        /// cctg's settings.json.
+        #[arg(long)]
+        settings: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SandboxAction {
+    /// Turn it on for the folder (default: the current one) and below.
+    On {
+        #[arg(long)]
+        folder: Option<PathBuf>,
+    },
+    /// Turn it off for the folder.
+    Off {
+        #[arg(long)]
+        folder: Option<PathBuf>,
+    },
+    /// Whether it is on and whether this device can run it.
+    Status {
+        #[arg(long)]
+        folder: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -115,6 +152,16 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("cctg statusline: bad arguments");
             std::process::exit(0);
         }
+        // The gate fails closed: only exit 2 blocks the tool call.
+        Err(_) if std::env::args().nth(1).as_deref() == Some("sandbox-gate") => {
+            eprintln!("cctg sandbox-gate: bad arguments");
+            std::process::exit(cctg::sandbox::gate::DENY_CODE);
+        }
+        // Anything but 0 and 10 keeps the wrapper from starting claude.
+        Err(_) if std::env::args().nth(1).as_deref() == Some("sandbox-check") => {
+            eprintln!("cctg sandbox-check: bad arguments");
+            std::process::exit(cctg::sandbox::cli::CHECK_FAILED);
+        }
         Err(error) => error.exit(),
     };
     // A supervisor with a log file sets its log up once it holds its lock.
@@ -132,6 +179,8 @@ async fn main() -> anyhow::Result<()> {
                 | Command::AgentWorker
                 | Command::Statusline
                 | Command::Run { .. }
+                | Command::SandboxGate
+                | Command::SandboxCheck { .. }
         ));
     }
     match cli.command {
@@ -236,6 +285,26 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Doctor => std::process::exit(cctg::doctor::run().await),
         Command::Join { code } => std::process::exit(cctg::join::run(code).await),
+        Command::Sandbox { action } => std::process::exit(match action {
+            SandboxAction::On { folder } => cctg::sandbox::cli::on(folder),
+            SandboxAction::Off { folder } => cctg::sandbox::cli::off(folder),
+            SandboxAction::Status { folder } => cctg::sandbox::cli::status(folder),
+        }),
+        Command::SandboxGate => {
+            // A panic must block too, and must not quote the input.
+            std::panic::set_hook(Box::new(|_| {
+                eprintln!("cctg sandbox-gate: internal error");
+                std::process::exit(cctg::sandbox::gate::DENY_CODE);
+            }));
+            std::process::exit(cctg::sandbox::gate::run());
+        }
+        Command::SandboxCheck { settings } => {
+            std::panic::set_hook(Box::new(|_| {
+                eprintln!("cctg sandbox-check: internal error");
+                std::process::exit(cctg::sandbox::cli::CHECK_FAILED);
+            }));
+            std::process::exit(cctg::sandbox::cli::check(&settings));
+        }
         Command::AgentInstall => {
             let exe = std::env::current_exe()?;
             let exe = cctg::device::canonical_cwd(&exe.to_string_lossy());
@@ -266,7 +335,7 @@ fn init_tracing(plain: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, HubCommand};
+    use super::{Cli, Command, HubCommand, SandboxAction};
     use clap::Parser;
 
     #[test]
@@ -377,5 +446,38 @@ mod tests {
             Cli::try_parse_from(["cctg", "doctor"]).unwrap().command,
             Command::Doctor
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox", "on"])
+                .unwrap()
+                .command,
+            Command::Sandbox {
+                action: SandboxAction::On { folder: None }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox", "off", "--folder", "x"]).unwrap().command,
+            Command::Sandbox { action: SandboxAction::Off { folder: Some(path) } }
+                if path == std::path::Path::new("x")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox", "status"])
+                .unwrap()
+                .command,
+            Command::Sandbox {
+                action: SandboxAction::Status { folder: None }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-gate"])
+                .unwrap()
+                .command,
+            Command::SandboxGate
+        ));
+        assert!(Cli::try_parse_from(["cctg", "sandbox-gate", "extra"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-check", "--settings", "s.json"]).unwrap().command,
+            Command::SandboxCheck { settings } if settings == std::path::Path::new("s.json")
+        ));
+        assert!(Cli::try_parse_from(["cctg", "sandbox-check"]).is_err());
     }
 }

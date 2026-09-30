@@ -18,6 +18,13 @@
 //! A restart waits while the claude console shows the agent view or a
 //! working background agent (TASK-047): `/exit` would end them with the
 //! session. The worker then answers `agents_running` and the hub asks again.
+//!
+//! Sandbox mode (TASK-087): `cctg run` keeps the first claude's arguments
+//! for every restart, so the worker points them at the folder's sandbox
+//! profile, or back at `settings.json`, on each restart
+//! ([`crate::sandbox::profile::retarget`]). A session whose mode differs
+//! from its folder's mark restarts on "Обновить"; a marked folder never
+//! restarts without its profile (a refused preflight fails the restart).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
@@ -27,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::client;
 use crate::keys::{self, Typed};
 use crate::proctree::Proc;
+use crate::sandbox::{self, marks, preflight, profile};
 use crate::shim;
 
 /// Set by `cctg run` for its claude: the pid of that `cctg run`.
@@ -80,6 +88,13 @@ pub struct Worker {
     pub state_dir: Option<PathBuf>,
     /// Where the worker types into claude ([`keys::Target`]), if anywhere.
     pub console: Option<keys::Target>,
+    /// This claude runs with a sandbox profile (env [`sandbox::ACTIVE_VAR`]).
+    pub sandbox_active: bool,
+    /// The session folder: an absolute `CLAUDE_PROJECT_DIR`, else the
+    /// caller sets the current directory.
+    pub folder: Option<PathBuf>,
+    /// `<home>/.cctg/sandbox/folders.json`; `None` without a home.
+    pub marks_file: Option<PathBuf>,
 }
 
 /// What an `update` leads to.
@@ -116,7 +131,56 @@ impl Worker {
                 .unwrap_or_default(),
             state_dir,
             console,
+            sandbox_active: var(sandbox::ACTIVE_VAR).as_deref() == Some("1"),
+            folder: var("CLAUDE_PROJECT_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| PathBuf::from(crate::device::canonical_cwd(&dir.to_string_lossy()))),
+            marks_file: sandbox::home_dir_of(&var).map(|home| sandbox::marks_file(&home)),
         }
+    }
+
+    /// The folder's mark asks for the sandbox. A marks file that cannot be
+    /// read asks for it (fail closed). Blocking.
+    pub fn wanted(&self) -> bool {
+        match (&self.marks_file, &self.folder) {
+            (Some(file), Some(folder)) => marks::covered(file, folder) != Ok(false),
+            _ => false,
+        }
+    }
+
+    /// The arguments this claude runs with: `run_args` are the first
+    /// claude's, which a restart may have pointed at the profile or away.
+    pub fn current_args(&self) -> Vec<String> {
+        let current = if self.sandbox_active {
+            self.folder.as_deref().and_then(|folder| {
+                let base = profile::settings_base(&self.run_args)?;
+                profile::retarget(&self.run_args, Some(&profile::profile_path(&base, folder)))
+            })
+        } else {
+            profile::retarget(&self.run_args, None)
+        };
+        current.unwrap_or_else(|| self.run_args.clone())
+    }
+
+    /// The next claude's arguments: [`relaunch_args`], pointed at the
+    /// folder's sandbox profile when its mark asks for one (written now by
+    /// [`profile::prepare`]; `None` when the device refuses), else at
+    /// `settings.json`. Blocking.
+    pub fn restart_args(
+        &self,
+        session_id: &str,
+        probe: &dyn preflight::Probe,
+    ) -> Option<Vec<String>> {
+        let args = relaunch_args(&self.run_args, session_id);
+        if !self.wanted() {
+            return Some(profile::retarget(&args, None).unwrap_or(args));
+        }
+        let folder = self.folder.as_deref()?;
+        let base = profile::settings_base(&self.run_args)?;
+        let exe = self.exe.as_deref()?;
+        let path = profile::prepare(probe, &base, folder, exe).ok()?;
+        profile::retarget(&args, Some(&path))
     }
 
     /// The worker can hand over to a newer binary.
@@ -148,9 +212,11 @@ impl Worker {
             // Mid-deploy (renamed away, not yet back): try again later.
             Err(_) => return Plan::Failed,
         }
-        let changed = self.shim_started.is_some_and(|started| {
-            started < RESTART_SINCE || changed_since(&config_files(&self.run_args), started)
-        });
+        let changed = self.wanted() != self.sandbox_active
+            || self.shim_started.is_some_and(|started| {
+                started < RESTART_SINCE
+                    || changed_since(&config_files(&self.current_args()), started)
+            });
         match (changed, self.restartable()) {
             (false, _) => Plan::UpToDate,
             (true, true) => Plan::Restart,
@@ -167,6 +233,11 @@ impl Worker {
     /// Writes the request for `cctg run` and types `/exit`. The request is
     /// removed again when `/exit` was not sent.
     pub fn restart(&self, session_id: &str) -> Typed {
+        self.restart_with(session_id, &preflight::RealProbe)
+    }
+
+    /// [`Self::restart`] with the device seen through `probe`.
+    pub fn restart_with(&self, session_id: &str, probe: &dyn preflight::Probe) -> Typed {
         let (Some(state), Some(run_pid), Some(console)) =
             (&self.state_dir, self.run_pid, &self.console)
         else {
@@ -175,10 +246,11 @@ impl Worker {
         if !is_session_id(session_id) {
             return Typed::Failed;
         }
-        let path = request_path(state, run_pid);
-        let request = Request {
-            args: relaunch_args(&self.run_args, session_id),
+        let Some(args) = self.restart_args(session_id, probe) else {
+            return Typed::Failed;
         };
+        let path = request_path(state, run_pid);
+        let request = Request { args };
         if write_request(&path, &request).is_err() {
             return Typed::Failed;
         }
@@ -608,6 +680,157 @@ mod tests {
         assert!(!w.self_update(), "no build yet");
         let bare = Worker::from_env(|_| None, Some(9), None, Some(keys::Target::Console(9)));
         assert!(!bare.resumed && bare.shim.is_none() && !bare.restartable());
+    }
+
+    /// A worker of a claude started by the wrapper in `home/proj`, with the
+    /// settings and the exe `install.sh` would give it.
+    fn sandbox_worker(home: &Path, exe: &Path, active: bool) -> Worker {
+        let folder = home.join("proj");
+        let conf = home.join(".cctg").join("claude");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&conf).unwrap();
+        let settings = conf.join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let folder = sandbox::paths::canonical(&folder).unwrap();
+        let normal = args(&[
+            "--mcp-config",
+            "m.json",
+            "--dangerously-load-development-channels",
+            "server:cctg",
+            "--settings",
+            &settings.to_string_lossy(),
+        ]);
+        let run_args = if active {
+            let path = profile::profile_path(&settings, &folder);
+            profile::retarget(&normal, Some(&path)).unwrap()
+        } else {
+            normal
+        };
+        Worker {
+            run_pid: Some(77),
+            run_args,
+            sandbox_active: active,
+            folder: Some(folder),
+            marks_file: Some(sandbox::marks_file(home)),
+            ..worker(home, exe)
+        }
+    }
+
+    #[test]
+    fn a_mode_that_differs_from_the_mark_restarts() {
+        let dir = TempDir::new("update-sandbox-plan");
+        let home = sandbox::paths::canonical(dir.path()).unwrap();
+        let exe = home.join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let w = sandbox_worker(&home, &exe, false);
+        assert_eq!(w.plan(), Plan::UpToDate);
+        marks::add(&sandbox::marks_file(&home), w.folder.as_deref().unwrap()).unwrap();
+        assert!(w.wanted());
+        assert_eq!(w.plan(), Plan::Restart, "marked, not sandboxed");
+        let w = sandbox_worker(&home, &exe, true);
+        assert_eq!(w.plan(), Plan::UpToDate, "marked and sandboxed");
+        std::fs::write(sandbox::marks_file(&home), "{broken").unwrap();
+        assert_eq!(w.plan(), Plan::UpToDate, "an unreadable mark counts as on");
+        std::fs::remove_file(sandbox::marks_file(&home)).unwrap();
+        assert_eq!(w.plan(), Plan::Restart, "sandboxed, no longer marked");
+        let manual = Worker {
+            run_pid: None,
+            ..sandbox_worker(&home, &exe, true)
+        };
+        assert_eq!(manual.plan(), Plan::ManualRestart);
+    }
+
+    #[test]
+    fn the_current_args_name_the_file_this_claude_reads() {
+        let dir = TempDir::new("update-sandbox-args");
+        let home = sandbox::paths::canonical(dir.path()).unwrap();
+        let exe = home.join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let normal = sandbox_worker(&home, &exe, false);
+        let settings = home.join(".cctg").join("claude").join("settings.json");
+        assert_eq!(config_files(&normal.current_args())[1], settings);
+        // First started normal, now sandboxed after a restart: the profile.
+        let restarted = Worker {
+            sandbox_active: true,
+            ..sandbox_worker(&home, &exe, false)
+        };
+        let profile = profile::profile_path(&settings, restarted.folder.as_deref().unwrap());
+        assert_eq!(config_files(&restarted.current_args())[1], profile);
+        assert!(
+            restarted
+                .current_args()
+                .contains(&"--strict-mcp-config".to_owned())
+        );
+        // And back: settings.json, no flags.
+        let back = Worker {
+            sandbox_active: false,
+            ..sandbox_worker(&home, &exe, true)
+        };
+        assert_eq!(back.current_args(), normal.run_args);
+    }
+
+    #[test]
+    fn a_restart_of_a_marked_folder_takes_its_profile_or_does_not_happen() {
+        let dir = TempDir::new("update-sandbox-restart");
+        let home = sandbox::paths::canonical(dir.path()).unwrap();
+        let exe = home.join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let w = sandbox_worker(&home, &exe, false);
+        let folder = w.folder.clone().unwrap();
+        let ready = preflight::tests::Fake::linux(&home);
+        // Not marked: the normal arguments.
+        let plain = w.restart_args("5e55", &ready).unwrap();
+        assert_eq!(plain, relaunch_args(&w.run_args, "5e55"));
+        marks::add(&sandbox::marks_file(&home), &folder).unwrap();
+        let args = w.restart_args("5e55", &ready).unwrap();
+        let settings = home.join(".cctg").join("claude").join("settings.json");
+        let path = profile::profile_path(&settings, &folder);
+        let at = args.iter().position(|arg| arg == "--settings").unwrap();
+        assert_eq!(args[at - 4..at], profile::FLAGS.map(str::to_owned));
+        assert_eq!(args[at + 1], path.to_string_lossy());
+        assert_eq!(args[args.len() - 2..], ["--resume", "5e55"]);
+        assert!(path.is_file(), "prepare wrote the profile");
+        // A device that refuses: no arguments, no request, nothing typed.
+        let mut old = preflight::tests::Fake::linux(&home);
+        old.answer("claude", 0, "2.1.1 (Claude Code)");
+        assert_eq!(w.restart_args("5e55", &old), None);
+        assert_eq!(w.restart_with("5e55", &old), Typed::Failed);
+        assert!(!request_path(&home, 77).exists());
+        // Sandboxed, mark gone: back to settings.json without the flags.
+        std::fs::remove_file(sandbox::marks_file(&home)).unwrap();
+        let sandboxed = sandbox_worker(&home, &exe, true);
+        let args = sandboxed.restart_args("5e55", &ready).unwrap();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| profile::FLAGS.contains(&arg.as_str()))
+        );
+        assert!(args.contains(&settings.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn the_sandbox_part_of_the_environment() {
+        let home = if cfg!(windows) { r"C:\h" } else { "/h" };
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let project = if cfg!(windows) {
+            r"C:\definitely
+ot\here"
+        } else {
+            "/definitely/not/here"
+        };
+        let env = |name: &str| match name {
+            "CCTG_SANDBOX" => Some("1".to_owned()),
+            "CLAUDE_PROJECT_DIR" => Some(project.to_owned()),
+            name if name == home_var => Some(home.to_owned()),
+            _ => None,
+        };
+        let w = Worker::from_env(env, None, None, None);
+        assert!(w.sandbox_active);
+        assert_eq!(w.folder, Some(PathBuf::from(project)));
+        assert_eq!(w.marks_file, Some(sandbox::marks_file(Path::new(home))));
+        let bare = Worker::from_env(|_| None, None, None, None);
+        assert!(!bare.sandbox_active && bare.folder.is_none() && bare.marks_file.is_none());
+        assert!(!bare.wanted());
     }
 
     #[test]

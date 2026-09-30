@@ -253,29 +253,75 @@ pub fn date(now: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Where files from the topic go, in order of preference.
-pub fn inboxes(work: Option<&Path>) -> Vec<PathBuf> {
+/// Where files from the topic go, in order of preference; the temp folder
+/// only with `temp_fallback`.
+pub fn inboxes(work: Option<&Path>, temp_fallback: bool) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = work
         .map(|work| work.join(".cctg").join("inbox"))
         .into_iter()
         .collect();
-    dirs.push(std::env::temp_dir().join("cctg-inbox"));
+    if temp_fallback {
+        dirs.push(std::env::temp_dir().join("cctg-inbox"));
+    }
     dirs
 }
 
 /// Saves `bytes` as a new file `<date>-<name>` (`name` already cleaned) in
 /// the first of [`inboxes`] that takes it; returns its path. A taken name
 /// gets `-2`, `-3`, ...; nothing is ever overwritten.
-pub fn save(work: Option<&Path>, name: &str, bytes: &[u8], now: SystemTime) -> io::Result<PathBuf> {
+///
+/// `sandboxed` (TASK-087): only `<work>/.cctg/inbox`, never the temp folder
+/// (the model could not reach it), and only when neither `.cctg` nor the
+/// inbox is a link or a file and the inbox resolves inside `work` (a
+/// sandboxed command could have pointed it anywhere). A swap between that
+/// check and the write remains possible (docs/sandbox.md).
+pub fn save(
+    work: Option<&Path>,
+    name: &str,
+    bytes: &[u8],
+    now: SystemTime,
+    sandboxed: bool,
+) -> io::Result<PathBuf> {
     let dated = format!("{}-{name}", date(now));
+    if sandboxed {
+        let work = work.ok_or_else(|| io::Error::other("no session folder"))?;
+        return save_in(&confined_inbox(work)?, &dated, bytes);
+    }
     let mut last = io::Error::other("no inbox");
-    for dir in inboxes(work) {
+    for dir in inboxes(work, true) {
         match save_in(&dir, &dated, bytes) {
             Ok(path) => return Ok(path),
             Err(error) => last = error,
         }
     }
     Err(last)
+}
+
+/// `<work>/.cctg/inbox`, made one folder at a time, with no link on the way
+/// and resolving inside `work`.
+fn confined_inbox(work: &Path) -> io::Result<PathBuf> {
+    let cctg = work.join(".cctg");
+    let inbox = cctg.join("inbox");
+    for dir in [&cctg, &inbox] {
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Err(io::Error::other("the inbox is not a plain folder")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir(dir)?,
+            Err(error) => return Err(error),
+        }
+    }
+    let inside = match (
+        crate::sandbox::paths::canonical(work),
+        crate::sandbox::paths::canonical(&inbox),
+    ) {
+        (Some(work), Some(real)) => crate::sandbox::paths::within(&work, &real),
+        _ => false,
+    };
+    if inside {
+        Ok(inbox)
+    } else {
+        Err(io::Error::other("the inbox is outside the session folder"))
+    }
 }
 
 fn save_in(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
@@ -339,10 +385,23 @@ pub fn read_upload(path: &Path) -> Result<Vec<u8>, UploadError> {
     if metadata.len() > MAX_UPLOAD {
         return Err(UploadError::TooBig);
     }
+    read_upload_from(std::fs::File::open(path).map_err(io)?)
+}
+
+/// [`read_upload`] of a file already open: the checks go by the handle, so
+/// what is read is what was checked (TASK-087: a sandboxed command may swap
+/// the path for a link at any moment).
+pub fn read_upload_from(file: std::fs::File) -> Result<Vec<u8>, UploadError> {
+    let io = |error: io::Error| UploadError::Io(error.kind());
+    let metadata = file.metadata().map_err(io)?;
+    if !metadata.is_file() {
+        return Err(UploadError::NotFile);
+    }
+    if metadata.len() > MAX_UPLOAD {
+        return Err(UploadError::TooBig);
+    }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(io)?
-        .take(MAX_UPLOAD + 1)
+    file.take(MAX_UPLOAD + 1)
         .read_to_end(&mut bytes)
         .map_err(io)?;
     match bytes.len() as u64 {
@@ -551,8 +610,8 @@ mod tests {
     fn a_save_never_overwrites_and_keeps_the_inbox_out_of_git() {
         let dir = TempDir::new("files-save");
         let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
-        let first = save(Some(dir.path()), "shot.png", b"one", now).unwrap();
-        let second = save(Some(dir.path()), "shot.png", b"two", now).unwrap();
+        let first = save(Some(dir.path()), "shot.png", b"one", now, false).unwrap();
+        let second = save(Some(dir.path()), "shot.png", b"two", now, false).unwrap();
         let inbox = dir.path().join(".cctg").join("inbox");
         assert_eq!(first, inbox.join("2026-09-25-shot.png"));
         assert_eq!(second, inbox.join("2026-09-25-shot-2.png"));
@@ -562,12 +621,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
         // An existing .gitignore is the user's: left as it is.
         std::fs::write(&ignore, "mine\n").unwrap();
-        save(Some(dir.path()), "shot.png", b"three", now).unwrap();
+        save(Some(dir.path()), "shot.png", b"three", now, false).unwrap();
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "mine\n");
         // A folder that cannot hold the inbox falls back to the temp dir.
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"a file, not a folder").unwrap();
-        let fallback = save(Some(&blocked), "x.txt", b"four", now).unwrap();
+        let fallback = save(Some(&blocked), "x.txt", b"four", now, false).unwrap();
         assert!(
             fallback.starts_with(std::env::temp_dir().join("cctg-inbox")),
             "{fallback:?}"
@@ -606,11 +665,64 @@ mod tests {
         );
     }
 
+    /// TASK-087: a sandboxed session keeps files in its folder only, never
+    /// in the temp folder and never through a link.
+    #[test]
+    fn a_sandboxed_save_stays_in_the_folder() {
+        let dir = TempDir::new("files-sandboxed");
+        let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
+        let work = dir.path().join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let saved = save(Some(&work), "a.txt", b"one", now, true).unwrap();
+        assert_eq!(
+            saved,
+            work.join(".cctg").join("inbox").join("2026-09-25-a.txt")
+        );
+        assert_eq!(
+            inboxes(Some(&work), false),
+            [work.join(".cctg").join("inbox")]
+        );
+        assert_eq!(inboxes(Some(&work), true).len(), 2);
+        assert!(save(None, "a.txt", b"one", now, true).is_err());
+        // A file where the inbox should be: no fallback anywhere.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir_all(blocked.join(".cctg")).unwrap();
+        std::fs::write(blocked.join(".cctg").join("inbox"), b"x").unwrap();
+        assert!(save(Some(&blocked), "x.txt", b"two", now, true).is_err());
+        #[cfg(unix)]
+        {
+            let outside = dir.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let linked = dir.path().join("linked");
+            std::fs::create_dir_all(linked.join(".cctg")).unwrap();
+            std::os::unix::fs::symlink(&outside, linked.join(".cctg").join("inbox")).unwrap();
+            assert!(save(Some(&linked), "x.txt", b"three", now, true).is_err());
+            let whole = dir.path().join("whole");
+            std::fs::create_dir_all(&whole).unwrap();
+            std::os::unix::fs::symlink(&outside, whole.join(".cctg")).unwrap();
+            assert!(save(Some(&whole), "x.txt", b"four", now, true).is_err());
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn an_open_file_is_read_by_its_handle() {
+        let dir = TempDir::new("files-handle");
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        let open = std::fs::File::open(&file).unwrap();
+        assert_eq!(read_upload_from(open), Ok(b"abc".to_vec()));
+        let folder = std::fs::File::open(dir.path());
+        if let Ok(folder) = folder {
+            assert_eq!(read_upload_from(folder), Err(UploadError::NotFile));
+        }
+    }
+
     #[test]
     fn the_inbox_ignores_only_itself() {
         let dir = TempDir::new("files-ignore");
         let now = UNIX_EPOCH + Duration::from_secs(1_790_294_400);
-        save(Some(dir.path()), "shot.png", b"one", now).unwrap();
+        save(Some(dir.path()), "shot.png", b"one", now, false).unwrap();
         let cctg = dir.path().join(".cctg");
         assert_eq!(
             std::fs::read_to_string(cctg.join("inbox").join(".gitignore")).unwrap(),

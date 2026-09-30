@@ -33,6 +33,8 @@ pub const FLAGS: [&str; 4] = [
 /// Linux: shared places sandboxed commands could still read. Candidate list
 /// until probe P3 (TASK-087 step 0) confirms each entry; an entry that
 /// breaks the session goes to the documented limits instead.
+// probe P3: drop an entry that breaks P1/P2/P5 or curl; probe P2: without a
+// working CLAUDE_CODE_TMPDIR drop /tmp and /var/tmp.
 pub const LINUX_EXTRA_DENY_READ: &[&str] = &[
     "/tmp",
     "/var/tmp",
@@ -45,20 +47,72 @@ pub const LINUX_EXTRA_DENY_READ: &[&str] = &[
 
 /// macOS: empty until probe P3m passes with `/tmp`, `/private/tmp`,
 /// `/var/tmp`, `/private/var/tmp` (no Mac probed: "not verified" in the doc).
+// probe P3m: the four paths above when a Mac run passes.
 pub const MACOS_EXTRA_DENY_READ: &[&str] = &[];
 
 /// `disableSkillShellExecution`: a user skill's `` !`cmd` `` might run
 /// outside the sandbox. On until probe P6 shows the sandbox covers it.
+// probe P6: false when `!`cat ~/.bashrc`` in a user skill is refused.
 pub const SKILL_SHELL_OFF: bool = true;
 
 /// Tool homes under `<folder>/.cctg/sandbox/`.
 pub const CACHE_DIRS: [&str; 6] = ["cargo", "cache", "data", "state", "npm", "go"];
 
+/// `export` lines of the tool caches for Bash (hook SessionStart writes them
+/// to `CLAUDE_ENV_FILE`): the caches live in the folder, `HOME` stays (rustup
+/// finds `~/.rustup` through it). `None` for a folder that is not absolute or
+/// has `'` or a control character (it could not be quoted safely).
+// probe P4: the values must reach Bash, also after a `cd`.
+pub fn cache_exports(folder: &str) -> Option<String> {
+    if !Path::new(folder).is_absolute() || folder.chars().any(|c| c == '\'' || c.is_control()) {
+        return None;
+    }
+    let own = format!("{}/.cctg/sandbox", folder.trim_end_matches('/'));
+    let lines = [
+        ("CARGO_HOME", format!("{own}/cargo")),
+        (
+            "CARGO_TARGET_DIR",
+            format!("{}/target", folder.trim_end_matches('/')),
+        ),
+        ("XDG_CACHE_HOME", format!("{own}/cache")),
+        ("XDG_DATA_HOME", format!("{own}/data")),
+        ("XDG_STATE_HOME", format!("{own}/state")),
+        ("npm_config_cache", format!("{own}/npm")),
+        ("GOPATH", format!("{own}/go")),
+    ];
+    Some(lines.iter().fold(String::new(), |mut out, (name, value)| {
+        let _ = writeln!(out, "export {name}='{value}'");
+        out
+    }))
+}
+
+/// Appends [`cache_exports`] to `CLAUDE_ENV_FILE` when this session runs with
+/// a profile. `None`: nothing to do.
+pub fn export_caches(var: &impl Fn(&str) -> Option<String>) -> Option<std::io::Result<()>> {
+    if var(super::ACTIVE_VAR).as_deref() != Some("1") {
+        return None;
+    }
+    let file = var("CLAUDE_ENV_FILE").filter(|file| !file.trim().is_empty())?;
+    let lines = cache_exports(&var("CLAUDE_PROJECT_DIR")?)?;
+    Some((|| {
+        let mut out = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)?;
+        std::io::Write::write_all(&mut out, lines.as_bytes())
+    })())
+}
+
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Tools that lead out of the folder (TASK-087 F6): `/cd`, publishing a file
 /// past cctg's checks, messages to the user's other sessions, cloud
-/// routines, the desktop and the browser.
+/// routines, the desktop and the browser. The two `Read` rules close other
+/// projects' transcripts and the prompt history to the Read tool even if the
+/// read block lets `~/.claude` through.
+// probe P7: add any tool the model still lists that leads out of the folder.
+// probe P1r: the two Read rules may go when the block alone refuses them.
+// probe P8: add EnterPlanMode if plan mode writes outside <config>/plans.
 const DENY: &[&str] = &[
     "Cd",
     "Artifact",
@@ -68,6 +122,8 @@ const DENY: &[&str] = &[
     "RemoteTrigger",
     "mcp__computer-use",
     "mcp__claude-in-chrome",
+    "Read(~/.claude/projects/**)",
+    "Read(~/.claude/history.jsonl)",
 ];
 
 /// Variables sandboxed commands never see.
@@ -241,6 +297,8 @@ fn overlay(
         .map(|name| json!({ "name": name, "mode": "deny" }))
         .collect();
     let mut overlay = json!({
+        // probe P2e: all of env must reach Bash, hooks and MCP; probe P2:
+        // CLAUDE_CODE_TMPDIR; probe P2p: the scrub (else the wrapper sets it).
         "env": {
             "CCTG_SANDBOX": "1",
             "CLAUDE_CODE_TMPDIR": tmp,
@@ -379,19 +437,30 @@ fn real_dir(dir: &Path) -> Result<(), Refusal> {
     }
 }
 
-/// claude's arguments with `--settings` pointed at `profile` (and [`FLAGS`]
-/// right before it), or back at cctg's `settings.json` with `None` (and the
-/// flags gone). `None` when there is no `--settings` of ours. The rest keeps
-/// its order.
-pub fn retarget(args: &[String], profile: Option<&Path>) -> Option<Vec<String>> {
-    let (at, value, inline) = args.iter().enumerate().find_map(|(at, arg)| {
+/// The first `--settings X` or `--settings=X`: its index, `X`, and whether
+/// it is the `=` form.
+fn find_settings(args: &[String]) -> Option<(usize, &str, bool)> {
+    args.iter().enumerate().find_map(|(at, arg)| {
         if arg == "--settings" {
             args.get(at + 1).map(|value| (at, value.as_str(), false))
         } else {
             arg.strip_prefix("--settings=")
                 .map(|value| (at, value, true))
         }
-    })?;
+    })
+}
+
+/// cctg's `settings.json` behind claude's `--settings` ([`base_of`]).
+pub fn settings_base(args: &[String]) -> Option<PathBuf> {
+    find_settings(args).and_then(|(_, value, _)| base_of(Path::new(value)))
+}
+
+/// claude's arguments with `--settings` pointed at `profile` (and [`FLAGS`]
+/// right before it), or back at cctg's `settings.json` with `None` (and the
+/// flags gone). `None` when there is no `--settings` of ours. The rest keeps
+/// its order.
+pub fn retarget(args: &[String], profile: Option<&Path>) -> Option<Vec<String>> {
+    let (at, value, inline) = find_settings(args)?;
     let base = base_of(Path::new(value))?;
     let target = profile.map_or(base, Path::to_path_buf);
     let target = target.to_str()?;
