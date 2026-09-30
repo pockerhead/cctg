@@ -374,8 +374,8 @@ fn run_elevated(request_path: &Path) -> Result<i32, String> {
 /// `ShellExecuteExW(runas)` of `cctg sandbox-install --elevated-step <path>`,
 /// hidden, waited on.
 fn shell_execute_runas(request_path: &Path) -> Result<i32, String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Foundation::ERROR_CANCELLED;
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, INFINITE, WaitForSingleObject,
     };
@@ -419,9 +419,6 @@ fn shell_execute_runas(request_path: &Path) -> Result<i32, String> {
     unsafe {
         let _ = GetExitCodeProcess(info.hProcess, &mut code);
         let _ = CloseHandle(info.hProcess);
-    }
-    if code == WAIT_OBJECT_0 {
-        // unreachable normally; keep the code as-is
     }
     Ok(code as i32)
 }

@@ -739,14 +739,17 @@ EOF
         sw=$(cygpath -w "$conf_dir/settings.json")
         # The Windows shell-prefix shim (TASK-089): a single-token executable
         # the sandbox profile points CLAUDE_CODE_SHELL_PREFIX at. It runs
-        # `cctg sandbox-exec "$@"` WITHOUT exec (MSYS exec would cut cctg off
-        # claude's process tree) and with MSYS path conversion off (cctg gets
-        # the command line unchanged).
+        # cctg sandbox-exec WITHOUT exec (MSYS exec would cut cctg off claude's
+        # process tree) and with MSYS path conversion off (cctg gets the command
+        # line unchanged). Only "$1" (not "$@"): probe P0c showed the prefix
+        # always passes exactly one argument, and a truncated command would run
+        # sandboxed, never unsandboxed (install_e2e asserts this form).
         make_room "$bin_dir/cctg-sandbox-exec"
         put "$bin_dir/cctg-sandbox-exec" 755 <<EOF
 #!/bin/sh
 # cctg-sandbox-exec: the shell prefix of sandboxed folders on Windows ($MARK).
-# Written by cctg install.sh. No exec, no MSYS path conversion.
+# Written by cctg install.sh. No exec, no MSYS path conversion; the prefix's
+# single argument is passed as "\$1".
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$c" sandbox-exec "\$1"
 EOF
         # The .cmd wrapper (used from cmd/PowerShell) is fail closed: it asks

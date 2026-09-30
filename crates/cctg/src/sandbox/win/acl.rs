@@ -870,6 +870,50 @@ mod tests {
         }
     }
 
+    /// The isolation rests on this: `grant_folder`'s inheritable-ACE
+    /// propagation stamps a junction OBJECT inside the tree but does NOT follow
+    /// it into the target's security descriptor, so a slot-planted junction to
+    /// a sibling never grants the slot access to that sibling. (PLAN_FINAL 3.5;
+    /// the code-reviewer verified this OS behaviour manually.)
+    #[test]
+    fn grant_does_not_follow_a_junction_into_its_target() {
+        let tmp = TempDir::new("acl-junction");
+        let base = canon(tmp.path());
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("a.rs"), b"x").unwrap();
+        // A sibling outside the folder, with a marker, reached by a junction
+        // planted inside the folder.
+        let sibling = base.join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("marker.txt"), b"secret").unwrap();
+        let linkdir = root.join("linkdir");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&linkdir)
+            .arg(&sibling)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !made {
+            return; // no junction support; nothing to assert
+        }
+        grant_folder(&root, FAKE_SLOT, |_| {}).unwrap();
+        // A real child got the inherited ACE...
+        assert!(has_ace(&root.join("src").join("a.rs"), FAKE_SLOT));
+        // ...but the junction's TARGET and its file did NOT.
+        assert!(
+            !has_ace(&sibling, FAKE_SLOT),
+            "the junction target must not gain the slot ACE"
+        );
+        assert!(
+            !has_ace(&sibling.join("marker.txt"), FAKE_SLOT),
+            "the target's file must not gain the slot ACE"
+        );
+        revoke_folder(&root, FAKE_SLOT);
+        let _ = std::fs::remove_dir(&linkdir);
+    }
+
     #[test]
     fn a_hard_linked_file_is_write_denied() {
         let tmp = TempDir::new("acl-hardlink");

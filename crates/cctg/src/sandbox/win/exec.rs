@@ -122,10 +122,12 @@ fn run_inner(line: &str) -> Result<i32, Refusal> {
     }
     let _ = super::acl::stamp_protected(&mark, &slot_sid, false);
 
-    // 6. Slot password and broker self-protection.
+    // 6. Slot password and broker self-protection. Self-protection is
+    // mandatory (fail closed, like the runner): without it the child, while it
+    // runs, could open the broker, which still holds the decrypted password.
     let password =
         super::cred::load(&win_dir, k).map_err(|_| Refusal("run cctg sandbox-install"))?;
-    let _ = self_protect(&me);
+    self_protect(&me).map_err(|_| Refusal("the sandbox could not start"))?;
 
     // 7-8. Build the spec and launch the runner under the slot account.
     let spec = RunnerSpec {
@@ -136,7 +138,7 @@ fn run_inner(line: &str) -> Result<i32, Refusal> {
             "-c".into(),
             "eval \"$CCTG_SANDBOX_COMMAND\"".into(),
         ],
-        env_overlay: env_overlay(line, &mark, &me, &info.group_sid),
+        env_overlay: env_overlay(line, &mark),
         slot_sid: slot_sid.clone(),
     };
     let code = spawn_runner(&exe, k, &password, &me, &slot_sid, &spec)?;
@@ -166,10 +168,10 @@ fn win_dir() -> Result<PathBuf, Refusal> {
     Ok(super::win_dir(&home))
 }
 
-/// The child's environment overlay: the slot profile plus a whitelist, no
-/// `CCTG_*` but `CCTG_SANDBOX`, no tokens.
-fn env_overlay(line: &str, mark: &Path, user_sid: &str, _group_sid: &str) -> Vec<(String, String)> {
-    let _ = user_sid;
+/// The child's environment overlay: a whitelist over the slot profile env the
+/// runner builds, with `CCTG_SANDBOX`/`CCTG_SANDBOX_COMMAND` but no other
+/// `CCTG_*`, no `CCTG_SANDBOX_MARK`/`_BASH`, no tokens.
+fn env_overlay(line: &str, mark: &Path) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let get = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     for name in [

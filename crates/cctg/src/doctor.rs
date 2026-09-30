@@ -173,64 +173,84 @@ fn windows_report(
         return false;
     };
     lines.push(format!("sandbox: installed, {} slots", installed.slots));
-    let mut ok = installed.owner_is_me;
     if !installed.owner_is_me {
         lines.push("sandbox: installed by another Windows user".to_owned());
     }
-    #[cfg(windows)]
-    {
-        use crate::sandbox::win;
-        if let Some(home) = probe.home() {
-            let win_dir = win::win_dir(&home);
-            if let Ok((active, retired, fresh)) = win::slots::counts(&win_dir, installed.slots) {
+    let live = windows_live_checks(probe, marked, installed.slots, lines);
+    installed.owner_is_me && live
+}
+
+/// The checks that need the real machine: slot counts, the slot ACE of each
+/// mark, the Secondary Logon service, `safe.directory = *`. Off Windows (a
+/// `Fake` with `Os::Windows` in tests) there is nothing to look at.
+#[cfg(windows)]
+fn windows_live_checks(
+    probe: &dyn preflight::Probe,
+    marked: &[std::path::PathBuf],
+    slots: u32,
+    lines: &mut Vec<String>,
+) -> bool {
+    use crate::sandbox::win;
+    let mut ok = true;
+    if let Some(home) = probe.home() {
+        let win_dir = win::win_dir(&home);
+        if let Ok((active, retired, fresh)) = win::slots::counts(&win_dir, slots) {
+            lines.push(format!(
+                "sandbox: slots {active} active, {retired} retired, {fresh} fresh"
+            ));
+        }
+        let mark = win::read_mark();
+        for folder in marked {
+            let folder_str = folder.to_string_lossy().to_string();
+            let slot = win::slots::active_slot(&win_dir, &folder_str)
+                .ok()
+                .flatten();
+            let has_ace = match (&mark, slot) {
+                (Some(mark), Some(k)) => mark
+                    .slot_sid(k)
+                    .is_some_and(|sid| win::acl::has_ace(folder, sid)),
+                _ => false,
+            };
+            if !has_ace {
                 lines.push(format!(
-                    "sandbox: slots {active} active, {retired} retired, {fresh} fresh"
+                    "  {}: no slot ACE (run cctg sandbox on)",
+                    folder.display()
                 ));
+                ok = false;
             }
-            for folder in marked {
-                let folder_str = folder.to_string_lossy().to_string();
-                let slot = win::slots::active_slot(&win_dir, &folder_str)
-                    .ok()
-                    .flatten();
-                let mark = win::read_mark();
-                let has_ace = match (&mark, slot) {
-                    (Some(mark), Some(k)) => mark
-                        .slot_sid(k)
-                        .is_some_and(|sid| win::acl::has_ace(folder, sid)),
-                    _ => false,
-                };
-                if !has_ace {
-                    lines.push(format!(
-                        "  {}: no slot ACE (run cctg sandbox on)",
-                        folder.display()
-                    ));
-                    ok = false;
-                }
-            }
-        }
-        // The Secondary Logon service must not be disabled.
-        if let Some(ran) = probe.run("sc", &["qc", "seclogon"], std::time::Duration::from_secs(5))
-            && ran.stdout.contains("DISABLED")
-        {
-            lines.push("sandbox: the Secondary Logon service is disabled; enable it".to_owned());
-            ok = false;
-        }
-        // git safe.directory = * would let the user's git run a slot-created config.
-        if let Some(ran) = probe.run(
-            "git",
-            &["config", "--global", "--get-all", "safe.directory"],
-            std::time::Duration::from_secs(3),
-        ) && ran.stdout.lines().any(|l| l.trim() == "*")
-        {
-            lines.push(
-                "sandbox: git trusts repositories of any owner (safe.directory = *); a .git \
-                 created by a sandbox command would run its config — remove it"
-                    .to_owned(),
-            );
         }
     }
-    let _ = marked;
+    // The Secondary Logon service must not be disabled.
+    if let Some(ran) = probe.run("sc", &["qc", "seclogon"], std::time::Duration::from_secs(5))
+        && ran.stdout.contains("DISABLED")
+    {
+        lines.push("sandbox: the Secondary Logon service is disabled; enable it".to_owned());
+        ok = false;
+    }
+    // git safe.directory = * would let the user's git run a slot-created config.
+    if let Some(ran) = probe.run(
+        "git",
+        &["config", "--global", "--get-all", "safe.directory"],
+        std::time::Duration::from_secs(3),
+    ) && ran.stdout.lines().any(|l| l.trim() == "*")
+    {
+        lines.push(
+            "sandbox: git trusts repositories of any owner (safe.directory = *); a .git \
+             created by a sandbox command would run its config — remove it"
+                .to_owned(),
+        );
+    }
     ok
+}
+
+#[cfg(not(windows))]
+fn windows_live_checks(
+    _probe: &dyn preflight::Probe,
+    _marked: &[std::path::PathBuf],
+    _slots: u32,
+    _lines: &mut Vec<String>,
+) -> bool {
+    true
 }
 
 #[cfg(test)]

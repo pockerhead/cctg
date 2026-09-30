@@ -105,26 +105,36 @@ fn windows_on(file: &Path, folder: &Path) -> Result<(), i32> {
             1
         })?
         .to_owned();
+    // A slot is consumed by `take`; anything that fails before the mark is
+    // written frees it again (retire + best-effort revoke), so a failed
+    // `sandbox on` never leaves an orphaned slot that `sandbox off` cannot
+    // clean (no mark exists, so off takes the `None` branch).
+    let unwind = |slot_sid: &str| {
+        win::acl::revoke_folder(folder, slot_sid);
+        let _ = win::slots::retire(&win_dir, &folder_str);
+    };
     if let Err(refusal) = profile::folder_dirs(folder, true) {
         eprintln!("cctg sandbox: {refusal}");
+        unwind(&slot_sid);
         return Err(1);
     }
     println!(
         "Выдаю права учётке сэндбокса на {}; на больших папках это может занять минуты…",
         folder.display()
     );
-    let granted = win::acl::grant_folder(folder, &slot_sid, |seen| {
+    let count = match win::acl::grant_folder(folder, &slot_sid, |seen| {
         eprintln!("  … {seen} файлов");
-    });
-    let count = match granted {
+    }) {
         Ok(count) => count,
         Err(_) => {
             eprintln!("cctg sandbox: не удалось выдать права; повторите cctg sandbox on");
+            unwind(&slot_sid);
             return Err(1);
         }
     };
     if win::acl::stamp_protected(folder, &slot_sid, true).is_err() {
         eprintln!("cctg sandbox: не удалось защитить служебные файлы; повторите cctg sandbox on");
+        unwind(&slot_sid);
         return Err(1);
     }
     if let Ok(exe) = std::env::current_exe() {

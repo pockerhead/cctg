@@ -5,18 +5,23 @@
 //! a developer's machine — it prints "skipped" and returns without touching
 //! the system.
 //!
-//! It exercises the acceptance criteria: a command in a marked folder cannot
-//! read the user's files or write another marked folder, secrets are gone from
-//! its environment, its exit code and stdin flow through, and after
-//! `sandbox off` the folder no longer starts a sandboxed command. Then it
-//! uninstalls and checks the accounts and the mark are gone. It starts cctg
-//! only through `tests/common` (no hub is ever contacted).
+//! It exercises the acceptance criteria and the PLAN_FINAL §3 scenario, all
+//! under the real restricted-token slot process: a command cannot read the
+//! user's files or write another marked folder; the sandboxed environment
+//! holds no secret (checked against a whitelist/denylist, not one name); the
+//! exit code and stdin flow through; `.git`/`.claude` and shell/IDE configs are
+//! write-denied; a hard-linked body is write-denied; a bare-repo `HEAD` left in
+//! the root is cleaned up; a junction inside the folder to the outside is not
+//! followed by the token; a TLS network call works (no restricting SIDs); and
+//! after `sandbox off` the folder no longer starts a sandboxed command. Then it
+//! uninstalls and checks the accounts, the group and the mark are gone. cctg is
+//! started only through `tests/common` (no hub is ever contacted).
 
 #![cfg(windows)]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 mod common;
 
@@ -38,8 +43,7 @@ fn git_bash() -> Option<PathBuf> {
     None
 }
 
-/// A cctg subcommand with the fake home and `CCTG_CLAUDE`; returns
-/// (code, stdout, stderr).
+/// A cctg subcommand with the fake home and `CCTG_CLAUDE`.
 fn cctg(home: &Path, claude: &Path, args: &[&str]) -> (i32, String, String) {
     let mut command = common::cctg(home);
     command.args(args).env("CCTG_CLAUDE", claude);
@@ -51,9 +55,61 @@ fn cctg(home: &Path, claude: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// One sandboxed command in `folder` (stdin null). The broker process also
+/// carries the given extra env (e.g. secrets, to prove they do not leak).
+fn broker(home: &Path, folder: &Path, bash: &Path, line: &str, extra: &[(&str, &str)]) -> Output {
+    let mut command = common::cctg(home);
+    command
+        .args(["sandbox-exec", line])
+        .current_dir(folder)
+        .env("CCTG_SANDBOX_MARK", folder)
+        .env("CCTG_SANDBOX_BASH", bash)
+        .env("CCTG_SANDBOX", "1");
+    for (k, v) in extra {
+        command.env(k, v);
+    }
+    common::output(&mut command).expect("broker")
+}
+
 fn write(path: &Path, bytes: &[u8]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, bytes).unwrap();
+}
+
+/// A slash-form path for Bash single quotes.
+fn slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn junction(link: &Path, target: &Path) -> bool {
+    let mut c = Command::new("cmd");
+    c.args(["/C", "mklink", "/J"]).arg(link).arg(target);
+    common::output(&mut c)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// A name that must never reach a sandboxed command (mirrors the runner's
+/// scrub): CCTG_* except the two sandbox vars, CLAUDE*/ANTHROPIC*, *_TOKEN,
+/// *_SECRET, and known token names.
+fn sensitive(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    if up == "CCTG_SANDBOX" || up == "CCTG_SANDBOX_COMMAND" {
+        return false;
+    }
+    up.starts_with("CCTG_")
+        || up.starts_with("CLAUDE")
+        || up.starts_with("ANTHROPIC")
+        || up.ends_with("_TOKEN")
+        || up.ends_with("_SECRET")
+        || matches!(
+            up.as_str(),
+            "GH_TOKEN" | "GITHUB_TOKEN" | "SSH_AUTH_SOCK" | "NPM_TOKEN" | "OPENAI_API_KEY"
+        )
+}
+
+fn settings_path(home: &Path) -> PathBuf {
+    home.join(".cctg").join("claude").join("settings.json")
 }
 
 #[test]
@@ -65,13 +121,17 @@ fn the_windows_sandbox_confines_a_command() {
         return skip("no Git Bash");
     };
 
-    // A throwaway home under the runner's temp.
+    // A throwaway home under the runner's temp, plus a program dir OUTSIDE it.
     let home = std::env::temp_dir().join(format!("cctg-e2e-{}", std::process::id()));
+    let tools = std::env::temp_dir().join(format!("cctg-e2e-tools-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&tools);
     std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("probe.txt"), b"tool-data").unwrap();
 
-    // A claude stand-in that reports a recent version, and the wrapper/shim
-    // markers preflight checks for.
+    // A claude stand-in that reports a recent version; the wrapper/shim
+    // markers preflight checks for; a base settings.json; a read-dirs entry.
     let claude = home.join("fake-claude.cmd");
     write(&claude, b"@echo 2.1.285 (Claude Code)\r\n");
     write(
@@ -86,9 +146,10 @@ fn the_windows_sandbox_confines_a_command() {
         &home.join(".cctg").join("bin").join("cctg-sandbox-exec"),
         b"MSYS_NO_PATHCONV=1 cctg sandbox-exec \"$1\"\n",
     );
+    write(&settings_path(&home), b"{}");
     write(
-        &home.join(".cctg").join("claude").join("settings.json"),
-        b"{}",
+        &home.join(".cctg").join("sandbox").join("read-dirs"),
+        tools.to_string_lossy().as_bytes(),
     );
 
     // Install two slots. On a non-elevated runner this fails; skip cleanly.
@@ -96,45 +157,70 @@ fn the_windows_sandbox_confines_a_command() {
     if code != 0 {
         let _ = cctg(&home, &claude, &["sandbox-uninstall"]);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&tools);
         return skip(&format!("sandbox-install failed ({code}): {out} {err}"));
     }
 
-    let run = || {
+    let bash2 = bash.clone();
+    let claude2 = claude.clone();
+    let home2 = home.clone();
+    let tools2 = tools.clone();
+    let run = move || {
+        let bash = &bash2;
+        let claude = &claude2;
+        let home = &home2;
+        let tools = &tools2;
         let a = home.join("dev").join("A");
         let b = home.join("dev").join("B");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
         write(&home.join("marker.txt"), b"top secret");
 
+        // Setup BEFORE sandbox on (so grant/stamp see them):
+        // - B has a git repo the real user created (its .git must become
+        //   read-only to the slot after sandbox on).
+        std::fs::create_dir_all(b.join(".git").join("hooks")).unwrap();
+        std::fs::write(b.join(".git").join("config"), b"[core]\n").unwrap();
+        // - A hard link from inside A to an outside file (its shared body must
+        //   be write-denied).
+        let outside_file = home.join("linked-outside.txt");
+        std::fs::write(&outside_file, b"shared-body").unwrap();
+        let _ = std::fs::hard_link(&outside_file, a.join("shared.txt"));
+        // - A junction inside A to the home directory (must not be followed).
+        let has_junction = junction(&a.join("linkhome"), home);
+
         for folder in [&a, &b] {
             let (code, _o, err) = cctg(
-                &home,
-                &claude,
+                home,
+                claude,
                 &["sandbox", "on", "--folder", &folder.to_string_lossy()],
             );
             assert_eq!(code, 0, "sandbox on {}: {err}", folder.display());
         }
 
-        // A command in A: identity, a write inside A, a denied read of the
-        // marker and of B, the secret check, stdin echo and a chosen exit code.
-        let marker = home.join("marker.txt").to_string_lossy().replace('\\', "/");
-        let bslash = b.to_string_lossy().replace('\\', "/");
+        // (1) A command in A: identity, write inside A, denied reads/writes,
+        // the env dump, a HEAD left in the root, stdin echo, exit code.
+        let marker = slash(&home.join("marker.txt"));
+        let bslash = slash(&b);
         let line = format!(
-            "whoami; echo wrote > wrote.txt && echo WROTE_OK; \
+            "whoami; \
+             echo wrote > wrote.txt && echo WROTE_OK; \
              (cat '{marker}' && echo READ_MARKER) 2>/dev/null || echo MARKER_DENIED; \
              (echo x > '{bslash}/from_a' && echo WROTE_B) 2>/dev/null || echo B_DENIED; \
-             if set | grep -q CCTG_HUB_SECRET; then echo SECRET_LEAK; else echo NO_SECRET; fi; \
+             echo ref: HEAD > HEAD; \
+             echo '--- ENVNAMES'; env | cut -d= -f1 | sort; echo '--- ENDENV'; \
              cat; exit 7"
         );
-        let mut command = common::cctg(&home);
+        let mut command = common::cctg(home);
         command
             .args(["sandbox-exec", &line])
             .current_dir(&a)
             .env("CCTG_SANDBOX_MARK", &a)
-            .env("CCTG_SANDBOX_BASH", &bash)
+            .env("CCTG_SANDBOX_BASH", bash)
             .env("CCTG_SANDBOX", "1")
             .env("CCTG_HUB_SECRET", "e2e-dummy-secret")
             .env("GH_TOKEN", "e2e-dummy-token")
+            .env("ANTHROPIC_API_KEY", "e2e-dummy-key")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -162,29 +248,142 @@ fn the_windows_sandbox_confines_a_command() {
         assert!(!stdout.contains("top secret"), "marker not read: {stdout}");
         assert!(stdout.contains("B_DENIED"), "write to B denied: {stdout}");
         assert!(!b.join("from_a").exists(), "B unwritten");
-        assert!(stdout.contains("NO_SECRET"), "no secret in env: {stdout}");
         assert!(
             stdout.contains("STDIN_REACHED"),
             "stdin reached the command: {stdout}"
         );
         assert_eq!(code, 7, "the command's own exit code: {stdout}");
 
-        // After sandbox off, A no longer starts a sandboxed command.
+        // Whitelist/denylist of the sandboxed environment: no sensitive name,
+        // and the expected overlay names are present.
+        let names: Vec<&str> = stdout
+            .lines()
+            .skip_while(|l| l.trim() != "--- ENVNAMES")
+            .skip(1)
+            .take_while(|l| l.trim() != "--- ENDENV")
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(!names.is_empty(), "env names captured: {stdout}");
+        for name in &names {
+            assert!(
+                !sensitive(name),
+                "sensitive env var leaked: {name}\n{stdout}"
+            );
+        }
+        for required in ["CCTG_SANDBOX", "PATH", "HOME", "TEMP", "CARGO_HOME"] {
+            assert!(
+                names.iter().any(|n| n.eq_ignore_ascii_case(required)),
+                "missing expected env {required}: {names:?}"
+            );
+        }
+
+        // The bare-repo HEAD the command left in the root was cleaned up.
+        assert!(
+            !a.join("HEAD").exists(),
+            "a slot-created HEAD is removed after the command"
+        );
+
+        // (2) Protected files, under the real token, in B.
+        let protect = "(echo x >> .git/config && echo WROTE_GITCONFIG) 2>/dev/null || echo GITCONFIG_DENIED; \
+             (touch .git/hooks/x && echo WROTE_HOOK) 2>/dev/null || echo HOOK_DENIED; \
+             (mkdir .claude/x && echo MADE_CLAUDE) 2>/dev/null || echo CLAUDE_DENIED";
+        let o = broker(home, &b, bash, protect, &[]);
+        let s = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            s.contains("GITCONFIG_DENIED"),
+            ".git/config write denied: {s}"
+        );
+        assert!(s.contains("HOOK_DENIED"), ".git/hooks write denied: {s}");
+        assert!(s.contains("CLAUDE_DENIED"), ".claude write denied: {s}");
+
+        // (3) The hard-linked body in A is write-denied.
+        let o = broker(
+            home,
+            &a,
+            bash,
+            "(printf x > shared.txt && echo WROTE_SHARED) 2>/dev/null || echo SHARED_DENIED",
+            &[],
+        );
+        let s = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            s.contains("SHARED_DENIED"),
+            "hard-linked body write denied: {s}"
+        );
+        assert_eq!(
+            std::fs::read(&outside_file).unwrap(),
+            b"shared-body",
+            "the outside body is unchanged"
+        );
+
+        // (4) A junction inside A to the outside is not followed by the token.
+        if has_junction {
+            let o = broker(
+                home,
+                &a,
+                bash,
+                "(cat linkhome/marker.txt && echo READ_VIA_JUNCTION) 2>/dev/null || echo JUNCTION_DENIED",
+                &[],
+            );
+            let s = String::from_utf8_lossy(&o.stdout);
+            assert!(s.contains("JUNCTION_DENIED"), "junction not followed: {s}");
+            assert!(
+                !s.contains("top secret"),
+                "marker not read via junction: {s}"
+            );
+        }
+
+        // (5) A TLS network call works (no restricting SIDs break Schannel).
+        let o = broker(
+            home,
+            &a,
+            bash,
+            "curl -sS -o /dev/null -w 'HTTP %{http_code}\\n' https://github.com 2>&1 || echo CURL_ERR",
+            &[],
+        );
+        let s = String::from_utf8_lossy(&o.stdout);
+        assert!(
+            !s.contains("SEC_E_NO_CREDENTIALS") && !s.to_lowercase().contains("no credentials"),
+            "Schannel credentials error inside the sandbox: {s}"
+        );
+
+        // (6) read-dirs: a sandbox-check in A syncs the group grant, then the
+        // tools dir is readable but not writable. Best effort: the grant is
+        // applied at session start; if sandbox-check refuses, skip.
+        let check_code = {
+            let mut c = common::cctg(home);
+            c.args(["sandbox-check", "--settings"])
+                .arg(settings_path(home))
+                .current_dir(&a)
+                .env("CCTG_CLAUDE", claude)
+                .env("CLAUDE_CODE_GIT_BASH_PATH", bash);
+            common::output(&mut c).unwrap().status.code().unwrap_or(-1)
+        };
+        if check_code == 0 {
+            let probe = slash(&tools.join("probe.txt"));
+            let line = format!(
+                "(cat '{probe}' >/dev/null && echo READ_TOOL) 2>/dev/null || echo TOOL_READ_DENIED; \
+                 (echo x > '{probe}' && echo WROTE_TOOL) 2>/dev/null || echo TOOL_WRITE_DENIED"
+            );
+            let o = broker(home, &a, bash, &line, &[]);
+            let s = String::from_utf8_lossy(&o.stdout);
+            assert!(s.contains("READ_TOOL"), "read-dirs allows reading: {s}");
+            assert!(
+                s.contains("TOOL_WRITE_DENIED"),
+                "read-dirs is read-only: {s}"
+            );
+        }
+
+        // (7) After sandbox off, A no longer starts a sandboxed command.
         let (code, _o, _e) = cctg(
-            &home,
-            &claude,
+            home,
+            claude,
             &["sandbox", "off", "--folder", &a.to_string_lossy()],
         );
         assert_eq!(code, 0, "sandbox off");
-        let mut refused = common::cctg(&home);
-        refused
-            .args(["sandbox-exec", "echo should-not-run"])
-            .current_dir(&a)
-            .env("CCTG_SANDBOX_MARK", &a)
-            .env("CCTG_SANDBOX_BASH", &bash);
-        let out = common::output(&mut refused).unwrap();
+        let o = broker(home, &a, bash, "echo should-not-run", &[]);
         assert_eq!(
-            out.status.code(),
+            o.status.code(),
             Some(125),
             "an unmarked folder is refused by the broker"
         );
@@ -194,14 +393,21 @@ fn the_windows_sandbox_confines_a_command() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
     let (code, _o, err) = cctg(&home, &claude, &["sandbox-uninstall"]);
     assert_eq!(code, 0, "sandbox-uninstall: {err}");
-    // The mark key is gone.
-    let mut reg = Command::new("reg");
-    reg.args(["query", r"HKLM\SOFTWARE\cctg\sandbox"]);
-    let mark_gone = common::output(&mut reg)
-        .map(|o| !o.status.success())
-        .unwrap_or(true);
+    let gone = |args: &[&str]| {
+        let mut c = Command::new(args[0]);
+        c.args(&args[1..]);
+        common::output(&mut c)
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+    };
+    let key_gone = gone(&["reg", "query", r"HKLM\SOFTWARE\cctg\sandbox"]);
+    let group_gone = gone(&["net", "localgroup", "cctg-sandbox"]);
+    let user_gone = gone(&["net", "user", "cctg-sandbox-1"]);
     let _ = std::fs::remove_dir_all(&home);
-    assert!(mark_gone, "the install mark is gone after uninstall");
+    let _ = std::fs::remove_dir_all(&tools);
+    assert!(key_gone, "the install mark is gone after uninstall");
+    assert!(group_gone, "the sandbox group is gone after uninstall");
+    assert!(user_gone, "the slot account is gone after uninstall");
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

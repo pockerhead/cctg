@@ -24,7 +24,6 @@ use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     CreateProcessAsUserW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -131,7 +130,13 @@ fn run_inner() -> anyhow::Result<i32> {
         anyhow::bail!("on Default desktop");
     }
     let primary = make_sandbox_token(self_token.raw())?;
-    let env = build_env_block(&spec.env_overlay);
+    // The child's environment is built from the slot user's own profile
+    // (CreateEnvironmentBlock, no inheritance) plus the broker's whitelist
+    // overlay. CreateProcessWithLogonW gives the runner the BROKER's
+    // environment (NULL lpEnvironment inherits the caller's), so the runner's
+    // own env is NOT used for the child — otherwise the broker's CCTG_* and
+    // tokens would leak in. A denylist scrub is a second guard.
+    let env = build_env_block(&spec.env_overlay, self_token.raw());
     let cmdline = build_cmdline(&spec.argv);
     let mut cmdline_w = wide(&cmdline);
     let app_w = wide(&spec.argv[0]);
@@ -362,15 +367,20 @@ fn quote_arg(a: &str) -> String {
     out
 }
 
-/// A UTF-16 environment block from this process's env with `overlay` applied
-/// (overlay replaces a base entry whose name matches case-insensitively).
-fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
-    let mut entries = current_env();
-    let upper: std::collections::HashSet<String> = overlay
+/// A UTF-16 environment block for the child: the slot user's profile
+/// environment (from `token`, no inheritance) with the broker's `overlay`
+/// applied on top (overlay wins case-insensitively). A name the overlay
+/// provides, or a sensitive one ([`sensitive`]), never survives from the base.
+fn build_env_block(overlay: &[(String, String)], token: HANDLE) -> Vec<u16> {
+    let mut entries = env_from_token(token);
+    let overlay_keys: std::collections::HashSet<String> = overlay
         .iter()
         .map(|(k, _)| k.to_ascii_uppercase())
         .collect();
-    entries.retain(|(k, _)| !upper.contains(&k.to_ascii_uppercase()));
+    entries.retain(|(k, _)| {
+        let up = k.to_ascii_uppercase();
+        !overlay_keys.contains(&up) && !sensitive(&up)
+    });
     for (k, v) in overlay {
         entries.push((k.clone(), v.clone()));
     }
@@ -386,23 +396,51 @@ fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     out
 }
 
-/// The runner's own environment as `(name, value)` pairs.
-fn current_env() -> Vec<(String, String)> {
-    // SAFETY: returns a double-NUL UTF-16 block owned by the OS.
-    let block = unsafe { GetEnvironmentStringsW() };
-    if block.is_null() {
+/// A variable name (uppercased) that must never reach a sandboxed command: any
+/// `CCTG_*` / `CLAUDE*` / `ANTHROPIC*`, a known token/secret name, or a
+/// `*_TOKEN` / `*_SECRET` name. `CCTG_SANDBOX` and `CCTG_SANDBOX_COMMAND` are
+/// re-added from the trusted overlay after this filter.
+fn sensitive(up: &str) -> bool {
+    up.starts_with("CCTG_")
+        || up.starts_with("CLAUDE")
+        || up.starts_with("ANTHROPIC")
+        || up.ends_with("_TOKEN")
+        || up.ends_with("_SECRET")
+        || matches!(
+            up,
+            "GH_TOKEN" | "GITHUB_TOKEN" | "SSH_AUTH_SOCK" | "NPM_TOKEN" | "OPENAI_API_KEY"
+        )
+}
+
+/// The profile environment of `token`'s user as `(name, value)` pairs,
+/// via `CreateEnvironmentBlock` with NO inheritance (so the runner's own
+/// inherited env is not used). Empty on failure (fail closed: the child then
+/// gets only the overlay).
+fn env_from_token(token: HANDLE) -> Vec<(String, String)> {
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
+    };
+    let mut block: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `token` is a valid token; binherit = FALSE (0).
+    if unsafe { CreateEnvironmentBlock(&mut block, token, 0) } == 0 || block.is_null() {
         return Vec::new();
     }
-    let mut pairs = Vec::new();
-    // SAFETY: block is a double-NUL-terminated UTF-16 environment block.
+    let pairs = parse_env_block(block as *const u16);
+    // SAFETY: `block` came from CreateEnvironmentBlock.
     unsafe {
-        let mut p = block;
-        loop {
-            if *p == 0 {
-                break;
-            }
+        let _ = DestroyEnvironmentBlock(block);
+    }
+    pairs
+}
+
+/// A double-NUL-terminated UTF-16 environment block as `(name, value)` pairs.
+fn parse_env_block(ptr: *const u16) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    // SAFETY: `ptr` is a double-NUL-terminated UTF-16 environment block.
+    unsafe {
+        let mut p = ptr;
+        while *p != 0 {
             let entry = from_wide(p);
-            // Advance past this entry and its NUL.
             let mut len = 0;
             while *p.add(len) != 0 {
                 len += 1;
@@ -414,7 +452,6 @@ fn current_env() -> Vec<(String, String)> {
                 pairs.push((entry[..eq].to_owned(), entry[eq + 1..].to_owned()));
             }
         }
-        let _ = FreeEnvironmentStringsW(block);
     }
     pairs
 }
@@ -513,9 +550,51 @@ mod tests {
     }
 
     #[test]
-    fn env_overlay_replaces_case_insensitively() {
-        let base = build_env_block(&[("cctg_test_marker_XYZ".into(), "1".into())]);
-        let text = String::from_utf16_lossy(&base);
-        assert!(text.contains("cctg_test_marker_XYZ=1"));
+    fn the_child_env_carries_the_overlay_and_drops_sensitive_base_vars() {
+        // Build against the test process's own token; the overlay is applied
+        // and the slot profile base never keeps a secret.
+        let token = open_self_token().expect("self token");
+        let block = build_env_block(
+            &[
+                ("CCTG_SANDBOX".into(), "1".into()),
+                ("PATH".into(), "C:/x".into()),
+            ],
+            token.raw(),
+        );
+        let text = String::from_utf16_lossy(&block);
+        assert!(text.contains("CCTG_SANDBOX=1"), "overlay is present");
+        assert!(text.contains("PATH=C:/x"), "overlay PATH wins");
+        // No secret from the base survives (defence in depth beyond the clean
+        // CreateEnvironmentBlock base).
+        for leak in ["CCTG_HUB_SECRET", "GH_TOKEN", "ANTHROPIC_API_KEY"] {
+            assert!(!text.contains(&format!("{leak}=")), "{leak} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn sensitive_names_are_scrubbed() {
+        for yes in [
+            "CCTG_HUB_SECRET",
+            "CCTG_JOIN_CODE",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+            "SOME_TOKEN",
+            "APP_SECRET",
+        ] {
+            assert!(sensitive(yes), "{yes}");
+        }
+        for no in [
+            "PATH",
+            "HOME",
+            "APPDATA",
+            "SYSTEMROOT",
+            "CARGO_HOME",
+            "GIT_CONFIG_GLOBAL",
+        ] {
+            assert!(!sensitive(no), "{no}");
+        }
     }
 }
