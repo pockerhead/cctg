@@ -719,8 +719,8 @@ write_wrappers() {
     # sandbox-check (TASK-087): 0 prints the sandbox profile of a marked
     # folder, 10 means not marked; anything else starts nothing (fail
     # closed). The flags of branch 0) are sandbox::profile::FLAGS.
-    # probe P2p: if the profile's CLAUDE_CODE_SUBPROCESS_ENV_SCRUB does not
-    # act, branch 0) starts with CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 exec.
+    # Probe P2p (WSL): the profile's CLAUDE_CODE_SUBPROCESS_ENV_SCRUB acts,
+    # branch 0) needs nothing more.
     make_room "$wrapper"
     put "$wrapper" 755 <<EOF
 #!/bin/sh

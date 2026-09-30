@@ -2,7 +2,7 @@
 
 Режим клиента cctg (TASK-087, часть A): сессия, запущенная через `claude-cctg` в помеченной папке, не читает и не пишет ничего вне этой папки. Работает на Linux (включая WSL2) и macOS. На Windows пока нет, `cctg sandbox on` там отказывает.
 
-Статус проверки: код и unit-тесты готовы, пробы с настоящим Claude Code на Linux и macOS ещё не сделаны. Пока их нет, всё, что помечено ниже «не проверено пробой», считайте обещанием, а не фактом.
+Статус проверки: пробы с настоящим Claude Code прошли на Linux в WSL2 (Ubuntu 22.04, ядро 5.15, Claude Code 2.1.285, bubblewrap 0.6.1, 2026-09-30). На macOS проб не было: всё про macOS ниже не проверено. Живой сессии `claude-cctg` через Telegram в сэндбоксе ещё не было.
 
 ## Как включить
 
@@ -29,7 +29,7 @@
 
 - Claude Code 2.1.284 или новее.
 - Linux: `bubblewrap` и `socat` (`apt install bubblewrap socat`), разрешённые user namespaces. На Ubuntu 24.04 их запрещает AppArmor для непривилегированных процессов; нужен профиль для `bwrap` или `sysctl kernel.apparmor_restrict_unprivileged_userns=0` (решение за вами, это системная настройка). Рекомендуется seccomp-фильтр Claude Code (`npm install -g @anthropic-ai/sandbox-runtime`): без него командам доступны Unix-сокеты вне закрытых путей.
-- WSL2: запуск программ Windows выключен (`[interop] enabled=false` в `/etc/wsl.conf`, затем `wsl --shutdown`). Иначе `cmd.exe` из сэндбокса выполняется в Windows вне всякого сэндбокса (не проверено пробой P10). cctg смотрит оба имени обработчика: `WSLInterop` и `WSLInterop-late` (так его называют дистрибутивы с systemd).
+- WSL2: выключать запуск программ Windows не нужно. Проба с включённым interop показала, что `cmd.exe` из сэндбокса не запускается (ни по имени, ни по полному пути), хотя `/mnt/c` читается. Проверено в одной конфигурации (выше).
 - macOS: `/usr/bin/sandbox-exec` (есть в системе).
 - В `~/.claude/settings.json` не должно быть ключей, которые расширяют сэндбокс: `permissions.additionalDirectories`, `sandbox.filesystem.allowWrite`, `sandbox.filesystem.allowRead`, `sandbox.excludedCommands`, `sandbox.network.allowUnixSockets`, `sandbox.network.allowMachLookup` (macOS) и правил `Edit(путь)`, `Write(путь)`, `NotebookEdit(путь)` в `permissions.allow`. Массивы из пользовательских настроек складываются с профилем, и отменить их нельзя, поэтому cctg с ними отказывает и называет ключи. Флаги, которые ослабляют сэндбокс (`allowAppleEvents`, `enableWeakerNetworkIsolation`, `enableWeakerNestedSandbox`, `autoAllowBashIfSandboxed`, `network.allowLocalBinding`, `network.allowAllUnixSockets`, `filesystem.disabled`, `allowUnsandboxedCommands`), профиль ставит сам, и его значение сильнее пользовательского: с ними cctg не отказывает, они просто не действуют.
 - `CLAUDE_CONFIG_DIR` не задан.
@@ -42,11 +42,11 @@
 
 - строгий сэндбокс Claude Code для Bash и всех его дочерних процессов (`failIfUnavailable`, без выхода из сэндбокса);
 - запрет чтения вне рабочей папки для файловых инструментов (`blockReadsOutsideWorkingDirectories`);
-- запрет инструментов, которые выводят за папку: `/cd`, `Artifact`, `SendUserFile`, `SendMessage`, `ListAgents`, `RemoteTrigger`, computer-use, Chrome, коннекторы claude.ai; чтение чужих транскриптов и `~/.claude/history.jsonl` инструментом Read;
+- запрет инструментов, которые выводят за папку: `/cd`, `Artifact`, `SendUserFile`, `SendMessage`, `ListAgents`, `RemoteTrigger`, computer-use, Chrome, `DesignSync`, коннекторы claude.ai (чужие транскрипты и `~/.claude/history.jsonl` инструмент Read не прочтёт: их закрывает блок чтения);
 - хук `cctg sandbox-gate`: Write, Edit, NotebookEdit и EnterWorktree только внутри папки и не в `.claude`, `.git`, `.vscode`, `.idea`, `.mcp.json`, конфиги shell; план plan mode в `~/.claude/plans` разрешён;
 - очистка учётных данных из окружения команд, хуков и MCP (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`), запрет `CCTG_*`, `GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`;
 - копия gitconfig только с `user.name` и `user.email`; глобальный `~/.gitconfig` командам не виден;
-- свой temp: `~/.cctg/sandbox/tmp/<hash>/`.
+- git-переменные (`GIT_CONFIG_GLOBAL` на копию, `GIT_CONFIG_NOSYSTEM`, `GIT_TERMINAL_PROMPT=0`) cctg передаёт Bash через `CLAUDE_ENV_FILE`: из `env` профиля Claude Code переменные `GIT_*` не пропускает.
 
 claude запускается с `--strict-mcp-config --setting-sources user --no-chrome`: MCP-серверы, хуки и настройки проекта не грузятся (они работали бы вне сэндбокса).
 
@@ -86,16 +86,21 @@ claude запускается с `--strict-mcp-config --setting-sources user --n
 - Хуки, настройки и скиллы проекта (`.claude/` папки не грузится).
 - Память проекта (`autoMemoryEnabled` выключен).
 - Пересылка сообщения субагенту из Telegram (`target_agent`): без `SendMessage` модель выполнит его сама.
-- Авто-разрешение команд сэндбокса: в режиме `default` запросы разрешений пойдут в Telegram.
-- Выполнение `` !`команда` `` в пользовательских скиллах (выключено, пока проба P6 не покажет, что сэндбокс его закрывает).
+- Авто-разрешение команд сэндбокса и режимы разрешений: очистка окружения (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`) переводит сессию в режим `default`, так что plan mode, auto и acceptEdits недоступны, а запросы разрешений идут в Telegram.
+- Worktree: `EnterWorktree` в сэндбоксе не создаёт worktree, потому что `.git` там только для чтения.
+- Составные команды с `cd` (`cd sub && cargo build`) Claude Code иногда не может проверить блоком чтения и спрашивает разрешение. Команды с путём внутри папки (`cargo build --manifest-path sub/Cargo.toml`) идут без вопроса.
+- Выполнение `` !`команда` `` в пользовательских скиллах (выключено: проба, закрывает ли его сэндбокс, не делалась).
 
 ## Честные пределы
 
 - `!` и `/add-dir`, набранные вами в терминале, работают вне сэндбокса.
 - Хуки и плагины из `~/.claude` (ваш конфиг) работают вне сэндбокса.
 - Системные каталоги (`/usr`, `/etc`) читаются.
-- Linux: без seccomp-фильтра командам доступны Unix-сокеты вне закрытых путей. Общий `/tmp` закрыт списком, который ещё проверит проба P3.
-- macOS: `/tmp` читается (не проверено пробой P3m); список процессов виден.
+- Linux: без seccomp-фильтра командам доступны Unix-сокеты вне закрытых путей. `/run/user`, сокеты docker, containerd и podman закрыты.
+- Temp общий: `/tmp` и `/var/tmp` команды читают и пишут. Свой temp для папки задать нельзя: Claude Code держит temp сэндбокса в `/tmp/claude-<uid>`, `CLAUDE_CODE_TMPDIR` из профиля на это не влияет.
+- Claude Code сам кладёт в папку пустые файлы-заглушки для точек монтирования сэндбокса (`.env*`, `.npmrc`, `.yarnrc*`, `.gitmodules`), и внутри сэндбокса на месте `.bashrc`, `.gitconfig`, `.mcp.json` и подобных видны устройства. Поэтому `git add -A` в сэндбоксе падает («can only add regular files»): добавляйте файлы явно. Заглушки после сессии можно удалить.
+- `GH_TOKEN` доходит до хуков и MCP-серверов (они работают вне сэндбокса), но не до команд Bash.
+- macOS: `/tmp` читается; список процессов виден (не проверено пробой).
 - Сеть открыта.
 - Общий `.git` связанного worktree пишется через worktree.
 - Код папки, который вы сами запускаете вне сэндбокса (`build.rs`, `Makefile`, кэш cargo из `.cctg/sandbox`), выполняется без ограничений.
@@ -106,7 +111,7 @@ claude запускается с `--strict-mcp-config --setting-sources user --n
 
 ## Как всё удалить
 
-`install.sh --uninstall` удаляет сгенерированные профили (`~/.cctg/claude/sandbox/`). Метки, allowlist, temp и копии gitconfig остаются в `~/.cctg/sandbox/`, их удалите руками:
+`install.sh --uninstall` удаляет сгенерированные профили (`~/.cctg/claude/sandbox/`). Метки, allowlist и копии gitconfig остаются в `~/.cctg/sandbox/`, их удалите руками:
 
 ```sh
 rm -rf ~/.cctg/sandbox

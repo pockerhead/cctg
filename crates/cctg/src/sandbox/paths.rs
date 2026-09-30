@@ -122,7 +122,8 @@ fn key(component: Component<'_>) -> String {
 /// applies to the rest of the path (a worktree is a working folder of its
 /// own). A path outside the folder is not "protected" ([`contains`] says
 /// no); one that cannot be resolved is (fail closed).
-// probe P9: the worktree rule follows where EnterWorktree really writes.
+// Probe P9: worktrees cannot be created in the sandbox; the rule stays for
+// a worktree made outside it.
 pub fn protected(root: &Path, path: &Path) -> bool {
     let (Some(root), Some(path)) = (canonical(root), resolve(root, path)) else {
         return true;
@@ -152,7 +153,7 @@ pub fn protected(root: &Path, path: &Path) -> bool {
 
 /// A plan file of plan mode: a `*.md` right in `<config_dir>/plans`, and
 /// when it exists, a plain file (no link out).
-// probe P8: plan mode must write its plan right in <config>/plans.
+// Probe P8: plan mode is not available in the profile (see gate.rs).
 pub fn plan_file(config_dir: &Path, path: &Path) -> bool {
     if !path.is_absolute() {
         return false;

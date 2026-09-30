@@ -38,7 +38,7 @@ pub fn home_dir_of(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
 }
 
 /// `<home>/.cctg/sandbox`: marks (`folders.json`), the read allowlist
-/// (`read-dirs`), temp dirs (`tmp/<hash>`) and gitconfig copies
+/// (`read-dirs`) and gitconfig copies
 /// (`git/<hash>`). Sandboxed commands never write here.
 pub fn sandbox_home(home: &Path) -> PathBuf {
     home.join(".cctg").join("sandbox")

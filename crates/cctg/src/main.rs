@@ -109,7 +109,7 @@ enum Command {
         /// cctg's settings.json.
         #[arg(long)]
         settings: PathBuf,
-        /// TASK-087 probes only: skip the WSL interop refusal and write
+        /// TASK-087 probes only: write the profile as
         /// `sandbox/probe-<hash>.json`, which no start or restart takes.
         #[arg(long, hide = true)]
         probe_run: bool,

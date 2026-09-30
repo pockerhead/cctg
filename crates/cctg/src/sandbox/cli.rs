@@ -139,10 +139,7 @@ pub fn status(folder: Option<PathBuf>) -> i32 {
 pub fn check(settings: &Path, probe_run: bool) -> i32 {
     let cwd = std::env::current_dir().ok();
     if probe_run {
-        eprintln!(
-            "cctg sandbox-check: a probe profile (TASK-087): WSL interop is not checked; \
-             not for real sessions"
-        );
+        eprintln!("cctg sandbox-check: a probe profile (TASK-087), not for real sessions");
         return check_in(&RealProbe, settings, cwd, true);
     }
     check_with(&RealProbe, settings, cwd)

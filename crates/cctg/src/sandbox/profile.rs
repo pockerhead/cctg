@@ -6,7 +6,7 @@
 //! at `settings.json`) on every restart.
 //!
 //! Nothing an unsandboxed process consumes lives in the folder, where
-//! sandboxed commands write: temp and the gitconfig copy are in
+//! sandboxed commands write: the gitconfig copy is in
 //! `~/.cctg/sandbox/`. Tool caches in `<folder>/.cctg/sandbox/` reach Bash
 //! only (`CLAUDE_ENV_FILE`, hook SessionStart), never the profile's `env`,
 //! which also reaches hooks, the status line and MCP servers.
@@ -30,14 +30,13 @@ pub const FLAGS: [&str; 4] = [
     "--no-chrome",
 ];
 
-/// Linux: shared places sandboxed commands could still read. Candidate list
-/// until probe P3 (TASK-087 step 0) confirms each entry; an entry that
-/// breaks the session goes to the documented limits instead.
-// probe P3: drop an entry that breaks P1/P2/P5 or curl; probe P2: without a
-// working CLAUDE_CODE_TMPDIR drop /tmp and /var/tmp.
+/// Linux: shared places sandboxed commands could still read. Not `/tmp` and
+/// `/var/tmp`: probe P2 (WSL, 2.1.285) showed that `CLAUDE_CODE_TMPDIR` in
+/// the profile does not move the sandbox temp (`TMPDIR` stays
+/// `/tmp/claude-<uid>`), so temp is shared with the user's other sessions
+/// (docs/sandbox.md).
+// Probe P3 (WSL): all four are refused, P1, P5 and curl still work.
 pub const LINUX_EXTRA_DENY_READ: &[&str] = &[
-    "/tmp",
-    "/var/tmp",
     "/run/user",
     "/run/docker.sock",
     "/var/run/docker.sock",
@@ -51,8 +50,8 @@ pub const LINUX_EXTRA_DENY_READ: &[&str] = &[
 pub const MACOS_EXTRA_DENY_READ: &[&str] = &[];
 
 /// `disableSkillShellExecution`: a user skill's `` !`cmd` `` might run
-/// outside the sandbox. On until probe P6 shows the sandbox covers it.
-// probe P6: false when `!`cat ~/.bashrc`` in a user skill is refused.
+/// outside the sandbox. Probe P6 was not run (it would put a skill into
+/// the user's `~/.claude`), so it stays on.
 pub const SKILL_SHELL_OFF: bool = true;
 
 /// Tool homes under `<folder>/.cctg/sandbox/`.
@@ -62,9 +61,9 @@ pub const CACHE_DIRS: [&str; 6] = ["cargo", "cache", "data", "state", "npm", "go
 /// to `CLAUDE_ENV_FILE`): the caches live in the folder, `HOME` stays (rustup
 /// finds `~/.rustup` through it). `None` for a folder that is not absolute or
 /// has `'` or a control character (it could not be quoted safely).
-// probe P4: the values must reach Bash, also after a `cd`.
+// Probe P4 (WSL): they reach Bash, also after a `cd`.
 pub fn cache_exports(folder: &str) -> Option<String> {
-    if !Path::new(folder).is_absolute() || folder.chars().any(|c| c == '\'' || c.is_control()) {
+    if !quotable(folder) {
         return None;
     }
     let own = format!("{}/.cctg/sandbox", folder.trim_end_matches('/'));
@@ -86,6 +85,25 @@ pub fn cache_exports(folder: &str) -> Option<String> {
     }))
 }
 
+/// The git variables for Bash: the user-name-only gitconfig copy, no system
+/// config, no password prompt. Probe P2e: Claude Code passes none of
+/// `GIT_CONFIG_*` from the profile's `env` on, so they go this way.
+pub fn git_exports(gitconfig: &str) -> Option<String> {
+    quotable(gitconfig).then(|| {
+        format!(
+            "export GIT_CONFIG_GLOBAL='{gitconfig}'\nexport GIT_CONFIG_NOSYSTEM='1'\nexport GIT_TERMINAL_PROMPT='0'\n"
+        )
+    })
+}
+
+/// An absolute path that fits in single quotes of a shell line.
+fn quotable(path: &str) -> bool {
+    Path::new(path).is_absolute() && !path.chars().any(|c| c == '\'' || c.is_control())
+}
+
+/// The profile variable that names the gitconfig copy for [`git_exports`].
+pub const GITCONFIG_VAR: &str = "CCTG_SANDBOX_GITCONFIG";
+
 /// Appends [`cache_exports`] to `CLAUDE_ENV_FILE` when this session runs with
 /// a profile. `None`: nothing to do.
 pub fn export_caches(var: &impl Fn(&str) -> Option<String>) -> Option<std::io::Result<()>> {
@@ -93,7 +111,10 @@ pub fn export_caches(var: &impl Fn(&str) -> Option<String>) -> Option<std::io::R
         return None;
     }
     let file = var("CLAUDE_ENV_FILE").filter(|file| !file.trim().is_empty())?;
-    let lines = cache_exports(&var("CLAUDE_PROJECT_DIR")?)?;
+    let mut lines = cache_exports(&var("CLAUDE_PROJECT_DIR")?)?;
+    if let Some(git) = var(GITCONFIG_VAR).and_then(|path| git_exports(&path)) {
+        lines.push_str(&git);
+    }
     Some((|| {
         let mut out = std::fs::OpenOptions::new()
             .create(true)
@@ -107,12 +128,14 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Tools that lead out of the folder (TASK-087 F6): `/cd`, publishing a file
 /// past cctg's checks, messages to the user's other sessions, cloud
-/// routines, the desktop and the browser. The two `Read` rules close other
-/// projects' transcripts and the prompt history to the Read tool even if the
-/// read block lets `~/.claude` through.
-// probe P7: add any tool the model still lists that leads out of the folder.
-// probe P1r: the two Read rules may go when the block alone refuses them.
-// probe P8: add EnterPlanMode if plan mode writes outside <config>/plans.
+/// routines, the desktop and the browser. Other projects' transcripts and
+/// the prompt history need no rule: probe P1r showed the read block refuses
+/// the Read tool there.
+// probe P7 (WSL run 3): of the listed tools only DesignSync publishes
+// outside; SendMessage, ListAgents, Artifact, SendUserFile, RemoteTrigger,
+// computer-use, Chrome and claude.ai connectors are not listed.
+// Probe P8: plan mode is not available (the env scrub forces the default
+// permission mode), so EnterPlanMode needs no rule.
 const DENY: &[&str] = &[
     "Cd",
     "Artifact",
@@ -122,8 +145,7 @@ const DENY: &[&str] = &[
     "RemoteTrigger",
     "mcp__computer-use",
     "mcp__claude-in-chrome",
-    "Read(~/.claude/projects/**)",
-    "Read(~/.claude/history.jsonl)",
+    "DesignSync",
 ];
 
 /// Variables sandboxed commands never see.
@@ -226,10 +248,9 @@ pub fn prepare(
     prepare_in(probe, base_settings, folder, exe, false)
 }
 
-/// A profile for the TASK-087 probes only: WSL interop is not refused
-/// (probe P10 runs with it on) and the file is `sandbox/probe-<hash>.json`,
-/// a name [`base_of`] does not know, so no wrapper start and no restart
-/// ever takes it.
+/// A profile for the TASK-087 probes only: the same checks and contents,
+/// but the file is `sandbox/probe-<hash>.json`, a name [`base_of`] does not
+/// know, so no wrapper start and no restart ever takes it.
 pub fn prepare_probe_run(
     probe: &dyn Probe,
     base_settings: &Path,
@@ -246,11 +267,7 @@ fn prepare_in(
     exe: &Path,
     probe_run: bool,
 ) -> Result<PathBuf, Refusal> {
-    if probe_run {
-        preflight::check_probe_run(probe, folder)?;
-    } else {
-        preflight::check(probe, folder)?;
-    }
+    preflight::check(probe, folder)?;
     let home = probe.home().ok_or(Refusal::NoHome)?;
     let home = probe.canonical(&home).unwrap_or(home);
     let private = preflight::private_dirs(probe, &home);
@@ -264,8 +281,6 @@ fn prepare_in(
 
     let id = hash(folder);
     let sandbox = sandbox_home(&home);
-    let tmp = sandbox.join("tmp").join(&id);
-    create_private_dir(&tmp).map_err(|_| Refusal::Io("~/.cctg/sandbox/tmp"))?;
     let git_dir = sandbox.join("git");
     create_private_dir(&git_dir).map_err(|_| Refusal::Io("~/.cctg/sandbox/git"))?;
     let gitconfig = git_dir.join(&id);
@@ -295,13 +310,7 @@ fn prepare_in(
 
     merge(
         &mut settings,
-        overlay(
-            &text(&tmp)?,
-            &text(&gitconfig)?,
-            allow_read,
-            deny_read,
-            &exe,
-        ),
+        overlay(&text(&gitconfig)?, allow_read, deny_read, &exe),
     );
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|_| Refusal::Io("профиль"))?;
     let mut path = profile_path(base_settings, folder);
@@ -315,27 +324,20 @@ fn prepare_in(
     Ok(path)
 }
 
-fn overlay(
-    tmp: &str,
-    gitconfig: &str,
-    allow_read: Vec<String>,
-    deny_read: Vec<String>,
-    exe: &str,
-) -> Value {
+fn overlay(gitconfig: &str, allow_read: Vec<String>, deny_read: Vec<String>, exe: &str) -> Value {
     let secrets: Vec<Value> = SECRET_VARS
         .iter()
         .map(|name| json!({ "name": name, "mode": "deny" }))
         .collect();
     let mut overlay = json!({
-        // probe P2e: all of env must reach Bash, hooks and MCP; probe P2:
-        // CLAUDE_CODE_TMPDIR; probe P2p: the scrub (else the wrapper sets it).
+        // probe P2e (WSL run 3): these reach Bash, hooks and MCP; GIT_*
+        // names do not (git_exports). Probe P2p: the scrub acts from here
+        // (no secret in Bash); it also forces the permission mode to
+        // default (plan, auto and acceptEdits are not available).
         "env": {
             "CCTG_SANDBOX": "1",
-            "CLAUDE_CODE_TMPDIR": tmp,
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-            "GIT_CONFIG_GLOBAL": gitconfig,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
+            "CCTG_SANDBOX_GITCONFIG": gitconfig,
             "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
         },
         "sandbox": {
@@ -588,11 +590,19 @@ mod tests {
         let gitconfig = sandbox_home(&home).join("git").join(&id);
         let env = &profile["env"];
         assert_eq!(env[crate::sandbox::ACTIVE_VAR], "1");
-        assert_eq!(env["CLAUDE_CODE_TMPDIR"], tmp.to_str().unwrap());
+        assert!(env.get("CLAUDE_CODE_TMPDIR").is_none(), "probe P2");
         assert_eq!(env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
-        assert_eq!(env["GIT_CONFIG_GLOBAL"], gitconfig.to_str().unwrap());
-        assert_eq!(env["GIT_CONFIG_NOSYSTEM"], "1");
-        assert_eq!(env["GIT_TERMINAL_PROMPT"], "0");
+        assert_eq!(env[GITCONFIG_VAR], gitconfig.to_str().unwrap());
+        assert!(env.get("GIT_CONFIG_GLOBAL").is_none(), "probe P2e");
+        assert_eq!(
+            git_exports(gitconfig.to_str().unwrap()).unwrap(),
+            format!(
+                "export GIT_CONFIG_GLOBAL='{}'\nexport GIT_CONFIG_NOSYSTEM='1'\nexport GIT_TERMINAL_PROMPT='0'\n",
+                gitconfig.display()
+            )
+        );
+        assert_eq!(git_exports("relative"), None);
+        assert_eq!(git_exports("/it's"), None);
         assert_eq!(env["ENABLE_CLAUDEAI_MCP_SERVERS"], "false");
         let sandbox = &profile["sandbox"];
         for key in ["enabled", "failIfUnavailable"] {
@@ -612,7 +622,8 @@ mod tests {
             [json!("~/.gitconfig"), json!("~/.config/git")]
         );
         assert_eq!(deny_read.len(), 2 + LINUX_EXTRA_DENY_READ.len());
-        assert!(deny_read.contains(&json!("/tmp")));
+        assert!(deny_read.contains(&json!("/run/user")));
+        assert!(!deny_read.contains(&json!("/tmp")), "probe P2");
         assert_eq!(sandbox["network"]["allowAllUnixSockets"], false);
         let secrets = sandbox["credentials"]["envVars"].as_array().unwrap();
         assert_eq!(secrets.len(), SECRET_VARS.len());
@@ -652,7 +663,7 @@ mod tests {
         assert_eq!(pre[1]["hooks"][0]["timeout"], 10);
 
         // Files and directories around it.
-        assert!(tmp.is_dir());
+        assert!(!tmp.exists(), "probe P2: no own temp dir");
         assert_eq!(
             std::fs::read_to_string(&gitconfig).unwrap(),
             "[user]\n\tname = \"Ann \\\"A\\\" Lee\"\n\temail = \"ann@example.org\"\n"
@@ -695,27 +706,19 @@ mod tests {
         assert_eq!(sandbox["network"]["allowLocalBinding"], false);
     }
 
-    /// The probe-only profile skips the WSL interop refusal alone and is
-    /// never a profile a start or restart takes.
+    /// The probe-only profile is never a profile a start or restart takes.
     #[test]
     fn a_probe_run_profile_is_apart() {
         let (_dir, home, folder) = home_and_folder("profile-probe-run");
         let (settings, exe) = install(&home);
         let mut fake = Fake::linux(&home);
-        fake.files.insert(
-            PathBuf::from("/proc/sys/fs/binfmt_misc/WSLInterop-late"),
-            "enabled\n".to_owned(),
-        );
-        assert_eq!(
-            prepare(&fake, &settings, &folder, &exe),
-            Err(Refusal::WslInterop)
-        );
         let path = prepare_probe_run(&fake, &settings, &folder, &exe).unwrap();
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             format!("probe-{}.json", hash(&folder))
         );
         assert_eq!(base_of(&path), None, "no start or restart takes it");
+        assert_ne!(path, profile_path(&settings, &folder));
         fake.answer("claude", 0, "2.1.1 (Claude Code)");
         assert!(prepare_probe_run(&fake, &settings, &folder, &exe).is_err());
     }

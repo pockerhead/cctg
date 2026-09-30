@@ -76,7 +76,8 @@ pub fn decide(input: &[u8], var: impl Fn(&str) -> Option<String>) -> Verdict {
     };
     let target = Path::new(&target);
     let in_folder = paths::contains(&root, target) && !paths::protected(&root, target);
-    // probe P8: plan mode writes its plan here.
+    // Plan files: probe P8 found plan mode unavailable in the profile (the
+    // env scrub forces the default mode); kept for when it comes back.
     let plan =
         super::claude_config_dir(&var).is_some_and(|config| paths::plan_file(&config, target));
     if in_folder || plan {
@@ -86,7 +87,9 @@ pub fn decide(input: &[u8], var: impl Fn(&str) -> Option<String>) -> Verdict {
     }
 }
 
-/// `path` is a worktree below `<root>/.claude/worktrees/` (probe P9).
+/// `path` is a worktree below `<root>/.claude/worktrees/`. Probe P9: in
+/// the sandbox EnterWorktree cannot create one (`.git` is read-only there);
+/// a path outside the folder is refused here.
 fn worktree(root: &Path, path: &Path) -> bool {
     let (Some(base), Some(path)) = (
         paths::canonical(root).map(|root| root.join(".claude").join("worktrees")),

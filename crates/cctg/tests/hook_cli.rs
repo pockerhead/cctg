@@ -394,6 +394,29 @@ fn a_sandboxed_session_start_exports_the_caches_for_bash() {
         None,
         "a quote cannot be exported safely"
     );
+    // Probe P2e: the git variables go this way too (the profile's env
+    // does not pass GIT_* on).
+    let gitconfig = home.join("gitconfig-copy");
+    let _ = std::fs::remove_file(&env_file);
+    let mut command = common::cctg(&home);
+    command
+        .args(["hook", "SessionStart"])
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .env("CLAUDE_PROJECT_DIR", &folder)
+        .env("CCTG_SANDBOX", "1")
+        .env("CCTG_SANDBOX_GITCONFIG", &gitconfig)
+        .stdin(Stdio::null());
+    let output = common::output(&mut command).unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let written = std::fs::read_to_string(&env_file).unwrap();
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines.len(), 10, "{written}");
+    assert_eq!(
+        lines[7],
+        format!("export GIT_CONFIG_GLOBAL='{}'", gitconfig.display())
+    );
+    assert_eq!(lines[8], "export GIT_CONFIG_NOSYSTEM='1'");
+    assert_eq!(lines[9], "export GIT_TERMINAL_PROMPT='0'");
 }
 
 #[test]
