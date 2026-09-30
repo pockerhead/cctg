@@ -396,9 +396,13 @@ fn build_env_block(overlay: &[(String, String)], token: HANDLE) -> Vec<u16> {
     out
 }
 
-/// A variable name (uppercased) that must never reach a sandboxed command: any
-/// `CCTG_*` / `CLAUDE*` / `ANTHROPIC*`, a known token/secret name, or a
-/// `*_TOKEN` / `*_SECRET` name. `CCTG_SANDBOX` and `CCTG_SANDBOX_COMMAND` are
+/// A variable name (uppercased) of the slot profile base that must never reach
+/// a sandboxed command: any `CCTG_*` / `CLAUDE*` (incl. the auth-bearing
+/// `CLAUDE_CODE_*`) / `ANTHROPIC*`, and any credential-looking name —
+/// `*_TOKEN`, `*_SECRET`, `*_KEY`, `*PASSWORD*`, `*PASSWD*`, `*APIKEY*`,
+/// `*CREDENTIAL*` (the CI runner image puts `PGPASSWORD` in the machine
+/// environment, which reaches every account's profile env) — plus known token
+/// names. `CCTG_SANDBOX`, `CCTG_SANDBOX_COMMAND` and `CLAUDE_PROJECT_DIR` are
 /// re-added from the trusted overlay after this filter.
 fn sensitive(up: &str) -> bool {
     up.starts_with("CCTG_")
@@ -406,6 +410,11 @@ fn sensitive(up: &str) -> bool {
         || up.starts_with("ANTHROPIC")
         || up.ends_with("_TOKEN")
         || up.ends_with("_SECRET")
+        || up.ends_with("_KEY")
+        || up.contains("PASSWORD")
+        || up.contains("PASSWD")
+        || up.contains("APIKEY")
+        || up.contains("CREDENTIAL")
         || matches!(
             up,
             "GH_TOKEN" | "GITHUB_TOKEN" | "SSH_AUTH_SOCK" | "NPM_TOKEN" | "OPENAI_API_KEY"
@@ -583,9 +592,16 @@ mod tests {
             "SSH_AUTH_SOCK",
             "SOME_TOKEN",
             "APP_SECRET",
+            // Seen in the windows-latest machine env (CI run 36747040711).
+            "PGPASSWORD",
+            "AWS_SECRET_ACCESS_KEY",
+            "MYSQL_PWD_PASSWORD",
+            "AZURE_CREDENTIALS",
+            "SERVICE_APIKEY",
         ] {
             assert!(sensitive(yes), "{yes}");
         }
+        // Names from that same runner env that are not credentials stay.
         for no in [
             "PATH",
             "HOME",
@@ -593,8 +609,14 @@ mod tests {
             "SYSTEMROOT",
             "CARGO_HOME",
             "GIT_CONFIG_GLOBAL",
+            "PGUSER",
+            "PGDATA",
+            "JAVA_HOME",
+            "AZURE_CONFIG_DIR",
+            "npm_config_prefix",
+            "MAVEN_OPTS",
         ] {
-            assert!(!sensitive(no), "{no}");
+            assert!(!sensitive(&no.to_ascii_uppercase()), "{no}");
         }
     }
 }
