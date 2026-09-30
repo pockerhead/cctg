@@ -87,6 +87,9 @@ pub trait Probe {
     fn home(&self) -> Option<PathBuf> {
         super::home_dir_of(&|name| self.var(name))
     }
+    /// Linux: Claude Code's temp shared by all projects of this user,
+    /// `/tmp/claude-<uid>`, and the names in it now. `None` elsewhere.
+    fn claude_temp(&self) -> Option<(String, Vec<String>)>;
 }
 
 pub struct RealProbe;
@@ -155,6 +158,27 @@ impl Probe for RealProbe {
 
     fn canonical(&self, path: &Path) -> Option<PathBuf> {
         paths::canonical(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn claude_temp(&self) -> Option<(String, Vec<String>)> {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let root = format!("/tmp/claude-{uid}");
+        let names = std::fs::read_dir(&root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((root, names))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn claude_temp(&self) -> Option<(String, Vec<String>)> {
+        None
     }
 }
 
@@ -524,6 +548,7 @@ pub(crate) mod tests {
         pub runs: HashMap<String, Ran>,
         pub files: HashMap<PathBuf, String>,
         pub unreadable: Vec<PathBuf>,
+        pub claude_temp: Option<(String, Vec<String>)>,
     }
 
     impl Fake {
@@ -537,6 +562,7 @@ pub(crate) mod tests {
                 runs: HashMap::new(),
                 files: HashMap::new(),
                 unreadable: Vec::new(),
+                claude_temp: None,
             };
             fake.answer("claude", 0, "2.1.284 (Claude Code)\n");
             fake.answer("bwrap", 0, "");
@@ -595,6 +621,9 @@ pub(crate) mod tests {
         }
         fn canonical(&self, path: &Path) -> Option<PathBuf> {
             paths::canonical(path)
+        }
+        fn claude_temp(&self) -> Option<(String, Vec<String>)> {
+            self.claude_temp.clone()
         }
     }
 
