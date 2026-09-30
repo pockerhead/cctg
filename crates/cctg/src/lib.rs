@@ -17,6 +17,7 @@ pub mod keys;
 pub mod proctree;
 pub mod reads;
 pub mod run;
+pub mod sandbox;
 pub mod shim;
 pub mod spool;
 pub mod statusfile;

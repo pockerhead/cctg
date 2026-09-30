@@ -212,7 +212,7 @@ pub fn canonical_cwd(cwd: &str) -> String {
 
 /// Windows `canonicalize` answers in the `\\?\` form; drop it where a plain
 /// spelling exists (`\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`).
-fn strip_verbatim(path: &str) -> String {
+pub(crate) fn strip_verbatim(path: &str) -> String {
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{rest}");
     }
