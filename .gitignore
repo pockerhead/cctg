@@ -8,3 +8,6 @@ registry.v1.json
 .agent/
 deploy/hub.env
 deploy/tls/
+
+# MAW pipeline artifacts stay local (history scrubbed 2026-09-30)
+maw/
