@@ -1236,6 +1236,53 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
     assert!(agent.quiet().await, "nothing went to the model");
 }
 
+/// TASK-087: the agent of a sandboxed folder answers `refused` over the real
+/// link (the agent side: `agent.rs` tests); the topic gets the neutral
+/// notice and the model nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_console_command_is_answered_over_the_link() {
+    let hub = start_hub("console-refused", Duration::from_millis(50)).await;
+    hub.start(A, 10).await;
+    let mut agent = Agent::connect(&hub, A, 10).await;
+    hub.status_message(100).await;
+    hub.agent_bound(100).await;
+    hub.control
+        .send(Control::Message(Inbound {
+            display_name: None,
+            chat: GROUP,
+            sender: cctg::hub::chat::PrivateChat::of_user(1001),
+            message_id: 51,
+            thread_id: Some(100),
+            text: Some("!cat ~/marker".into()),
+            reply_to: None,
+            quote: None,
+            forwarded: false,
+            media: None,
+            from_name: None,
+            author: None,
+            reply_from: None,
+        }))
+        .unwrap();
+    let command_id = match agent.next().await {
+        Some(HubMsg::ConsoleCommand { command_id, .. }) => command_id,
+        other => panic!("no console command: {other:?}"),
+    };
+    agent
+        .send(AgentMsg::ConsoleCommandTyped {
+            command_id,
+            outcome: CommandOutcome::Refused,
+            panel: None,
+        })
+        .await;
+    hub.until("the refusal answered", |ops| {
+        ops.iter().any(|op| {
+            matches!(op, Op::Send { reply_to: Some(51), text, .. } if text == console::REFUSED_NOTICE)
+        })
+    })
+    .await;
+    assert!(agent.quiet().await, "nothing went to the model");
+}
+
 /// A home directory whose `.cctg/device.env` points at `addr`.
 fn hook_home(test: &str, addr: &str) -> PathBuf {
     let home = common::own_tmp().join(format!("status-e2e-{test}"));

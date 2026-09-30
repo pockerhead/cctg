@@ -6,6 +6,10 @@
 //! (TLS with the pin when one is set) and sends the secret once to the
 //! hook endpoint's `POST /v1/ping`, which only checks it. It never prints the
 //! secret. Exit code 0 when everything a session needs works.
+//!
+//! Last, the sandbox (TASK-087): how many folders are marked and, when any
+//! are, whether this device can start them ([`sandbox_report`]). It installs
+//! nothing and runs no model.
 
 use std::time::Duration;
 
@@ -13,12 +17,19 @@ use crate::client;
 use crate::device::DeviceConfig;
 use crate::hook::{self, PostError};
 use crate::hub::devices::secret_device_id;
+use crate::sandbox::{self, marks, preflight};
 
 /// Per check; a far hub over TLS answers well within it.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn run() -> i32 {
-    let report = check(&DeviceConfig::load(), TIMEOUT).await;
+    let mut report = check(&DeviceConfig::load(), TIMEOUT).await;
+    if let Ok((lines, ok)) =
+        tokio::task::spawn_blocking(|| sandbox_report(&preflight::RealProbe)).await
+    {
+        report.lines.extend(lines);
+        report.ok &= ok;
+    }
     for line in &report.lines {
         println!("{line}");
     }
@@ -99,6 +110,56 @@ pub async fn check(config: &DeviceConfig, timeout: Duration) -> Report {
     Report { lines, ok }
 }
 
+/// The sandbox lines and whether marked folders can start. Paths go to the
+/// local terminal only.
+pub fn sandbox_report(probe: &dyn preflight::Probe) -> (Vec<String>, bool) {
+    let not_used = || (vec!["sandbox: not used".to_owned()], true);
+    let Some(home) = probe.home() else {
+        return not_used();
+    };
+    let marked = match marks::load(&sandbox::marks_file(&home)) {
+        Ok(marked) if marked.is_empty() => return not_used(),
+        Ok(marked) => marked,
+        Err(error) => {
+            return (
+                vec![format!(
+                    "sandbox: {error}; folders named in it or in folders.json.bak stay \
+                     sandboxed, folders it never named start as usual, and where that cannot \
+                     be told (a cut-off file without its .bak) claude-cctg starts nothing; \
+                     fix or remove it (docs/sandbox.md)"
+                )],
+                false,
+            );
+        }
+    };
+    let mut lines = vec![format!("sandbox: {} folder(s) marked", marked.len())];
+    lines.extend(
+        marked
+            .iter()
+            .map(|folder| format!("  {}", folder.display())),
+    );
+    if probe.os() == preflight::Os::Windows {
+        lines.push("sandbox: not available on Windows yet".to_owned());
+        return (lines, false);
+    }
+    match preflight::device(probe).and_then(|ready| {
+        preflight::wrapper(probe)?;
+        Ok(ready)
+    }) {
+        Ok(ready) => {
+            lines.push(format!(
+                "sandbox: device ready (Claude Code {})",
+                ready.claude
+            ));
+            (lines, true)
+        }
+        Err(refusal) => {
+            lines.push(format!("sandbox: marked folders will not start: {refusal}"));
+            (lines, false)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::net::TcpListener;
@@ -142,6 +203,38 @@ mod tests {
             }
         });
         (agent_addr, hook_addr, rx)
+    }
+
+    #[test]
+    fn the_sandbox_section_follows_the_marks_and_the_device() {
+        let (_dir, home, folder) = preflight::tests::home_and_folder("doctor-sandbox");
+        let mut fake = preflight::tests::Fake::linux(&home);
+        assert_eq!(
+            sandbox_report(&fake),
+            (vec!["sandbox: not used".to_owned()], true)
+        );
+        marks::add(&sandbox::marks_file(&home), &folder).unwrap();
+        let (lines, ok) = sandbox_report(&fake);
+        assert!(ok, "{lines:?}");
+        assert!(lines[0].contains("1 folder(s) marked"), "{lines:?}");
+        assert!(lines.last().unwrap().contains("device ready"), "{lines:?}");
+        fake.answer("claude", 0, "2.1.1 (Claude Code)");
+        let (lines, ok) = sandbox_report(&fake);
+        assert!(!ok);
+        assert!(
+            lines.last().unwrap().contains("will not start"),
+            "{lines:?}"
+        );
+        fake.os = preflight::Os::Windows;
+        let (lines, ok) = sandbox_report(&fake);
+        assert!(!ok);
+        assert!(
+            lines.last().unwrap().contains("not available on Windows"),
+            "{lines:?}"
+        );
+        std::fs::write(sandbox::marks_file(&home), b"{broken").unwrap();
+        let (lines, ok) = sandbox_report(&fake);
+        assert!(!ok && lines[0].contains("starts nothing"), "{lines:?}");
     }
 
     #[tokio::test]

@@ -48,20 +48,8 @@ pub const MAX_RECORD: u64 = 64 << 20;
 /// `<CLAUDE_CONFIG_DIR>/projects`, or `~/.claude/projects` without it: the
 /// only directory whose transcripts this device's agent reads.
 pub fn projects_root() -> Option<PathBuf> {
-    let var = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    };
-    if let Some(config) = var("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(config).join("projects"));
-    }
-    let home = if cfg!(windows) {
-        var("USERPROFILE").or_else(|| var("HOME"))
-    } else {
-        var("HOME")
-    };
-    home.map(|home| PathBuf::from(home).join(".claude").join("projects"))
+    crate::sandbox::claude_config_dir(&|name| std::env::var(name).ok())
+        .map(|config| config.join("projects"))
 }
 
 /// Claude Code keeps a longer project folder name to this many characters

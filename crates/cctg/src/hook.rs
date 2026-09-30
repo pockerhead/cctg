@@ -133,6 +133,14 @@ pub const ANSWERED_REASON: &str = "Answered in Telegram";
 /// Runs one hook invocation. Never fails: every problem ends as one fixed
 /// line on stderr.
 pub async fn run(event: &str) {
+    // TASK-087: a sandboxed session keeps tool caches in its folder, for
+    // Bash only (the profile's env would reach hooks and MCP too).
+    if event == "SessionStart"
+        && let Some(Err(_)) =
+            crate::sandbox::profile::export_caches(&|name| std::env::var(name).ok())
+    {
+        warn!("sandbox cache variables not written to CLAUDE_ENV_FILE");
+    }
     let Some(input) = read_stdin(MAX_STDIN, STDIN_TIMEOUT) else {
         warn!("hook input unreadable, too large or late; nothing sent");
         return;

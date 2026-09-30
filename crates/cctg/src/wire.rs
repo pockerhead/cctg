@@ -561,6 +561,10 @@ pub enum CommandOutcome {
     /// Claude Code's agent view is open or a background agent runs: nothing
     /// typed (TASK-047). Hubs before it read [`Self::Other`], a failure.
     AgentsRunning,
+    /// The session folder is in sandbox mode: `!` lines and commands that
+    /// widen its boundary are not typed (TASK-087). Hubs before it read
+    /// [`Self::Other`] and answer as for a failure.
+    Refused,
     /// Not typed, or typed and erased again for another reason.
     Failed,
     /// An outcome of a newer agent.
@@ -1874,6 +1878,30 @@ mod tests {
                 outcome: CommandOutcome::Other,
                 panel: None,
             })
+        );
+        // TASK-087: `refused` round-trips; a hub without the variant reads
+        // it as an outcome of a newer agent.
+        let refused = AgentMsg::ConsoleCommandTyped {
+            command_id: 5,
+            outcome: CommandOutcome::Refused,
+            panel: None,
+        };
+        let line = encode(&refused);
+        assert!(String::from_utf8_lossy(&line).contains(r#""outcome":"refused""#));
+        assert_eq!(decode::<AgentMsg>(&line), Ok(refused));
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldOutcome {
+            Sent,
+            Draft,
+            AgentsRunning,
+            Failed,
+            #[serde(other)]
+            Other,
+        }
+        assert_eq!(
+            serde_json::from_str::<OldOutcome>(r#""refused""#).unwrap(),
+            OldOutcome::Other
         );
         // A status line without numbers is still one event.
         let id = EventId::new();
