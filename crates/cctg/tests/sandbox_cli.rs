@@ -150,9 +150,10 @@ fn sandbox_on_refuses_what_cannot_be_locked() {
     let out = common::output(&mut on).unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if cfg!(windows) {
-        assert!(stderr.contains("Windows"), "{stderr}");
-    }
+    // The refusal names the folder and a reason (an outdated claude on Linux
+    // and macOS; on Windows the test folder is outside the profile, which is
+    // refused first). Either way no mark is written.
+    assert!(stderr.contains("cctg sandbox:"), "{stderr}");
     assert!(
         !home
             .join(".cctg")

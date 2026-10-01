@@ -1900,18 +1900,11 @@ async fn read_file(
 }
 
 /// A sandboxed session's `send_file`: only a file that
-/// [`sandbox::paths::open_inside`] opens in `root`, read from that handle.
-#[cfg(unix)]
+/// [`sandbox::paths::open_inside`] opens in `root` (Linux, macOS, Windows),
+/// read from that handle.
 fn read_confined(root: &Path, path: &Path) -> Result<Vec<u8>, String> {
     let file = sandbox::paths::open_inside(root, path).ok_or_else(|| OUTSIDE_FOLDER.to_owned())?;
     files::read_upload_from(file).map_err(|error| error.to_string())
-}
-
-/// No sandbox on Windows yet (TASK-087 part C): a sandboxed session (a
-/// hand-set `CCTG_SANDBOX=1`) sends nothing rather than anything.
-#[cfg(not(unix))]
-fn read_confined(_root: &Path, _path: &Path) -> Result<Vec<u8>, String> {
-    Err(OUTSIDE_FOLDER.to_owned())
 }
 
 /// What came of one transfer.
@@ -4422,6 +4415,15 @@ mod tests {
         std::fs::write(base.join("marker"), b"secret").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(base.join("marker"), root.join("link.txt")).unwrap();
+        #[cfg(windows)]
+        {
+            // A junction inside the folder pointing at the outside directory.
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(root.join("linkdir"))
+                .arg(&base)
+                .output();
+        }
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
@@ -4439,13 +4441,17 @@ mod tests {
             .to_string()
         };
         let outside = base.join("marker").to_string_lossy().into_owned();
-        let mut refused = vec![outside.as_str(), "../marker"];
-        if cfg!(unix) {
-            refused.push("link.txt");
-        } else {
-            refused.push("in.txt");
-        }
-        for (id, path) in (20..).zip(refused) {
+        let mut refused: Vec<String> = vec![outside, "../marker".to_owned()];
+        #[cfg(unix)]
+        refused.push("link.txt".to_owned());
+        #[cfg(windows)]
+        refused.push(
+            root.join("linkdir")
+                .join("marker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        for (id, path) in (20..).zip(&refused) {
             claude.send(&call(id, path)).await;
             let answer = claude.recv().await;
             assert_eq!(answer["id"], id, "{answer}");
@@ -4454,14 +4460,12 @@ mod tests {
             assert!(text.contains(OUTSIDE_FOLDER), "{text}");
             assert!(!text.contains("secret"));
         }
-        if cfg!(unix) {
-            // A file of the folder goes: the first thing the hub hears.
-            claude.send(&call(30, "in.txt")).await;
-            let AgentMsg::FileOffer { name, size, .. } = agent_line(&mut reader).await else {
-                panic!("an offer");
-            };
-            assert_eq!((name.as_str(), size), ("in.txt", 6));
-        }
+        // A file of the folder goes: the first thing the hub hears.
+        claude.send(&call(30, "in.txt")).await;
+        let AgentMsg::FileOffer { name, size, .. } = agent_line(&mut reader).await else {
+            panic!("an offer");
+        };
+        assert_eq!((name.as_str(), size), ("in.txt", 6));
     }
 
     /// TASK-087: in a sandboxed folder a file from the topic is kept in the

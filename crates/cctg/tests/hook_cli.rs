@@ -368,6 +368,13 @@ fn a_sandboxed_session_start_exports_the_caches_for_bash() {
         assert!(output.stdout.is_empty());
         std::fs::read_to_string(&env_file).ok()
     };
+    if cfg!(windows) {
+        // Windows: the broker sets the caches and git variables directly, so a
+        // sandboxed SessionStart writes nothing to CLAUDE_ENV_FILE (which would
+        // otherwise reach hooks running outside the sandbox).
+        assert_eq!(start(Some("1"), &folder), None);
+        return;
+    }
     let written = start(Some("1"), &folder).expect("CLAUDE_ENV_FILE written");
     let lines: Vec<&str> = written.lines().collect();
     assert_eq!(lines.len(), 7, "{written}");

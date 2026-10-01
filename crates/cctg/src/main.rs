@@ -113,7 +113,39 @@ enum Command {
         /// `sandbox/probe-<hash>.json`, which no start or restart takes.
         #[arg(long, hide = true)]
         probe_run: bool,
+        /// `.cmd` wrapper form: print `profile <path>` (0), `unmarked` (10),
+        /// or nothing (3), instead of the bare path.
+        #[arg(long, hide = true)]
+        cmd: bool,
     },
+    /// Install the Windows folder sandbox: one UAC prompt creates the sandbox
+    /// group and a pool of hidden slot accounts (Windows only).
+    #[command(name = "sandbox-install")]
+    SandboxInstall {
+        /// The number of slot accounts (one per marked folder; default 8).
+        #[arg(long)]
+        slots: Option<u32>,
+        /// Internal: the hidden elevated half, given a request file.
+        #[arg(long, hide = true)]
+        elevated_step: Option<PathBuf>,
+    },
+    /// Remove the Windows folder sandbox (accounts, group, mark). One UAC.
+    #[command(name = "sandbox-uninstall")]
+    SandboxUninstall {
+        /// Internal: the hidden elevated half, given a request file.
+        #[arg(long, hide = true)]
+        elevated_step: Option<PathBuf>,
+    },
+    /// The Windows sandbox broker (the shell prefix's target): pass our own
+    /// calls through, run everything else under the folder's slot account.
+    #[command(hide = true)]
+    SandboxExec {
+        /// The prefix's `$1`.
+        line: String,
+    },
+    /// The Windows sandbox runner (spawned by the broker under a slot account).
+    #[command(hide = true)]
+    SandboxRunner,
 }
 
 #[derive(Debug, Subcommand)]
@@ -166,6 +198,16 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("cctg sandbox-check: bad arguments");
             std::process::exit(cctg::sandbox::cli::CHECK_FAILED);
         }
+        // The broker and runner fail closed with the broker code.
+        Err(_)
+            if matches!(
+                std::env::args().nth(1).as_deref(),
+                Some("sandbox-exec") | Some("sandbox-runner")
+            ) =>
+        {
+            eprintln!("cctg sandbox-exec: bad arguments");
+            std::process::exit(cctg::sandbox::BROKER_FAILED);
+        }
         Err(error) => error.exit(),
     };
     // A supervisor with a log file sets its log up once it holds its lock.
@@ -185,6 +227,8 @@ async fn main() -> anyhow::Result<()> {
                 | Command::Run { .. }
                 | Command::SandboxGate
                 | Command::SandboxCheck { .. }
+                | Command::SandboxExec { .. }
+                | Command::SandboxRunner
         ));
     }
     match cli.command {
@@ -305,12 +349,34 @@ async fn main() -> anyhow::Result<()> {
         Command::SandboxCheck {
             settings,
             probe_run,
+            cmd,
         } => {
             std::panic::set_hook(Box::new(|_| {
                 eprintln!("cctg sandbox-check: internal error");
                 std::process::exit(cctg::sandbox::cli::CHECK_FAILED);
             }));
-            std::process::exit(cctg::sandbox::cli::check(&settings, probe_run));
+            std::process::exit(cctg::sandbox::cli::check(&settings, probe_run, cmd));
+        }
+        Command::SandboxInstall {
+            slots,
+            elevated_step,
+        } => std::process::exit(cctg::sandbox::sandbox_install(slots, elevated_step)),
+        Command::SandboxUninstall { elevated_step } => {
+            std::process::exit(cctg::sandbox::sandbox_uninstall(elevated_step))
+        }
+        Command::SandboxExec { line } => {
+            std::panic::set_hook(Box::new(|_| {
+                eprintln!("cctg sandbox: internal error");
+                std::process::exit(cctg::sandbox::BROKER_FAILED);
+            }));
+            std::process::exit(cctg::sandbox::sandbox_exec(&line));
+        }
+        Command::SandboxRunner => {
+            std::panic::set_hook(Box::new(|_| {
+                eprintln!("cctg sandbox: internal error");
+                std::process::exit(cctg::sandbox::BROKER_FAILED);
+            }));
+            std::process::exit(cctg::sandbox::sandbox_runner());
         }
         Command::AgentInstall => {
             let exe = std::env::current_exe()?;
@@ -483,7 +549,7 @@ mod tests {
         assert!(Cli::try_parse_from(["cctg", "sandbox-gate", "extra"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["cctg", "sandbox-check", "--settings", "s.json"]).unwrap().command,
-            Command::SandboxCheck { settings, probe_run: false } if settings == std::path::Path::new("s.json")
+            Command::SandboxCheck { settings, probe_run: false, cmd: false } if settings == std::path::Path::new("s.json")
         ));
         assert!(matches!(
             Cli::try_parse_from([
@@ -500,6 +566,50 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-check", "--settings", "s.json", "--cmd"])
+                .unwrap()
+                .command,
+            Command::SandboxCheck { cmd: true, .. }
+        ));
         assert!(Cli::try_parse_from(["cctg", "sandbox-check"]).is_err());
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-install"])
+                .unwrap()
+                .command,
+            Command::SandboxInstall {
+                slots: None,
+                elevated_step: None
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-install", "--slots", "4"])
+                .unwrap()
+                .command,
+            Command::SandboxInstall { slots: Some(4), .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-install", "--elevated-step", "r.json"]).unwrap().command,
+            Command::SandboxInstall { elevated_step: Some(path), .. } if path == std::path::Path::new("r.json")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-uninstall"])
+                .unwrap()
+                .command,
+            Command::SandboxUninstall {
+                elevated_step: None
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-exec", "echo hi"]).unwrap().command,
+            Command::SandboxExec { line } if line == "echo hi"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cctg", "sandbox-runner"])
+                .unwrap()
+                .command,
+            Command::SandboxRunner
+        ));
+        assert!(Cli::try_parse_from(["cctg", "sandbox-exec"]).is_err());
     }
 }

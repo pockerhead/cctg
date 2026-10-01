@@ -138,9 +138,9 @@ pub fn sandbox_report(probe: &dyn preflight::Probe) -> (Vec<String>, bool) {
             .iter()
             .map(|folder| format!("  {}", folder.display())),
     );
+    let mut ok = true;
     if probe.os() == preflight::Os::Windows {
-        lines.push("sandbox: not available on Windows yet".to_owned());
-        return (lines, false);
+        ok &= windows_report(probe, &marked, &mut lines);
     }
     match preflight::device(probe).and_then(|ready| {
         preflight::wrapper(probe)?;
@@ -151,13 +151,106 @@ pub fn sandbox_report(probe: &dyn preflight::Probe) -> (Vec<String>, bool) {
                 "sandbox: device ready (Claude Code {})",
                 ready.claude
             ));
-            (lines, true)
+            (lines, ok)
         }
         Err(refusal) => {
             lines.push(format!("sandbox: marked folders will not start: {refusal}"));
             (lines, false)
         }
     }
+}
+
+/// Windows-only sandbox lines: install state, per-mark ACE, the Secondary
+/// Logon service and a `git safe.directory = *` warning. Returns whether all
+/// is well.
+fn windows_report(
+    probe: &dyn preflight::Probe,
+    marked: &[std::path::PathBuf],
+    lines: &mut Vec<String>,
+) -> bool {
+    let Some(installed) = probe.sandbox_install() else {
+        lines.push("sandbox: not installed (run cctg sandbox-install)".to_owned());
+        return false;
+    };
+    lines.push(format!("sandbox: installed, {} slots", installed.slots));
+    if !installed.owner_is_me {
+        lines.push("sandbox: installed by another Windows user".to_owned());
+    }
+    let live = windows_live_checks(probe, marked, installed.slots, lines);
+    installed.owner_is_me && live
+}
+
+/// The checks that need the real machine: slot counts, the slot ACE of each
+/// mark, the Secondary Logon service, `safe.directory = *`. Off Windows (a
+/// `Fake` with `Os::Windows` in tests) there is nothing to look at.
+#[cfg(windows)]
+fn windows_live_checks(
+    probe: &dyn preflight::Probe,
+    marked: &[std::path::PathBuf],
+    slots: u32,
+    lines: &mut Vec<String>,
+) -> bool {
+    use crate::sandbox::win;
+    let mut ok = true;
+    if let Some(home) = probe.home() {
+        let win_dir = win::win_dir(&home);
+        if let Ok((active, retired, fresh)) = win::slots::counts(&win_dir, slots) {
+            lines.push(format!(
+                "sandbox: slots {active} active, {retired} retired, {fresh} fresh"
+            ));
+        }
+        let mark = win::read_mark();
+        for folder in marked {
+            let folder_str = folder.to_string_lossy().to_string();
+            let slot = win::slots::active_slot(&win_dir, &folder_str)
+                .ok()
+                .flatten();
+            let has_ace = match (&mark, slot) {
+                (Some(mark), Some(k)) => mark
+                    .slot_sid(k)
+                    .is_some_and(|sid| win::acl::has_ace(folder, sid)),
+                _ => false,
+            };
+            if !has_ace {
+                lines.push(format!(
+                    "  {}: no slot ACE (run cctg sandbox on)",
+                    folder.display()
+                ));
+                ok = false;
+            }
+        }
+    }
+    // The Secondary Logon service must not be disabled.
+    if let Some(ran) = probe.run("sc", &["qc", "seclogon"], std::time::Duration::from_secs(5))
+        && ran.stdout.contains("DISABLED")
+    {
+        lines.push("sandbox: the Secondary Logon service is disabled; enable it".to_owned());
+        ok = false;
+    }
+    // git safe.directory = * would let the user's git run a slot-created config.
+    if let Some(ran) = probe.run(
+        "git",
+        &["config", "--global", "--get-all", "safe.directory"],
+        std::time::Duration::from_secs(3),
+    ) && ran.stdout.lines().any(|l| l.trim() == "*")
+    {
+        lines.push(
+            "sandbox: git trusts repositories of any owner (safe.directory = *); a .git \
+             created by a sandbox command would run its config — remove it"
+                .to_owned(),
+        );
+    }
+    ok
+}
+
+#[cfg(not(windows))]
+fn windows_live_checks(
+    _probe: &dyn preflight::Probe,
+    _marked: &[std::path::PathBuf],
+    _slots: u32,
+    _lines: &mut Vec<String>,
+) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -225,13 +318,24 @@ mod tests {
             lines.last().unwrap().contains("will not start"),
             "{lines:?}"
         );
-        fake.os = preflight::Os::Windows;
-        let (lines, ok) = sandbox_report(&fake);
-        assert!(!ok);
+        // Windows, installed: the report names the install; a marked folder
+        // with no slot ACE on the real machine is not ready (that is fine
+        // here). Not installed with marks present is also not ready.
+        let win = preflight::tests::Fake::windows(&home);
+        let (lines, _ok) = sandbox_report(&win);
         assert!(
-            lines.last().unwrap().contains("not available on Windows"),
+            lines.iter().any(|l| l.contains("sandbox: installed")),
             "{lines:?}"
         );
+        let mut bare = preflight::tests::Fake::windows(&home);
+        bare.installed = None;
+        let (lines, ok) = sandbox_report(&bare);
+        assert!(!ok);
+        assert!(
+            lines.iter().any(|l| l.contains("not installed")),
+            "{lines:?}"
+        );
+
         std::fs::write(sandbox::marks_file(&home), b"{broken").unwrap();
         let (lines, ok) = sandbox_report(&fake);
         assert!(!ok && lines[0].contains("starts nothing"), "{lines:?}");

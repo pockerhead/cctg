@@ -26,11 +26,25 @@ pub mod console;
 pub mod gate;
 pub mod marks;
 pub mod paths;
+pub mod prefix;
 pub mod preflight;
 pub mod profile;
 
+/// The native Windows command sandbox (TASK-089): restricted-token accounts,
+/// ACLs, the broker and runner. All Win32; the whole tree is `#[cfg(windows)]`.
+#[cfg(windows)]
+pub mod win;
+
 /// `"1"`: this session runs with a sandbox profile (its `env` sets it).
 pub const ACTIVE_VAR: &str = "CCTG_SANDBOX";
+
+/// The Windows sandbox install schema (cross-platform so the preflight and its
+/// tests can compare it). [`win::SETUP_VERSION`] is this value.
+pub const SETUP_VERSION: u32 = 1;
+
+/// The Windows broker's exit code when it did not run the command. Distinct
+/// from any command's own code. Cross-platform so `main` can name it.
+pub const BROKER_FAILED: i32 = 125;
 
 /// The home directory from `var` (Windows: `USERPROFILE`, then `HOME`).
 pub fn home_dir_of(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -47,6 +61,12 @@ pub fn sandbox_home(home: &Path) -> PathBuf {
 /// `<home>/.cctg/sandbox/folders.json`.
 pub fn marks_file(home: &Path) -> PathBuf {
     sandbox_home(home).join("folders.json")
+}
+
+/// `<home>/.cctg/bin/cctg-sandbox-exec`: the Windows shell-prefix shim. A
+/// path only, so the cross-platform preflight and its tests can name it.
+pub fn win_shim_path(home: &Path) -> PathBuf {
+    home.join(".cctg").join("bin").join("cctg-sandbox-exec")
 }
 
 /// Claude Code's config dir: a non-empty `CLAUDE_CONFIG_DIR`, else
@@ -94,6 +114,61 @@ impl Guard {
             root: paths::canonical(&root).unwrap_or(root),
             marks_file: home_dir_of(&var).map(|home| marks_file(&home)),
         }
+    }
+}
+
+/// `cctg sandbox-install` (Windows). Elsewhere: a message and code 1.
+pub fn sandbox_install(slots: Option<u32>, elevated_step: Option<PathBuf>) -> i32 {
+    #[cfg(windows)]
+    {
+        win::install::install(slots, elevated_step)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (slots, elevated_step);
+        eprintln!("cctg sandbox-install работает только на Windows");
+        1
+    }
+}
+
+/// `cctg sandbox-uninstall` (Windows). Elsewhere: a message and code 1.
+pub fn sandbox_uninstall(elevated_step: Option<PathBuf>) -> i32 {
+    #[cfg(windows)]
+    {
+        win::install::uninstall(elevated_step)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = elevated_step;
+        eprintln!("cctg sandbox-uninstall работает только на Windows");
+        1
+    }
+}
+
+/// `cctg sandbox-exec <line>` (Windows broker). Elsewhere: [`BROKER_FAILED`].
+pub fn sandbox_exec(line: &str) -> i32 {
+    #[cfg(windows)]
+    {
+        win::exec::run(line)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = line;
+        eprintln!("cctg sandbox: the Windows sandbox does not run here");
+        BROKER_FAILED
+    }
+}
+
+/// `cctg sandbox-runner` (Windows). Elsewhere: [`BROKER_FAILED`].
+pub fn sandbox_runner() -> i32 {
+    #[cfg(windows)]
+    {
+        win::runner::run()
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("cctg sandbox: the Windows sandbox does not run here");
+        BROKER_FAILED
     }
 }
 

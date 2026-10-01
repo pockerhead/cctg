@@ -737,11 +737,40 @@ EOF
         cw=$(cygpath -w "$exe")
         mw=$(cygpath -w "$conf_dir/mcp.json")
         sw=$(cygpath -w "$conf_dir/settings.json")
+        # The Windows shell-prefix shim (TASK-089): a single-token executable
+        # the sandbox profile points CLAUDE_CODE_SHELL_PREFIX at. It runs
+        # cctg sandbox-exec WITHOUT exec (MSYS exec would cut cctg off claude's
+        # process tree) and with MSYS path conversion off (cctg gets the command
+        # line unchanged). Only "$1" (not "$@"): probe P0c showed the prefix
+        # always passes exactly one argument, and a truncated command would run
+        # sandboxed, never unsandboxed (install_e2e asserts this form).
+        make_room "$bin_dir/cctg-sandbox-exec"
+        put "$bin_dir/cctg-sandbox-exec" 755 <<EOF
+#!/bin/sh
+# cctg-sandbox-exec: the shell prefix of sandboxed folders on Windows ($MARK).
+# Written by cctg install.sh. No exec, no MSYS path conversion; the prefix's
+# single argument is passed as "\$1".
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$c" sandbox-exec "\$1"
+EOF
+        # The .cmd wrapper (used from cmd/PowerShell) is fail closed: it asks
+        # sandbox-check --cmd and starts claude only for a profile or unmarked
+        # folder. The :sandboxed flags are sandbox::profile::FLAGS.
         make_room "$wrapper.cmd"
         printf '%s\r\n' \
             '@echo off' \
             "rem claude-cctg: Claude Code with the cctg channel and hooks ($MARK)." \
+            'setlocal' \
+            'set "cctg_p="' \
+            "for /f \"usebackq delims=\" %%p in (\`call \"$cw\" sandbox-check --settings \"$sw\" --cmd\`) do set \"cctg_p=%%p\"" \
+            'if "%cctg_p%"=="unmarked" goto normal' \
+            'if "%cctg_p:~0,8%"=="profile " goto sandboxed' \
+            'exit /b 1' \
+            ':normal' \
             "\"$cw\" run -- --mcp-config \"$mw\" --dangerously-load-development-channels server:cctg --settings \"$sw\" %*" \
+            'exit /b %errorlevel%' \
+            ':sandboxed' \
+            "\"$cw\" run -- --mcp-config \"$mw\" --dangerously-load-development-channels server:cctg --strict-mcp-config --setting-sources user --no-chrome --settings \"%cctg_p:~8%\" %*" \
+            'exit /b %errorlevel%' \
             | put "$wrapper.cmd" 644
     fi
 }
@@ -827,6 +856,12 @@ strip_device_env() {
 }
 
 uninstall_all() {
+    # The Windows sandbox must be removed first: its accounts, group and HKLM
+    # key survive a binary delete, and only cctg sandbox-uninstall clears them.
+    if [ "$os" = windows ] \
+        && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' reg query 'HKLM\SOFTWARE\cctg\sandbox' >/dev/null 2>&1; then
+        die "the Windows sandbox is installed: first run \"$exe\" sandbox-uninstall (one UAC), then run this again"
+    fi
     for w in "$wrapper" "$wrapper.cmd"; do
         if [ -e "$w" ]; then
             if grep -q "$MARK" "$w" 2>/dev/null; then remove "$w"; else say "left $w (not written by this script)"; fi
@@ -837,6 +872,10 @@ uninstall_all() {
             say "put back $w (it was $w.before-cctg-install)"
         fi
     done
+    # The Windows shell-prefix shim.
+    if [ -e "$bin_dir/cctg-sandbox-exec" ]; then
+        if grep -q "$MARK" "$bin_dir/cctg-sandbox-exec" 2>/dev/null; then remove "$bin_dir/cctg-sandbox-exec"; else say "left $bin_dir/cctg-sandbox-exec (not written by this script)"; fi
+    fi
     remove "$conf_dir/mcp.json"
     remove "$conf_dir/settings.json"
     # Sandbox profiles are generated; the marks, the read allowlist, temp and

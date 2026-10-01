@@ -107,8 +107,13 @@ fn quotable(path: &str) -> bool {
 pub const GITCONFIG_VAR: &str = "CCTG_SANDBOX_GITCONFIG";
 
 /// Appends [`cache_exports`] to `CLAUDE_ENV_FILE` when this session runs with
-/// a profile. `None`: nothing to do.
+/// a profile. `None`: nothing to do. On Windows always `None`: the broker sets
+/// the caches and git variables directly, and `CLAUDE_ENV_FILE` would reach
+/// hooks that run outside the sandbox.
 pub fn export_caches(var: &impl Fn(&str) -> Option<String>) -> Option<std::io::Result<()>> {
+    if cfg!(windows) {
+        return None;
+    }
     if var(super::ACTIVE_VAR).as_deref() != Some("1") {
         return None;
     }
@@ -289,33 +294,74 @@ fn prepare_in(
     let gitconfig = git_dir.join(&id);
     write_if_changed(&gitconfig, user_gitconfig(probe).as_bytes())
         .map_err(|_| Refusal::Io("~/.cctg/sandbox/git"))?;
-    folder_dirs(folder)?;
+    let windows = probe.os() == Os::Windows;
 
-    let mut deny_read = vec!["~/.gitconfig".to_owned(), "~/.config/git".to_owned()];
-    if let Some(state) = probe
-        .var(crate::hub::config::STATE_VAR)
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute() && !paths::within(&home, dir))
-    {
-        deny_read.push(text(&state)?);
-    }
-    let extra = match probe.os() {
-        Os::Linux => LINUX_EXTRA_DENY_READ,
-        Os::MacOs => MACOS_EXTRA_DENY_READ,
-        Os::Windows | Os::Other => &[],
+    // On Windows all sandbox directories, ACLs and env are keyed on the mark
+    // root (the broker agrees), not the session subfolder.
+    let (win, dirs_base) = if windows {
+        let root = covering_mark(probe, &home, folder)?;
+        folder_dirs(&root, true)?;
+        let slot = probe.windows_prepare(&root, &gitconfig, &allow_read)?;
+        let _ = slot; // the slot's ACEs are applied inside windows_prepare
+        let bash = probe.git_bash().ok_or(Refusal::NoGitBash)?;
+        let bash = probe.canonical(&bash).unwrap_or(bash);
+        let mark = text(&root)?;
+        let win = WinEnv {
+            shim: fwd(&super::win_shim_path(&home)),
+            tmp: format!(
+                "{}\\.cctg\\sandbox\\tmp",
+                mark.trim_end_matches(['/', '\\'])
+            ),
+            mark,
+            bash: text(&bash)?,
+        };
+        (Some(win), root)
+    } else {
+        folder_dirs(folder, false)?;
+        (None, folder.to_path_buf())
     };
-    deny_read.extend(extra.iter().map(|path| (*path).to_owned()));
-    deny_read.extend(other_projects_temp(probe, folder));
-    let mut allow_read = allow_read
-        .iter()
-        .map(|dir| text(dir))
-        .collect::<Result<Vec<_>, _>>()?;
-    allow_read.push(text(&gitconfig)?);
+    let _ = dirs_base;
+
+    let mut deny_read = Vec::new();
+    let mut allow_read_text = Vec::new();
+    if !windows {
+        deny_read.push("~/.gitconfig".to_owned());
+        deny_read.push("~/.config/git".to_owned());
+        if let Some(state) = probe
+            .var(crate::hub::config::STATE_VAR)
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute() && !paths::within(&home, dir))
+        {
+            deny_read.push(text(&state)?);
+        }
+        let extra = match probe.os() {
+            Os::Linux => LINUX_EXTRA_DENY_READ,
+            Os::MacOs => MACOS_EXTRA_DENY_READ,
+            Os::Windows | Os::Other => &[],
+        };
+        deny_read.extend(extra.iter().map(|path| (*path).to_owned()));
+        deny_read.extend(other_projects_temp(probe, folder));
+        allow_read_text = allow_read
+            .iter()
+            .map(|dir| text(dir))
+            .collect::<Result<Vec<_>, _>>()?;
+        allow_read_text.push(text(&gitconfig)?);
+    }
 
     merge(
         &mut settings,
-        overlay(&text(&gitconfig)?, allow_read, deny_read, &exe),
+        overlay(
+            probe.os(),
+            &text(&gitconfig)?,
+            allow_read_text,
+            deny_read,
+            &exe,
+            win.as_ref(),
+        ),
     );
+    if windows {
+        rewrite_hooks_exec_form(&mut settings, &exe);
+    }
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|_| Refusal::Io("профиль"))?;
     let mut path = profile_path(base_settings, folder);
     if probe_run {
@@ -377,30 +423,82 @@ fn other_projects_temp(probe: &dyn Probe, folder: &Path) -> Vec<String> {
     other
 }
 
-fn overlay(gitconfig: &str, allow_read: Vec<String>, deny_read: Vec<String>, exe: &str) -> Value {
-    let secrets: Vec<Value> = SECRET_VARS
-        .iter()
-        .map(|name| json!({ "name": name, "mode": "deny" }))
-        .collect();
+/// The Windows-only env the profile adds (no OS sandbox block there): the
+/// shell-prefix shim, the mark root, the Git Bash and the temp relocation.
+struct WinEnv {
+    /// `CLAUDE_CODE_SHELL_PREFIX` (forward slashes).
+    shim: String,
+    /// `CCTG_SANDBOX_MARK` (the covering mark root).
+    mark: String,
+    /// `CCTG_SANDBOX_BASH`.
+    bash: String,
+    /// `TEMP`/`TMP`/`CLAUDE_CODE_TMPDIR` (`<mark>\.cctg\sandbox\tmp`).
+    tmp: String,
+}
+
+fn overlay(
+    os: Os,
+    gitconfig: &str,
+    allow_read: Vec<String>,
+    deny_read: Vec<String>,
+    exe: &str,
+    win: Option<&WinEnv>,
+) -> Value {
+    // probe P2e/P2p (WSL) and P0c (Windows): these env keys reach Bash, hooks
+    // and MCP; the scrub forces the default permission mode.
+    let mut env = json!({
+        "CCTG_SANDBOX": "1",
+        "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
+        "CCTG_SANDBOX_GITCONFIG": gitconfig,
+        "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
+    });
     let mut overlay = json!({
-        // probe P2e (WSL run 3): these reach Bash, hooks and MCP; GIT_*
-        // names do not (git_exports). Probe P2p: the scrub acts from here
-        // (no secret in Bash); it also forces the permission mode to
-        // default (plan, auto and acceptEdits are not available).
-        "env": {
-            "CCTG_SANDBOX": "1",
-            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
-            "CCTG_SANDBOX_GITCONFIG": gitconfig,
-            "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
+        "permissions": {
+            "blockReadsOutsideWorkingDirectories": true,
+            "disableBypassPermissionsMode": "disable",
+            "allow": ["WebFetch(domain:*)"],
+            "deny": DENY
         },
-        "sandbox": {
+        "disableClaudeAiConnectors": true,
+        "autoMemoryEnabled": false,
+    });
+    if SKILL_SHELL_OFF {
+        overlay["disableSkillShellExecution"] = Value::Bool(true);
+    }
+    if let Some(win) = win {
+        // Windows: no `sandbox` block (probe A of TASK-087: failIfUnavailable
+        // refuses to start). The shell prefix, PowerShell off, the mark, the
+        // Git Bash and the temp relocation (P0c) go in env; the gate is an
+        // exec-form hook.
+        env["CLAUDE_CODE_SHELL_PREFIX"] = json!(win.shim);
+        env["CLAUDE_CODE_USE_POWERSHELL_TOOL"] = json!("0");
+        env["CCTG_SANDBOX_MARK"] = json!(win.mark);
+        env["CCTG_SANDBOX_BASH"] = json!(win.bash);
+        env["TEMP"] = json!(win.tmp);
+        env["TMP"] = json!(win.tmp);
+        env["CLAUDE_CODE_TMPDIR"] = json!(win.tmp);
+        overlay["hooks"] = json!({ "PreToolUse": [{
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit|EnterWorktree",
+            "hooks": [{
+                "type": "command",
+                "command": exe,
+                "args": ["sandbox-gate"],
+                "timeout": 10
+            }]
+        }] });
+    } else {
+        // Linux and macOS: the strict Claude Code sandbox and a shell-form
+        // gate hook.
+        let secrets: Vec<Value> = SECRET_VARS
+            .iter()
+            .map(|name| json!({ "name": name, "mode": "deny" }))
+            .collect();
+        let _ = os;
+        overlay["sandbox"] = json!({
             "enabled": true,
             "failIfUnavailable": true,
             "allowUnsandboxedCommands": false,
             "enableWeakerNestedSandbox": false,
-            // Review finding 2: user settings may set these; the profile's
-            // value wins (--settings is above user settings). Any new
-            // boolean that weakens the sandbox belongs here too.
             "allowAppleEvents": false,
             "enableWeakerNetworkIsolation": false,
             "autoAllowBashIfSandboxed": false,
@@ -411,27 +509,17 @@ fn overlay(gitconfig: &str, allow_read: Vec<String>, deny_read: Vec<String>, exe
             },
             "network": { "allowAllUnixSockets": false, "allowLocalBinding": false },
             "credentials": { "envVars": secrets }
-        },
-        "permissions": {
-            "blockReadsOutsideWorkingDirectories": true,
-            "disableBypassPermissionsMode": "disable",
-            "allow": ["WebFetch(domain:*)"],
-            "deny": DENY
-        },
-        "disableClaudeAiConnectors": true,
-        "autoMemoryEnabled": false,
-        "hooks": { "PreToolUse": [{
+        });
+        overlay["hooks"] = json!({ "PreToolUse": [{
             "matcher": "Write|Edit|MultiEdit|NotebookEdit|EnterWorktree",
             "hooks": [{
                 "type": "command",
                 "command": format!("\"{exe}\" sandbox-gate"),
                 "timeout": 10
             }]
-        }] }
-    });
-    if SKILL_SHELL_OFF {
-        overlay["disableSkillShellExecution"] = Value::Bool(true);
+        }] });
     }
+    overlay["env"] = env;
     overlay
 }
 
@@ -501,12 +589,14 @@ fn user_gitconfig(probe: &dyn Probe) -> String {
 
 /// `<folder>/.cctg/sandbox/` with the cache dirs and a `.gitignore` of `*`.
 /// Every existing part from `<folder>/.cctg` down must be a real directory
-/// (a sandboxed command could have put a link there).
-fn folder_dirs(folder: &Path) -> Result<(), Refusal> {
+/// (a sandboxed command could have put a link there). On Windows also `tmp`
+/// and `config` (temp relocation, `XDG_CONFIG_HOME`).
+pub(crate) fn folder_dirs(folder: &Path, windows: bool) -> Result<(), Refusal> {
     let base = folder.join(".cctg").join("sandbox");
     real_dir(&folder.join(".cctg"))?;
     real_dir(&base)?;
-    for dir in CACHE_DIRS {
+    let extra: &[&str] = if windows { &["tmp", "config"] } else { &[] };
+    for dir in CACHE_DIRS.iter().chain(extra) {
         real_dir(&base.join(dir))?;
     }
     let ignore = base.join(".gitignore");
@@ -515,6 +605,84 @@ fn folder_dirs(folder: &Path) -> Result<(), Refusal> {
     }
     write_if_changed(&ignore, b"*\n").map_err(|_| Refusal::Io("<папка>/.cctg/sandbox"))?;
     Ok(())
+}
+
+/// The mark that covers `folder`, canonical. `NotPrepared` when none does.
+fn covering_mark(probe: &dyn Probe, home: &Path, folder: &Path) -> Result<PathBuf, Refusal> {
+    let folder = probe
+        .canonical(folder)
+        .unwrap_or_else(|| folder.to_path_buf());
+    let marks = super::marks::load(&super::marks_file(home)).map_err(|_| Refusal::NotPrepared)?;
+    super::marks::covering(&marks, &folder)
+        .map(Path::to_path_buf)
+        .ok_or(Refusal::NotPrepared)
+}
+
+/// A path with forward slashes (for `CLAUDE_CODE_SHELL_PREFIX`).
+fn fwd(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Rewrites each base hook of the form `"<exe>" hook <Event>` into exec form
+/// (`command` + `args`), so Claude Code runs it without the shell prefix
+/// (probe P0c). Other hooks (a user's, through the prefix into the sandbox)
+/// and the status line are left as they are.
+fn rewrite_hooks_exec_form(settings: &mut Value, exe: &str) {
+    let Some(events) = settings
+        .pointer_mut("/hooks")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (_event, groups) in events.iter_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups {
+            let Some(hooks) = group.pointer_mut("/hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for hook in hooks {
+                let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
+                if hook.get("args").is_some() {
+                    continue;
+                }
+                if let Some((program, event)) = parse_hook_command(command)
+                    && same_exe(&program, exe)
+                {
+                    let obj = hook.as_object_mut().unwrap();
+                    obj.insert("command".to_owned(), json!(program));
+                    obj.insert("args".to_owned(), json!(["hook", event]));
+                }
+            }
+        }
+    }
+}
+
+/// `"<program>" hook <Event>` (Event = `[A-Za-z]+`) -> `(program, Event)`.
+fn parse_hook_command(command: &str) -> Option<(String, String)> {
+    let command = command.trim();
+    let rest = command.strip_prefix('"')?;
+    let (program, rest) = rest.split_once('"')?;
+    let mut parts = rest.split_whitespace();
+    if parts.next()? != "hook" {
+        return None;
+    }
+    let event = parts.next()?;
+    if parts.next().is_some() || !event.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some((program.to_owned(), event.to_owned()))
+}
+
+/// Whether the hook program is our resolved exe (both spellings, case-fold).
+fn same_exe(program: &str, exe: &str) -> bool {
+    program.eq_ignore_ascii_case(exe)
+        || paths::canonical(Path::new(program))
+            .zip(paths::canonical(Path::new(exe)))
+            .is_some_and(|(a, b)| a == b)
 }
 
 fn real_dir(dir: &Path) -> Result<(), Refusal> {
@@ -865,11 +1033,12 @@ mod tests {
     fn refusals_write_nothing() {
         let (_dir, home, folder) = home_and_folder("profile-refused");
         let (settings, exe) = install(&home);
+        // Windows without an install: SandboxNotInstalled, nothing written.
         let mut fake = Fake::linux(&home);
         fake.os = Os::Windows;
         assert_eq!(
             prepare(&fake, &settings, &folder, &exe),
-            Err(Refusal::WindowsNotYet)
+            Err(Refusal::SandboxNotInstalled)
         );
         assert!(!sandbox_home(&home).exists());
         assert!(!folder.join(".cctg").exists());
@@ -882,6 +1051,99 @@ mod tests {
             Err(Refusal::BaseSettings)
         );
         assert!(!profile_path(&settings, &folder).exists());
+    }
+
+    /// Windows: no `sandbox` block; env carries the prefix, PowerShell off,
+    /// the mark, the Git Bash and the temp relocation; the base hooks are in
+    /// exec form and the gate has `args: ["sandbox-gate"]`; the status line is
+    /// untouched.
+    #[test]
+    fn the_windows_profile_has_no_sandbox_block_and_exec_hooks() {
+        let (_dir, home, folder) = home_and_folder("profile-windows");
+        let (settings, exe) = install(&home);
+        // install.sh writes the hook commands with the exe path; use it so the
+        // exec-form rewrite matches.
+        let exe_disp = exe.display().to_string();
+        std::fs::write(
+            &settings,
+            serde_json::to_vec_pretty(&json!({
+                "statusLine": { "type": "command", "command": "\"cctg\" statusline" },
+                "hooks": {
+                    "SessionStart": [{ "hooks": [{ "type": "command", "command": format!("\"{exe_disp}\" hook SessionStart") }] }],
+                    "PreToolUse": [
+                        { "matcher": "AskUserQuestion", "hooks": [{ "type": "command", "command": format!("\"{exe_disp}\" hook PreToolUse") }] }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::sandbox::marks::add(&crate::sandbox::marks_file(&home), &folder).unwrap();
+        let fake = Fake::windows(&home);
+        let path = prepare(&fake, &settings, &folder, &exe).unwrap();
+        let profile: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            profile.get("sandbox").is_none(),
+            "no sandbox block on Windows"
+        );
+        let env = &profile["env"];
+        assert_eq!(env["CCTG_SANDBOX"], "1");
+        assert_eq!(env["CLAUDE_CODE_USE_POWERSHELL_TOOL"], "0");
+        assert!(
+            env["CLAUDE_CODE_SHELL_PREFIX"]
+                .as_str()
+                .unwrap()
+                .ends_with("cctg-sandbox-exec")
+        );
+        assert!(
+            !env["CLAUDE_CODE_SHELL_PREFIX"]
+                .as_str()
+                .unwrap()
+                .contains('\\')
+        );
+        let folder_native = folder.to_string_lossy().to_string();
+        assert_eq!(env["CCTG_SANDBOX_MARK"], folder_native);
+        assert!(
+            env["CCTG_SANDBOX_BASH"]
+                .as_str()
+                .unwrap()
+                .ends_with("bash.exe")
+        );
+        assert!(
+            env["TEMP"]
+                .as_str()
+                .unwrap()
+                .ends_with(r"\.cctg\sandbox\tmp")
+        );
+        assert_eq!(env["TEMP"], env["CLAUDE_CODE_TMPDIR"]);
+        assert_eq!(env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1");
+        // Base hooks in exec form.
+        let exe_canon = paths::canonical(&exe).unwrap();
+        let start = &profile["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(start["args"], json!(["hook", "SessionStart"]));
+        assert_eq!(
+            Path::new(start["command"].as_str().unwrap()),
+            exe_canon.as_path()
+        );
+        // The gate: exec form, args sandbox-gate.
+        let pre = profile["hooks"]["PreToolUse"].as_array().unwrap();
+        let gate = pre
+            .iter()
+            .find(|h| h["matcher"] == "Write|Edit|MultiEdit|NotebookEdit|EnterWorktree")
+            .unwrap();
+        assert_eq!(gate["hooks"][0]["args"], json!(["sandbox-gate"]));
+        assert_eq!(gate["hooks"][0]["timeout"], 10);
+        assert!(
+            !gate["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("sandbox-gate")
+        );
+        // The status line is untouched.
+        assert_eq!(profile["statusLine"]["command"], "\"cctg\" statusline");
+        // The folder temp/config dirs exist.
+        assert!(folder.join(".cctg").join("sandbox").join("tmp").is_dir());
+        assert!(folder.join(".cctg").join("sandbox").join("config").is_dir());
     }
 
     #[test]
