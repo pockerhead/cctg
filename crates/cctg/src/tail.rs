@@ -15,12 +15,16 @@
 //! never opened) and checks on the canonical path (no symlink or junction
 //! way out). Any session id in that folder is served (after `/clear` the id
 //! changes, the folder does not); another project's sessions never are
-//! (TASK-034 decision 12: the hub may run on another machine).
+//! (TASK-034 decision 12: the hub may run on another machine). The folder
+//! follows the session's transcript: Claude Code moves it into the project
+//! folder of a worktree on `EnterWorktree` (and of a new folder on `/cd`)
+//! and back on `ExitWorktree` (TASK-093).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use transcript::{ChannelPlace, StreamEvent};
 
@@ -59,18 +63,34 @@ const MAX_FOLDER_NAME: usize = 200;
 /// The agent's own project folder `<projects root>/<project>` (TASK-034
 /// decision 12): where Claude Code keeps the transcript of the agent's claude
 /// session (its env `CLAUDE_CODE_SESSION_ID`). Found, not computed: the
-/// folder that holds `<session id>.jsonl` ([`Self::folder`]), looked for on
-/// each read until it is there and then kept. Until then Claude Code's names
-/// for the cwd ([`project_folder_name`] of the resolved and the given cwd)
-/// stand in, never kept: they serve a session that `/clear`ed before its
-/// first record, whose env id never gets a transcript.
+/// folder that holds `<session id>.jsonl` ([`Self::folder`]), kept while it
+/// holds the session's transcript and looked for again when it does not:
+/// Claude Code moves the transcript into the project folder of a worktree on
+/// `EnterWorktree` (and of a new folder on `/cd`) and back on `ExitWorktree`
+/// (TASK-093). Until it is found Claude Code's names for the cwd
+/// ([`project_folder_name`] of the resolved and the given cwd) stand in,
+/// never kept: they serve a session that `/clear`ed before its first record,
+/// whose env id never gets a transcript.
 #[derive(Debug)]
 pub struct OwnProject {
     root: PathBuf,
     session_id: String,
     by_cwd: Vec<PathBuf>,
-    found: OnceLock<PathBuf>,
+    found: Mutex<Found>,
 }
+
+/// The folder found last, and when the projects root was last searched in
+/// vain while it was kept.
+#[derive(Debug, Default)]
+struct Found {
+    folder: Option<PathBuf>,
+    missed: Option<Instant>,
+}
+
+/// A kept folder that lost the session's transcript is not searched for
+/// again more often than this: a transcript that is gone or in two folders
+/// would otherwise list the projects root on every read (TASK-093).
+const RESEARCH_EVERY: Duration = Duration::from_secs(5);
 
 impl OwnProject {
     /// Under the projects directory `root`, for the claude session
@@ -94,7 +114,7 @@ impl OwnProject {
             root,
             session_id,
             by_cwd,
-            found: OnceLock::new(),
+            found: Mutex::default(),
         })
     }
 
@@ -105,19 +125,32 @@ impl OwnProject {
             root,
             session_id: String::new(),
             by_cwd: Vec::new(),
-            found: OnceLock::from(folder),
+            found: Mutex::new(Found {
+                folder: Some(folder),
+                missed: None,
+            }),
         }
     }
 
     /// The folder to read from now: the one that holds the session's
-    /// transcript (kept once found), else an existing folder named after the
-    /// cwd, else none. Blocking: it may list the projects root.
+    /// transcript (kept while it holds it, looked for again when it does
+    /// not, at most every [`RESEARCH_EVERY`]), else the last one found, else
+    /// an existing folder named after the cwd, else none. Blocking: it may
+    /// list the projects root.
     pub fn folder(&self) -> Option<PathBuf> {
-        if let Some(found) = self.found.get() {
-            return Some(found.clone());
-        }
+        let (kept, missed) = {
+            let found = self.found();
+            (found.folder.clone(), found.missed)
+        };
         let file = format!("{}.jsonl", self.session_id);
         let holds = |folder: &Path| folder.join(&file).is_file();
+        if let Some(kept) = &kept
+            && (self.session_id.is_empty()
+                || holds(kept)
+                || missed.is_some_and(|at| at.elapsed() < RESEARCH_EVERY))
+        {
+            return Some(kept.clone());
+        }
         let found = self
             .by_cwd
             .iter()
@@ -133,10 +166,27 @@ impl OwnProject {
                 // Claude Code's own lookup gives up on an id in two folders.
                 holding.next().is_none().then_some(first)
             });
-        match found {
-            Some(found) => Some(self.found.get_or_init(|| found).clone()),
-            None => self.by_cwd.iter().find(|folder| folder.is_dir()).cloned(),
+        match (found, kept) {
+            (Some(found), _) => {
+                *self.found() = Found {
+                    folder: Some(found.clone()),
+                    missed: None,
+                };
+                Some(found)
+            }
+            // Being moved, gone or in two folders: the last folder stays.
+            (None, Some(kept)) => {
+                self.found().missed = Some(Instant::now());
+                Some(kept)
+            }
+            (None, None) => self.by_cwd.iter().find(|folder| folder.is_dir()).cloned(),
         }
+    }
+
+    /// The lock is held only to read or write [`Found`], never while the
+    /// disk is searched.
+    fn found(&self) -> std::sync::MutexGuard<'_, Found> {
+        self.found.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Opens `<folder>/<parts>` only when the folder sits right in the
@@ -668,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn the_own_folder_is_found_by_the_sessions_transcript_and_then_kept() {
+    fn the_own_folder_is_found_by_the_sessions_transcript_and_kept_while_it_holds_it() {
         let dir = TempDir::new("tail-own-find");
         let root = root(&dir);
         std::fs::create_dir_all(&root).unwrap();
@@ -699,6 +749,105 @@ mod tests {
         // Nothing to find it by: no reads at all.
         assert!(OwnProject::new(root.clone(), None, Some(cwd)).is_none());
         assert!(OwnProject::new(root.clone(), Some("../x"), Some(cwd)).is_none());
+    }
+
+    /// TASK-093: Claude Code moves the transcript into the project folder of
+    /// a worktree on `EnterWorktree` and back on `ExitWorktree`; reads go on
+    /// from the same offset wherever it is.
+    #[test]
+    fn the_own_folder_follows_its_transcript_into_a_worktree_folder_and_back() {
+        let dir = TempDir::new("tail-own-move");
+        let root = root(&dir);
+        let home = root.join("C--repo");
+        let worktree = root.join("C--repo--claude-worktrees-tasks");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let file = format!("{SESSION}.jsonl");
+        let at_home = home.join(&file);
+        let in_worktree = worktree.join(&file);
+        append(&at_home.to_string_lossy(), &prompt("one"));
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(r"C:\repo")).unwrap();
+        let (_, first, got, ..) = texts(&read_chunk(Some(&own), SESSION, Some(0)));
+        assert_eq!(got, ["one"]);
+
+        // EnterWorktree.
+        std::fs::rename(&at_home, &in_worktree).unwrap();
+        append(&in_worktree.to_string_lossy(), &prompt("two"));
+        let (from, second, got, missing, _, reset) =
+            texts(&read_chunk(Some(&own), SESSION, Some(first)));
+        assert_eq!(
+            (from, got, missing, reset),
+            (first, vec!["two".into()], false, false)
+        );
+        assert_eq!(own.folder(), Some(worktree.clone()));
+
+        // ExitWorktree.
+        std::fs::rename(&in_worktree, &at_home).unwrap();
+        append(&at_home.to_string_lossy(), &prompt("three"));
+        let (from, _, got, ..) = texts(&read_chunk(Some(&own), SESSION, Some(second)));
+        assert_eq!((from, got), (second, vec!["three".to_owned()]));
+        assert_eq!(own.folder(), Some(home.clone()));
+
+        // A copy elsewhere does not take it away from the folder it is in.
+        let copy = root.join("C--copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::copy(&at_home, copy.join(&file)).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        std::fs::remove_dir_all(&copy).unwrap();
+
+        // Another project's session is still never served.
+        let other = "5e551017-0000-4000-8000-000000000003";
+        let foreign = root.join("C--other");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join(format!("{other}.jsonl")), prompt("private")).unwrap();
+        assert!(texts(&read_chunk(Some(&own), other, Some(0))).3);
+
+        // Gone while it was in the worktree's folder: the last folder stays.
+        std::fs::rename(&at_home, &in_worktree).unwrap();
+        assert_eq!(own.folder(), Some(worktree.clone()));
+        std::fs::remove_file(&in_worktree).unwrap();
+        assert_eq!(own.folder(), Some(worktree));
+    }
+
+    /// TASK-093 review: a kept folder whose transcript is gone (or in two
+    /// other folders) does not list the projects root on every read: one
+    /// search per [`RESEARCH_EVERY`].
+    #[test]
+    fn a_lost_transcript_is_looked_for_at_most_once_per_interval() {
+        let dir = TempDir::new("tail-own-backoff");
+        let root = root(&dir);
+        let home = root.join("C--repo");
+        let elsewhere = root.join("C--repo--claude-worktrees-tasks");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let file = format!("{SESSION}.jsonl");
+        std::fs::write(home.join(&file), prompt("one")).unwrap();
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(r"C:\repo")).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        // Gone: searched once in vain, the kept folder stays.
+        std::fs::remove_file(home.join(&file)).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        assert!(own.found().missed.is_some());
+        // It shows up elsewhere: not looked for until the interval is over.
+        std::fs::write(elsewhere.join(&file), prompt("two")).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        let past = Instant::now().checked_sub(RESEARCH_EVERY + Duration::from_secs(1));
+        own.found().missed = past;
+        assert_eq!(own.folder(), Some(elsewhere.clone()));
+        assert!(own.found().missed.is_none());
+        // In two folders besides the kept one: no answer, the same backoff.
+        std::fs::remove_file(elsewhere.join(&file)).unwrap();
+        let (one, two) = (root.join("C--one"), root.join("C--two"));
+        for folder in [&one, &two] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join(&file), prompt("x")).unwrap();
+        }
+        assert_eq!(own.folder(), Some(elsewhere.clone()));
+        let missed = own.found().missed;
+        assert!(missed.is_some());
+        std::fs::remove_file(two.join(&file)).unwrap();
+        assert_eq!(own.folder(), Some(elsewhere), "still waiting");
+        assert_eq!(own.found().missed, missed, "no search meanwhile");
     }
 
     #[test]

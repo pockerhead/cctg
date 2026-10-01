@@ -35,8 +35,8 @@ use tracing::{debug, info, warn};
 use super::devices::{Devices, JoinError, Who};
 use crate::tls::{Acceptor, Incoming, ReadTask, Stream};
 use crate::wire::{
-    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookPost, HubMsg, JOIN_PATH,
-    JoinAnswer, Liveness, MAX_HOOK_BODY, MAX_JOIN_BODY, PERMISSION_PATH, PING_PATH,
+    self, AgentMsg, Beat, Behavior, EventId, HOOK_PATH, Heartbeat, HookEvent, HookPost, HubMsg,
+    JOIN_PATH, JoinAnswer, Liveness, MAX_HOOK_BODY, MAX_JOIN_BODY, PERMISSION_PATH, PING_PATH,
     PermissionAnswer, PermissionPost, QUESTION_PATH, QuestionAnswer, QuestionPost, Register,
     Rejection, WireError,
 };
@@ -1167,14 +1167,29 @@ fn accept_hook(
         short(&post.session_id).to_owned(),
         post.event.is_frequent(),
     );
+    // Only a documented value is logged, never the device's text (TASK-093).
+    let source: &'static str = match &post.event {
+        HookEvent::SessionStart {
+            source: Some(source),
+            ..
+        } => match source.as_str() {
+            "startup" => "startup",
+            "resume" => "resume",
+            "clear" => "clear",
+            "compact" => "compact",
+            "fork" => "fork",
+            _ => "",
+        },
+        _ => "",
+    };
     match events.try_send(post) {
         Ok(()) => {
             // Remembered only once handed over, so a 503 can be re-sent.
             dedup.insert(id, now);
             if frequent {
-                debug!(event = kind, session, "hook event accepted");
+                debug!(event = kind, session, source, "hook event accepted");
             } else {
-                info!(event = kind, session, "hook event accepted");
+                info!(event = kind, session, source, "hook event accepted");
             }
             Status::NoContent
         }

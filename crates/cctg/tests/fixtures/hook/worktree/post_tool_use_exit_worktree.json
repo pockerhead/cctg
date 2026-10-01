@@ -1,0 +1,12 @@
+{
+  "session_id": "{sid}",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "ExitWorktree",
+  "tool_input": {
+    "action": "keep"
+  },
+  "tool_use_id": "toolu_01WorktreeExit00000000001"
+}

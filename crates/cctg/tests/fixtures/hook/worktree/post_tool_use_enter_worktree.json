@@ -1,0 +1,12 @@
+{
+  "session_id": "{sid}",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "EnterWorktree",
+  "tool_input": {
+    "name": "tasks"
+  },
+  "tool_use_id": "toolu_01WorktreeEnter0000000001"
+}

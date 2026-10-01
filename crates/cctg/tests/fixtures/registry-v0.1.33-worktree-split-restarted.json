@@ -1,0 +1,72 @@
+{
+  "version": 3,
+  "seq": 4,
+  "slots": [
+    {
+      "host": "box",
+      "folder_key": "c:/work/project",
+      "folder_name": "Project",
+      "ordinal": 1,
+      "current_session": "aaaaaaaa-0000-4000-8000-000000000001",
+      "views": [
+        {
+          "chat": {
+            "group": 0
+          },
+          "topic_id": 100,
+          "applied_title": "[box] Project · aaaaaaaa",
+          "applied_icon": "5357121491508928442",
+          "pending_separator": null
+        }
+      ]
+    },
+    {
+      "host": "box",
+      "folder_key": "c:/work/project/.claude/worktrees/tasks",
+      "folder_name": "tasks",
+      "ordinal": 1,
+      "current_session": "aaaaaaaa-0000-4000-8000-000000000001",
+      "views": [
+        {
+          "chat": {
+            "group": 0
+          },
+          "topic_id": 101,
+          "applied_title": "[box] tasks · aaaaaaaa",
+          "applied_icon": "5357121491508928442",
+          "pending_separator": null
+        }
+      ]
+    }
+  ],
+  "sessions": {
+    "aaaaaaaa-0000-4000-8000-000000000001": {
+      "host": "box",
+      "kind": {
+        "kind": "top_level"
+      },
+      "slot": 0,
+      "transcript_path": "/t/aaaaaaaa-0000-4000-8000-000000000001.jsonl",
+      "claude_pid": 20,
+      "title": null,
+      "ended": false,
+      "seen": 4,
+      "stream": {
+        "offset": 0,
+        "calls": [],
+        "receipts": []
+      }
+    }
+  },
+  "subagents": {},
+  "pids": {
+    "box/20": "aaaaaaaa-0000-4000-8000-000000000001"
+  },
+  "groups": [
+    {
+      "chat": 0,
+      "ready": true,
+      "can_delete": false
+    }
+  ]
+}

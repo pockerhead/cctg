@@ -15667,7 +15667,7 @@ mod tests {
 
     use super::*;
     use crate::hub::api::{ForumTopic, Message};
-    use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL};
+    use crate::hub::registry::{ICON_ALIVE, ICON_DEAD, ICON_NO_CHANNEL, RELEASED_NOTE};
     use crate::hub::scheduler::{BucketConfig, GROUP_BUCKET, Limits, Scheduler, Transport};
     use crate::hub::testdir::TempDir;
     use crate::wire::{
@@ -27597,6 +27597,70 @@ again"
                 .all(|(_, meta)| !meta.contains_key("message_ids"))
         );
         assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// TASK-093: a registry hub v0.1.33 left split by a compaction inside a
+    /// worktree (topic 100 "Project", where the user writes, and topic 101
+    /// "tasks"), loaded by this hub: topic 101 is told once that the session
+    /// went back; what the user writes in topic 100 reaches the session,
+    /// what is written in topic 101 is kept like in any dead topic and
+    /// never reaches it, with nothing more said there.
+    #[tokio::test]
+    async fn a_healed_split_tells_the_released_topic_once_and_keeps_its_messages() {
+        const SPLIT: &str =
+            include_str!("../../tests/fixtures/registry-v0.1.33-worktree-split.json");
+        let dir = TempDir::new("slots-healed-split");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        store.save(SPLIT.as_bytes()).unwrap();
+        let registry = store.load(GroupChat::UNIT).unwrap();
+        let stalled = Arc::new(Fake {
+            stall: true,
+            ..Fake::default()
+        });
+        let (scheduler, outbox) = Scheduler::new(stalled, BucketConfig::default());
+        tokio::spawn(scheduler.run());
+        let mut slots = Slots::new(registry, store, outbox, options());
+        let mut work = capture_dispatch(&mut slots);
+        let mut agent = connect_queue(&mut slots, 1, A, Some(10), 64);
+        let in_topic = |thread: i64, message_id: i64| Inbound {
+            thread_id: Some(thread),
+            ..topic_text(message_id, "hi", false)
+        };
+        let to_released = |work: &mut mpsc::UnboundedReceiver<(Work, Op)>| {
+            let mut texts = Vec::new();
+            while let Ok((_, op)) = work.try_recv() {
+                if let Op::Send {
+                    thread_id: Some(101),
+                    text,
+                    ..
+                } = op
+                {
+                    texts.push(text);
+                }
+            }
+            texts
+        };
+        slots.pump();
+        assert_eq!(to_released(&mut work), [RELEASED_NOTE]);
+        slots
+            .registry
+            .topic_separated(SlotId(1), Chat::GROUP, 101, RELEASED_NOTE);
+
+        slots.on_topic_message(in_topic(100, 1));
+        slots.pump();
+        slots.on_topic_message(in_topic(101, 2));
+        slots.pump();
+        slots.on_tick();
+        slots.pump();
+        let got = inbounds(&mut agent);
+        let ids: Vec<&str> = got
+            .iter()
+            .map(|(_, meta)| meta["message_id"].as_str())
+            .collect();
+        assert_eq!(ids, ["1"]);
+        assert_eq!(buffered(&slots, 1), [2]);
+        assert!(to_released(&mut work).is_empty(), "nothing more said there");
+        assert_eq!(slots.registry.slots[1].views[0].pending_separator, None);
     }
 
     #[tokio::test]
