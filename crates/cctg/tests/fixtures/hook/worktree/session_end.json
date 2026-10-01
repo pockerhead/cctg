@@ -1,0 +1,7 @@
+{
+  "session_id": "{sid}",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "hook_event_name": "SessionEnd",
+  "reason": "prompt_input_exit"
+}

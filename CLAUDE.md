@@ -48,6 +48,7 @@
 - Прочие типы, которые надо игнорировать при рендере: `mode`, `permission-mode`, `file-history-snapshot`, `ai-title`, `last-prompt`, `system`, `summary`.
 - `ai-title` даёт автоназвание сессии, пригодится для заголовка в теме.
 - Когда записи видны в jsonl (замер TASK-016, 2.1.281): через 0.1-0.3 с после `timestamp`. Исключение: в интерактивной сессии запись ассистента с `tool_use` пишется только по окончании инструмента, вместе с `tool_result`; идущий вызов в файле не виден.
+- Проверено 2026-10-01 (TASK-093, 2.1.285): `EnterWorktree`/`ExitWorktree` не стреляют ни `SessionStart`, ни `CwdChanged`. После входа `cwd` всех хуков это `<repo>/.claude/worktrees/<n>`, а `transcript_path` это `<P>--claude-worktrees-<n>/<id>.jsonl` с тем же id: транскрипт переезжает в эту папку проекта и обратно при выходе (так же при `/cd`). Компакция внутри worktree даёт `PreCompact` и `SessionStart(compact)` с cwd worktree. Поэтому hub не привязывает известную сессию к её cwd (своя тема остаётся), а агент ищет папку проекта заново, когда транскрипт из неё уехал.
 
 **Hooks:** `SessionStart`, `SessionEnd`, `Stop`, `UserPromptSubmit` получают в stdin JSON с `session_id`, `cwd`, `transcript_path`, `source` (`startup|resume|clear|compact|fork`). Это единственный надёжный способ узнать session id и путь транскрипта. Channel MCP-сервер сам этого не знает.
 

@@ -1364,3 +1364,285 @@ async fn e2e_a_session_that_exits_while_its_refused_line_waits_still_sends_it_be
 async fn e2e_a_clear_while_a_refused_line_waits_still_sends_it_before_the_next_separator() {
     rotation_while_a_refused_line_waits(true).await;
 }
+
+// ---------------------------------------------------------------- worktree (TASK-093)
+
+/// A hook input recorded from Claude Code's `EnterWorktree` probe
+/// (`tests/fixtures/hook/worktree/<name>.json`) for session `s`, built by the
+/// real hook code. Placeholders stand for whole string values, so paths are
+/// put in as values, never spliced into JSON text.
+fn hook_fixture(
+    name: &str,
+    event: &str,
+    s: &Session,
+    cwd: &str,
+    transcript: &Path,
+    answer: &str,
+) -> HookPost {
+    fn fill(value: &mut serde_json::Value, with: &[(&str, &str)]) {
+        match value {
+            serde_json::Value::String(text) => {
+                if let Some((_, to)) = with.iter().find(|(from, _)| from == text) {
+                    *text = (*to).to_owned();
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|item| fill(item, with)),
+            serde_json::Value::Object(fields) => {
+                fields.values_mut().for_each(|field| fill(field, with));
+            }
+            _ => {}
+        }
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("hook")
+        .join("worktree")
+        .join(format!("{name}.json"));
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("fixture")).expect("fixture json");
+    let transcript = transcript.to_string_lossy();
+    fill(
+        &mut value,
+        &[
+            ("{sid}", s.id.as_str()),
+            ("{cwd}", cwd),
+            ("{transcript}", &transcript),
+            ("{answer}", answer),
+        ],
+    );
+    let bytes = serde_json::to_vec(&value).expect("json");
+    cctg::hook::build(
+        event,
+        &bytes,
+        &cctg::hook::Probe {
+            host: HOST,
+            cwd: &|c: &str| c.to_owned(),
+            lineage: &|_: &str| cctg::proctree::Lineage {
+                claude_pid: Some(4242),
+                parent_claude_pid: None,
+            },
+            live_pids: &|| None,
+            exists: &|p: &Path| p.exists(),
+        },
+    )
+    .expect("fixture builds")
+}
+
+fn append_to(path: &Path, bytes: &str) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes.as_bytes()).unwrap();
+    file.flush().unwrap();
+}
+
+/// A topic message for the session, as the user writes it.
+fn inbound(message_id: i64) -> Control {
+    Control::Message(Inbound {
+        display_name: None,
+        chat: GROUP,
+        sender: cctg::hub::chat::PrivateChat::of_user(1001),
+        message_id,
+        thread_id: Some(THREAD),
+        text: Some("from telegram".into()),
+        reply_to: None,
+        quote: None,
+        forwarded: false,
+        media: None,
+        from_name: None,
+        author: None,
+        reply_from: None,
+    })
+}
+
+/// The slots of the saved registry as (folder name, current session).
+fn saved_slots(state: &Path) -> Option<Vec<(String, Option<String>)>> {
+    let text = std::fs::read_to_string(state.join("registry.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let slots = value["slots"].as_array()?;
+    Some(
+        slots
+            .iter()
+            .map(|slot| {
+                (
+                    slot["folder_name"].as_str().unwrap_or_default().to_owned(),
+                    slot["current_session"].as_str().map(str::to_owned),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// TASK-093: a session that enters a worktree (its hooks' cwd and its
+/// transcript move), compacts and restarts there, and exits it again keeps
+/// its one topic both ways: lines and answers reach it, and the user's
+/// messages reach the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_a_session_that_moves_into_a_worktree_and_back_keeps_one_topic_both_ways() {
+    let s = session("worktree", 30);
+    let (l, port) = listener().await;
+    let fake = Arc::new(Fake::default());
+    let hub = start_hub(&s.state, l, fast_bucket(), fake.clone()).await;
+    let send = |post: HookPost| {
+        let hooks = hub.hooks.clone();
+        async move { hooks.send(post).await.unwrap() }
+    };
+    let has_line = |line: &str| fake.topic_lines().iter().any(|l| l == line);
+    let eyes = |id: i64| fake.reactions().contains(&(id, "👀".to_owned()));
+    let wt_dir = s.workdir.join(".claude").join("worktrees").join("tasks");
+    std::fs::create_dir_all(&wt_dir).unwrap();
+    let wt_cwd = canonical_cwd(&wt_dir.to_string_lossy());
+    let wt_project = s
+        .config
+        .join("projects")
+        .join("C--qa-w--claude-worktrees-tasks");
+    std::fs::create_dir_all(&wt_project).unwrap();
+    let wt_transcript = wt_project.join(format!("{}.jsonl", s.id));
+    let home_cwd = s.cwd();
+    let in_wt = |name: &str, event: &str, answer: &str| {
+        hook_fixture(name, event, &s, &wt_cwd, &wt_transcript, answer)
+    };
+    // The fake gives every topic the same thread, so a second topic shows
+    // only as its create call.
+    let created = || -> Vec<String> {
+        fake.recs()
+            .into_iter()
+            .filter_map(|r| match r.op {
+                Op::CreateTopic { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // 1. At home.
+    start_session(&hub, &s, "startup").await;
+    let agent = start_agent(&s, port);
+    wait_for("topic", 20, || {
+        fake.recs()
+            .iter()
+            .any(|r| matches!(&r.op, Op::CreateTopic { .. }))
+    })
+    .await;
+    s.append(&prompt("before"));
+    wait_for("> before", 20, || has_line("> before")).await;
+
+    // 2. A message from the topic.
+    hub.control.send(inbound(555)).unwrap();
+    wait_for("eyes 555", 20, || eyes(555)).await;
+
+    // 3. EnterWorktree: the transcript and every later hook's cwd move.
+    std::fs::rename(&s.transcript, &wt_transcript).unwrap();
+    send(in_wt(
+        "post_tool_use_enter_worktree",
+        cctg::hook::TOOL_STATUS_EVENT,
+        "",
+    ))
+    .await;
+    append_to(&wt_transcript, &prompt("in worktree"));
+    append_to(&wt_transcript, &call("w1", "inside"));
+    append_to(&wt_transcript, &result("w1", false));
+    append_to(&wt_transcript, &answer("ANSWER IN WORKTREE"));
+    send(in_wt("stop", "Stop", "ANSWER IN WORKTREE")).await;
+    wait_for("worktree turn", 30, || {
+        has_line("> in worktree") && has_line(&ok_line("inside")) && has_line("ANSWER IN WORKTREE")
+    })
+    .await;
+
+    // 4. Compaction inside the worktree: a SessionStart from there.
+    send(in_wt("pre_compact", "PreCompact", "")).await;
+    send(in_wt("session_start_compact", "SessionStart", "")).await;
+    hub.control.send(inbound(556)).unwrap();
+    wait_for("eyes 556", 20, || eyes(556)).await;
+    append_to(&wt_transcript, &prompt("after compact"));
+    append_to(&wt_transcript, &answer("ANSWER AFTER COMPACT"));
+    send(in_wt("stop", "Stop", "ANSWER AFTER COMPACT")).await;
+    wait_for("compact turn", 30, || {
+        has_line("> after compact") && has_line("ANSWER AFTER COMPACT")
+    })
+    .await;
+    assert_eq!(created().len(), 1, "a start from the worktree made a topic");
+
+    // 5. Claude restarts inside the worktree (`cctg run`, a resume).
+    drop(agent);
+    send(in_wt("session_end", "SessionEnd", "")).await;
+    send(in_wt("session_start_resume", "SessionStart", "")).await;
+    let agent = start_agent(&s, port);
+    append_to(&wt_transcript, &prompt("after resume"));
+    append_to(&wt_transcript, &answer("ANSWER AFTER RESUME"));
+    send(in_wt("stop", "Stop", "ANSWER AFTER RESUME")).await;
+    hub.control.send(inbound(557)).unwrap();
+    wait_for("resume turn", 30, || {
+        has_line("> after resume") && has_line("ANSWER AFTER RESUME")
+    })
+    .await;
+    wait_for("eyes 557", 20, || eyes(557)).await;
+
+    // 6. ExitWorktree: back home.
+    std::fs::rename(&wt_transcript, &s.transcript).unwrap();
+    send(hook_fixture(
+        "post_tool_use_exit_worktree",
+        cctg::hook::TOOL_STATUS_EVENT,
+        &s,
+        &home_cwd,
+        &s.transcript,
+        "",
+    ))
+    .await;
+    s.append(&prompt("back home"));
+    s.append(&call("h1", "home"));
+    s.append(&result("h1", false));
+    s.append(&answer("ANSWER BACK HOME"));
+    send(hook_fixture(
+        "stop",
+        "Stop",
+        &s,
+        &home_cwd,
+        &s.transcript,
+        "ANSWER BACK HOME",
+    ))
+    .await;
+    hub.control.send(inbound(558)).unwrap();
+    wait_for("home turn", 30, || {
+        has_line("> back home") && has_line(&ok_line("home")) && has_line("ANSWER BACK HOME")
+    })
+    .await;
+    wait_for("eyes 558", 20, || eyes(558)).await;
+
+    // One topic, of the home folder; one slot, the session's.
+    wait_for("one slot saved", 20, || {
+        saved_slots(&s.state) == Some(vec![("w".to_owned(), Some(s.id.clone()))])
+    })
+    .await;
+    let created = created();
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert!(
+        created[0].contains("] w") && !created[0].contains("tasks"),
+        "{created:?}"
+    );
+    let lines = fake.topic_lines();
+    assert_no_dup(&lines);
+    let at = |line: &str| {
+        lines
+            .iter()
+            .position(|l| l == line)
+            .unwrap_or_else(|| panic!("{line:?} not in {lines:?}"))
+    };
+    let order = [
+        at("> before"),
+        at("> in worktree"),
+        at(&ok_line("inside")),
+        at("> after compact"),
+        at("> after resume"),
+        at("> back home"),
+        at(&ok_line("home")),
+    ];
+    assert!(order.is_sorted(), "{lines:?}");
+    for id in [555, 556, 557, 558] {
+        assert!(eyes(id), "no 👀 on {id}");
+    }
+    drop(agent);
+    hub.stop();
+}

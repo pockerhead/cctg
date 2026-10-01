@@ -1,0 +1,9 @@
+{
+  "session_id": "{sid}",
+  "transcript_path": "{transcript}",
+  "cwd": "{cwd}",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "{answer}"
+}

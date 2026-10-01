@@ -1354,11 +1354,13 @@ impl Registry {
         )
     }
 
-    /// The slot for a new top-level session, in this order: the slot it
-    /// already holds; its previous slot if free; on `/clear` (`clear_pid`),
-    /// the slot of the previous session of the same claude process, which
-    /// that session gives up; the first free slot of the folder; a new
-    /// ordinal.
+    /// The slot for a top-level session, in this order: the slot it holds
+    /// or held, if it is still its own or free, wherever its cwd is now
+    /// (TASK-093); on `/clear` (`clear_pid`), the slot of the previous
+    /// session of the same claude process on the same host, which that
+    /// session gives up; the first free slot of its folder (its slot's
+    /// folder when it has a slot on this host, else its cwd's); a new
+    /// ordinal of that folder.
     fn allocate(
         &mut self,
         session: &str,
@@ -1367,21 +1369,28 @@ impl Registry {
         clear_pid: Option<u32>,
         clear_slot: Option<SlotId>,
     ) -> SlotId {
-        let key = folder_key(cwd);
-        let same_folder = |slot: &Slot| slot.host == host && slot.folder_key == key;
-        if let Some(own) = self.sessions.get(session).and_then(|entry| entry.slot) {
-            let slot = &self.slots[own.0];
-            if same_folder(slot)
-                && (slot.current_session.as_deref() == Some(session) || self.is_free(own))
-            {
-                return own;
-            }
-            // Known limitation (TASK-011 review I6): a session resumed from
-            // another folder takes a slot there, and its old slot keeps
-            // showing it (busy, same icon) until its SessionEnd.
+        let own = self
+            .sessions
+            .get(session)
+            .and_then(|entry| entry.slot)
+            .filter(|id| self.slots.get(id.0).is_some_and(|slot| slot.host == host));
+        if let Some(own) = own
+            && (self.slots[own.0].current_session.as_deref() == Some(session) || self.is_free(own))
+        {
+            return own;
         }
+        // A known session's folder is its slot's, wherever its cwd went
+        // (worktree, `/cd`, resume from elsewhere, TASK-093).
+        let (key, name) = match own {
+            Some(own) => (
+                self.slots[own.0].folder_key.clone(),
+                self.slots[own.0].folder_name.clone(),
+            ),
+            None => (folder_key(cwd), folder_name(cwd)),
+        };
+        let same_folder = |slot: &Slot| slot.host == host && slot.folder_key == key;
         if let Some(id) = clear_slot
-            && self.slots.get(id.0).is_some_and(same_folder)
+            && self.slots.get(id.0).is_some_and(|slot| slot.host == host)
             && self.is_free(id)
         {
             return id;
@@ -1392,7 +1401,7 @@ impl Registry {
             .cloned();
         if let Some(previous) = previous
             && let Some(id) = self.sessions.get(&previous).and_then(|entry| entry.slot)
-            && same_folder(&self.slots[id.0])
+            && self.slots[id.0].host == host
             && self.slots[id.0].current_session.as_deref() == Some(previous.as_str())
         {
             if let Some(entry) = self.sessions.get_mut(&previous) {
@@ -1416,7 +1425,7 @@ impl Registry {
         self.slots.push(Slot {
             host: host.to_owned(),
             folder_key: key,
-            folder_name: folder_name(cwd),
+            folder_name: name,
             ordinal,
             current_session: None,
             buffer: Buffer::default(),
@@ -1452,6 +1461,43 @@ impl Registry {
         }
     }
 
+    /// Releases every slot but `keep` whose current session is `session`: a
+    /// session is current in one slot at most (TASK-093). A released slot is
+    /// free and dead. Returns how many were released.
+    fn release_elsewhere(&mut self, session: &str, keep: SlotId) -> usize {
+        let mut released = 0;
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if index != keep.0 && slot.current_session.as_deref() == Some(session) {
+                slot.current_session = None;
+                released += 1;
+            }
+        }
+        released
+    }
+
+    /// Heals a registry in which a top-level session is current in several
+    /// slots (hub v0.1.33 and older, TASK-093): the slot its entry points at
+    /// keeps it when that slot holds it; the others are released. A session
+    /// whose entry's slot does not hold it is left as it is.
+    pub(crate) fn heal_split_sessions(&mut self) -> usize {
+        let held: Vec<(String, SlotId)> = self
+            .sessions
+            .iter()
+            .filter(|(_, entry)| entry.kind == SessionKind::TopLevel)
+            .filter_map(|(session, entry)| {
+                let slot = entry.slot?;
+                let holds = self
+                    .slots
+                    .get(slot.0)
+                    .is_some_and(|it| it.current_session.as_deref() == Some(session.as_str()));
+                holds.then(|| (session.clone(), slot))
+            })
+            .collect();
+        held.iter()
+            .map(|(session, slot)| self.release_elsewhere(session, *slot))
+            .sum()
+    }
+
     /// Nesting from the pid the device reports as the next claude ancestor.
     /// An ancestor the registry does not know is "nested, parent unknown".
     fn nesting(&self, host: &str, parent_pid: Option<u32>) -> SessionKind {
@@ -1463,14 +1509,13 @@ impl Registry {
         }
     }
 
-    fn take_clear_slot(&mut self, host: &str, pid: u32, cwd: &str) -> Option<SlotId> {
+    fn take_clear_slot(&mut self, host: &str, pid: u32) -> Option<SlotId> {
         let now = Instant::now();
         self.recent_clears.retain(|_, (_, expires)| *expires > now);
         let (slot, _) = self.recent_clears.remove(&pid_key(host, pid))?;
-        let wanted_folder = folder_key(cwd);
         self.slots
             .get(slot.0)
-            .is_some_and(|entry| entry.host == host && entry.folder_key == wanted_folder)
+            .is_some_and(|entry| entry.host == host)
             .then_some(slot)
     }
 
@@ -1510,7 +1555,7 @@ impl Registry {
         }
         let clear = source == Some("clear");
         let clear_slot = match (source, claude_pid) {
-            (Some("clear"), Some(pid)) => self.take_clear_slot(&post.host, pid, &post.cwd),
+            (Some("clear"), Some(pid)) => self.take_clear_slot(&post.host, pid),
             (_, Some(pid)) => {
                 self.recent_clears.remove(&pid_key(&post.host, pid));
                 None
@@ -1540,6 +1585,7 @@ impl Registry {
                 let clear_pid = claude_pid.filter(|_| clear);
                 let id = self.allocate(session, &post.host, &post.cwd, clear_pid, clear_slot);
                 self.occupy(id, session, source == Some("resume"));
+                self.release_elsewhere(session, id);
                 // A session takes an archived slot back (TASK-074).
                 let slot = &mut self.slots[id.0];
                 slot.archived = false;
@@ -2852,6 +2898,14 @@ impl RegistryStore {
                 .map_err(|error| LoadError::KeepV2(error.kind()))?,
             None => {}
         }
+        let released = registry.heal_split_sessions();
+        if released > 0 {
+            tracing::info!(
+                released,
+                "slots of a session current in several slots released"
+            );
+        }
+        registry.dirty |= released > 0;
         registry.after_restart();
         registry.dirty |= migrated.is_some();
         registry.adopt_default_group(default);
@@ -4056,6 +4110,198 @@ mod tests {
         assert_eq!(slot_of(&registry, C), Some(b_slot));
         let jobs = settle(&mut registry, &mut topic);
         assert_eq!(separators(&jobs), ["── session cccccccc · new ──"]);
+    }
+
+    /// A worktree of [`CWD`] as Claude Code's `EnterWorktree` makes it.
+    const WORKTREE: &str = r"C:\Work\Project\.claude\worktrees\tasks";
+
+    /// TASK-093: a known session keeps its slot when its cwd moves into a
+    /// worktree (compaction, resume) and back.
+    #[test]
+    fn a_session_that_moves_into_a_worktree_keeps_its_slot() {
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        settle(&mut registry, &mut topic);
+        let slot = slot_of(&registry, A);
+
+        registry.apply_hook(&start_from(A, WORKTREE, Some(10), None, "compact"));
+        assert_eq!(slot_of(&registry, A), slot);
+        assert_eq!(registry.slots.len(), 1);
+        let jobs = settle(&mut registry, &mut topic);
+        assert_eq!(creates(&jobs), 0);
+        assert!(separators(&jobs).is_empty(), "{jobs:?}");
+
+        registry.apply_hook(&end(A));
+        registry.apply_hook(&start_from(A, WORKTREE, Some(20), None, "resume"));
+        assert_eq!(slot_of(&registry, A), slot);
+        assert_eq!(creates(&settle(&mut registry, &mut topic)), 0);
+
+        registry.apply_hook(&start_from(A, CWD, Some(20), None, "compact"));
+        assert_eq!(slot_of(&registry, A), slot);
+        assert_eq!(registry.slots.len(), 1);
+    }
+
+    /// TASK-093: a moved session whose slot another session took gets the
+    /// next ordinal of its own folder, not a slot of the worktree.
+    #[test]
+    fn a_moved_session_whose_slot_was_taken_gets_the_next_ordinal_of_its_own_folder() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&end(A));
+        registry.apply_hook(&start(B, CWD, Some(11), None)); // #1
+        registry.apply_hook(&start_from(A, WORKTREE, Some(12), None, "resume"));
+        let slot = &registry.slots[slot_of(&registry, A).unwrap().0];
+        assert_eq!(slot.ordinal, 2);
+        assert_eq!(slot.folder_name, "Project");
+        assert_eq!(slot.folder_key, folder_key(CWD));
+        assert!(
+            !registry
+                .slots
+                .iter()
+                .any(|slot| slot.folder_name == "tasks")
+        );
+    }
+
+    /// TASK-093: `/clear` inside a worktree stays in the process's slot, in
+    /// both orders of the end and the start.
+    #[test]
+    fn clear_in_a_worktree_stays_in_its_slot() {
+        // The start before the end.
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None)); // #1
+        registry.apply_hook(&start(B, CWD, Some(11), None)); // #2
+        settle(&mut registry, &mut topic);
+        registry.apply_hook(&end(A)); // #1 free now
+        registry.apply_hook(&start_from(C, WORKTREE, Some(11), None, "clear"));
+        assert_eq!(slot_of(&registry, C), slot_of(&registry, B));
+        let jobs = settle(&mut registry, &mut topic);
+        assert_eq!(separators(&jobs), ["── session cccccccc · new ──"]);
+
+        // The end before the start.
+        let mut registry = Registry::default();
+        let mut topic = 100;
+        registry.apply_hook(&start(A, CWD, Some(10), None)); // #1
+        registry.apply_hook(&start(B, CWD, Some(11), None)); // #2
+        settle(&mut registry, &mut topic);
+        registry.apply_hook(&end(A)); // #1 is the first free slot
+        let b_slot = slot_of(&registry, B).unwrap();
+        registry.apply_hook(&post(
+            B,
+            WORKTREE,
+            HookEvent::SessionEnd {
+                reason: Some("clear".into()),
+                claude_pid: None,
+            },
+        ));
+        registry.apply_hook(&start_from(C, WORKTREE, Some(11), None, "clear"));
+        assert_eq!(slot_of(&registry, C), Some(b_slot));
+        let jobs = settle(&mut registry, &mut topic);
+        assert_eq!(separators(&jobs), ["── session cccccccc · new ──"]);
+    }
+
+    /// TASK-093: a session the hub does not know yet that starts right in a
+    /// worktree gets a slot of that folder, by the usual rules.
+    #[test]
+    fn a_new_session_in_a_worktree_folder_gets_a_slot_of_that_folder() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(N, WORKTREE, Some(30), None));
+        let slot = slot_of(&registry, N).unwrap();
+        assert_ne!(Some(slot), slot_of(&registry, A));
+        assert_eq!(registry.slots[slot.0].folder_name, "tasks");
+        assert_eq!(registry.slots[slot.0].ordinal, 1);
+    }
+
+    /// TASK-093: a start of a top-level session leaves it current in its
+    /// own slot alone.
+    #[test]
+    fn a_session_is_current_in_one_slot_only() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(B, r"C:\Work\Other", Some(11), None));
+        registry.apply_hook(&end(B));
+        let slot_a = slot_of(&registry, A).unwrap();
+        let slot_b = slot_of(&registry, B).unwrap();
+        // As a hub of v0.1.33 left it.
+        registry.slots[slot_b.0].current_session = Some(A.into());
+
+        registry.apply_hook(&start_from(A, CWD, Some(10), None, "compact"));
+        let holding: Vec<usize> = registry
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.current_session.as_deref() == Some(A))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(holding, [slot_a.0]);
+        assert_eq!(registry.slots[slot_b.0].current_session, None);
+        assert_eq!(registry.state(slot_b), SlotState::Dead);
+        assert_eq!(
+            registry.desired_title(slot_b),
+            topic_title("box", "Other", 1, None)
+        );
+    }
+
+    /// TASK-093: the own slot is the same host's only; a start on another
+    /// host gets a slot there and releases the old one.
+    #[test]
+    fn a_session_on_another_host_gets_a_slot_there_and_releases_its_old_one() {
+        let mut registry = Registry::default();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        let old = slot_of(&registry, A).unwrap();
+        let mut moved = start(A, CWD, Some(10), None);
+        moved.host = "laptop".into();
+        registry.apply_hook(&moved);
+        let new = slot_of(&registry, A).unwrap();
+        assert_ne!(new, old);
+        assert_eq!(registry.slots[new.0].host, "laptop");
+        assert_eq!(registry.slots[old.0].current_session, None);
+    }
+
+    /// TASK-093: a registry of an older hub with a session current in two
+    /// slots is healed at load: the slot its entry points at keeps it. A
+    /// session whose entry points at a slot that does not hold it is not
+    /// touched. A healed file loads clean.
+    #[test]
+    fn a_split_registry_is_healed_at_load() {
+        const D: &str = "eeeeeeee-0000-4000-8000-000000000005";
+        let dir = TempDir::new("registry-heal");
+        let store = RegistryStore::open(dir.path()).unwrap();
+        let mut registry = store.load(GroupChat::UNIT).unwrap();
+        registry.apply_hook(&start(A, CWD, Some(10), None));
+        registry.apply_hook(&start(B, r"C:\Work\Other", Some(11), None));
+        registry.apply_hook(&start(C, r"C:\Work\T", Some(12), None));
+        registry.apply_hook(&end(C));
+        registry.apply_hook(&start(D, r"C:\Work\D1", Some(13), None));
+        registry.apply_hook(&start(N, r"C:\Work\D2", Some(14), None));
+        registry.apply_hook(&end(N));
+        let (f, b) = (
+            slot_of(&registry, A).unwrap(),
+            slot_of(&registry, B).unwrap(),
+        );
+        let (t, d1, d2) = (
+            slot_of(&registry, C).unwrap(),
+            slot_of(&registry, D).unwrap(),
+            slot_of(&registry, N).unwrap(),
+        );
+        registry.slots[t.0].current_session = Some(A.into());
+        registry.slots[d2.0].current_session = Some(D.into());
+        registry.sessions.get_mut(D).unwrap().slot = Some(b);
+        store.save(&RegistryStore::encode(&registry)).unwrap();
+
+        let loaded = store.load(GroupChat::UNIT).unwrap();
+        let current = |slot: SlotId| loaded.slots[slot.0].current_session.as_deref();
+        assert_eq!(current(f), Some(A));
+        assert_eq!(current(t), None);
+        assert_eq!(current(b), Some(B));
+        assert_eq!(current(d1), Some(D));
+        assert_eq!(current(d2), Some(D));
+        assert!(loaded.dirty);
+
+        store.save(&RegistryStore::encode(&loaded)).unwrap();
+        assert!(!store.load(GroupChat::UNIT).unwrap().dirty);
     }
 
     #[test]

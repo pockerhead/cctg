@@ -877,9 +877,10 @@ pub async fn run_stdio() -> i32 {
         }
     };
     let frames = read_frames(std::io::BufReader::new(std::io::stdin()));
-    // Found by the env session's transcript, looked for again on each read
-    // until it is there: after `/clear` the env id is stale, the folder is
-    // not (TASK-034 decision 12).
+    // Found by the env session's transcript, kept while it holds it and
+    // looked for again when it does not (it moves into a worktree's project
+    // folder and back, TASK-093): after `/clear` the env id is stale, the
+    // folder is not (TASK-034 decision 12).
     let project = tokio::task::spawn_blocking(move || {
         let cwd = std::env::current_dir()
             .ok()

@@ -209,6 +209,30 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
     .expect("repeat accepted");
     assert!(hook_rx.recv().await.is_some());
     assert!(hook_rx.try_recv().is_err(), "the repeat is dropped");
+    // TASK-093: a session start logs its documented source, never another
+    // text from the device.
+    for source in ["compact".to_owned(), content.clone()] {
+        let start = HookPost::new(
+            format!("host-{content}"),
+            "5e551017-0000-4000-8000-000000000001".into(),
+            format!("/home/{content}"),
+            format!("/home/{content}/s.jsonl"),
+            HookEvent::SessionStart {
+                source: Some(source),
+                claude_pid: None,
+                parent_claude_pid: None,
+            },
+        );
+        hook::post(
+            &HubAddr::plain(hooks_addr.to_string()),
+            &secret,
+            &start,
+            timeout,
+        )
+        .await
+        .expect("start accepted");
+        assert!(hook_rx.recv().await.is_some());
+    }
 
     let logs = String::from_utf8(captured.0.lock().map(|l| l.clone()).unwrap_or_default())
         .unwrap_or_default();
@@ -237,6 +261,13 @@ async fn ingress_logs_carry_no_secrets_or_contents() {
     // The hook's wrong secret warned; the broken heads after it did not.
     assert_eq!(lines_with("WARN", "bad or missing secret"), 1, "{logs}");
     assert_eq!(lines_with("DEBUG", "hook request rejected"), 2, "{logs}");
+    // The field name and its value are apart by color codes.
+    let compact = logs
+        .lines()
+        .filter(|line| line.contains("hook event accepted"))
+        .filter(|line| line.contains("source") && line.contains("\"compact\""))
+        .count();
+    assert_eq!(compact, 1, "{logs}");
     for leaked in [real.as_str(), wrong.as_str(), content.as_str()] {
         assert!(!logs.contains(leaked), "{leaked} in logs: {logs}");
     }
