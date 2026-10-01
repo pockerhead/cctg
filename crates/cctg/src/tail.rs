@@ -24,6 +24,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use transcript::{ChannelPlace, StreamEvent};
 
@@ -75,8 +76,21 @@ pub struct OwnProject {
     root: PathBuf,
     session_id: String,
     by_cwd: Vec<PathBuf>,
-    found: Mutex<Option<PathBuf>>,
+    found: Mutex<Found>,
 }
+
+/// The folder found last, and when the projects root was last searched in
+/// vain while it was kept.
+#[derive(Debug, Default)]
+struct Found {
+    folder: Option<PathBuf>,
+    missed: Option<Instant>,
+}
+
+/// A kept folder that lost the session's transcript is not searched for
+/// again more often than this: a transcript that is gone or in two folders
+/// would otherwise list the projects root on every read (TASK-093).
+const RESEARCH_EVERY: Duration = Duration::from_secs(5);
 
 impl OwnProject {
     /// Under the projects directory `root`, for the claude session
@@ -100,7 +114,7 @@ impl OwnProject {
             root,
             session_id,
             by_cwd,
-            found: Mutex::new(None),
+            found: Mutex::default(),
         })
     }
 
@@ -111,20 +125,29 @@ impl OwnProject {
             root,
             session_id: String::new(),
             by_cwd: Vec::new(),
-            found: Mutex::new(Some(folder)),
+            found: Mutex::new(Found {
+                folder: Some(folder),
+                missed: None,
+            }),
         }
     }
 
     /// The folder to read from now: the one that holds the session's
     /// transcript (kept while it holds it, looked for again when it does
-    /// not), else the last one found, else an existing folder named after
-    /// the cwd, else none. Blocking: it may list the projects root.
+    /// not, at most every [`RESEARCH_EVERY`]), else the last one found, else
+    /// an existing folder named after the cwd, else none. Blocking: it may
+    /// list the projects root.
     pub fn folder(&self) -> Option<PathBuf> {
-        let kept = self.kept().clone();
+        let (kept, missed) = {
+            let found = self.found();
+            (found.folder.clone(), found.missed)
+        };
         let file = format!("{}.jsonl", self.session_id);
         let holds = |folder: &Path| folder.join(&file).is_file();
         if let Some(kept) = &kept
-            && (self.session_id.is_empty() || holds(kept))
+            && (self.session_id.is_empty()
+                || holds(kept)
+                || missed.is_some_and(|at| at.elapsed() < RESEARCH_EVERY))
         {
             return Some(kept.clone());
         }
@@ -145,18 +168,24 @@ impl OwnProject {
             });
         match (found, kept) {
             (Some(found), _) => {
-                *self.kept() = Some(found.clone());
+                *self.found() = Found {
+                    folder: Some(found.clone()),
+                    missed: None,
+                };
                 Some(found)
             }
-            // Being moved, or gone: the last folder stays.
-            (None, Some(kept)) => Some(kept),
+            // Being moved, gone or in two folders: the last folder stays.
+            (None, Some(kept)) => {
+                self.found().missed = Some(Instant::now());
+                Some(kept)
+            }
             (None, None) => self.by_cwd.iter().find(|folder| folder.is_dir()).cloned(),
         }
     }
 
-    /// The folder found last; the lock is held only to read or write it,
-    /// never while the disk is searched.
-    fn kept(&self) -> std::sync::MutexGuard<'_, Option<PathBuf>> {
+    /// The lock is held only to read or write [`Found`], never while the
+    /// disk is searched.
+    fn found(&self) -> std::sync::MutexGuard<'_, Found> {
         self.found.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -778,6 +807,47 @@ mod tests {
         assert_eq!(own.folder(), Some(worktree.clone()));
         std::fs::remove_file(&in_worktree).unwrap();
         assert_eq!(own.folder(), Some(worktree));
+    }
+
+    /// TASK-093 review: a kept folder whose transcript is gone (or in two
+    /// other folders) does not list the projects root on every read: one
+    /// search per [`RESEARCH_EVERY`].
+    #[test]
+    fn a_lost_transcript_is_looked_for_at_most_once_per_interval() {
+        let dir = TempDir::new("tail-own-backoff");
+        let root = root(&dir);
+        let home = root.join("C--repo");
+        let elsewhere = root.join("C--repo--claude-worktrees-tasks");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let file = format!("{SESSION}.jsonl");
+        std::fs::write(home.join(&file), prompt("one")).unwrap();
+        let own = OwnProject::new(root.clone(), Some(SESSION), Some(r"C:\repo")).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        // Gone: searched once in vain, the kept folder stays.
+        std::fs::remove_file(home.join(&file)).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        assert!(own.found().missed.is_some());
+        // It shows up elsewhere: not looked for until the interval is over.
+        std::fs::write(elsewhere.join(&file), prompt("two")).unwrap();
+        assert_eq!(own.folder(), Some(home.clone()));
+        let past = Instant::now().checked_sub(RESEARCH_EVERY + Duration::from_secs(1));
+        own.found().missed = past;
+        assert_eq!(own.folder(), Some(elsewhere.clone()));
+        assert!(own.found().missed.is_none());
+        // In two folders besides the kept one: no answer, the same backoff.
+        std::fs::remove_file(elsewhere.join(&file)).unwrap();
+        let (one, two) = (root.join("C--one"), root.join("C--two"));
+        for folder in [&one, &two] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join(&file), prompt("x")).unwrap();
+        }
+        assert_eq!(own.folder(), Some(elsewhere.clone()));
+        let missed = own.found().missed;
+        assert!(missed.is_some());
+        std::fs::remove_file(two.join(&file)).unwrap();
+        assert_eq!(own.folder(), Some(elsewhere), "still waiting");
+        assert_eq!(own.found().missed, missed, "no search meanwhile");
     }
 
     #[test]

@@ -284,6 +284,10 @@ pub fn topic_title(host: &str, folder: &str, ordinal: u32, label: Option<&str>) 
     title
 }
 
+/// Posted once into the topics of a slot a split session was taken out of
+/// when a registry of hub v0.1.33 or older is healed (TASK-093).
+pub const RELEASED_NOTE: &str =
+    "Эта тема больше не связана с сессией: она вернулась в свою прежнюю тему.";
 /// Last line of a block whose subagent or nested run is still working.
 pub const BLOCK_RUNNING: &str = "в работе…";
 /// Last line of a block whose session ended before its result arrived.
@@ -1463,39 +1467,67 @@ impl Registry {
 
     /// Releases every slot but `keep` whose current session is `session`: a
     /// session is current in one slot at most (TASK-093). A released slot is
-    /// free and dead. Returns how many were released.
-    fn release_elsewhere(&mut self, session: &str, keep: SlotId) -> usize {
-        let mut released = 0;
+    /// free and dead; nothing else of it changes.
+    fn release_elsewhere(&mut self, session: &str, keep: SlotId) {
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if index != keep.0 && slot.current_session.as_deref() == Some(session) {
                 slot.current_session = None;
+            }
+        }
+    }
+
+    /// Heals a registry in which a top-level session is current in several
+    /// slots (hub v0.1.33 and older, TASK-093: a start from a worktree took
+    /// a second slot, and the session's entry points at the later one).
+    /// The earliest of them keeps it, the topic the session lived in first
+    /// and the user writes to, and its entry moves there; each other one is
+    /// released and its topics get [`RELEASED_NOTE`] once. Returns how many
+    /// were released.
+    pub(crate) fn heal_split_sessions(&mut self) -> usize {
+        let mut holding: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if let Some(session) = &slot.current_session {
+                holding.entry(session.clone()).or_default().push(index);
+            }
+        }
+        let mut released = 0;
+        for (session, slots) in holding {
+            let [keep, rest @ ..] = slots.as_slice() else {
+                continue;
+            };
+            let Some(entry) = self
+                .sessions
+                .get_mut(&session)
+                .filter(|entry| entry.kind == SessionKind::TopLevel)
+            else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            entry.slot = Some(SlotId(*keep));
+            for &index in rest {
+                self.release_split(index);
                 released += 1;
             }
         }
         released
     }
 
-    /// Heals a registry in which a top-level session is current in several
-    /// slots (hub v0.1.33 and older, TASK-093): the slot its entry points at
-    /// keeps it when that slot holds it; the others are released. A session
-    /// whose entry's slot does not hold it is left as it is.
-    pub(crate) fn heal_split_sessions(&mut self) -> usize {
-        let held: Vec<(String, SlotId)> = self
-            .sessions
-            .iter()
-            .filter(|(_, entry)| entry.kind == SessionKind::TopLevel)
-            .filter_map(|(session, entry)| {
-                let slot = entry.slot?;
-                let holds = self
-                    .slots
-                    .get(slot.0)
-                    .is_some_and(|it| it.current_session.as_deref() == Some(session.as_str()));
-                holds.then(|| (session.clone(), slot))
-            })
-            .collect();
-        held.iter()
-            .map(|(session, slot)| self.release_elsewhere(session, *slot))
-            .sum()
+    /// Releases slot `index` of a healed split; each of its topics is told
+    /// once, the way a session separator is posted.
+    fn release_split(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        slot.current_session = None;
+        if slot.archived {
+            return;
+        }
+        for view in slot.views.iter_mut().filter(|view| view.topic_id.is_some()) {
+            view.pending_separator = Some(match view.pending_separator.take() {
+                Some(pending) => format!("{pending}\n{RELEASED_NOTE}"),
+                None => RELEASED_NOTE.to_owned(),
+            });
+        }
     }
 
     /// Nesting from the pid the device reports as the next claude ancestor.
@@ -4224,10 +4256,39 @@ mod tests {
         registry.apply_hook(&end(B));
         let slot_a = slot_of(&registry, A).unwrap();
         let slot_b = slot_of(&registry, B).unwrap();
-        // As a hub of v0.1.33 left it.
-        registry.slots[slot_b.0].current_session = Some(A.into());
+        // As a hub of v0.1.33 left it, with views in a private chat and
+        // another group, a kept message and the archive mark.
+        let other = &mut registry.slots[slot_b.0];
+        other.current_session = Some(A.into());
+        other.views[0].topic_id = Some(700);
+        other
+            .views
+            .push(View::new(Chat::Private(PrivateChat::of_user(7))));
+        other
+            .views
+            .push(View::new(Chat::Group(GroupChat::of(-1002))));
+        other.buffer.messages.push_back(crate::hub::buffer::Parked {
+            chat: Chat::GROUP,
+            message_id: 5,
+            thread_id: 700,
+            text: "kept".into(),
+            reply_to: None,
+            quote: None,
+            forwarded: false,
+            file: None,
+            from_name: None,
+            history: None,
+            mention: false,
+            voice: None,
+        });
+        other.archived = true;
+        let mut expected = other.clone();
+        expected.current_session = None;
 
         registry.apply_hook(&start_from(A, CWD, Some(10), None, "compact"));
+        // Released, nothing else of it touched: no note on a live start.
+        assert_eq!(registry.slots[slot_b.0], expected);
+        registry.slots[slot_b.0].archived = false;
         let holding: Vec<usize> = registry
             .slots
             .iter()
@@ -4260,10 +4321,78 @@ mod tests {
         assert_eq!(registry.slots[old.0].current_session, None);
     }
 
-    /// TASK-093: a registry of an older hub with a session current in two
-    /// slots is healed at load: the slot its entry points at keeps it. A
-    /// session whose entry points at a slot that does not hold it is not
-    /// touched. A healed file loads clean.
+    /// TASK-093: the registries hub v0.1.33 itself wrote after a compaction
+    /// inside a worktree (made with its code from `ed5179e`): the session's
+    /// entry points at the later "tasks" slot (`split`), or, after a restart
+    /// at home, at the first one (`restarted`). Both heal into the first
+    /// topic, the one the user writes to; "tasks" is released and its topic
+    /// told once. A healed file loads clean and is not told again.
+    #[test]
+    fn a_v0133_worktree_split_heals_into_the_sessions_first_topic() {
+        const SPLIT: &str =
+            include_str!("../../tests/fixtures/registry-v0.1.33-worktree-split.json");
+        const RESTARTED: &str =
+            include_str!("../../tests/fixtures/registry-v0.1.33-worktree-split-restarted.json");
+        for (name, file, entry_slot) in [("split", SPLIT, 1), ("restarted", RESTARTED, 0)] {
+            let raw: Registry = serde_json::from_str(file).unwrap();
+            assert_eq!(raw.sessions[A].slot, Some(SlotId(entry_slot)), "{name}");
+            assert!(
+                raw.slots
+                    .iter()
+                    .all(|slot| slot.current_session.as_deref() == Some(A)),
+                "{name}: the old hub's split"
+            );
+            let dir = TempDir::new("registry-heal-v0133");
+            let store = RegistryStore::open(dir.path()).unwrap();
+            store.save(file.as_bytes()).unwrap();
+            let mut loaded = store.load(GroupChat::UNIT).unwrap();
+            assert!(loaded.dirty, "{name}");
+            assert_eq!(loaded.slots[0].folder_name, "Project");
+            assert_eq!(
+                loaded.slots[0].current_session.as_deref(),
+                Some(A),
+                "{name}"
+            );
+            assert_eq!(loaded.slots[1].current_session, None, "{name}");
+            assert_eq!(slot_of(&loaded, A), Some(SlotId(0)), "{name}");
+            assert_eq!(loaded.slots[0].views[0].pending_separator, None, "{name}");
+            assert_eq!(
+                loaded.slots[1].views[0].pending_separator.as_deref(),
+                Some(RELEASED_NOTE),
+                "{name}"
+            );
+            // The note goes to the "tasks" topic once, as a separator does.
+            let jobs = loaded.topic_work(&Icons::default(), false);
+            let notes: Vec<_> = jobs
+                .iter()
+                .filter_map(|job| match job {
+                    TopicJob::Separator {
+                        slot,
+                        thread_id,
+                        text,
+                        ..
+                    } => Some((*slot, *thread_id, text.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(notes, [(SlotId(1), 101, RELEASED_NOTE)], "{name}");
+            loaded.topic_separated(SlotId(1), Chat::GROUP, 101, RELEASED_NOTE);
+            store.save(&RegistryStore::encode(&loaded)).unwrap();
+            let again = store.load(GroupChat::UNIT).unwrap();
+            assert!(!again.dirty, "{name}");
+            assert_eq!(again.slots[1].views[0].pending_separator, None, "{name}");
+            assert_eq!(again.state(SlotId(1)), SlotState::Dead, "{name}");
+            // The session's next start stays in its first topic.
+            let mut again = again;
+            again.apply_hook(&start_from(A, WORKTREE, Some(10), None, "compact"));
+            assert_eq!(slot_of(&again, A), Some(SlotId(0)), "{name}");
+            assert_eq!(again.slots[1].current_session, None, "{name}");
+        }
+    }
+
+    /// TASK-093: a registry with sessions current in several slots heals
+    /// each into its earliest slot, wherever its entry pointed; a session
+    /// current in one slot is not touched.
     #[test]
     fn a_split_registry_is_healed_at_load() {
         const D: &str = "eeeeeeee-0000-4000-8000-000000000005";
@@ -4286,7 +4415,10 @@ mod tests {
             slot_of(&registry, D).unwrap(),
             slot_of(&registry, N).unwrap(),
         );
+        // A's entry at the later slot (as v0.1.33 leaves it), D's at a slot
+        // that does not even hold it.
         registry.slots[t.0].current_session = Some(A.into());
+        registry.sessions.get_mut(A).unwrap().slot = Some(t);
         registry.slots[d2.0].current_session = Some(D.into());
         registry.sessions.get_mut(D).unwrap().slot = Some(b);
         store.save(&RegistryStore::encode(&registry)).unwrap();
@@ -4295,9 +4427,12 @@ mod tests {
         let current = |slot: SlotId| loaded.slots[slot.0].current_session.as_deref();
         assert_eq!(current(f), Some(A));
         assert_eq!(current(t), None);
+        assert_eq!(slot_of(&loaded, A), Some(f));
         assert_eq!(current(b), Some(B));
+        assert_eq!(slot_of(&loaded, B), Some(b));
         assert_eq!(current(d1), Some(D));
-        assert_eq!(current(d2), Some(D));
+        assert_eq!(current(d2), None);
+        assert_eq!(slot_of(&loaded, D), Some(d1));
         assert!(loaded.dirty);
 
         store.save(&RegistryStore::encode(&loaded)).unwrap();
