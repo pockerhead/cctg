@@ -332,7 +332,13 @@
 //! session's agent compresses it ([`SessionAsk::Compress`], at most one per
 //! slot, [`Options::compress_wait`]), and is cut to its newest part when
 //! that fails. The owner switches a slot to every message and back in the
-//! menu's session row.
+//! menu's session row. A forward with a comment comes as separate messages
+//! within a second (TASK-094): forwards of a mention's author go with it as
+//! parts of its burst when they come within its gather window
+//! (`Options::gather_quiet` after the newest, at most `Options::gather_max`
+//! after the first), or when the mention comes within the window of their
+//! own run kept right before it (they leave the backlog); another author's
+//! messages are kept as before.
 //!
 //! Several groups (TASK-069, see [`groups`]): the group of `CCTG_CHAT_ID`
 //! is the default one; others join while the hub runs, when an allowlisted
@@ -804,6 +810,30 @@ struct MentionAlbum {
     mentioned: bool,
     /// Its files kept for the next mention before one of them addressed
     /// the agent, oldest first, each with its part in the group backlog.
+    kept: Vec<(Inbound, String)>,
+}
+
+/// The latest mention in a group topic of a slot (TASK-094): Telegram hands
+/// a forward with a comment as the comment and then the forwards, separate
+/// messages within a second. Forwards of its author within the gather window
+/// ([`Slots::within_burst`]) go with it instead of being kept.
+#[derive(Debug)]
+struct MentionBurst {
+    sender: PrivateChat,
+    first: Instant,
+    /// Its newest message.
+    last: Instant,
+}
+
+/// Forwards of one author kept last in a group topic of a slot (TASK-094):
+/// a mention by that author within the gather window takes them out of the
+/// backlog to go with it.
+#[derive(Debug)]
+struct KeptForwards {
+    sender: PrivateChat,
+    first: Instant,
+    last: Instant,
+    /// Oldest first, each with its part in the group backlog.
     kept: Vec<(Inbound, String)>,
 }
 
@@ -1914,6 +1944,11 @@ pub struct Slots {
     /// The album of the latest file of each group topic of a slot
     /// (TASK-077; by group, TASK-069).
     mention_albums: HashMap<(SlotId, Chat), MentionAlbum>,
+    /// The latest mention of each group topic of a slot (TASK-094).
+    mention_bursts: HashMap<(SlotId, Chat), MentionBurst>,
+    /// The forwards of one author kept last in each group topic of a slot
+    /// (TASK-094).
+    kept_forwards: HashMap<(SlotId, Chat), KeptForwards>,
     /// Hooks waiting for their channel twin, oldest first.
     hook_asks: Vec<HookAsk>,
     /// Hooks waiting for a press, by the key of their prompt.
@@ -2209,6 +2244,8 @@ impl Slots {
             reads: HashMap::new(),
             compressing: HashSet::new(),
             mention_albums: HashMap::new(),
+            mention_bursts: HashMap::new(),
+            kept_forwards: HashMap::new(),
             hook_asks: Vec::new(),
             hook_waiters: HashMap::new(),
             relayed: VecDeque::new(),
@@ -4325,8 +4362,16 @@ impl Slots {
             self.keep_for_mention(slot, place, input);
             return;
         }
-        // The files of its album kept before it go first, as files.
-        for earlier in self.album_mention(slot, place, &input) {
+        // The files of its album and the forwards of its author kept just
+        // before it go first, in their order, each once.
+        let mut earlier = self.forwards_of_mention(slot, place, &input);
+        for file in self.album_mention(slot, place, &input) {
+            if !earlier.iter().any(|kept| kept.key() == file.key()) {
+                earlier.push(file);
+            }
+        }
+        earlier.sort_by_key(|kept| kept.message_id);
+        for earlier in earlier {
             self.take_in(slot, place, thread_id, earlier);
         }
         self.take_in(slot, place, thread_id, input);
@@ -4354,6 +4399,7 @@ impl Slots {
                     && mentioned(bot, &input, &self.heard_posts)
             })
             .map(|bot| bot.username.clone());
+        self.note_mention_burst(slot, place.chat, &input, mention_of.is_some());
         let (text, file) = match (input.text, input.media) {
             (Some(text), _) => (text, None),
             (None, Some(media)) => {
@@ -4795,7 +4841,89 @@ impl Slots {
             && group_view.is_some_and(|view| !view.every_message)
             && !mentioned(bot, input, &self.heard_posts)
             && !self.album_mentioned(slot, place.chat, input)
+            && !self.joins_mention(slot, place.chat, input)
             && !console
+    }
+
+    /// Now is within the gather window of a burst begun at `first` whose
+    /// newest message came at `last` (TASK-094): as [`Self::gather`] waits.
+    /// Never without `Options::gather_quiet`.
+    fn within_burst(&self, first: Instant, last: Instant) -> bool {
+        let quiet = self.options.gather_quiet;
+        !quiet.is_zero() && Instant::now() <= (last + quiet).min(first + self.options.gather_max)
+    }
+
+    /// `input` is a forward of the author of the latest mention in the
+    /// group topic of `slot` in `chat`, within its gather window (TASK-094).
+    fn joins_mention(&self, slot: SlotId, chat: Chat, input: &Inbound) -> bool {
+        input.forwarded
+            && self.mention_bursts.get(&(slot, chat)).is_some_and(|burst| {
+                burst.sender == input.sender && self.within_burst(burst.first, burst.last)
+            })
+    }
+
+    /// Message `input` of a group topic of `slot` in `chat` goes to the
+    /// buffer (TASK-094): a mention begins a burst its author's forwards
+    /// join, a forward that joins it keeps it open.
+    fn note_mention_burst(&mut self, slot: SlotId, chat: Chat, input: &Inbound, mention: bool) {
+        let now = Instant::now();
+        if mention {
+            let burst = MentionBurst {
+                sender: input.sender,
+                first: now,
+                last: now,
+            };
+            self.mention_bursts.insert((slot, chat), burst);
+        } else if self.joins_mention(slot, chat, input)
+            && let Some(burst) = self.mention_bursts.get_mut(&(slot, chat))
+        {
+            burst.last = now;
+        }
+    }
+
+    /// Group mention `input` of `slot` (TASK-094): the forwards its author
+    /// kept last in that topic, within the gather window, leave the group
+    /// backlog to go with it, oldest first.
+    fn forwards_of_mention(&mut self, slot: SlotId, place: Place, input: &Inbound) -> Vec<Inbound> {
+        let addressed = self
+            .options
+            .mentions
+            .as_ref()
+            .is_some_and(|bot| mentioned(bot, input, &self.heard_posts));
+        if !matches!(place.chat, Chat::Group(_)) || !addressed {
+            return Vec::new();
+        }
+        let Some(kept) = self.kept_forwards.remove(&(slot, place.chat)) else {
+            return Vec::new();
+        };
+        if kept.sender != input.sender || !self.within_burst(kept.first, kept.last) {
+            return Vec::new();
+        }
+        let Some(view) = self
+            .registry
+            .slot_mut(slot)
+            .and_then(|entry| entry.view_mut(place.chat))
+        else {
+            return Vec::new();
+        };
+        // Newest first: each is the latest part equal to it.
+        let mut taken: Vec<Inbound> = kept
+            .kept
+            .into_iter()
+            .rev()
+            .filter(|(_, part)| view.backlog.remove_latest(part))
+            .map(|(input, _)| input)
+            .collect();
+        taken.reverse();
+        if !taken.is_empty() {
+            self.registry.dirty = true;
+            info!(
+                ordinal = self.ordinal(slot),
+                forwards = taken.len(),
+                "forwards kept just before a mention of their author go with it"
+            );
+        }
+        taken
     }
 
     /// `input` is a file of the album of `slot`'s topic in `chat` that
@@ -4865,6 +4993,7 @@ impl Slots {
         let album = album_of(&input)
             .map(str::to_owned)
             .map(|id| (id, input.clone()));
+        let forward = input.forwarded.then(|| input.clone());
         let key = input.key();
         let duration = input.media.as_ref().and_then(|media| media.duration);
         let (text, file) = match (input.text, input.media) {
@@ -4906,6 +5035,9 @@ impl Slots {
         let (kept, told) = (view.backlog.parts.len(), view.mention_told);
         self.registry.dirty = true;
         info!(ordinal, kept, "group message kept for the next mention");
+        // A forward may go with a mention of its author right after
+        // (TASK-094); a voice message waiting for its words stays here.
+        self.keep_forward(slot, place.chat, forward.filter(|_| id == 0), &part);
         // A voice message's words replace its placeholder once recognized
         // (TASK-085); without recognition it stays a placeholder.
         if let Some(file_id) = voice {
@@ -4954,6 +5086,37 @@ impl Slots {
         }
     }
 
+    /// Group message `forward` of `slot` in `chat`, kept with `part`, is the
+    /// newest of its author's run of forwards there (TASK-094); `None`: the
+    /// message just kept ends any run.
+    fn keep_forward(&mut self, slot: SlotId, chat: Chat, forward: Option<Inbound>, part: &str) {
+        let Some(input) = forward else {
+            self.kept_forwards.remove(&(slot, chat));
+            return;
+        };
+        let now = Instant::now();
+        let joins = self.kept_forwards.get(&(slot, chat)).is_some_and(|run| {
+            run.sender == input.sender
+                && run.kept.len() < mention::MAX_BACKLOG
+                && self.within_burst(run.first, run.last)
+        });
+        match self.kept_forwards.get_mut(&(slot, chat)) {
+            Some(run) if joins => {
+                run.last = now;
+                run.kept.push((input, part.to_owned()));
+            }
+            _ => {
+                let run = KeptForwards {
+                    sender: input.sender,
+                    first: now,
+                    last: now,
+                    kept: vec![(input, part.to_owned())],
+                };
+                self.kept_forwards.insert((slot, chat), run);
+            }
+        }
+    }
+
     /// The backlog of the group view of `slot` for a message of topic
     /// `place` that goes to the buffer (TASK-077): taken, as one history to
     /// compress first when it is longer than the owner's limit. `None` for
@@ -4974,6 +5137,8 @@ impl Slots {
         if let Some(album) = self.mention_albums.get_mut(&(slot, place.chat)) {
             album.kept.clear();
         }
+        // So do the forwards kept so far (TASK-094).
+        self.kept_forwards.remove(&(slot, place.chat));
         let text = mention::render(&taken);
         let state = if text.chars().count() <= limit as usize {
             buffer::HistoryState::Full
@@ -11774,6 +11939,8 @@ impl Slots {
         // Its album waits for no mention there (TASK-072).
         if let Some(topic) = topic {
             self.mention_albums.remove(&(slot, topic.chat));
+            self.mention_bursts.remove(&(slot, topic.chat));
+            self.kept_forwards.remove(&(slot, topic.chat));
         }
         self.stop_mirroring(slot, topic, mirrored);
     }
@@ -13278,6 +13445,8 @@ impl Slots {
             self.foreign_told.remove(&place);
             self.gaps.remove(&place);
             self.mention_albums.remove(&(slot, place.chat));
+            self.mention_bursts.remove(&(slot, place.chat));
+            self.kept_forwards.remove(&(slot, place.chat));
         }
         self.shown.remove(&slot);
         self.notices.retain(|(noticed, _), _| *noticed != slot);
@@ -34856,6 +35025,199 @@ again"
         assert_eq!(backlog_of(&slots), ["Анна: раньше"]);
         assert!(got(&mut agent).inbounds.is_empty());
         assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    // TASK-094: forwards that come together with a mention of their author.
+
+    /// [`mention_slot`] on a hub that gathers bursts.
+    fn mention_gather_slot(
+        dir: &TempDir,
+    ) -> (
+        Slots,
+        mpsc::UnboundedReceiver<(Work, Op)>,
+        mpsc::Receiver<HubMsg>,
+    ) {
+        let options = Options {
+            gather_quiet: GATHER_QUIET,
+            gather_max: GATHER_MAX,
+            ..mention_options()
+        };
+        let (mut slots, mut work) = shared_slot(dir, options);
+        let mut agent = mention_agent(&mut slots, 1, 64, false);
+        slots.pump();
+        let _ = all_work(&mut work);
+        let _ = got(&mut agent);
+        (slots, work, agent)
+    }
+
+    /// Group message `text` in topic 100 by user `user` named `name`; a
+    /// forward when `forwarded`.
+    fn group_from(message_id: i64, text: &str, user: i64, name: &str, forwarded: bool) -> Control {
+        let Control::Message(input) = group_by(message_id, text, name, None) else {
+            unreachable!()
+        };
+        Control::Message(Inbound {
+            sender: PrivateChat::of_user(user),
+            forwarded,
+            ..input
+        })
+    }
+
+    /// The live report: Telegram hands a forward with a comment as the
+    /// comment (the mention) and then the forwards, all within a second.
+    /// The forwards go with the mention as one inbound, marked, in order,
+    /// and nothing is kept for the next mention.
+    #[tokio::test(start_paused = true)]
+    async fn forwards_right_after_a_mention_of_their_author_go_with_it() {
+        let dir = TempDir::new("slots-mention-forwards-after");
+        let (mut slots, mut work, mut agent) = mention_gather_slot(&dir);
+        slots.on_control(group_from(10, "@cctg_bot глянь", 7, "Иван", false));
+        slots.pump();
+        for id in 11..=12 {
+            pass(&mut slots, ms(200)).await;
+            slots.on_control(group_from(id, &format!("чужое {id}"), 7, "Иван", true));
+            slots.pump();
+        }
+        assert!(backlog_of(&slots).is_empty(), "nothing kept");
+        pass(&mut slots, GATHER_QUIET).await;
+        let batch = got(&mut agent);
+        assert_eq!(
+            mention_contents(&batch),
+            [
+                "(обращение к вам из группы, где открыта эта сессия)\nИван: глянь\n\n---\n\n\
+                 Иван: (переслано)\nчужое 11\n\n---\n\nИван: (переслано)\nчужое 12"
+            ]
+        );
+        assert_eq!(batch.inbounds[0].1["message_ids"], "10,11,12");
+        assert!(backlog_of(&slots).is_empty());
+        let handed = all_work(&mut work);
+        assert_eq!(reactions_on(&handed), [10, 11, 12]);
+        assert!(
+            sends_into(&handed, group_100()).is_empty(),
+            "no hint: nothing was kept"
+        );
+    }
+
+    /// Forwards and then a mention of their author within the gather
+    /// window: the forwards leave the backlog and go with the mention as
+    /// parts of its batch, after the history of what was kept before them.
+    #[tokio::test(start_paused = true)]
+    async fn forwards_right_before_a_mention_of_their_author_go_with_it() {
+        let dir = TempDir::new("slots-mention-forwards-before");
+        let (mut slots, _work, mut agent) = mention_gather_slot(&dir);
+        slots.on_control(group_from(9, "раньше", 8, "Анна", false));
+        pass(&mut slots, GATHER_MAX).await;
+        for id in 10..=11 {
+            slots.on_control(group_from(id, &format!("чужое {id}"), 7, "Иван", true));
+            pass(&mut slots, ms(200)).await;
+        }
+        assert_eq!(backlog_of(&slots).len(), 3, "kept until the mention");
+        slots.on_control(group_from(12, "@cctg_bot что скажешь?", 7, "Иван", false));
+        slots.pump();
+        assert!(backlog_of(&slots).is_empty());
+        pass(&mut slots, GATHER_QUIET).await;
+        let batch = got(&mut agent);
+        assert_eq!(
+            mention_contents(&batch),
+            [
+                "(история темы группы с прошлого обращения к вам: 1 сообщение)\n\
+                 Анна: раньше\n(конец истории)\n\n\
+                 Иван: (переслано)\nчужое 10\n\n---\n\nИван: (переслано)\nчужое 11\n\n---\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nИван: что скажешь?"
+            ]
+        );
+        assert_eq!(batch.inbounds[0].1["message_ids"], "10,11,12");
+        assert!(slots.registry.slots[0].buffer.is_idle());
+    }
+
+    /// Another author's messages in the window of a mention are kept, and so
+    /// are forwards of the mention's author after the window; forwards of
+    /// another author, or a run another message ended, go as history.
+    #[tokio::test(start_paused = true)]
+    async fn only_forwards_of_the_mention_author_within_the_window_go_with_it() {
+        let dir = TempDir::new("slots-mention-forwards-other");
+        let (mut slots, _work, mut agent) = mention_gather_slot(&dir);
+        slots.on_control(group_from(10, "@cctg_bot глянь", 7, "Иван", false));
+        slots.pump();
+        slots.on_control(group_from(11, "чужое 11", 8, "Анна", true));
+        slots.on_control(group_from(12, "своё 12", 8, "Анна", false));
+        slots.pump();
+        pass(&mut slots, GATHER_QUIET).await;
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            ["(обращение к вам из группы, где открыта эта сессия)\nИван: глянь"]
+        );
+        // The mention's own window is over.
+        pass(&mut slots, GATHER_MAX).await;
+        slots.on_control(group_from(13, "чужое 13", 7, "Иван", true));
+        slots.pump();
+        assert_eq!(
+            backlog_of(&slots),
+            [
+                "Анна: (переслано)\nчужое 11",
+                "Анна: своё 12",
+                "Иван: (переслано)\nчужое 13"
+            ]
+        );
+        // Forwards of another author before a mention stay history.
+        pass(&mut slots, GATHER_MAX).await;
+        slots.on_control(group_from(20, "чужое 20", 8, "Анна", true));
+        slots.on_control(group_from(21, "@cctg_bot а это?", 7, "Иван", false));
+        slots.pump();
+        pass(&mut slots, GATHER_QUIET).await;
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(история темы группы с прошлого обращения к вам: 4 сообщения)\n\
+                 Анна: (переслано)\nчужое 11\n\n---\n\nАнна: своё 12\n\n---\n\n\
+                 Иван: (переслано)\nчужое 13\n\n---\n\nАнна: (переслано)\nчужое 20\n\
+                 (конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nИван: а это?"
+            ]
+        );
+        // A run of the author's forwards that another message ended.
+        pass(&mut slots, GATHER_MAX).await;
+        slots.on_control(group_from(30, "чужое 30", 7, "Иван", true));
+        slots.on_control(group_from(31, "своё 31", 8, "Анна", false));
+        slots.on_control(group_from(32, "@cctg_bot и?", 7, "Иван", false));
+        slots.pump();
+        pass(&mut slots, GATHER_QUIET).await;
+        let batch = got(&mut agent);
+        assert_eq!(
+            mention_contents(&batch),
+            [
+                "(история темы группы с прошлого обращения к вам: 2 сообщения)\n\
+                 Иван: (переслано)\nчужое 30\n\n---\n\nАнна: своё 31\n(конец истории)\n\n\
+                 (обращение к вам из группы, где открыта эта сессия)\nИван: и?"
+            ]
+        );
+        assert_eq!(batch.inbounds[0].1["message_id"], "32");
+        assert!(backlog_of(&slots).is_empty());
+    }
+
+    /// In every-message mode forwards after a mention go as before: each to
+    /// the session, whoever forwarded it.
+    #[tokio::test(start_paused = true)]
+    async fn forwards_after_a_mention_in_every_message_mode_go_as_before() {
+        let dir = TempDir::new("slots-mention-forwards-every");
+        let (mut slots, _work, mut agent) = mention_gather_slot(&dir);
+        assert_eq!(
+            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None),
+            menu::ANSWER_SAVED
+        );
+        slots.on_control(group_from(10, "@cctg_bot глянь", 7, "Иван", false));
+        slots.on_control(group_from(11, "чужое 11", 7, "Иван", true));
+        slots.on_control(group_from(12, "чужое 12", 8, "Анна", true));
+        slots.pump();
+        pass(&mut slots, GATHER_QUIET).await;
+        assert_eq!(
+            mention_contents(&got(&mut agent)),
+            [
+                "(обращение к вам из группы, где открыта эта сессия)\nИван: глянь\n\n---\n\n\
+                 Иван: (переслано)\nчужое 11\n\n---\n\nАнна: (переслано)\nчужое 12"
+            ]
+        );
+        assert!(backlog_of(&slots).is_empty());
     }
 
     /// (л): a file that mentions the agent in its caption carries the
