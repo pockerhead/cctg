@@ -490,6 +490,10 @@ fn menu_switch(home: &Path, bash: &Path, claude: &Path, checks: &mut Checks) {
         "the menu switch marks a folder",
         format!("{on:?}"),
     );
+    if on != Ok(Switched::On) {
+        // Everything below needs the mark: one failure, not a cascade.
+        return;
+    }
     let out = status();
     checks.check(
         out.contains("(активен)"),
@@ -502,6 +506,16 @@ fn menu_switch(home: &Path, bash: &Path, claude: &Path, checks: &mut Checks) {
         "a sandboxed command creates a protected name",
         &s,
     );
+    if !s.contains("MADE_VSCODE") {
+        // Without it the refusal below cannot happen: only unmark.
+        let off = switch::turn_off(&probe, &file, &c);
+        checks.check(
+            off == Ok(Switched::Off),
+            "the menu switch unmarks the folder",
+            format!("{off:?}"),
+        );
+        return;
+    }
     let off = switch::turn_off(&probe, &file, &c);
     checks.check(
         off == Err(preflight::Refusal::SandboxWroteProtected(1)),
@@ -574,8 +588,10 @@ fn the_windows_sandbox_confines_a_command() {
         tools.to_string_lossy().as_bytes(),
     );
 
-    // Install two slots. On a non-elevated runner this fails; skip cleanly.
-    let (code, out, err) = cctg(&home, &claude, &["sandbox-install", "--slots", "2"]);
+    // Install three slots: A and B take two (A's stays retired after its
+    // `sandbox off`, a retired number is not reused), the menu switch's C the
+    // third. On a non-elevated runner this fails; skip cleanly.
+    let (code, out, err) = cctg(&home, &claude, &["sandbox-install", "--slots", "3"]);
     if code != 0 {
         let _ = cctg(&home, &claude, &["sandbox-uninstall"]);
         let _ = std::fs::remove_dir_all(&home);

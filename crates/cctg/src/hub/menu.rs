@@ -2332,6 +2332,11 @@ mod tests {
             note_refused("не найдена\nпрограмма bwrap"),
             "не переключено: не найдена программа bwrap"
         );
+        // More marked folders than Windows slots: the whole reason, one line.
+        let slots = crate::sandbox::preflight::Refusal::NoFreeSlot(8).to_string();
+        let note = note_refused(&slots);
+        assert_eq!(note, format!("не переключено: {slots}"), "not cut");
+        assert!(!note.contains('\n') && note.contains("cctg sandbox-install --slots"));
         let long = note_refused(&"я".repeat(500));
         assert!(transcript::telegram_len(&long) <= NOTE_LIMIT, "{long}");
         let rows = (0..PAGE_SIZE as u32)
