@@ -310,6 +310,7 @@ impl Claude {
             private_place: false,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         };
         let (outbox, events) = agent::spawn(LinkConfig {
             addr: cctg::tls::HubAddr::plain(addr.to_string()),
@@ -322,6 +323,7 @@ impl Claude {
             replay: None,
             heartbeat: Default::default(),
             status: None,
+            sandbox: None,
         });
         let (frames, frames_rx) = mpsc::channel(16);
         let (ours, theirs) = tokio::io::duplex(1 << 20);
@@ -331,6 +333,7 @@ impl Claude {
             claude: None,
             sandbox: None,
             fallback_inbox: None,
+            switch: None,
         };
         tokio::spawn(agent::serve_channel(
             frames_rx,

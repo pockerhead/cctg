@@ -508,7 +508,8 @@ async fn agent_session(
                         | AgentMsg::FileOffer { .. }
                         | AgentMsg::FileChunk(_)
                         | AgentMsg::SessionAnswer { .. }
-                        | AgentMsg::StatusLine { .. }),
+                        | AgentMsg::StatusLine { .. }
+                        | AgentMsg::SandboxAnswer { .. }),
                     ))) => {
                         if events.send(AgentEvent::Message { conn, received_at, msg }).await.is_err() {
                             break;
@@ -1441,6 +1442,7 @@ mod tests {
             private_place: false,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         }
     }
 

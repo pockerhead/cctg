@@ -264,6 +264,7 @@ async fn hub(test: &str, question_wait: Duration) -> Hub {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })

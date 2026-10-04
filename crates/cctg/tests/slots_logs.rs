@@ -153,6 +153,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })
@@ -217,6 +218,7 @@ async fn slot_logs_warn_once_and_carry_no_private_text() {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })

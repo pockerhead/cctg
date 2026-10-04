@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::client;
 use crate::keys::{self, Typed};
 use crate::proctree::Proc;
-use crate::sandbox::{self, marks, preflight, profile};
+use crate::sandbox::{self, marks, paths, preflight, profile};
 use crate::shim;
 
 /// Set by `cctg run` for its claude: the pid of that `cctg run`.
@@ -271,6 +271,25 @@ impl Worker {
             (false, _) => Plan::UpToDate,
             (true, true) => Plan::Restart,
             (true, false) => Plan::ManualRestart,
+        }
+    }
+
+    /// `update.sandbox_folder` (TASK-090): a restart only for the sandbox
+    /// mode, only of a session inside `switched` whose mode differs from its
+    /// folder's mark; nothing else counts (no new build, no changed
+    /// settings). Blocking (reads the marks file).
+    pub fn mode_plan(&self, switched: &Path) -> Plan {
+        let inside = self
+            .folder
+            .as_deref()
+            .is_some_and(|own| paths::within(switched, own));
+        if !inside || self.wanted() == self.sandbox_active {
+            return Plan::UpToDate;
+        }
+        if self.restartable() {
+            Plan::Restart
+        } else {
+            Plan::ManualRestart
         }
     }
 
@@ -788,6 +807,82 @@ mod tests {
             ..sandbox_worker(&home, &exe, true)
         };
         assert_eq!(manual.plan(), Plan::ManualRestart);
+    }
+
+    /// TASK-090: the quiet `update` of a menu switch restarts only a session
+    /// inside the switched folder whose mode differs from its mark.
+    #[test]
+    fn a_mode_restart_asks_only_about_the_folder_and_the_mode() {
+        let dir = TempDir::new("update-mode-plan");
+        let home = sandbox::paths::canonical(dir.path()).unwrap();
+        let exe = home.join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let w = sandbox_worker(&home, &exe, false);
+        let folder = w.folder.clone().unwrap();
+        let neighbour = home.join("proj2");
+        assert_eq!(w.mode_plan(&folder), Plan::UpToDate, "mode as marked");
+        marks::add(&sandbox::marks_file(&home), &folder).unwrap();
+        assert_eq!(w.mode_plan(&folder), Plan::Restart);
+        assert_eq!(w.mode_plan(&home), Plan::Restart, "a folder above");
+        assert_eq!(
+            w.mode_plan(&neighbour),
+            Plan::UpToDate,
+            "a name prefix is not a parent"
+        );
+        assert_eq!(w.mode_plan(&folder.join("sub")), Plan::UpToDate);
+        let manual = Worker {
+            run_pid: None,
+            ..sandbox_worker(&home, &exe, false)
+        };
+        assert_eq!(manual.mode_plan(&folder), Plan::ManualRestart);
+        // Settings changed since the start: "Обновить" restarts, the quiet
+        // ask of a matching mode does not.
+        let sandboxed = Worker {
+            shim_started: Some(1),
+            ..sandbox_worker(&home, &exe, true)
+        };
+        assert_eq!(sandboxed.plan(), Plan::Restart);
+        assert_eq!(sandboxed.mode_plan(&folder), Plan::UpToDate);
+    }
+
+    /// TASK-090: a switch from the menu, then the restart it leads to, takes
+    /// the profile; switched back, the restart leaves it.
+    #[test]
+    fn a_menu_switch_leads_to_a_restart_in_the_new_mode() {
+        let dir = TempDir::new("update-mode-chain");
+        let home = sandbox::paths::canonical(dir.path()).unwrap();
+        let exe = home.join("cctg.exe");
+        std::fs::write(&exe, "one").unwrap();
+        let w = sandbox_worker(&home, &exe, false);
+        let folder = w.folder.clone().unwrap();
+        let file = sandbox::marks_file(&home);
+        let settings = profile::settings_base(&w.run_args).unwrap();
+        let fake = preflight::tests::Fake::linux(&home);
+        assert_eq!(
+            sandbox::switch::turn_on(&fake, &file, &folder, &exe, Some(&settings)),
+            Ok(sandbox::switch::Switched::On)
+        );
+        assert_eq!(w.mode_plan(&folder), Plan::Restart);
+        let args = w.restart_args("5e55", &fake).unwrap();
+        let at = args.iter().position(|arg| arg == "--settings").unwrap();
+        assert_eq!(args[at - 4..at], profile::FLAGS.map(str::to_owned));
+        assert_eq!(
+            args[at + 1],
+            profile::profile_path(&settings, &folder).to_string_lossy()
+        );
+        assert_eq!(
+            sandbox::switch::turn_off(&fake, &file, &folder),
+            Ok(sandbox::switch::Switched::Off)
+        );
+        let sandboxed = sandbox_worker(&home, &exe, true);
+        assert_eq!(sandboxed.mode_plan(&folder), Plan::Restart);
+        let args = sandboxed.restart_args("5e55", &fake).unwrap();
+        assert!(
+            !args
+                .iter()
+                .any(|arg| profile::FLAGS.contains(&arg.as_str()))
+        );
+        assert!(args.contains(&settings.to_string_lossy().into_owned()));
     }
 
     #[test]

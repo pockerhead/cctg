@@ -230,6 +230,7 @@ async fn message_logs_carry_no_text_and_no_user_id() {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })

@@ -257,6 +257,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
         .send(HubMsg::Update {
             update_id: 7,
             release: None,
+            sandbox_folder: None,
         })
         .await
         .unwrap();
@@ -406,6 +407,7 @@ async fn a_new_binary_is_taken_without_losing_a_line() {
         .send(HubMsg::Update {
             update_id: 8,
             release: None,
+            sandbox_folder: None,
         })
         .await
         .unwrap();
@@ -656,6 +658,7 @@ async fn update_answer(
         .send(HubMsg::Update {
             update_id,
             release: release.map(str::to_owned),
+            sandbox_folder: None,
         })
         .await
         .unwrap();

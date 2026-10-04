@@ -251,8 +251,8 @@ impl Server {
                 self.emit(line)
             }
             // Transcript and session reads, console keys and commands,
-            // updates and files are the agent loop's, not the channel's;
-            // pings and `bound` end in the link task.
+            // updates, files and sandbox switches are the agent loop's, not
+            // the channel's; pings and `bound` end in the link task.
             LinkEvent::Message(
                 HubMsg::Registered { .. }
                 | HubMsg::Ping
@@ -266,7 +266,8 @@ impl Server {
                 | HubMsg::Released { .. }
                 | HubMsg::FileStart { .. }
                 | HubMsg::FileChunk(_)
-                | HubMsg::FileAnswer { .. },
+                | HubMsg::FileAnswer { .. }
+                | HubMsg::SandboxSet { .. },
             ) => Vec::new(),
         }
     }
@@ -1185,6 +1186,7 @@ mod tests {
             HubMsg::Update {
                 update_id: 1,
                 release: None,
+                sandbox_folder: None,
             },
             HubMsg::Released {
                 update_id: 1,

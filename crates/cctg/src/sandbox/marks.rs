@@ -218,12 +218,12 @@ pub fn remove(file: &Path, folder: &Path) -> Result<Removed, MarksError> {
     })
 }
 
-fn same(a: &Path, b: &Path) -> bool {
+pub(crate) fn same(a: &Path, b: &Path) -> bool {
     paths::within(a, b) && paths::within(b, a)
 }
 
 /// The spelling marks are kept in ([`crate::device::canonical_cwd`]).
-fn canonical(folder: &Path) -> PathBuf {
+pub(crate) fn canonical(folder: &Path) -> PathBuf {
     match folder.to_str() {
         Some(text) => PathBuf::from(crate::device::canonical_cwd(text)),
         None => paths::canonical(folder).unwrap_or_else(|| folder.to_path_buf()),

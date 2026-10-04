@@ -29,6 +29,7 @@ pub mod paths;
 pub mod prefix;
 pub mod preflight;
 pub mod profile;
+pub mod switch;
 
 /// The native Windows command sandbox (TASK-089): restricted-token accounts,
 /// ACLs, the broker and runner. All Win32; the whole tree is `#[cfg(windows)]`.

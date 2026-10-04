@@ -384,7 +384,7 @@ use super::fetch::{self, Fetch, Fetched};
 use super::groups::{self, GroupLookup, KnownGroups, Membership, Missing, PickAction, PickRow};
 use super::ingress::{AgentEvent, MAX_PERMISSION_WAITS, PermissionAsk, QuestionAsk};
 use super::mention;
-use super::menu::{self, MenuPress, OwnerPage, Page, RowState, SlotAction};
+use super::menu::{self, MenuPress, OwnerPage, Page, RowSandbox, RowState, SlotAction};
 use super::mirror::{Detached, Follow, Landed, Mirror, Write};
 use super::people::{self, Book, Refusal};
 use super::permissions::{self, Edit, Opened, Prompt, Prompts, State};
@@ -409,8 +409,8 @@ use crate::files;
 use crate::wire::{
     AgentMsg, Answered, Behavior, Client, CommandOutcome, ConsoleKey, FileChunk, FileKind,
     FileOutcome, FilePart, HookEvent, HookPost, HubMsg, MAX_ALBUM, PermissionPost,
-    PermissionRequest, QUESTION_TOOL, SessionAnswer, SessionAsk, StreamItem, StreamLine,
-    UpdateOutcome,
+    PermissionRequest, QUESTION_TOOL, SandboxOutcome, SandboxState, SessionAnswer, SessionAsk,
+    StreamItem, StreamLine, UpdateOutcome,
 };
 
 /// The longest text one session read may bring, as the agent sends at most
@@ -507,6 +507,11 @@ pub const UPDATE_WAIT: Duration = Duration::from_secs(120);
 /// A restart held back by background agents or the agent view on the
 /// terminal (TASK-047) is asked again after this.
 pub const UPDATE_RETRY: Duration = Duration::from_secs(30);
+/// A sandbox switch from the menu waits this long for the agent's answer
+/// (TASK-090): on Windows the grant of a large folder takes minutes.
+pub const SANDBOX_WAIT: Duration = Duration::from_secs(15 * 60);
+/// A note under a session row about its sandbox goes after this.
+pub const SANDBOX_NOTE_FOR: Duration = Duration::from_secs(30 * 60);
 /// The channel message a session gets from the hub once its next agent is
 /// bound, after a client restart cut off its work (TASK-047).
 pub const CONTINUE_TEXT: &str = "Клиент cctg обновлён, и сессия была перезапущена посреди работы. \
@@ -1878,10 +1883,44 @@ struct Conn {
     private_place: bool,
     /// The enrolled device it came in with, when not on the shared secret.
     enrolled: Option<String>,
+    /// Its session's sandbox state ([`crate::wire::Register::sandbox`]),
+    /// kept up by its `sandbox_answer`s; `None`: it cannot switch (TASK-090).
+    sandbox: Option<SandboxState>,
+}
+
+/// A sandbox switch asked from the menu (TASK-090), until its answer.
+struct SandboxAsk {
+    /// The pressed row's slot and its live session then.
+    slot: SlotId,
+    session: String,
+    conn: u64,
+    /// One switch per device at a time.
+    host: String,
+    /// The owner who pressed.
+    chat: PrivateChat,
+    on: bool,
+    /// The menu message pressed on, edited once at the answer when it still
+    /// shows a sessions page.
+    menu: Option<i64>,
+    until: Instant,
+}
+
+/// An agent's `sandbox_answer` ([`AgentMsg::SandboxAnswer`]).
+struct SandboxAnswer {
+    request_id: u64,
+    outcome: SandboxOutcome,
+    reason: Option<String>,
+    state: Option<SandboxState>,
+    folder: Option<String>,
+    restart: bool,
 }
 
 /// An update press of a session, until its last answer.
 struct UpdateAsk {
+    /// TASK-090: a quiet restart for the sandbox mode after a switch of
+    /// this folder on the session's device; nothing is downloaded and the
+    /// topic is told nothing.
+    sandbox_folder: Option<String>,
     /// The `update` in flight: its id and connection.
     sent: Option<(u64, u64)>,
     /// The last `update` whose agent answered that it leaves: a later answer
@@ -1905,6 +1944,17 @@ struct UpdateAsk {
     /// ⏹ was written into the session's console while the press waited: a
     /// restart cuts off that work.
     interrupted: bool,
+}
+
+impl UpdateAsk {
+    /// A quiet ask of a sandbox switch (TASK-090) that no agent has taken:
+    /// another ask may replace it.
+    fn quiet_waiting(&self) -> bool {
+        self.sandbox_folder.is_some()
+            && self.sent.is_none()
+            && self.left.is_none()
+            && self.held.is_none()
+    }
 }
 
 pub struct Slots {
@@ -2014,6 +2064,14 @@ pub struct Slots {
     command_asks: HashMap<u64, CommandAsk>,
     /// Update presses by session.
     updates: HashMap<String, UpdateAsk>,
+    /// Sandbox switches asked from the menu, by request id (TASK-090).
+    sandbox_asks: HashMap<u64, SandboxAsk>,
+    /// Slots whose 🔓 waits for its second press, until when.
+    sandbox_confirm: HashMap<SlotId, Instant>,
+    /// The line under a slot's row about its sandbox, and since when.
+    sandbox_notes: HashMap<SlotId, (String, Instant)>,
+    /// The page each person's menu shows now (TASK-090).
+    menu_pages: HashMap<PrivateChat, Page>,
     /// The download task, once [`Slots::fetch_files`] started it.
     fetcher: Option<mpsc::Sender<fetch::Job>>,
     /// The kept file of a slot on its way to the agent.
@@ -2276,6 +2334,10 @@ impl Slots {
             key_asks: HashMap::new(),
             command_asks: HashMap::new(),
             updates: HashMap::new(),
+            sandbox_asks: HashMap::new(),
+            sandbox_confirm: HashMap::new(),
+            sandbox_notes: HashMap::new(),
+            menu_pages: HashMap::new(),
             fetcher: None,
             fetching: HashMap::new(),
             link_losses: HashMap::new(),
@@ -2714,6 +2776,7 @@ impl Slots {
                     );
                     self.pending.insert(session.clone(), conn);
                 }
+                let sandbox = register.sandbox;
                 self.conns.insert(
                     conn,
                     Conn {
@@ -2738,8 +2801,16 @@ impl Slots {
                         leaving: false,
                         private_place: register.private_place,
                         enrolled: register.enrolled,
+                        sandbox,
                     },
                 );
+                // TASK-090: the session runs in the mode its folder asks for
+                // now: a note about a pending restart is done.
+                if sandbox.is_some_and(|state| state.active == state.wanted)
+                    && let Some(slot) = self.current_slot(&session)
+                {
+                    self.sandbox_notes.remove(&slot);
+                }
                 self.tell_bound(conn);
                 // A link that came back takes the answers that wait for it.
                 self.push_selected(Some(&session));
@@ -2791,6 +2862,24 @@ impl Slots {
                     } => self.on_command_typed(conn, &session, command_id, outcome, panel),
                     AgentMsg::UpdateAnswer { update_id, outcome } => {
                         self.on_update_answer(conn, &session, update_id, outcome);
+                    }
+                    AgentMsg::SandboxAnswer {
+                        request_id,
+                        outcome,
+                        reason,
+                        state,
+                        folder,
+                        restart,
+                    } => {
+                        let answer = SandboxAnswer {
+                            request_id,
+                            outcome,
+                            reason,
+                            state,
+                            folder,
+                            restart,
+                        };
+                        self.on_sandbox_answer(conn, &session, answer);
                     }
                     AgentMsg::FileOffer {
                         transfer_id,
@@ -9184,7 +9273,13 @@ impl Slots {
         let Some((_, conn)) = self.live_agent(slot).filter(|(live, _)| live == session) else {
             return status::ANSWER_OFFLINE;
         };
-        if self.updates.contains_key(session) {
+        // A quiet restart of a sandbox switch that has not gone out yet is
+        // replaced by this press (TASK-090): its `update` would not download.
+        if self
+            .updates
+            .get(session)
+            .is_some_and(|ask| !ask.quiet_waiting())
+        {
             return status::ANSWER_UPDATE_RUNNING;
         }
         if !self.outdated(conn) {
@@ -9206,6 +9301,7 @@ impl Slots {
         self.updates.insert(
             session.to_owned(),
             UpdateAsk {
+                sandbox_folder: None,
                 sent: None,
                 left: None,
                 rounds: 0,
@@ -9235,6 +9331,9 @@ impl Slots {
             let Some(ask) = self.updates.get(&session) else {
                 continue;
             };
+            // TASK-090: a quiet restart of a sandbox switch tells the topic
+            // nothing, only the note under the pressed row.
+            let quiet = ask.sandbox_folder.is_some();
             if ask.sent.is_none() && ask.left.is_none() && !self.agents_running(&session).is_empty()
             {
                 // Subagents run (TASK-047): no `update` goes out, as after an
@@ -9246,7 +9345,9 @@ impl Slots {
                     ask.until = now + UPDATE_WAIT;
                     tell = !std::mem::replace(&mut ask.agents_told, true);
                 }
-                if tell
+                if tell && quiet {
+                    self.sandbox_progress(&session, Some(menu::NOTE_WAITS_AGENTS));
+                } else if tell
                     && let Some(slot) = self.current_slot(&session)
                     && let Some(place) = self.registry.place(slot)
                 {
@@ -9261,7 +9362,9 @@ impl Slots {
                     ask.until = now + UPDATE_WAIT;
                     ask.told = true;
                 }
-                if !told
+                if !told && quiet {
+                    self.sandbox_progress(&session, Some(menu::NOTE_WAITS_TURN));
+                } else if !told
                     && let Some(slot) = self.current_slot(&session)
                     && let Some(place) = self.registry.place(slot)
                 {
@@ -9277,10 +9380,16 @@ impl Slots {
                 self.updates.remove(&session);
                 continue;
             }
+            // No restart while the agent switches the sandbox (TASK-090): it
+            // would end the agent in the middle of it.
             if ask.sent.is_some()
                 || ask.held.is_some()
                 || ask.retry_at.is_some_and(|at| now < at)
                 || self.busy(&session)
+                || self
+                    .sandbox_asks
+                    .values()
+                    .any(|asked| asked.session == session)
             {
                 continue;
             }
@@ -9300,15 +9409,23 @@ impl Slots {
                 .is_some_and(|client| client.self_update);
             let update_id = crate::wire::random_u64();
             // Only an agent of another build downloads; the next agent of
-            // the session, already the hub's build, only restarts claude.
-            let release = self.options.release.clone().filter(|_| self.outdated(conn));
+            // the session, already the hub's build, only restarts claude. A
+            // quiet restart never downloads (TASK-090).
+            let release = self
+                .options
+                .release
+                .clone()
+                .filter(|_| !quiet && self.outdated(conn));
+            let update = HubMsg::Update {
+                update_id,
+                release,
+                sandbox_folder: ask.sandbox_folder.clone(),
+            };
             let sent = able
-                && self.conns.get(&conn).is_some_and(|bound| {
-                    bound
-                        .to_agent
-                        .try_send(HubMsg::Update { update_id, release })
-                        .is_ok()
-                });
+                && self
+                    .conns
+                    .get(&conn)
+                    .is_some_and(|bound| bound.to_agent.try_send(update).is_ok());
             if !sent {
                 continue;
             }
@@ -9365,6 +9482,12 @@ impl Slots {
             );
             return;
         }
+        // TASK-090: a quiet restart of a sandbox switch tells the topic
+        // nothing; the note under the pressed row follows it.
+        let quiet = self
+            .updates
+            .get(session)
+            .is_some_and(|ask| ask.sandbox_folder.is_some());
         if outcome == UpdateOutcome::AgentsRunning
             && let Some(ask) = self.updates.get_mut(session).filter(|ask| {
                 ask.sent == Some((update_id, conn)) || ask.left == Some((update_id, conn))
@@ -9387,7 +9510,9 @@ impl Slots {
                 "restart held back: background agents"
             );
             self.keep_agent(conn, session);
-            if tell
+            if quiet {
+                self.sandbox_progress(session, Some(menu::NOTE_WAITS_AGENTS));
+            } else if tell
                 && let Some(slot) = self.current_slot(session)
                 && let Some(place) = self.registry.place(slot)
             {
@@ -9441,6 +9566,16 @@ impl Slots {
             self.updates.remove(session);
         }
         self.keep_agent(conn, session);
+        if quiet && asked {
+            let note = match outcome {
+                UpdateOutcome::UpToDate => None,
+                UpdateOutcome::NeedsManualRestart => Some(menu::NOTE_MANUAL),
+                UpdateOutcome::DraftInInput => Some(menu::NOTE_DRAFT),
+                _ => Some(menu::NOTE_RESTART_FAILED),
+            };
+            self.sandbox_progress(session, note);
+            return;
+        }
         let notice = match outcome {
             UpdateOutcome::UpToDate if self.outdated(conn) => status::NO_NEW_BUILD_NOTICE,
             UpdateOutcome::UpToDate => status::UPDATED_NOTICE,
@@ -9464,6 +9599,266 @@ impl Slots {
             && let Some(shown) = self.shown.get_mut(&slot)
         {
             shown.next_at = Some(Instant::now());
+        }
+    }
+
+    /// The owner of the device of agent `conn` (TASK-063): the enrolled
+    /// device's owner in a team, else the first owner. `None` without
+    /// private chats.
+    fn device_owner(&self, conn: u64) -> Option<PrivateChat> {
+        let owners = self.options.owners.as_ref()?;
+        let Some(devices) = &owners.devices else {
+            return Some(owners.first);
+        };
+        let enrolled = self.conns.get(&conn)?.enrolled.as_deref();
+        Some(
+            enrolled
+                .and_then(|id| devices.owner(id))
+                .unwrap_or(owners.first),
+        )
+    }
+
+    /// 🔒, 🔓 and its «точно?» of the menu of `chat` for `slot` (TASK-090):
+    /// only the owner of the slot and of its device, only a live session
+    /// whose agent can switch, one switch per device at a time. The agent
+    /// does the work and answers later; the press is answered at once.
+    /// `menu_at`: the menu message pressed on.
+    fn press_sandbox(
+        &mut self,
+        chat: PrivateChat,
+        slot: SlotId,
+        action: SlotAction,
+        menu_at: Option<i64>,
+    ) -> String {
+        let private = Chat::Private(chat);
+        if !self
+            .registry
+            .place(slot)
+            .is_some_and(|place| place.chat == private)
+        {
+            return menu::ANSWER_NOT_YOURS.to_owned();
+        }
+        let Some((session, conn)) = self.live_agent(slot) else {
+            return status::ANSWER_OFFLINE.to_owned();
+        };
+        // The button changes the device's files: its owner's only.
+        if self.device_owner(conn) != Some(chat) {
+            return menu::ANSWER_NOT_YOURS.to_owned();
+        }
+        let Some(bound) = self.conns.get(&conn) else {
+            return status::ANSWER_OFFLINE.to_owned();
+        };
+        let Some(state) = bound.sandbox else {
+            let self_update = bound
+                .client
+                .as_ref()
+                .is_some_and(|client| client.self_update);
+            return if self_update && self.outdated(conn) {
+                menu::ANSWER_SANDBOX_OLD_CLIENT
+            } else {
+                status::ANSWER_OLD_CLIENT
+            }
+            .to_owned();
+        };
+        let host = bound.host.clone();
+        if self.sandbox_asks.values().any(|ask| ask.host == host) {
+            return menu::ANSWER_SANDBOX_BUSY.to_owned();
+        }
+        if state.inherited {
+            return menu::ANSWER_SANDBOX_INHERITED.to_owned();
+        }
+        let now = Instant::now();
+        let on = match action {
+            SlotAction::SandboxOn if state.wanted => return menu::ANSWER_UNCHANGED.to_owned(),
+            SlotAction::SandboxOn => true,
+            SlotAction::SandboxOff if !state.wanted => return menu::ANSWER_UNCHANGED.to_owned(),
+            SlotAction::SandboxOff => {
+                self.sandbox_confirm.insert(slot, now + status::CONFIRM_FOR);
+                return menu::ANSWER_SANDBOX_CONFIRM.to_owned();
+            }
+            _ => {
+                let armed = self
+                    .sandbox_confirm
+                    .remove(&slot)
+                    .is_some_and(|until| now < until);
+                if !armed || !state.wanted {
+                    return menu::ANSWER_UNCHANGED.to_owned();
+                }
+                false
+            }
+        };
+        let request_id = crate::wire::random_u64();
+        let sent = self.conns.get(&conn).is_some_and(|bound| {
+            bound
+                .to_agent
+                .try_send(HubMsg::SandboxSet { request_id, on })
+                .is_ok()
+        });
+        if !sent {
+            return status::ANSWER_OFFLINE.to_owned();
+        }
+        self.sandbox_asks.insert(
+            request_id,
+            SandboxAsk {
+                slot,
+                session,
+                conn,
+                host,
+                chat,
+                on,
+                menu: menu_at,
+                until: now + SANDBOX_WAIT,
+            },
+        );
+        self.sandbox_notes
+            .insert(slot, (menu::NOTE_SWITCHING.to_owned(), now));
+        info!(
+            ordinal = self.ordinal(slot),
+            on, "sandbox switch asked from the menu"
+        );
+        if on {
+            menu::ANSWER_SANDBOX_CHECKING
+        } else {
+            menu::ANSWER_SANDBOX_OFF
+        }
+        .to_owned()
+    }
+
+    /// An agent's `sandbox_answer` (TASK-090). Its state is the agent's
+    /// truth about itself and is always kept. The switch asked from the
+    /// menu takes it also over the agent's next connection (a lost link
+    /// during a long Windows grant): same device, same session.
+    fn on_sandbox_answer(&mut self, conn: u64, session: &str, answer: SandboxAnswer) {
+        let Some(bound) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        if let Some(state) = answer.state {
+            bound.sandbox = Some(state);
+        }
+        let host = bound.host.clone();
+        let ours = self
+            .sandbox_asks
+            .get(&answer.request_id)
+            .is_some_and(|ask| ask.host == host && (ask.conn == conn || ask.session == session));
+        let Some(ask) = ours
+            .then(|| self.sandbox_asks.remove(&answer.request_id))
+            .flatten()
+        else {
+            debug!(conn, "sandbox answer nothing waits for");
+            return;
+        };
+        let note = match answer.outcome {
+            SandboxOutcome::Done
+                if answer
+                    .state
+                    .is_some_and(|state| state.active == state.wanted) =>
+            {
+                None
+            }
+            SandboxOutcome::Done => Some(menu::note_done(ask.on, answer.restart)),
+            SandboxOutcome::Inherited => Some(menu::NOTE_INHERITED.to_owned()),
+            SandboxOutcome::Refused => Some(menu::note_refused(
+                answer.reason.as_deref().unwrap_or_default(),
+            )),
+            SandboxOutcome::Busy => Some(menu::NOTE_BUSY.to_owned()),
+            SandboxOutcome::Failed | SandboxOutcome::Other => Some(menu::NOTE_FAILED.to_owned()),
+        };
+        match note {
+            Some(note) => {
+                self.sandbox_notes.insert(ask.slot, (note, Instant::now()));
+            }
+            None => {
+                self.sandbox_notes.remove(&ask.slot);
+            }
+        }
+        let restarts = answer.outcome == SandboxOutcome::Done
+            || answer.outcome == SandboxOutcome::Inherited && ask.on;
+        if restarts && let Some(folder) = &answer.folder {
+            self.ask_mode_restart(&ask.host, folder);
+        }
+        info!(
+            ordinal = self.ordinal(ask.slot),
+            outcome = ?answer.outcome,
+            "sandbox switch answered"
+        );
+        // One edit of the menu pressed on, when it still shows the sessions.
+        if let Some(message) = ask.menu
+            && self
+                .registry
+                .person(ask.chat)
+                .and_then(|person| person.menu)
+                == Some(message)
+            && let Some(page @ Page::Sessions(_)) = self.menu_pages.get(&ask.chat).copied()
+        {
+            self.edit_menu(ask.chat, message, page);
+        }
+    }
+
+    /// After a switch of `folder` on `host` (TASK-090): every live session of
+    /// that device whose agent can take it gets a quiet `update` with
+    /// `sandbox_folder`. The hub compares no paths: each agent restarts only
+    /// when its folder is inside and its mode differs from its mark
+    /// ([`crate::update::Worker::mode_plan`]). A press of «Обновить» in
+    /// progress is left alone: it restarts for the mode as well.
+    fn ask_mode_restart(&mut self, host: &str, folder: &str) {
+        let now = Instant::now();
+        for index in 0..self.registry.slots.len() {
+            let Some((session, conn)) = self.live_agent(SlotId(index)) else {
+                continue;
+            };
+            let able = self.conns.get(&conn).is_some_and(|bound| {
+                bound.host == host
+                    && bound.sandbox.is_some()
+                    && bound
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client.self_update)
+            });
+            if !able {
+                continue;
+            }
+            match self.updates.get_mut(&session) {
+                None => {
+                    self.updates.insert(
+                        session,
+                        UpdateAsk {
+                            sandbox_folder: Some(folder.to_owned()),
+                            sent: None,
+                            left: None,
+                            rounds: 0,
+                            until: now + UPDATE_WAIT,
+                            told: false,
+                            held: None,
+                            retry_at: None,
+                            agents_told: false,
+                            interrupted: false,
+                        },
+                    );
+                }
+                Some(ask) if ask.quiet_waiting() => ask.sandbox_folder = Some(folder.to_owned()),
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// A quiet restart of `session` went on (TASK-090): the note under its
+    /// row says so, or goes with `None`; only a row its owner pressed has a
+    /// note to change.
+    fn sandbox_progress(&mut self, session: &str, note: Option<&str>) {
+        let Some(slot) = self.current_slot(session) else {
+            return;
+        };
+        if !self.sandbox_notes.contains_key(&slot) {
+            return;
+        }
+        match note {
+            Some(note) => {
+                self.sandbox_notes
+                    .insert(slot, (note.to_owned(), Instant::now()));
+            }
+            None => {
+                self.sandbox_notes.remove(&slot);
+            }
         }
     }
 
@@ -13565,6 +13960,7 @@ impl Slots {
         // Before the send: the person is known from now on, so no second
         // menu goes for their first topic.
         self.registry.person_mut(chat);
+        self.menu_pages.insert(chat, page);
         let content = self.menu_content(chat, page);
         self.hand_off(
             Work::Menu(MenuJob::Show { chat }),
@@ -13762,6 +14158,34 @@ impl Slots {
                     .and_then(|shown| shown.confirm.as_ref())
                     .is_some_and(|(armed, until)| *armed == session && now < *until)
             });
+        // TASK-090: the sandbox button, for the owner of the slot and of the
+        // device of its live agent only.
+        // (`shared` is `Some` exactly in the slot's own private view.)
+        let sandbox = self
+            .live_agent(slot)
+            .filter(|(_, conn)| shared.is_some() && self.device_owner(*conn) == Some(chat))
+            .map(
+                |(_, conn)| match self.conns.get(&conn).and_then(|bound| bound.sandbox) {
+                    None => RowSandbox::OldClient,
+                    Some(state) if state.inherited => RowSandbox::Inherited {
+                        active: state.active,
+                    },
+                    Some(state) if state.active == state.wanted && state.active => RowSandbox::On,
+                    Some(state) if state.active == state.wanted => RowSandbox::Off,
+                    Some(state) => RowSandbox::Pending {
+                        wanted: state.wanted,
+                    },
+                },
+            );
+        let sandbox_confirm = sandbox.is_some()
+            && self
+                .sandbox_confirm
+                .get(&slot)
+                .is_some_and(|until| now < *until);
+        let sandbox_note = sandbox
+            .and_then(|_| self.sandbox_notes.get(&slot))
+            .filter(|(_, since)| now.saturating_duration_since(*since) < SANDBOX_NOTE_FOR)
+            .map(|(note, _)| note.clone());
         menu::SessionRow {
             slot: u32::try_from(slot.0).unwrap_or(u32::MAX),
             title: self.registry.desired_title(slot),
@@ -13772,6 +14196,9 @@ impl Slots {
             mentions,
             pick,
             groups,
+            sandbox,
+            sandbox_confirm,
+            sandbox_note,
         }
     }
 
@@ -13813,10 +14240,14 @@ impl Slots {
             MenuPress::GroupDisplay => (Page::GroupDisplay, String::new()),
             MenuPress::Sound => (Page::Sound, String::new()),
             MenuPress::Zone { fractions } => (Page::Zone { fractions }, String::new()),
-            MenuPress::Slot { action, page, slot } => (
-                Page::Sessions(page as usize),
-                self.press_menu_slot(chat, action, slot, input.display_name.as_deref()),
-            ),
+            MenuPress::Slot { action, page, slot } => {
+                let menu_at = input.message_id.filter(|_| on_menu);
+                let author = input.display_name.as_deref();
+                (
+                    Page::Sessions(page as usize),
+                    self.press_menu_slot(chat, action, slot, author, menu_at),
+                )
+            }
             MenuPress::UpdateAll { page } => (Page::Sessions(page as usize), self.update_all(chat)),
             MenuPress::People => (Page::People, String::new()),
             people_press @ (MenuPress::Remove { .. }
@@ -13867,6 +14298,7 @@ impl Slots {
     /// Menu `message` of `chat` shows `page`; one edit when it shows
     /// something else.
     fn edit_menu(&mut self, chat: PrivateChat, message: i64, page: Page) {
+        self.menu_pages.insert(chat, page);
         let content = self.menu_content(chat, page);
         if self.menus.get(&chat) == Some(&content) {
             return;
@@ -13894,6 +14326,7 @@ impl Slots {
         action: SlotAction,
         slot: u32,
         author: Option<&str>,
+        menu_at: Option<i64>,
     ) -> String {
         let slot = SlotId(slot as usize);
         let private = Chat::Private(chat);
@@ -13935,6 +14368,9 @@ impl Slots {
             }
             SlotAction::Mentions => self.set_every_message(slot, private, false).to_owned(),
             SlotAction::EveryMessage => self.set_every_message(slot, private, true).to_owned(),
+            SlotAction::SandboxOn | SlotAction::SandboxOff | SlotAction::SandboxOffConfirm => {
+                self.press_sandbox(chat, slot, action, menu_at)
+            }
             SlotAction::Groups => self
                 .press_share_of(slot, private, Press::Groups, author)
                 .to_owned(),
@@ -14447,6 +14883,26 @@ impl Slots {
         let now = Instant::now();
         self.key_asks.retain(|_, ask| ask.until > now);
         self.command_asks.retain(|_, ask| ask.until > now);
+        // TASK-090: a switch no answer came for says so under its row.
+        let late: Vec<u64> = self
+            .sandbox_asks
+            .iter()
+            .filter(|(_, ask)| ask.until <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            if let Some(ask) = self.sandbox_asks.remove(&id) {
+                info!(
+                    ordinal = self.ordinal(ask.slot),
+                    "sandbox switch not answered"
+                );
+                self.sandbox_notes
+                    .insert(ask.slot, (menu::NOTE_NO_ANSWER.to_owned(), now));
+            }
+        }
+        self.sandbox_notes
+            .retain(|_, (_, since)| now.saturating_duration_since(*since) < SANDBOX_NOTE_FOR);
+        self.sandbox_confirm.retain(|_, until| now < *until);
         let late: Vec<u64> = self
             .reads
             .iter()
@@ -16116,6 +16572,7 @@ mod tests {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -18207,6 +18664,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -18264,6 +18722,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -19088,6 +19547,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -19187,6 +19647,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -20250,6 +20711,7 @@ again"
             private_place: false,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         }
     }
 
@@ -22346,6 +22808,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             };
             self.agents
                 .send(AgentEvent::Registered {
@@ -22744,6 +23207,7 @@ again"
                     private_place: false,
                     enrolled: None,
                     heartbeat: false,
+                    sandbox: None,
                 },
                 to_agent,
             })
@@ -22801,6 +23265,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -22851,6 +23316,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -22913,6 +23379,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -24338,6 +24805,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -24552,6 +25020,7 @@ again"
             private_place: false,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         };
         rig.agents
             .send(AgentEvent::Registered {
@@ -25592,6 +26061,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -25719,6 +26189,7 @@ again"
         let Ok(HubMsg::Update {
             update_id,
             release: None,
+            sandbox_folder: None,
         }) = first.try_recv()
         else {
             panic!("no update after the turn");
@@ -25785,7 +26256,10 @@ again"
         for (outcome, _) in failures {
             assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
             slots.pump();
-            let Ok(HubMsg::Update { update_id, release }) = first.try_recv() else {
+            let Ok(HubMsg::Update {
+                update_id, release, ..
+            }) = first.try_recv()
+            else {
                 panic!("no update");
             };
             assert_eq!(release.as_deref(), Some("v0.1.3"));
@@ -26288,6 +26762,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -26609,6 +27084,7 @@ again"
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -30148,6 +30624,7 @@ again"
                 private_place: true,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -31233,6 +31710,7 @@ again"
                 private_place: true,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         });
@@ -32193,6 +32671,575 @@ again"
                 ..
             })
         ));
+    }
+
+    // ------------------------------------------------------------ TASK-090
+
+    /// Registers agent `conn` of `session` (claude `pid`) on `host`, of the
+    /// hub's build, able to update itself, with sandbox state `sandbox`.
+    fn register_sandboxed(
+        slots: &mut Slots,
+        conn: u64,
+        session: &str,
+        pid: u32,
+        host: &str,
+        sandbox: Option<SandboxState>,
+    ) -> mpsc::Receiver<HubMsg> {
+        let (to_agent, from_hub) = mpsc::channel(64);
+        slots.on_agent(AgentEvent::Registered {
+            conn,
+            register: Register {
+                host: host.into(),
+                client: client(HUB_BUILD, true),
+                console_keys: true,
+                session_reads: false,
+                private_place: true,
+                sandbox,
+                ..reads_register(session, Some(pid))
+            },
+            to_agent,
+        });
+        from_hub
+    }
+
+    fn mode(active: bool, wanted: bool) -> Option<SandboxState> {
+        Some(SandboxState {
+            active,
+            wanted,
+            inherited: false,
+        })
+    }
+
+    /// A session start of `session` on `host`.
+    fn start_on(host: &str, session: &str, pid: u32) -> HookPost {
+        HookPost::new(
+            host.into(),
+            session.into(),
+            CWD.into(),
+            String::new(),
+            HookEvent::SessionStart {
+                source: Some("startup".into()),
+                claude_pid: Some(pid),
+                parent_claude_pid: None,
+            },
+        )
+    }
+
+    /// What `from_hub` holds now.
+    fn drained(from_hub: &mut mpsc::Receiver<HubMsg>) -> Vec<HubMsg> {
+        std::iter::from_fn(|| from_hub.try_recv().ok()).collect()
+    }
+
+    /// The `sandbox_set`s among `msgs`: (request id, on).
+    fn sandbox_sets(msgs: &[HubMsg]) -> Vec<(u64, bool)> {
+        msgs.iter()
+            .filter_map(|msg| match msg {
+                HubMsg::SandboxSet { request_id, on } => Some((*request_id, *on)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `update`s among `msgs`: (update id, release, sandbox folder).
+    fn update_asks(msgs: &[HubMsg]) -> Vec<(u64, Option<String>, Option<String>)> {
+        msgs.iter()
+            .filter_map(|msg| match msg {
+                HubMsg::Update {
+                    update_id,
+                    release,
+                    sandbox_folder,
+                } => Some((*update_id, release.clone(), sandbox_folder.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sandbox_answer(
+        slots: &mut Slots,
+        conn: u64,
+        request_id: u64,
+        outcome: SandboxOutcome,
+        state: Option<SandboxState>,
+    ) {
+        slots.on_agent(AgentEvent::Message {
+            conn,
+            received_at: StdInstant::now(),
+            msg: AgentMsg::SandboxAnswer {
+                request_id,
+                outcome,
+                reason: (outcome == SandboxOutcome::Refused)
+                    .then(|| "не найдена программа bwrap".to_owned()),
+                state,
+                folder: Some("/w/proj".into()),
+                restart: true,
+            },
+        });
+    }
+
+    /// Everything handed out that is not the menu or a callback answer: what
+    /// the topics would show.
+    fn outside_the_menu(handed: &[(Work, Op)]) -> Vec<String> {
+        handed
+            .iter()
+            .filter(|(work, op)| {
+                !matches!(work, Work::Menu(_)) && !matches!(op, Op::AnswerCallback { .. })
+            })
+            .map(|(_, op)| format!("{op:?}"))
+            .collect()
+    }
+
+    fn says_sandbox(texts: &[String]) -> bool {
+        texts.iter().any(|text| {
+            ["сэндбокс", "Сэндбокс", "🔒", "🔓", "sandbox"]
+                .iter()
+                .any(|word| text.contains(word))
+        })
+    }
+
+    /// The menu options of these tests: private chats, the hub's build.
+    fn sandbox_options() -> Options {
+        Options {
+            build: Some(HUB_BUILD.into()),
+            ..menu_options()
+        }
+    }
+
+    /// TASK-090: 🔒 goes to the session's agent at once, one switch per
+    /// device; the answer shows under the row and asks every live session of
+    /// that device that can take it for a quiet restart, which never shows
+    /// in a topic; the restarted session's next agent clears the note.
+    #[tokio::test]
+    async fn the_menu_sandbox_switch_restarts_the_device_sessions_quietly() {
+        let dir = TempDir::new("slots-090-switch");
+        let (mut slots, mut work) = menu_slot(&dir, sandbox_options());
+        let mut seen = Vec::new();
+        let mut a = register_sandboxed(&mut slots, 1, A, 10, "box", mode(false, false));
+        // B on the same device, C on another, D on the same device but old.
+        slots.on_hook(&start(B, 11));
+        slots.on_hook(&start_on("far", C, 12));
+        slots.on_hook(&start(D, 13));
+        for slot in 1..4 {
+            slots.registry.topic_created(
+                SlotId(slot),
+                private_owner(),
+                700 + slot as i64,
+                "t",
+                None,
+            );
+        }
+        let mut b = register_sandboxed(&mut slots, 2, B, 11, "box", mode(false, false));
+        let mut c = register_sandboxed(&mut slots, 3, C, 12, "far", mode(false, false));
+        let mut d = register_sandboxed(&mut slots, 4, D, 13, "box", None);
+        slots.pump();
+        seen.extend(all_work(&mut work));
+        let slot_of = |slots: &Slots, session: &str| slots.current_slot(session).unwrap().0;
+        let press = |slots: &mut Slots, code: &str, session: &str| {
+            let slot = slot_of(slots, session);
+            slots.on_control(menu_press(MENU, &format!("menu:{code}:0:{slot}")));
+            slots.pump();
+        };
+
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        press(&mut slots, "sb", A);
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [None, Some(menu::ANSWER_SANDBOX_CHECKING.to_owned())]
+        );
+        let (text, _) = last_menu_edit(&handed);
+        assert!(text.contains(menu::NOTE_SWITCHING), "{text}");
+        seen.extend(handed);
+        let sets = sandbox_sets(&drained(&mut a));
+        let [(request_id, true)] = sets[..] else {
+            panic!("{sets:?}");
+        };
+        // One switch per device: B waits, C on another device does not; the
+        // old agent of D cannot switch at all.
+        press(&mut slots, "sb", B);
+        press(&mut slots, "sb", D);
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [
+                Some(menu::ANSWER_SANDBOX_BUSY.to_owned()),
+                Some(status::ANSWER_OLD_CLIENT.to_owned())
+            ]
+        );
+        assert!(sandbox_sets(&drained(&mut d)).is_empty());
+        seen.extend(handed);
+        assert!(sandbox_sets(&drained(&mut b)).is_empty());
+        press(&mut slots, "sb", C);
+        let c_sets = sandbox_sets(&drained(&mut c));
+        assert_eq!(c_sets.len(), 1, "another device switches meanwhile");
+        seen.extend(all_work(&mut work));
+
+        // A stale or foreign answer changes nothing.
+        sandbox_answer(
+            &mut slots,
+            1,
+            request_id + 1,
+            SandboxOutcome::Done,
+            mode(false, true),
+        );
+        sandbox_answer(
+            &mut slots,
+            3,
+            request_id,
+            SandboxOutcome::Done,
+            mode(false, false),
+        );
+        slots.pump();
+        assert!(slots.sandbox_asks.contains_key(&request_id));
+        assert!(update_asks(&drained(&mut b)).is_empty());
+
+        sandbox_answer(
+            &mut slots,
+            1,
+            request_id,
+            SandboxOutcome::Done,
+            mode(false, true),
+        );
+        slots.pump();
+        let handed = all_work(&mut work);
+        let (text, keyboard) = last_menu_edit(&handed);
+        assert!(
+            text.contains(
+                "— ждёт сообщения, 🔒 после перезапуска\n   включится после перезапуска сессии"
+            ),
+            "{text}"
+        );
+        assert!(button_texts(&keyboard).contains(&"🔓 1".to_owned()));
+        seen.extend(handed);
+        // The quiet restart: every live session of «box» that can take it.
+        let quiet = Some("/w/proj".to_owned());
+        let a_asks = update_asks(&drained(&mut a));
+        let b_asks = update_asks(&drained(&mut b));
+        assert_eq!(a_asks.len(), 1, "{a_asks:?}");
+        assert_eq!(
+            (a_asks[0].1.clone(), a_asks[0].2.clone()),
+            (None, quiet.clone())
+        );
+        assert_eq!(
+            (b_asks[0].1.clone(), b_asks[0].2.clone()),
+            (None, quiet.clone())
+        );
+        assert!(update_asks(&drained(&mut c)).is_empty(), "another device");
+        assert!(update_asks(&drained(&mut d)).is_empty(), "an old agent");
+
+        // B's mode is as marked; nothing anywhere.
+        answer(&mut slots, 2, b_asks[0].0, UpdateOutcome::UpToDate);
+        // A restarts and is released.
+        answer(&mut slots, 1, a_asks[0].0, UpdateOutcome::Restarting);
+        slots.pump();
+        assert!(drained(&mut a).iter().any(|msg| matches!(
+            msg,
+            HubMsg::Released { update_id, .. } if *update_id == a_asks[0].0
+        )));
+        seen.extend(all_work(&mut work));
+        // Its next agent runs sandboxed: the note goes, the row says so, and
+        // it is asked once more (it answers that it is up to date).
+        let mut next = register_sandboxed(&mut slots, 5, A, 10, "box", mode(true, true));
+        slots.pump();
+        let again = update_asks(&drained(&mut next));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].2, quiet);
+        answer(&mut slots, 5, again[0].0, UpdateOutcome::UpToDate);
+        slots.pump();
+        assert!(!slots.updates.contains_key(A));
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let handed = all_work(&mut work);
+        let (text, keyboard) = last_menu_edit(&handed);
+        assert!(text.contains("— ждёт сообщения, 🔒 сэндбокс"), "{text}");
+        assert!(!text.contains("перезапуск"), "{text}");
+        assert!(button_texts(&keyboard).contains(&"🔓 1".to_owned()));
+        seen.extend(handed);
+
+        // 🔓 asks once more; the second press switches it off.
+        press(&mut slots, "sf", A);
+        let handed = all_work(&mut work);
+        assert_eq!(
+            callback_answers(&handed),
+            [Some(menu::ANSWER_SANDBOX_CONFIRM.to_owned())]
+        );
+        assert!(button_texts(&last_menu_edit(&handed).1).contains(&"🔓 1 точно?".to_owned()));
+        assert!(sandbox_sets(&drained(&mut next)).is_empty());
+        seen.extend(handed);
+        press(&mut slots, "sfc", A);
+        let sets = sandbox_sets(&drained(&mut next));
+        let [(request_id, false)] = sets[..] else {
+            panic!("{sets:?}");
+        };
+        seen.extend(all_work(&mut work));
+        // The answer comes over the agent's next connection.
+        let _later = register_sandboxed(&mut slots, 6, A, 10, "box", mode(true, true));
+        sandbox_answer(
+            &mut slots,
+            6,
+            request_id,
+            SandboxOutcome::Done,
+            mode(true, false),
+        );
+        slots.pump();
+        let handed = all_work(&mut work);
+        let (text, _) = last_menu_edit(&handed);
+        assert!(
+            text.contains(
+                "сэндбокс снимется после перезапуска\n   снимется после перезапуска сессии"
+            ),
+            "{text}"
+        );
+        seen.extend(handed);
+
+        assert!(
+            !says_sandbox(&outside_the_menu(&seen)),
+            "{:#?}",
+            outside_the_menu(&seen)
+        );
+    }
+
+    /// TASK-090: who and what may press 🔒: the slot's owner only, the owner
+    /// of the agent's device only, a live session only, a new agent only;
+    /// a refusal and a missing answer show under the row; a folder above
+    /// has no button.
+    #[tokio::test]
+    async fn the_menu_sandbox_switch_has_its_gates_and_notes() {
+        let dir = TempDir::new("slots-090-gates");
+        let (devices, laptop, mac) = two_devices(&dir);
+        devices.set_owner(&mac, PrivateChat::of_user(8)).unwrap();
+        let options = Options {
+            owners: Some(Owners {
+                first: owner_chat(),
+                devices: Some(devices.clone()),
+                share_new: false,
+            }),
+            ..sandbox_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        let answers =
+            |slots: &mut Slots, work: &mut mpsc::UnboundedReceiver<(Work, Op)>, data: &str| {
+                slots.on_control(menu_press(MENU, data));
+                slots.pump();
+                callback_answers(&all_work(work))
+            };
+        let one = |text: &str| vec![Some(text.to_owned())];
+        // No agent yet.
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sb:0:0"),
+            one(status::ANSWER_OFFLINE)
+        );
+        // Not the private chat of the slot.
+        assert_eq!(
+            slots.press_menu_slot(
+                PrivateChat::of_user(9),
+                SlotAction::SandboxOn,
+                0,
+                None,
+                None
+            ),
+            menu::ANSWER_NOT_YOURS
+        );
+        // The agent's device belongs to someone else.
+        let (to_agent, mut from_hub) = mpsc::channel(16);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 1,
+            register: Register {
+                client: client(HUB_BUILD, true),
+                enrolled: Some(mac),
+                sandbox: mode(false, false),
+                ..reads_register(A, Some(10))
+            },
+            to_agent,
+        });
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sb:0:0"),
+            one(menu::ANSWER_NOT_YOURS)
+        );
+        assert!(sandbox_sets(&drained(&mut from_hub)).is_empty());
+        // An old agent: told to update first, nothing sent.
+        let mut old = register_sandboxed(&mut slots, 2, A, 10, "box", None);
+        slots.conns.get_mut(&2).unwrap().client = client(OLD_BUILD, true);
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sb:0:0"),
+            one(menu::ANSWER_SANDBOX_OLD_CLIENT)
+        );
+        assert!(sandbox_sets(&drained(&mut old)).is_empty());
+        // Its own device (enrolled laptop): goes.
+        let (to_agent, mut agent) = mpsc::channel(16);
+        slots.on_agent(AgentEvent::Registered {
+            conn: 3,
+            register: Register {
+                client: client(HUB_BUILD, true),
+                enrolled: Some(laptop),
+                sandbox: mode(false, false),
+                ..reads_register(A, Some(10))
+            },
+            to_agent,
+        });
+        // 🔓 of a folder that is not marked, a confirmation never asked.
+        for data in ["menu:sf:0:0", "menu:sfc:0:0"] {
+            assert_eq!(
+                answers(&mut slots, &mut work, data),
+                one(menu::ANSWER_UNCHANGED)
+            );
+        }
+        // An «Обновить» press waits while the switch runs.
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sb:0:0"),
+            one(menu::ANSWER_SANDBOX_CHECKING)
+        );
+        let sets = sandbox_sets(&drained(&mut agent));
+        let [(request_id, true)] = sets[..] else {
+            panic!("{sets:?}");
+        };
+        slots.conns.get_mut(&3).unwrap().client = client(OLD_BUILD, true);
+        assert_eq!(slots.press_update(A), status::ANSWER_UPDATING);
+        slots.pump();
+        assert!(update_asks(&drained(&mut agent)).is_empty(), "mid-switch");
+        // Refused: the reason under the row, no quiet restart; the update
+        // press goes now.
+        sandbox_answer(
+            &mut slots,
+            3,
+            request_id,
+            SandboxOutcome::Refused,
+            mode(false, false),
+        );
+        slots.pump();
+        let handed = all_work(&mut work);
+        let (text, _) = last_menu_edit(&handed);
+        assert!(
+            text.contains("\n   не переключено: не найдена программа bwrap"),
+            "{text}"
+        );
+        let asks = update_asks(&drained(&mut agent));
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].2, None, "the press, not a quiet one");
+        answer(&mut slots, 3, asks[0].0, UpdateOutcome::UpToDate);
+        slots.pump();
+        let _ = all_work(&mut work);
+        // An ask that gets no answer says so on the tick.
+        slots.conns.get_mut(&3).unwrap().client = client(HUB_BUILD, true);
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sb:0:0"),
+            one(menu::ANSWER_SANDBOX_CHECKING)
+        );
+        assert_eq!(sandbox_sets(&drained(&mut agent)).len(), 1);
+        for ask in slots.sandbox_asks.values_mut() {
+            ask.until = Instant::now();
+        }
+        slots.on_tick();
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let (text, _) = last_menu_edit(&all_work(&mut work));
+        assert!(text.contains(menu::NOTE_NO_ANSWER), "{text}");
+        // A confirmation that ran out does nothing.
+        slots.conns.get_mut(&3).unwrap().sandbox = mode(true, true);
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sf:0:0"),
+            one(menu::ANSWER_SANDBOX_CONFIRM)
+        );
+        slots.sandbox_confirm.insert(SlotId(0), Instant::now());
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sfc:0:0"),
+            one(menu::ANSWER_UNCHANGED)
+        );
+        assert!(sandbox_sets(&drained(&mut agent)).is_empty());
+        // A mark above: no button, and a press is told why.
+        slots.conns.get_mut(&3).unwrap().sandbox = Some(SandboxState {
+            active: true,
+            wanted: true,
+            inherited: true,
+        });
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let (text, keyboard) = last_menu_edit(&all_work(&mut work));
+        assert!(text.contains("🔒 сэндбокс (задан папкой выше)"), "{text}");
+        assert!(
+            !button_texts(&keyboard)
+                .iter()
+                .any(|label| label.starts_with('🔒') || label.starts_with('🔓'))
+        );
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sf:0:0"),
+            one(menu::ANSWER_SANDBOX_INHERITED)
+        );
+        // A dead session has no button and is offline.
+        slots.on_hook(&end(A, 10));
+        slots.pump();
+        assert_eq!(
+            answers(&mut slots, &mut work, "menu:sb:0:0"),
+            one(status::ANSWER_OFFLINE)
+        );
+    }
+
+    /// TASK-090: a quiet restart waiting for a turn is replaced by an
+    /// «Обновить» press, which downloads; the menu is edited at the answer
+    /// only while it still shows the sessions; a quiet restart that needs
+    /// the user says so under the row, never in the topic.
+    #[tokio::test]
+    async fn a_quiet_restart_gives_way_to_update_and_tells_only_the_row() {
+        let dir = TempDir::new("slots-090-quiet");
+        let options = Options {
+            release: Some("v0.1.3".into()),
+            ..sandbox_options()
+        };
+        let (mut slots, mut work) = menu_slot(&dir, options);
+        let mut a = register_sandboxed(&mut slots, 1, A, 10, "box", mode(false, false));
+        slots.on_control(menu_press(MENU, "menu:sb:0:0"));
+        let sets = sandbox_sets(&drained(&mut a));
+        let [(request_id, true)] = sets[..] else {
+            panic!("{sets:?}");
+        };
+        // The menu moved to another tab: no edit at the answer.
+        slots.on_control(menu_press(MENU, "menu:d"));
+        let _ = all_work(&mut work);
+        // A turn runs: the quiet restart waits.
+        slots.on_hook(&hook(A, HookEvent::UserPromptSubmit { prompt_id: None }));
+        sandbox_answer(
+            &mut slots,
+            1,
+            request_id,
+            SandboxOutcome::Done,
+            mode(false, true),
+        );
+        slots.pump();
+        assert!(
+            menu_edits(&all_work(&mut work)).is_empty(),
+            "not on the sessions tab"
+        );
+        assert!(update_asks(&drained(&mut a)).is_empty(), "a turn runs");
+        assert!(slots.updates[A].sandbox_folder.is_some());
+        // «Обновить» takes its place.
+        slots.conns.get_mut(&1).unwrap().client = client(OLD_BUILD, true);
+        assert_eq!(slots.press_update(A), status::ANSWER_AFTER_TURN);
+        assert!(slots.updates[A].sandbox_folder.is_none());
+        slots.conns.get_mut(&1).unwrap().client = client(HUB_BUILD, true);
+        slots.updates.remove(A);
+        // A quiet one again; it ends with a manual restart: the row says so.
+        slots.ask_mode_restart("box", "/w/proj");
+        slots.on_hook(&hook(
+            A,
+            HookEvent::Stop {
+                prompt_id: None,
+                last_assistant_message: None,
+            },
+        ));
+        slots.pump();
+        let asks = update_asks(&drained(&mut a));
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].1, None, "never a download");
+        let _ = all_work(&mut work);
+        answer(&mut slots, 1, asks[0].0, UpdateOutcome::NeedsManualRestart);
+        slots.pump();
+        let handed = all_work(&mut work);
+        assert!(!says_sandbox(&outside_the_menu(&handed)));
+        assert!(
+            !outside_the_menu(&handed)
+                .iter()
+                .any(|op| op.contains(status::MANUAL_RESTART_NOTICE)),
+            "{handed:#?}"
+        );
+        slots.on_control(menu_press(MENU, "menu:s:0"));
+        let (text, _) = last_menu_edit(&all_work(&mut work));
+        assert!(text.contains(menu::NOTE_MANUAL), "{text}");
     }
 
     /// TASK-073: 👥 and 🙈 in the menu share and unshare like the button of
@@ -34941,11 +35988,11 @@ again"
         slots.pump();
         let _ = all_work(&mut work);
         assert_eq!(
-            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None),
+            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None, None),
             menu::ANSWER_SAVED
         );
         assert_eq!(
-            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None),
+            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None, None),
             menu::ANSWER_UNCHANGED
         );
         assert_eq!(
@@ -34977,7 +36024,7 @@ again"
         );
         assert_eq!(got20.inbounds[0].1["mention"], "true");
         assert_eq!(
-            slots.press_menu_slot(owner_chat(), SlotAction::Mentions, 0, None),
+            slots.press_menu_slot(owner_chat(), SlotAction::Mentions, 0, None, None),
             menu::ANSWER_SAVED
         );
         assert_eq!(
@@ -34991,7 +36038,7 @@ again"
         // A person whose slot it is not changes nothing.
         let stranger = PrivateChat::of_user(99);
         assert_eq!(
-            slots.press_menu_slot(stranger, SlotAction::EveryMessage, 0, None),
+            slots.press_menu_slot(stranger, SlotAction::EveryMessage, 0, None, None),
             menu::ANSWER_NOT_YOURS
         );
     }
@@ -35202,7 +36249,7 @@ again"
         let dir = TempDir::new("slots-mention-forwards-every");
         let (mut slots, _work, mut agent) = mention_gather_slot(&dir);
         assert_eq!(
-            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None),
+            slots.press_menu_slot(owner_chat(), SlotAction::EveryMessage, 0, None, None),
             menu::ANSWER_SAVED
         );
         slots.on_control(group_from(10, "@cctg_bot глянь", 7, "Иван", false));
