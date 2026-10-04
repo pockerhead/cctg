@@ -81,6 +81,56 @@ pub fn updates_asked(n: usize) -> String {
     format!("Обновление запрошено: сессий {n}")
 }
 
+// The sandbox switch of a session row (TASK-090): answers to the press and
+// the note under the row. None names a path.
+pub const ANSWER_SANDBOX_CHECKING: &str = "Проверяю устройство…";
+pub const ANSWER_SANDBOX_OFF: &str = "Выключаю…";
+pub const ANSWER_SANDBOX_CONFIRM: &str = "Нажмите ещё раз, чтобы выключить сэндбокс папки";
+pub const ANSWER_SANDBOX_OLD_CLIENT: &str =
+    "Клиент этой сессии устарел: сначала «⬆️ Обновить все клиенты»";
+pub const ANSWER_SANDBOX_BUSY: &str = "Устройство уже переключает папку, подождите";
+pub const ANSWER_SANDBOX_INHERITED: &str =
+    "Сэндбокс задаёт папка выше: снять можно только на устройстве (cctg sandbox off в той папке)";
+pub const NOTE_SWITCHING: &str = "⏳ переключаю…";
+pub const NOTE_INHERITED: &str = ANSWER_SANDBOX_INHERITED;
+pub const NOTE_BUSY: &str = "устройство было занято, нажмите ещё раз";
+pub const NOTE_FAILED: &str = "не получилось переключить";
+pub const NOTE_WAITS_TURN: &str = "перезапуск после конца хода";
+pub const NOTE_WAITS_AGENTS: &str = "перезапуск ждёт фоновых агентов";
+pub const NOTE_MANUAL: &str = "перезапустите сессию сами через claude-cctg";
+pub const NOTE_DRAFT: &str =
+    "в поле ввода терминала есть текст: перезапуск не начат, перезапустите сессию сами";
+pub const NOTE_RESTART_FAILED: &str =
+    "перезапуск не удался: перезапустите сессию сами через claude-cctg";
+pub const NOTE_NO_ANSWER: &str =
+    "устройство не ответило; ↻ покажет состояние после переподключения агента";
+/// A note under a session row, at most (UTF-16 units).
+const NOTE_LIMIT: usize = 200;
+
+/// The note after a switch to `on` that the session takes on a restart:
+/// `restart` when cctg restarts it itself.
+pub fn note_done(on: bool, restart: bool) -> String {
+    let when = if on {
+        "включится после перезапуска сессии"
+    } else {
+        "снимется после перезапуска сессии"
+    };
+    if restart {
+        when.to_owned()
+    } else {
+        format!("{when}; перезапустите сессию сами через claude-cctg")
+    }
+}
+
+/// The note of a switch the device refused, with its reason.
+pub fn note_refused(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    cut(&format!("не переключено: {reason}"), NOTE_LIMIT)
+}
+
 /// One person's menu and settings, by their private chat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Person {
@@ -475,10 +525,16 @@ pub enum SlotAction {
     EveryMessage,
     /// 👥 n…: the group picker in the slot's topic (TASK-069).
     Groups,
+    /// 🔒: mark the session folder for the sandbox on its device (TASK-090).
+    SandboxOn,
+    /// 🔓: unmark it; asks once more.
+    SandboxOff,
+    /// «точно?» of 🔓.
+    SandboxOffConfirm,
 }
 
 impl SlotAction {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 12] = [
         Self::Open,
         Self::Share,
         Self::Unshare,
@@ -488,6 +544,9 @@ impl SlotAction {
         Self::Mentions,
         Self::EveryMessage,
         Self::Groups,
+        Self::SandboxOn,
+        Self::SandboxOff,
+        Self::SandboxOffConfirm,
     ];
 
     fn code(self) -> &'static str {
@@ -501,6 +560,9 @@ impl SlotAction {
             Self::Mentions => "mn",
             Self::EveryMessage => "ma",
             Self::Groups => "gp",
+            Self::SandboxOn => "sb",
+            Self::SandboxOff => "sf",
+            Self::SandboxOffConfirm => "sfc",
         }
     }
 }
@@ -893,6 +955,30 @@ pub struct SessionRow {
     pub pick: bool,
     /// The titles of the groups it shows in (TASK-069), when `pick`.
     pub groups: Vec<String>,
+    /// The sandbox of the session folder (TASK-090); `None`: no button
+    /// (not the owner of the slot and its device, or no live agent).
+    pub sandbox: Option<RowSandbox>,
+    /// 🔓 asks for its second press.
+    pub sandbox_confirm: bool,
+    /// What the last switch led to, a line under the row.
+    pub sandbox_note: Option<String>,
+}
+
+/// The sandbox button of a session row (TASK-090).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSandbox {
+    /// The agent predates TASK-090: the button answers that it is old.
+    OldClient,
+    Off,
+    On,
+    /// The mark and the running mode differ: restart pending.
+    Pending {
+        wanted: bool,
+    },
+    /// A folder above sets it; no button.
+    Inherited {
+        active: bool,
+    },
 }
 
 /// Group titles a session row names at most (TASK-069).
@@ -1197,10 +1283,23 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
             (Some(true), None) => groups_text(row),
             _ => String::new(),
         };
+        let sandbox = match row.sandbox {
+            Some(RowSandbox::On) => ", 🔒 сэндбокс",
+            Some(RowSandbox::Pending { wanted: true }) => ", 🔒 после перезапуска",
+            Some(RowSandbox::Pending { wanted: false }) => ", сэндбокс снимется после перезапуска",
+            Some(RowSandbox::Inherited { active: true }) => ", 🔒 сэндбокс (задан папкой выше)",
+            Some(RowSandbox::Inherited { active: false }) => {
+                ", 🔒 после перезапуска (задан папкой выше)"
+            }
+            Some(RowSandbox::Off | RowSandbox::OldClient) | None => "",
+        };
         text.push_str(&format!(
-            "\n{n}. {icon} {} — {state}{group}",
+            "\n{n}. {icon} {} — {state}{group}{sandbox}",
             cut(&row.title, TITLE_LIMIT)
         ));
+        if let Some(note) = &row.sandbox_note {
+            text.push_str(&format!("\n   {}", cut(note, NOTE_LIMIT)));
+        }
         let press = |action| MenuPress::Slot {
             action,
             page,
@@ -1233,6 +1332,21 @@ fn render_sessions(sessions: Option<&SessionsView>, rows: &mut Vec<Vec<Value>>) 
                 press(SlotAction::StopConfirm),
             )),
             None => {}
+        }
+        match row.sandbox {
+            Some(
+                RowSandbox::Off | RowSandbox::OldClient | RowSandbox::Pending { wanted: false },
+            ) => buttons.push(button(format!("🔒 {n}"), press(SlotAction::SandboxOn))),
+            Some(RowSandbox::On | RowSandbox::Pending { wanted: true }) if row.sandbox_confirm => {
+                buttons.push(button(
+                    format!("🔓 {n} точно?"),
+                    press(SlotAction::SandboxOffConfirm),
+                ));
+            }
+            Some(RowSandbox::On | RowSandbox::Pending { wanted: true }) => {
+                buttons.push(button(format!("🔓 {n}"), press(SlotAction::SandboxOff)));
+            }
+            Some(RowSandbox::Inherited { .. }) | None => {}
         }
         rows.push(buttons);
     }
@@ -1655,6 +1769,9 @@ mod tests {
                 .map(|_| slot.is_multiple_of(2)),
             pick: false,
             groups: Vec::new(),
+            sandbox: None,
+            sandbox_confirm: false,
+            sandbox_note: None,
         }
     }
 
@@ -2099,12 +2216,174 @@ mod tests {
         }
     }
 
+    /// TASK-090: each sandbox state of a row has its words and its button;
+    /// a folder above gives none, a row without a state neither.
+    #[test]
+    fn a_session_row_shows_and_switches_its_sandbox() {
+        let with = |slot: u32, sandbox: Option<RowSandbox>| SessionRow {
+            sandbox,
+            ..row(slot, None, false, None)
+        };
+        let view = SessionsView {
+            rows: vec![
+                with(1, Some(RowSandbox::Off)),
+                with(2, Some(RowSandbox::On)),
+                with(3, Some(RowSandbox::Pending { wanted: true })),
+                with(4, Some(RowSandbox::Pending { wanted: false })),
+                with(5, Some(RowSandbox::Inherited { active: true })),
+                with(6, Some(RowSandbox::Inherited { active: false })),
+            ],
+            page: 0,
+            pages: 2,
+            outdated: 0,
+        };
+        let (text, keyboard) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            Some(&view),
+            None,
+            None,
+            0,
+        );
+        for line in [
+            "\n1. ⚡ [box] project · 1 — работает\n",
+            "\n2. ⚡ [box] project · 2 — работает, 🔒 сэндбокс\n",
+            "\n3. ⚡ [box] project · 3 — работает, 🔒 после перезапуска\n",
+            "\n4. ⚡ [box] project · 4 — работает, сэндбокс снимется после перезапуска\n",
+            "\n5. ⚡ [box] project · 5 — работает, 🔒 сэндбокс (задан папкой выше)\n",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert!(
+            text.ends_with(
+                "\n6. ⚡ [box] project · 6 — работает, 🔒 после перезапуска (задан папкой выше)"
+            ),
+            "{text}"
+        );
+        let names = labels(&keyboard);
+        let presses = datas(&keyboard);
+        let at = |label: &str| {
+            names
+                .iter()
+                .position(|l| l == label)
+                .unwrap_or_else(|| panic!("{label}: {names:?}"))
+        };
+        assert_eq!(presses[at("🔒 1")], "menu:sb:0:1");
+        assert_eq!(presses[at("🔓 2")], "menu:sf:0:2");
+        assert_eq!(presses[at("🔓 3")], "menu:sf:0:3");
+        assert_eq!(presses[at("🔒 4")], "menu:sb:0:4");
+        for absent in ["🔒 5", "🔓 5", "🔒 6", "🔓 6"] {
+            assert!(!names.contains(&absent.to_owned()), "{absent}");
+        }
+        // An old client still gets 🔒 (its press says it is old); a row
+        // without a state has no button and no words.
+        let view = SessionsView {
+            rows: vec![
+                with(1, Some(RowSandbox::OldClient)),
+                with(2, None),
+                SessionRow {
+                    sandbox_confirm: true,
+                    sandbox_note: Some("не переключено: причина".into()),
+                    ..with(3, Some(RowSandbox::On))
+                },
+            ],
+            page: 0,
+            pages: 1,
+            outdated: 0,
+        };
+        let (text, keyboard) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            Some(&view),
+            None,
+            None,
+            0,
+        );
+        let names = labels(&keyboard);
+        assert!(names.contains(&"🔒 1".to_owned()), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|l| l.ends_with(" 2") && (l.starts_with('🔒') || l.starts_with('🔓'))),
+            "{names:?}"
+        );
+        assert!(names.contains(&"🔓 3 точно?".to_owned()), "{names:?}");
+        assert_eq!(
+            datas(&keyboard)[names.iter().position(|l| l == "🔓 3 точно?").unwrap()],
+            "menu:sfc:0:3"
+        );
+        assert!(
+            text.ends_with("работает, 🔒 сэндбокс\n   не переключено: причина"),
+            "{text}"
+        );
+        assert!(!text.contains("project · 1 — работает,"), "{text}");
+    }
+
+    /// TASK-090: the notes of a switch: what the restart does, the reason of
+    /// a refusal on one line and cut, and a full page within Telegram's limit.
+    #[test]
+    fn sandbox_notes_are_one_short_line_and_a_page_fits() {
+        assert_eq!(note_done(true, true), "включится после перезапуска сессии");
+        assert_eq!(
+            note_done(false, false),
+            "снимется после перезапуска сессии; перезапустите сессию сами через claude-cctg"
+        );
+        assert_eq!(
+            note_refused("не найдена\nпрограмма bwrap"),
+            "не переключено: не найдена программа bwrap"
+        );
+        // More marked folders than Windows slots: the whole reason, one line.
+        let slots = crate::sandbox::preflight::Refusal::NoFreeSlot(8).to_string();
+        let note = note_refused(&slots);
+        assert_eq!(note, format!("не переключено: {slots}"), "not cut");
+        assert!(!note.contains('\n') && note.contains("cctg sandbox-install --slots"));
+        let long = note_refused(&"я".repeat(500));
+        assert!(transcript::telegram_len(&long) <= NOTE_LIMIT, "{long}");
+        let rows = (0..PAGE_SIZE as u32)
+            .map(|slot| SessionRow {
+                title: "т".repeat(500),
+                sandbox: Some(RowSandbox::Inherited { active: false }),
+                sandbox_note: Some("з".repeat(500)),
+                ..row(slot, Some(true), true, Some(true))
+            })
+            .collect();
+        let view = SessionsView {
+            rows,
+            page: 0,
+            pages: 1,
+            outdated: 9,
+        };
+        let (text, _) = render(
+            &Page::Sessions(0),
+            &Settings::default(),
+            Some(&view),
+            None,
+            None,
+            0,
+        );
+        assert!(transcript::telegram_len(&text) <= transcript::TELEGRAM_TEXT_LIMIT);
+        assert!(
+            text.ends_with(&cut(&"з".repeat(500), NOTE_LIMIT)),
+            "cut, not lost"
+        );
+    }
+
     #[test]
     fn every_press_round_trips_and_fits_64_bytes() {
         let rows = vec![
-            row(u32::MAX, Some(false), false, Some(false)),
-            row(1, Some(true), false, Some(true)),
-            row(2, Some(true), true, None),
+            SessionRow {
+                sandbox: Some(RowSandbox::On),
+                sandbox_confirm: true,
+                ..row(u32::MAX, Some(false), false, Some(false))
+            },
+            SessionRow {
+                sandbox: Some(RowSandbox::Off),
+                ..row(1, Some(true), false, Some(true))
+            },
+            SessionRow {
+                sandbox: Some(RowSandbox::On),
+                ..row(2, Some(true), true, None)
+            },
             row(3, None, false, None),
             row(u32::MAX - 1, Some(true), true, Some(true)),
             row(0, Some(false), false, Some(false)),

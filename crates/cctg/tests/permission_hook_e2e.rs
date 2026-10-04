@@ -242,6 +242,7 @@ async fn hub(test: &str) -> Hub {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })

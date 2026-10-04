@@ -403,6 +403,17 @@ pub enum Refusal {
     BaseSettings,
     /// A file of the sandbox could not be written or read; which one.
     Io(&'static str),
+    /// The marks file cannot be read, is damaged or cannot be written
+    /// (TASK-090, the menu switch).
+    MarksFile,
+    /// Windows: commands of the sandbox created protected names in the
+    /// folder (`.git`, `.claude`, `.vscode`, `.idea`, shell configs...), this
+    /// many; turning it off is left to the terminal, which lists them
+    /// (TASK-090).
+    SandboxWroteProtected(usize),
+    /// Windows: the folder's permissions for the sandbox account could not
+    /// be set; what failed, as a verb phrase (TASK-090).
+    Permissions(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,6 +504,17 @@ impl fmt::Display for Refusal {
             }
             Self::BaseSettings => f.write_str("~/.cctg/claude/settings.json повреждён"),
             Self::Io(what) => write!(f, "не удалось записать {what}"),
+            Self::MarksFile => f.write_str(
+                "файл меток сэндбокса на устройстве не читается, повреждён или не \
+                 записывается: cctg doctor",
+            ),
+            Self::SandboxWroteProtected(n) => write!(
+                f,
+                "команды из сэндбокса создали служебные файлы или папки (.git, .claude, \
+                 .vscode, .idea и подобные: {n}); снимите сэндбокс в терминале: \
+                 cctg sandbox off в этой папке покажет их"
+            ),
+            Self::Permissions(what) => write!(f, "не удалось {what}; нажмите ещё раз"),
         }
     }
 }

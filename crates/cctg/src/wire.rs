@@ -200,6 +200,42 @@ pub struct Register {
     /// the device).
     #[serde(skip)]
     pub enrolled: Option<String>,
+    /// The agent's sandbox state at registration (TASK-090). Present: the
+    /// agent answers `sandbox_set` and takes `update.sandbox_folder`.
+    /// Agents built before leave it out; the hub then never sends them either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxState>,
+}
+
+/// Sandbox mode of an agent's session folder (TASK-090).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxState {
+    /// claude runs with a sandbox profile (env `CCTG_SANDBOX`).
+    pub active: bool,
+    /// A mark covers the session folder (a damaged marks file: true).
+    pub wanted: bool,
+    /// The covering mark is a folder above, not the folder itself.
+    #[serde(default)]
+    pub inherited: bool,
+}
+
+/// What became of a `sandbox_set` (TASK-090).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxOutcome {
+    /// The folder's mark is now as asked (also when it already was).
+    Done,
+    /// A mark of a folder above covers it; the folder has none of its own.
+    Inherited,
+    /// The device or the folder does not allow it.
+    Refused,
+    /// Another switch or the agent's leave is running.
+    Busy,
+    /// Anything else.
+    Failed,
+    /// An outcome of a newer agent.
+    #[serde(other)]
+    Other,
 }
 
 /// The agent's build and update abilities.
@@ -331,6 +367,25 @@ pub enum AgentMsg {
         five_hour: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seven_day: Option<u32>,
+    },
+    /// The answer to one `sandbox_set` (TASK-090).
+    SandboxAnswer {
+        request_id: u64,
+        outcome: SandboxOutcome,
+        /// `Refused`: the device's reason (`preflight::Refusal` text, names
+        /// no path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// The agent's state after the switch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<SandboxState>,
+        /// The switched folder as the device spells it (`Worker.folder`), for
+        /// `update.sandbox_folder`. Never logged, never sent to Telegram.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        /// cctg can restart this session itself (`cctg run`, a shim).
+        #[serde(default)]
+        restart: bool,
     },
 }
 
@@ -640,6 +695,7 @@ impl Kinds for AgentMsg {
         "session_answer",
         "ping",
         "status_line",
+        "sandbox_answer",
     ];
 }
 
@@ -735,6 +791,13 @@ pub enum HubMsg {
         update_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         release: Option<String>,
+        /// TASK-090: a restart for the sandbox mode only. The agent restarts
+        /// claude when its session folder is inside this folder and its mode
+        /// differs from the folder's mark; otherwise it answers `up_to_date`.
+        /// Never a download, never a reload. Sent only to agents with
+        /// `Register.sandbox`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox_folder: Option<String>,
     },
     /// The answer to a leaving `update_answer`, queued behind every message
     /// handed to the agent before it: after it nothing more comes.
@@ -791,6 +854,13 @@ pub enum HubMsg {
     Bound {
         session_id: String,
     },
+    /// Sent only to an agent whose `Register.sandbox` is present: mark
+    /// (`on`) or unmark its session folder for the sandbox (TASK-090);
+    /// answered by one `sandbox_answer` with the same `request_id`.
+    SandboxSet {
+        request_id: u64,
+        on: bool,
+    },
 }
 
 impl Kinds for HubMsg {
@@ -810,6 +880,7 @@ impl Kinds for HubMsg {
         "session_read",
         "ping",
         "bound",
+        "sandbox_set",
     ];
 }
 
@@ -1419,6 +1490,7 @@ mod tests {
                 private_place: false,
                 enrolled: None,
                 heartbeat: true,
+                sandbox: None,
             }),
             AgentMsg::Reply {
                 text: "multi\nline \u{2014} text".into(),
@@ -1562,6 +1634,26 @@ mod tests {
                 five_hour: None,
                 seven_day: Some(92),
             },
+            AgentMsg::SandboxAnswer {
+                request_id: 11,
+                outcome: SandboxOutcome::Done,
+                reason: None,
+                state: Some(SandboxState {
+                    active: false,
+                    wanted: true,
+                    inherited: false,
+                }),
+                folder: Some("/w/proj".into()),
+                restart: true,
+            },
+            AgentMsg::SandboxAnswer {
+                request_id: 12,
+                outcome: SandboxOutcome::Refused,
+                reason: Some("не найдена программа bwrap".into()),
+                state: None,
+                folder: None,
+                restart: false,
+            },
         ]
     }
 
@@ -1580,6 +1672,14 @@ mod tests {
             HubMsg::Ping,
             HubMsg::Bound {
                 session_id: "s".into(),
+            },
+            HubMsg::SandboxSet {
+                request_id: 13,
+                on: true,
+            },
+            HubMsg::SandboxSet {
+                request_id: u64::MAX,
+                on: false,
             },
             HubMsg::Rejected {
                 reason: Rejection::Auth,
@@ -1620,10 +1720,17 @@ mod tests {
             HubMsg::Update {
                 update_id: 9,
                 release: None,
+                sandbox_folder: None,
             },
             HubMsg::Update {
                 update_id: 10,
                 release: Some("v0.1.3".into()),
+                sandbox_folder: None,
+            },
+            HubMsg::Update {
+                update_id: 14,
+                release: None,
+                sandbox_folder: Some("C:\\work\\app".into()),
             },
             HubMsg::Released {
                 update_id: 9,
@@ -1838,6 +1945,7 @@ mod tests {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             }))
         );
     }
@@ -2109,6 +2217,7 @@ mod tests {
                 build: "ab".repeat(32),
                 self_update: true,
             }),
+            sandbox: None,
         };
         let line = encode(&AgentMsg::Register(register.clone()));
         assert_eq!(decode::<AgentMsg>(&line), Ok(AgentMsg::Register(register)));
@@ -2136,7 +2245,8 @@ mod tests {
         assert_eq!(
             encode(&HubMsg::Update {
                 update_id: 4,
-                release: None
+                release: None,
+                sandbox_folder: None,
             }),
             b"{\"v\":1,\"type\":\"update\",\"update_id\":4}\n"
         );
@@ -2145,7 +2255,8 @@ mod tests {
             decode::<HubMsg>(tagged),
             Ok(HubMsg::Update {
                 update_id: 5,
-                release: Some("v0.1.3".into())
+                release: Some("v0.1.3".into()),
+                sandbox_folder: None,
             })
         );
         for (name, outcome) in [
@@ -2179,6 +2290,74 @@ mod tests {
         old.as_object_mut().unwrap().remove("client_version");
         let old = decode_hook(&serde_json::to_vec(&old).unwrap()).unwrap();
         assert_eq!(old.client_version, None);
+    }
+
+    /// TASK-090: the sandbox switch is additive. An agent before it sends no
+    /// `sandbox`, a hub before it sends no `sandbox_folder`, and an outcome
+    /// a newer agent invents is read as `other`.
+    #[test]
+    fn the_sandbox_switch_stays_compatible_with_version_one_peers() {
+        let legacy = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w"}"#;
+        let Ok(AgentMsg::Register(bare)) = decode::<AgentMsg>(legacy) else {
+            panic!("legacy register");
+        };
+        assert_eq!(bare.sandbox, None);
+        assert!(
+            !String::from_utf8_lossy(&encode(&AgentMsg::Register(bare.clone())))
+                .contains("sandbox")
+        );
+        let state = SandboxState {
+            active: true,
+            wanted: false,
+            inherited: true,
+        };
+        let with = Register {
+            sandbox: Some(state),
+            ..bare
+        };
+        let line = encode(&AgentMsg::Register(with.clone()));
+        assert_eq!(decode::<AgentMsg>(&line), Ok(AgentMsg::Register(with)));
+        // `inherited` may be left out.
+        let short = br#"{"v":1,"type":"register","session_id":"s","host":"h","cwd":"/w","sandbox":{"active":false,"wanted":true}}"#;
+        let Ok(AgentMsg::Register(short)) = decode::<AgentMsg>(short) else {
+            panic!("short register");
+        };
+        assert_eq!(
+            short.sandbox,
+            Some(SandboxState {
+                active: false,
+                wanted: true,
+                inherited: false
+            })
+        );
+        assert_eq!(
+            decode::<HubMsg>(br#"{"v":1,"type":"update","update_id":4}"#),
+            Ok(HubMsg::Update {
+                update_id: 4,
+                release: None,
+                sandbox_folder: None,
+            })
+        );
+        let newer = br#"{"v":1,"type":"sandbox_answer","request_id":3,"outcome":"something_new"}"#;
+        assert_eq!(
+            decode::<AgentMsg>(newer),
+            Ok(AgentMsg::SandboxAnswer {
+                request_id: 3,
+                outcome: SandboxOutcome::Other,
+                reason: None,
+                state: None,
+                folder: None,
+                restart: false,
+            })
+        );
+        let set = encode(&HubMsg::SandboxSet {
+            request_id: 5,
+            on: true,
+        });
+        assert_eq!(
+            set,
+            b"{\"v\":1,\"type\":\"sandbox_set\",\"request_id\":5,\"on\":true}\n"
+        );
     }
 
     #[test]

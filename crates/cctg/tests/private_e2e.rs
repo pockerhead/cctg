@@ -906,6 +906,7 @@ impl Agent {
             private_place,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
         let mut agent = Self {

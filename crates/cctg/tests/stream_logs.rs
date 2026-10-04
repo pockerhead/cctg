@@ -171,6 +171,7 @@ async fn a_missing_transcript_is_warned_once_and_the_stream_goes_on() {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })

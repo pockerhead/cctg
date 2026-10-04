@@ -13,7 +13,9 @@
 //! write-denied; a hard-linked body is write-denied; a bare-repo `HEAD` left in
 //! the root is cleaned up; a junction inside the folder to the outside is not
 //! followed by the token; a TLS network call works (no restricting SIDs); and
-//! after `sandbox off` the folder no longer starts a sandboxed command. Then it
+//! after `sandbox off` the folder no longer starts a sandboxed command; the
+//! switch of the bot menu (TASK-090) marks a folder, keeps the mark while the
+//! slot account created a protected name there, and unmarks it after. Then it
 //! uninstalls and checks the accounts, the group and the mark are gone.
 //!
 //! Every check is recorded and the test fails ONCE at the end with the full
@@ -25,6 +27,9 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use cctg::sandbox::preflight::{self, Probe, RealProbe};
+use cctg::sandbox::switch::{self, Switched};
 
 mod common;
 
@@ -404,6 +409,143 @@ fn scenario(home: &Path, tools: &Path, bash: &Path, claude: &Path, checks: &mut 
         "an unmarked folder is refused by the broker (125)",
         format!("exit {code}"),
     );
+
+    menu_switch(home, bash, claude, checks);
+}
+
+/// The device as the menu switch's agent sees it (TASK-090): the fake home
+/// and the claude stand-in, nothing of the environment the tests run in.
+struct HomeProbe {
+    home: PathBuf,
+    claude: PathBuf,
+}
+
+impl Probe for HomeProbe {
+    fn os(&self) -> preflight::Os {
+        RealProbe.os()
+    }
+    fn var(&self, name: &str) -> Option<String> {
+        match name {
+            "USERPROFILE" | "HOME" => Some(self.home.to_string_lossy().into_owned()),
+            "CCTG_CLAUDE" => Some(self.claude.to_string_lossy().into_owned()),
+            _ if name.starts_with("CCTG_") || name.starts_with("CLAUDE") => None,
+            _ => RealProbe.var(name),
+        }
+    }
+    fn which(&self, program: &str) -> Option<PathBuf> {
+        RealProbe.which(program)
+    }
+    fn run(
+        &self,
+        program: &str,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Option<preflight::Ran> {
+        RealProbe.run(program, args, timeout)
+    }
+    fn read(&self, path: &Path) -> std::io::Result<String> {
+        RealProbe.read(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        RealProbe.exists(path)
+    }
+    fn canonical(&self, path: &Path) -> Option<PathBuf> {
+        RealProbe.canonical(path)
+    }
+    fn claude_temp(&self) -> Option<(String, Vec<String>)> {
+        RealProbe.claude_temp()
+    }
+    fn sandbox_install(&self) -> Option<preflight::Installed> {
+        RealProbe.sandbox_install()
+    }
+    fn shared_ancestor(&self, folder: &Path, home: &Path) -> Option<PathBuf> {
+        RealProbe.shared_ancestor(folder, home)
+    }
+    fn git_bash(&self) -> Option<PathBuf> {
+        RealProbe.git_bash()
+    }
+}
+
+/// (8) TASK-090: the agent's switch from the menu marks a folder like
+/// `cctg sandbox on` (an active slot, the broker runs there), refuses to
+/// unmark it while a protected name the slot account created is there (the
+/// mark stays), and unmarks it once that is gone (the slot retired).
+fn menu_switch(home: &Path, bash: &Path, claude: &Path, checks: &mut Checks) {
+    let c = home.join("dev").join("C");
+    std::fs::create_dir_all(&c).unwrap();
+    let c = cctg::sandbox::paths::canonical(&c).unwrap_or(c);
+    let probe = HomeProbe {
+        home: home.to_owned(),
+        claude: claude.to_owned(),
+    };
+    let file = home.join(".cctg").join("sandbox").join("folders.json");
+    let exe = Path::new(env!("CARGO_BIN_EXE_cctg"));
+    let status = || {
+        let folder = c.to_string_lossy();
+        cctg(home, claude, &["sandbox", "status", "--folder", &folder]).1
+    };
+    let on = switch::turn_on(&probe, &file, &c, exe, None);
+    checks.check(
+        on == Ok(Switched::On),
+        "the menu switch marks a folder",
+        format!("{on:?}"),
+    );
+    if on != Ok(Switched::On) {
+        // Everything below needs the mark: one failure, not a cascade.
+        return;
+    }
+    let out = status();
+    checks.check(
+        out.contains("(активен)"),
+        "the menu switch takes an active slot",
+        &out,
+    );
+    let (_code, s) = broker(home, &c, bash, "mkdir .vscode && echo MADE_VSCODE");
+    checks.check(
+        s.contains("MADE_VSCODE"),
+        "a sandboxed command creates a protected name",
+        &s,
+    );
+    if !s.contains("MADE_VSCODE") {
+        // Without it the refusal below cannot happen: only unmark.
+        let off = switch::turn_off(&probe, &file, &c);
+        checks.check(
+            off == Ok(Switched::Off),
+            "the menu switch unmarks the folder",
+            format!("{off:?}"),
+        );
+        return;
+    }
+    let off = switch::turn_off(&probe, &file, &c);
+    checks.check(
+        off == Err(preflight::Refusal::SandboxWroteProtected(1)),
+        "the menu switch keeps the mark while the slot's protected name is there",
+        format!("{off:?}"),
+    );
+    let out = status();
+    checks.check(
+        out.contains("(активен)"),
+        "the mark and the slot stay after the refusal",
+        &out,
+    );
+    let removed = std::fs::remove_dir(c.join(".vscode"));
+    checks.check(
+        removed.is_ok(),
+        "the user removes the slot's protected name",
+        format!("{removed:?}"),
+    );
+    let off = switch::turn_off(&probe, &file, &c);
+    checks.check(
+        off == Ok(Switched::Off),
+        "the menu switch unmarks the folder",
+        format!("{off:?}"),
+    );
+    let out = status();
+    checks.check(
+        out.contains("не назначен"),
+        "the slot is retired after the menu switch",
+        &out,
+    );
 }
 
 #[test]
@@ -446,8 +588,10 @@ fn the_windows_sandbox_confines_a_command() {
         tools.to_string_lossy().as_bytes(),
     );
 
-    // Install two slots. On a non-elevated runner this fails; skip cleanly.
-    let (code, out, err) = cctg(&home, &claude, &["sandbox-install", "--slots", "2"]);
+    // Install three slots: A and B take two (A's stays retired after its
+    // `sandbox off`, a retired number is not reused), the menu switch's C the
+    // third. On a non-elevated runner this fails; skip cleanly.
+    let (code, out, err) = cctg(&home, &claude, &["sandbox-install", "--slots", "3"]);
     if code != 0 {
         let _ = cctg(&home, &claude, &["sandbox-uninstall"]);
         let _ = std::fs::remove_dir_all(&home);

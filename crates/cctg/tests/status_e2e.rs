@@ -559,6 +559,7 @@ impl Agent {
             private_place: false,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         });
         wire::write_msg(&mut write, &register).await.unwrap();
         let mut agent = Self {
@@ -1559,6 +1560,7 @@ async fn replaying_agent(
             private_place: false,
             enrolled: None,
             heartbeat: false,
+            sandbox: None,
         },
         backoff: Backoff::default(),
         replay: Some(Replay {
@@ -1567,6 +1569,7 @@ async fn replaying_agent(
         }),
         heartbeat: Default::default(),
         status: Some(StatusWatch::new(state)),
+        sandbox: None,
     });
     let up = async {
         loop {

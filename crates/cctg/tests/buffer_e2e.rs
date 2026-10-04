@@ -206,6 +206,7 @@ async fn kept_messages_reach_the_resumed_session_over_tcp_once_in_order() {
         private_place: false,
         enrolled: None,
         heartbeat: false,
+        sandbox: None,
     };
     write
         .write_all(&wire::encode(&AgentMsg::Register(register)))
@@ -360,6 +361,7 @@ async fn a_burst_reaches_a_live_session_over_tcp_as_one_inbound() {
         private_place: false,
         enrolled: None,
         heartbeat: false,
+        sandbox: None,
     };
     write
         .write_all(&wire::encode(&AgentMsg::Register(register)))

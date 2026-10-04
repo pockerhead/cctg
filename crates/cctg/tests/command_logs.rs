@@ -183,6 +183,7 @@ async fn command_logs_carry_no_paths() {
                 private_place: false,
                 enrolled: None,
                 heartbeat: false,
+                sandbox: None,
             },
             to_agent,
         })
