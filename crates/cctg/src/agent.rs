@@ -164,10 +164,26 @@ pub struct LinkConfig {
     /// Where the status line numbers wait ([`crate::statusfile`]); `None`:
     /// none are passed on. Set together with `register.status_lines`.
     pub status: Option<StatusWatch>,
-    /// The session's sandbox state now (TASK-090), put into `register` at
-    /// every connection: a switch shows after a reconnect too. `None`:
-    /// `register.sandbox` goes as it is.
-    pub sandbox: Option<Arc<Mutex<SandboxState>>>,
+    /// Where the session's sandbox state is read at every connection
+    /// (TASK-090): a switch from the menu or the terminal shows after a
+    /// reconnect. `None`: `register.sandbox` goes as it is.
+    pub sandbox: Option<SandboxSource>,
+}
+
+/// What the session's sandbox state is read from (TASK-090).
+#[derive(Debug, Clone)]
+pub struct SandboxSource {
+    pub marks_file: Option<PathBuf>,
+    pub folder: PathBuf,
+    /// This claude runs with a sandbox profile.
+    pub active: bool,
+}
+
+impl SandboxSource {
+    /// The state now ([`sandbox::switch::state`]); blocking.
+    fn state(&self) -> SandboxState {
+        sandbox::switch::state(self.marks_file.as_deref(), &self.folder, self.active)
+    }
 }
 
 /// The status line numbers the link passes on (TASK-058).
@@ -533,10 +549,10 @@ async fn connect(config: &LinkConfig) -> Result<Linked, ConnectError> {
         };
         write_agent_msg(&mut write, &hello).await?;
         let mut register = config.register.clone();
-        if let Some(cell) = &config.sandbox
-            && let Ok(state) = cell.lock()
+        if let Some(source) = config.sandbox.clone()
+            && let Ok(state) = tokio::task::spawn_blocking(move || source.state()).await
         {
-            register.sandbox = Some(*state);
+            register.sandbox = Some(state);
         }
         write_agent_msg(&mut write, &AgentMsg::Register(register)).await?;
         let mut reader = BufReader::new(read);
@@ -778,8 +794,6 @@ pub struct Dirs {
 pub struct Switch {
     /// The device as the checks see it.
     pub probe: Arc<dyn sandbox::preflight::Probe + Send + Sync>,
-    /// The session's state, shared with the link ([`LinkConfig::sandbox`]).
-    pub state: Arc<Mutex<SandboxState>>,
 }
 
 impl fmt::Debug for Switch {
@@ -866,23 +880,14 @@ pub async fn run_stdio() -> i32 {
         let _ =
             tokio::task::spawn_blocking(move || statusfile::prune(&state, SystemTime::now())).await;
     }
-    // The folder's sandbox state for the menu switch (TASK-090), refreshed
-    // by each switch and sent again at every registration.
+    // The folder's sandbox state for the menu switch (TASK-090), read again
+    // at every registration; the one in `register` is only the fallback.
     let active = worker.sandbox_active;
-    let sandbox_state = {
-        let marks = worker.marks_file.clone();
-        let folder = worker.folder.clone().unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            sandbox::switch::state(marks.as_deref(), &folder, active)
-        })
-        .await
-        .unwrap_or(SandboxState {
-            active,
-            wanted: active,
-            inherited: false,
-        })
+    let sandbox_source = SandboxSource {
+        marks_file: worker.marks_file.clone(),
+        folder: worker.folder.clone().unwrap_or_default(),
+        active,
     };
-    let sandbox_cell = Arc::new(Mutex::new(sandbox_state));
     let (hub, events) = match link_plan(session_id, entrypoint.as_deref(), &config) {
         Ok(plan) => {
             let register = Register {
@@ -902,7 +907,11 @@ pub async fn run_stdio() -> i32 {
                 private_place: true,
                 enrolled: None,
                 heartbeat: true,
-                sandbox: Some(sandbox_state),
+                sandbox: Some(SandboxState {
+                    active,
+                    wanted: active,
+                    inherited: false,
+                }),
             };
             let (outbox, events) = spawn(LinkConfig {
                 addr: plan.agent,
@@ -915,7 +924,7 @@ pub async fn run_stdio() -> i32 {
                 }),
                 heartbeat: Heartbeat::default(),
                 status: status.clone(),
-                sandbox: Some(sandbox_cell.clone()),
+                sandbox: Some(sandbox_source),
             });
             (Hub::Link(outbox), Some(events))
         }
@@ -956,7 +965,6 @@ pub async fn run_stdio() -> i32 {
         }),
         switch: Some(Switch {
             probe: Arc::new(sandbox::preflight::RealProbe),
-            state: sandbox_cell,
         }),
     };
     let worker = Some(Arc::new(worker));
@@ -1317,8 +1325,10 @@ async fn serve_loop<W: AsyncWrite + Unpin>(
                     let Some(worker) = worker
                         .clone()
                         .filter(|_| leaving.is_none() && downloading.is_none())
+                        // Never a restart in the middle of a sandbox switch.
+                        .filter(|_| switching.as_ref().is_none_or(JoinHandle::is_finished))
                     else {
-                        debug!("update without a worker or during another one; ignored");
+                        debug!("update without a worker, during another one or a switch; ignored");
                         continue;
                     };
                     match (release, worker.exe.clone(), sandbox_folder) {
@@ -2492,7 +2502,7 @@ fn spawn_switch(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let answer = tokio::task::spawn_blocking(move || {
-            run_switch(&*switch.probe, &worker, &switch.state, request_id, on)
+            run_switch(&*switch.probe, &worker, request_id, on)
         })
         .await
         .unwrap_or(AgentMsg::SandboxAnswer {
@@ -2511,16 +2521,18 @@ fn spawn_switch(
 }
 
 /// Marks (`on`) or unmarks the session folder as `cctg sandbox on|off` does
-/// ([`sandbox::switch`]), keeps the new state in `cell` and answers. The
-/// profile is written only for a session the wrapper started (its
-/// `--settings`). Blocking (minutes on Windows).
+/// ([`sandbox::switch`]) and answers with the new state. The profile is
+/// written only for a session the wrapper started (its `--settings`). A
+/// session without a folder (no absolute `CLAUDE_PROJECT_DIR` and no
+/// current directory) is refused with that reason. Blocking (minutes on
+/// Windows).
 fn run_switch(
     probe: &dyn sandbox::preflight::Probe,
     worker: &Worker,
-    cell: &Mutex<SandboxState>,
     request_id: u64,
     on: bool,
 ) -> AgentMsg {
+    use sandbox::preflight::{FolderProblem, Refusal};
     let answer = |outcome, reason, state, folder| AgentMsg::SandboxAnswer {
         request_id,
         outcome,
@@ -2529,11 +2541,15 @@ fn run_switch(
         folder,
         restart: worker.restartable() && worker.self_update(),
     };
-    let (Some(folder), Some(exe)) = (&worker.folder, &worker.exe) else {
+    let Some(folder) = worker.folder.as_ref().filter(|folder| folder.is_absolute()) else {
+        let reason = Refusal::BadFolder(FolderProblem::NotAbsolute).to_string();
+        return answer(SandboxOutcome::Refused, Some(reason), None, None);
+    };
+    let Some(exe) = &worker.exe else {
         return answer(SandboxOutcome::Failed, None, None, None);
     };
     let Some(file) = &worker.marks_file else {
-        let reason = sandbox::preflight::Refusal::NoHome.to_string();
+        let reason = Refusal::NoHome.to_string();
         return answer(SandboxOutcome::Refused, Some(reason), None, None);
     };
     let switched = if on {
@@ -2550,9 +2566,6 @@ fn run_switch(
         Err(refusal) => (SandboxOutcome::Refused, Some(refusal.to_string())),
     };
     let state = sandbox::switch::state(Some(file), folder, worker.sandbox_active);
-    if let Ok(mut shared) = cell.lock() {
-        *shared = state;
-    }
     let folder = folder.to_string_lossy().into_owned();
     answer(outcome, reason, Some(state), Some(folder))
 }
@@ -4346,12 +4359,7 @@ mod tests {
     /// are manual) and the shared state the link and the switch keep.
     fn sandbox_session(
         name: &str,
-    ) -> (
-        crate::hub::testdir::TempDir,
-        PathBuf,
-        Worker,
-        Arc<Mutex<SandboxState>>,
-    ) {
+    ) -> (crate::hub::testdir::TempDir, PathBuf, Worker, SandboxSource) {
         let dir = crate::hub::testdir::TempDir::new(name);
         let home = sandbox::paths::canonical(dir.path()).unwrap().join("home");
         let folder = home.join("proj");
@@ -4364,8 +4372,12 @@ mod tests {
             marks_file: Some(sandbox::marks_file(&home)),
             ..Worker::default()
         };
-        let state = sandbox::switch::state(worker.marks_file.as_deref(), &folder, false);
-        (dir, home, worker, Arc::new(Mutex::new(state)))
+        let source = SandboxSource {
+            marks_file: worker.marks_file.clone(),
+            folder,
+            active: false,
+        };
+        (dir, home, worker, source)
     }
 
     /// TASK-090: the agent registers with its sandbox state, switches the
@@ -4373,7 +4385,7 @@ mod tests {
     /// alone, and registers again with the new state.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_menu_switch_marks_the_folder_and_the_quiet_update_follows() {
-        let (_dir, home, worker, cell) = sandbox_session("agent-sandbox-switch");
+        let (_dir, home, worker, source) = sandbox_session("agent-sandbox-switch");
         let folder = worker.folder.clone().unwrap();
         let file = worker.marks_file.clone().unwrap();
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -4385,13 +4397,12 @@ mod tests {
             max: Duration::from_millis(160),
         };
         let (outbox, events) = spawn(LinkConfig {
-            sandbox: Some(cell.clone()),
+            sandbox: Some(source),
             ..config(addr, backoff)
         });
         let dirs = Dirs {
             switch: Some(Switch {
                 probe: Arc::new(sandbox::preflight::tests::Fake::linux(&home)),
-                state: cell,
             }),
             ..Dirs::default()
         };
@@ -4527,7 +4538,7 @@ mod tests {
     /// once; a refusal carries the device's reason, which names no path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_switch_is_refused_with_its_reason_and_one_runs_at_a_time() {
-        let (_dir, home, worker, cell) = sandbox_session("agent-sandbox-busy");
+        let (_dir, home, worker, _) = sandbox_session("agent-sandbox-busy");
         let folder = worker.folder.clone().unwrap();
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
@@ -4543,7 +4554,6 @@ mod tests {
                     inner,
                     go: std::sync::Mutex::new(wait),
                 }),
-                state: cell,
             }),
             ..Dirs::default()
         };
@@ -4591,6 +4601,144 @@ mod tests {
         assert_eq!(reason, "не найдена программа bwrap");
         assert!(!reason.contains(&*folder.to_string_lossy()));
         assert!(!state.wanted, "no mark");
+    }
+
+    /// The agent of `worker` on a raw hub, its switch on `probe`; the hub's
+    /// side of its first link.
+    async fn switching_agent(
+        worker: Worker,
+        source: Option<SandboxSource>,
+        probe: Arc<dyn sandbox::preflight::Probe + Send + Sync>,
+    ) -> (
+        TcpListener,
+        Register,
+        BufReader<OwnedReadHalf>,
+        OwnedWriteHalf,
+    ) {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backoff = Backoff {
+            initial: Duration::from_millis(20),
+            max: Duration::from_millis(160),
+        };
+        let (outbox, events) = spawn(LinkConfig {
+            sandbox: source,
+            ..config(addr, backoff)
+        });
+        let dirs = Dirs {
+            switch: Some(Switch { probe }),
+            ..Dirs::default()
+        };
+        let (frames, frames_rx) = mpsc::channel(16);
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            // Claude Code's end stays open as long as the agent runs.
+            let _keep = (frames, theirs);
+            serve_channel(
+                frames_rx,
+                ours,
+                Hub::Link(outbox),
+                Some(events),
+                dirs,
+                None,
+                Some(Arc::new(worker)),
+            )
+            .await
+        });
+        let (register, reader, write) = raw_hub_register(&listener).await;
+        (listener, register, reader, write)
+    }
+
+    /// TASK-090 review R3: a mark set in the terminal shows at the agent's
+    /// next registration, not only a switch from the menu.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_mark_shows_after_a_reconnect() {
+        let (_dir, home, worker, source) = sandbox_session("agent-sandbox-relink");
+        let folder = worker.folder.clone().unwrap();
+        let file = worker.marks_file.clone().unwrap();
+        let probe = Arc::new(sandbox::preflight::tests::Fake::linux(&home));
+        let (listener, register, reader, write) =
+            switching_agent(worker, Some(source), probe).await;
+        assert_eq!(register.sandbox.map(|state| state.wanted), Some(false));
+        sandbox::marks::add(&file, &folder).unwrap();
+        drop((reader, write));
+        let (register, _reader, _write) = raw_hub_register(&listener).await;
+        assert_eq!(
+            register.sandbox,
+            Some(SandboxState {
+                active: false,
+                wanted: true,
+                inherited: false
+            })
+        );
+    }
+
+    /// TASK-090 review R4: an `update` that comes while a switch runs is not
+    /// acted on (a restartable session would `/exit` in the middle of it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_is_not_acted_on_during_a_switch() {
+        let (_dir, home, worker, _) = sandbox_session("agent-sandbox-no-update");
+        let folder = worker.folder.clone().unwrap();
+        let (go, wait) = std::sync::mpsc::channel();
+        let probe = Arc::new(Held {
+            inner: sandbox::preflight::tests::Fake::linux(&home),
+            go: std::sync::Mutex::new(wait),
+        });
+        let (_listener, _, mut reader, mut write) = switching_agent(worker, None, probe).await;
+        let set = HubMsg::SandboxSet {
+            request_id: 1,
+            on: true,
+        };
+        wire::write_msg(&mut write, &set).await.unwrap();
+        let update = HubMsg::Update {
+            update_id: 2,
+            release: None,
+            sandbox_folder: Some(folder.to_string_lossy().into_owned()),
+        };
+        wire::write_msg(&mut write, &update).await.unwrap();
+        let early =
+            tokio::time::timeout(Duration::from_millis(1500), agent_line(&mut reader)).await;
+        go.send(()).unwrap();
+        assert!(early.is_err(), "acted on during the switch: {early:?}");
+        assert!(matches!(
+            agent_line(&mut reader).await,
+            AgentMsg::SandboxAnswer {
+                request_id: 1,
+                outcome: SandboxOutcome::Done,
+                ..
+            }
+        ));
+    }
+
+    /// TASK-090 review 7: a session without a folder is refused with that
+    /// reason, not a bare failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_without_a_folder_is_refused_with_the_reason() {
+        let (_dir, home, worker, _) = sandbox_session("agent-sandbox-no-folder");
+        let worker = Worker {
+            folder: None,
+            ..worker
+        };
+        let probe = Arc::new(sandbox::preflight::tests::Fake::linux(&home));
+        let (_listener, _, mut reader, mut write) = switching_agent(worker, None, probe).await;
+        let set = HubMsg::SandboxSet {
+            request_id: 1,
+            on: false,
+        };
+        wire::write_msg(&mut write, &set).await.unwrap();
+        let AgentMsg::SandboxAnswer {
+            outcome, reason, ..
+        } = agent_line(&mut reader).await
+        else {
+            panic!("no answer");
+        };
+        assert_eq!(outcome, SandboxOutcome::Refused);
+        assert_eq!(
+            reason.as_deref(),
+            Some("эту папку нельзя запереть: путь не абсолютный")
+        );
     }
 
     #[tokio::test]

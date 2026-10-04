@@ -95,8 +95,10 @@ pub fn turn_on(
         .map_err(|error| match error {
             WinOnError::Nested => Refusal::BadFolder(preflight::FolderProblem::Nested),
             WinOnError::Refused(refusal) => refusal,
-            WinOnError::GrantFailed => Refusal::Io("права учётки сэндбокса на папку"),
-            WinOnError::StampFailed => Refusal::Io("защиту служебных файлов папки"),
+            WinOnError::GrantFailed => {
+                Refusal::Permissions("выдать учётке сэндбокса права на папку")
+            }
+            WinOnError::StampFailed => Refusal::Permissions("защитить служебные файлы папки"),
         })?;
         #[cfg(not(windows))]
         return Err(Refusal::UnsupportedOs);
@@ -438,14 +440,23 @@ mod tests {
 
     #[test]
     fn the_new_refusals_name_no_path() {
-        for refusal in [Refusal::MarksFile, Refusal::SandboxWroteProtected(2)] {
+        for refusal in [
+            Refusal::MarksFile,
+            Refusal::SandboxWroteProtected(2),
+            Refusal::Permissions("выдать учётке сэндбокса права на папку"),
+        ] {
             let text = refusal.to_string();
             assert!(!text.contains('/') && !text.contains('\\'), "{text}");
         }
+        // Every protected name the slot can own, not only .git and .claude.
+        let wrote = Refusal::SandboxWroteProtected(2).to_string();
         assert!(
-            Refusal::SandboxWroteProtected(2)
-                .to_string()
-                .contains("(2)")
+            wrote.contains(".vscode") && wrote.contains(": 2)"),
+            "{wrote}"
+        );
+        assert_eq!(
+            Refusal::Permissions("выдать учётке сэндбокса права на папку").to_string(),
+            "не удалось выдать учётке сэндбокса права на папку; нажмите ещё раз"
         );
     }
 }
