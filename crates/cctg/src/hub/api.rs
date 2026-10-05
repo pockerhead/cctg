@@ -121,8 +121,9 @@ pub struct Message {
     pub forum_topic_reopened: Option<IgnoredAny>,
     /// A `pinned_message` service message: the message that was pinned.
     pub pinned_message: Option<MessageRef>,
-    /// The file of the message and its caption (TASK-032). Boxed: a sent
-    /// message in every scheduler answer stays small.
+    /// The file of the message and its caption (TASK-032), a rich message's
+    /// blocks (TASK-079). Boxed: a sent message in every scheduler answer
+    /// stays small.
     #[serde(flatten)]
     pub media: Box<MessageMedia>,
 }
@@ -139,10 +140,13 @@ pub struct MessageOrigin {
     pub sender_user_name: Option<String>,
 }
 
-/// The file fields of a message.
+/// The file fields of a message, and its rich content.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct MessageMedia {
+    /// A rich message (TASK-079: Telegram Desktop 7.x sends them) has no
+    /// `text`, only these blocks (`RichMessage`).
+    pub rich_message: Option<Value>,
     /// The words that came with a file.
     pub caption: Option<String>,
     /// The album the file belongs to: its files come as messages of their

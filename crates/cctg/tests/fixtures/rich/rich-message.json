@@ -1,0 +1,21 @@
+{
+ "update_id": 0,
+ "message": {
+  "message_id": 0,
+  "from": {"id": 0, "is_bot": false, "first_name": "<first_name>", "username": "<username>", "language_code": "ru"},
+  "chat": {"id": 0, "first_name": "<first_name>", "username": "<username>", "type": "private"},
+  "date": 0,
+  "rich_message": {"blocks": [
+   {"type": "paragraph", "text": ["Проверь ", {"type": "bold", "text": "таблицу"}, " и ", {"type": "code", "text": "cargo test"}, ":"]},
+   {"type": "table", "cells": [
+    [{"text": "Файл", "is_header": true, "align": "left", "valign": "middle"}, {"text": "Строк", "is_header": true, "align": "right", "valign": "middle"}],
+    [{"text": {"type": "code", "text": "updates.rs"}, "align": "left", "valign": "middle"}, {"text": "2220", "align": "right", "valign": "middle"}]
+   ], "is_bordered": true, "is_striped": true},
+   {"type": "list", "items": [
+    {"label": "•", "blocks": [{"type": "paragraph", "text": "первое"}]},
+    {"label": "•", "blocks": [{"type": "paragraph", "text": [{"type": "italic", "text": "второе"}]}]}
+   ]},
+   {"type": "pre", "text": "cargo test -p cctg", "language": "sh"}
+  ]}
+ }
+}

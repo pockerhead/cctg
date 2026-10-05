@@ -32,7 +32,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STALLED_BATCH_BACKOFF: Duration = Duration::from_secs(1);
 /// UTF-16 units kept of a replied message quoted for the session.
 pub const QUOTE_LIMIT: usize = 500;
-/// Nesting of a rich message's blocks read for a quote, at most (TASK-075).
+/// Nesting of a rich message's blocks read for a quote (TASK-075) or as
+/// markdown (TASK-079), at most.
 const RICH_DEPTH: usize = 32;
 /// Waits before the second and third attempt to save the offset (a file held
 /// open by a scanner or indexer on Windows makes the rename fail for a moment).
@@ -156,6 +157,7 @@ pub struct Inbound {
     pub message_id: i64,
     /// `None` for the General topic.
     pub thread_id: Option<i64>,
+    /// The message's text; a rich message's [`rich_markdown`] (TASK-079).
     pub text: Option<String>,
     /// The message this one explicitly answers. `None` for the implicit
     /// reply to the topic root that Telegram sets on every topic message.
@@ -496,6 +498,15 @@ fn invite_of(message: &Message, allowlist: &Allowlist) -> Option<InviteInput> {
 /// allowlist check because the bot itself is their sender.
 pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> Routed {
     if let Some(mut message) = update.message {
+        // A rich message has no `text`: its markdown stands in (TASK-079).
+        if message.text.is_none() {
+            message.text = message
+                .media
+                .rich_message
+                .take()
+                .map(|rich| rich_markdown(&rich))
+                .filter(|text| !text.trim().is_empty());
+        }
         if let Some(connect) = connect_of(&message, allowlist) {
             return Routed::Connect(connect);
         }
@@ -932,6 +943,242 @@ fn inline_words(value: &Value, depth: usize) -> String {
     }
 }
 
+/// A rich message (TASK-079) as markdown. Telegram gives only its blocks
+/// (`RichMessage` has no markdown), so they are written back as GFM:
+/// headings, lists and task lists, tables, quotes, code, bold, italic,
+/// strikethrough and links; any other block or part as its text, a media
+/// block as `[photo]` with its caption. Plain text is not escaped: the
+/// session reads the words as typed, and `@bot` and `/commands` stay
+/// findable.
+fn rich_markdown(rich: &Value) -> String {
+    md_blocks(rich.get("blocks"), 0).join("\n\n")
+}
+
+/// The markdown of each block of `blocks` that shows something.
+fn md_blocks(blocks: Option<&Value>, depth: usize) -> Vec<String> {
+    blocks
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|block| md_block(block, depth + 1))
+        .filter(|block| !block.trim().is_empty())
+        .collect()
+}
+
+fn md_block(block: &Value, depth: usize) -> String {
+    if depth > RICH_DEPTH {
+        return String::new();
+    }
+    let text = || md_inline(block.get("text"), depth);
+    let kind = str_of(block, "type");
+    match kind {
+        "heading" => {
+            let size = block.get("size").and_then(Value::as_u64).unwrap_or(1);
+            format!("{} {}", "#".repeat(size.clamp(1, 6) as usize), text())
+        }
+        "pre" => {
+            let code = block
+                .get("text")
+                .map(|code| inline_words(code, depth))
+                .unwrap_or_default();
+            let fence = "`".repeat(longest_run(&code, '`').max(2) + 1);
+            format!("{fence}{}\n{code}\n{fence}", str_of(block, "language"))
+        }
+        "divider" => "---".to_owned(),
+        "mathematical_expression" => format!("$$\n{}\n$$", str_of(block, "expression")),
+        "list" => md_list(block, depth),
+        "table" => md_table(block, depth),
+        "blockquote" | "expandable_blockquote" | "pullquote" => {
+            let mut parts = vec![text()];
+            parts.extend(md_blocks(block.get("blocks"), depth));
+            parts.push(md_inline(block.get("credit"), depth));
+            parts.retain(|part| !part.trim().is_empty());
+            parts
+                .join("\n\n")
+                .lines()
+                .map(|line| format!("> {line}").trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "anchor" | "buttons" => String::new(),
+        "photo" | "video" | "animation" | "audio" | "document" | "voice_note" | "map" => {
+            match md_caption(block, depth) {
+                caption if caption.trim().is_empty() => format!("[{kind}]"),
+                caption => format!("[{kind}: {caption}]"),
+            }
+        }
+        // A paragraph, a footer, details, a collage and kinds yet unknown:
+        // their text, summary, blocks and caption.
+        _ => {
+            let mut parts = vec![text(), md_inline(block.get("summary"), depth)];
+            parts.extend(md_blocks(block.get("blocks"), depth));
+            parts.push(md_caption(block, depth));
+            parts.retain(|part| !part.trim().is_empty());
+            parts.join("\n\n")
+        }
+    }
+}
+
+/// A list: `-` or `<value>.` per item, `[ ]`/`[x]` for a checkbox, the
+/// item's further lines indented under its first.
+fn md_list(list: &Value, depth: usize) -> String {
+    let items = list.get("items").and_then(Value::as_array);
+    let item = |item: &Value| {
+        let marker = match item.get("value").and_then(Value::as_i64) {
+            Some(value) => format!("{value}."),
+            None => "-".to_owned(),
+        };
+        let flag = |key| item.get(key).and_then(Value::as_bool).unwrap_or(false);
+        let check = match (flag("has_checkbox"), flag("is_checked")) {
+            (true, true) => "[x] ",
+            (true, false) => "[ ] ",
+            (false, _) => "",
+        };
+        let body = md_blocks(item.get("blocks"), depth).join("\n");
+        let indent = " ".repeat(marker.len() + 1);
+        let mut lines = body.lines();
+        let mut out = format!("{marker} {check}{}", lines.next().unwrap_or_default());
+        for line in lines {
+            out.push('\n');
+            if !line.is_empty() {
+                out.push_str(&indent);
+                out.push_str(line);
+            }
+        }
+        out
+    };
+    items
+        .into_iter()
+        .flatten()
+        .map(item)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A GFM table: the first row is the head, its cells' alignment the rule;
+/// `|` in a cell escaped, line breaks as spaces. Its caption after it.
+fn md_table(table: &Value, depth: usize) -> String {
+    let rows: Vec<&Vec<Value>> = table
+        .get("cells")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .collect();
+    let width = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+    let caption = md_caption(table, depth);
+    let Some(head) = rows.first().filter(|_| width > 0) else {
+        return caption;
+    };
+    let cell = |cell: Option<&Value>| {
+        cell.map(|cell| md_inline(cell.get("text"), depth))
+            .unwrap_or_default()
+            .replace(['\r', '\n'], " ")
+            .replace('|', "\\|")
+    };
+    let line = |row: &Vec<Value>| {
+        let cells: Vec<String> = (0..width).map(|at| cell(row.get(at))).collect();
+        format!("| {} |", cells.join(" | "))
+    };
+    let rule: Vec<&str> = (0..width)
+        .map(|at| match head.get(at).map(|cell| str_of(cell, "align")) {
+            Some("center") => ":---:",
+            Some("right") => "---:",
+            _ => "---",
+        })
+        .collect();
+    let mut lines = vec![line(head), format!("| {} |", rule.join(" | "))];
+    lines.extend(rows[1..].iter().map(|row| line(row)));
+    if !caption.trim().is_empty() {
+        lines.push(String::new());
+        lines.push(caption);
+    }
+    lines.join("\n")
+}
+
+/// The caption of a block: a `RichBlockCaption`'s text (an object without
+/// a `type`), or a table's own rich text.
+fn md_caption(block: &Value, depth: usize) -> String {
+    match block.get("caption") {
+        Some(caption) if caption.is_object() && caption.get("type").is_none() => {
+            md_inline(caption.get("text"), depth)
+        }
+        caption => md_inline(caption, depth),
+    }
+}
+
+/// Rich text as inline markdown.
+fn md_inline(text: Option<&Value>, depth: usize) -> String {
+    if depth > RICH_DEPTH {
+        return String::new();
+    }
+    match text {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(|part| md_inline(Some(part), depth + 1))
+            .collect(),
+        Some(part @ Value::Object(_)) => {
+            let inner = || md_inline(part.get("text"), depth + 1);
+            match str_of(part, "type") {
+                "bold" => wrap("**", &inner()),
+                "italic" => wrap("*", &inner()),
+                "strikethrough" => wrap("~~", &inner()),
+                "code" => code_span(
+                    &part
+                        .get("text")
+                        .map(|code| inline_words(code, depth + 1))
+                        .unwrap_or_default(),
+                ),
+                "url" => match (inner(), str_of(part, "url")) {
+                    (inner, url) if inner.is_empty() || inner == url => url.to_owned(),
+                    (inner, url) => format!("[{inner}]({url})"),
+                },
+                "custom_emoji" => str_of(part, "alternative_text").to_owned(),
+                "mathematical_expression" => format!("${}$", str_of(part, "expression")),
+                _ => inner(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// `inner` between two `marker`s, its edge whitespace kept outside them.
+fn wrap(marker: &str, inner: &str) -> String {
+    let core = inner.trim();
+    if core.is_empty() {
+        return inner.to_owned();
+    }
+    let start = inner.len() - inner.trim_start().len();
+    let end = start + core.len();
+    format!("{}{marker}{core}{marker}{}", &inner[..start], &inner[end..])
+}
+
+/// `code` as a code span, fenced by more backticks than it holds in a row.
+fn code_span(code: &str) -> String {
+    match longest_run(code, '`') {
+        _ if code.is_empty() => String::new(),
+        0 => format!("`{code}`"),
+        run => {
+            let ticks = "`".repeat(run + 1);
+            format!("{ticks} {code} {ticks}")
+        }
+    }
+}
+
+/// The most `c` in a row in `text`.
+fn longest_run(text: &str, c: char) -> usize {
+    text.split(|other| other != c)
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// A string field of a rich object, empty when it is none.
+fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1316,6 +1563,122 @@ mod tests {
             "quote": { "text": "жирным", "position": 8, "is_manual": true },
         }));
         assert_eq!(selected.quote.as_deref(), Some("жирным"));
+    }
+
+    /// TASK-079: the blocks Telegram returned for a GFM rich message (probe
+    /// TASK-075 R1, recorded 2026-09-28) come back as that markdown.
+    #[test]
+    fn a_rich_message_reads_as_the_markdown_of_its_blocks() {
+        let rich = json!({ "blocks": [
+            { "type": "heading", "text": "Заголовок 1", "size": 1 },
+            { "type": "heading", "text": "Заголовок 2", "size": 2 },
+            { "type": "paragraph", "text": ["Абзац с ", { "type": "bold", "text": "жирным" }, ", ",
+                { "type": "italic", "text": "курсивом" }, ", ", { "type": "code", "text": "кодом" },
+                ", ", { "type": "strikethrough", "text": "зачёркнутым" }, " и ",
+                { "type": "url", "text": "ссылкой", "url": "https://example.com/path_with_underscores" },
+                "."] },
+            { "type": "table", "cells": [
+                [{ "text": "Файл", "is_header": true, "align": "left", "valign": "middle" },
+                 { "text": "Строк", "is_header": true, "align": "right", "valign": "middle" },
+                 { "text": "Статус", "is_header": true, "align": "center", "valign": "middle" }],
+                [{ "text": { "type": "code", "text": "crates/hub/api.rs" }, "align": "left", "valign": "middle" },
+                 { "text": "1109", "align": "right", "valign": "middle" },
+                 { "text": "✅", "align": "center", "valign": "middle" }],
+            ], "is_bordered": true, "is_striped": true },
+            { "type": "list", "items": [
+                { "label": "1.", "blocks": [
+                    { "type": "paragraph", "text": "Первый пункт" },
+                    { "type": "list", "items": [{ "label": "•", "blocks": [
+                        { "type": "paragraph", "text": "вложенный" },
+                        { "type": "list", "items": [{ "label": "1.", "blocks": [
+                            { "type": "paragraph", "text": "нумерованный внутри" },
+                        ], "type": "1", "value": 1 }] },
+                    ] }] },
+                ], "type": "1", "value": 1 },
+                { "label": "2.", "blocks": [{ "type": "paragraph", "text": "Второй пункт" }],
+                  "type": "1", "value": 2 },
+            ] },
+            { "type": "list", "items": [
+                { "label": "•", "blocks": [{ "type": "paragraph", "text": "задача" }],
+                  "has_checkbox": true },
+                { "label": "•", "blocks": [{ "type": "paragraph", "text": "сделано" }],
+                  "has_checkbox": true, "is_checked": true },
+            ] },
+            { "type": "blockquote", "blocks": [{ "type": "paragraph", "text": "Цитата из ответа" }] },
+            { "type": "pre", "text": "fn main() {\n    println!(\"{:?}\", v);\n}", "language": "rust" },
+            { "type": "divider" },
+            { "type": "paragraph", "text": "Конец." },
+        ] });
+        let read = input(json!({ "rich_message": rich }));
+        assert_eq!(
+            read.text.as_deref(),
+            Some(
+                "# Заголовок 1\n\n## Заголовок 2\n\n\
+                 Абзац с **жирным**, *курсивом*, `кодом`, ~~зачёркнутым~~ и \
+                 [ссылкой](https://example.com/path_with_underscores).\n\n\
+                 | Файл | Строк | Статус |\n| --- | ---: | :---: |\n| `crates/hub/api.rs` | 1109 | ✅ |\n\n\
+                 1. Первый пункт\n   - вложенный\n     1. нумерованный внутри\n2. Второй пункт\n\n\
+                 - [ ] задача\n- [x] сделано\n\n\
+                 > Цитата из ответа\n\n\
+                 ```rust\nfn main() {\n    println!(\"{:?}\", v);\n}\n```\n\n\
+                 ---\n\nКонец."
+            )
+        );
+        assert!(read.media.is_none());
+        // `text`, when a message has one, stays the text.
+        let both = input(json!({ "text": "слова", "rich_message": rich }));
+        assert_eq!(both.text.as_deref(), Some("слова"));
+    }
+
+    /// TASK-079: the rarer blocks and parts: edge spaces stay outside the
+    /// markers, a `|` in a cell and backticks in code are kept apart, media
+    /// and a formula read as their words, an anchor as nothing; a rich
+    /// message with nothing to read has no text.
+    #[test]
+    fn rich_markdown_reads_every_kind_of_block() {
+        let rich = json!({ "blocks": [
+            { "type": "paragraph", "text": [{ "type": "bold", "text": " жир " }, "|",
+                { "type": "code", "text": "a`b" }, { "type": "mention", "text": "@cctg_bot",
+                "username": "cctg_bot" }, " ", { "type": "url", "text": "https://x.io", "url": "https://x.io" },
+                { "type": "custom_emoji", "custom_emoji_id": "5", "alternative_text": "🙂" },
+                { "type": "mathematical_expression", "expression": "x^2" }] },
+            { "type": "table", "cells": [[{ "text": "a|b" }, { "text": "c\nd" }], [{ "text": "1" }]],
+              "caption": { "type": "italic", "text": "подпись" } },
+            { "type": "expandable_blockquote", "text": "свёрнуто", "credit": "автор" },
+            { "type": "details", "summary": "Итог", "blocks": [{ "type": "paragraph", "text": "внутри" }] },
+            { "type": "photo", "photo": [], "caption": { "text": "кот" } },
+            { "type": "document", "document": {} },
+            { "type": "pre", "text": "```\nx" },
+            { "type": "anchor", "name": "a" },
+            { "type": "mathematical_expression", "expression": "E=mc^2" },
+            { "type": "heading", "text": "h", "size": 9 },
+        ] });
+        assert_eq!(
+            rich_markdown(&rich),
+            " **жир** |`` a`b ``@cctg_bot https://x.io🙂$x^2$\n\n\
+             | a\\|b | c d |\n| --- | --- |\n| 1 |  |\n\n*подпись*\n\n\
+             > свёрнуто\n>\n> автор\n\n\
+             Итог\n\nвнутри\n\n\
+             [photo: кот]\n\n[document]\n\n\
+             ````\n```\nx\n````\n\n\
+             $$\nE=mc^2\n$$\n\n###### h"
+        );
+
+        let empty = route_one(json!({ "update_id": 1, "message": message(ALLOWED,
+            json!({ "rich_message": { "blocks": [{ "type": "anchor", "name": "a" }] } })) }));
+        assert!(matches!(
+            empty,
+            Routed::Input(Inbound {
+                text: None,
+                media: None,
+                ..
+            })
+        ));
+        let deep = (0..100).fold(
+            json!({ "type": "paragraph", "text": "дно" }),
+            |inner, _| json!({ "type": "blockquote", "blocks": [inner] }),
+        );
+        assert_eq!(rich_markdown(&json!({ "blocks": [deep] })), "");
     }
 
     #[test]
