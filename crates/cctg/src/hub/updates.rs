@@ -6,6 +6,11 @@
 //! the hub knows ([`KnownGroups`], TASK-069); from another group only the
 //! bot's own membership changes (`my_chat_member`) and `/connect` of an
 //! allowlisted user get through.
+//!
+//! A rich message (TASK-079, Telegram Desktop 7.x) has no `text`; its blocks
+//! are read as markdown ([`rich_markdown`]), at most [`RICH_TEXT_LIMIT`].
+//! Known limit: a photo, video or file block inside it reaches the session
+//! only as `[photo: caption]`, its file is not downloaded.
 
 use std::future::Future;
 use std::io;
@@ -35,6 +40,11 @@ pub const QUOTE_LIMIT: usize = 500;
 /// Nesting of a rich message's blocks read for a quote (TASK-075) or as
 /// markdown (TASK-079), at most.
 const RICH_DEPTH: usize = 32;
+/// Bytes of a rich message's markdown kept, at most (TASK-079): nested list
+/// indents can make one message valid for Telegram (32768 characters) into
+/// megabytes, and one inbound must fit an agent-link line
+/// ([`crate::wire::MAX_LINE`]) even with every byte JSON-escaped.
+const RICH_TEXT_LIMIT: usize = 64 * 1024;
 /// Waits before the second and third attempt to save the offset (a file held
 /// open by a scanner or indexer on Windows makes the rename fail for a moment).
 const SAVE_RETRY_WAITS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(500)];
@@ -947,11 +957,22 @@ fn inline_words(value: &Value, depth: usize) -> String {
 /// (`RichMessage` has no markdown), so they are written back as GFM:
 /// headings, lists and task lists, tables, quotes, code, bold, italic,
 /// strikethrough and links; any other block or part as its text, a media
-/// block as `[photo]` with its caption. Plain text is not escaped: the
-/// session reads the words as typed, and `@bot` and `/commands` stay
-/// findable.
+/// block as `[photo]` with its caption (the file is not fetched). Plain text
+/// is not escaped: the session reads the words as typed, and `@bot` and
+/// `/commands` stay findable; so does an `@bot` in a link's URL, which
+/// `[text](url)` shows, and it counts as a mention. More than
+/// [`RICH_TEXT_LIMIT`] bytes are cut on a character boundary and end in `…`.
 fn rich_markdown(rich: &Value) -> String {
-    md_blocks(rich.get("blocks"), 0).join("\n\n")
+    let mut markdown = md_blocks(rich.get("blocks"), 0).join("\n\n");
+    if markdown.len() > RICH_TEXT_LIMIT {
+        let mut end = RICH_TEXT_LIMIT - '…'.len_utf8();
+        while !markdown.is_char_boundary(end) {
+            end -= 1;
+        }
+        markdown.truncate(end);
+        markdown.push('…');
+    }
+    markdown
 }
 
 /// The markdown of each block of `blocks` that shows something.
@@ -974,7 +995,10 @@ fn md_block(block: &Value, depth: usize) -> String {
     match kind {
         "heading" => {
             let size = block.get("size").and_then(Value::as_u64).unwrap_or(1);
-            format!("{} {}", "#".repeat(size.clamp(1, 6) as usize), text())
+            match text() {
+                text if text.trim().is_empty() => String::new(),
+                text => format!("{} {text}", "#".repeat(size.clamp(1, 6) as usize)),
+            }
         }
         "pre" => {
             let code = block
@@ -1056,7 +1080,8 @@ fn md_list(list: &Value, depth: usize) -> String {
 }
 
 /// A GFM table: the first row is the head, its cells' alignment the rule;
-/// `|` in a cell escaped, line breaks as spaces. Its caption after it.
+/// `|` in a cell escaped, line breaks as spaces (`colspan` and `rowspan`
+/// are not kept: a spanned cell is one). Its caption after it.
 fn md_table(table: &Value, depth: usize) -> String {
     let rows: Vec<&Vec<Value>> = table
         .get("cells")
@@ -1679,6 +1704,64 @@ mod tests {
             |inner, _| json!({ "type": "blockquote", "blocks": [inner] }),
         );
         assert_eq!(rich_markdown(&json!({ "blocks": [deep] })), "");
+        // An empty heading is nothing.
+        let headings = json!({ "blocks": [{ "type": "heading", "text": " ", "size": 2 },
+            { "type": "paragraph", "text": "x" }] });
+        assert_eq!(rich_markdown(&headings), "x");
+    }
+
+    /// TASK-079 review: 15 nested lists with ten-digit item numbers around
+    /// 16000 lines (32000 characters, 31 blocks: inside Telegram's rich
+    /// limits) render to about 2.9 MB; the markdown is cut to
+    /// [`RICH_TEXT_LIMIT`], and its inbound, every byte JSON-escaped, twice
+    /// over (a burst may add as much again), fits an agent-link line.
+    #[test]
+    fn a_rich_message_is_cut_to_its_limit_and_fits_a_link_line() {
+        let lines = "\u{1}\n".repeat(16_000);
+        let nested = (0..15).fold(json!({ "type": "paragraph", "text": lines }), |inner, _| {
+            json!({ "type": "list", "items": [{ "label": "1.", "value": 1_000_000_000,
+                "blocks": [inner] }] })
+        });
+        let read = input(json!({ "rich_message": { "blocks": [nested] } }));
+        let text = read.text.expect("the markdown");
+        assert!(text.len() <= RICH_TEXT_LIMIT, "{}", text.len());
+        assert!(text.len() > RICH_TEXT_LIMIT - 64, "{}", text.len());
+        assert!(
+            text.starts_with("1000000000. 1000000000. "),
+            "{}",
+            &text[..40]
+        );
+        assert!(text.ends_with('…'));
+        // The worst content of that size: every byte a control character,
+        // escaped as `\u0001` (6 bytes).
+        for content in [text.repeat(2), "\u{1}".repeat(2 * RICH_TEXT_LIMIT)] {
+            let inbound = crate::wire::HubMsg::Inbound {
+                content,
+                meta: std::collections::BTreeMap::from([("from_name".into(), "anna".into())]),
+            };
+            let line = crate::wire::encode(&inbound);
+            assert!(line.len() <= crate::wire::MAX_LINE, "{}", line.len());
+        }
+
+        // A cut never splits a character.
+        let wide = json!({ "blocks": [{ "type": "paragraph", "text": "я".repeat(40_000) }] });
+        let cut = rich_markdown(&wide);
+        assert!(
+            cut.len() <= RICH_TEXT_LIMIT && cut.ends_with("я…"),
+            "{}",
+            cut.len()
+        );
+    }
+
+    /// TASK-079 review: a link's URL is part of the markdown, so an `@bot`
+    /// in it counts as a mention (accepted: the sender is allowlisted).
+    #[test]
+    fn an_at_bot_in_a_rich_link_url_counts_as_a_mention() {
+        let rich = json!({ "blocks": [{ "type": "paragraph", "text": ["глянь ",
+            { "type": "url", "text": "ссылку", "url": "https://t.me/@cctg_bot" }] }] });
+        let text = input(json!({ "rich_message": rich })).text.unwrap();
+        assert_eq!(text, "глянь [ссылку](https://t.me/@cctg_bot)");
+        assert!(super::super::mention::mentions(&text, "cctg_bot"));
     }
 
     #[test]
