@@ -160,6 +160,7 @@ async fn one_overflow_warning_per_episode() {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: None,
                 reply_from: None,
             }))

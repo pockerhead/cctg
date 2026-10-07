@@ -4607,6 +4607,7 @@ impl Slots {
                 forwarded: input.forwarded,
                 file,
                 from_name: input.from_name,
+                from_username: input.from_username,
                 history,
                 mention: mention_of.is_some(),
                 voice,
@@ -6194,7 +6195,8 @@ impl Slots {
     /// `reply_to_message_id` for
     /// an explicit reply, `target_agent` for a reply to a block of its
     /// subagent, `forwarded` for a forward, `from_name` for a team
-    /// member's message (TASK-036) and `mention` for a group message that
+    /// member's message (TASK-036) with `mention_in_answer` when it is a
+    /// username, and `mention` for a group message that
     /// addresses the agent (TASK-080).
     fn inbound_meta(&self, session: &str, parked: &Parked) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::from([
@@ -6210,6 +6212,9 @@ impl Slots {
         }
         if let Some(name) = &parked.from_name {
             meta.insert("from_name".to_owned(), name.clone());
+            if parked.from_username {
+                meta.insert("mention_in_answer".to_owned(), format!("@{name}"));
+            }
         }
         if let Some(reply_to) = parked.reply_to {
             meta.insert("reply_to_message_id".to_owned(), reply_to.to_string());
@@ -6293,6 +6298,7 @@ impl Slots {
             .any(|parked| parked.from_name != last.from_name)
         {
             meta.remove("from_name");
+            meta.remove("mention_in_answer");
         }
         if parts.len() > 1 {
             let ids: Vec<String> = parts
@@ -16684,6 +16690,7 @@ mod tests {
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         })
@@ -16765,6 +16772,7 @@ mod tests {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: None,
                 reply_from: None,
             }))
@@ -16782,6 +16790,7 @@ mod tests {
                 forwarded: true,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: None,
                 reply_from: None,
             }))
@@ -17601,6 +17610,7 @@ again"
                 forwarded: false,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: None,
                 reply_from: None,
             }))
@@ -21165,6 +21175,7 @@ again"
                     forwarded: false,
                     media: None,
                     from_name: None,
+                    from_username: false,
                     author: None,
                     reply_from: None,
                 }))
@@ -26844,6 +26855,7 @@ again"
             forwarded,
             media: None,
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         }
@@ -27112,6 +27124,7 @@ again"
                 duration: None,
             }),
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         })
@@ -28124,6 +28137,48 @@ again"
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_sole_author_with_a_username_is_named_for_a_mention_in_the_answer() {
+        let dir = TempDir::new("slots-gather-mention");
+        let (mut slots, _work, mut agent) = gather_slots(&dir);
+        let by = |id: i64, text: &str, name: &str, username: bool| Inbound {
+            from_name: Some(name.to_owned()),
+            from_username: username,
+            ..topic_text(id, text, false)
+        };
+        let send = |slots: &mut Slots, messages: Vec<Inbound>| {
+            for message in messages {
+                slots.on_topic_message(message);
+                slots.pump();
+            }
+        };
+        send(
+            &mut slots,
+            vec![by(1, "раз", "anna_k", true), by(2, "два", "anna_k", true)],
+        );
+        pass(&mut slots, GATHER_QUIET).await;
+        send(&mut slots, vec![by(3, "три", "Иван", false)]);
+        pass(&mut slots, GATHER_QUIET).await;
+        send(
+            &mut slots,
+            vec![
+                by(4, "четыре", "anna_k", true),
+                by(5, "пять", "bob_m", true),
+            ],
+        );
+        pass(&mut slots, GATHER_QUIET).await;
+        let got = inbounds(&mut agent);
+        let mention = |meta: &BTreeMap<String, String>| meta.get("mention_in_answer").cloned();
+        assert_eq!(mention(&got[0].1).as_deref(), Some("@anna_k"));
+        assert_eq!(mention(&got[1].1), None, "a first name mentions nobody");
+        assert_eq!(
+            mention(&got[2].1),
+            None,
+            "two authors: the content names each"
+        );
+        assert!(got[0].1.keys().all(|key| crate::channel::is_meta_key(key)));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_lone_message_goes_after_the_quiet_window_and_a_steady_stream_by_its_limit() {
         let dir = TempDir::new("slots-gather-window");
         let (mut slots, _work, mut agent) = gather_slots(&dir);
@@ -28593,6 +28648,7 @@ again"
             forwarded: false,
             file: None,
             from_name: None,
+            from_username: false,
             history: None,
             mention: false,
             voice: None,
@@ -30628,6 +30684,7 @@ again"
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: Some(SHARER.into()),
             display_name: Some(SHARER.into()),
             reply_from: None,
@@ -34819,6 +34876,7 @@ again"
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: Some(SHARER.into()),
             display_name: Some(SHARER.into()),
             reply_from: None,
@@ -35735,6 +35793,7 @@ again"
             forwarded: false,
             media: None,
             from_name: Some(name.into()),
+            from_username: false,
             author: Some(name.into()),
             display_name: Some(name.into()),
             reply_from,
@@ -40251,6 +40310,7 @@ again"
                 duration,
             }),
             from_name: from_name.map(str::to_owned),
+            from_username: false,
             author: Some(from_name.unwrap_or(SHARER).to_owned()),
             reply_from: None,
         })

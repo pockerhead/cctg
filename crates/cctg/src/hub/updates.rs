@@ -176,6 +176,8 @@ pub struct Inbound {
     /// The sender's [`author_name`], only when the allowlist is a team
     /// (TASK-036). Never logged.
     pub from_name: Option<String>,
+    /// `from_name` is the sender's username, so `@` plus it mentions them.
+    pub from_username: bool,
     /// The sender's [`author_name`] always: it signs the echo of the message
     /// in the slot's other views (TASK-063). Never logged.
     pub author: Option<String>,
@@ -522,6 +524,7 @@ pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> 
         }
         let author = author_name(&from);
         let from_name = author.clone().filter(|_| allowlist.is_team());
+        let from_username = from_name.is_some() && from.username.is_some();
         let display_name = display_name(&from);
         let media = media(&mut message);
         let thread_id = message
@@ -568,6 +571,7 @@ pub fn classify(update: Update, groups: &KnownGroups, allowlist: &Allowlist) -> 
             forwarded: message.forward_origin.is_some(),
             media,
             from_name,
+            from_username,
             author,
             display_name,
         });
@@ -990,6 +994,7 @@ mod tests {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: Some("x".to_owned()),
                 display_name: Some("x".to_owned()),
                 reply_from: None,
@@ -1045,7 +1050,19 @@ mod tests {
         }});
         let text = json!({ "update_id": 1, "message": text });
         match route(text.clone(), &team) {
-            Routed::Input(input) => assert_eq!(input.from_name.as_deref(), Some("anna_k")),
+            Routed::Input(input) => {
+                assert_eq!(input.from_name.as_deref(), Some("anna_k"));
+                assert!(input.from_username);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut unnamed = text.clone();
+        unnamed["message"]["from"]["username"].take();
+        match route(unnamed, &team) {
+            Routed::Input(input) => {
+                assert_eq!(input.from_name.as_deref(), Some("Анна"));
+                assert!(!input.from_username, "a first name mentions nobody");
+            }
             other => panic!("{other:?}"),
         }
         match route(press.clone(), &team) {
@@ -1058,7 +1075,7 @@ mod tests {
             route(text.clone(), &alone),
             Routed::Input(Inbound {
                 from_name: None,
-
+                from_username: false,
                 ..
             })
         ));

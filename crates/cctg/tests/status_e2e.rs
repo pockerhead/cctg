@@ -1187,6 +1187,7 @@ async fn a_console_command_goes_over_the_link_and_its_answer_comes_back() {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: None,
                 reply_from: None,
             }))
@@ -1260,6 +1261,7 @@ async fn a_refused_console_command_is_answered_over_the_link() {
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         }))

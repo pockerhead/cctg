@@ -380,6 +380,7 @@ fn say(hub: &Hub, message_id: i64, text: &str, reply_to: Option<i64>) {
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         }))

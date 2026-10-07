@@ -243,6 +243,7 @@ pub fn part(
         forwarded,
         file: None,
         from_name: from_name.map(str::to_owned),
+        from_username: false,
         history: None,
         mention: false,
         voice: None,

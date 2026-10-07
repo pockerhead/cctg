@@ -460,6 +460,7 @@ async fn e2e_the_status_message_rolls_below_the_turn() {
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         }))

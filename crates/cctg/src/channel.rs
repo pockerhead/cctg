@@ -74,9 +74,9 @@ the tag, with its own `thread_id`) comes from this session's users like any othe
 foreign topic. A message, or a part, whose words (after that block, if any) start with \
 `(обращение к вам` addresses you directly: someone in the group mentioned the bot or replied to it, \
 and the tag has `mention=\"true\"`. Treat it as an ordinary request to you. \
-People often mute these topics and get notified only when mentioned, so when you answer or turn to \
-someone's message, mention its author as `@` plus that name (for example `@anna_k`), in the final \
-answer of the turn too. \
+People often mute these topics and get notified only when mentioned: when the tag has a \
+`mention_in_answer` attribute (for example `@anna_k`), put that mention in your answer to the \
+message, in the final answer of the turn too. \
 If the tag has a `target_agent` attribute, the message is for that subagent, running or finished: \
 forward it with SendMessage to that agent instead of acting on it yourself. Tool permission prompts are relayed to Telegram by Claude Code itself; \
 never ask for permissions through `reply`. A tag with a `file_path` attribute brings a file the user sent \
@@ -693,7 +693,7 @@ mod tests {
         assert!(instructions.contains("`file_path` attribute"));
         assert!(instructions.contains("`mcp__cctg__send_file`"));
         assert!(instructions.contains("a short caption saying what the file is"));
-        assert!(instructions.contains("mention its author as `@` plus that name"));
+        assert!(instructions.contains("`mention_in_answer` attribute"));
         // TASK-080: a group mention reads as addressed to this session.
         assert!(instructions.contains("`(обращение к вам` addresses you directly"));
         assert!(crate::hub::buffer::MENTION_MARK.starts_with("(обращение к вам"));

@@ -110,6 +110,9 @@ pub struct Parked {
     /// See [`crate::hub::updates::Inbound::from_name`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_name: Option<String>,
+    /// See [`crate::hub::updates::Inbound::from_username`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_username: bool,
     /// The group topic's messages since the last mention of the agent,
     /// read before this one (TASK-077).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +450,7 @@ mod tests {
             forwarded: false,
             file: None,
             from_name: None,
+            from_username: false,
             history: None,
             mention: false,
             voice: None,

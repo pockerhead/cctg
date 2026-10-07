@@ -697,6 +697,7 @@ async fn e2e_reactions() {
             forwarded: false,
             media: None,
             from_name: None,
+            from_username: false,
             author: None,
             reply_from: None,
         }))
@@ -1453,6 +1454,7 @@ fn inbound(message_id: i64) -> Control {
         forwarded: false,
         media: None,
         from_name: None,
+        from_username: false,
         author: None,
         reply_from: None,
     })

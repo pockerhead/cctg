@@ -1231,6 +1231,7 @@ impl Soak {
                 forwarded: false,
                 media: None,
                 from_name: None,
+                from_username: false,
                 author: None,
                 reply_from: None,
             }));
